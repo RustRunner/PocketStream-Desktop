@@ -108,6 +108,54 @@ pub async fn stop_recording(stream: State<'_, StreamManager>) -> Result<String, 
     stream.stop_recording().await
 }
 
+// ── Video Embed Commands ─────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn embed_video(
+    window: tauri::WebviewWindow,
+    stream: State<'_, StreamManager>,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Result<(), AppError> {
+    let _ = &window; // used below on windows
+
+    #[cfg(windows)]
+    {
+        let hwnd = window
+            .hwnd()
+            .map_err(|e| AppError::Stream(format!("Failed to get window handle: {}", e)))?;
+        let parent = hwnd.0 as isize;
+        let gst_hwnd =
+            crate::streaming::video_embed::embed(parent, x, y, width, height)?;
+        stream.set_embedded_hwnd(gst_hwnd).await;
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (stream, x, y, width, height);
+        return Err(AppError::Stream("Video embedding only supported on Windows".into()));
+    }
+
+    #[allow(unreachable_code)]
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn update_video_position(
+    stream: State<'_, StreamManager>,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Result<(), AppError> {
+    if let Some(hwnd) = stream.get_embedded_hwnd().await {
+        crate::streaming::video_embed::reposition(hwnd, x, y, width, height)?;
+    }
+    Ok(())
+}
+
 // ── Camera / PTZ Commands ────────────────────────────────────────────
 
 #[tauri::command]

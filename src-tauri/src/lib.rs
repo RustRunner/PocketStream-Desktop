@@ -39,6 +39,9 @@ pub fn run() {
             commands::take_screenshot,
             commands::start_recording,
             commands::stop_recording,
+            // Video Embed
+            commands::embed_video,
+            commands::update_video_position,
             // Camera / PTZ
             commands::discover_onvif,
             commands::ptz_move,

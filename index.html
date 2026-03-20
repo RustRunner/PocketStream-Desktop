@@ -199,23 +199,21 @@
               <div class="card-body video-container">
                 <div id="video-area" class="video-area">
                   <p class="placeholder-text">Select a camera and start stream</p>
-                  <!-- Overlay controls -->
-                  <div class="video-overlay">
-                    <button id="btn-screenshot" class="overlay-btn" title="Screenshot" disabled>
-                      <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
-                        <circle cx="12" cy="12" r="3.2"/>
-                        <path d="M9 2L7.17 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2h-3.17L15 2H9zm3 15c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5z"/>
-                      </svg>
-                    </button>
-                    <button id="btn-record" class="overlay-btn" title="Record" disabled>
-                      <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
-                        <circle cx="12" cy="12" r="8"/>
-                      </svg>
-                    </button>
-                  </div>
                 </div>
                 <div class="video-controls">
                   <button id="btn-toggle-stream" class="filled-btn">Start Stream</button>
+                  <div class="video-controls-spacer"></div>
+                  <button id="btn-screenshot" class="icon-btn" title="Screenshot" disabled>
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
+                      <circle cx="12" cy="12" r="3.2"/>
+                      <path d="M9 2L7.17 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2h-3.17L15 2H9zm3 15c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5z"/>
+                    </svg>
+                  </button>
+                  <button id="btn-record" class="icon-btn" title="Record" disabled>
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
+                      <circle cx="12" cy="12" r="8"/>
+                    </svg>
+                  </button>
                 </div>
               </div>
             </div>

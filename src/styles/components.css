@@ -460,7 +460,25 @@
 
 .video-controls {
   display: flex;
+  align-items: center;
   gap: 8px;
+}
+
+.video-controls-spacer {
+  flex: 1;
+}
+
+.video-controls .icon-btn {
+  color: var(--md-on-surface-variant);
+}
+
+.video-controls .icon-btn:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+.video-controls .icon-btn.recording {
+  color: var(--md-error, #d32f2f);
 }
 
 /* ── PTZ Pad ────────────────────────────────────────────────────────── */

@@ -445,6 +445,8 @@ function setupStreamControls() {
         updateStreamUI();
         startStatusPolling();
         showToast("Stream started");
+        // Wait for GStreamer to create its window, then embed it
+        await tryEmbedVideo();
       } catch (e) {
         showToast("Stream failed: " + e, true);
       }
@@ -483,12 +485,61 @@ function updateStreamUI() {
   $("#btn-record").disabled = !isStreaming;
 
   const area = $("#video-area");
+  const placeholder = area.querySelector(".placeholder-text");
   if (isStreaming) {
-    area.querySelector(".placeholder-text").textContent = "Stream active (video in external window)";
+    placeholder.style.display = "none";
   } else {
-    area.querySelector(".placeholder-text").textContent = "Select a camera and start stream";
+    placeholder.style.display = "";
+    placeholder.textContent = "Select a camera and start stream";
   }
 }
+
+/** Try to embed the GStreamer video window into the video-area with retries. */
+async function tryEmbedVideo(retries = 8, delayMs = 500) {
+  for (let i = 0; i < retries; i++) {
+    await new Promise((r) => setTimeout(r, delayMs));
+    if (!isStreaming) return; // user stopped before embed
+    try {
+      const bounds = getVideoAreaBounds();
+      await api.embedVideo(bounds.x, bounds.y, bounds.width, bounds.height);
+      log("Video embedded successfully");
+      return;
+    } catch (e) {
+      log(`Embed attempt ${i + 1}/${retries}: ${e}`);
+    }
+  }
+  log("Could not embed video — it may remain in a separate window");
+}
+
+/** Get the video-area bounds in physical pixels relative to the window client area. */
+function getVideoAreaBounds() {
+  const el = $("#video-area");
+  const rect = el.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  return {
+    x: Math.round(rect.x * dpr),
+    y: Math.round(rect.y * dpr),
+    width: Math.round(rect.width * dpr),
+    height: Math.round(rect.height * dpr),
+  };
+}
+
+function log(msg) {
+  console.log(`[PocketStream] ${msg}`);
+}
+
+// Reposition embedded video on window resize
+let resizeTimer = null;
+window.addEventListener("resize", () => {
+  if (!isStreaming) return;
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(async () => {
+    try {
+      const bounds = getVideoAreaBounds();
+      await api.updateVideoPosition(bounds.x, bounds.y, bounds.width, bounds.height);
+    } catch (_) {}
+  }, 50);
+});
 
 // ── RTSP Server Controls ────────────────────────────────────────────
 

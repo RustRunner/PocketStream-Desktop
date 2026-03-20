@@ -65,6 +65,14 @@ export async function takeScreenshot() {
   return await invoke("take_screenshot");
 }
 
+export async function embedVideo(x, y, width, height) {
+  return await invoke("embed_video", { x, y, width, height });
+}
+
+export async function updateVideoPosition(x, y, width, height) {
+  return await invoke("update_video_position", { x, y, width, height });
+}
+
 export async function startRecording() {
   return await invoke("start_recording");
 }

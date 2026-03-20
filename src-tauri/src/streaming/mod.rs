@@ -1,6 +1,7 @@
 pub mod recorder;
 pub mod rtsp_client;
 pub mod rtsp_server;
+pub mod video_embed;
 
 use serde::Serialize;
 use std::sync::Arc;
@@ -32,6 +33,7 @@ struct StreamState {
     recording: bool,
     recording_path: Option<String>,
     start_time: Option<std::time::Instant>,
+    embedded_hwnd: Option<isize>,
 }
 
 impl StreamManager {
@@ -43,6 +45,7 @@ impl StreamManager {
                 recording: false,
                 recording_path: None,
                 start_time: None,
+                embedded_hwnd: None,
             })),
         }
     }
@@ -115,6 +118,7 @@ impl StreamManager {
         }
         state.playback = None;
         state.start_time = None;
+        state.embedded_hwnd = None;
 
         Ok(())
     }
@@ -247,6 +251,16 @@ impl StreamManager {
 
         log::info!("Recording saved: {}", path);
         Ok(path)
+    }
+
+    pub async fn set_embedded_hwnd(&self, hwnd: isize) {
+        let mut state = self.state.lock().await;
+        state.embedded_hwnd = Some(hwnd);
+    }
+
+    pub async fn get_embedded_hwnd(&self) -> Option<isize> {
+        let state = self.state.lock().await;
+        state.embedded_hwnd
     }
 }
 
