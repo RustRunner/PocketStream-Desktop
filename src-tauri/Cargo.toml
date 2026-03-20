@@ -1,0 +1,42 @@
+[package]
+name = "pocketstream-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "PocketStream for Desktop — IP Camera Monitoring & Relay Station"
+license = "AGPL-3.0"
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+pnet = "0.35"
+ipnetwork = "0.20"
+aes-gcm = "0.10"
+rand = "0.8"
+dirs = "5"
+toml = "0.8"
+log = "0.4"
+env_logger = "0.11"
+thiserror = "2"
+base64 = "0.22"
+chrono = "0.4"
+
+gstreamer = "0.23"
+gstreamer-app = "0.23"
+gstreamer-video = "0.23"
+gstreamer-rtsp-server = "0.23"
+glib = "0.20"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader"] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

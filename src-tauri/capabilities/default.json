@@ -1,0 +1,15 @@
+{
+  "identifier": "default",
+  "description": "Default capabilities for PocketStream Desktop",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "shell:allow-open",
+    "dialog:default",
+    "notification:default",
+    {
+      "identifier": "core:app:default",
+      "allow": []
+    }
+  ]
+}
