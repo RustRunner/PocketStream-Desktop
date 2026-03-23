@@ -1,20 +1,20 @@
 /*
  * PocketStream Desktop — Material Design 3 Theme
  *
- * Color scheme matches the Android app's teal/dark theme.
+ * Color scheme matches the Android app's green/dark theme.
  * Uses CSS custom properties for easy theming.
  */
 
 :root {
-  /* Primary — Teal (matching Android app) */
-  --md-primary: #00897B;
-  --md-primary-light: #4DB6AC;
-  --md-primary-dark: #00695C;
-  --md-on-primary: #FFFFFF;
+  /* Primary — Green (matching Android app) */
+  --md-primary: #3DDC84;
+  --md-primary-light: #3DDC84;
+  --md-primary-dark: #2BA968;
+  --md-on-primary: #000000;
 
-  /* Secondary */
-  --md-secondary: #26A69A;
-  --md-on-secondary: #FFFFFF;
+  /* Secondary / Accent */
+  --md-secondary: #00E676;
+  --md-on-secondary: #000000;
 
   /* Surface / Background — Dark theme */
   --md-background: #121212;

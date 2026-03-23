@@ -132,6 +132,24 @@ pub fn reposition(gst_hwnd_raw: isize, x: i32, y: i32, width: i32, height: i32) 
     }
 }
 
+/// Hide the embedded video window (e.g. when a modal dialog opens).
+#[cfg(windows)]
+pub fn set_visible(gst_hwnd_raw: isize, visible: bool) -> Result<(), AppError> {
+    unsafe {
+        let gst_hwnd: HWND = gst_hwnd_raw as HWND;
+        if IsWindow(gst_hwnd) == 0 {
+            return Err(AppError::Stream("Video window no longer exists".into()));
+        }
+        ShowWindow(gst_hwnd, if visible { SW_SHOW } else { SW_HIDE });
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+pub fn set_visible(_hwnd: isize, _visible: bool) -> Result<(), AppError> {
+    Err(AppError::Stream("Video embedding is only supported on Windows".into()))
+}
+
 // Stubs for non-Windows platforms
 #[cfg(not(windows))]
 pub fn embed(_parent: isize, _x: i32, _y: i32, _w: i32, _h: i32) -> Result<isize, AppError> {

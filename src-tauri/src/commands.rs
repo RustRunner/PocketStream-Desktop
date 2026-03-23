@@ -2,7 +2,7 @@ use tauri::State;
 
 use crate::config::{AppConfig, AppSettings};
 use crate::error::AppError;
-use crate::network::{InterfaceInfo, NetworkManager, ScanResult};
+use crate::network::{ArpDevice, InterfaceInfo, NetworkManager, ScanResult};
 use crate::streaming::{StreamManager, StreamStatus};
 
 // ── Config Commands ──────────────────────────────────────────────────
@@ -54,6 +54,47 @@ pub async fn set_static_ip(
 ) -> Result<(), AppError> {
     crate::network::ip_config::assign_static_ip(&name, &ip, &subnet_mask, gateway.as_deref())
         .await
+}
+
+// ── ARP Discovery Commands ───────────────────────────────────────────
+
+#[tauri::command]
+pub async fn start_arp_discovery(
+    manager: State<'_, NetworkManager>,
+    app: tauri::AppHandle,
+    interface: String,
+) -> Result<(), AppError> {
+    manager.start_arp_discovery(&interface, app).await
+}
+
+#[tauri::command]
+pub async fn stop_arp_discovery(
+    manager: State<'_, NetworkManager>,
+) -> Result<(), AppError> {
+    manager.stop_arp_discovery().await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_arp_devices(
+    manager: State<'_, NetworkManager>,
+) -> Result<Vec<ArpDevice>, AppError> {
+    Ok(manager.get_arp_devices().await)
+}
+
+#[tauri::command]
+pub async fn get_adopted_subnets(
+    manager: State<'_, NetworkManager>,
+) -> Result<std::collections::HashMap<String, String>, AppError> {
+    Ok(manager.get_adopted_ips().await)
+}
+
+#[tauri::command]
+pub async fn remove_adopted_subnet(
+    manager: State<'_, NetworkManager>,
+    subnet: String,
+) -> Result<(), AppError> {
+    manager.remove_adopted_subnet(&subnet).await
 }
 
 // ── Streaming Commands ───────────────────────────────────────────────
@@ -152,6 +193,17 @@ pub async fn update_video_position(
 ) -> Result<(), AppError> {
     if let Some(hwnd) = stream.get_embedded_hwnd().await {
         crate::streaming::video_embed::reposition(hwnd, x, y, width, height)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_video_visible(
+    stream: State<'_, StreamManager>,
+    visible: bool,
+) -> Result<(), AppError> {
+    if let Some(hwnd) = stream.get_embedded_hwnd().await {
+        crate::streaming::video_embed::set_visible(hwnd, visible)?;
     }
     Ok(())
 }

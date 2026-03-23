@@ -123,27 +123,27 @@
                   <path d="M4 2h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2h-6l2 3v1H6v-1l2-3H4c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2zm0 14h16V4H4v12z"/>
                 </svg>
                 <h2>Host</h2>
+                <div class="header-actions">
+                  <button id="btn-refresh-host" class="icon-btn small" title="Refresh interfaces">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+                      <path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/>
+                    </svg>
+                  </button>
+                </div>
               </div>
               <div class="card-body">
                 <div class="status-row">
                   <span class="status-label">Interface:</span>
                   <span id="iface-name" class="status-value">--</span>
                 </div>
-                <div id="subnet-list" class="subnet-list"></div>
                 <div class="status-row">
-                  <span class="status-label">Camera IP:</span>
-                  <select id="camera-ip" class="status-select">
-                    <option value="">-- Select --</option>
-                  </select>
+                  <span class="status-label">Mode:</span>
+                  <span id="ip-mode" class="status-value">Static</span>
                 </div>
-                <div class="card-actions">
-                  <button id="btn-scan-all" class="outlined-btn">Scan All Subnets</button>
-                  <button id="btn-ip-config" class="text-btn">IP Config</button>
-                </div>
+                <div id="subnet-list" class="subnet-list"></div>
               </div>
-              <!-- Scan progress -->
-              <div id="scan-progress" class="progress-bar" style="display:none">
-                <div class="progress-fill"></div>
+              <div class="card-footer">
+                <button id="btn-ip-config" class="text-btn">Configure</button>
               </div>
             </div>
 
@@ -157,8 +157,14 @@
               </div>
               <div class="card-body">
                 <div id="device-list" class="device-list">
-                  <p class="placeholder-text">No nodes found. Run a network scan.</p>
+                  <p class="placeholder-text">Listening for devices via ARP...</p>
                 </div>
+              </div>
+              <div class="card-footer">
+                <span class="status-label">Camera IP:</span>
+                <select id="camera-ip" class="status-select">
+                  <option value="">-- Select --</option>
+                </select>
               </div>
             </div>
 
@@ -187,10 +193,9 @@
                   <span class="status-label">Bandwidth:</span>
                   <span id="rtsp-bandwidth" class="status-value">--</span>
                 </div>
-                <div class="card-actions">
-                  <button id="btn-toggle-rtsp" class="filled-btn">Start Server</button>
-                  <button id="btn-copy-url" class="text-btn" disabled>Copy URL</button>
-                </div>
+              </div>
+              <div class="card-footer">
+                <button id="btn-toggle-rtsp" class="text-btn">Start Server</button>
               </div>
             </div>
 
@@ -218,48 +223,6 @@
               </div>
             </div>
 
-            <!-- PTZ Control Card -->
-            <div class="card" id="card-ptz">
-              <div class="card-header">
-                <svg class="card-icon" width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
-                  <path d="M12 2C6.49 2 2 6.49 2 12s4.49 10 10 10 10-4.49 10-10S17.51 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm3-8c0 1.66-1.34 3-3 3s-3-1.34-3-3 1.34-3 3-3 3 1.34 3 3z"/>
-                </svg>
-                <h2>PTZ Control</h2>
-              </div>
-              <div class="card-body">
-                <div class="ptz-pad">
-                  <button class="ptz-btn up" data-dir="up" title="Tilt Up">
-                    <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor"><path d="M7.41 15.41L12 10.83l4.59 4.58L18 14l-6-6-6 6z"/></svg>
-                  </button>
-                  <button class="ptz-btn left" data-dir="left" title="Pan Left">
-                    <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor"><path d="M15.41 7.41L10.83 12l4.58 4.59L14 18l-6-6 6-6z"/></svg>
-                  </button>
-                  <button class="ptz-btn center" data-dir="home" title="Home">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>
-                  </button>
-                  <button class="ptz-btn right" data-dir="right" title="Pan Right">
-                    <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor"><path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg>
-                  </button>
-                  <button class="ptz-btn down" data-dir="down" title="Tilt Down">
-                    <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor"><path d="M7.41 8.59L12 13.17l4.59-4.58L18 10l-6 6-6-6z"/></svg>
-                  </button>
-                </div>
-                <div class="zoom-controls">
-                  <button class="outlined-btn small" id="btn-zoom-in">Zoom +</button>
-                  <button class="outlined-btn small" id="btn-zoom-out">Zoom -</button>
-                </div>
-                <div class="preset-row">
-                  <h3 class="setting-label">Presets</h3>
-                  <div class="preset-buttons" id="preset-buttons">
-                    <button class="preset-btn" data-preset="1">1</button>
-                    <button class="preset-btn" data-preset="2">2</button>
-                    <button class="preset-btn" data-preset="3">3</button>
-                    <button class="preset-btn" data-preset="4">4</button>
-                  </div>
-                </div>
-              </div>
-            </div>
-
           </div>
         </main>
       </div>
@@ -267,11 +230,11 @@
 
     <!-- Node Alias Dialog -->
     <dialog id="alias-dialog" class="dialog">
-      <h2>Set Node Alias</h2>
+      <h2>Rename Node</h2>
       <div class="dialog-body">
         <p id="alias-dialog-ip" class="alias-dialog-ip"></p>
         <div class="input-field">
-          <label for="alias-input">Alias</label>
+          <label for="alias-input">Name</label>
           <input type="text" id="alias-input" placeholder="e.g. Front Door Camera" />
         </div>
       </div>
@@ -285,23 +248,42 @@
 
     <!-- IP Config Dialog -->
     <dialog id="ip-config-dialog" class="dialog">
-      <h2>Static IP Configuration</h2>
+      <h2>IP Configuration</h2>
       <div class="dialog-body">
-        <div class="input-field">
-          <label for="static-iface">Interface</label>
-          <select id="static-iface"></select>
+        <div class="toggle-group ip-mode-toggle">
+          <button class="toggle-btn active" data-ip-mode="static">Static IP</button>
+          <button class="toggle-btn" data-ip-mode="dhcp-client">DHCP Client</button>
+          <button class="toggle-btn" data-ip-mode="dhcp-server">DHCP Server</button>
         </div>
-        <div class="input-field">
-          <label for="static-ip">IP Address</label>
-          <input type="text" id="static-ip" placeholder="192.168.1.100" />
+
+        <!-- Static IP fields -->
+        <div id="ip-config-static" class="ip-config-section">
+          <div class="input-field">
+            <label for="static-iface">Interface</label>
+            <select id="static-iface"></select>
+          </div>
+          <div class="input-field">
+            <label for="static-ip">IP Address</label>
+            <input type="text" id="static-ip" placeholder="192.168.1.100" />
+          </div>
+          <div class="input-field">
+            <label for="static-mask">Subnet Mask</label>
+            <input type="text" id="static-mask" value="255.255.255.0" />
+          </div>
+          <div class="input-field">
+            <label for="static-gateway">Gateway (optional)</label>
+            <input type="text" id="static-gateway" placeholder="192.168.1.1" />
+          </div>
         </div>
-        <div class="input-field">
-          <label for="static-mask">Subnet Mask</label>
-          <input type="text" id="static-mask" value="255.255.255.0" />
+
+        <!-- DHCP Client placeholder -->
+        <div id="ip-config-dhcp-client" class="ip-config-section" style="display:none">
+          <p class="placeholder-text">DHCP Client — coming soon</p>
         </div>
-        <div class="input-field">
-          <label for="static-gateway">Gateway (optional)</label>
-          <input type="text" id="static-gateway" placeholder="192.168.1.1" />
+
+        <!-- DHCP Server placeholder -->
+        <div id="ip-config-dhcp-server" class="ip-config-section" style="display:none">
+          <p class="placeholder-text">DHCP Server — coming soon</p>
         </div>
       </div>
       <div class="dialog-actions">

@@ -38,6 +38,39 @@ export async function setStaticIp(name, ip, subnetMask, gateway = null) {
   return await invoke("set_static_ip", { name, ip, subnetMask, gateway });
 }
 
+// ── ARP Discovery ───────────────────────────────────────────────────
+
+export async function startArpDiscovery(iface) {
+  return await invoke("start_arp_discovery", { interface: iface });
+}
+
+export async function stopArpDiscovery() {
+  return await invoke("stop_arp_discovery");
+}
+
+export async function getArpDevices() {
+  return await invoke("get_arp_devices");
+}
+
+export async function getAdoptedSubnets() {
+  return await invoke("get_adopted_subnets");
+}
+
+export async function removeAdoptedSubnet(subnet) {
+  return await invoke("remove_adopted_subnet", { subnet });
+}
+
+/** Listen for a Tauri event. Returns an unlisten function. */
+export function onEvent(eventName, callback) {
+  const listen = window.__TAURI__?.event?.listen;
+  if (listen) {
+    // listen() returns a Promise<UnlistenFn>
+    return listen(eventName, (event) => callback(event.payload));
+  }
+  console.log(`[dev] onEvent: ${eventName} (no Tauri runtime)`);
+  return Promise.resolve(() => {});
+}
+
 // ── Streaming ───────────────────────────────────────────────────────
 
 export async function startStream() {
@@ -71,6 +104,10 @@ export async function embedVideo(x, y, width, height) {
 
 export async function updateVideoPosition(x, y, width, height) {
   return await invoke("update_video_position", { x, y, width, height });
+}
+
+export async function setVideoVisible(visible) {
+  return await invoke("set_video_visible", { visible });
 }
 
 export async function startRecording() {

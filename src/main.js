@@ -15,6 +15,10 @@ let statusPollInterval = null;
 const nodeAliases = new Map(); // IP -> alias string
 let lastSubnetResults = []; // cache for re-rendering after alias changes
 
+// ARP discovery state
+const arpDevices = new Map(); // MAC -> ArpDevice
+const adoptedSubnets = new Map(); // subnet -> adopted IP string
+
 // ── DOM References ──────────────────────────────────────────────────
 
 const $ = (sel) => document.querySelector(sel);
@@ -25,17 +29,20 @@ const $$ = (sel) => document.querySelectorAll(sel);
 document.addEventListener("DOMContentLoaded", async () => {
   setupMenuAndAbout();
   setupProtocolToggle();
-  setupNetworkActions();
   setupStreamControls();
   setupRtspControls();
-  setupPtzControls();
   setupIpConfigDialog();
   setupSettingsSave();
   setupAliasDialog();
   setupCameraIpDropdown();
 
+  setupRefreshButton();
+
   await loadConfig();
   await refreshInterfaces();
+
+  // Start listening for ARP events (backend auto-starts ARP discovery)
+  setupArpListeners();
 });
 
 // ── Config ──────────────────────────────────────────────────────────
@@ -160,27 +167,14 @@ async function refreshInterfaces() {
       return;
     }
 
-    // Find the ethernet adapter (prefer physical ethernet over wifi)
+    // Find the ethernet adapter (ethernet only, no wifi)
     const eth =
-      interfaces.find((i) => i.is_up && i.is_ethernet && i.ips.length > 0) ||
-      interfaces.find((i) => i.is_up && i.ips.length > 0);
+      interfaces.find((i) => i.is_up && i.is_ethernet && i.ips.length > 0);
 
     if (eth) {
       activeInterface = eth;
       $("#iface-name").textContent = eth.display_name || eth.name;
-
-      // Render all IPs for this adapter
-      const subnetList = $("#subnet-list");
-      subnetList.innerHTML = eth.ips
-        .map(
-          (ip) => `
-        <div class="status-row subnet-row" data-subnet="${ip.subnet}">
-          <span class="status-label">IP:</span>
-          <span class="status-value">${ip.address}/${ip.prefix}</span>
-        </div>`
-        )
-        .join("");
-      // Populate camera IP dropdown with host IPs
+      renderSubnetList();
       updateCameraIpDropdown(null);
     } else {
       $("#iface-name").textContent = "None found";
@@ -191,107 +185,274 @@ async function refreshInterfaces() {
   }
 }
 
-function setupNetworkActions() {
-  $("#btn-scan-all").addEventListener("click", async () => {
-    if (!activeInterface || activeInterface.ips.length === 0) {
-      showToast("No active network interface", true);
-      return;
-    }
+/** Render the subnet list in the Host card, including auto-adopted subnets. */
+function renderSubnetList() {
+  const subnetList = $("#subnet-list");
+  if (!activeInterface) return;
 
-    const progress = $("#scan-progress");
-    progress.style.display = "";
-    progress.classList.add("indeterminate");
-    $("#btn-scan-all").disabled = true;
-
-    try {
-      // Scan all subnets in parallel
-      const scanPromises = activeInterface.ips.map((ip) =>
-        api.scanNetwork(ip.subnet).then((results) => ({
-          subnet: ip.subnet,
-          localIp: ip.address,
-          devices: results || [],
-        }))
-      );
-      const subnetResults = await Promise.all(scanPromises);
-      renderDeviceList(subnetResults);
-    } catch (e) {
-      showToast("Scan failed: " + e, true);
-    } finally {
-      progress.style.display = "none";
-      progress.classList.remove("indeterminate");
-      $("#btn-scan-all").disabled = false;
-    }
-  });
-}
-
-// Filter to likely network devices:
-// - Only port 80 open (web-managed switches, APs, etc.)
-// - Port 22 open with any combo of other ports (SSH-capable devices)
-// - Exclude gateway (x.x.x.1) for each subnet
-function filterDevices(devices, localIp) {
-  // Derive gateway: same subnet prefix + .1
-  const parts = localIp.split(".");
-  const gateway = `${parts[0]}.${parts[1]}.${parts[2]}.1`;
-
-  return devices.filter((d) => {
-    if (d.ip === gateway) return false;
-    if (d.ip === localIp) return false;
-    const ports = d.open_ports;
-    if (ports.length === 1 && ports[0] === 80) return true;
-    if (ports.includes(22)) return true;
-    return false;
-  });
-}
-
-function renderDeviceList(subnetResults) {
-  lastSubnetResults = subnetResults;
-  const list = $("#device-list");
-
-  // Apply device filter to each subnet
-  const filtered = subnetResults.map((sr) => ({
-    ...sr,
-    devices: filterDevices(sr.devices, sr.localIp),
-  }));
-
-  const totalDevices = filtered.reduce((n, s) => n + s.devices.length, 0);
-  if (totalDevices === 0) {
-    list.innerHTML = '<p class="placeholder-text">No matching nodes found on any subnet.</p>';
-    updateCameraIpDropdown(filtered);
-    return;
-  }
-
-  const pencilSvg = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1.001 1.001 0 000-1.41l-2.34-2.34a1.001 1.001 0 00-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>';
-
-  list.innerHTML = filtered
+  let html = activeInterface.ips
     .map(
-      (sr) => `
-    <div class="subnet-group">
-      <div class="subnet-header">${sr.subnet} <span class="subnet-count">(${sr.devices.length} nodes)</span></div>
-      ${
-        sr.devices.length === 0
-          ? '<p class="placeholder-text">No matching nodes.</p>'
-          : sr.devices
-              .map((d) => {
-                const alias = nodeAliases.get(d.ip);
-                return `
-        <div class="device-item${selectedDevice === d.ip ? " selected" : ""}" data-ip="${d.ip}">
-          <a class="device-ip" href="#" data-browse="${d.ip}" title="Open in browser">${d.ip}</a>
-          <div class="device-right">
-            ${alias ? `<span class="device-alias">${alias}</span>` : `<span class="device-ports">${d.open_ports.join(", ")}</span>`}
-            <button class="edit-alias-btn" data-alias-ip="${d.ip}" title="Set alias">${pencilSvg}</button>
-          </div>
-        </div>`;
-              })
-              .join("")
-      }
-    </div>`
+      (ip) => `
+      <div class="status-row subnet-row" data-subnet="${ip.subnet}">
+        <span class="status-label">IP:</span>
+        <span class="status-value">${ip.address}/${ip.prefix}</span>
+      </div>`
     )
     .join("");
 
-  // Click device row to select as camera target
+  // Add auto-adopted subnets
+  for (const [subnet, adoptedIp] of adoptedSubnets) {
+    html += `
+      <div class="status-row subnet-row subnet-row-auto" data-subnet="${subnet}">
+        <span class="status-label">IP:</span>
+        <span class="status-value">${adoptedIp}/24 <span class="badge-auto">(auto)</span></span>
+        <button class="btn-remove-ip" data-remove-subnet="${subnet}" title="Remove adopted IP">&times;</button>
+      </div>`;
+  }
+
+  subnetList.innerHTML = html;
+
+  // Wire up remove buttons
+  subnetList.querySelectorAll(".btn-remove-ip").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const subnet = btn.dataset.removeSubnet;
+      try {
+        await api.removeAdoptedSubnet(subnet);
+        adoptedSubnets.delete(subnet);
+        renderSubnetList();
+        showToast("Removed adopted IP");
+      } catch (err) {
+        showToast("Failed to remove: " + err, true);
+      }
+    });
+  });
+}
+
+// ── Refresh & ARP Status ────────────────────────────────────────────
+
+function setupRefreshButton() {
+  $("#btn-refresh-host").addEventListener("click", async () => {
+    const btn = $("#btn-refresh-host");
+    btn.disabled = true;
+    btn.classList.add("spinning");
+
+    try {
+      await refreshInterfaces();
+      await loadExistingArpState();
+      showToast("Refreshed");
+    } catch (e) {
+      showToast("Refresh failed: " + e, true);
+    } finally {
+      btn.disabled = false;
+      btn.classList.remove("spinning");
+    }
+  });
+}
+
+// ── ARP Discovery ───────────────────────────────────────────────────
+
+const scannedIps = new Set(); // IPs already being/been port-scanned
+let pendingScans = 0; // number of port scans in flight
+
+function setupArpListeners() {
+  // Listen for individual ARP device discoveries
+  api.onEvent("arp-device-discovered", (device) => {
+    // Skip our own IPs
+    if (activeInterface?.ips.some((ip) => ip.address === device.ip)) return;
+
+    const isNew = !arpDevices.has(device.mac);
+    arpDevices.set(device.mac, device);
+
+    if (isNew) {
+      log(`ARP: discovered ${device.ip} (${device.mac})`);
+      showScanSpinner(true);
+      scanDevicePorts(device.ip);
+    }
+  });
+
+  // Listen for subnet adoption events — rescan devices on the adopted subnet
+  api.onEvent("subnet-adopted", (data) => {
+    log(`Subnet adopted: ${data.subnet} -> ${data.adopted_ip}`);
+    adoptedSubnets.set(data.subnet, data.adopted_ip);
+    renderSubnetList();
+
+    // Retry port scan for all devices on this subnet (now reachable)
+    for (const device of arpDevices.values()) {
+      if (device.subnet === data.subnet) {
+        scannedIps.delete(device.ip); // allow rescan
+        showScanSpinner(true);
+        scanDevicePorts(device.ip);
+      }
+    }
+  });
+
+  // Load any already-discovered devices and adopted subnets
+  loadExistingArpState();
+}
+
+async function loadExistingArpState() {
+  try {
+    const [devices, subnets] = await Promise.all([
+      api.getArpDevices(),
+      api.getAdoptedSubnets(),
+    ]);
+
+    if (devices && devices.length > 0) {
+      for (const d of devices) {
+        arpDevices.set(d.mac, d);
+      }
+      showScanSpinner(true);
+      for (const d of devices) {
+        scanDevicePorts(d.ip);
+      }
+    }
+
+    if (subnets) {
+      for (const [subnet, ip] of Object.entries(subnets)) {
+        adoptedSubnets.set(subnet, ip);
+      }
+      if (Object.keys(subnets).length > 0) renderSubnetList();
+    }
+  } catch (e) {
+    console.error("Failed to load ARP state:", e);
+  }
+}
+
+// Map to store TCP scan results by IP
+const tcpScanResults = new Map(); // IP -> ScanResult
+
+/** Scan a single device's ports and update the UI when done. */
+async function scanDevicePorts(ip) {
+  if (scannedIps.has(ip)) return;
+  scannedIps.add(ip);
+  pendingScans++;
+
+  try {
+    const results = await api.scanNetwork(`${ip}/32`);
+    if (results) {
+      for (const r of results) {
+        if (r.reachable && r.open_ports.length > 0) {
+          tcpScanResults.set(r.ip, r);
+        }
+      }
+    }
+  } catch (e) {
+    log(`Port scan failed for ${ip}: ${e}`);
+  }
+
+  pendingScans--;
+  // Re-render with latest scan results; hide spinner when all done
+  renderArpDeviceList();
+  if (pendingScans <= 0) {
+    showScanSpinner(false);
+  }
+}
+
+/** Show or hide the scanning spinner in the Nodes card. */
+function showScanSpinner(show) {
+  const list = $("#device-list");
+  const existing = list.querySelector(".scan-spinner");
+  if (show && !existing) {
+    list.innerHTML = '<div class="scan-spinner"><div class="spinner"></div><span>Scanning devices...</span></div>';
+  } else if (!show && existing) {
+    existing.remove();
+  }
+}
+
+/** Render the Nodes card with ARP-discovered devices + TCP scan data. */
+function renderArpDeviceList() {
+  const list = $("#device-list");
+
+  // Group devices by subnet
+  const bySubnet = new Map();
+  for (const device of arpDevices.values()) {
+    if (!bySubnet.has(device.subnet)) {
+      bySubnet.set(device.subnet, []);
+    }
+    bySubnet.get(device.subnet).push(device);
+  }
+
+  // Only show devices that have completed port scan with open ports
+  // If scans are still running, keep the spinner visible
+  if (bySubnet.size === 0 && pendingScans <= 0) {
+    list.innerHTML = '<p class="placeholder-text">No devices found.</p>';
+    updateCameraIpDropdown(null);
+    return;
+  }
+
+  // Also build subnetResults format for camera IP dropdown
+  const subnetResults = [];
+
+  const pencilSvg = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1.001 1.001 0 000-1.41l-2.34-2.34a1.001 1.001 0 00-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>';
+
+  let html = "";
+  let nodeIndex = 0;
+  for (const [subnet, devices] of bySubnet) {
+    // Filter: skip devices that are our own IPs
+    const ownIps = new Set();
+    if (activeInterface) {
+      activeInterface.ips.forEach((ip) => ownIps.add(ip.address));
+    }
+    for (const ip of adoptedSubnets.values()) {
+      ownIps.add(ip);
+    }
+
+    const filtered = devices.filter((d) => {
+      if (ownIps.has(d.ip)) return false;
+      const tcpData = tcpScanResults.get(d.ip);
+      return tcpData && tcpData.open_ports && tcpData.open_ports.length > 0;
+    });
+    if (filtered.length === 0) continue;
+
+    const devicesForDropdown = [];
+
+    html += `<div class="subnet-group">`;
+
+    for (const d of filtered) {
+      nodeIndex++;
+      const alias = nodeAliases.get(d.ip);
+      const name = alias || `Node ${nodeIndex}`;
+      const tcpData = tcpScanResults.get(d.ip);
+      const ports = tcpData ? tcpData.open_ports : [];
+
+      devicesForDropdown.push({ ip: d.ip, open_ports: ports });
+
+      html += `
+        <div class="device-item${selectedDevice === d.ip ? " selected" : ""}" data-ip="${d.ip}">
+          <div class="device-name-row">
+            <span class="device-name">${name}</span>
+            <button class="edit-alias-btn" data-alias-ip="${d.ip}" title="Rename">${pencilSvg}</button>
+          </div>
+          <div class="device-detail-row">
+            <a class="device-ip" href="#" data-browse="${d.ip}" title="Open in browser">${d.ip}</a>
+            <span class="device-ports">${ports.join(", ")}</span>
+          </div>
+        </div>`;
+    }
+
+    html += `</div>`;
+
+    subnetResults.push({
+      subnet,
+      localIp: adoptedSubnets.get(subnet) || (activeInterface?.ips[0]?.address ?? ""),
+      devices: devicesForDropdown,
+    });
+  }
+
+  // If no devices passed the filter, don't overwrite the spinner
+  if (!html && pendingScans > 0) return;
+  if (!html) {
+    list.innerHTML = '<p class="placeholder-text">No devices found.</p>';
+    updateCameraIpDropdown(null);
+    return;
+  }
+
+  list.innerHTML = html;
+
+  // Wire up event handlers
   list.querySelectorAll(".device-item").forEach((item) => {
     item.addEventListener("click", (e) => {
-      // Don't select if clicking the IP link, alias button
       if (e.target.closest(".device-ip") || e.target.closest(".edit-alias-btn")) return;
       list.querySelectorAll(".device-item").forEach((i) => i.classList.remove("selected"));
       item.classList.add("selected");
@@ -304,12 +465,10 @@ function renderDeviceList(subnetResults) {
     });
   });
 
-  // Click IP to open in browser
   list.querySelectorAll(".device-ip[data-browse]").forEach((link) => {
     link.addEventListener("click", (e) => {
       e.preventDefault();
       const ip = link.dataset.browse;
-      // Use Tauri shell plugin to open URL in default browser
       const invoke = window.__TAURI__?.core?.invoke;
       if (invoke) {
         invoke("plugin:shell|open", { path: `http://${ip}` }).catch(() => {
@@ -321,16 +480,37 @@ function renderDeviceList(subnetResults) {
     });
   });
 
-  // Click pencil to edit alias
   list.querySelectorAll(".edit-alias-btn").forEach((btn) => {
     btn.addEventListener("click", (e) => {
       e.stopPropagation();
-      const ip = btn.dataset.aliasIp;
-      openAliasDialog(ip);
+      openAliasDialog(btn.dataset.aliasIp);
     });
   });
 
-  updateCameraIpDropdown(filtered);
+  // Update the camera IP dropdown with ARP-discovered nodes
+  lastSubnetResults = subnetResults;
+  updateCameraIpDropdown(subnetResults);
+}
+
+// Filter to likely network/camera devices:
+// - Has SSH (port 22) — managed network devices
+// - Has RTSP (port 554 or 8554) — IP cameras
+// - Only port 80 open — web-managed switches, APs, etc.
+// - Exclude gateway (x.x.x.1) and local host for each subnet
+function filterDevices(devices, localIp) {
+  // Derive gateway: same subnet prefix + .1
+  const parts = localIp.split(".");
+  const gateway = `${parts[0]}.${parts[1]}.${parts[2]}.1`;
+
+  return devices.filter((d) => {
+    if (d.ip === gateway) return false;
+    if (d.ip === localIp) return false;
+    const ports = d.open_ports;
+    if (ports.includes(22)) return true;
+    if (ports.includes(554) || ports.includes(8554)) return true;
+    if (ports.length === 1 && ports[0] === 80) return true;
+    return false;
+  });
 }
 
 function updateCameraIpDropdown(filteredSubnets) {
@@ -349,18 +529,21 @@ function updateCameraIpDropdown(filteredSubnets) {
     options += '</optgroup>';
   }
 
-  // Node IPs (from filtered scan results)
+  // Node IPs (from ARP-discovered + scan results)
   if (filteredSubnets) {
+    let hasNodes = false;
+    let nodeOptions = "";
     filteredSubnets.forEach((sr) => {
-      if (sr.devices.length === 0) return;
-      options += `<optgroup label="Nodes - ${sr.subnet}">`;
       sr.devices.forEach((d) => {
+        hasNodes = true;
         const alias = nodeAliases.get(d.ip);
         const label = alias ? `${d.ip} (${alias})` : d.ip;
-        options += `<option value="${d.ip}">${label}</option>`;
+        nodeOptions += `<option value="${d.ip}">${label}</option>`;
       });
-      options += '</optgroup>';
     });
+    if (hasNodes) {
+      options += `<optgroup label="Nodes">${nodeOptions}</optgroup>`;
+    }
   }
 
   select.innerHTML = options;
@@ -385,7 +568,9 @@ function openAliasDialog(ip) {
   $("#alias-dialog-ip").textContent = ip;
   $("#alias-input").value = nodeAliases.get(ip) || "";
   dialog.dataset.ip = ip;
+  api.setVideoVisible(false);
   dialog.showModal();
+  dialog.addEventListener("close", () => api.setVideoVisible(true), { once: true });
   $("#alias-input").focus();
 }
 
@@ -400,7 +585,7 @@ function setupAliasDialog() {
       nodeAliases.delete(ip);
     }
     dialog.close();
-    renderDeviceList(lastSubnetResults);
+    renderArpDeviceList();
   });
 
   $("#alias-clear").addEventListener("click", () => {
@@ -408,7 +593,7 @@ function setupAliasDialog() {
     const ip = dialog.dataset.ip;
     nodeAliases.delete(ip);
     dialog.close();
-    renderDeviceList(lastSubnetResults);
+    renderArpDeviceList();
   });
 
   $("#alias-cancel").addEventListener("click", () => {
@@ -567,20 +752,11 @@ function setupRtspControls() {
     }
   });
 
-  $("#btn-copy-url").addEventListener("click", () => {
-    const url = $("#rtsp-url").textContent;
-    if (url && url !== "--") {
-      navigator.clipboard.writeText(url);
-      showToast("URL copied to clipboard");
-    }
-  });
 }
 
 function updateRtspUI(url) {
   const btn = $("#btn-toggle-rtsp");
   btn.textContent = isRtspRunning ? "Stop Server" : "Start Server";
-  btn.className = isRtspRunning ? "outlined-btn active-btn" : "filled-btn";
-  $("#btn-copy-url").disabled = !isRtspRunning;
 
   const statusEl = $("#rtsp-status");
   if (isRtspRunning) {
@@ -596,103 +772,14 @@ function updateRtspUI(url) {
   }
 }
 
-// ── PTZ Controls ────────────────────────────────────────────────────
-
-function setupPtzControls() {
-  const cameraUrl = () => {
-    if (!selectedDevice) return null;
-    return `http://${selectedDevice}`;
-  };
-
-  // Direction buttons — press and hold
-  $$(".ptz-btn[data-dir]").forEach((btn) => {
-    const dir = btn.dataset.dir;
-
-    btn.addEventListener("mousedown", () => {
-      const url = cameraUrl();
-      if (!url) return;
-
-      const moves = {
-        up: [0, 1, 0],
-        down: [0, -1, 0],
-        left: [-1, 0, 0],
-        right: [1, 0, 0],
-        home: null,
-      };
-
-      if (dir === "home") {
-        api.ptzGotoPreset(url, 1);
-      } else {
-        const [pan, tilt, zoom] = moves[dir];
-        api.ptzMove(url, pan, tilt, zoom);
-      }
-    });
-
-    btn.addEventListener("mouseup", () => {
-      const url = cameraUrl();
-      if (url && dir !== "home") api.ptzStop(url);
-    });
-
-    btn.addEventListener("mouseleave", () => {
-      const url = cameraUrl();
-      if (url && dir !== "home") api.ptzStop(url);
-    });
-  });
-
-  // Zoom buttons
-  $("#btn-zoom-in").addEventListener("mousedown", () => {
-    const url = cameraUrl();
-    if (url) api.ptzMove(url, 0, 0, 1);
-  });
-  $("#btn-zoom-in").addEventListener("mouseup", () => {
-    const url = cameraUrl();
-    if (url) api.ptzStop(url);
-  });
-
-  $("#btn-zoom-out").addEventListener("mousedown", () => {
-    const url = cameraUrl();
-    if (url) api.ptzMove(url, 0, 0, -1);
-  });
-  $("#btn-zoom-out").addEventListener("mouseup", () => {
-    const url = cameraUrl();
-    if (url) api.ptzStop(url);
-  });
-
-  // Presets — click to go, long-press to save
-  $$(".preset-btn").forEach((btn) => {
-    let holdTimer;
-
-    btn.addEventListener("mousedown", () => {
-      holdTimer = setTimeout(() => {
-        const url = cameraUrl();
-        if (url) {
-          const num = parseInt(btn.dataset.preset);
-          api.ptzSetPreset(url, num, `Preset ${num}`);
-          showToast(`Preset ${num} saved`);
-        }
-        holdTimer = null;
-      }, 1000);
-    });
-
-    btn.addEventListener("mouseup", () => {
-      if (holdTimer) {
-        clearTimeout(holdTimer);
-        const url = cameraUrl();
-        if (url) {
-          api.ptzGotoPreset(url, parseInt(btn.dataset.preset));
-        }
-      }
-    });
-  });
-}
-
 // ── IP Config Dialog ────────────────────────────────────────────────
 
 function setupIpConfigDialog() {
   const dialog = $("#ip-config-dialog");
+  let activeMode = "static";
 
+  // Open dialog
   $("#btn-ip-config").addEventListener("click", async () => {
-    // Populate interface dropdown
     try {
       const interfaces = await api.listInterfaces();
       const select = $("#static-iface");
@@ -702,29 +789,57 @@ function setupIpConfigDialog() {
         .join("");
     } catch (_) {}
 
+    api.setVideoVisible(false);
     dialog.showModal();
+    dialog.addEventListener("close", () => api.setVideoVisible(true), { once: true });
+  });
+
+  // Mode toggle within dialog
+  $$("[data-ip-mode]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      $$("[data-ip-mode]").forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      activeMode = btn.dataset.ipMode;
+
+      // Show/hide sections
+      $$("#ip-config-static, #ip-config-dhcp-client, #ip-config-dhcp-server").forEach(
+        (s) => (s.style.display = "none")
+      );
+      $(`#ip-config-${activeMode}`).style.display = "";
+    });
   });
 
   $("#ip-config-cancel").addEventListener("click", () => dialog.close());
 
   $("#ip-config-apply").addEventListener("click", async () => {
-    const iface = $("#static-iface").value;
-    const ip = $("#static-ip").value;
-    const mask = $("#static-mask").value;
-    const gw = $("#static-gateway").value || null;
+    if (activeMode === "static") {
+      const iface = $("#static-iface").value;
+      const ip = $("#static-ip").value;
+      const mask = $("#static-mask").value;
+      const gw = $("#static-gateway").value || null;
 
-    if (!iface || !ip || !mask) {
-      showToast("Please fill in all required fields", true);
-      return;
-    }
+      if (!iface || !ip || !mask) {
+        showToast("Please fill in all required fields", true);
+        return;
+      }
 
-    try {
-      await api.setStaticIp(iface, ip, mask, gw);
-      showToast("Static IP assigned");
+      try {
+        await api.setStaticIp(iface, ip, mask, gw);
+        $("#ip-mode").textContent = "Static";
+        showToast("Static IP assigned");
+        dialog.close();
+        await refreshInterfaces();
+      } catch (e) {
+        showToast("Failed: " + e, true);
+      }
+    } else if (activeMode === "dhcp-client") {
+      $("#ip-mode").textContent = "DHCP Client";
+      showToast("DHCP Client — coming soon");
       dialog.close();
-      await refreshInterfaces();
-    } catch (e) {
-      showToast("Failed: " + e, true);
+    } else if (activeMode === "dhcp-server") {
+      $("#ip-mode").textContent = "DHCP Server";
+      showToast("DHCP Server — coming soon");
+      dialog.close();
     }
   });
 }

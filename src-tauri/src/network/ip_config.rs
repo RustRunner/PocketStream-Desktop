@@ -81,7 +81,7 @@ async fn assign_linux(
     Ok(())
 }
 
-async fn run_command(program: &str, args: &[&str]) -> Result<String, AppError> {
+pub(crate) async fn run_command(program: &str, args: &[&str]) -> Result<String, AppError> {
     let output = tokio::process::Command::new(program)
         .args(args)
         .output()
@@ -90,9 +90,12 @@ async fn run_command(program: &str, args: &[&str]) -> Result<String, AppError> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let msg = if stderr.trim().is_empty() { stdout } else { stderr };
         return Err(AppError::Network(format!(
             "{} failed: {}",
-            program, stderr
+            program,
+            msg.trim()
         )));
     }
 
@@ -112,4 +115,53 @@ fn mask_to_prefix(mask: &str) -> Result<u8, AppError> {
         .map_err(|_| AppError::Network(format!("Invalid subnet mask: {}", mask)))?;
     let bits: u32 = u32::from(addr);
     Ok(bits.count_ones() as u8)
+}
+
+/// Add a secondary IP address to an interface (preserves existing IPs).
+pub async fn add_secondary_ip(interface: &str, ip: &str, mask: &str) -> Result<(), AppError> {
+    validate_ip(ip)?;
+    validate_ip(mask)?;
+
+    #[cfg(target_os = "windows")]
+    {
+        let name_arg = format!("name={}", interface);
+        run_command(
+            "netsh",
+            &["interface", "ip", "add", "address", &name_arg, ip, mask],
+        )
+        .await?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let prefix = mask_to_prefix(mask)?;
+        let cidr = format!("{}/{}", ip, prefix);
+        run_command("ip", &["addr", "add", &cidr, "dev", interface]).await?;
+    }
+
+    Ok(())
+}
+
+/// Remove a secondary IP address from an interface.
+pub async fn remove_secondary_ip(interface: &str, ip: &str) -> Result<(), AppError> {
+    validate_ip(ip)?;
+
+    #[cfg(target_os = "windows")]
+    {
+        let name_arg = format!("name={}", interface);
+        run_command(
+            "netsh",
+            &["interface", "ip", "delete", "address", &name_arg, ip],
+        )
+        .await?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Find the prefix for this IP — default to /24
+        let cidr = format!("{}/24", ip);
+        run_command("ip", &["addr", "del", &cidr, "dev", interface]).await?;
+    }
+
+    Ok(())
 }
