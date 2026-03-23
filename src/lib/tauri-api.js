@@ -73,8 +73,8 @@ export function onEvent(eventName, callback) {
 
 // ── Streaming ───────────────────────────────────────────────────────
 
-export async function startStream() {
-  return await invoke("start_stream");
+export async function startStream(windowHandle = null) {
+  return await invoke("start_stream", { windowHandle: windowHandle ? parseInt(windowHandle) : null });
 }
 
 export async function stopStream() {
@@ -98,8 +98,8 @@ export async function takeScreenshot() {
   return await invoke("take_screenshot");
 }
 
-export async function embedVideo(x, y, width, height) {
-  return await invoke("embed_video", { x, y, width, height });
+export async function createVideoWindow(x, y, width, height) {
+  return await invoke("create_video_window", { x, y, width, height });
 }
 
 export async function updateVideoPosition(x, y, width, height) {

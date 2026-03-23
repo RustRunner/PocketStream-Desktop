@@ -12,13 +12,6 @@
     <div id="app">
       <!-- Top App Bar -->
       <header class="app-bar">
-        <button id="menu-toggle" class="icon-btn" title="Settings">
-          <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
-            <path d="M3 18h18v-2H3v2zm0-5h18v-2H3v2zm0-7v2h18V6H3z"/>
-          </svg>
-        </button>
-        <h1 class="app-title">PocketStream Desktop</h1>
-        <div class="app-bar-spacer"></div>
         <div class="about-wrapper">
           <button id="about-toggle" class="icon-btn" title="About">
             <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
@@ -36,6 +29,17 @@
             <p class="about-text muted">Licensed under AGPL-3.0</p>
           </div>
         </div>
+        <div class="app-bar-spacer"></div>
+        <div class="app-bar-center">
+          <img class="app-logo" src="/src/assets/ps_icon.png" alt="PocketStream" width="30" height="30" />
+          <h1 class="app-title">PocketStream Desktop</h1>
+        </div>
+        <div class="app-bar-spacer"></div>
+        <button id="menu-toggle" class="icon-btn" title="Settings">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M3 18h18v-2H3v2zm0-5h18v-2H3v2zm0-7v2h18V6H3z"/>
+          </svg>
+        </button>
       </header>
 
       <div class="main-layout">
@@ -143,6 +147,7 @@
                 <div id="subnet-list" class="subnet-list"></div>
               </div>
               <div class="card-footer">
+                <div class="card-footer-spacer"></div>
                 <button id="btn-ip-config" class="text-btn">Configure</button>
               </div>
             </div>
@@ -195,30 +200,80 @@
                 </div>
               </div>
               <div class="card-footer">
+                <div class="card-footer-spacer"></div>
                 <button id="btn-toggle-rtsp" class="text-btn">Start Server</button>
               </div>
             </div>
 
             <!-- Video Stream Card -->
             <div class="card wide" id="card-video">
-              <div class="card-body video-container">
-                <div id="video-area" class="video-area">
-                  <p class="placeholder-text">Select a camera and start stream</p>
+              <div class="card-body video-split">
+                <!-- PTZ Controls Panel -->
+                <div class="ptz-panel">
+                  <h3 class="ptz-title">PTZ Control</h3>
+
+                  <!-- D-Pad -->
+                  <div class="ptz-dpad">
+                    <button class="ptz-btn ptz-up" data-ptz="up" title="Tilt Up">
+                      <svg width="28" height="28" viewBox="0 0 24 24" fill="currentColor"><path d="M7.41 15.41L12 10.83l4.59 4.58L18 14l-6-6-6 6z"/></svg>
+                    </button>
+                    <button class="ptz-btn ptz-left" data-ptz="left" title="Pan Left">
+                      <svg width="28" height="28" viewBox="0 0 24 24" fill="currentColor"><path d="M15.41 16.59L10.83 12l4.58-4.59L14 6l-6 6 6 6z"/></svg>
+                    </button>
+                    <button class="ptz-btn ptz-home" data-ptz="home" title="Home">
+                      <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="4"/></svg>
+                    </button>
+                    <button class="ptz-btn ptz-right" data-ptz="right" title="Pan Right">
+                      <svg width="28" height="28" viewBox="0 0 24 24" fill="currentColor"><path d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6z"/></svg>
+                    </button>
+                    <button class="ptz-btn ptz-down" data-ptz="down" title="Tilt Down">
+                      <svg width="28" height="28" viewBox="0 0 24 24" fill="currentColor"><path d="M7.41 8.59L12 13.17l4.59-4.58L18 10l-6 6-6-6z"/></svg>
+                    </button>
+                  </div>
+
+                  <!-- Zoom -->
+                  <div class="ptz-zoom">
+                    <button class="ptz-btn ptz-zoom-btn" data-ptz="zoom-in" title="Zoom In">
+                      <svg width="26" height="26" viewBox="0 0 24 24" fill="currentColor"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0016 9.5 6.5 6.5 0 109.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14zM12 10h-2v2H9v-2H7V9h2V7h1v2h2v1z"/></svg>
+                    </button>
+                    <button class="ptz-btn ptz-zoom-btn" data-ptz="zoom-out" title="Zoom Out">
+                      <svg width="26" height="26" viewBox="0 0 24 24" fill="currentColor"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0016 9.5 6.5 6.5 0 109.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14zM7 9h5v1H7z"/></svg>
+                    </button>
+                  </div>
+
+                  <!-- Presets -->
+                  <div class="ptz-presets">
+                    <span class="ptz-presets-label">Presets</span>
+                    <div class="ptz-preset-grid">
+                      <button class="ptz-preset-btn" data-preset="1">1</button>
+                      <button class="ptz-preset-btn" data-preset="2">2</button>
+                      <button class="ptz-preset-btn" data-preset="3">3</button>
+                      <button class="ptz-preset-btn" data-preset="4">4</button>
+                    </div>
+                  </div>
                 </div>
-                <div class="video-controls">
-                  <button id="btn-toggle-stream" class="filled-btn">Start Stream</button>
-                  <div class="video-controls-spacer"></div>
-                  <button id="btn-screenshot" class="icon-btn" title="Screenshot" disabled>
-                    <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
-                      <circle cx="12" cy="12" r="3.2"/>
-                      <path d="M9 2L7.17 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2h-3.17L15 2H9zm3 15c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5z"/>
-                    </svg>
-                  </button>
-                  <button id="btn-record" class="icon-btn" title="Record" disabled>
-                    <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
-                      <circle cx="12" cy="12" r="8"/>
-                    </svg>
-                  </button>
+
+                <!-- Video + Controls -->
+                <div class="video-container">
+                  <div id="video-area" class="video-area">
+                    <p class="placeholder-text">Select a camera and start stream</p>
+                  </div>
+                  <div class="video-controls">
+                    <div class="video-controls-spacer"></div>
+                    <button id="btn-screenshot" class="icon-btn" title="Screenshot" disabled>
+                      <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
+                        <circle cx="12" cy="12" r="3.2"/>
+                        <path d="M9 2L7.17 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2h-3.17L15 2H9zm3 15c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5z"/>
+                      </svg>
+                    </button>
+                    <button id="btn-record" class="icon-btn" title="Record" disabled>
+                      <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
+                        <circle cx="12" cy="12" r="8"/>
+                      </svg>
+                    </button>
+                    <div class="video-controls-spacer"></div>
+                    <button id="btn-toggle-stream" class="filled-btn">Start Stream</button>
+                  </div>
                 </div>
               </div>
             </div>

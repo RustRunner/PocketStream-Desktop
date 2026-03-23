@@ -37,6 +37,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   setupCameraIpDropdown();
 
   setupRefreshButton();
+  setupPtzControls();
 
   await loadConfig();
   await refreshInterfaces();
@@ -119,7 +120,21 @@ function setupSettingsSave() {
 function setupMenuAndAbout() {
   // Hamburger toggles settings sidebar
   $("#menu-toggle").addEventListener("click", () => {
-    $("#sidebar").classList.toggle("collapsed");
+    const sidebar = $("#sidebar");
+    sidebar.classList.toggle("collapsed");
+
+    // Reposition video after sidebar animation completes
+    if (isStreaming) {
+      // Hide during animation to prevent overlap
+      api.setVideoVisible(false);
+      setTimeout(async () => {
+        try {
+          const bounds = getVideoAreaBounds();
+          await api.updateVideoPosition(bounds.x, bounds.y, bounds.width, bounds.height);
+          await api.setVideoVisible(true);
+        } catch (_) {}
+      }, 250);
+    }
   });
 
   // About icon toggles about panel
@@ -625,13 +640,20 @@ function setupStreamControls() {
       }
     } else {
       try {
-        await api.startStream();
+        // Ensure current camera IP is saved to backend before starting
+        if (config) {
+          config.stream.camera_ip = $("#camera-ip").value || config.stream.camera_ip;
+          await api.saveConfig(config);
+        }
+        // Create a child window for GStreamer to render into
+        const bounds = getVideoAreaBounds();
+        const handle = await api.createVideoWindow(bounds.x, bounds.y, bounds.width, bounds.height);
+        // Start stream with the window handle — GStreamer renders directly into it
+        await api.startStream(handle);
         isStreaming = true;
         updateStreamUI();
         startStatusPolling();
         showToast("Stream started");
-        // Wait for GStreamer to create its window, then embed it
-        await tryEmbedVideo();
       } catch (e) {
         showToast("Stream failed: " + e, true);
       }
@@ -679,23 +701,6 @@ function updateStreamUI() {
   }
 }
 
-/** Try to embed the GStreamer video window into the video-area with retries. */
-async function tryEmbedVideo(retries = 8, delayMs = 500) {
-  for (let i = 0; i < retries; i++) {
-    await new Promise((r) => setTimeout(r, delayMs));
-    if (!isStreaming) return; // user stopped before embed
-    try {
-      const bounds = getVideoAreaBounds();
-      await api.embedVideo(bounds.x, bounds.y, bounds.width, bounds.height);
-      log("Video embedded successfully");
-      return;
-    } catch (e) {
-      log(`Embed attempt ${i + 1}/${retries}: ${e}`);
-    }
-  }
-  log("Could not embed video — it may remain in a separate window");
-}
-
 /** Get the video-area bounds in physical pixels relative to the window client area. */
 function getVideoAreaBounds() {
   const el = $("#video-area");
@@ -725,6 +730,87 @@ window.addEventListener("resize", () => {
     } catch (_) {}
   }, 50);
 });
+
+// ── PTZ Controls ─────────────────────────────────────────────────────
+
+function setupPtzControls() {
+  const ptzActions = {
+    up:         () => api.ptzMove(getCameraUrl(), 0, 0.5, 0),
+    down:       () => api.ptzMove(getCameraUrl(), 0, -0.5, 0),
+    left:       () => api.ptzMove(getCameraUrl(), -0.5, 0, 0),
+    right:      () => api.ptzMove(getCameraUrl(), 0.5, 0, 0),
+    home:       () => api.ptzGotoPreset(getCameraUrl(), 1),
+    "zoom-in":  () => api.ptzMove(getCameraUrl(), 0, 0, 0.5),
+    "zoom-out": () => api.ptzMove(getCameraUrl(), 0, 0, -0.5),
+  };
+
+  // D-pad and zoom buttons — hold to move, release to stop
+  document.querySelectorAll(".ptz-btn[data-ptz]").forEach((btn) => {
+    const action = btn.dataset.ptz;
+    if (action === "home") {
+      btn.addEventListener("click", () => {
+        if (!getCameraUrl()) return;
+        ptzActions.home().catch((e) => log(`PTZ home: ${e}`));
+      });
+      return;
+    }
+
+    const startMove = () => {
+      if (!getCameraUrl()) return;
+      const fn = ptzActions[action];
+      if (fn) fn().catch((e) => log(`PTZ ${action}: ${e}`));
+    };
+    const stopMove = () => {
+      if (!getCameraUrl()) return;
+      api.ptzStop(getCameraUrl()).catch(() => {});
+    };
+
+    btn.addEventListener("mousedown", startMove);
+    btn.addEventListener("mouseup", stopMove);
+    btn.addEventListener("mouseleave", stopMove);
+  });
+
+  // Preset buttons — click to go, long-press to save
+  document.querySelectorAll(".ptz-preset-btn[data-preset]").forEach((btn) => {
+    let pressTimer = null;
+    const preset = parseInt(btn.dataset.preset);
+
+    btn.addEventListener("mousedown", () => {
+      pressTimer = setTimeout(() => {
+        pressTimer = null;
+        if (!getCameraUrl()) return;
+        api.ptzSetPreset(getCameraUrl(), preset, `Preset ${preset}`)
+          .then(() => showToast(`Preset ${preset} saved`))
+          .catch((e) => showToast(`Failed: ${e}`, true));
+      }, 800);
+    });
+
+    btn.addEventListener("mouseup", () => {
+      if (pressTimer) {
+        clearTimeout(pressTimer);
+        pressTimer = null;
+        if (!getCameraUrl()) return;
+        api.ptzGotoPreset(getCameraUrl(), preset)
+          .catch((e) => log(`PTZ preset ${preset}: ${e}`));
+      }
+    });
+
+    btn.addEventListener("mouseleave", () => {
+      if (pressTimer) {
+        clearTimeout(pressTimer);
+        pressTimer = null;
+      }
+    });
+  });
+}
+
+function getCameraUrl() {
+  const ip = $("#camera-ip").value;
+  if (!ip || !config) return null;
+  const port = config.stream.rtsp_port || 554;
+  const path = config.stream.rtsp_path || "/live";
+  return `rtsp://${ip}:${port}${path}`;
+}
 
 // ── RTSP Server Controls ────────────────────────────────────────────
 

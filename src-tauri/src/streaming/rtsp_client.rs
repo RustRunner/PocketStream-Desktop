@@ -1,13 +1,15 @@
 //! RTSP/UDP playback pipeline via GStreamer.
 //!
 //! Builds a pipeline with a `tee` so the decoded stream can be:
-//! 1. Displayed via autovideosink (own window)
+//! 1. Displayed via d3d11videosink into a provided window handle
 //! 2. Optionally recorded to MP4
 //! 3. Snapshot-captured via an appsink
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
+
+use gstreamer_video::prelude::VideoOverlayExtManual;
 
 use crate::error::AppError;
 
@@ -19,7 +21,13 @@ pub struct PlaybackPipeline {
 
 impl PlaybackPipeline {
     /// Create a playback pipeline for an RTSP source.
-    pub fn new_rtsp(url: &str, latency_ms: u32, use_tcp: bool) -> Result<Self, AppError> {
+    /// `window_handle`: if Some, render into that HWND via VideoOverlay.
+    pub fn new_rtsp(
+        url: &str,
+        latency_ms: u32,
+        use_tcp: bool,
+        window_handle: Option<usize>,
+    ) -> Result<Self, AppError> {
         gst::init().map_err(|e| AppError::Stream(e.to_string()))?;
 
         let protocols = if use_tcp { "tcp" } else { "udp+tcp" };
@@ -29,7 +37,7 @@ impl PlaybackPipeline {
                 "rtspsrc location={url} latency={latency} protocols={proto} ",
                 "! decodebin name=dec ",
                 "dec. ! videoconvert ! tee name=t ",
-                "t. ! queue leaky=downstream max-size-buffers=2 ! autovideosink sync=false ",
+                "t. ! queue leaky=downstream max-size-buffers=2 ! autovideosink name=videosink sync=false ",
                 "t. ! queue leaky=downstream max-size-buffers=1 ",
                 "! videoconvert ! videoscale ",
                 "! video/x-raw,format=RGB ",
@@ -40,11 +48,11 @@ impl PlaybackPipeline {
             proto = protocols,
         );
 
-        Self::from_pipeline_str(&pipeline_str)
+        Self::from_pipeline_str(&pipeline_str, window_handle)
     }
 
     /// Create a playback pipeline for a UDP source.
-    pub fn new_udp(port: u16) -> Result<Self, AppError> {
+    pub fn new_udp(port: u16, window_handle: Option<usize>) -> Result<Self, AppError> {
         gst::init().map_err(|e| AppError::Stream(e.to_string()))?;
 
         let pipeline_str = format!(
@@ -52,7 +60,7 @@ impl PlaybackPipeline {
                 "udpsrc port={port} ",
                 "! tsdemux name=demux ",
                 "demux. ! h264parse ! decodebin ! videoconvert ! tee name=t ",
-                "t. ! queue leaky=downstream max-size-buffers=2 ! autovideosink sync=false ",
+                "t. ! queue leaky=downstream max-size-buffers=2 ! autovideosink name=videosink sync=false ",
                 "t. ! queue leaky=downstream max-size-buffers=1 ",
                 "! videoconvert ! videoscale ",
                 "! video/x-raw,format=RGB ",
@@ -61,14 +69,49 @@ impl PlaybackPipeline {
             port = port,
         );
 
-        Self::from_pipeline_str(&pipeline_str)
+        Self::from_pipeline_str(&pipeline_str, window_handle)
     }
 
-    fn from_pipeline_str(pipeline_str: &str) -> Result<Self, AppError> {
+    fn from_pipeline_str(
+        pipeline_str: &str,
+        window_handle: Option<usize>,
+    ) -> Result<Self, AppError> {
         let pipeline = gst::parse::launch(pipeline_str)
             .map_err(|e| AppError::Stream(format!("Pipeline parse error: {}", e)))?
             .downcast::<gst::Pipeline>()
             .map_err(|_| AppError::Stream("Failed to cast to Pipeline".into()))?;
+
+        // If a window handle is provided, intercept the "prepare-window-handle"
+        // bus message so GStreamer renders into our child HWND instead of
+        // creating its own top-level window.
+        if let Some(handle) = window_handle {
+            let bus = pipeline.bus().ok_or_else(|| {
+                AppError::Stream("Pipeline has no bus".into())
+            })?;
+
+            bus.set_sync_handler(move |_, msg| {
+                if msg.structure().is_some_and(|s| s.name() == "prepare-window-handle") {
+                    if let Some(overlay) = msg
+                        .src()
+                        .and_then(|src| {
+                            src.dynamic_cast_ref::<gstreamer_video::VideoOverlay>()
+                        })
+                    {
+                        unsafe {
+                            overlay.set_window_handle(handle);
+                        }
+                        log::info!(
+                            "VideoOverlay: set window handle 0x{:X} on {}",
+                            handle,
+                            msg.src().map(|s| s.name().to_string()).unwrap_or_default()
+                        );
+                    }
+                }
+                gst::BusSyncReply::Pass
+            });
+
+            log::info!("Bus sync handler installed for window handle 0x{:X}", handle);
+        }
 
         let appsink = pipeline
             .by_name("snap")

@@ -84,7 +84,7 @@ pub fn run() {
             commands::start_recording,
             commands::stop_recording,
             // Video Embed
-            commands::embed_video,
+            commands::create_video_window,
             commands::update_video_position,
             commands::set_video_visible,
             // Camera / PTZ

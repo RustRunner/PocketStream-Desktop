@@ -18,6 +18,7 @@
   background: var(--md-surface);
   border-bottom: 1px solid var(--md-surface-variant);
   flex-shrink: 0;
+  position: relative;
   -webkit-app-region: drag;
 }
 
@@ -25,12 +26,29 @@
   -webkit-app-region: no-drag;
 }
 
+.app-bar-center {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  pointer-events: none;
+  overflow: visible;
+}
+
+.app-logo {
+  flex-shrink: 0;
+  overflow: visible;
+  display: block;
+}
+
 .app-title {
   font-size: 18px;
   font-weight: 500;
-  margin-left: 12px;
-  color: var(--md-primary-light);
+  color: rgba(255, 255, 255, 0.87);
   letter-spacing: 0.5px;
+  white-space: nowrap;
 }
 
 .app-bar-spacer {
@@ -48,7 +66,7 @@
   display: none;
   position: absolute;
   top: 100%;
-  right: 0;
+  left: 0;
   margin-top: 8px;
   background: var(--md-surface-container);
   border: 1px solid var(--md-surface-variant);

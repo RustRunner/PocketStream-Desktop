@@ -33,7 +33,7 @@ struct StreamState {
     recording: bool,
     recording_path: Option<String>,
     start_time: Option<std::time::Instant>,
-    embedded_hwnd: Option<isize>,
+    video_child_hwnd: Option<isize>,
 }
 
 impl StreamManager {
@@ -45,7 +45,7 @@ impl StreamManager {
                 recording: false,
                 recording_path: None,
                 start_time: None,
-                embedded_hwnd: None,
+                video_child_hwnd: None,
             })),
         }
     }
@@ -74,7 +74,11 @@ impl StreamManager {
         }
     }
 
-    pub async fn start_playback(&self, settings: &AppSettings) -> Result<(), AppError> {
+    pub async fn start_playback(
+        &self,
+        settings: &AppSettings,
+        window_handle: Option<usize>,
+    ) -> Result<(), AppError> {
         let mut state = self.state.lock().await;
 
         // Stop existing playback if any
@@ -85,12 +89,12 @@ impl StreamManager {
         let pipeline = match settings.stream.protocol.as_str() {
             "udp" => {
                 log::info!("Starting UDP playback on port {}", settings.stream.udp_port);
-                PlaybackPipeline::new_udp(settings.stream.udp_port)?
+                PlaybackPipeline::new_udp(settings.stream.udp_port, window_handle)?
             }
             _ => {
                 let url = Self::build_input_url(settings);
                 log::info!("Starting RTSP playback from: {}", url);
-                PlaybackPipeline::new_rtsp(&url, 200, true)?
+                PlaybackPipeline::new_rtsp(&url, 200, true, window_handle)?
             }
         };
 
@@ -118,7 +122,11 @@ impl StreamManager {
         }
         state.playback = None;
         state.start_time = None;
-        state.embedded_hwnd = None;
+
+        // Destroy the video child window
+        if let Some(hwnd) = state.video_child_hwnd.take() {
+            video_embed::destroy_video_child(hwnd);
+        }
 
         Ok(())
     }
@@ -253,14 +261,14 @@ impl StreamManager {
         Ok(path)
     }
 
-    pub async fn set_embedded_hwnd(&self, hwnd: isize) {
+    pub async fn set_video_child_hwnd(&self, hwnd: isize) {
         let mut state = self.state.lock().await;
-        state.embedded_hwnd = Some(hwnd);
+        state.video_child_hwnd = Some(hwnd);
     }
 
-    pub async fn get_embedded_hwnd(&self) -> Option<isize> {
+    pub async fn get_video_child_hwnd(&self) -> Option<isize> {
         let state = self.state.lock().await;
-        state.embedded_hwnd
+        state.video_child_hwnd
     }
 }
 

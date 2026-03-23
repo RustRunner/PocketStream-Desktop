@@ -103,9 +103,10 @@ pub async fn remove_adopted_subnet(
 pub async fn start_stream(
     stream: State<'_, StreamManager>,
     config: State<'_, AppConfig>,
+    window_handle: Option<usize>,
 ) -> Result<(), AppError> {
     let settings = config.get();
-    stream.start_playback(&settings).await
+    stream.start_playback(&settings, window_handle).await
 }
 
 #[tauri::command]
@@ -151,26 +152,45 @@ pub async fn stop_recording(stream: State<'_, StreamManager>) -> Result<String, 
 
 // ── Video Embed Commands ─────────────────────────────────────────────
 
+/// Create a child window for GStreamer to render into.
+/// Returns the child HWND as a number so the frontend can pass it to start_stream.
+/// The child window is created on the main UI thread so it gets proper message processing.
 #[tauri::command]
-pub async fn embed_video(
+pub async fn create_video_window(
     window: tauri::WebviewWindow,
     stream: State<'_, StreamManager>,
     x: i32,
     y: i32,
     width: i32,
     height: i32,
-) -> Result<(), AppError> {
-    let _ = &window; // used below on windows
+) -> Result<String, AppError> {
+    let _ = &window;
 
     #[cfg(windows)]
     {
+        use tauri::Manager;
+
         let hwnd = window
             .hwnd()
             .map_err(|e| AppError::Stream(format!("Failed to get window handle: {}", e)))?;
         let parent = hwnd.0 as isize;
-        let gst_hwnd =
-            crate::streaming::video_embed::embed(parent, x, y, width, height)?;
-        stream.set_embedded_hwnd(gst_hwnd).await;
+
+        // Create the child window on the main thread so it gets messages processed
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let app = window.app_handle().clone();
+        app.run_on_main_thread(move || {
+            let result =
+                crate::streaming::video_embed::create_video_child(parent, x, y, width, height);
+            let _ = tx.send(result);
+        })
+        .map_err(|e| AppError::Stream(format!("Failed to run on main thread: {}", e)))?;
+
+        let child = rx
+            .await
+            .map_err(|_| AppError::Stream("Main thread channel closed".into()))??;
+
+        stream.set_video_child_hwnd(child).await;
+        return Ok(child.to_string());
     }
 
     #[cfg(not(windows))]
@@ -178,9 +198,6 @@ pub async fn embed_video(
         let _ = (stream, x, y, width, height);
         return Err(AppError::Stream("Video embedding only supported on Windows".into()));
     }
-
-    #[allow(unreachable_code)]
-    Ok(())
 }
 
 #[tauri::command]
@@ -191,7 +208,7 @@ pub async fn update_video_position(
     width: i32,
     height: i32,
 ) -> Result<(), AppError> {
-    if let Some(hwnd) = stream.get_embedded_hwnd().await {
+    if let Some(hwnd) = stream.get_video_child_hwnd().await {
         crate::streaming::video_embed::reposition(hwnd, x, y, width, height)?;
     }
     Ok(())
@@ -202,7 +219,7 @@ pub async fn set_video_visible(
     stream: State<'_, StreamManager>,
     visible: bool,
 ) -> Result<(), AppError> {
-    if let Some(hwnd) = stream.get_embedded_hwnd().await {
+    if let Some(hwnd) = stream.get_video_child_hwnd().await {
         crate::streaming::video_embed::set_visible(hwnd, visible)?;
     }
     Ok(())
