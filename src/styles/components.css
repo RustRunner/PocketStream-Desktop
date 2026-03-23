@@ -772,7 +772,7 @@
   font-family: var(--md-font-mono);
   font-weight: 500;
   cursor: pointer;
-  min-width: 160px;
+  min-width: 144px;
 }
 
 .status-select:focus {

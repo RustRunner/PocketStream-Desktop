@@ -567,6 +567,14 @@ function updateCameraIpDropdown(filteredSubnets) {
   if (currentVal) {
     select.value = currentVal;
   }
+
+  // Update PTU dropdown with the same options
+  const ptuSelect = $("#ptu-ip");
+  const ptuVal = ptuSelect.value;
+  ptuSelect.innerHTML = options;
+  if (ptuVal) {
+    ptuSelect.value = ptuVal;
+  }
 }
 
 function setupCameraIpDropdown() {
@@ -574,6 +582,12 @@ function setupCameraIpDropdown() {
     selectedDevice = e.target.value || null;
     if (config && selectedDevice) {
       config.stream.camera_ip = selectedDevice;
+    }
+  });
+
+  $("#ptu-ip").addEventListener("change", (e) => {
+    if (config) {
+      config.stream.ptu_ip = e.target.value || "";
     }
   });
 }
