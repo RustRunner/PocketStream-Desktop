@@ -87,6 +87,8 @@ pub fn run() {
             commands::create_video_window,
             commands::update_video_position,
             commands::set_video_visible,
+            // FLIR PTU
+            commands::ptu_send,
             // Camera / PTZ
             commands::discover_onvif,
             commands::ptz_move,

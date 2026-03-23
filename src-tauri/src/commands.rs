@@ -225,6 +225,14 @@ pub async fn set_video_visible(
     Ok(())
 }
 
+// ── FLIR PTU Commands ────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn ptu_send(ip: String, cmd: String) -> Result<std::collections::HashMap<String, String>, AppError> {
+    let base_url = format!("http://{}", ip);
+    crate::camera::flir_ptu::send_command(&base_url, &cmd).await
+}
+
 // ── Camera / PTZ Commands ────────────────────────────────────────────
 
 #[tauri::command]

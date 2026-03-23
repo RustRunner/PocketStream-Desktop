@@ -1,3 +1,4 @@
+pub mod flir_ptu;
 pub mod onvif;
 pub mod ptz;
 

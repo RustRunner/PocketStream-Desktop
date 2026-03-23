@@ -354,6 +354,8 @@ async function scanDevicePorts(ip) {
     }
   } catch (e) {
     log(`Port scan failed for ${ip}: ${e}`);
+    // Allow retry on failure (subnet may not be adopted yet)
+    scannedIps.delete(ip);
   }
 
   pendingScans--;
@@ -747,36 +749,102 @@ window.addEventListener("resize", () => {
 
 // ── PTZ Controls ─────────────────────────────────────────────────────
 
+// ── FLIR PTU State ───────────────────────────────────────────────────
+
+let ptuSpeedBig = 100;   // populated from PTU on connect
+let ptuSpeedSmall = 10;
+const ptuPresets = new Map(); // preset# -> { pan, tilt }
+
+function getPtuIp() {
+  return $("#ptu-ip").value || null;
+}
+
+async function ptuCmd(cmd) {
+  const ip = getPtuIp();
+  if (!ip) return null;
+  return api.ptuSend(ip, cmd);
+}
+
+/** Poll PTU position until motion completes, then switch back to speed mode. */
+async function waitForPtuHome(maxTries = 40) {
+  let lastPan = null, lastTilt = null;
+  for (let i = 0; i < maxTries; i++) {
+    await new Promise((r) => setTimeout(r, 250));
+    try {
+      const data = await ptuCmd("PP&TP");
+      if (!data) break;
+      const pan = data.PP;
+      const tilt = data.TP;
+      // Position stopped changing — motion complete
+      if (pan === lastPan && tilt === lastTilt) break;
+      lastPan = pan;
+      lastTilt = tilt;
+    } catch (_) {
+      break;
+    }
+  }
+  // Switch back to speed mode
+  await ptuCmd("C=V").catch(() => {});
+  log("PTU: back to speed mode");
+}
+
 function setupPtzControls() {
-  const ptzActions = {
-    up:         () => api.ptzMove(getCameraUrl(), 0, 0.5, 0),
-    down:       () => api.ptzMove(getCameraUrl(), 0, -0.5, 0),
-    left:       () => api.ptzMove(getCameraUrl(), -0.5, 0, 0),
-    right:      () => api.ptzMove(getCameraUrl(), 0.5, 0, 0),
-    home:       () => api.ptzGotoPreset(getCameraUrl(), 1),
-    "zoom-in":  () => api.ptzMove(getCameraUrl(), 0, 0, 0.5),
-    "zoom-out": () => api.ptzMove(getCameraUrl(), 0, 0, -0.5),
+  // Query PTU speed limits when PTU IP is selected
+  $("#ptu-ip").addEventListener("change", async () => {
+    if (!getPtuIp()) return;
+    try {
+      const data = await ptuCmd("PU&TU&PL&TL");
+      if (data) {
+        const panUpper = parseInt(data.PU) || 100;
+        const tiltUpper = parseInt(data.TU) || 100;
+        ptuSpeedBig = Math.min(panUpper, tiltUpper);
+        ptuSpeedSmall = Math.max(Math.round(ptuSpeedBig / 10), parseInt(data.PL) || 1);
+        log(`PTU limits: big=${ptuSpeedBig} small=${ptuSpeedSmall}`);
+        // Set to speed mode
+        await ptuCmd("C=V");
+      }
+    } catch (e) {
+      log(`PTU init failed: ${e}`);
+    }
+  });
+
+  // D-pad buttons — hold to move at speed, release to stop
+  const speedCmds = {
+    up:         () => `TS=${ptuSpeedBig}`,
+    down:       () => `TS=${-ptuSpeedBig}`,
+    left:       () => `PS=${ptuSpeedBig}`,
+    right:      () => `PS=${-ptuSpeedBig}`,
+    "zoom-in":  () => `TS=${ptuSpeedSmall}`,
+    "zoom-out": () => `TS=${-ptuSpeedSmall}`,
   };
 
-  // D-pad and zoom buttons — hold to move, release to stop
   document.querySelectorAll(".ptz-btn[data-ptz]").forEach((btn) => {
     const action = btn.dataset.ptz;
+
     if (action === "home") {
-      btn.addEventListener("click", () => {
-        if (!getCameraUrl()) return;
-        ptzActions.home().catch((e) => log(`PTZ home: ${e}`));
+      btn.addEventListener("click", async () => {
+        if (!getPtuIp()) return;
+        try {
+          // Switch to position mode, go to 0,0 at max speed
+          await ptuCmd(`C=I&PS=${ptuSpeedBig}&TS=${ptuSpeedBig}&PP=0&TP=0`);
+          showToast("PTU homing");
+          // Poll until motion completes, then switch back to speed mode
+          await waitForPtuHome();
+        } catch (e) {
+          log(`PTU home: ${e}`);
+        }
       });
       return;
     }
 
     const startMove = () => {
-      if (!getCameraUrl()) return;
-      const fn = ptzActions[action];
-      if (fn) fn().catch((e) => log(`PTZ ${action}: ${e}`));
+      if (!getPtuIp()) return;
+      const cmdFn = speedCmds[action];
+      if (cmdFn) ptuCmd(cmdFn()).catch((e) => log(`PTU ${action}: ${e}`));
     };
     const stopMove = () => {
-      if (!getCameraUrl()) return;
-      api.ptzStop(getCameraUrl()).catch(() => {});
+      if (!getPtuIp()) return;
+      ptuCmd("PS=0&TS=0").catch(() => {});
     };
 
     btn.addEventListener("mousedown", startMove);
@@ -784,28 +852,45 @@ function setupPtzControls() {
     btn.addEventListener("mouseleave", stopMove);
   });
 
-  // Preset buttons — click to go, long-press to save
+  // Preset buttons — click to recall, long-press to save current position
   document.querySelectorAll(".ptz-preset-btn[data-preset]").forEach((btn) => {
     let pressTimer = null;
     const preset = parseInt(btn.dataset.preset);
 
     btn.addEventListener("mousedown", () => {
-      pressTimer = setTimeout(() => {
+      pressTimer = setTimeout(async () => {
         pressTimer = null;
-        if (!getCameraUrl()) return;
-        api.ptzSetPreset(getCameraUrl(), preset, `Preset ${preset}`)
-          .then(() => showToast(`Preset ${preset} saved`))
-          .catch((e) => showToast(`Failed: ${e}`, true));
+        if (!getPtuIp()) return;
+        try {
+          // Save current position as preset
+          const data = await ptuCmd("PP&TP");
+          if (data) {
+            ptuPresets.set(preset, { pan: data.PP, tilt: data.TP });
+            showToast(`Preset ${preset} saved (P:${data.PP} T:${data.TP})`);
+          }
+        } catch (e) {
+          showToast(`Failed: ${e}`, true);
+        }
       }, 800);
     });
 
-    btn.addEventListener("mouseup", () => {
+    btn.addEventListener("mouseup", async () => {
       if (pressTimer) {
         clearTimeout(pressTimer);
         pressTimer = null;
-        if (!getCameraUrl()) return;
-        api.ptzGotoPreset(getCameraUrl(), preset)
-          .catch((e) => log(`PTZ preset ${preset}: ${e}`));
+        if (!getPtuIp()) return;
+        const saved = ptuPresets.get(preset);
+        if (saved) {
+          try {
+            await ptuCmd(`C=I&PS=${ptuSpeedBig}&TS=${ptuSpeedBig}&PP=${saved.pan}&TP=${saved.tilt}`);
+            // Wait for motion to complete, then back to speed mode
+            waitForPtuHome().catch(() => {});
+          } catch (e) {
+            log(`PTU preset ${preset}: ${e}`);
+          }
+        } else {
+          showToast(`Preset ${preset} not saved yet`, true);
+        }
       }
     });
 
@@ -816,14 +901,6 @@ function setupPtzControls() {
       }
     });
   });
-}
-
-function getCameraUrl() {
-  const ip = $("#camera-ip").value;
-  if (!ip || !config) return null;
-  const port = config.stream.rtsp_port || 554;
-  const path = config.stream.rtsp_path || "/live";
-  return `rtsp://${ip}:${port}${path}`;
 }
 
 // ── RTSP Server Controls ────────────────────────────────────────────

@@ -118,6 +118,12 @@ export async function stopRecording() {
   return await invoke("stop_recording");
 }
 
+// ── FLIR PTU ────────────────────────────────────────────────────────
+
+export async function ptuSend(ip, cmd) {
+  return await invoke("ptu_send", { ip, cmd });
+}
+
 // ── Camera / PTZ ────────────────────────────────────────────────────
 
 export async function discoverOnvif(subnet = null) {
