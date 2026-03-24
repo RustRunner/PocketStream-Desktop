@@ -147,20 +147,24 @@ export function setupIpConfigDialog() {
   const dialog = $("#ip-config-dialog");
   let activeMode = "static";
 
-  // Open dialog
+  // Open dialog — show immediately, populate interfaces async
   $("#btn-ip-config").addEventListener("click", async () => {
-    try {
-      const interfaces = await api.listInterfaces();
-      const select = $("#static-iface");
-      select.innerHTML = (interfaces || [])
-        .filter((i) => i.is_ethernet)
-        .map((i) => `<option value="${i.name}">${i.display_name || i.name} (${i.ip || "no IP"})</option>`)
-        .join("");
-    } catch (_) {}
+    const select = $("#static-iface");
+    select.innerHTML = '<option value="">Loading interfaces…</option>';
 
     api.setVideoVisible(false);
     dialog.showModal();
     dialog.addEventListener("close", () => api.setVideoVisible(true), { once: true });
+
+    try {
+      const interfaces = await api.listInterfaces();
+      select.innerHTML = (interfaces || [])
+        .filter((i) => i.is_ethernet)
+        .map((i) => `<option value="${i.name}">${i.display_name || i.name} (${i.ip || "no IP"})</option>`)
+        .join("");
+    } catch (_) {
+      select.innerHTML = '<option value="">Failed to load interfaces</option>';
+    }
   });
 
   // Mode toggle within dialog
