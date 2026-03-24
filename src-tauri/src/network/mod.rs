@@ -79,24 +79,39 @@ impl NetworkManager {
         let app_handle_for_adopt = app_handle.clone();
 
         // Get current IPs so auto-adopt knows which subnets are "known"
+        // and so the pcap listener can match the correct capture device.
         let iface_info = interface::get_by_name(interface_display_name)?;
         let known_ips: Vec<String> = iface_info.ips.iter().map(|ip| ip.address.clone()).collect();
+        let ethernet_ips: Vec<Ipv4Addr> = known_ips
+            .iter()
+            .filter_map(|ip| ip.parse().ok())
+            .collect();
         log::info!(
             "Starting ARP discovery on '{}' (IPs: {:?})",
             interface_display_name,
             known_ips
         );
 
-        let handle = arp::start_listener(devices.clone(), app_handle)?;
+        let handle = arp::start_listener(devices.clone(), app_handle, ethernet_ips)?;
         *self.arp_listener_handle.lock().await = Some(handle);
 
-        // Ping sweep known subnets to provoke ARP traffic so pcap sees all devices
+        // Ping sweep known subnets to provoke ARP traffic so pcap sees all devices,
+        // then read the OS ARP table to catch cached entries that didn't generate
+        // new ARP packets on the wire.
         let sweep_ips = known_ips.clone();
+        let sweep_devices = self.arp_devices.clone();
+        let sweep_app_handle = app_handle_for_adopt.clone();
+        let sweep_iface_ip = sweep_ips.first().cloned().unwrap_or_default();
         tokio::spawn(async move {
             // Small delay to let pcap listener start first
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             log::info!("Ping sweeping known subnets to populate ARP");
             ping_sweep_subnets(&sweep_ips).await;
+
+            // Read OS ARP table scoped to the Ethernet interface only
+            if !sweep_iface_ip.is_empty() {
+                merge_arp_table(sweep_devices, sweep_app_handle, &sweep_iface_ip).await;
+            }
         });
 
         // Auto-adopt handler for foreign subnets
@@ -268,4 +283,46 @@ async fn ping_sweep_subnets(interface_ips: &[String]) {
 
     while join_set.join_next().await.is_some() {}
     log::info!("Ping sweep complete");
+}
+
+/// Read the OS ARP table and merge entries into the discovered devices map.
+/// This catches hosts whose ARP entries were already cached in the OS
+/// (e.g. from a prior browser visit), since the ping sweep won't generate
+/// new ARP packets on the wire for those hosts.
+async fn merge_arp_table(
+    devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
+    app_handle: tauri::AppHandle,
+    interface_ip: &str,
+) {
+    use tauri::Emitter;
+
+    let entries = arp::read_system_arp_table(interface_ip).await;
+    let mut added = 0u32;
+
+    let mut map = devices.lock().await;
+    let now = chrono::Utc::now().to_rfc3339();
+
+    for (ip, mac) in entries {
+        if map.contains_key(&mac) {
+            continue;
+        }
+
+        let octets = ip.octets();
+        let device = ArpDevice {
+            mac: mac.clone(),
+            ip: ip.to_string(),
+            subnet: format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]),
+            first_seen: now.clone(),
+            last_seen: now.clone(),
+        };
+
+        log::info!("ARP table: {} ({})", device.ip, device.mac);
+        let _ = app_handle.emit("arp-device-discovered", &device);
+        map.insert(mac, device);
+        added += 1;
+    }
+
+    if added > 0 {
+        log::info!("Merged {} devices from OS ARP table", added);
+    }
 }

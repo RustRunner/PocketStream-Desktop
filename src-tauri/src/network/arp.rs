@@ -27,15 +27,22 @@ impl ArpListenerHandle {
     }
 }
 
-/// Start raw pcap ARP listener on the Ethernet interface.
+/// Start raw pcap ARP listener on the specified Ethernet interface.
 /// Discovers all devices on the wire — both known and foreign subnets.
+///
+/// `ethernet_ips` — IPv4 addresses assigned to the target Ethernet adapter.
+/// Used to match the correct pcap capture device (avoids picking WiFi).
 pub fn start_listener(
     devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
     app_handle: tauri::AppHandle,
+    ethernet_ips: Vec<Ipv4Addr>,
 ) -> Result<ArpListenerHandle, AppError> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    log::info!("Starting pcap ARP listener");
+    log::info!(
+        "Starting pcap ARP listener (target IPs: {:?})",
+        ethernet_ips
+    );
 
     tokio::task::spawn_blocking(move || {
         let pcap_devices = match pcap::Device::list() {
@@ -48,22 +55,19 @@ pub fn start_listener(
 
         log::info!("pcap: found {} capture devices", pcap_devices.len());
 
-        // Find the Ethernet adapter by matching IPs
-        let our_ips: Vec<std::net::IpAddr> = match crate::network::interface::list_physical() {
-            Ok(ifaces) => ifaces
-                .iter()
-                .filter(|i| i.is_ethernet && i.is_up)
-                .flat_map(|i| {
-                    i.ips
-                        .iter()
-                        .filter_map(|ip| ip.address.parse::<std::net::IpAddr>().ok())
-                })
-                .collect(),
-            Err(_) => vec![],
-        };
+        // Log all pcap devices for diagnostics
+        for d in &pcap_devices {
+            let addrs: Vec<String> = d.addresses.iter().map(|a| a.addr.to_string()).collect();
+            log::debug!("pcap: device '{}' addrs={:?}", d.name, addrs);
+        }
+
+        // Match the pcap device that has one of the target Ethernet IPs.
+        // This ensures we capture on the Ethernet adapter, not WiFi.
+        let target_addrs: Vec<std::net::IpAddr> =
+            ethernet_ips.iter().map(|ip| std::net::IpAddr::V4(*ip)).collect();
 
         let pcap_dev = pcap_devices.into_iter().find(|d| {
-            d.addresses.iter().any(|a| our_ips.contains(&a.addr))
+            d.addresses.iter().any(|a| target_addrs.contains(&a.addr))
         });
 
         let pcap_dev = match pcap_dev {
@@ -72,7 +76,7 @@ pub fn start_listener(
                 d
             }
             None => {
-                log::warn!("pcap: no device matched Ethernet IPs");
+                log::warn!("pcap: no device matched Ethernet IPs {:?}", ethernet_ips);
                 return;
             }
         };
@@ -192,6 +196,53 @@ fn format_mac(mac: &[u8; 6]) -> String {
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     )
+}
+
+/// Read the OS ARP table for a specific interface and return dynamic entries.
+///
+/// Supplements pcap-based discovery: if a host is already in the OS
+/// ARP cache (e.g. from a prior browser visit), the ping sweep won't
+/// generate a new ARP request on the wire, so pcap never sees it.
+///
+/// `interface_ip` scopes the query to a single interface via `arp -a -N`,
+/// preventing WiFi entries from leaking in.
+pub async fn read_system_arp_table(interface_ip: &str) -> Vec<(Ipv4Addr, String)> {
+    let output = match tokio::process::Command::new("arp")
+        .args(["-a", "-N", interface_ip])
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            log::warn!("Failed to read ARP table: {}", e);
+            return vec![];
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    log::debug!("ARP table for {}: {} entries", interface_ip, stdout.lines().count());
+    parse_arp_table(&stdout)
+}
+
+/// Parse `arp -a` output into (IP, MAC) pairs.
+/// Only returns dynamic entries with valid IPv4 addresses.
+fn parse_arp_table(output: &str) -> Vec<(Ipv4Addr, String)> {
+    let mut entries = Vec::new();
+    for line in output.lines() {
+        let parts: Vec<&str> = line.trim().split_whitespace().collect();
+        // Windows `arp -a` format: "  192.168.1.207  aa-bb-cc-dd-ee-ff  dynamic"
+        if parts.len() >= 3 && parts[2].eq_ignore_ascii_case("dynamic") {
+            if let Ok(ip) = parts[0].parse::<Ipv4Addr>() {
+                // Normalize MAC from aa-bb-cc-dd-ee-ff to aa:bb:cc:dd:ee:ff
+                let mac = parts[1].replace('-', ":").to_lowercase();
+                // Skip incomplete entries (ff-ff-ff-ff-ff-ff or 00-00-00-00-00-00)
+                if mac != "ff:ff:ff:ff:ff:ff" && mac != "00:00:00:00:00:00" {
+                    entries.push((ip, mac));
+                }
+            }
+        }
+    }
+    entries
 }
 
 #[cfg(test)]
@@ -337,6 +388,67 @@ mod tests {
     #[test]
     fn format_mac_all_ff() {
         assert_eq!(format_mac(&[0xFF; 6]), "ff:ff:ff:ff:ff:ff");
+    }
+
+    // ── parse_arp_table ─────────────────────────────────────────────
+
+    #[test]
+    fn parse_arp_table_windows_format() {
+        let output = "\
+Interface: 192.168.1.100 --- 0x6
+  Internet Address      Physical Address      Type
+  192.168.1.1           aa-bb-cc-dd-ee-01     dynamic
+  192.168.1.207         aa-bb-cc-dd-ee-02     dynamic
+  192.168.1.255         ff-ff-ff-ff-ff-ff     static
+";
+        let entries = parse_arp_table(output);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, Ipv4Addr::new(192, 168, 1, 1));
+        assert_eq!(entries[0].1, "aa:bb:cc:dd:ee:01");
+        assert_eq!(entries[1].0, Ipv4Addr::new(192, 168, 1, 207));
+        assert_eq!(entries[1].1, "aa:bb:cc:dd:ee:02");
+    }
+
+    #[test]
+    fn parse_arp_table_skips_static_entries() {
+        let output = "  192.168.1.1  aa-bb-cc-dd-ee-ff  static\n";
+        let entries = parse_arp_table(output);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn parse_arp_table_skips_broadcast() {
+        let output = "  192.168.1.255  ff-ff-ff-ff-ff-ff  dynamic\n";
+        let entries = parse_arp_table(output);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn parse_arp_table_skips_zeroed_mac() {
+        let output = "  192.168.1.50  00-00-00-00-00-00  dynamic\n";
+        let entries = parse_arp_table(output);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn parse_arp_table_empty_output() {
+        assert!(parse_arp_table("").is_empty());
+    }
+
+    #[test]
+    fn parse_arp_table_header_lines_ignored() {
+        let output = "\
+Interface: 192.168.1.100 --- 0x6
+  Internet Address      Physical Address      Type
+";
+        assert!(parse_arp_table(output).is_empty());
+    }
+
+    #[test]
+    fn parse_arp_table_normalizes_mac() {
+        let output = "  10.0.0.1  AA-BB-CC-DD-EE-FF  dynamic\n";
+        let entries = parse_arp_table(output);
+        assert_eq!(entries[0].1, "aa:bb:cc:dd:ee:ff");
     }
 }
 

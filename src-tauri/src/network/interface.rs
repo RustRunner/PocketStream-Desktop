@@ -91,7 +91,6 @@ fn parse_adapter_json(stdout: &str) -> Result<Vec<serde_json::Value>, AppError> 
 #[cfg(target_os = "windows")]
 fn parse_adapter(a: &serde_json::Value, is_vpn: bool) -> InterfaceInfo {
     let name = a["Name"].as_str().unwrap_or("").to_string();
-    let desc = a["Description"].as_str().unwrap_or("").to_string();
     let mac = a["MacAddress"].as_str().unwrap_or("").replace('-', ":");
     let media = a["MediaType"].as_str().unwrap_or("");
 
@@ -115,9 +114,7 @@ fn parse_adapter(a: &serde_json::Value, is_vpn: bool) -> InterfaceInfo {
         })
     }).collect();
 
-    let is_ethernet = media.contains("802.3")
-        || desc.to_lowercase().contains("ethernet")
-        || name.to_lowercase().contains("ethernet");
+    let is_ethernet = media.contains("802.3");
 
     InterfaceInfo {
         display_name: name.clone(),
@@ -400,7 +397,9 @@ mod tests {
         }
 
         #[test]
-        fn parse_adapter_ethernet_by_description() {
+        fn parse_adapter_ethernet_requires_802_3_media_type() {
+            // Only MediaType "802.3" qualifies as ethernet — name/description
+            // containing "ethernet" is NOT enough (avoids WiFi false positives).
             let json: serde_json::Value = serde_json::from_str(r#"{
                 "Name": "Connection 1",
                 "Description": "USB Ethernet Adapter",
@@ -409,7 +408,30 @@ mod tests {
                 "IPs": []
             }"#).unwrap();
             let iface = parse_adapter(&json, false);
-            assert!(iface.is_ethernet, "Should detect 'ethernet' in description");
+            assert!(!iface.is_ethernet, "Empty MediaType should not be ethernet");
+
+            let json_802_3: serde_json::Value = serde_json::from_str(r#"{
+                "Name": "Connection 1",
+                "Description": "USB Ethernet Adapter",
+                "MacAddress": "",
+                "MediaType": "802.3",
+                "IPs": []
+            }"#).unwrap();
+            let iface2 = parse_adapter(&json_802_3, false);
+            assert!(iface2.is_ethernet, "802.3 MediaType should be ethernet");
+        }
+
+        #[test]
+        fn parse_adapter_wifi_not_ethernet() {
+            let json: serde_json::Value = serde_json::from_str(r#"{
+                "Name": "Wi-Fi",
+                "Description": "Intel(R) Wi-Fi 6E AX211",
+                "MacAddress": "AA-BB-CC-DD-EE-FF",
+                "MediaType": "Native 802.11",
+                "IPs": [{"Address": "192.168.1.50", "PrefixLength": 24}]
+            }"#).unwrap();
+            let iface = parse_adapter(&json, false);
+            assert!(!iface.is_ethernet, "WiFi (802.11) must not be marked ethernet");
         }
     }
 
