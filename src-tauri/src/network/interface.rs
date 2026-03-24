@@ -235,3 +235,204 @@ pub fn get_by_name(name: &str) -> Result<InterfaceInfo, AppError> {
         .find(|i| i.name == name)
         .ok_or_else(|| AppError::Network(format!("Interface '{}' not found", name)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Data Structure Tests ────────────────────────────────────────
+
+    #[test]
+    fn ip_info_serializes() {
+        let ip = IpInfo {
+            address: "192.168.1.10".into(),
+            prefix: 24,
+            subnet: "192.168.1.0/24".into(),
+        };
+        let json = serde_json::to_string(&ip).unwrap();
+        assert!(json.contains("192.168.1.10"));
+        assert!(json.contains("\"prefix\":24"));
+    }
+
+    #[test]
+    fn interface_info_serializes() {
+        let iface = InterfaceInfo {
+            name: "eth0".into(),
+            display_name: "Ethernet".into(),
+            ips: vec![IpInfo {
+                address: "10.0.0.1".into(),
+                prefix: 24,
+                subnet: "10.0.0.0/24".into(),
+            }],
+            mac: "aa:bb:cc:dd:ee:ff".into(),
+            is_up: true,
+            is_ethernet: true,
+            is_vpn: false,
+        };
+        let json = serde_json::to_string(&iface).unwrap();
+        assert!(json.contains("\"name\":\"eth0\""));
+        assert!(json.contains("\"is_up\":true"));
+        assert!(json.contains("\"is_vpn\":false"));
+    }
+
+    // ── Windows-specific parse functions ─────────────────────────────
+
+    #[cfg(target_os = "windows")]
+    mod windows_tests {
+        use super::super::*;
+
+        #[test]
+        fn is_vpn_adapter_matches_known_keywords() {
+            assert!(is_vpn_adapter("Tailscale Tunnel"));
+            assert!(is_vpn_adapter("TAP-Windows Adapter V9"));
+            assert!(is_vpn_adapter("WireGuard Tunnel"));
+            assert!(is_vpn_adapter("Cisco AnyConnect Virtual Miniport"));
+            assert!(is_vpn_adapter("NordLynx Tunnel"));
+            assert!(is_vpn_adapter("OpenVPN TAP-Windows6"));
+            assert!(is_vpn_adapter("Fortinet Virtual Ethernet Adapter"));
+            assert!(is_vpn_adapter("ZeroTier One Virtual Port"));
+        }
+
+        #[test]
+        fn is_vpn_adapter_case_insensitive() {
+            assert!(is_vpn_adapter("TAILSCALE TUNNEL"));
+            assert!(is_vpn_adapter("wireguard"));
+            assert!(is_vpn_adapter("VPN Connection"));
+        }
+
+        #[test]
+        fn is_vpn_adapter_rejects_normal() {
+            assert!(!is_vpn_adapter("Intel(R) Ethernet Connection I219-V"));
+            assert!(!is_vpn_adapter("Realtek PCIe GBE Family Controller"));
+            assert!(!is_vpn_adapter("Microsoft Wi-Fi Direct Virtual Adapter"));
+        }
+
+        #[test]
+        fn parse_adapter_json_empty_string() {
+            let result = parse_adapter_json("").unwrap();
+            assert!(result.is_empty());
+        }
+
+        #[test]
+        fn parse_adapter_json_single_object() {
+            let json = r#"{"Name":"Ethernet","Description":"Intel Ethernet","MacAddress":"AA-BB-CC-DD-EE-FF","MediaType":"802.3","IPs":[]}"#;
+            let result = parse_adapter_json(json).unwrap();
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0]["Name"].as_str().unwrap(), "Ethernet");
+        }
+
+        #[test]
+        fn parse_adapter_json_array() {
+            let json = r#"[{"Name":"Eth1","Description":"Intel","MacAddress":"","MediaType":"","IPs":[]},{"Name":"Eth2","Description":"Realtek","MacAddress":"","MediaType":"","IPs":[]}]"#;
+            let result = parse_adapter_json(json).unwrap();
+            assert_eq!(result.len(), 2);
+        }
+
+        #[test]
+        fn parse_adapter_json_invalid() {
+            assert!(parse_adapter_json("not json").is_err());
+        }
+
+        #[test]
+        fn parse_adapter_basic() {
+            let json: serde_json::Value = serde_json::from_str(r#"{
+                "Name": "Ethernet 2",
+                "Description": "Intel(R) I210 Gigabit Ethernet",
+                "MacAddress": "AA-BB-CC-DD-EE-FF",
+                "MediaType": "802.3",
+                "IPs": [{"Address": "192.168.1.100", "PrefixLength": 24}]
+            }"#).unwrap();
+            let iface = parse_adapter(&json, false);
+            assert_eq!(iface.name, "Ethernet 2");
+            assert_eq!(iface.display_name, "Ethernet 2");
+            assert_eq!(iface.mac, "AA:BB:CC:DD:EE:FF");
+            assert!(iface.is_ethernet);
+            assert!(!iface.is_vpn);
+            assert!(iface.is_up);
+            assert_eq!(iface.ips.len(), 1);
+            assert_eq!(iface.ips[0].address, "192.168.1.100");
+            assert_eq!(iface.ips[0].prefix, 24);
+        }
+
+        #[test]
+        fn parse_adapter_vpn() {
+            let json: serde_json::Value = serde_json::from_str(r#"{
+                "Name": "Tailscale",
+                "Description": "Tailscale Tunnel",
+                "MacAddress": "",
+                "MediaType": "",
+                "IPs": []
+            }"#).unwrap();
+            let iface = parse_adapter(&json, true);
+            assert!(iface.is_vpn);
+            assert!(!iface.is_ethernet);
+            assert!(iface.ips.is_empty());
+        }
+
+        #[test]
+        fn parse_adapter_no_ips() {
+            let json: serde_json::Value = serde_json::from_str(r#"{
+                "Name": "Ethernet",
+                "Description": "Realtek",
+                "MacAddress": "",
+                "MediaType": "802.3",
+                "IPs": null
+            }"#).unwrap();
+            let iface = parse_adapter(&json, false);
+            assert!(iface.ips.is_empty());
+        }
+
+        #[test]
+        fn parse_adapter_ipv6_passthrough() {
+            // parse_adapter accepts any valid IP (including IPv6)
+            // because the PowerShell query already filters to IPv4.
+            // Verify it doesn't panic on IPv6 input.
+            let json: serde_json::Value = serde_json::from_str(r#"{
+                "Name": "Ethernet",
+                "Description": "Intel",
+                "MacAddress": "",
+                "MediaType": "802.3",
+                "IPs": [{"Address": "fe80::1", "PrefixLength": 64}]
+            }"#).unwrap();
+            let iface = parse_adapter(&json, false);
+            // IPv6 may or may not parse — the function shouldn't panic
+            assert!(iface.ips.len() <= 1);
+        }
+
+        #[test]
+        fn parse_adapter_ethernet_by_description() {
+            let json: serde_json::Value = serde_json::from_str(r#"{
+                "Name": "Connection 1",
+                "Description": "USB Ethernet Adapter",
+                "MacAddress": "",
+                "MediaType": "",
+                "IPs": []
+            }"#).unwrap();
+            let iface = parse_adapter(&json, false);
+            assert!(iface.is_ethernet, "Should detect 'ethernet' in description");
+        }
+    }
+
+    // ── Platform-independent tests ──────────────────────────────────
+
+    #[test]
+    fn list_physical_returns_ok() {
+        // Should succeed on any platform (may be empty in CI)
+        let result = list_physical();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn list_all_returns_ok() {
+        let result = list_all();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn get_by_name_nonexistent_returns_err() {
+        let result = get_by_name("__nonexistent_interface_42__");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("not found"));
+    }
+}

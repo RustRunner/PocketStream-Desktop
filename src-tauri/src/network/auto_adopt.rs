@@ -79,3 +79,111 @@ pub async fn remove_adopted_ip(interface_name: &str, ip: &str) -> Result<(), App
     log::info!("Removing adopted IP {} from {}", ip, interface_name);
     ip_config::remove_secondary_ip(interface_name, ip).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    // ── already_on_subnet ───────────────────────────────────────────
+
+    #[test]
+    fn already_on_subnet_same_24() {
+        let device = Ipv4Addr::new(192, 168, 1, 50);
+        let ours = vec![Ipv4Addr::new(192, 168, 1, 100)];
+        assert!(already_on_subnet(device, &ours));
+    }
+
+    #[test]
+    fn already_on_subnet_different_third_octet() {
+        let device = Ipv4Addr::new(192, 168, 2, 50);
+        let ours = vec![Ipv4Addr::new(192, 168, 1, 100)];
+        assert!(!already_on_subnet(device, &ours));
+    }
+
+    #[test]
+    fn already_on_subnet_different_second_octet() {
+        let device = Ipv4Addr::new(10, 1, 1, 50);
+        let ours = vec![Ipv4Addr::new(10, 2, 1, 50)];
+        assert!(!already_on_subnet(device, &ours));
+    }
+
+    #[test]
+    fn already_on_subnet_empty_ips() {
+        let device = Ipv4Addr::new(10, 0, 0, 1);
+        assert!(!already_on_subnet(device, &[]));
+    }
+
+    #[test]
+    fn already_on_subnet_multiple_ips_one_matches() {
+        let device = Ipv4Addr::new(10, 0, 0, 50);
+        let ours = vec![
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(10, 0, 0, 100),
+        ];
+        assert!(already_on_subnet(device, &ours));
+    }
+
+    #[test]
+    fn already_on_subnet_exact_same_ip() {
+        let device = Ipv4Addr::new(192, 168, 1, 100);
+        let ours = vec![Ipv4Addr::new(192, 168, 1, 100)];
+        assert!(already_on_subnet(device, &ours));
+    }
+
+    // ── pick_candidate_ip ───────────────────────────────────────────
+
+    #[test]
+    fn pick_candidate_returns_same_subnet() {
+        let device = Ipv4Addr::new(192, 168, 5, 10);
+        let candidates = pick_candidate_ip(device);
+        assert!(!candidates.is_empty());
+        for c in &candidates {
+            let o = c.octets();
+            assert_eq!(o[0], 192);
+            assert_eq!(o[1], 168);
+            assert_eq!(o[2], 5);
+        }
+    }
+
+    #[test]
+    fn pick_candidate_starts_at_100() {
+        let device = Ipv4Addr::new(10, 0, 0, 50);
+        let candidates = pick_candidate_ip(device);
+        assert_eq!(candidates[0], Ipv4Addr::new(10, 0, 0, 100));
+    }
+
+    #[test]
+    fn pick_candidate_skips_device_ip() {
+        let device = Ipv4Addr::new(10, 0, 0, 100);
+        let candidates = pick_candidate_ip(device);
+        assert!(!candidates.contains(&Ipv4Addr::new(10, 0, 0, 100)));
+    }
+
+    #[test]
+    fn pick_candidate_skips_reserved_addresses() {
+        let device = Ipv4Addr::new(10, 0, 0, 50);
+        let candidates = pick_candidate_ip(device);
+        for c in &candidates {
+            let last = c.octets()[3];
+            assert_ne!(last, 0, "Should not pick .0 (network)");
+            assert_ne!(last, 255, "Should not pick .255 (broadcast)");
+            assert_ne!(last, 1, "Should not pick .1 (gateway)");
+        }
+    }
+
+    #[test]
+    fn pick_candidate_returns_multiple() {
+        let device = Ipv4Addr::new(172, 16, 0, 50);
+        let candidates = pick_candidate_ip(device);
+        assert!(candidates.len() >= 5, "Should return several candidates");
+    }
+
+    #[test]
+    fn pick_candidate_no_duplicates() {
+        let device = Ipv4Addr::new(10, 0, 0, 50);
+        let candidates = pick_candidate_ip(device);
+        let unique: std::collections::HashSet<_> = candidates.iter().collect();
+        assert_eq!(unique.len(), candidates.len());
+    }
+}

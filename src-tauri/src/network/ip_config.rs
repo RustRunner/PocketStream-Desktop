@@ -179,3 +179,58 @@ pub async fn remove_secondary_ip(interface: &str, ip: &str) -> Result<(), AppErr
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── validate_ip ─────────────────────────────────────────────────
+
+    #[test]
+    fn validate_ip_valid_addresses() {
+        assert!(validate_ip("192.168.1.1").is_ok());
+        assert!(validate_ip("10.0.0.1").is_ok());
+        assert!(validate_ip("255.255.255.0").is_ok());
+        assert!(validate_ip("0.0.0.0").is_ok());
+        assert!(validate_ip("172.16.0.1").is_ok());
+    }
+
+    #[test]
+    fn validate_ip_invalid_addresses() {
+        assert!(validate_ip("").is_err());
+        assert!(validate_ip("not-an-ip").is_err());
+        assert!(validate_ip("256.1.1.1").is_err());
+        assert!(validate_ip("192.168.1").is_err());
+        assert!(validate_ip("192.168.1.1.1").is_err());
+        assert!(validate_ip("::1").is_err()); // IPv6 rejected
+    }
+
+    #[test]
+    fn validate_ip_error_message() {
+        let err = validate_ip("bad").unwrap_err();
+        assert!(err.to_string().contains("Invalid IP address"));
+        assert!(err.to_string().contains("bad"));
+    }
+
+    // ── mask_to_prefix (Linux only) ─────────────────────────────────
+
+    #[cfg(target_os = "linux")]
+    mod linux_tests {
+        use super::super::*;
+
+        #[test]
+        fn mask_to_prefix_common_masks() {
+            assert_eq!(mask_to_prefix("255.255.255.0").unwrap(), 24);
+            assert_eq!(mask_to_prefix("255.255.0.0").unwrap(), 16);
+            assert_eq!(mask_to_prefix("255.0.0.0").unwrap(), 8);
+            assert_eq!(mask_to_prefix("255.255.255.255").unwrap(), 32);
+            assert_eq!(mask_to_prefix("255.255.255.128").unwrap(), 25);
+            assert_eq!(mask_to_prefix("255.255.252.0").unwrap(), 22);
+        }
+
+        #[test]
+        fn mask_to_prefix_invalid() {
+            assert!(mask_to_prefix("not-a-mask").is_err());
+        }
+    }
+}

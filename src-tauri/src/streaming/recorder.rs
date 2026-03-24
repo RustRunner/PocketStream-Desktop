@@ -96,3 +96,150 @@ fn write_bmp(path: &Path, rgb_data: &[u8], width: u32, height: u32) -> Result<()
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    // ── write_bmp ───────────────────────────────────────────────────
+
+    #[test]
+    fn write_bmp_creates_valid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.bmp");
+        // 2x2 red pixels: RGB(255,0,0) × 4
+        let rgb = vec![
+            255, 0, 0, 255, 0, 0,
+            255, 0, 0, 255, 0, 0,
+        ];
+        write_bmp(&path, &rgb, 2, 2).unwrap();
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn write_bmp_magic_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("magic.bmp");
+        let rgb = vec![0u8; 3]; // 1x1 black pixel
+        write_bmp(&path, &rgb, 1, 1).unwrap();
+
+        let mut file = fs::File::open(&path).unwrap();
+        let mut header = [0u8; 2];
+        file.read_exact(&mut header).unwrap();
+        assert_eq!(&header, b"BM");
+    }
+
+    #[test]
+    fn write_bmp_file_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("size.bmp");
+        let width = 4u32;
+        let height = 3u32;
+        let rgb = vec![128u8; (width * height * 3) as usize];
+        write_bmp(&path, &rgb, width, height).unwrap();
+
+        let file_len = fs::metadata(&path).unwrap().len();
+        // Row size = ((4*3 + 3)/4)*4 = 12 (no padding needed for width=4)
+        // File size = 54 (header) + 12 * 3 (rows) = 90
+        assert_eq!(file_len, 90);
+    }
+
+    #[test]
+    fn write_bmp_row_padding() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pad.bmp");
+        // Width 3: row_stride = 9 bytes, padded to 12 bytes
+        let width = 3u32;
+        let height = 1u32;
+        let rgb = vec![0u8; 9]; // 3 pixels × 3 bytes
+        write_bmp(&path, &rgb, width, height).unwrap();
+
+        let file_len = fs::metadata(&path).unwrap().len();
+        // Row size = ((3*3+3)/4)*4 = 12
+        // File size = 54 + 12 = 66
+        assert_eq!(file_len, 66);
+    }
+
+    #[test]
+    fn write_bmp_rgb_to_bgr_conversion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("color.bmp");
+        // 1x1 pixel: RGB(0xAA, 0xBB, 0xCC)
+        let rgb = vec![0xAA, 0xBB, 0xCC];
+        write_bmp(&path, &rgb, 1, 1).unwrap();
+
+        let data = fs::read(&path).unwrap();
+        // Pixel data starts at offset 54
+        // BMP stores BGR, so: CC BB AA (+ 1 byte padding for width=1)
+        assert_eq!(data[54], 0xCC); // Blue
+        assert_eq!(data[55], 0xBB); // Green
+        assert_eq!(data[56], 0xAA); // Red
+    }
+
+    #[test]
+    fn write_bmp_dimensions_in_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dims.bmp");
+        let rgb = vec![0u8; 10 * 5 * 3];
+        write_bmp(&path, &rgb, 10, 5).unwrap();
+
+        let data = fs::read(&path).unwrap();
+        // Width at offset 18 (4 bytes LE)
+        let w = u32::from_le_bytes([data[18], data[19], data[20], data[21]]);
+        assert_eq!(w, 10);
+        // Height at offset 22 (4 bytes LE, negative for top-down)
+        let h = i32::from_le_bytes([data[22], data[23], data[24], data[25]]);
+        assert_eq!(h, -5);
+    }
+
+    #[test]
+    fn write_bmp_24_bits_per_pixel() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bpp.bmp");
+        let rgb = vec![0u8; 3];
+        write_bmp(&path, &rgb, 1, 1).unwrap();
+
+        let data = fs::read(&path).unwrap();
+        // Bits per pixel at offset 28 (2 bytes LE)
+        let bpp = u16::from_le_bytes([data[28], data[29]]);
+        assert_eq!(bpp, 24);
+    }
+
+    // ── save_screenshot_bmp ─────────────────────────────────────────
+
+    #[test]
+    fn save_screenshot_creates_dir_and_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("screenshots");
+        let rgb = vec![0u8; 4 * 4 * 3]; // 4x4
+        let path = save_screenshot_bmp(&rgb, 4, 4, &output).unwrap();
+        assert!(path.exists());
+        assert!(path.to_string_lossy().contains("PS_Screenshot_"));
+        assert!(path.extension().unwrap() == "bmp");
+    }
+
+    // ── recording_path ──────────────────────────────────────────────
+
+    #[test]
+    fn recording_path_creates_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("recordings");
+        let path = recording_path(&output).unwrap();
+        assert!(output.exists(), "Directory should be created");
+        assert!(path.to_string_lossy().contains("PS_Recording_"));
+        assert_eq!(path.extension().unwrap(), "mp4");
+    }
+
+    #[test]
+    fn recording_path_unique_per_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = recording_path(dir.path()).unwrap();
+        // Sleep briefly so timestamp differs
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let p2 = recording_path(dir.path()).unwrap();
+        // Paths should differ (different timestamp)
+        // Note: within the same second they'd be equal, hence the sleep
+        assert_ne!(p1, p2);
+    }
+}

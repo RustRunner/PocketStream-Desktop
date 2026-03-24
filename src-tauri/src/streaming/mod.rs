@@ -307,3 +307,151 @@ fn get_local_ip() -> Option<String> {
         .next()
         .map(|ip| ip.address)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::*;
+
+    fn make_settings(
+        protocol: &str,
+        camera_ip: &str,
+        username: &str,
+        password: &str,
+    ) -> AppSettings {
+        AppSettings {
+            stream: StreamConfig {
+                protocol: protocol.into(),
+                rtsp_port: 554,
+                rtsp_path: "/live".into(),
+                udp_port: 8600,
+                camera_ip: camera_ip.into(),
+            },
+            rtsp_server: RtspServerConfig {
+                enabled: false,
+                port: 8554,
+                token: "testtoken".into(),
+                bind_interface: String::new(),
+            },
+            credentials: Credentials {
+                username: username.into(),
+                password: password.into(),
+            },
+        }
+    }
+
+    // ── build_input_url ─────────────────────────────────────────────
+
+    #[test]
+    fn build_url_rtsp_with_credentials() {
+        let s = make_settings("rtsp", "192.168.1.10", "admin", "pass123");
+        let url = StreamManager::build_input_url(&s);
+        assert_eq!(url, "rtsp://admin:pass123@192.168.1.10:554/live");
+    }
+
+    #[test]
+    fn build_url_rtsp_without_credentials() {
+        let s = make_settings("rtsp", "192.168.1.10", "", "");
+        let url = StreamManager::build_input_url(&s);
+        assert_eq!(url, "rtsp://192.168.1.10:554/live");
+    }
+
+    #[test]
+    fn build_url_rtsp_empty_password_still_has_creds() {
+        // If username is set but password is empty, creds block is still added
+        let s = make_settings("rtsp", "10.0.0.5", "admin", "");
+        let url = StreamManager::build_input_url(&s);
+        assert_eq!(url, "rtsp://admin:@10.0.0.5:554/live");
+    }
+
+    #[test]
+    fn build_url_udp() {
+        let s = make_settings("udp", "", "", "");
+        let url = StreamManager::build_input_url(&s);
+        assert_eq!(url, "udp://@:8600");
+    }
+
+    #[test]
+    fn build_url_udp_ignores_camera_ip() {
+        let s = make_settings("udp", "192.168.1.1", "admin", "pass");
+        let url = StreamManager::build_input_url(&s);
+        assert_eq!(url, "udp://@:8600");
+    }
+
+    #[test]
+    fn build_url_custom_port_and_path() {
+        let mut s = make_settings("rtsp", "10.0.0.5", "", "");
+        s.stream.rtsp_port = 8554;
+        s.stream.rtsp_path = "/cam1/main".into();
+        let url = StreamManager::build_input_url(&s);
+        assert_eq!(url, "rtsp://10.0.0.5:8554/cam1/main");
+    }
+
+    #[test]
+    fn build_url_custom_udp_port() {
+        let mut s = make_settings("udp", "", "", "");
+        s.stream.udp_port = 9999;
+        let url = StreamManager::build_input_url(&s);
+        assert_eq!(url, "udp://@:9999");
+    }
+
+    #[test]
+    fn build_url_unknown_protocol_falls_to_rtsp() {
+        // Any non-"udp" protocol defaults to RTSP path
+        let s = make_settings("http", "1.2.3.4", "", "");
+        let url = StreamManager::build_input_url(&s);
+        assert!(url.starts_with("rtsp://"));
+    }
+
+    // ── StreamStatus ────────────────────────────────────────────────
+
+    #[test]
+    fn stream_status_serializes() {
+        let status = StreamStatus {
+            playing: true,
+            rtsp_server_running: false,
+            rtsp_url: Some("rtsp://127.0.0.1:8554/stream-abc".into()),
+            recording: false,
+            uptime_secs: 120,
+            bandwidth_kbps: 0.0,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("\"playing\":true"));
+        assert!(json.contains("\"uptime_secs\":120"));
+    }
+
+    #[test]
+    fn stream_status_default_values() {
+        let status = StreamStatus {
+            playing: false,
+            rtsp_server_running: false,
+            rtsp_url: None,
+            recording: false,
+            uptime_secs: 0,
+            bandwidth_kbps: 0.0,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("\"rtsp_url\":null"));
+    }
+
+    // ── StreamManager ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn stream_manager_initial_status() {
+        let mgr = StreamManager::new();
+        let status = mgr.get_status().await.unwrap();
+        assert!(!status.playing);
+        assert!(!status.rtsp_server_running);
+        assert!(!status.recording);
+        assert_eq!(status.uptime_secs, 0);
+        assert!(status.rtsp_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_manager_video_hwnd_roundtrip() {
+        let mgr = StreamManager::new();
+        assert!(mgr.get_video_child_hwnd().await.is_none());
+        mgr.set_video_child_hwnd(0x12345).await;
+        assert_eq!(mgr.get_video_child_hwnd().await, Some(0x12345));
+    }
+}

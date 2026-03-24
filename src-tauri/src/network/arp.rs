@@ -194,6 +194,152 @@ fn format_mac(mac: &[u8; 6]) -> String {
     )
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    /// Build a minimal valid ARP packet (42 bytes: 14 Ethernet + 28 ARP).
+    fn make_arp_packet(sender_mac: [u8; 6], sender_ip: [u8; 4]) -> Vec<u8> {
+        let mut pkt = vec![0u8; 42];
+        // Destination MAC (6 bytes) + Source MAC (6 bytes) — left as zeros
+        // Ethertype: ARP = 0x0806
+        pkt[12] = 0x08;
+        pkt[13] = 0x06;
+        // ARP header starts at offset 14
+        let arp = &mut pkt[14..];
+        arp[0] = 0x00; arp[1] = 0x01; // Hardware type: Ethernet (1)
+        arp[2] = 0x08; arp[3] = 0x00; // Protocol type: IPv4 (0x0800)
+        arp[4] = 6;                     // Hardware address length
+        arp[5] = 4;                     // Protocol address length
+        arp[6] = 0x00; arp[7] = 0x02; // Opcode: Reply (2)
+        arp[8..14].copy_from_slice(&sender_mac);
+        arp[14..18].copy_from_slice(&sender_ip);
+        pkt
+    }
+
+    #[test]
+    fn parse_valid_arp_reply() {
+        let pkt = make_arp_packet(
+            [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01],
+            [192, 168, 1, 100],
+        );
+        let (ip, mac) = parse_arp_packet(&pkt).unwrap();
+        assert_eq!(ip, Ipv4Addr::new(192, 168, 1, 100));
+        assert_eq!(mac, [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01]);
+    }
+
+    #[test]
+    fn parse_arp_different_subnet() {
+        let pkt = make_arp_packet(
+            [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+            [10, 0, 0, 42],
+        );
+        let (ip, mac) = parse_arp_packet(&pkt).unwrap();
+        assert_eq!(ip, Ipv4Addr::new(10, 0, 0, 42));
+        assert_eq!(mac, [0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+    }
+
+    #[test]
+    fn parse_arp_high_octets() {
+        let pkt = make_arp_packet(
+            [0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54],
+            [172, 16, 255, 254],
+        );
+        let (ip, _mac) = parse_arp_packet(&pkt).unwrap();
+        assert_eq!(ip, Ipv4Addr::new(172, 16, 255, 254));
+    }
+
+    #[test]
+    fn reject_packet_too_short() {
+        assert!(parse_arp_packet(&[0u8; 41]).is_none());
+    }
+
+    #[test]
+    fn reject_empty_packet() {
+        assert!(parse_arp_packet(&[]).is_none());
+    }
+
+    #[test]
+    fn reject_non_arp_ethertype() {
+        let mut pkt = make_arp_packet([1; 6], [10, 0, 0, 1]);
+        pkt[12] = 0x08;
+        pkt[13] = 0x00; // IPv4 ethertype, not ARP
+        assert!(parse_arp_packet(&pkt).is_none());
+    }
+
+    #[test]
+    fn reject_non_ethernet_hardware_type() {
+        let mut pkt = make_arp_packet([1; 6], [10, 0, 0, 1]);
+        pkt[14] = 0x00;
+        pkt[15] = 0x06; // Hardware type 6 (IEEE 802) instead of 1
+        assert!(parse_arp_packet(&pkt).is_none());
+    }
+
+    #[test]
+    fn reject_non_ipv4_protocol() {
+        let mut pkt = make_arp_packet([1; 6], [10, 0, 0, 1]);
+        pkt[16] = 0x86;
+        pkt[17] = 0xDD; // IPv6 protocol type
+        assert!(parse_arp_packet(&pkt).is_none());
+    }
+
+    #[test]
+    fn reject_wrong_hardware_addr_len() {
+        let mut pkt = make_arp_packet([1; 6], [10, 0, 0, 1]);
+        pkt[18] = 8; // hw addr len 8 instead of 6
+        assert!(parse_arp_packet(&pkt).is_none());
+    }
+
+    #[test]
+    fn reject_wrong_protocol_addr_len() {
+        let mut pkt = make_arp_packet([1; 6], [10, 0, 0, 1]);
+        pkt[19] = 16; // proto addr len 16 instead of 4
+        assert!(parse_arp_packet(&pkt).is_none());
+    }
+
+    #[test]
+    fn reject_broadcast_mac() {
+        let pkt = make_arp_packet([0xFF; 6], [192, 168, 1, 1]);
+        assert!(parse_arp_packet(&pkt).is_none());
+    }
+
+    #[test]
+    fn accept_exactly_42_bytes() {
+        let pkt = make_arp_packet([0x01, 0x02, 0x03, 0x04, 0x05, 0x06], [1, 2, 3, 4]);
+        assert_eq!(pkt.len(), 42);
+        assert!(parse_arp_packet(&pkt).is_some());
+    }
+
+    #[test]
+    fn accept_oversized_packet() {
+        let mut pkt = make_arp_packet([0x01; 6], [192, 168, 0, 1]);
+        pkt.extend_from_slice(&[0u8; 100]); // trailing data (padding)
+        let (ip, _) = parse_arp_packet(&pkt).unwrap();
+        assert_eq!(ip, Ipv4Addr::new(192, 168, 0, 1));
+    }
+
+    // ── format_mac ──────────────────────────────────────────────────
+
+    #[test]
+    fn format_mac_standard() {
+        assert_eq!(
+            format_mac(&[0xAA, 0xBB, 0xCC, 0x01, 0x02, 0x03]),
+            "aa:bb:cc:01:02:03"
+        );
+    }
+
+    #[test]
+    fn format_mac_all_zeros() {
+        assert_eq!(format_mac(&[0; 6]), "00:00:00:00:00:00");
+    }
+
+    #[test]
+    fn format_mac_all_ff() {
+        assert_eq!(format_mac(&[0xFF; 6]), "ff:ff:ff:ff:ff:ff");
+    }
+}
+
 /// Check if `target_ip` is in use by pinging and checking ARP table.
 pub async fn send_arp_probe(
     target_ip: Ipv4Addr,
