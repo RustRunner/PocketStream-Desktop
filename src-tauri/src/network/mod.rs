@@ -20,6 +20,7 @@ pub struct NetworkManager {
     arp_devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
     adopted_ips: Arc<Mutex<HashMap<String, Ipv4Addr>>>,
     arp_listener_handle: Arc<Mutex<Option<arp::ArpListenerHandle>>>,
+    auto_adopt_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     auto_adopt_enabled: Arc<Mutex<bool>>,
     interface_name: Arc<Mutex<Option<String>>>,
 }
@@ -31,6 +32,7 @@ impl NetworkManager {
             arp_devices: Arc::new(Mutex::new(HashMap::new())),
             adopted_ips: Arc::new(Mutex::new(HashMap::new())),
             arp_listener_handle: Arc::new(Mutex::new(None)),
+            auto_adopt_handle: Arc::new(Mutex::new(None)),
             auto_adopt_enabled: Arc::new(Mutex::new(true)),
             interface_name: Arc::new(Mutex::new(None)),
         }
@@ -98,7 +100,7 @@ impl NetworkManager {
         });
 
         // Auto-adopt handler for foreign subnets
-        tokio::spawn(async move {
+        let adopt_handle = tokio::spawn(async move {
             use tauri::Emitter;
             let mut known_subnets: HashSet<String> = HashSet::new();
 
@@ -186,13 +188,17 @@ impl NetworkManager {
                 }
             }
         });
+        *self.auto_adopt_handle.lock().await = Some(adopt_handle);
 
         Ok(())
     }
 
     pub async fn stop_arp_discovery(&self) {
-        let mut handle = self.arp_listener_handle.lock().await;
-        if let Some(h) = handle.take() {
+        if let Some(h) = self.auto_adopt_handle.lock().await.take() {
+            h.abort();
+            log::info!("Auto-adopt task cancelled");
+        }
+        if let Some(h) = self.arp_listener_handle.lock().await.take() {
             h.stop();
             log::info!("ARP discovery stopped");
         }

@@ -76,7 +76,7 @@ pub async fn scan(subnet: &str) -> Result<Vec<ScanResult>, AppError> {
         }
     }
 
-    results.sort_by(|a, b| a.ip.cmp(&b.ip));
+    results.sort_by_key(|r| r.ip.parse::<IpAddr>().ok());
     Ok(results)
 }
 

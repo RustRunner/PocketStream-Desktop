@@ -11,3 +11,5 @@ src-tauri/gen/
 *.bmp
 *.jpg
 *.jpeg
+pocketstream-audit-*.md
+.cargo/

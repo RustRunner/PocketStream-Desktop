@@ -1,2 +1,0 @@
-[build]
-rustflags = ["-L", "C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\lib"]

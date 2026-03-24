@@ -249,7 +249,7 @@ impl StreamManager {
             .as_ref()
             .ok_or_else(|| AppError::Stream("No active playback".into()))?;
 
-        pipeline.detach_recording()?;
+        pipeline.detach_recording().await?;
 
         state.recording = false;
         let path = state

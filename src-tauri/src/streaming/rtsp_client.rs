@@ -28,8 +28,6 @@ impl PlaybackPipeline {
         use_tcp: bool,
         window_handle: Option<usize>,
     ) -> Result<Self, AppError> {
-        gst::init().map_err(|e| AppError::Stream(e.to_string()))?;
-
         let protocols = if use_tcp { "tcp" } else { "udp+tcp" };
 
         let pipeline_str = format!(
@@ -53,8 +51,6 @@ impl PlaybackPipeline {
 
     /// Create a playback pipeline for a UDP source.
     pub fn new_udp(port: u16, window_handle: Option<usize>) -> Result<Self, AppError> {
-        gst::init().map_err(|e| AppError::Stream(e.to_string()))?;
-
         let pipeline_str = format!(
             concat!(
                 "udpsrc port={port} ",
@@ -223,7 +219,7 @@ impl PlaybackPipeline {
     }
 
     /// Detach the recording branch and finalize the MP4.
-    pub fn detach_recording(&self) -> Result<(), AppError> {
+    pub async fn detach_recording(&self) -> Result<(), AppError> {
         let tee = self
             .pipeline
             .by_name("t")
@@ -246,7 +242,7 @@ impl PlaybackPipeline {
         }
 
         rec_bin.send_event(gst::event::Eos::new());
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         rec_bin
             .set_state(gst::State::Null)

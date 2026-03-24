@@ -3,7 +3,6 @@
 //! Takes the incoming camera stream (RTSP or UDP) and re-broadcasts it
 //! as an RTSP endpoint on the local network.
 
-use gstreamer as gst;
 use gstreamer_rtsp_server as gst_rtsp_server;
 use gstreamer_rtsp_server::prelude::*;
 
@@ -24,8 +23,6 @@ impl RtspRestreamer {
         port: u16,
         mount_path: &str,
     ) -> Result<Self, AppError> {
-        gst::init().map_err(|e| AppError::Stream(e.to_string()))?;
-
         let server = gst_rtsp_server::RTSPServer::new();
         server.set_service(&port.to_string());
 
@@ -72,8 +69,6 @@ impl RtspRestreamer {
         server_port: u16,
         mount_path: &str,
     ) -> Result<Self, AppError> {
-        gst::init().map_err(|e| AppError::Stream(e.to_string()))?;
-
         let server = gst_rtsp_server::RTSPServer::new();
         server.set_service(&server_port.to_string());
 

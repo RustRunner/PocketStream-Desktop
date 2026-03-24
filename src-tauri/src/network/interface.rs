@@ -169,30 +169,3 @@ pub fn get_by_name(name: &str) -> Result<InterfaceInfo, AppError> {
         .find(|i| i.name == name)
         .ok_or_else(|| AppError::Network(format!("Interface '{}' not found", name)))
 }
-
-/// Get the Windows adapter GUID for a named interface.
-/// Returns the NPF device path, e.g. `\Device\NPF_{812AD22F-...}`.
-#[cfg(target_os = "windows")]
-pub fn get_adapter_guid(name: &str) -> Result<String, AppError> {
-    let output = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            &format!(
-                r#"(Get-NetAdapter -Name '{}').InterfaceGuid"#,
-                name.replace('\'', "''")
-            ),
-        ])
-        .output()
-        .map_err(|e| AppError::Network(format!("Failed to get adapter GUID: {}", e)))?;
-
-    let guid = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if guid.is_empty() {
-        return Err(AppError::Network(format!(
-            "No GUID found for interface '{}'",
-            name
-        )));
-    }
-
-    Ok(format!(r"\Device\NPF_{}", guid))
-}
