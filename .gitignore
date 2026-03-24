@@ -15,3 +15,4 @@ pocketstream-audit-*.md
 security-audit-*.md
 DHCP-Clone-23MAR26.md
 .cargo/
+standalone-leasegraft/

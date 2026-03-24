@@ -35,8 +35,13 @@ export function setupStreamControls() {
       }
     } else {
       try {
+        const selectedIp = $("#camera-ip").value;
+        if (!selectedIp) {
+          showToast("Select a camera IP first", true);
+          return;
+        }
         if (state.config) {
-          state.config.stream.camera_ip = $("#camera-ip").value || state.config.stream.camera_ip;
+          state.config.stream.camera_ip = selectedIp;
           await api.saveConfig(state.config);
         }
         const bounds = getVideoAreaBounds();
