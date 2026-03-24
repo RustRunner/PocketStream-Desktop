@@ -229,7 +229,13 @@ pub async fn set_video_visible(
 
 #[tauri::command]
 pub async fn ptu_send(ip: String, cmd: String) -> Result<std::collections::HashMap<String, String>, AppError> {
-    let base_url = format!("http://{}", ip);
+    let addr: std::net::Ipv4Addr = ip
+        .parse()
+        .map_err(|_| AppError::Network(format!("Invalid IP address: {}", ip)))?;
+    if addr.is_loopback() || addr.is_link_local() || addr.is_broadcast() || addr.is_unspecified() {
+        return Err(AppError::Network(format!("IP address not allowed: {}", ip)));
+    }
+    let base_url = format!("http://{}", addr);
     crate::camera::flir_ptu::send_command(&base_url, &cmd).await
 }
 

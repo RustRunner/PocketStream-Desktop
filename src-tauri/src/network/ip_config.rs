@@ -11,6 +11,7 @@ pub async fn assign_static_ip(
     subnet_mask: &str,
     gateway: Option<&str>,
 ) -> Result<(), AppError> {
+    validate_interface_name(interface)?;
     validate_ip(ip)?;
     validate_ip(subnet_mask)?;
     if let Some(gw) = gateway {
@@ -102,6 +103,17 @@ pub(crate) async fn run_command(program: &str, args: &[&str]) -> Result<String, 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+fn validate_interface_name(name: &str) -> Result<(), AppError> {
+    let known = super::interface::list_all()?;
+    if !known.iter().any(|iface| iface.name == name) {
+        return Err(AppError::Network(format!(
+            "Unknown network interface: {}",
+            name
+        )));
+    }
+    Ok(())
+}
+
 fn validate_ip(ip: &str) -> Result<(), AppError> {
     ip.parse::<std::net::Ipv4Addr>()
         .map_err(|_| AppError::Network(format!("Invalid IP address: {}", ip)))?;
@@ -119,6 +131,7 @@ fn mask_to_prefix(mask: &str) -> Result<u8, AppError> {
 
 /// Add a secondary IP address to an interface (preserves existing IPs).
 pub async fn add_secondary_ip(interface: &str, ip: &str, mask: &str) -> Result<(), AppError> {
+    validate_interface_name(interface)?;
     validate_ip(ip)?;
     validate_ip(mask)?;
 
@@ -144,6 +157,7 @@ pub async fn add_secondary_ip(interface: &str, ip: &str, mask: &str) -> Result<(
 
 /// Remove a secondary IP address from an interface.
 pub async fn remove_secondary_ip(interface: &str, ip: &str) -> Result<(), AppError> {
+    validate_interface_name(interface)?;
     validate_ip(ip)?;
 
     #[cfg(target_os = "windows")]
