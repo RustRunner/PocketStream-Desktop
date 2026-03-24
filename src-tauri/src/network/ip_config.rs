@@ -104,7 +104,7 @@ pub(crate) async fn run_command(program: &str, args: &[&str]) -> Result<String, 
 }
 
 fn validate_interface_name(name: &str) -> Result<(), AppError> {
-    let known = super::interface::list_all()?;
+    let known = super::interface::list_physical()?;
     if !known.iter().any(|iface| iface.name == name) {
         return Err(AppError::Network(format!(
             "Unknown network interface: {}",

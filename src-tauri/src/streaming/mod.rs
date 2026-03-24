@@ -140,20 +140,44 @@ impl StreamManager {
         let port = settings.rtsp_server.port;
         let mount_path = format!("/stream-{}", settings.rtsp_server.token);
 
+        // Resolve bind interface to an IP address
+        let bind_address = if settings.rtsp_server.bind_interface.is_empty() {
+            None
+        } else {
+            let iface = crate::network::interface::get_by_name(
+                &settings.rtsp_server.bind_interface,
+            )?;
+            let ip = iface.ips.first().map(|ip| ip.address.clone()).ok_or_else(
+                || AppError::Stream(format!(
+                    "Interface '{}' has no IPv4 address",
+                    settings.rtsp_server.bind_interface
+                )),
+            )?;
+            Some(ip)
+        };
+
         let server = match settings.stream.protocol.as_str() {
             "udp" => RtspRestreamer::start_from_udp(
                 settings.stream.udp_port,
                 port,
                 &mount_path,
+                bind_address.as_deref(),
             )?,
             _ => {
                 let input_url = Self::build_input_url(settings);
-                RtspRestreamer::start_from_rtsp(&input_url, port, &mount_path)?
+                RtspRestreamer::start_from_rtsp(
+                    &input_url,
+                    port,
+                    &mount_path,
+                    bind_address.as_deref(),
+                )?
             }
         };
 
-        // Determine local IP for the URL shown to users
-        let local_ip = get_local_ip().unwrap_or_else(|| "0.0.0.0".into());
+        // Use bind address for client URL if set, otherwise detect local IP
+        let local_ip = bind_address.unwrap_or_else(|| {
+            get_local_ip().unwrap_or_else(|| "0.0.0.0".into())
+        });
         let client_url = server.client_url(&local_ip);
 
         state.rtsp_server = Some(server);

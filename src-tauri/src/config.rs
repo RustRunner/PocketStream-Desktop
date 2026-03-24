@@ -30,6 +30,9 @@ pub struct RtspServerConfig {
     pub port: u16,
     /// Authentication token for RTSP access
     pub token: String,
+    /// Network interface to bind the RTSP server to (empty = all interfaces)
+    #[serde(default)]
+    pub bind_interface: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +64,7 @@ impl Default for AppSettings {
                 enabled: false,
                 port: 8554,
                 token: generate_token(),
+                bind_interface: String::new(),
             },
             credentials: Credentials {
                 username: String::new(),

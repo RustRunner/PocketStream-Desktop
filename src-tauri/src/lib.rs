@@ -66,6 +66,7 @@ pub fn run() {
             // Network
             commands::scan_network,
             commands::list_interfaces,
+            commands::list_vpn_interfaces,
             commands::set_static_ip,
             commands::get_interface_info,
             // ARP Discovery
@@ -100,7 +101,7 @@ pub fn run() {
             let handle = app.handle().clone();
             // Auto-start ARP discovery on the first Ethernet interface
             tauri::async_runtime::spawn(async move {
-                match network::interface::list_all() {
+                match network::interface::list_physical() {
                     Ok(interfaces) => {
                         let eth = interfaces
                             .iter()

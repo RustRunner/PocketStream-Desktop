@@ -30,6 +30,10 @@ export async function listInterfaces() {
   return await invoke("list_interfaces");
 }
 
+export async function listVpnInterfaces() {
+  return await invoke("list_vpn_interfaces");
+}
+
 export async function getInterfaceInfo(name) {
   return await invoke("get_interface_info", { name });
 }

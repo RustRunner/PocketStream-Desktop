@@ -49,7 +49,7 @@ pub fn start_listener(
         log::info!("pcap: found {} capture devices", pcap_devices.len());
 
         // Find the Ethernet adapter by matching IPs
-        let our_ips: Vec<std::net::IpAddr> = match crate::network::interface::list_all() {
+        let our_ips: Vec<std::net::IpAddr> = match crate::network::interface::list_physical() {
             Ok(ifaces) => ifaces
                 .iter()
                 .filter(|i| i.is_ethernet && i.is_up)

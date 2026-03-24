@@ -22,9 +22,13 @@ impl RtspRestreamer {
         input_url: &str,
         port: u16,
         mount_path: &str,
+        bind_address: Option<&str>,
     ) -> Result<Self, AppError> {
         let server = gst_rtsp_server::RTSPServer::new();
         server.set_service(&port.to_string());
+        if let Some(addr) = bind_address {
+            server.set_address(addr);
+        }
 
         let factory = gst_rtsp_server::RTSPMediaFactory::new();
 
@@ -68,9 +72,13 @@ impl RtspRestreamer {
         udp_port: u16,
         server_port: u16,
         mount_path: &str,
+        bind_address: Option<&str>,
     ) -> Result<Self, AppError> {
         let server = gst_rtsp_server::RTSPServer::new();
         server.set_service(&server_port.to_string());
+        if let Some(addr) = bind_address {
+            server.set_address(addr);
+        }
 
         let factory = gst_rtsp_server::RTSPMediaFactory::new();
 

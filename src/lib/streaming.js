@@ -97,7 +97,28 @@ function updateStreamUI() {
 
 // ── RTSP server controls ────────────────────────────────────────────
 
-export function setupRtspControls() {
+export async function setupRtspControls() {
+  // Sync Start button disabled state with the Enable toggle
+  const enableToggle = $("#rtsp-server-enable");
+  const startBtn = $("#btn-toggle-rtsp");
+  startBtn.disabled = !enableToggle.checked;
+  enableToggle.addEventListener("change", () => {
+    startBtn.disabled = !enableToggle.checked;
+  });
+
+  // Populate VPN dropdown in background — don't block other setup
+  populateVpnDropdown();
+
+  $("#rtsp-bind-interface").addEventListener("change", async () => {
+    if (!state.config) return;
+    state.config.rtsp_server.bind_interface = $("#rtsp-bind-interface").value;
+    try {
+      await api.saveConfig(state.config);
+    } catch (e) {
+      showToast("Failed to save VPN selection: " + e, true);
+    }
+  });
+
   $("#btn-toggle-rtsp").addEventListener("click", async () => {
     if (state.isRtspRunning) {
       try {
@@ -110,6 +131,11 @@ export function setupRtspControls() {
       }
     } else {
       try {
+        // Save bind_interface selection before starting
+        if (state.config) {
+          state.config.rtsp_server.bind_interface = $("#rtsp-bind-interface").value;
+          await api.saveConfig(state.config);
+        }
         const url = await api.startRtspServer();
         state.isRtspRunning = true;
         updateRtspUI(url);
@@ -122,9 +148,30 @@ export function setupRtspControls() {
   });
 }
 
+async function populateVpnDropdown() {
+  const select = $("#rtsp-bind-interface");
+  try {
+    const vpns = (await api.listVpnInterfaces()).filter((i) => i.ips.length > 0);
+    for (const iface of vpns) {
+      const opt = document.createElement("option");
+      opt.value = iface.name;
+      opt.textContent = `${iface.name} (${iface.ips[0].address})`;
+      select.appendChild(opt);
+    }
+    // Restore saved selection
+    if (state.config && state.config.rtsp_server.bind_interface) {
+      select.value = state.config.rtsp_server.bind_interface;
+    }
+  } catch (e) {
+    console.warn("Failed to list VPN interfaces:", e);
+  }
+}
+
 function updateRtspUI(url) {
   const btn = $("#btn-toggle-rtsp");
   btn.textContent = state.isRtspRunning ? "Stop Server" : "Start Server";
+  // Always allow stopping; respect Enable toggle when stopped
+  btn.disabled = state.isRtspRunning ? false : !$("#rtsp-server-enable").checked;
 
   const statusEl = $("#rtsp-status");
   if (state.isRtspRunning) {

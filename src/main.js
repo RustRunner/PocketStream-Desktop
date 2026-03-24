@@ -47,6 +47,9 @@ async function loadConfig() {
     $("#rtsp-server-enable").checked = state.config.rtsp_server.enabled;
     $("#rtsp-server-port").value = state.config.rtsp_server.port;
     $("#rtsp-token").value = state.config.rtsp_server.token;
+    if (state.config.rtsp_server.bind_interface) {
+      $("#rtsp-bind-interface").value = state.config.rtsp_server.bind_interface;
+    }
 
     // Set active protocol
     const proto = state.config.stream.protocol;
@@ -75,6 +78,7 @@ function setupSettingsSave() {
         enabled: $("#rtsp-server-enable").checked,
         port: parseInt($("#rtsp-server-port").value) || 8554,
         token: $("#rtsp-token").value,
+        bind_interface: state.config?.rtsp_server?.bind_interface || "",
       },
       credentials: {
         username: $("#camera-user").value,

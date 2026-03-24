@@ -39,7 +39,7 @@ impl NetworkManager {
     }
 
     pub fn list_interfaces(&self) -> Result<Vec<InterfaceInfo>, AppError> {
-        interface::list_all()
+        interface::list_physical()
     }
 
     pub fn get_interface(&self, name: &str) -> Result<InterfaceInfo, AppError> {
