@@ -12,5 +12,6 @@ src-tauri/gen/
 *.jpg
 *.jpeg
 pocketstream-audit-*.md
+security-audit-*.md
 DHCP-Clone-23MAR26.md
 .cargo/
