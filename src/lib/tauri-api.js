@@ -42,6 +42,14 @@ export async function setStaticIp(name, ip, subnetMask, gateway = null) {
   return await invoke("set_static_ip", { name, ip, subnetMask, gateway });
 }
 
+export async function addSecondaryIp(name, ip, subnetMask) {
+  return await invoke("add_secondary_ip", { name, ip, subnetMask });
+}
+
+export async function removeSecondaryIp(name, ip) {
+  return await invoke("remove_secondary_ip", { name, ip });
+}
+
 // ── ARP Discovery ───────────────────────────────────────────────────
 
 export async function startArpDiscovery(iface) {

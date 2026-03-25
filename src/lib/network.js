@@ -143,75 +143,155 @@ export function setupCameraIpDropdown() {
 
 // ── IP Configuration dialog ─────────────────────────────────────────
 
+/** Interfaces loaded when dialog opens — used by add/remove handlers. */
+let dialogInterfaces = [];
+
 export function setupIpConfigDialog() {
   const dialog = $("#ip-config-dialog");
-  let activeMode = "static";
 
-  // Open dialog — show immediately, populate interfaces async
+  // ── Open dialog ──────────────────────────────────────────────────
   $("#btn-ip-config").addEventListener("click", async () => {
     const select = $("#static-iface");
-    select.innerHTML = '<option value="">Loading interfaces…</option>';
+    select.innerHTML = '<option value="">Loading…</option>';
 
     api.setVideoVisible(false);
     dialog.showModal();
     dialog.addEventListener("close", () => api.setVideoVisible(true), { once: true });
 
     try {
-      const interfaces = await api.listInterfaces();
-      select.innerHTML = (interfaces || [])
-        .filter((i) => i.is_ethernet)
-        .map((i) => `<option value="${i.name}">${i.display_name || i.name} (${i.ip || "no IP"})</option>`)
+      dialogInterfaces = (await api.listInterfaces() || []).filter((i) => i.is_ethernet);
+      select.innerHTML = dialogInterfaces
+        .map((i) => {
+          const ip = i.ips.length > 0 ? i.ips[0].address : "no IP";
+          return `<option value="${i.name}">${i.display_name || i.name} (${ip})</option>`;
+        })
         .join("");
+      populateDialogFields();
     } catch (_) {
-      select.innerHTML = '<option value="">Failed to load interfaces</option>';
+      select.innerHTML = '<option value="">Failed to load</option>';
     }
   });
 
-  // Mode toggle within dialog
-  $$("[data-ip-mode]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      $$("[data-ip-mode]").forEach((b) => b.classList.remove("active"));
-      btn.classList.add("active");
-      activeMode = btn.dataset.ipMode;
+  // Re-populate when interface selection changes
+  $("#static-iface").addEventListener("change", populateDialogFields);
 
-      $$("#ip-config-static, #ip-config-dhcp-client, #ip-config-dhcp-server").forEach(
-        (s) => (s.style.display = "none")
-      );
-      $(`#ip-config-${activeMode}`).style.display = "";
-    });
+  // ── Add secondary IP ─────────────────────────────────────────────
+  $("#btn-add-sec-ip").addEventListener("click", async () => {
+    const iface = $("#static-iface").value;
+    const ip = $("#add-sec-ip").value.trim();
+    const mask = $("#add-sec-mask").value.trim();
+    if (!iface || !ip || !mask) {
+      showToast("Enter an IP and mask", true);
+      return;
+    }
+    try {
+      await api.addSecondaryIp(iface, ip, mask);
+      $("#add-sec-ip").value = "";
+      showToast("Secondary IP added");
+      await reloadDialogInterfaces();
+    } catch (e) {
+      showToast("Failed: " + e, true);
+    }
   });
 
+  // ── Cancel ───────────────────────────────────────────────────────
   $("#ip-config-cancel").addEventListener("click", () => dialog.close());
 
+  // ── Apply (primary IP only) ──────────────────────────────────────
   $("#ip-config-apply").addEventListener("click", async () => {
-    if (activeMode === "static") {
-      const iface = $("#static-iface").value;
-      const ip = $("#static-ip").value;
-      const mask = $("#static-mask").value;
-      const gw = $("#static-gateway").value || null;
+    const iface = $("#static-iface").value;
+    const ip = $("#static-ip").value.trim();
+    const mask = $("#static-mask").value.trim();
+    const gw = $("#static-gateway").value.trim() || null;
 
-      if (!iface || !ip || !mask) {
-        showToast("Please fill in all required fields", true);
-        return;
-      }
+    if (!iface || !ip || !mask) {
+      showToast("Fill in address and mask", true);
+      return;
+    }
 
+    try {
+      await api.setStaticIp(iface, ip, mask, gw);
+      showToast("Primary IP updated");
+      dialog.close();
+      await refreshInterfaces();
+    } catch (e) {
+      showToast("Failed: " + e, true);
+    }
+  });
+}
+
+/** Fill primary IP fields and secondary IP list from the selected interface. */
+function populateDialogFields() {
+  const name = $("#static-iface").value;
+  const iface = dialogInterfaces.find((i) => i.name === name);
+  if (!iface) return;
+
+  // Primary = first IP
+  const primary = iface.ips[0];
+  $("#static-ip").value = primary ? primary.address : "";
+  $("#static-mask").value = primary ? prefixToMask(primary.prefix) : "255.255.255.0";
+  $("#static-gateway").value = "";
+
+  // Secondary = all remaining IPs
+  renderSecondaryIps(iface);
+}
+
+/** Render the secondary IP list with remove buttons. */
+function renderSecondaryIps(iface) {
+  const list = $("#secondary-ip-list");
+  const secondaries = iface.ips.slice(1);
+
+  if (secondaries.length === 0) {
+    list.innerHTML = '<p class="placeholder-text" style="padding:8px">No secondary IPs</p>';
+    return;
+  }
+
+  list.innerHTML = secondaries
+    .map((ip) => {
+      const isAuto = adoptedSubnets.has(ip.subnet);
+      const badge = isAuto ? '<span class="badge-auto">(auto)</span>' : "";
+      return `<div class="secondary-ip-item">
+        <span>${ip.address}/${ip.prefix} ${badge}</span>
+        <button class="btn-remove-ip" data-remove-sec-ip="${ip.address}" title="Remove">×</button>
+      </div>`;
+    })
+    .join("");
+
+  // Wire remove buttons
+  list.querySelectorAll("[data-remove-sec-ip]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const ip = btn.dataset.removeSecIp;
+      const ifaceName = $("#static-iface").value;
       try {
-        await api.setStaticIp(iface, ip, mask, gw);
-        $("#ip-mode").textContent = "Static";
-        showToast("Static IP assigned");
-        dialog.close();
-        await refreshInterfaces();
+        await api.removeSecondaryIp(ifaceName, ip);
+        // Also remove from adopted map if it was auto-adopted
+        for (const [subnet, adoptedIp] of adoptedSubnets) {
+          if (adoptedIp === ip) {
+            adoptedSubnets.delete(subnet);
+            break;
+          }
+        }
+        showToast(`Removed ${ip}`);
+        await reloadDialogInterfaces();
       } catch (e) {
         showToast("Failed: " + e, true);
       }
-    } else if (activeMode === "dhcp-client") {
-      $("#ip-mode").textContent = "DHCP Client";
-      showToast("DHCP Client — coming soon");
-      dialog.close();
-    } else if (activeMode === "dhcp-server") {
-      $("#ip-mode").textContent = "DHCP Server";
-      showToast("DHCP Server — coming soon");
-      dialog.close();
-    }
+    });
   });
+}
+
+/** Reload interfaces and refresh dialog fields without closing. */
+async function reloadDialogInterfaces() {
+  try {
+    dialogInterfaces = (await api.listInterfaces() || []).filter((i) => i.is_ethernet);
+    populateDialogFields();
+    // Also refresh the host card
+    await refreshInterfaces();
+  } catch (_) {}
+}
+
+/** Convert CIDR prefix to dotted mask (e.g. 24 → "255.255.255.0"). */
+function prefixToMask(prefix) {
+  const bits = prefix >= 32 ? 0xFFFFFFFF : (0xFFFFFFFF << (32 - prefix)) >>> 0;
+  return [bits >>> 24, (bits >>> 16) & 0xFF, (bits >>> 8) & 0xFF, bits & 0xFF].join(".");
 }

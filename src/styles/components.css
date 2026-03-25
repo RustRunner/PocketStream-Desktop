@@ -653,8 +653,64 @@
   margin: 4px 0;
 }
 
-.ip-mode-toggle {
-  margin-bottom: 16px;
+/* ── IP Config Dialog ──────────────────────────────────────────────── */
+
+.ip-config-dialog {
+  min-width: 460px;
+}
+
+.ip-section-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--md-on-surface-variant);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  margin: 16px 0 8px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--md-surface-variant);
+}
+
+.ip-row-fields {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+}
+
+.ip-add-row {
+  margin-top: 8px;
+}
+
+.ip-add-row .icon-btn {
+  margin-bottom: 12px;
+  flex-shrink: 0;
+  color: var(--md-primary-light);
+}
+
+.secondary-ip-list {
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+.secondary-ip-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px;
+  border-radius: var(--md-radius-sm);
+  font-family: var(--md-font-mono);
+  font-size: 13px;
+}
+
+.secondary-ip-item:hover {
+  background: var(--md-surface-variant);
+}
+
+.secondary-ip-item .badge-auto {
+  margin-left: 6px;
+}
+
+.secondary-ip-item .btn-remove-ip {
+  flex-shrink: 0;
 }
 
 .subnet-row,

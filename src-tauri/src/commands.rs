@@ -61,6 +61,23 @@ pub async fn set_static_ip(
         .await
 }
 
+#[tauri::command]
+pub async fn add_secondary_ip(
+    name: String,
+    ip: String,
+    subnet_mask: String,
+) -> Result<(), AppError> {
+    crate::network::ip_config::add_secondary_ip(&name, &ip, &subnet_mask).await
+}
+
+#[tauri::command]
+pub async fn remove_secondary_ip(
+    name: String,
+    ip: String,
+) -> Result<(), AppError> {
+    crate::network::ip_config::remove_secondary_ip(&name, &ip).await
+}
+
 // ── ARP Discovery Commands ───────────────────────────────────────────
 
 #[tauri::command]

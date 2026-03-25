@@ -32,13 +32,18 @@ export function setupArpListeners() {
     adoptedSubnets.set(data.subnet, data.adopted_ip);
     renderSubnetList();
 
-    for (const device of arpDevices.values()) {
-      if (device.subnet === data.subnet) {
-        scannedIps.delete(device.ip);
-        showScanSpinner(true);
-        scanDevicePorts(device.ip);
+    // Re-scan devices on the adopted subnet after a delay.
+    // netsh takes a few seconds to fully activate the new IP.
+    setTimeout(() => {
+      for (const device of arpDevices.values()) {
+        if (device.subnet === data.subnet) {
+          scannedIps.delete(device.ip);
+          tcpScanResults.delete(device.ip);
+          showScanSpinner(true);
+          scanDevicePorts(device.ip);
+        }
       }
-    }
+    }, 2000);
   });
 
   loadExistingArpState();
@@ -74,23 +79,40 @@ export async function loadExistingArpState() {
 
 // ── Port scanning ───────────────────────────────────────────────────
 
-async function scanDevicePorts(ip) {
-  if (scannedIps.has(ip)) return;
+const MAX_SCAN_RETRIES = 3;
+const RETRY_DELAY_MS = 5000;
+
+async function scanDevicePorts(ip, attempt = 0) {
+  if (attempt === 0 && scannedIps.has(ip)) return;
   scannedIps.add(ip);
-  pendingScans++;
+  if (attempt === 0) pendingScans++;
 
   try {
     const results = await api.scanNetwork(`${ip}/32`);
+    let found = false;
     if (results) {
       for (const r of results) {
         if (r.reachable && r.open_ports.length > 0) {
           tcpScanResults.set(r.ip, r);
+          found = true;
         }
+      }
+    }
+    if (!found) {
+      scannedIps.delete(ip);
+      // Retry — the device may be on a subnet that was just adopted
+      if (attempt < MAX_SCAN_RETRIES) {
+        setTimeout(() => scanDevicePorts(ip, attempt + 1), RETRY_DELAY_MS);
+        return; // don't decrement pendingScans yet
       }
     }
   } catch (e) {
     log(`Port scan failed for ${ip}: ${e}`);
     scannedIps.delete(ip);
+    if (attempt < MAX_SCAN_RETRIES) {
+      setTimeout(() => scanDevicePorts(ip, attempt + 1), RETRY_DELAY_MS);
+      return;
+    }
   }
 
   pendingScans--;

@@ -13,8 +13,10 @@ pub fn already_on_subnet(device_ip: Ipv4Addr, current_ips: &[Ipv4Addr]) -> bool 
 }
 
 /// Pick a candidate IP on the same /24 as `device_ip`.
-/// Tries .100, then .101, .99, .102, .98, etc., skipping the device IP itself.
-fn pick_candidate_ip(device_ip: Ipv4Addr) -> Vec<Ipv4Addr> {
+/// Tries .100, then .101, .99, .102, .98, etc., skipping the device IP itself
+/// and any last-octet values already used by the interface (to keep IPs
+/// distinguishable across subnets).
+fn pick_candidate_ip(device_ip: Ipv4Addr, used_last_octets: &[u8]) -> Vec<Ipv4Addr> {
     let octets = device_ip.octets();
     let device_last = octets[3];
     let base = [octets[0], octets[1], octets[2]];
@@ -22,7 +24,12 @@ fn pick_candidate_ip(device_ip: Ipv4Addr) -> Vec<Ipv4Addr> {
     let mut candidates = Vec::new();
     let starts: &[u8] = &[100, 101, 99, 102, 98, 103, 97, 104, 96, 105, 95];
     for &last in starts {
-        if last != device_last && last != 0 && last != 255 && last != 1 {
+        if last != device_last
+            && last != 0
+            && last != 255
+            && last != 1
+            && !used_last_octets.contains(&last)
+        {
             candidates.push(Ipv4Addr::new(base[0], base[1], base[2], last));
         }
     }
@@ -44,7 +51,10 @@ pub async fn adopt_subnet(
         return Ok(None);
     }
 
-    let candidates = pick_candidate_ip(device_ip);
+    // Collect last octets from all existing IPs on the interface so the
+    // candidate picker avoids them (keeps IPs distinguishable across subnets).
+    let used_last_octets: Vec<u8> = current_ips.iter().map(|ip| ip.octets()[3]).collect();
+    let candidates = pick_candidate_ip(device_ip, &used_last_octets);
 
     for candidate in candidates {
         // ARP probe to check if candidate is in use
@@ -136,7 +146,7 @@ mod tests {
     #[test]
     fn pick_candidate_returns_same_subnet() {
         let device = Ipv4Addr::new(192, 168, 5, 10);
-        let candidates = pick_candidate_ip(device);
+        let candidates = pick_candidate_ip(device, &[]);
         assert!(!candidates.is_empty());
         for c in &candidates {
             let o = c.octets();
@@ -149,21 +159,21 @@ mod tests {
     #[test]
     fn pick_candidate_starts_at_100() {
         let device = Ipv4Addr::new(10, 0, 0, 50);
-        let candidates = pick_candidate_ip(device);
+        let candidates = pick_candidate_ip(device, &[]);
         assert_eq!(candidates[0], Ipv4Addr::new(10, 0, 0, 100));
     }
 
     #[test]
     fn pick_candidate_skips_device_ip() {
         let device = Ipv4Addr::new(10, 0, 0, 100);
-        let candidates = pick_candidate_ip(device);
+        let candidates = pick_candidate_ip(device, &[]);
         assert!(!candidates.contains(&Ipv4Addr::new(10, 0, 0, 100)));
     }
 
     #[test]
     fn pick_candidate_skips_reserved_addresses() {
         let device = Ipv4Addr::new(10, 0, 0, 50);
-        let candidates = pick_candidate_ip(device);
+        let candidates = pick_candidate_ip(device, &[]);
         for c in &candidates {
             let last = c.octets()[3];
             assert_ne!(last, 0, "Should not pick .0 (network)");
@@ -175,15 +185,36 @@ mod tests {
     #[test]
     fn pick_candidate_returns_multiple() {
         let device = Ipv4Addr::new(172, 16, 0, 50);
-        let candidates = pick_candidate_ip(device);
+        let candidates = pick_candidate_ip(device, &[]);
         assert!(candidates.len() >= 5, "Should return several candidates");
     }
 
     #[test]
     fn pick_candidate_no_duplicates() {
         let device = Ipv4Addr::new(10, 0, 0, 50);
-        let candidates = pick_candidate_ip(device);
+        let candidates = pick_candidate_ip(device, &[]);
         let unique: std::collections::HashSet<_> = candidates.iter().collect();
         assert_eq!(unique.len(), candidates.len());
+    }
+
+    #[test]
+    fn pick_candidate_skips_used_last_octets() {
+        let device = Ipv4Addr::new(10, 0, 0, 50);
+        // Interface already has .100 — candidate should skip it
+        let candidates = pick_candidate_ip(device, &[100]);
+        assert!(!candidates.contains(&Ipv4Addr::new(10, 0, 0, 100)));
+        // Should start with .101 instead
+        assert_eq!(candidates[0], Ipv4Addr::new(10, 0, 0, 101));
+    }
+
+    #[test]
+    fn pick_candidate_skips_multiple_used_octets() {
+        let device = Ipv4Addr::new(10, 0, 0, 50);
+        // Interface has .100 and .101
+        let candidates = pick_candidate_ip(device, &[100, 101]);
+        assert!(!candidates.contains(&Ipv4Addr::new(10, 0, 0, 100)));
+        assert!(!candidates.contains(&Ipv4Addr::new(10, 0, 0, 101)));
+        // Should start with .99
+        assert_eq!(candidates[0], Ipv4Addr::new(10, 0, 0, 99));
     }
 }

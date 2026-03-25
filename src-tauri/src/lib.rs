@@ -68,6 +68,8 @@ pub fn run() {
             commands::list_interfaces,
             commands::list_vpn_interfaces,
             commands::set_static_ip,
+            commands::add_secondary_ip,
+            commands::remove_secondary_ip,
             commands::get_interface_info,
             // ARP Discovery
             commands::start_arp_discovery,

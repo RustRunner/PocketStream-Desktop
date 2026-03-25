@@ -329,43 +329,47 @@
     </dialog>
 
     <!-- IP Config Dialog -->
-    <dialog id="ip-config-dialog" class="dialog">
+    <dialog id="ip-config-dialog" class="dialog ip-config-dialog">
       <h2>IP Configuration</h2>
       <div class="dialog-body">
-        <div class="toggle-group ip-mode-toggle">
-          <button class="toggle-btn active" data-ip-mode="static">Static IP</button>
-          <button class="toggle-btn" data-ip-mode="dhcp-client">DHCP Client</button>
-          <button class="toggle-btn" data-ip-mode="dhcp-server">DHCP Server</button>
+        <!-- Interface selector -->
+        <div class="input-field">
+          <label for="static-iface">Interface</label>
+          <select id="static-iface"></select>
         </div>
 
-        <!-- Static IP fields -->
-        <div id="ip-config-static" class="ip-config-section">
-          <div class="input-field">
-            <label for="static-iface">Interface</label>
-            <select id="static-iface"></select>
-          </div>
-          <div class="input-field">
-            <label for="static-ip">IP Address</label>
+        <!-- Primary IP -->
+        <h3 class="ip-section-label">Primary IP</h3>
+        <div class="ip-row-fields">
+          <div class="input-field" style="flex:2">
+            <label for="static-ip">Address</label>
             <input type="text" id="static-ip" placeholder="192.168.1.100" />
           </div>
-          <div class="input-field">
-            <label for="static-mask">Subnet Mask</label>
+          <div class="input-field" style="flex:1">
+            <label for="static-mask">Mask</label>
             <input type="text" id="static-mask" value="255.255.255.0" />
           </div>
-          <div class="input-field">
-            <label for="static-gateway">Gateway (optional)</label>
-            <input type="text" id="static-gateway" placeholder="192.168.1.1" />
+        </div>
+        <div class="input-field">
+          <label for="static-gateway">Gateway (optional)</label>
+          <input type="text" id="static-gateway" placeholder="192.168.1.1" />
+        </div>
+
+        <!-- Secondary IPs -->
+        <h3 class="ip-section-label">Secondary IPs</h3>
+        <div id="secondary-ip-list" class="secondary-ip-list"></div>
+        <div class="ip-row-fields ip-add-row">
+          <div class="input-field" style="flex:2">
+            <input type="text" id="add-sec-ip" placeholder="10.0.0.100" />
           </div>
-        </div>
-
-        <!-- DHCP Client placeholder -->
-        <div id="ip-config-dhcp-client" class="ip-config-section" style="display:none">
-          <p class="placeholder-text">DHCP Client — coming soon</p>
-        </div>
-
-        <!-- DHCP Server placeholder -->
-        <div id="ip-config-dhcp-server" class="ip-config-section" style="display:none">
-          <p class="placeholder-text">DHCP Server — coming soon</p>
+          <div class="input-field" style="flex:1">
+            <input type="text" id="add-sec-mask" value="255.255.255.0" />
+          </div>
+          <button id="btn-add-sec-ip" class="icon-btn small" title="Add secondary IP">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/>
+            </svg>
+          </button>
         </div>
       </div>
       <div class="dialog-actions">

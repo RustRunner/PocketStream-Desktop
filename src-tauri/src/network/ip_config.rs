@@ -41,7 +41,12 @@ async fn assign_windows(
     subnet_mask: &str,
     gateway: Option<&str>,
 ) -> Result<(), AppError> {
-    // Set static IP
+    // Snapshot existing secondary IPs before the set (which replaces all).
+    let secondaries: Vec<super::interface::IpInfo> = super::interface::get_by_name(interface)
+        .map(|info| info.ips.into_iter().skip(1).collect())
+        .unwrap_or_default();
+
+    // Set primary static IP (replaces all existing IPs)
     let mut args = vec![
         "interface", "ip", "set", "address",
         interface, "static", ip, subnet_mask,
@@ -49,9 +54,36 @@ async fn assign_windows(
     if let Some(gw) = gateway {
         args.push(gw);
     }
-
     run_command("netsh", &args).await?;
+
+    // Re-add secondary IPs that were wiped by the set command.
+    // Skip the new primary if it happened to also be a secondary.
+    for sec in &secondaries {
+        if sec.address == ip {
+            continue;
+        }
+        let mask = prefix_to_mask(sec.prefix);
+        let name_arg = format!("name={}", interface);
+        if let Err(e) = run_command(
+            "netsh",
+            &["interface", "ip", "add", "address", &name_arg, &sec.address, &mask],
+        ).await {
+            log::warn!("Failed to restore secondary IP {}: {}", sec.address, e);
+        }
+    }
+
     Ok(())
+}
+
+/// Convert a CIDR prefix length to a dotted subnet mask.
+fn prefix_to_mask(prefix: u8) -> String {
+    let bits: u32 = if prefix >= 32 {
+        0xFFFFFFFF
+    } else {
+        0xFFFFFFFF << (32 - prefix)
+    };
+    let o = bits.to_be_bytes();
+    format!("{}.{}.{}.{}", o[0], o[1], o[2], o[3])
 }
 
 #[cfg(target_os = "linux")]
