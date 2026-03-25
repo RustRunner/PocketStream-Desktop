@@ -10,6 +10,12 @@ use tokio::sync::Mutex;
 use crate::config::AppSettings;
 use crate::error::AppError;
 
+#[derive(Debug, Clone, Serialize)]
+pub struct RtspServerInfo {
+    pub rtsp_url: String,
+    pub display_url: String,
+}
+
 use rtsp_client::PlaybackPipeline;
 use rtsp_server::RtspRestreamer;
 
@@ -18,6 +24,7 @@ pub struct StreamStatus {
     pub playing: bool,
     pub rtsp_server_running: bool,
     pub rtsp_url: Option<String>,
+    pub display_url: Option<String>,
     pub recording: bool,
     pub uptime_secs: u64,
     pub bandwidth_kbps: f64,
@@ -33,6 +40,9 @@ struct StreamState {
     recording: bool,
     recording_path: Option<String>,
     start_time: Option<std::time::Instant>,
+    rtsp_start_time: Option<std::time::Instant>,
+    /// Cached IP resolved at RTSP server start — avoids running PowerShell every poll.
+    rtsp_local_ip: Option<String>,
     video_child_hwnd: Option<isize>,
 }
 
@@ -45,6 +55,8 @@ impl StreamManager {
                 recording: false,
                 recording_path: None,
                 start_time: None,
+                rtsp_start_time: None,
+                rtsp_local_ip: None,
                 video_child_hwnd: None,
             })),
         }
@@ -131,13 +143,19 @@ impl StreamManager {
         Ok(())
     }
 
-    pub async fn start_rtsp_server(&self, settings: &AppSettings) -> Result<String, AppError> {
+    pub async fn start_rtsp_server(&self, settings: &AppSettings) -> Result<RtspServerInfo, AppError> {
+        let port = settings.rtsp_server.port;
+
+        // Ensure firewall allows inbound TCP on the RTSP port.
+        // Non-fatal — server still works on localhost if this fails.
+        if let Err(e) = crate::network::firewall::ensure_rtsp_allowed(port) {
+            log::warn!("Firewall setup: {}", e);
+        }
+
         let mut state = self.state.lock().await;
 
         // Stop existing server if any
         state.rtsp_server = None;
-
-        let port = settings.rtsp_server.port;
         let mount_path = format!("/stream-{}", settings.rtsp_server.token);
 
         // Resolve bind interface to an IP address
@@ -178,20 +196,30 @@ impl StreamManager {
         let local_ip = bind_address.unwrap_or_else(|| {
             get_local_ip().unwrap_or_else(|| "0.0.0.0".into())
         });
-        let client_url = server.client_url(&local_ip);
+        let info = RtspServerInfo {
+            rtsp_url: server.client_url(&local_ip),
+            display_url: server.display_url(&local_ip),
+        };
 
         state.rtsp_server = Some(server);
-        if state.start_time.is_none() {
-            state.start_time = Some(std::time::Instant::now());
-        }
+        state.rtsp_start_time = Some(std::time::Instant::now());
+        state.rtsp_local_ip = Some(local_ip);
 
-        Ok(client_url)
+        Ok(info)
     }
 
     pub async fn stop_rtsp_server(&self) -> Result<(), AppError> {
         let mut state = self.state.lock().await;
-        // Dropping the server stops it and detaches from the main context
-        state.rtsp_server = None;
+        if let Some(server) = state.rtsp_server.take() {
+            state.rtsp_start_time = None;
+            state.rtsp_local_ip = None;
+            // Drop the server in a blocking thread so GLib cleanup
+            // (closing active RTSP sessions) doesn't block the async runtime.
+            tokio::task::spawn_blocking(move || {
+                drop(server);
+                log::info!("RTSP server fully cleaned up");
+            });
+        }
         log::info!("RTSP server stopped");
         Ok(())
     }
@@ -199,20 +227,23 @@ impl StreamManager {
     pub async fn get_status(&self) -> Result<StreamStatus, AppError> {
         let state = self.state.lock().await;
         let uptime = state
-            .start_time
+            .rtsp_start_time
             .map(|t| t.elapsed().as_secs())
             .unwrap_or(0);
+
+        let cached_ip = state.rtsp_local_ip.as_deref().unwrap_or("0.0.0.0");
+        let bandwidth = state.rtsp_server.as_ref()
+            .map(|s| s.bandwidth_kbps())
+            .unwrap_or(0.0);
 
         Ok(StreamStatus {
             playing: state.playback.is_some(),
             rtsp_server_running: state.rtsp_server.is_some(),
-            rtsp_url: state.rtsp_server.as_ref().map(|s| {
-                let ip = get_local_ip().unwrap_or_else(|| "0.0.0.0".into());
-                s.client_url(&ip)
-            }),
+            rtsp_url: state.rtsp_server.as_ref().map(|s| s.client_url(cached_ip)),
+            display_url: state.rtsp_server.as_ref().map(|s| s.display_url(cached_ip)),
             recording: state.recording,
             uptime_secs: uptime,
-            bandwidth_kbps: 0.0, // TODO: query pipeline stats
+            bandwidth_kbps: bandwidth,
         })
     }
 
@@ -296,16 +327,30 @@ impl StreamManager {
     }
 }
 
-/// Get the first non-loopback IPv4 address on this machine.
+/// Get the local WiFi IPv4 address (preferred), falling back to any non-VPN interface.
+///
+/// The camera occupies the Ethernet port, so the RTSP server should bind to
+/// WiFi or a VPN-over-WiFi interface for local network streaming.
 fn get_local_ip() -> Option<String> {
-    // Use the interface listing which works on all platforms
-    crate::network::interface::list_all()
-        .ok()?
-        .into_iter()
-        .filter(|i| i.is_up && i.is_ethernet)
-        .flat_map(|i| i.ips)
+    let interfaces = crate::network::interface::list_all().ok()?;
+
+    // Prefer WiFi interfaces first
+    let wifi_ip = interfaces.iter()
+        .filter(|i| i.is_up && i.is_wifi && !i.is_vpn)
+        .flat_map(|i| &i.ips)
         .next()
-        .map(|ip| ip.address)
+        .map(|ip| ip.address.clone());
+
+    if wifi_ip.is_some() {
+        return wifi_ip;
+    }
+
+    // Fallback: any non-VPN interface with an IP
+    interfaces.iter()
+        .filter(|i| i.is_up && !i.is_vpn)
+        .flat_map(|i| &i.ips)
+        .next()
+        .map(|ip| ip.address.clone())
 }
 
 #[cfg(test)]
@@ -411,6 +456,7 @@ mod tests {
             playing: true,
             rtsp_server_running: false,
             rtsp_url: Some("rtsp://127.0.0.1:8554/stream-abc".into()),
+            display_url: Some("rtsp://127.0.0.1:8554".into()),
             recording: false,
             uptime_secs: 120,
             bandwidth_kbps: 0.0,
@@ -418,6 +464,7 @@ mod tests {
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("\"playing\":true"));
         assert!(json.contains("\"uptime_secs\":120"));
+        assert!(json.contains("\"display_url\":"));
     }
 
     #[test]
@@ -426,12 +473,14 @@ mod tests {
             playing: false,
             rtsp_server_running: false,
             rtsp_url: None,
+            display_url: None,
             recording: false,
             uptime_secs: 0,
             bandwidth_kbps: 0.0,
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("\"rtsp_url\":null"));
+        assert!(json.contains("\"display_url\":null"));
     }
 
     // ── StreamManager ───────────────────────────────────────────────

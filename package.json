@@ -10,7 +10,8 @@
     "tauri": "tauri"
   },
   "dependencies": {
-    "@material/web": "^2.0.0"
+    "@material/web": "^2.0.0",
+    "qrcode": "^1.5.4"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",

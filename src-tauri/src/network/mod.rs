@@ -1,5 +1,6 @@
 pub mod arp;
 pub mod auto_adopt;
+pub mod firewall;
 pub mod interface;
 pub mod ip_config;
 pub mod scanner;

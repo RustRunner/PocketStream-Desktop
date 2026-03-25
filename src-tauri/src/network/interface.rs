@@ -18,6 +18,7 @@ pub struct InterfaceInfo {
     pub mac: String,
     pub is_up: bool,
     pub is_ethernet: bool,
+    pub is_wifi: bool,
     pub is_vpn: bool,
 }
 
@@ -115,6 +116,7 @@ fn parse_adapter(a: &serde_json::Value, is_vpn: bool) -> InterfaceInfo {
     }).collect();
 
     let is_ethernet = media.contains("802.3");
+    let is_wifi = media.contains("802.11") || media.contains("Native 802.11");
 
     InterfaceInfo {
         display_name: name.clone(),
@@ -123,6 +125,7 @@ fn parse_adapter(a: &serde_json::Value, is_vpn: bool) -> InterfaceInfo {
         mac,
         is_up: true,
         is_ethernet,
+        is_wifi,
         is_vpn,
     }
 }
@@ -214,6 +217,7 @@ fn list_all_pnet() -> Result<Vec<InterfaceInfo>, AppError> {
                 mac: iface.mac.map(|m| m.to_string()).unwrap_or_default(),
                 is_up: iface.is_up(),
                 is_ethernet: lower.starts_with("eth") || lower.starts_with("en"),
+                is_wifi: lower.starts_with("wl") || lower.starts_with("wlan"),
                 is_vpn: lower.starts_with("tun")
                     || lower.starts_with("tap")
                     || lower.starts_with("wg")
@@ -264,6 +268,7 @@ mod tests {
             mac: "aa:bb:cc:dd:ee:ff".into(),
             is_up: true,
             is_ethernet: true,
+            is_wifi: false,
             is_vpn: false,
         };
         let json = serde_json::to_string(&iface).unwrap();
@@ -432,6 +437,7 @@ mod tests {
             }"#).unwrap();
             let iface = parse_adapter(&json, false);
             assert!(!iface.is_ethernet, "WiFi (802.11) must not be marked ethernet");
+            assert!(iface.is_wifi, "WiFi (802.11) must be marked as wifi");
         }
     }
 

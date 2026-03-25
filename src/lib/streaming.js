@@ -1,9 +1,13 @@
 /**
- * PocketStream Desktop — Stream, RTSP server, recording
+ * PocketStream Desktop — Stream, RTSP server, recording, QR code
  */
 
+import QRCode from "qrcode";
 import * as api from "./tauri-api.js";
 import { $, state, showToast, formatUptime } from "./state.js";
+
+/** Full RTSP URL (with token) — stored for QR code generation */
+let rtspFullUrl = null;
 
 // ── Video area bounds ───────────────────────────────────────────────
 
@@ -141,9 +145,10 @@ export async function setupRtspControls() {
           state.config.rtsp_server.bind_interface = $("#rtsp-bind-interface").value;
           await api.saveConfig(state.config);
         }
-        const url = await api.startRtspServer();
+        const info = await api.startRtspServer();
         state.isRtspRunning = true;
-        updateRtspUI(url);
+        rtspFullUrl = info.rtsp_url;
+        updateRtspUI(info.display_url);
         startStatusPolling();
         showToast("RTSP server started");
       } catch (e) {
@@ -151,6 +156,9 @@ export async function setupRtspControls() {
       }
     }
   });
+
+  // QR code button + dialog
+  setupQrDialog();
 }
 
 async function populateVpnDropdown() {
@@ -172,24 +180,64 @@ async function populateVpnDropdown() {
   }
 }
 
-function updateRtspUI(url) {
+function updateRtspUI(displayUrl) {
   const btn = $("#btn-toggle-rtsp");
   btn.textContent = state.isRtspRunning ? "Stop Server" : "Start Server";
   // Always allow stopping; respect Enable toggle when stopped
   btn.disabled = state.isRtspRunning ? false : !$("#rtsp-server-enable").checked;
 
   const statusEl = $("#rtsp-status");
+  const qrBtn = $("#btn-show-qr");
+
   if (state.isRtspRunning) {
     statusEl.textContent = "Online";
     statusEl.className = "status-value status-online";
-    $("#rtsp-url").textContent = url || "--";
+    $("#rtsp-url").textContent = displayUrl || "--";
+    qrBtn.disabled = false;
   } else {
     statusEl.textContent = "Offline";
     statusEl.className = "status-value status-offline";
     $("#rtsp-url").textContent = "--";
     $("#rtsp-uptime").textContent = "--";
     $("#rtsp-bandwidth").textContent = "--";
+    rtspFullUrl = null;
+    qrBtn.disabled = true;
   }
+}
+
+// ── QR Code Dialog ──────────────────────────────────────────────────
+
+function setupQrDialog() {
+  const dialog = $("#qr-dialog");
+  const qrBtn = $("#btn-show-qr");
+  const closeBtn = $("#qr-close");
+
+  qrBtn.addEventListener("click", async () => {
+    if (!rtspFullUrl) return;
+
+    const canvas = $("#qr-canvas");
+    try {
+      await QRCode.toCanvas(canvas, rtspFullUrl, {
+        width: 256,
+        margin: 2,
+        color: { dark: "#000000", light: "#ffffff" },
+      });
+    } catch (e) {
+      console.error("QR code generation failed:", e);
+      showToast("Failed to generate QR code", true);
+      return;
+    }
+
+    $("#qr-url").textContent = rtspFullUrl;
+    dialog.showModal();
+  });
+
+  closeBtn.addEventListener("click", () => dialog.close());
+
+  // Close on backdrop click
+  dialog.addEventListener("click", (e) => {
+    if (e.target === dialog) dialog.close();
+  });
 }
 
 // ── Status polling ──────────────────────────────────────────────────

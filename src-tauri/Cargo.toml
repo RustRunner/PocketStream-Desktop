@@ -31,8 +31,10 @@ reqwest = { version = "0.12", features = ["json"] }
 gstreamer = "0.23"
 gstreamer-app = "0.23"
 gstreamer-video = "0.23"
+gstreamer-rtsp = "0.23"
 gstreamer-rtsp-server = "0.23"
 glib = "0.20"
+gio = "0.20"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_Threading"] }

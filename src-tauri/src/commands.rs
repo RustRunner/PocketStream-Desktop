@@ -3,7 +3,7 @@ use tauri::State;
 use crate::config::{AppConfig, AppSettings};
 use crate::error::AppError;
 use crate::network::{ArpDevice, InterfaceInfo, NetworkManager, ScanResult};
-use crate::streaming::{StreamManager, StreamStatus};
+use crate::streaming::{RtspServerInfo, StreamManager, StreamStatus};
 
 // ── Config Commands ──────────────────────────────────────────────────
 
@@ -123,7 +123,7 @@ pub async fn stop_stream(stream: State<'_, StreamManager>) -> Result<(), AppErro
 pub async fn start_rtsp_server(
     stream: State<'_, StreamManager>,
     config: State<'_, AppConfig>,
-) -> Result<String, AppError> {
+) -> Result<RtspServerInfo, AppError> {
     let settings = config.get();
     stream.start_rtsp_server(&settings).await
 }
