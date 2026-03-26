@@ -124,7 +124,8 @@ impl StreamManager {
 
             if state.recording {
                 if let Some(ref p) = state.playback {
-                    let _ = p.detach_recording();
+                    // Must .await so the EOS flushes and the MP4 moov atom is written.
+                    let _ = p.detach_recording().await;
                 }
                 state.recording = false;
                 state.recording_path = None;

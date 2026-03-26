@@ -136,13 +136,15 @@ impl PlaybackPipeline {
             return false;
         }
 
-        // Check bus for error messages
+        // Check bus for error/EOS without consuming other messages.
+        // pop_filtered only removes messages matching the given types,
+        // leaving state-change, QoS, warning, etc. on the bus.
         if let Some(bus) = self.pipeline.bus() {
-            while let Some(msg) = bus.peek() {
-                match msg.view() {
-                    gst::MessageView::Error(_) | gst::MessageView::Eos(_) => return false,
-                    _ => { bus.pop(); }
-                }
+            if bus
+                .pop_filtered(&[gst::MessageType::Error, gst::MessageType::Eos])
+                .is_some()
+            {
+                return false;
             }
         }
 
