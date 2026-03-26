@@ -217,16 +217,17 @@
 
 .toggle-group {
   display: flex;
-  border: 1px solid var(--md-surface-variant);
+  border: 1px solid var(--md-primary);
   border-radius: var(--md-radius-xl);
   overflow: hidden;
 }
 
 .toggle-btn {
   flex: 1;
-  background: transparent;
+  background: rgba(61, 220, 132, 0.08);
   border: none;
-  color: var(--md-on-surface-variant);
+  border-right: 1px solid var(--md-primary);
+  color: var(--md-primary-light);
   padding: 8px 16px;
   font-size: 14px;
   font-weight: 500;
@@ -234,13 +235,17 @@
   transition: all var(--md-transition);
 }
 
+.toggle-btn:last-child {
+  border-right: none;
+}
+
 .toggle-btn.active {
-  background: var(--md-primary);
-  color: var(--md-on-primary);
+  background: rgba(61, 220, 132, 0.25);
+  color: #fff;
 }
 
 .toggle-btn:hover:not(.active) {
-  background: rgba(255, 255, 255, 0.04);
+  background: rgba(61, 220, 132, 0.18);
 }
 
 /* ── Input Fields ───────────────────────────────────────────────────── */
