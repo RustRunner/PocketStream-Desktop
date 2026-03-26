@@ -152,7 +152,7 @@ fn run_adapter_query(filter: &str) -> Result<String, AppError> {
         }} | ConvertTo-Json -Depth 3 -Compress"#,
         filter
     );
-    let output = std::process::Command::new("powershell")
+    let output = super::cmd("powershell")
         .args(["-NoProfile", "-Command", &script])
         .output()
         .map_err(|e| AppError::Network(format!("Failed to run PowerShell: {}", e)))?;
@@ -227,6 +227,33 @@ fn list_all_pnet() -> Result<Vec<InterfaceInfo>, AppError> {
         .collect();
 
     Ok(result)
+}
+
+/// Lightweight interface status check via pnet (no process spawning).
+/// Matches by MAC address and returns (is_up, current_ipv4_ips).
+/// This is cheap enough to poll every few seconds.
+pub fn quick_status_by_mac(mac: &str) -> Option<(bool, Vec<IpInfo>)> {
+    let target = mac.to_lowercase();
+    let interfaces = pnet::datalink::interfaces();
+
+    let iface = interfaces.iter().find(|i| {
+        i.mac
+            .map(|m| m.to_string().to_lowercase() == target)
+            .unwrap_or(false)
+    })?;
+
+    let ips = iface
+        .ips
+        .iter()
+        .filter(|ip_net| ip_net.is_ipv4())
+        .map(|ip_net| IpInfo {
+            address: ip_net.ip().to_string(),
+            prefix: ip_net.prefix(),
+            subnet: format!("{}/{}", ip_net.network(), ip_net.prefix()),
+        })
+        .collect();
+
+    Some((iface.is_up(), ips))
 }
 
 /// Get info for a specific interface by name.

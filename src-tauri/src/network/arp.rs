@@ -207,7 +207,7 @@ fn format_mac(mac: &[u8; 6]) -> String {
 /// `interface_ip` scopes the query to a single interface via `arp -a -N`,
 /// preventing WiFi entries from leaking in.
 pub async fn read_system_arp_table(interface_ip: &str) -> Vec<(Ipv4Addr, String)> {
-    let output = match tokio::process::Command::new("arp")
+    let output = match super::async_cmd("arp")
         .args(["-a", "-N", interface_ip])
         .output()
         .await
@@ -458,12 +458,12 @@ pub async fn send_arp_probe(
     timeout: std::time::Duration,
 ) -> Result<bool, AppError> {
     let timeout_ms = timeout.as_millis().to_string();
-    let _ = tokio::process::Command::new("ping")
+    let _ = super::async_cmd("ping")
         .args(["-n", "1", "-w", &timeout_ms, &target_ip.to_string()])
         .output()
         .await;
 
-    let output = tokio::process::Command::new("arp")
+    let output = super::async_cmd("arp")
         .args(["-a"])
         .output()
         .await

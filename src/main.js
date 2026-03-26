@@ -4,7 +4,7 @@
 
 import * as api from "./lib/tauri-api.js";
 import { $, $$, state, showToast } from "./lib/state.js";
-import { refreshInterfaces, setupIpConfigDialog, setupCameraIpDropdown } from "./lib/network.js";
+import { refreshInterfaces, setupIpConfigDialog, setupCameraIpDropdown, setupInterfaceWatcher } from "./lib/network.js";
 import { setupArpListeners, loadExistingArpState, setupAliasDialog, resetDiscoveryStatus } from "./lib/devices.js";
 import { setupStreamControls, setupRtspControls, setupVideoResize, getVideoAreaBounds } from "./lib/streaming.js";
 import { setupPtzControls } from "./lib/ptz.js";
@@ -30,6 +30,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   // Start listening for ARP events (backend auto-starts ARP discovery)
   setupArpListeners();
+  setupInterfaceWatcher();
 });
 
 // ── Config ──────────────────────────────────────────────────────────
@@ -193,6 +194,11 @@ function setupRefreshButton() {
 
     try {
       await refreshInterfaces();
+      // Start ARP discovery if an interface was found — handles the case
+      // where the app launched before the cable was connected.
+      if (state.activeInterface) {
+        await api.startArpDiscovery(state.activeInterface.name);
+      }
       await loadExistingArpState();
       showToast("Refreshed");
     } catch (e) {

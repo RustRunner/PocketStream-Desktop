@@ -31,11 +31,13 @@ export function setupStreamControls() {
   $("#btn-toggle-stream").addEventListener("click", async () => {
     if (state.isStreaming) {
       try {
-        await api.stopStream();
+        // Set flags BEFORE the async stop so the status poll
+        // doesn't race and trigger a false "Stream Lost".
         state.isStreaming = false;
         state.streamLost = false;
-        updateStreamUI();
         stopStatusPolling();
+        await api.stopStream();
+        updateStreamUI();
         showToast("Stream stopped");
       } catch (e) {
         showToast("Failed to stop: " + e, true);

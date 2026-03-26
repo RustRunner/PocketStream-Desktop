@@ -27,7 +27,7 @@ pub fn ensure_rtsp_allowed(_port: u16) -> Result<(), AppError> {
 #[cfg(target_os = "windows")]
 fn ensure_allow_rule(port: u16) -> Result<(), AppError> {
     // Check if the rule already exists
-    let check = std::process::Command::new("powershell")
+    let check = super::cmd("powershell")
         .args([
             "-NoProfile",
             "-Command",
@@ -42,7 +42,7 @@ fn ensure_allow_rule(port: u16) -> Result<(), AppError> {
     let count = String::from_utf8_lossy(&check.stdout).trim().to_string();
     if count != "0" {
         // Rule exists — update the port in case it changed
-        let _ = std::process::Command::new("powershell")
+        let _ = super::cmd("powershell")
             .args([
                 "-NoProfile",
                 "-Command",
@@ -57,7 +57,7 @@ fn ensure_allow_rule(port: u16) -> Result<(), AppError> {
     }
 
     // Create the rule
-    let result = std::process::Command::new("powershell")
+    let result = super::cmd("powershell")
         .args([
             "-NoProfile",
             "-Command",
@@ -101,7 +101,7 @@ fn remove_block_rules() {
         exe_path.replace('\'', "''")
     );
 
-    match std::process::Command::new("powershell")
+    match super::cmd("powershell")
         .args(["-NoProfile", "-Command", &script])
         .output()
     {

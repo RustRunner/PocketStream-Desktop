@@ -123,7 +123,7 @@ async fn assign_linux(
 }
 
 pub(crate) async fn run_command(program: &str, args: &[&str]) -> Result<String, AppError> {
-    let output = tokio::process::Command::new(program)
+    let output = super::async_cmd(program)
         .args(args)
         .output()
         .await

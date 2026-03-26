@@ -16,6 +16,30 @@ pub use scanner::ScanResult;
 
 use crate::error::AppError;
 
+// ── Hidden-window command helpers ────────────────────────────────────
+// On Windows, every `Command::new()` spawns a visible console window
+// unless CREATE_NO_WINDOW (0x0800_0000) is set.
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Create a `std::process::Command` that won't flash a console window.
+pub(crate) fn cmd(program: &str) -> std::process::Command {
+    let mut c = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(CREATE_NO_WINDOW);
+    }
+    c
+}
+
+/// Create a `tokio::process::Command` that won't flash a console window.
+pub(crate) fn async_cmd(program: &str) -> tokio::process::Command {
+    let std_cmd = cmd(program);
+    tokio::process::Command::from(std_cmd)
+}
+
 pub struct NetworkManager {
     active_scans: Arc<Mutex<HashSet<String>>>,
     arp_devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
@@ -348,7 +372,7 @@ async fn ping_sweep_subnets(interface_ips: &[String]) {
             for last in 1..=254 {
                 let target = format!("{}.{}.{}.{}", o[0], o[1], o[2], last);
                 join_set.spawn(async move {
-                    let _ = tokio::process::Command::new("ping")
+                    let _ = async_cmd("ping")
                         .args(["-n", "1", "-w", "200", &target])
                         .output()
                         .await;

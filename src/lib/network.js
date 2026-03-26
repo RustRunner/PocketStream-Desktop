@@ -3,7 +3,8 @@
  */
 
 import * as api from "./tauri-api.js";
-import { $, $$, state, adoptedSubnets, nodeAliases, showToast } from "./state.js";
+import { $, $$, state, adoptedSubnets, nodeAliases, arpDevices, tcpScanResults, showToast } from "./state.js";
+import { resetDiscoveryStatus } from "./devices.js";
 
 // ── Interface discovery ─────────────────────────────────────────────
 
@@ -30,6 +31,41 @@ export async function refreshInterfaces() {
     console.error("Failed to list interfaces:", e);
     $("#iface-name").textContent = "Error";
   }
+}
+
+// ── Interface status watcher ────────────────────────────────────────
+// Backend polls pnet every 3s (zero network traffic) and emits this
+// event when the active Ethernet interface changes state.
+
+export function setupInterfaceWatcher() {
+  api.onEvent("interface-status-changed", (iface) => {
+    const wasDown = !state.activeInterface || state.activeInterface.ips.length === 0;
+    state.activeInterface = iface;
+
+    if (!iface.is_up || iface.ips.length === 0) {
+      // ── Disconnected ─────────────────────────────────────────────
+      $("#iface-name").textContent =
+        (iface.display_name || iface.name) + " (Disconnected)";
+
+      // Clear stale nodes — they're unreachable now
+      arpDevices.clear();
+      tcpScanResults.clear();
+      $("#device-list").innerHTML = "";
+      updateCameraIpDropdown(null);
+    } else {
+      // ── Connected (or reconnected) ───────────────────────────────
+      $("#iface-name").textContent = iface.display_name || iface.name;
+
+      // If we just came back from disconnected, kick off ARP discovery
+      if (wasDown) {
+        resetDiscoveryStatus();
+        api.startArpDiscovery(iface.name).catch(() => {});
+      }
+    }
+
+    renderSubnetList();
+    updateCameraIpDropdown(null);
+  });
 }
 
 // ── Subnet list rendering ───────────────────────────────────────────
