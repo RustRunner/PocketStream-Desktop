@@ -84,7 +84,7 @@
 }
 
 .window-btn-close:hover {
-  background: #e81123;
+  background: var(--md-error);
   color: #fff;
 }
 

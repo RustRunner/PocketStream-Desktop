@@ -124,8 +124,8 @@
 }
 
 .active-btn {
-  border-color: var(--md-error, #d32f2f);
-  color: var(--md-error, #d32f2f);
+  border-color: var(--md-error);
+  color: var(--md-error);
 }
 
 .active-btn:hover {
@@ -365,6 +365,15 @@
   grid-template-columns: 1fr auto;
   row-gap: 6px;
   align-items: center;
+  font-size: 13px;
+}
+
+#card-rtsp .status-value {
+  font-size: 13px;
+}
+
+#card-rtsp .status-value.monospace {
+  font-size: 13px;
 }
 
 #card-rtsp .status-row {
@@ -373,9 +382,11 @@
 
 #card-rtsp .status-value,
 #card-rtsp .qr-icon-btn {
-  min-width: 80px;
-  text-align: center;
   justify-self: end;
+}
+
+.qr-icon-btn {
+  border-radius: var(--md-radius-sm);
 }
 
 /* ── Status Rows ────────────────────────────────────────────────────── */
@@ -403,7 +414,7 @@
 }
 
 .status-online {
-  color: var(--status-online);
+  color: var(--md-primary-light);
 }
 
 .status-offline {
@@ -639,7 +650,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--md-error, #d32f2f);
+  color: var(--md-error);
   font-size: 18px;
   font-weight: 500;
   letter-spacing: 0.5px;
@@ -724,7 +735,7 @@
 }
 
 .video-controls .icon-btn.recording {
-  color: var(--md-error, #d32f2f);
+  color: var(--md-error);
 }
 
 /* ── Device List ────────────────────────────────────────────────────── */
@@ -737,6 +748,12 @@
 
 .ip-config-dialog {
   min-width: 460px;
+}
+
+.dialog-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
 }
 
 .ip-config-dialog[open] {
@@ -1032,7 +1049,7 @@
 
 .btn-remove-ip:hover {
   opacity: 1;
-  color: var(--md-error, #d32f2f);
+  color: var(--md-error);
 }
 
 .subnet-row-auto {

@@ -25,12 +25,12 @@
   --md-on-surface-variant: #AEAEAE;
 
   /* Error */
-  --md-error: #CF6679;
+  --md-error: #FF3B5C;
   --md-on-error: #000000;
 
   /* Status colors */
   --status-online: #66BB6A;
-  --status-offline: #EF5350;
+  --status-offline: #FF3B5C;
   --status-warning: #FFA726;
   --status-recording: #EF5350;
 

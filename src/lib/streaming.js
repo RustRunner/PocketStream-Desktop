@@ -132,6 +132,9 @@ export async function setupRtspControls() {
   });
 
   $("#btn-toggle-rtsp").addEventListener("click", async () => {
+    const spinner = $("#rtsp-spinner");
+    spinner.style.display = "";
+
     if (state.isRtspRunning) {
       try {
         await api.stopRtspServer();
@@ -158,6 +161,8 @@ export async function setupRtspControls() {
         showToast("RTSP server failed: " + e, true);
       }
     }
+
+    spinner.style.display = "none";
   });
 
   // QR code button + dialog
@@ -232,7 +237,9 @@ function setupQrDialog() {
     }
 
     $("#qr-url").textContent = rtspFullUrl;
+    api.setVideoVisible(false);
     dialog.showModal();
+    dialog.addEventListener("close", () => api.setVideoVisible(true), { once: true });
   });
 
   closeBtn.addEventListener("click", () => dialog.close());

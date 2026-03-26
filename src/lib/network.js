@@ -39,7 +39,12 @@ export function renderSubnetList() {
   if (!state.activeInterface) return;
 
   const adoptedIpSet = new Set(adoptedSubnets.values());
-  let html = state.activeInterface.ips
+  const sortedIps = [...state.activeInterface.ips].sort((a, b) => {
+    const aAuto = adoptedIpSet.has(a.address) ? 1 : 0;
+    const bAuto = adoptedIpSet.has(b.address) ? 1 : 0;
+    return aAuto - bAuto;
+  });
+  let html = sortedIps
     .map((ip) => {
       const isAuto = adoptedIpSet.has(ip.address);
       if (isAuto) {
@@ -200,6 +205,8 @@ export function setupIpConfigDialog() {
       showToast("Enter an IP and mask", true);
       return;
     }
+    const spinner = $("#ip-config-spinner");
+    spinner.style.display = "";
     try {
       await api.addSecondaryIp(iface, ip, mask);
       $("#add-sec-ip").value = "";
@@ -208,6 +215,7 @@ export function setupIpConfigDialog() {
     } catch (e) {
       showToast("Failed: " + e, true);
     }
+    spinner.style.display = "none";
   });
 
   // ── Cancel ───────────────────────────────────────────────────────
@@ -225,6 +233,8 @@ export function setupIpConfigDialog() {
       return;
     }
 
+    const spinner = $("#ip-config-spinner");
+    spinner.style.display = "";
     try {
       await api.setStaticIp(iface, ip, mask, gw);
       showToast("Primary IP updated");
@@ -233,6 +243,7 @@ export function setupIpConfigDialog() {
     } catch (e) {
       showToast("Failed: " + e, true);
     }
+    spinner.style.display = "none";
   });
 }
 
@@ -281,6 +292,8 @@ function renderSecondaryIps(iface, primary) {
     btn.addEventListener("click", async () => {
       const ip = btn.dataset.removeSecIp;
       const ifaceName = $("#static-iface").value;
+      const spinner = $("#ip-config-spinner");
+      spinner.style.display = "";
       try {
         await api.removeSecondaryIp(ifaceName, ip);
         // Also remove from adopted map if it was auto-adopted
@@ -295,6 +308,7 @@ function renderSecondaryIps(iface, primary) {
       } catch (e) {
         showToast("Failed: " + e, true);
       }
+      spinner.style.display = "none";
     });
   });
 }
