@@ -80,11 +80,6 @@ export async function loadExistingArpState() {
     return;
   }
 
-  // Restart ARP discovery on the active interface
-  try {
-    await api.startArpDiscovery(state.activeInterface.name);
-  } catch (_) {}
-
   try {
     const [devices, subnets] = await Promise.all([
       api.getArpDevices(),
@@ -290,17 +285,76 @@ function renderArpDeviceList() {
 function openAliasDialog(ip) {
   const dialog = $("#alias-dialog");
   $("#alias-dialog-ip").textContent = ip;
-  $("#alias-input").value = nodeAliases.get(ip) || "";
+  $("#alias-input").value = "";
+  $("#alias-custom-field").style.display = "none";
   dialog.dataset.ip = ip;
-  api.setVideoVisible(false);
+
+  // Reset role buttons
+  const existing = nodeAliases.get(ip) || "";
+  const roleBtns = dialog.querySelectorAll("[data-role]");
+  roleBtns.forEach((b) => b.classList.remove("active"));
+
+  const isCustom = existing && existing !== "CAM" && existing !== "PTU";
+  if (existing === "CAM") {
+    dialog.querySelector("[data-role='cam']").classList.add("active");
+  } else if (existing === "PTU") {
+    dialog.querySelector("[data-role='ptu']").classList.add("active");
+  } else if (existing) {
+    dialog.querySelector("[data-role='custom']").classList.add("active");
+    $("#alias-input").value = existing;
+    $("#alias-custom-field").style.display = "";
+  }
+
+  // Show Clear/Save only for custom role
+  $("#alias-clear").style.display = isCustom ? "" : "none";
+  $("#alias-save").style.display = isCustom ? "" : "none";
+
+  if (dialog.open) dialog.close();
+  api.setVideoVisible(false).catch(() => {});
   dialog.showModal();
-  dialog.addEventListener("close", () => api.setVideoVisible(true), { once: true });
-  $("#alias-input").focus();
+  dialog.addEventListener("close", () => api.setVideoVisible(true).catch(() => {}), { once: true });
 }
 
 export function setupAliasDialog() {
+  const dialog = $("#alias-dialog");
+
+  function updateAliasActions(role) {
+    const isCustom = role === "custom";
+    $("#alias-clear").style.display = isCustom ? "" : "none";
+    $("#alias-save").style.display = isCustom ? "" : "none";
+  }
+
+  // Role toggle buttons
+  const roleBtns = document.querySelectorAll(".alias-role-group [data-role]");
+  roleBtns.forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      roleBtns.forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      const role = btn.dataset.role;
+
+      if (role === "cam") {
+        const ip = dialog.dataset.ip;
+        nodeAliases.set(ip, "CAM");
+        $("#camera-ip").value = ip;
+        if (state.config) state.config.stream.camera_ip = ip;
+        dialog.close();
+        renderArpDeviceList();
+      } else if (role === "ptu") {
+        const ip = dialog.dataset.ip;
+        nodeAliases.set(ip, "PTU");
+        $("#ptu-ip").value = ip;
+        dialog.close();
+        renderArpDeviceList();
+      } else {
+        $("#alias-custom-field").style.display = "";
+        updateAliasActions("custom");
+        $("#alias-input").focus();
+      }
+    });
+  });
+
   $("#alias-save").addEventListener("click", () => {
-    const dialog = $("#alias-dialog");
     const ip = dialog.dataset.ip;
     const alias = $("#alias-input").value.trim();
     if (alias) {

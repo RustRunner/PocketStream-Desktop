@@ -237,9 +237,9 @@ function setupQrDialog() {
     }
 
     $("#qr-url").textContent = rtspFullUrl;
-    api.setVideoVisible(false);
+    api.setVideoVisible(false).catch(() => {});
     dialog.showModal();
-    dialog.addEventListener("close", () => api.setVideoVisible(true), { once: true });
+    dialog.addEventListener("close", () => api.setVideoVisible(true).catch(() => {}), { once: true });
   });
 
   closeBtn.addEventListener("click", () => dialog.close());
@@ -299,8 +299,13 @@ function showStreamLost() {
   }
   overlay.style.display = "";
 
-  // Reset stream state and UI
+  // Reset stream and RTSP server
   api.stopStream().catch(() => {});
+  if (state.isRtspRunning) {
+    api.stopRtspServer().catch(() => {});
+    state.isRtspRunning = false;
+    updateRtspUI(null);
+  }
   state.isStreaming = false;
   state.isRecording = false;
   updateStreamUI();

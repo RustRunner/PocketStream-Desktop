@@ -210,6 +210,9 @@ function setupRefreshButton() {
 
     try {
       resetDiscoveryStatus();
+      if (state.activeInterface) {
+        await api.startArpDiscovery(state.activeInterface.name);
+      }
       await loadExistingArpState();
     } catch (e) {
       showToast("Refresh failed: " + e, true);

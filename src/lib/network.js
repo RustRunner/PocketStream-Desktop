@@ -175,9 +175,9 @@ export function setupIpConfigDialog() {
     const select = $("#static-iface");
     select.innerHTML = '<option value="">Loading…</option>';
 
-    api.setVideoVisible(false);
+    api.setVideoVisible(false).catch(() => {});
     dialog.showModal();
-    dialog.addEventListener("close", () => api.setVideoVisible(true), { once: true });
+    dialog.addEventListener("close", () => api.setVideoVisible(true).catch(() => {}), { once: true });
 
     try {
       dialogInterfaces = (await api.listInterfaces() || []).filter((i) => i.is_ethernet);

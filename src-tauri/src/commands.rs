@@ -1,4 +1,4 @@
-use tauri::State;
+use tauri::{Manager, State};
 
 use crate::config::{AppConfig, AppSettings};
 use crate::error::AppError;
@@ -135,8 +135,24 @@ pub async fn start_stream(
 }
 
 #[tauri::command]
-pub async fn stop_stream(stream: State<'_, StreamManager>) -> Result<(), AppError> {
-    stream.stop_playback().await
+pub async fn stop_stream(
+    window: tauri::WebviewWindow,
+    stream: State<'_, StreamManager>,
+) -> Result<(), AppError> {
+    // Capture HWND before stopping (stop clears it)
+    let hwnd = stream.get_video_child_hwnd();
+
+    stream.stop_playback().await?;
+
+    // Destroy the video child window on the main thread (must match creation thread)
+    if let Some(h) = hwnd {
+        let app = window.app_handle().clone();
+        let _ = app.run_on_main_thread(move || {
+            crate::streaming::video_embed::destroy_video_child(h);
+        });
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -214,7 +230,7 @@ pub async fn create_video_window(
             .await
             .map_err(|_| AppError::Stream("Main thread channel closed".into()))??;
 
-        stream.set_video_child_hwnd(child).await;
+        stream.set_video_child_hwnd(child);
         return Ok(child.to_string());
     }
 
@@ -233,7 +249,7 @@ pub async fn update_video_position(
     width: i32,
     height: i32,
 ) -> Result<(), AppError> {
-    if let Some(hwnd) = stream.get_video_child_hwnd().await {
+    if let Some(hwnd) = stream.get_video_child_hwnd() {
         crate::streaming::video_embed::reposition(hwnd, x, y, width, height)?;
     }
     Ok(())
@@ -244,7 +260,7 @@ pub async fn set_video_visible(
     stream: State<'_, StreamManager>,
     visible: bool,
 ) -> Result<(), AppError> {
-    if let Some(hwnd) = stream.get_video_child_hwnd().await {
+    if let Some(hwnd) = stream.get_video_child_hwnd() {
         crate::streaming::video_embed::set_visible(hwnd, visible)?;
     }
     Ok(())

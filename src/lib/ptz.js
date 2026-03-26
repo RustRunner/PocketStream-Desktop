@@ -9,6 +9,7 @@ import { $, log, showToast } from "./state.js";
 
 let ptuSpeedBig = 100;
 let ptuSpeedSmall = 10;
+let ptuSpeedQueried = false;
 const ptuPresets = new Map(); // preset# -> { pan, tilt }
 
 function getPtuIp() {
@@ -43,23 +44,29 @@ async function waitForPtuHome(maxTries = 40) {
 
 // ── PTZ control setup ───────────────────────────────────────────────
 
+async function queryPtuSpeed() {
+  if (!getPtuIp()) return;
+  try {
+    const data = await ptuCmd("PU&TU&PL&TL");
+    if (data) {
+      const panUpper = parseInt(data.PU) || 100;
+      const tiltUpper = parseInt(data.TU) || 100;
+      ptuSpeedBig = Math.min(panUpper, tiltUpper);
+      ptuSpeedSmall = Math.max(Math.round(ptuSpeedBig / 10), parseInt(data.PL) || 1);
+      ptuSpeedQueried = true;
+      log(`PTU limits: big=${ptuSpeedBig} small=${ptuSpeedSmall}`);
+      await ptuCmd("C=V");
+    }
+  } catch (e) {
+    log(`PTU init failed: ${e}`);
+  }
+}
+
 export function setupPtzControls() {
   // Query PTU speed limits when PTU IP is selected
-  $("#ptu-ip").addEventListener("change", async () => {
-    if (!getPtuIp()) return;
-    try {
-      const data = await ptuCmd("PU&TU&PL&TL");
-      if (data) {
-        const panUpper = parseInt(data.PU) || 100;
-        const tiltUpper = parseInt(data.TU) || 100;
-        ptuSpeedBig = Math.min(panUpper, tiltUpper);
-        ptuSpeedSmall = Math.max(Math.round(ptuSpeedBig / 10), parseInt(data.PL) || 1);
-        log(`PTU limits: big=${ptuSpeedBig} small=${ptuSpeedSmall}`);
-        await ptuCmd("C=V");
-      }
-    } catch (e) {
-      log(`PTU init failed: ${e}`);
-    }
+  $("#ptu-ip").addEventListener("change", () => {
+    ptuSpeedQueried = false;
+    queryPtuSpeed();
   });
 
   // D-pad buttons — hold to move at speed, release to stop
@@ -87,8 +94,9 @@ export function setupPtzControls() {
       return;
     }
 
-    const startMove = () => {
+    const startMove = async () => {
       if (!getPtuIp()) return;
+      if (!ptuSpeedQueried) await queryPtuSpeed();
       const cmdFn = speedCmds[action];
       if (cmdFn) ptuCmd(cmdFn()).catch((e) => log(`PTU ${action}: ${e}`));
     };

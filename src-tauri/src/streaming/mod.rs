@@ -32,6 +32,7 @@ pub struct StreamStatus {
 
 pub struct StreamManager {
     state: Arc<Mutex<StreamState>>,
+    video_hwnd: Arc<std::sync::atomic::AtomicIsize>,
 }
 
 struct StreamState {
@@ -43,7 +44,6 @@ struct StreamState {
     rtsp_start_time: Option<std::time::Instant>,
     /// Cached IP resolved at RTSP server start — avoids running PowerShell every poll.
     rtsp_local_ip: Option<String>,
-    video_child_hwnd: Option<isize>,
 }
 
 impl StreamManager {
@@ -57,8 +57,8 @@ impl StreamManager {
                 start_time: None,
                 rtsp_start_time: None,
                 rtsp_local_ip: None,
-                video_child_hwnd: None,
             })),
+            video_hwnd: Arc::new(std::sync::atomic::AtomicIsize::new(0)),
         }
     }
 
@@ -118,27 +118,31 @@ impl StreamManager {
     }
 
     pub async fn stop_playback(&self) -> Result<(), AppError> {
-        let mut state = self.state.lock().await;
+        // Take the pipeline out of state quickly, then stop it outside the lock
+        let pipeline = {
+            let mut state = self.state.lock().await;
 
-        // Stop recording first if active
-        if state.recording {
-            if let Some(ref pipeline) = state.playback {
-                let _ = pipeline.detach_recording();
+            if state.recording {
+                if let Some(ref p) = state.playback {
+                    let _ = p.detach_recording();
+                }
+                state.recording = false;
+                state.recording_path = None;
             }
-            state.recording = false;
-            state.recording_path = None;
+
+            let p = state.playback.take();
+            state.start_time = None;
+            p
+        };
+
+        // Stop pipeline outside the lock — GStreamer Null transition can be slow
+        if let Some(p) = pipeline {
+            p.stop()?;
         }
 
-        if let Some(ref pipeline) = state.playback {
-            pipeline.stop()?;
-        }
-        state.playback = None;
-        state.start_time = None;
-
-        // Destroy the video child window
-        if let Some(hwnd) = state.video_child_hwnd.take() {
-            video_embed::destroy_video_child(hwnd);
-        }
+        // Clear HWND — actual window destruction handled by the command layer
+        // on the main thread to avoid cross-thread DestroyWindow hangs.
+        self.clear_video_child_hwnd();
 
         Ok(())
     }
@@ -318,14 +322,17 @@ impl StreamManager {
         Ok(path)
     }
 
-    pub async fn set_video_child_hwnd(&self, hwnd: isize) {
-        let mut state = self.state.lock().await;
-        state.video_child_hwnd = Some(hwnd);
+    pub fn set_video_child_hwnd(&self, hwnd: isize) {
+        self.video_hwnd.store(hwnd, std::sync::atomic::Ordering::Relaxed);
     }
 
-    pub async fn get_video_child_hwnd(&self) -> Option<isize> {
-        let state = self.state.lock().await;
-        state.video_child_hwnd
+    pub fn get_video_child_hwnd(&self) -> Option<isize> {
+        let val = self.video_hwnd.load(std::sync::atomic::Ordering::Relaxed);
+        if val == 0 { None } else { Some(val) }
+    }
+
+    pub fn clear_video_child_hwnd(&self) {
+        self.video_hwnd.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
