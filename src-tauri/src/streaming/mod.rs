@@ -236,8 +236,10 @@ impl StreamManager {
             .map(|s| s.bandwidth_kbps())
             .unwrap_or(0.0);
 
+        let playing = state.playback.as_ref().map_or(false, |p| p.is_healthy());
+
         Ok(StreamStatus {
-            playing: state.playback.is_some(),
+            playing,
             rtsp_server_running: state.rtsp_server.is_some(),
             rtsp_url: state.rtsp_server.as_ref().map(|s| s.client_url(cached_ip)),
             display_url: state.rtsp_server.as_ref().map(|s| s.display_url(cached_ip)),

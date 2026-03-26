@@ -3,7 +3,7 @@
  */
 
 import * as api from "./tauri-api.js";
-import { $, state, log, showToast, nodeAliases, arpDevices, adoptedSubnets, tcpScanResults } from "./state.js";
+import { $, state, log, nodeAliases, arpDevices, adoptedSubnets, tcpScanResults } from "./state.js";
 import { renderSubnetList, updateCameraIpDropdown } from "./network.js";
 
 // ── Local scanning state ────────────────────────────────────────────
@@ -11,18 +11,43 @@ import { renderSubnetList, updateCameraIpDropdown } from "./network.js";
 const scannedIps = new Set();
 let pendingScans = 0;
 
+// ── Discovery status ─────────────────────────────────────────────────
+
+function showDiscoveryStatus(label) {
+  const container = $("#discovery-status");
+  if (!container) return;
+  if (label) {
+    $("#discovery-label").textContent = label;
+    container.classList.remove("hidden");
+  } else {
+    container.classList.add("hidden");
+  }
+}
+
+export function resetDiscoveryStatus() {
+  scannedIps.clear();
+  showDiscoveryStatus("IP Discovery...");
+}
+
 // ── ARP event listeners ─────────────────────────────────────────────
 
 export function setupArpListeners() {
+  if (state.activeInterface) {
+    showDiscoveryStatus("IP Discovery...");
+  } else {
+    showDiscoveryStatus(null);
+  }
+
   api.onEvent("arp-device-discovered", (device) => {
-    if (state.activeInterface?.ips.some((ip) => ip.address === device.ip)) return;
+    if (!state.activeInterface) return;
+    if (state.activeInterface.ips.some((ip) => ip.address === device.ip)) return;
 
     const isNew = !arpDevices.has(device.mac);
     arpDevices.set(device.mac, device);
 
     if (isNew) {
       log(`ARP: discovered ${device.ip} (${device.mac})`);
-      showScanSpinner(true);
+      showDiscoveryStatus("Port Scan...");
       scanDevicePorts(device.ip);
     }
   });
@@ -39,7 +64,7 @@ export function setupArpListeners() {
         if (device.subnet === data.subnet) {
           scannedIps.delete(device.ip);
           tcpScanResults.delete(device.ip);
-          showScanSpinner(true);
+          showDiscoveryStatus("Port Scan...");
           scanDevicePorts(device.ip);
         }
       }
@@ -50,6 +75,16 @@ export function setupArpListeners() {
 }
 
 export async function loadExistingArpState() {
+  if (!state.activeInterface) {
+    showDiscoveryStatus(null);
+    return;
+  }
+
+  // Restart ARP discovery on the active interface
+  try {
+    await api.startArpDiscovery(state.activeInterface.name);
+  } catch (_) {}
+
   try {
     const [devices, subnets] = await Promise.all([
       api.getArpDevices(),
@@ -60,10 +95,12 @@ export async function loadExistingArpState() {
       for (const d of devices) {
         arpDevices.set(d.mac, d);
       }
-      showScanSpinner(true);
+      showDiscoveryStatus("Port Scan...");
       for (const d of devices) {
         scanDevicePorts(d.ip);
       }
+    } else {
+      showDiscoveryStatus("IP Discovery...");
     }
 
     if (subnets) {
@@ -79,8 +116,8 @@ export async function loadExistingArpState() {
 
 // ── Port scanning ───────────────────────────────────────────────────
 
-const MAX_SCAN_RETRIES = 3;
-const RETRY_DELAY_MS = 5000;
+const MAX_SCAN_RETRIES = 2;
+const RETRY_DELAY_MS = 4000;
 
 async function scanDevicePorts(ip, attempt = 0) {
   if (attempt === 0 && scannedIps.has(ip)) return;
@@ -118,17 +155,7 @@ async function scanDevicePorts(ip, attempt = 0) {
   pendingScans--;
   renderArpDeviceList();
   if (pendingScans <= 0) {
-    showScanSpinner(false);
-  }
-}
-
-function showScanSpinner(show) {
-  const list = $("#device-list");
-  const existing = list.querySelector(".scan-spinner");
-  if (show && !existing) {
-    list.innerHTML = '<div class="scan-spinner"><div class="spinner"></div><span>Scanning devices...</span></div>';
-  } else if (!show && existing) {
-    existing.remove();
+    showDiscoveryStatus(null);
   }
 }
 

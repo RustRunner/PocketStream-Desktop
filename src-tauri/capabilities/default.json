@@ -11,6 +11,10 @@
     {
       "identifier": "core:app:default",
       "allow": []
-    }
+    },
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-close",
+    "core:window:allow-is-maximized"
   ]
 }

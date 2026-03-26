@@ -4,7 +4,9 @@
 
 import QRCode from "qrcode";
 import * as api from "./tauri-api.js";
-import { $, state, showToast, formatUptime } from "./state.js";
+import { $, state, showToast, formatUptime, arpDevices, tcpScanResults } from "./state.js";
+import { resetDiscoveryStatus } from "./devices.js";
+import { updateCameraIpDropdown } from "./network.js";
 
 /** Full RTSP URL (with token) — stored for QR code generation */
 let rtspFullUrl = null;
@@ -31,6 +33,7 @@ export function setupStreamControls() {
       try {
         await api.stopStream();
         state.isStreaming = false;
+        state.streamLost = false;
         updateStreamUI();
         stopStatusPolling();
         showToast("Stream stopped");
@@ -263,7 +266,55 @@ async function pollStatus() {
       $("#rtsp-uptime").textContent = formatUptime(status.uptime_secs);
       $("#rtsp-bandwidth").textContent = `${status.bandwidth_kbps.toFixed(1)} kbps`;
     }
+
+    // Detect stream drop — backend says not playing but we think we're streaming
+    if (state.isStreaming && !status.playing) {
+      showStreamLost();
+    } else if (state.isStreaming && status.playing) {
+      hideStreamLost();
+    }
   } catch (_) {}
+}
+
+function showStreamLost() {
+  if (state.streamLost) return;
+  state.streamLost = true;
+
+  // Hide stale video frame and show overlay
+  api.setVideoVisible(false).catch(() => {});
+  const area = $("#video-area");
+  let overlay = area.querySelector(".stream-lost-overlay");
+  if (!overlay) {
+    overlay = document.createElement("div");
+    overlay.className = "stream-lost-overlay";
+    overlay.textContent = "Stream Lost...";
+    area.appendChild(overlay);
+  }
+  overlay.style.display = "";
+
+  // Reset stream state and UI
+  api.stopStream().catch(() => {});
+  state.isStreaming = false;
+  state.isRecording = false;
+  updateStreamUI();
+  stopStatusPolling();
+
+  // Clear stale nodes
+  arpDevices.clear();
+  tcpScanResults.clear();
+  $("#device-list").innerHTML = "";
+  updateCameraIpDropdown(null);
+  resetDiscoveryStatus();
+
+  showToast("Stream lost — connection dropped", true);
+}
+
+function hideStreamLost() {
+  if (!state.streamLost) return;
+  state.streamLost = false;
+  api.setVideoVisible(true).catch(() => {});
+  const overlay = $("#video-area").querySelector(".stream-lost-overlay");
+  if (overlay) overlay.style.display = "none";
 }
 
 // ── Video resize handler ────────────────────────────────────────────

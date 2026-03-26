@@ -81,16 +81,25 @@ pub async fn scan(subnet: &str) -> Result<Vec<ScanResult>, AppError> {
 }
 
 async fn probe_host(ip: IpAddr) -> ScanResult {
-    let mut open_ports = Vec::new();
+    let mut set = JoinSet::new();
 
     for &port in PROBE_PORTS {
         let addr = SocketAddr::new(ip, port);
-        if let Ok(Ok(_)) =
-            tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await
-        {
+        set.spawn(async move {
+            match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+                Ok(Ok(_)) => Some(port),
+                _ => None,
+            }
+        });
+    }
+
+    let mut open_ports = Vec::new();
+    while let Some(result) = set.join_next().await {
+        if let Ok(Some(port)) = result {
             open_ports.push(port);
         }
     }
+    open_ports.sort();
 
     ScanResult {
         ip: ip.to_string(),

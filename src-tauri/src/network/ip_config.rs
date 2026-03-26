@@ -56,20 +56,28 @@ async fn assign_windows(
     }
     run_command("netsh", &args).await?;
 
-    // Re-add secondary IPs that were wiped by the set command.
+    // Re-add secondary IPs that were wiped by the set command (in parallel).
     // Skip the new primary if it happened to also be a secondary.
+    let mut tasks = Vec::new();
     for sec in &secondaries {
         if sec.address == ip {
             continue;
         }
         let mask = prefix_to_mask(sec.prefix);
-        let name_arg = format!("name={}", interface);
-        if let Err(e) = run_command(
-            "netsh",
-            &["interface", "ip", "add", "address", &name_arg, &sec.address, &mask],
-        ).await {
-            log::warn!("Failed to restore secondary IP {}: {}", sec.address, e);
-        }
+        let iface = interface.to_string();
+        let addr = sec.address.clone();
+        tasks.push(tokio::spawn(async move {
+            let name_arg = format!("name={}", iface);
+            if let Err(e) = run_command(
+                "netsh",
+                &["interface", "ip", "add", "address", &name_arg, &addr, &mask],
+            ).await {
+                log::warn!("Failed to restore secondary IP {}: {}", addr, e);
+            }
+        }));
+    }
+    for task in tasks {
+        let _ = task.await;
     }
 
     Ok(())

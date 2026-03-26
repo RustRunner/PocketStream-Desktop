@@ -98,11 +98,16 @@ pub fn run() {
             commands::ptz_stop,
             commands::ptz_goto_preset,
             commands::ptz_set_preset,
+            commands::sony_cgi_zoom,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
-            // Auto-start ARP discovery on the first Ethernet interface
+            // Load adopted subnets from config, then auto-start ARP discovery
             tauri::async_runtime::spawn(async move {
+                let config: tauri::State<'_, config::AppConfig> = handle.state();
+                let manager: tauri::State<'_, network::NetworkManager> = handle.state();
+                manager.load_adopted_from_config(&config).await;
+
                 match network::interface::list_physical() {
                     Ok(interfaces) => {
                         let eth = interfaces
@@ -113,8 +118,6 @@ pub fn run() {
                             let name = iface.name.clone();
                             log::info!("Auto-starting ARP discovery on '{}'", name);
 
-                            let manager: tauri::State<'_, network::NetworkManager> =
-                                handle.state();
                             if let Err(e) = manager.start_arp_discovery(&name, handle.clone()).await
                             {
                                 log::warn!("Failed to auto-start ARP discovery: {}", e);

@@ -43,6 +43,8 @@
 .card-body {
   padding: 16px 20px;
   flex: 1;
+  overflow-y: auto;
+  min-height: 0;
 }
 
 .card-footer {
@@ -62,13 +64,6 @@
 
 .card-footer .text-btn {
   padding: 6px 14px;
-  border: 1px solid var(--md-primary);
-  background: rgba(61, 220, 132, 0.08);
-  border-radius: var(--md-radius-xl);
-}
-
-.card-footer .text-btn:hover:not(:disabled) {
-  background: rgba(61, 220, 132, 0.18);
 }
 
 .card-actions {
@@ -81,9 +76,9 @@
 /* ── Buttons ────────────────────────────────────────────────────────── */
 
 .filled-btn {
-  background: var(--md-primary);
-  color: var(--md-on-primary);
-  border: none;
+  background: rgba(61, 220, 132, 0.08);
+  color: var(--md-primary-light);
+  border: 1px solid var(--md-primary);
   border-radius: var(--md-radius-xl);
   padding: 10px 24px;
   font-size: 14px;
@@ -94,8 +89,7 @@
 }
 
 .filled-btn:hover:not(:disabled) {
-  background: var(--md-primary-dark);
-  box-shadow: var(--md-elevation-1);
+  background: rgba(61, 220, 132, 0.18);
 }
 
 .filled-btn:disabled {
@@ -144,9 +138,9 @@
 }
 
 .text-btn {
-  background: transparent;
+  background: rgba(61, 220, 132, 0.08);
   color: var(--md-primary-light);
-  border: none;
+  border: 1px solid var(--md-primary);
   border-radius: var(--md-radius-xl);
   padding: 10px 16px;
   font-size: 14px;
@@ -156,7 +150,7 @@
 }
 
 .text-btn:hover:not(:disabled) {
-  background: rgba(61, 220, 132, 0.12);
+  background: rgba(61, 220, 132, 0.18);
 }
 
 .text-btn:disabled {
@@ -359,6 +353,26 @@
   transform: translateX(20px);
 }
 
+/* ── RTSP Card Grid ────────────────────────────────────────────────── */
+
+#card-rtsp .card-body {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  row-gap: 6px;
+  align-items: center;
+}
+
+#card-rtsp .status-row {
+  display: contents;
+}
+
+#card-rtsp .status-value,
+#card-rtsp .qr-icon-btn {
+  min-width: 80px;
+  text-align: center;
+  justify-self: end;
+}
+
 /* ── Status Rows ────────────────────────────────────────────────────── */
 
 .status-row {
@@ -458,16 +472,13 @@
 
 .ptz-dpad {
   display: grid;
-  grid-template-columns: 52px 52px 52px;
-  grid-template-rows: 52px 52px 52px;
-  gap: 10px;
+  grid-template-columns: 76px 56px 76px;
+  grid-template-rows: 56px 56px 56px;
+  gap: 6px;
   place-items: center;
 }
 
 .ptz-btn {
-  width: 52px;
-  height: 52px;
-  border-radius: 50%;
   border: 1px solid var(--md-surface-variant);
   background: var(--md-surface-variant);
   color: var(--md-on-surface);
@@ -488,20 +499,74 @@
   background: rgba(61, 220, 132, 0.3);
 }
 
-.ptz-up    { grid-column: 2; grid-row: 1; }
-.ptz-left  { grid-column: 1; grid-row: 2; }
-.ptz-home  { grid-column: 2; grid-row: 2; }
-.ptz-right { grid-column: 3; grid-row: 2; }
-.ptz-down  { grid-column: 2; grid-row: 3; }
-
-.ptz-zoom {
-  display: flex;
-  gap: 16px;
+.ptz-up, .ptz-down {
+  width: 56px;
+  height: 56px;
 }
 
-.ptz-zoom-btn {
-  width: 52px;
-  height: 52px;
+.ptz-up    { border-radius: 30px 30px 10px 10px; grid-column: 2; grid-row: 1; }
+.ptz-down  { border-radius: 10px 10px 30px 30px; grid-column: 2; grid-row: 3; }
+
+.ptz-left, .ptz-right {
+  width: 76px;
+  height: 48px;
+}
+
+.ptz-left  { border-radius: 30px 10px 10px 30px; grid-column: 1; grid-row: 2; }
+.ptz-right { border-radius: 10px 30px 30px 10px; grid-column: 3; grid-row: 2; }
+
+.ptz-home {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  grid-column: 2;
+  grid-row: 2;
+}
+
+.ptz-zoom-slider {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 0 16px;
+  margin-top: 16px;
+  box-sizing: border-box;
+}
+
+.ptz-zoom-slider .zoom-icon {
+  color: var(--md-on-surface-variant);
+  flex-shrink: 0;
+}
+
+#zoom-slider {
+  flex: 1;
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  background: var(--md-surface-variant);
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+
+#zoom-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--md-primary-light);
+  cursor: pointer;
+  border: none;
+}
+
+#zoom-slider::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--md-primary-light);
+  cursor: pointer;
+  border: none;
 }
 
 .ptz-presets {
@@ -562,6 +627,20 @@
   color: var(--md-on-surface-variant);
 }
 
+.stream-lost-overlay {
+  position: absolute;
+  inset: 0;
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--md-error, #d32f2f);
+  font-size: 18px;
+  font-weight: 500;
+  letter-spacing: 0.5px;
+  z-index: 10;
+}
+
 .video-frame {
   width: 100%;
   height: 100%;
@@ -613,25 +692,21 @@
 .video-controls {
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: 8px;
+  position: relative;
 }
 
 .video-controls .filled-btn,
 .video-controls .outlined-btn {
-  background: rgba(61, 220, 132, 0.08);
-  border: 1px solid var(--md-primary);
-  color: var(--md-primary-light);
+  position: absolute;
+  right: 0;
   padding: 6px 14px;
   font-size: 13px;
 }
 
-.video-controls .filled-btn:hover:not(:disabled),
-.video-controls .outlined-btn:hover:not(:disabled) {
-  background: rgba(61, 220, 132, 0.18);
-}
-
 .video-controls-spacer {
-  flex: 1;
+  display: none;
 }
 
 .video-controls .icon-btn {
@@ -659,10 +734,22 @@
   min-width: 460px;
 }
 
+.ip-config-dialog[open] {
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.ip-config-dialog .dialog-body {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
 .ip-section-label {
   font-size: 12px;
-  font-weight: 600;
-  color: var(--md-on-surface-variant);
+  font-weight: 700;
+  color: var(--md-primary-light);
   text-transform: uppercase;
   letter-spacing: 0.6px;
   margin: 16px 0 8px;
@@ -687,7 +774,8 @@
 }
 
 .secondary-ip-list {
-  max-height: 160px;
+  min-height: 100px;
+  max-height: 200px;
   overflow-y: auto;
 }
 
@@ -884,6 +972,22 @@
   animation: spin 0.8s linear infinite;
 }
 
+/* ── Discovery Status ──────────────────────────────────────────────── */
+
+.discovery-status {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 8px 24px;
+  color: var(--md-on-surface-variant);
+  font-size: 14px;
+}
+
+.discovery-status.hidden {
+  display: none;
+}
+
 .icon-btn.spinning svg {
   animation: spin 0.8s linear infinite;
 }
@@ -912,7 +1016,8 @@
   border: none;
   color: var(--md-on-surface-variant);
   cursor: pointer;
-  font-size: 18px;
+  display: flex;
+  align-items: center;
   line-height: 1;
   padding: 0 4px;
   opacity: 0.4;
@@ -930,6 +1035,14 @@
   align-items: center;
   gap: 4px;
 }
+
+.auto-ip-group {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
 
 /* ── QR Code Dialog ────────────────────────────────────────────────── */
 

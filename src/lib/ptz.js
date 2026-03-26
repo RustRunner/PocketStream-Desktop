@@ -64,12 +64,10 @@ export function setupPtzControls() {
 
   // D-pad buttons — hold to move at speed, release to stop
   const speedCmds = {
-    up:         () => `TS=${ptuSpeedBig}`,
-    down:       () => `TS=${-ptuSpeedBig}`,
-    left:       () => `PS=${ptuSpeedBig}`,
-    right:      () => `PS=${-ptuSpeedBig}`,
-    "zoom-in":  () => `TS=${ptuSpeedSmall}`,
-    "zoom-out": () => `TS=${-ptuSpeedSmall}`,
+    up:    () => `TS=${ptuSpeedBig}`,
+    down:  () => `TS=${-ptuSpeedBig}`,
+    left:  () => `PS=${ptuSpeedBig}`,
+    right: () => `PS=${-ptuSpeedBig}`,
   };
 
   document.querySelectorAll(".ptz-btn[data-ptz]").forEach((btn) => {
@@ -151,4 +149,7 @@ export function setupPtzControls() {
       }
     });
   });
+
+  // TODO: Wire zoom slider to camera CGI zoom API
+  // Needs reverse-engineering of Sony EV-7520 web interface commands
 }

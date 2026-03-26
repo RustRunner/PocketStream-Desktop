@@ -127,6 +127,28 @@ impl PlaybackPipeline {
         Ok(())
     }
 
+    /// Check if the pipeline is still actively playing.
+    /// Returns false if the pipeline has errored, EOS'd, or left the Playing state.
+    pub fn is_healthy(&self) -> bool {
+        // Check pipeline state
+        let (_, current, _) = self.pipeline.state(gst::ClockTime::from_mseconds(0));
+        if current != gst::State::Playing {
+            return false;
+        }
+
+        // Check bus for error messages
+        if let Some(bus) = self.pipeline.bus() {
+            while let Some(msg) = bus.peek() {
+                match msg.view() {
+                    gst::MessageView::Error(_) | gst::MessageView::Eos(_) => return false,
+                    _ => { bus.pop(); }
+                }
+            }
+        }
+
+        true
+    }
+
     /// Stop and clean up.
     pub fn stop(&self) -> Result<(), AppError> {
         self.pipeline

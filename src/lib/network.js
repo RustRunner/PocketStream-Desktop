@@ -38,23 +38,39 @@ export function renderSubnetList() {
   const subnetList = $("#subnet-list");
   if (!state.activeInterface) return;
 
+  const adoptedIpSet = new Set(adoptedSubnets.values());
   let html = state.activeInterface.ips
-    .map(
-      (ip) => `
+    .map((ip) => {
+      const isAuto = adoptedIpSet.has(ip.address);
+      if (isAuto) {
+        return `
+        <div class="status-row subnet-row subnet-row-auto" data-subnet="${ip.subnet}">
+          <span class="status-label">IP:</span>
+          <span class="auto-ip-group">
+            <span class="badge-auto">(auto)</span>
+            <span class="status-value">${ip.address}/${ip.prefix}</span>
+          </span>
+        </div>`;
+      }
+      return `
       <div class="status-row subnet-row" data-subnet="${ip.subnet}">
         <span class="status-label">IP:</span>
         <span class="status-value">${ip.address}/${ip.prefix}</span>
-      </div>`
-    )
+      </div>`;
+    })
     .join("");
 
-  // Add auto-adopted subnets
+  // Add auto-adopted subnets (skip if already shown in interface IPs)
+  const renderedIps = new Set(state.activeInterface.ips.map((ip) => ip.address));
   for (const [subnet, adoptedIp] of adoptedSubnets) {
+    if (renderedIps.has(adoptedIp)) continue;
     html += `
       <div class="status-row subnet-row subnet-row-auto" data-subnet="${subnet}">
         <span class="status-label">IP:</span>
-        <span class="status-value">${adoptedIp}/24 <span class="badge-auto">(auto)</span></span>
-        <button class="btn-remove-ip" data-remove-subnet="${subnet}" title="Remove adopted IP">&times;</button>
+        <span class="auto-ip-group">
+          <span class="badge-auto">(auto)</span>
+          <span class="status-value">${adoptedIp}/24</span>
+        </span>
       </div>`;
   }
 
@@ -226,20 +242,21 @@ function populateDialogFields() {
   const iface = dialogInterfaces.find((i) => i.name === name);
   if (!iface) return;
 
-  // Primary = first IP
-  const primary = iface.ips[0];
+  // Find the first non-auto-adopted IP as primary
+  const adoptedIps = new Set(adoptedSubnets.values());
+  const primary = iface.ips.find((ip) => !adoptedIps.has(ip.address)) || iface.ips[0];
   $("#static-ip").value = primary ? primary.address : "";
   $("#static-mask").value = primary ? prefixToMask(primary.prefix) : "255.255.255.0";
   $("#static-gateway").value = "";
 
-  // Secondary = all remaining IPs
-  renderSecondaryIps(iface);
+  // Secondary = all IPs except the primary
+  renderSecondaryIps(iface, primary);
 }
 
 /** Render the secondary IP list with remove buttons. */
-function renderSecondaryIps(iface) {
+function renderSecondaryIps(iface, primary) {
   const list = $("#secondary-ip-list");
-  const secondaries = iface.ips.slice(1);
+  const secondaries = iface.ips.filter((ip) => !primary || ip.address !== primary.address);
 
   if (secondaries.length === 0) {
     list.innerHTML = '<p class="placeholder-text" style="padding:8px">No secondary IPs</p>';
@@ -252,7 +269,9 @@ function renderSecondaryIps(iface) {
       const badge = isAuto ? '<span class="badge-auto">(auto)</span>' : "";
       return `<div class="secondary-ip-item">
         <span>${ip.address}/${ip.prefix} ${badge}</span>
-        <button class="btn-remove-ip" data-remove-sec-ip="${ip.address}" title="Remove">×</button>
+        <button class="btn-remove-ip" data-remove-sec-ip="${ip.address}" title="Remove">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+        </button>
       </div>`;
     })
     .join("");

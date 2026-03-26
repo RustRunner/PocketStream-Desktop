@@ -39,6 +39,68 @@ impl NetworkManager {
         }
     }
 
+    /// Load previously adopted subnets from config and verify they still
+    /// exist on the adapter. Re-add any that are missing.
+    pub async fn load_adopted_from_config(&self, config: &crate::config::AppConfig) {
+        let settings = config.get();
+        if settings.adopted_subnets.is_empty() {
+            return;
+        }
+
+        // Get the active ethernet interface
+        let iface = match interface::list_physical() {
+            Ok(interfaces) => interfaces
+                .into_iter()
+                .find(|i| i.is_up && i.is_ethernet && !i.ips.is_empty()),
+            Err(_) => None,
+        };
+
+        let iface = match iface {
+            Some(i) => i,
+            None => {
+                log::info!("No active interface — skipping adopted subnet restore");
+                return;
+            }
+        };
+
+        let current_ips: std::collections::HashSet<String> =
+            iface.ips.iter().map(|ip| ip.address.clone()).collect();
+
+        let mut map = self.adopted_ips.lock().await;
+        for (subnet, ip_str) in &settings.adopted_subnets {
+            if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                map.insert(subnet.clone(), ip);
+
+                if current_ips.contains(ip_str) {
+                    log::info!("Adopted IP {} already on adapter", ip_str);
+                } else {
+                    log::info!("Re-adding missing adopted IP {} to {}", ip_str, iface.name);
+                    if let Err(e) = ip_config::add_secondary_ip(
+                        &iface.name,
+                        ip_str,
+                        "255.255.255.0",
+                    ).await {
+                        log::warn!("Failed to re-add adopted IP {}: {}", ip_str, e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Save current adopted subnets to config.
+    pub async fn save_adopted_to_config(&self, config: &crate::config::AppConfig) {
+        let map = self.adopted_ips.lock().await;
+        let adopted: HashMap<String, String> = map
+            .iter()
+            .map(|(k, v)| (k.clone(), v.to_string()))
+            .collect();
+        let mut settings = config.get();
+        settings.adopted_subnets = adopted;
+        if let Err(e) = config.update(settings) {
+            log::warn!("Failed to save adopted subnets: {}", e);
+        }
+    }
+
     pub fn list_interfaces(&self) -> Result<Vec<InterfaceInfo>, AppError> {
         interface::list_physical()
     }
@@ -118,6 +180,7 @@ impl NetworkManager {
         // Auto-adopt handler for foreign subnets
         let adopt_handle = tokio::spawn(async move {
             use tauri::Emitter;
+            use tauri::Manager;
             let mut known_subnets: HashSet<String> = HashSet::new();
 
             // Mark subnets we already have IPs on as known
@@ -192,6 +255,18 @@ impl NetworkManager {
                                 device.subnet,
                                 adopted_ip
                             );
+
+                            // Persist to config
+                            let config: tauri::State<'_, crate::config::AppConfig> =
+                                app_handle_for_adopt.state();
+                            let adopted_map = adopted.lock().await;
+                            let mut settings = config.get();
+                            settings.adopted_subnets = adopted_map
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.to_string()))
+                                .collect();
+                            drop(adopted_map);
+                            let _ = config.update(settings);
                         }
                         Ok(None) => {
                             known_subnets.insert(device.subnet.clone());

@@ -4,6 +4,7 @@ use aes_gcm::{
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -48,6 +49,9 @@ pub struct AppSettings {
     pub stream: StreamConfig,
     pub rtsp_server: RtspServerConfig,
     pub credentials: Credentials,
+    /// Auto-adopted subnet IPs: subnet string -> adopted IP address
+    #[serde(default)]
+    pub adopted_subnets: HashMap<String, String>,
 }
 
 impl Default for AppSettings {
@@ -70,6 +74,7 @@ impl Default for AppSettings {
                 username: String::new(),
                 password: String::new(),
             },
+            adopted_subnets: HashMap::new(),
         }
     }
 }

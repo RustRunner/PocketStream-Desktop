@@ -114,9 +114,12 @@ pub async fn get_adopted_subnets(
 #[tauri::command]
 pub async fn remove_adopted_subnet(
     manager: State<'_, NetworkManager>,
+    config: State<'_, AppConfig>,
     subnet: String,
 ) -> Result<(), AppError> {
-    manager.remove_adopted_subnet(&subnet).await
+    manager.remove_adopted_subnet(&subnet).await?;
+    manager.save_adopted_to_config(&config).await;
+    Ok(())
 }
 
 // ── Streaming Commands ───────────────────────────────────────────────
@@ -297,4 +300,46 @@ pub async fn ptz_set_preset(
     name: String,
 ) -> Result<(), AppError> {
     crate::camera::ptz::set_preset(&camera_url, preset, &name).await
+}
+
+#[tauri::command]
+pub async fn sony_cgi_zoom(
+    ip: String,
+    zoom_speed: i32,
+    username: String,
+    password: String,
+) -> Result<(), AppError> {
+    let url = if zoom_speed == 0 {
+        format!("http://{}/command/ptzf.cgi?ContinuousPanTiltZoom=0,0,0", ip)
+    } else {
+        let speed = zoom_speed.clamp(-100, 100);
+        format!(
+            "http://{}/command/ptzf.cgi?ContinuousPanTiltZoom=0,0,{}",
+            ip, speed
+        )
+    };
+
+    log::info!("Sony CGI zoom: speed={} → {}", zoom_speed, url);
+
+    let client = reqwest::Client::new();
+    let mut req = client.get(&url);
+    if !username.is_empty() {
+        req = req.basic_auth(&username, Some(&password));
+    }
+
+    let resp = req
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .map_err(|e| AppError::Camera(format!("Sony CGI request failed: {}", e)))?;
+
+    let status = resp.status();
+    if !status.is_success() && status.as_u16() != 204 {
+        return Err(AppError::Camera(format!(
+            "Sony CGI returned HTTP {}",
+            status
+        )));
+    }
+
+    Ok(())
 }

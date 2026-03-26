@@ -5,7 +5,7 @@
 import * as api from "./lib/tauri-api.js";
 import { $, $$, state, showToast } from "./lib/state.js";
 import { refreshInterfaces, setupIpConfigDialog, setupCameraIpDropdown } from "./lib/network.js";
-import { setupArpListeners, loadExistingArpState, setupAliasDialog } from "./lib/devices.js";
+import { setupArpListeners, loadExistingArpState, setupAliasDialog, resetDiscoveryStatus } from "./lib/devices.js";
 import { setupStreamControls, setupRtspControls, setupVideoResize, getVideoAreaBounds } from "./lib/streaming.js";
 import { setupPtzControls } from "./lib/ptz.js";
 
@@ -13,6 +13,7 @@ import { setupPtzControls } from "./lib/ptz.js";
 
 document.addEventListener("DOMContentLoaded", async () => {
   setupMenuAndAbout();
+  setupWindowControls();
   setupProtocolToggle();
   setupStreamControls();
   setupRtspControls();
@@ -84,6 +85,7 @@ function setupSettingsSave() {
         username: $("#camera-user").value,
         password: $("#camera-pass").value,
       },
+      adopted_subnets: state.config?.adopted_subnets || {},
     };
 
     try {
@@ -140,6 +142,30 @@ function setupMenuAndAbout() {
   });
 }
 
+// ── Window Controls ─────────────────────────────────────────────────
+
+function setupWindowControls() {
+  const win = window.__TAURI__?.window?.getCurrentWindow?.();
+  if (!win) return;
+
+  const maximizeIcon = `<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M3 3v10h10V3H3zm9 9H4V4h8v8z"/></svg>`;
+  const restoreIcon = `<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M3 5v8h8V5H3zm7 7H4V6h6v6zm1-9H5v1h7v7h1V3h-2z"/></svg>`;
+
+  async function updateMaximizeIcon() {
+    $("#btn-maximize").innerHTML = (await win.isMaximized()) ? restoreIcon : maximizeIcon;
+  }
+
+  $("#btn-minimize").addEventListener("click", () => win.minimize());
+  $("#btn-maximize").addEventListener("click", async () => {
+    await win.toggleMaximize();
+    updateMaximizeIcon();
+  });
+  $("#btn-close").addEventListener("click", () => win.close());
+
+  win.onResized?.(() => updateMaximizeIcon());
+  updateMaximizeIcon();
+}
+
 // ── Protocol Toggle ─────────────────────────────────────────────────
 
 function setupProtocolToggle() {
@@ -169,6 +195,22 @@ function setupRefreshButton() {
       await refreshInterfaces();
       await loadExistingArpState();
       showToast("Refreshed");
+    } catch (e) {
+      showToast("Refresh failed: " + e, true);
+    } finally {
+      btn.disabled = false;
+      btn.classList.remove("spinning");
+    }
+  });
+
+  $("#btn-refresh-nodes").addEventListener("click", async () => {
+    const btn = $("#btn-refresh-nodes");
+    btn.disabled = true;
+    btn.classList.add("spinning");
+
+    try {
+      resetDiscoveryStatus();
+      await loadExistingArpState();
     } catch (e) {
       showToast("Refresh failed: " + e, true);
     } finally {

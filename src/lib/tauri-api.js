@@ -157,3 +157,7 @@ export async function ptzGotoPreset(cameraUrl, preset) {
 export async function ptzSetPreset(cameraUrl, preset, name) {
   return await invoke("ptz_set_preset", { cameraUrl, preset, name });
 }
+
+export async function sonyCgiZoom(ip, zoomSpeed, username, password) {
+  return await invoke("sony_cgi_zoom", { ip, zoomSpeed, username, password });
+}

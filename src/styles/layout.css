@@ -55,26 +55,54 @@
   flex: 1;
 }
 
-/* ── About Panel (top-right expandable) ────────────────────────────── */
+/* ── Window Controls ───────────────────────────────────────────────── */
 
-.about-wrapper {
-  position: relative;
+.window-controls {
+  display: flex;
+  align-items: center;
+  margin-left: 8px;
   -webkit-app-region: no-drag;
+}
+
+.window-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  background: transparent;
+  border: none;
+  color: rgba(255, 255, 255, 0.7);
+  cursor: pointer;
+  border-radius: 6px;
+  transition: background 0.15s, color 0.15s;
+}
+
+.window-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+}
+
+.window-btn-close:hover {
+  background: #e81123;
+  color: #fff;
+}
+
+/* ── About Panel ───────────────────────────────────────────────────── */
+
+.sidebar-about {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--md-surface-variant);
 }
 
 .about-panel {
   display: none;
-  position: absolute;
-  top: 100%;
-  left: 0;
-  margin-top: 8px;
-  background: var(--md-surface-container);
-  border: 1px solid var(--md-surface-variant);
-  border-radius: var(--md-radius-md);
-  box-shadow: var(--md-elevation-2);
-  padding: 16px 20px;
-  min-width: 280px;
-  z-index: 100;
+  padding: 12px 0 0;
+  text-align: center;
 }
 
 .about-panel.open {
@@ -119,7 +147,7 @@
 .card-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  grid-template-rows: auto 1fr;
+  grid-template-rows: 31fr 59fr;
   gap: 20px;
   height: 100%;
 }
@@ -132,6 +160,7 @@
 /* ── Dialog ─────────────────────────────────────────────────────────── */
 
 .dialog {
+  margin: auto;
   border: none;
   border-radius: var(--md-radius-lg);
   background: var(--md-surface-container);
