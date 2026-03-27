@@ -13,7 +13,7 @@
 .app-bar {
   display: flex;
   align-items: center;
-  height: 56px;
+  height: 50px;
   padding: 0 16px;
   background: var(--md-surface);
   border-bottom: 1px solid var(--md-surface-variant);
