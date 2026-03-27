@@ -68,11 +68,11 @@
               </div>
               <div class="input-field">
                 <label for="camera-user">Username</label>
-                <input type="text" id="camera-user" autocomplete="off" />
+                <input type="text" id="camera-user" autocomplete="off" placeholder="OPTIONAL" />
               </div>
               <div class="input-field">
                 <label for="camera-pass">Password</label>
-                <input type="password" id="camera-pass" autocomplete="off" />
+                <input type="password" id="camera-pass" autocomplete="off" placeholder="OPTIONAL" />
               </div>
             </section>
 
@@ -110,9 +110,8 @@
                   </button>
                 </div>
               </div>
+              <button id="save-settings" class="filled-btn full-width">Save Settings</button>
             </section>
-
-            <button id="save-settings" class="filled-btn full-width">Save Settings</button>
 
             <div class="about-wrapper sidebar-about">
               <button id="about-toggle" class="icon-btn" title="About">
@@ -219,10 +218,6 @@
                 <div class="status-row">
                   <span class="status-label">Status:</span>
                   <span id="rtsp-status" class="status-value status-offline">Offline</span>
-                </div>
-                <div class="status-row">
-                  <span class="status-label">URL:</span>
-                  <span id="rtsp-url" class="status-value monospace">--</span>
                 </div>
                 <div class="status-row">
                   <span class="status-label">Uptime:</span>
@@ -357,8 +352,8 @@
       <h2>Stream QR Code</h2>
       <div class="dialog-body qr-dialog-body">
         <canvas id="qr-canvas"></canvas>
-        <p id="qr-url" class="qr-url monospace"></p>
-        <p class="qr-hint muted">Scan with your phone to open in VLC</p>
+        <p id="qr-url" class="qr-url monospace clickable-url" title="Click to copy"></p>
+        <p id="qr-copy-hint" class="qr-hint muted">Click URL to copy to clipboard</p>
       </div>
       <div class="dialog-actions">
         <button class="filled-btn" id="qr-close">Close</button>

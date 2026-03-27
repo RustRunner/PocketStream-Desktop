@@ -246,6 +246,21 @@ function setupQrDialog() {
 
   closeBtn.addEventListener("click", () => dialog.close());
 
+  // Click URL to copy to clipboard
+  $("#qr-url").addEventListener("click", async () => {
+    const url = $("#qr-url").textContent;
+    if (!url) return;
+    try {
+      await navigator.clipboard.writeText(url);
+      $("#qr-copy-hint").textContent = "Copied!";
+      setTimeout(() => {
+        $("#qr-copy-hint").textContent = "Click URL to copy to clipboard";
+      }, 2000);
+    } catch (_) {
+      showToast("Failed to copy", true);
+    }
+  });
+
   // Close on backdrop click
   dialog.addEventListener("click", (e) => {
     if (e.target === dialog) dialog.close();

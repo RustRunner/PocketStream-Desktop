@@ -86,6 +86,13 @@ pub async fn start_arp_discovery(
     app: tauri::AppHandle,
     interface: String,
 ) -> Result<(), AppError> {
+    if !crate::is_npcap_available() {
+        return Err(AppError::Network(
+            "Npcap is not installed -- ARP discovery requires Npcap \
+             (https://npcap.com/#download)"
+                .into(),
+        ));
+    }
     manager.start_arp_discovery(&interface, app).await
 }
 

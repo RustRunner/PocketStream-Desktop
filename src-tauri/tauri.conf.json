@@ -40,7 +40,8 @@
     ],
     "resources": [
       "resources/gstreamer/bin/*",
-      "resources/gstreamer/lib/gstreamer-1.0/*"
+      "resources/gstreamer/lib/gstreamer-1.0/*",
+      "resources/prerequisites/*"
     ],
     "windows": {
       "nsis": {

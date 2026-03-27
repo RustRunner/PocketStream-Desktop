@@ -9,6 +9,80 @@ use tauri::Manager;
 
 pub use error::AppError;
 
+/// Whether Npcap was successfully loaded at startup.
+/// Checked before any pcap operations to avoid delay-load crashes.
+static NPCAP_AVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn is_npcap_available() -> bool {
+    NPCAP_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// If Npcap is missing and a bundled installer exists, offer to install it.
+/// Uses a Win32 MessageBox (no Tauri window needed — runs before app starts).
+/// Returns true if Npcap was installed successfully.
+#[cfg(windows)]
+fn offer_npcap_install() -> bool {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    let exe_dir = match std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        Some(d) => d,
+        None => return false,
+    };
+
+    let installer = exe_dir
+        .join("resources")
+        .join("prerequisites")
+        .join("npcap-setup.exe");
+
+    if !installer.exists() {
+        log::info!("No bundled Npcap installer at {}", installer.display());
+        return false;
+    }
+
+    let title: Vec<u16> = OsStr::new("PocketStream Desktop")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let msg: Vec<u16> = OsStr::new(
+        "Npcap is required for network device discovery.\n\n\
+         Would you like to install it now?\n\n\
+         (During install, check \"Install Npcap in WinPcap API-compatible Mode\")",
+    )
+    .encode_wide()
+    .chain(std::iter::once(0))
+    .collect();
+
+    // MB_YESNO (4) | MB_ICONQUESTION (0x20)
+    let result = unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
+            std::ptr::null_mut(),
+            msg.as_ptr(),
+            title.as_ptr(),
+            0x00000004 | 0x00000020,
+        )
+    };
+
+    if result != 6 {
+        // User chose No
+        return false;
+    }
+
+    log::info!("Launching bundled Npcap installer: {}", installer.display());
+    match std::process::Command::new(&installer).status() {
+        Ok(status) => {
+            log::info!("Npcap installer exited with: {}", status);
+            // Retry loading Npcap DLLs
+            setup_npcap()
+        }
+        Err(e) => {
+            log::warn!("Failed to launch Npcap installer: {}", e);
+            false
+        }
+    }
+}
+
 /// Try to configure GStreamer from DLLs bundled alongside the executable.
 /// Returns true if a bundled GStreamer was found and configured.
 #[cfg(windows)]
@@ -174,7 +248,12 @@ pub fn run() {
     // ── Prerequisites ────────────────────────────────────────────────
     #[cfg(windows)]
     {
-        let npcap_ok = setup_npcap();
+        let mut npcap_ok = setup_npcap();
+        if !npcap_ok {
+            // Offer to install from bundled installer (shows a system dialog)
+            npcap_ok = offer_npcap_install();
+        }
+        NPCAP_AVAILABLE.store(npcap_ok, std::sync::atomic::Ordering::Relaxed);
         if !npcap_ok {
             log::warn!("Npcap is not installed — network discovery features will be limited");
         }
@@ -258,12 +337,16 @@ pub fn run() {
                             .find(|i| i.is_up && i.is_ethernet && !i.ips.is_empty());
 
                         if let Some(iface) = eth {
-                            let name = iface.name.clone();
-                            log::info!("Auto-starting ARP discovery on '{}'", name);
+                            if is_npcap_available() {
+                                let name = iface.name.clone();
+                                log::info!("Auto-starting ARP discovery on '{}'", name);
 
-                            if let Err(e) = manager.start_arp_discovery(&name, handle.clone()).await
-                            {
-                                log::warn!("Failed to auto-start ARP discovery: {}", e);
+                                if let Err(e) = manager.start_arp_discovery(&name, handle.clone()).await
+                                {
+                                    log::warn!("Failed to auto-start ARP discovery: {}", e);
+                                }
+                            } else {
+                                log::info!("Skipping ARP discovery (Npcap not installed)");
                             }
 
                             // Start lightweight interface watcher (pnet-based,

@@ -99,7 +99,7 @@
 
 .filled-btn.full-width {
   width: 100%;
-  margin-top: 16px;
+  margin-top: 8px;
 }
 
 .outlined-btn {
@@ -257,7 +257,7 @@
 .setting-label {
   font-size: 13px;
   font-weight: 500;
-  color: var(--md-on-surface-variant);
+  color: var(--md-primary);
   margin-bottom: 8px;
   text-transform: uppercase;
   letter-spacing: 0.8px;
@@ -475,7 +475,7 @@
   align-items: center;
   padding: 24px 20px;
   border-right: 1px solid var(--md-surface-variant);
-  gap: 24px;
+  gap: 18px;
 }
 
 .ptz-title {
@@ -545,7 +545,7 @@
   gap: 8px;
   width: 100%;
   padding: 0 16px;
-  margin-top: 16px;
+  margin-top: 8px;
   box-sizing: border-box;
 }
 
@@ -1091,6 +1091,12 @@
   background: var(--md-surface-variant);
   border-radius: var(--md-radius-sm);
   width: 100%;
+  cursor: pointer;
+  transition: background var(--md-transition);
+}
+
+.qr-url:hover {
+  background: rgba(61, 220, 132, 0.15);
 }
 
 .qr-hint {

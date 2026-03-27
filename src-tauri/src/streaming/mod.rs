@@ -268,7 +268,7 @@ impl StreamManager {
             .unwrap_or_else(|| std::path::PathBuf::from("."))
             .join("PocketStream");
 
-        let path = recorder::save_screenshot_bmp(&rgb_data, width, height, &output_dir)?;
+        let path = recorder::save_screenshot_jpg(&rgb_data, width, height, &output_dir)?;
 
         Ok(path.to_string_lossy().to_string())
     }
