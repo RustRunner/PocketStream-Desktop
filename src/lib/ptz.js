@@ -105,9 +105,10 @@ export function setupPtzControls() {
       ptuCmd("PS=0&TS=0").catch(() => {});
     };
 
-    btn.addEventListener("mousedown", startMove);
-    btn.addEventListener("mouseup", stopMove);
-    btn.addEventListener("mouseleave", stopMove);
+    btn.addEventListener("pointerdown", (e) => { e.preventDefault(); startMove(); });
+    btn.addEventListener("pointerup", stopMove);
+    btn.addEventListener("pointerleave", stopMove);
+    btn.addEventListener("pointercancel", stopMove);
   });
 
   // Preset buttons — click to recall, long-press to save current position
@@ -115,7 +116,8 @@ export function setupPtzControls() {
     let pressTimer = null;
     const preset = parseInt(btn.dataset.preset);
 
-    btn.addEventListener("mousedown", () => {
+    btn.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
       pressTimer = setTimeout(async () => {
         pressTimer = null;
         if (!getPtuIp()) return;
@@ -131,7 +133,7 @@ export function setupPtzControls() {
       }, 800);
     });
 
-    btn.addEventListener("mouseup", async () => {
+    btn.addEventListener("pointerup", async () => {
       if (pressTimer) {
         clearTimeout(pressTimer);
         pressTimer = null;
@@ -150,7 +152,14 @@ export function setupPtzControls() {
       }
     });
 
-    btn.addEventListener("mouseleave", () => {
+    btn.addEventListener("pointerleave", () => {
+      if (pressTimer) {
+        clearTimeout(pressTimer);
+        pressTimer = null;
+      }
+    });
+
+    btn.addEventListener("pointercancel", () => {
       if (pressTimer) {
         clearTimeout(pressTimer);
         pressTimer = null;

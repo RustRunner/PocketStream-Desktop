@@ -128,27 +128,25 @@ impl PlaybackPipeline {
     }
 
     /// Check if the pipeline is still actively playing.
-    /// Returns false if the pipeline has errored, EOS'd, or left the Playing state.
-    pub fn is_healthy(&self) -> bool {
-        // Check pipeline state
-        let (_, current, _) = self.pipeline.state(gst::ClockTime::from_mseconds(0));
-        if current != gst::State::Playing {
-            return false;
-        }
-
-        // Check bus for error/EOS without consuming other messages.
-        // pop_filtered only removes messages matching the given types,
-        // leaving state-change, QoS, warning, etc. on the bus.
+    /// Returns Ok(true) if healthy, Ok(false) if not playing yet,
+    /// or Err(message) with a user-friendly error description.
+    pub fn health_check(&self) -> Result<bool, String> {
+        // Always check bus first — errors may arrive before or after
+        // the state transitions away from Playing.
         if let Some(bus) = self.pipeline.bus() {
-            if bus
-                .pop_filtered(&[gst::MessageType::Error, gst::MessageType::Eos])
-                .is_some()
+            if let Some(msg) = bus.pop_filtered(&[gst::MessageType::Error, gst::MessageType::Eos])
             {
-                return false;
+                if let gst::MessageView::Error(err) = msg.view() {
+                    let raw = err.error().to_string();
+                    let debug = err.debug().map(|d| d.to_string()).unwrap_or_default();
+                    return Err(friendly_rtsp_error(&raw, &debug));
+                }
+                return Err("End of stream".into());
             }
         }
 
-        true
+        let (_, current, _) = self.pipeline.state(gst::ClockTime::from_mseconds(0));
+        Ok(current == gst::State::Playing)
     }
 
     /// Stop and clean up.
@@ -278,5 +276,47 @@ impl PlaybackPipeline {
 
         log::info!("Recording branch detached and finalized");
         Ok(())
+    }
+}
+
+/// Translate raw GStreamer/RTSP errors into user-friendly messages.
+fn friendly_rtsp_error(error: &str, debug: &str) -> String {
+    let combined = format!("{} {}", error, debug).to_lowercase();
+
+    // RTSP status codes
+    if combined.contains("503") || combined.contains("service unavailable") {
+        return "RTSP 503: wrong stream path or camera busy. Check the Path in settings.".into();
+    }
+    if combined.contains("404") || combined.contains("not found") {
+        return "RTSP 404: stream path not found. Check the Path in settings.".into();
+    }
+    if combined.contains("401") || combined.contains("unauthorized") {
+        return "RTSP 401: bad credentials. Check Username/Password in settings.".into();
+    }
+    if combined.contains("403") || combined.contains("forbidden") {
+        return "RTSP 403: access denied. Check credentials and camera permissions.".into();
+    }
+
+    // Connection errors
+    if combined.contains("could not connect") || combined.contains("connection refused") {
+        return "Cannot reach camera. Check IP address and that RTSP is enabled on port 554.".into();
+    }
+    if combined.contains("timed out") || combined.contains("timeout") {
+        return "Connection timed out. Camera may be unreachable or RTSP port blocked.".into();
+    }
+
+    // Codec / pipeline errors
+    if combined.contains("no element") {
+        return format!("Missing GStreamer plugin: {}", error);
+    }
+    if combined.contains("not negotiated") || combined.contains("not-negotiated") {
+        return "Stream format not supported. Camera may use an unsupported codec.".into();
+    }
+
+    // Fallback: truncate long debug info
+    if debug.len() > 120 {
+        format!("{} ({}...)", error, &debug[..120])
+    } else {
+        format!("{} ({})", error, debug)
     }
 }

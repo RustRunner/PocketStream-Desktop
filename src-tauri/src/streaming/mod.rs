@@ -28,6 +28,7 @@ pub struct StreamStatus {
     pub recording: bool,
     pub uptime_secs: u64,
     pub bandwidth_kbps: f64,
+    pub error: Option<String>,
 }
 
 pub struct StreamManager {
@@ -91,6 +92,10 @@ impl StreamManager {
         settings: &AppSettings,
         window_handle: Option<usize>,
     ) -> Result<(), AppError> {
+        // GStreamer init runs in a background thread at startup; block here
+        // until it's ready (usually instant, only slow on first cold launch).
+        crate::ensure_gstreamer();
+
         let mut state = self.state.lock().await;
 
         // Stop existing playback if any
@@ -149,6 +154,8 @@ impl StreamManager {
     }
 
     pub async fn start_rtsp_server(&self, settings: &AppSettings) -> Result<RtspServerInfo, AppError> {
+        crate::ensure_gstreamer();
+
         let port = settings.rtsp_server.port;
 
         // Ensure firewall allows inbound TCP on the RTSP port.
@@ -241,7 +248,13 @@ impl StreamManager {
             .map(|s| s.bandwidth_kbps())
             .unwrap_or(0.0);
 
-        let playing = state.playback.as_ref().map_or(false, |p| p.is_healthy());
+        let (playing, error) = match state.playback.as_ref() {
+            Some(p) => match p.health_check() {
+                Ok(healthy) => (healthy, None),
+                Err(msg) => (false, Some(msg)),
+            },
+            None => (false, None),
+        };
 
         Ok(StreamStatus {
             playing,
@@ -251,6 +264,7 @@ impl StreamManager {
             recording: state.recording,
             uptime_secs: uptime,
             bandwidth_kbps: bandwidth,
+            error,
         })
     }
 
@@ -392,6 +406,7 @@ mod tests {
                 username: username.into(),
                 password: password.into(),
             },
+            adopted_subnets: std::collections::HashMap::new(),
         }
     }
 
@@ -470,6 +485,7 @@ mod tests {
             recording: false,
             uptime_secs: 120,
             bandwidth_kbps: 0.0,
+            error: None,
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("\"playing\":true"));
@@ -487,6 +503,7 @@ mod tests {
             recording: false,
             uptime_secs: 0,
             bandwidth_kbps: 0.0,
+            error: None,
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("\"rtsp_url\":null"));
@@ -506,11 +523,11 @@ mod tests {
         assert!(status.rtsp_url.is_none());
     }
 
-    #[tokio::test]
-    async fn stream_manager_video_hwnd_roundtrip() {
+    #[test]
+    fn stream_manager_video_hwnd_roundtrip() {
         let mgr = StreamManager::new();
-        assert!(mgr.get_video_child_hwnd().await.is_none());
-        mgr.set_video_child_hwnd(0x12345).await;
-        assert_eq!(mgr.get_video_child_hwnd().await, Some(0x12345));
+        assert!(mgr.get_video_child_hwnd().is_none());
+        mgr.set_video_child_hwnd(0x12345);
+        assert_eq!(mgr.get_video_child_hwnd(), Some(0x12345));
     }
 }

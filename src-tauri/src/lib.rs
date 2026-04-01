@@ -5,9 +5,30 @@ mod error;
 mod network;
 mod streaming;
 
+use std::path::PathBuf;
+use std::sync::OnceLock;
 use tauri::Manager;
 
 pub use error::AppError;
+
+/// Lazily-initialized GStreamer guard.  The background thread kicks off
+/// `gstreamer::init()` early, but if a streaming command arrives before
+/// it finishes, `ensure_gstreamer()` will block until init completes.
+static GST_READY: OnceLock<()> = OnceLock::new();
+
+/// Log directory path, set once during startup.
+static LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn ensure_gstreamer() {
+    GST_READY.get_or_init(|| {
+        gstreamer::init().expect(
+            "Failed to initialize GStreamer. \
+             Ensure GStreamer MSVC x86_64 runtime is installed \
+             (https://gstreamer.freedesktop.org/download/)",
+        );
+        log::info!("GStreamer {} initialized", gstreamer::version_string());
+    });
+}
 
 /// Whether Npcap was successfully loaded at startup.
 /// Checked before any pcap operations to avoid delay-load crashes.
@@ -112,8 +133,22 @@ fn setup_bundled_gstreamer() -> bool {
 
     log::info!("Found bundled GStreamer at {}", gst_bin.display());
 
-    // Prepend the bundled bin directory to PATH so the OS loader finds
-    // GStreamer core DLLs (gstreamer-1.0-0.dll, glib-2.0-0.dll, etc.)
+    // Set the DLL search directory so transitive dependencies of plugins
+    // (e.g. gstlibav.dll → avcodec-61.dll) are found by LoadLibrary.
+    // This is more reliable than PATH for implicit DLL dependencies.
+    {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        let dir_wide: Vec<u16> = OsStr::new(&gst_bin)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            windows_sys::Win32::System::LibraryLoader::SetDllDirectoryW(dir_wide.as_ptr());
+        }
+    }
+
+    // Also prepend to PATH as a belt-and-suspenders approach
     let current_path = std::env::var("PATH").unwrap_or_default();
     std::env::set_var("PATH", format!("{};{}", gst_bin.display(), current_path));
 
@@ -126,6 +161,11 @@ fn setup_bundled_gstreamer() -> bool {
 
     // Store the plugin registry cache in AppData so it's writable even
     // when the install dir (Program Files) is read-only.
+    //
+    // Only invalidate the cache when the application binary is newer than
+    // the registry (i.e. after an update).  Keeping the cache across normal
+    // launches cuts GStreamer init from 5-15 s down to < 1 s, which is
+    // critical for ARP discovery timing.
     if let Some(data_dir) = dirs::data_local_dir() {
         let registry = data_dir
             .join("PocketStream")
@@ -133,6 +173,22 @@ fn setup_bundled_gstreamer() -> bool {
         if let Some(parent) = registry.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+
+        let should_invalidate = match (
+            std::fs::metadata(&exe_path).and_then(|m| m.modified()),
+            std::fs::metadata(&registry).and_then(|m| m.modified()),
+        ) {
+            (Ok(exe_time), Ok(reg_time)) => exe_time > reg_time,
+            _ => true, // registry missing or metadata unreadable — rebuild
+        };
+
+        if should_invalidate {
+            log::info!("Invalidating GStreamer registry cache (app binary is newer)");
+            let _ = std::fs::remove_file(&registry);
+        } else {
+            log::info!("Using cached GStreamer registry");
+        }
+
         std::env::set_var("GST_REGISTRY", registry.to_str().unwrap_or_default());
     }
 
@@ -242,8 +298,57 @@ async fn watch_interface(mac: String, display_name: String, handle: tauri::AppHa
     }
 }
 
+/// Return the log directory (set at startup).
+pub fn log_dir() -> Option<&'static PathBuf> {
+    LOG_DIR.get()
+}
+
+/// Initialise logging: stderr (visible in dev) + rotating log file.
+fn setup_logging() {
+    let log_dir = dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("PocketStream")
+        .join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+
+    let log_file = log_dir.join("pocketstream.log");
+
+    // Basic rotation: truncate if the file exceeds 10 MB.
+    if let Ok(meta) = std::fs::metadata(&log_file) {
+        if meta.len() > 10 * 1024 * 1024 {
+            let _ = std::fs::remove_file(&log_file);
+        }
+    }
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file);
+
+    let mut dispatch = fern::Dispatch::new()
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                "{} [{}] {} - {}",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                record.level(),
+                record.target(),
+                message,
+            ))
+        })
+        .level(log::LevelFilter::Info)
+        .level_for("pocketstream_desktop", log::LevelFilter::Debug)
+        .chain(std::io::stderr());
+
+    if let Ok(f) = file {
+        dispatch = dispatch.chain(f);
+    }
+
+    let _ = dispatch.apply();
+    let _ = LOG_DIR.set(log_dir);
+}
+
 pub fn run() {
-    env_logger::init();
+    setup_logging();
 
     // ── Prerequisites ────────────────────────────────────────────────
     #[cfg(windows)]
@@ -266,13 +371,11 @@ pub fn run() {
         }
     }
 
-    // Initialize GStreamer once at startup
-    gstreamer::init().expect(
-        "Failed to initialize GStreamer. \
-         Ensure GStreamer MSVC x86_64 runtime is installed \
-         (https://gstreamer.freedesktop.org/download/)"
-    );
-    log::info!("GStreamer {} initialized", gstreamer::version_string());
+    // Start GStreamer init in background — it can take seconds when the
+    // bundled plugin registry is cold.  ARP discovery (below) doesn't need
+    // GStreamer, so letting them run in parallel eliminates the startup
+    // blind window where ARP traffic goes uncaptured.
+    std::thread::spawn(|| ensure_gstreamer());
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -282,6 +385,8 @@ pub fn run() {
         .manage(streaming::StreamManager::new())
         .manage(network::NetworkManager::new())
         .invoke_handler(tauri::generate_handler![
+            // Logging
+            commands::open_log_folder,
             // Config
             commands::get_config,
             commands::save_config,

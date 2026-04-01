@@ -10,6 +10,12 @@ const invoke = window.__TAURI__?.core?.invoke ?? (async (cmd, args) => {
   return null;
 });
 
+// ── Logging ─────────────────────────────────────────────────────────
+
+export async function openLogFolder() {
+  return await invoke("open_log_folder");
+}
+
 // ── Config ──────────────────────────────────────────────────────────
 
 export async function getConfig() {

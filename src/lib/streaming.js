@@ -4,9 +4,7 @@
 
 import QRCode from "qrcode";
 import * as api from "./tauri-api.js";
-import { $, state, showToast, formatUptime, arpDevices, tcpScanResults } from "./state.js";
-import { resetDiscoveryStatus } from "./devices.js";
-import { updateCameraIpDropdown } from "./network.js";
+import { $, state, showToast, formatUptime } from "./state.js";
 
 /** Full RTSP URL (with token) — stored for QR code generation */
 let rtspFullUrl = null;
@@ -225,6 +223,14 @@ function setupQrDialog() {
   qrBtn.addEventListener("click", async () => {
     if (!rtspFullUrl) return;
 
+    // Show dialog first so the canvas is in the visible DOM —
+    // rendering to a canvas inside a hidden <dialog> can produce
+    // blank output on some WebView2 / Chromium builds.
+    $("#qr-url").textContent = rtspFullUrl;
+    api.setVideoVisible(false).catch(() => {});
+    dialog.showModal();
+    dialog.addEventListener("close", () => api.setVideoVisible(true).catch(() => {}), { once: true });
+
     const canvas = $("#qr-canvas");
     try {
       await QRCode.toCanvas(canvas, rtspFullUrl, {
@@ -235,13 +241,7 @@ function setupQrDialog() {
     } catch (e) {
       console.error("QR code generation failed:", e);
       showToast("Failed to generate QR code", true);
-      return;
     }
-
-    $("#qr-url").textContent = rtspFullUrl;
-    api.setVideoVisible(false).catch(() => {});
-    dialog.showModal();
-    dialog.addEventListener("close", () => api.setVideoVisible(true).catch(() => {}), { once: true });
   });
 
   closeBtn.addEventListener("click", () => dialog.close());
@@ -289,18 +289,23 @@ async function pollStatus() {
     if (status.rtsp_server_running) {
       $("#rtsp-uptime").textContent = formatUptime(status.uptime_secs);
       $("#rtsp-bandwidth").textContent = `${status.bandwidth_kbps.toFixed(1)} kbps`;
+      // Keep rtspFullUrl in sync — it may have been cleared by a
+      // transient stream-loss event while the server kept running.
+      if (!rtspFullUrl && status.rtsp_url) {
+        rtspFullUrl = status.rtsp_url;
+      }
     }
 
     // Detect stream drop — backend says not playing but we think we're streaming
     if (state.isStreaming && !status.playing) {
-      showStreamLost();
+      showStreamLost(status.error);
     } else if (state.isStreaming && status.playing) {
       hideStreamLost();
     }
   } catch (_) {}
 }
 
-function showStreamLost() {
+function showStreamLost(errorMsg) {
   if (state.streamLost) return;
   state.streamLost = true;
 
@@ -328,14 +333,9 @@ function showStreamLost() {
   updateStreamUI();
   stopStatusPolling();
 
-  // Clear stale nodes
-  arpDevices.clear();
-  tcpScanResults.clear();
-  $("#device-list").innerHTML = "";
-  updateCameraIpDropdown(null);
-  resetDiscoveryStatus();
-
-  showToast("Stream lost — connection dropped", true);
+  // Show the actual GStreamer error if available
+  const reason = errorMsg || "connection dropped";
+  showToast("Stream lost — " + reason, true);
 }
 
 function hideStreamLost() {

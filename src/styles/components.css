@@ -503,6 +503,9 @@
   justify-content: center;
   cursor: pointer;
   transition: all var(--md-transition);
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 .ptz-btn:hover {
@@ -618,6 +621,9 @@
   font-weight: 500;
   cursor: pointer;
   transition: all var(--md-transition);
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 .ptz-preset-btn:hover {

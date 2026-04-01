@@ -31,6 +31,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Start listening for ARP events (backend auto-starts ARP discovery)
   setupArpListeners();
   setupInterfaceWatcher();
+
+  // Load any devices the backend discovered before our listeners were ready
+  await loadExistingArpState();
 });
 
 // ── Config ──────────────────────────────────────────────────────────
@@ -72,7 +75,7 @@ function setupSettingsSave() {
       stream: {
         protocol: activeProto,
         rtsp_port: parseInt($("#rtsp-port").value) || 554,
-        rtsp_path: $("#rtsp-path").value || "/live",
+        rtsp_path: $("#rtsp-path").value || "/z3-1.sdp",
         udp_port: parseInt($("#udp-port").value) || 8600,
         camera_ip: state.config?.stream?.camera_ip || "",
       },
@@ -110,6 +113,11 @@ function setupSettingsSave() {
 // ── Sidebar ─────────────────────────────────────────────────────────
 
 function setupMenuAndAbout() {
+  // Open Log Folder button
+  $("#open-logs").addEventListener("click", () => {
+    api.openLogFolder().catch((e) => showToast("Failed to open logs: " + e, true));
+  });
+
   // Hamburger toggles settings sidebar
   $("#menu-toggle").addEventListener("click", () => {
     const sidebar = $("#sidebar");

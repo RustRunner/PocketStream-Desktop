@@ -5,6 +5,35 @@ use crate::error::AppError;
 use crate::network::{ArpDevice, InterfaceInfo, NetworkManager, ScanResult};
 use crate::streaming::{RtspServerInfo, StreamManager, StreamStatus};
 
+// ── Logging Commands ─────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn open_log_folder() -> Result<(), AppError> {
+    let dir = crate::log_dir()
+        .ok_or_else(|| AppError::Config("Log directory not initialised".into()))?;
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("explorer")
+            .arg(dir.as_os_str())
+            .spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open")
+            .arg(dir.as_os_str())
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open")
+            .arg(dir.as_os_str())
+            .spawn();
+    }
+
+    Ok(())
+}
+
 // ── Config Commands ──────────────────────────────────────────────────
 
 #[tauri::command]

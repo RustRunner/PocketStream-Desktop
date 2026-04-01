@@ -109,6 +109,15 @@
   display: block;
 }
 
+.about-action {
+  margin-top: 10px;
+  padding: 6px 14px;
+  font-size: 13px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
 /* ── Main Layout ────────────────────────────────────────────────────── */
 
 .main-layout {

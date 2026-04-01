@@ -61,6 +61,19 @@ $CoreDlls = @(
     "gstallocators-1.0-0.dll"
     "gstmpegts-1.0-0.dll"
 
+    # D3D11 GPU decoding/rendering dependencies
+    "gstd3d11-1.0-0.dll"
+    "gstcodecs-1.0-0.dll"
+    "gstd3dshader-1.0-0.dll"
+    "gstdxva-1.0-0.dll"
+    "gstcontroller-1.0-0.dll"
+    "gstriff-1.0-0.dll"
+
+    # OpenGL fallback + image format support
+    "graphene-1.0-0.dll"
+    "jpeg8.dll"
+    "png16.dll"
+
     # RTSP server library
     "gstrtspserver-1.0-0.dll"
 
@@ -87,6 +100,8 @@ $CoreDlls = @(
     "avcodec-61.dll"
     "avutil-59.dll"
     "avfilter-10.dll"
+    "avformat-61.dll"
+    "bz2.dll"
     "swresample-5.dll"
     "swscale-8.dll"
 

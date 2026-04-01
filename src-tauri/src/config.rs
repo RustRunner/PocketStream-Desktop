@@ -15,7 +15,7 @@ pub struct StreamConfig {
     pub protocol: String,
     /// Camera RTSP port (default 554)
     pub rtsp_port: u16,
-    /// Camera RTSP path (default "/live")
+    /// Camera RTSP path (default "/z3-1.sdp")
     pub rtsp_path: String,
     /// UDP stream port (default 8600)
     pub udp_port: u16,
@@ -60,7 +60,7 @@ impl Default for AppSettings {
             stream: StreamConfig {
                 protocol: "rtsp".into(),
                 rtsp_port: 554,
-                rtsp_path: "/live".into(),
+                rtsp_path: "/z3-1.sdp".into(),
                 udp_port: 8600,
                 camera_ip: String::new(),
             },
@@ -378,7 +378,7 @@ mod tests {
         let s = AppSettings::default();
         assert_eq!(s.stream.protocol, "rtsp");
         assert_eq!(s.stream.rtsp_port, 554);
-        assert_eq!(s.stream.rtsp_path, "/live");
+        assert_eq!(s.stream.rtsp_path, "/z3-1.sdp");
         assert_eq!(s.stream.udp_port, 8600);
         assert!(s.stream.camera_ip.is_empty());
     }
@@ -432,6 +432,7 @@ mod tests {
                 username: "admin".into(),
                 password: "secret".into(),
             },
+            adopted_subnets: std::collections::HashMap::new(),
         };
         let toml_str = toml::to_string_pretty(&settings).unwrap();
         let parsed: AppSettings = toml::from_str(&toml_str).unwrap();
