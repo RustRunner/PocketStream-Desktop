@@ -2,6 +2,8 @@
  * PocketStream Desktop — Shared state & utilities
  */
 
+const invoke = window.__TAURI__?.core?.invoke;
+
 // ── Shared mutable state ────────────────────────────────────────────
 
 export const state = {
@@ -33,6 +35,14 @@ export function log(msg) {
 }
 
 export function showToast(message, isError = false) {
+  // Write toast messages to the log file for diagnostics
+  if (invoke) {
+    invoke("log_frontend", {
+      level: isError ? "error" : "info",
+      message: `toast: ${message}`,
+    }).catch(() => {});
+  }
+
   const existing = document.querySelector(".toast");
   if (existing) existing.remove();
 

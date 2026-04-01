@@ -386,6 +386,7 @@ pub fn run() {
         .manage(network::NetworkManager::new())
         .invoke_handler(tauri::generate_handler![
             // Logging
+            commands::log_frontend,
             commands::open_log_folder,
             // Config
             commands::get_config,

@@ -8,6 +8,16 @@ use crate::streaming::{RtspServerInfo, StreamManager, StreamStatus};
 // ── Logging Commands ─────────────────────────────────────────────────
 
 #[tauri::command]
+pub fn log_frontend(level: String, message: String) {
+    match level.as_str() {
+        "error" => log::error!("[frontend] {}", message),
+        "warn" => log::warn!("[frontend] {}", message),
+        "debug" => log::debug!("[frontend] {}", message),
+        _ => log::info!("[frontend] {}", message),
+    }
+}
+
+#[tauri::command]
 pub fn open_log_folder() -> Result<(), AppError> {
     let dir = crate::log_dir()
         .ok_or_else(|| AppError::Config("Log directory not initialised".into()))?;

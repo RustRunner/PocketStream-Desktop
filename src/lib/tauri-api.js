@@ -12,6 +12,10 @@ const invoke = window.__TAURI__?.core?.invoke ?? (async (cmd, args) => {
 
 // ── Logging ─────────────────────────────────────────────────────────
 
+export function logToFile(level, message) {
+  invoke("log_frontend", { level, message }).catch(() => {});
+}
+
 export async function openLogFolder() {
   return await invoke("open_log_folder");
 }
