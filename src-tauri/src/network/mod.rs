@@ -65,6 +65,10 @@ impl NetworkManager {
 
     /// Load previously adopted subnets from config and verify they still
     /// exist on the adapter. Re-add any that are missing.
+    ///
+    /// Entries whose subnet matches the adapter's native IPs are pruned —
+    /// they were either saved by mistake or the adapter's primary IP changed
+    /// to cover that subnet since the adoption.
     pub async fn load_adopted_from_config(&self, config: &crate::config::AppConfig) {
         let settings = config.get();
         if settings.adopted_subnets.is_empty() {
@@ -87,11 +91,35 @@ impl NetworkManager {
             }
         };
 
+        // Build the set of /24 subnets the adapter already covers natively.
+        // Any adopted entry on a native subnet is redundant.
+        let native_subnets: HashSet<String> = iface
+            .ips
+            .iter()
+            .filter_map(|ip| ip.address.parse::<Ipv4Addr>().ok())
+            .map(|ip| {
+                let o = ip.octets();
+                format!("{}.{}.{}.0/24", o[0], o[1], o[2])
+            })
+            .collect();
+
         let current_ips: std::collections::HashSet<String> =
             iface.ips.iter().map(|ip| ip.address.clone()).collect();
 
         let mut map = self.adopted_ips.lock().await;
+        let mut pruned = false;
+
         for (subnet, ip_str) in &settings.adopted_subnets {
+            // Skip entries whose subnet the adapter already covers natively
+            if native_subnets.contains(subnet) {
+                log::info!(
+                    "Pruning adopted subnet {} ({}) — adapter already covers it natively",
+                    subnet, ip_str,
+                );
+                pruned = true;
+                continue;
+            }
+
             if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
                 map.insert(subnet.clone(), ip);
 
@@ -108,6 +136,18 @@ impl NetworkManager {
                     }
                 }
             }
+        }
+
+        // Persist the cleaned-up map so pruned entries don't come back
+        if pruned {
+            let adopted: HashMap<String, String> = map
+                .iter()
+                .map(|(k, v)| (k.clone(), v.to_string()))
+                .collect();
+            let mut new_settings = config.get();
+            new_settings.adopted_subnets = adopted;
+            let _ = config.update(new_settings);
+            log::info!("Saved pruned adopted subnets to config");
         }
     }
 
