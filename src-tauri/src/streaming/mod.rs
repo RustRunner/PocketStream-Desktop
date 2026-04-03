@@ -63,6 +63,27 @@ impl StreamManager {
         }
     }
 
+    /// Redact credentials from a URL for safe logging.
+    fn redact_url(url: &str) -> String {
+        // rtsp://user:pass@host → rtsp://user:***@host
+        // Only match when credentials appear between "://" and "@"
+        let scheme_end = match url.find("://") {
+            Some(i) => i + 3,
+            None => return url.to_string(),
+        };
+        let authority = &url[scheme_end..];
+        if let Some(at) = authority.find('@') {
+            if let Some(colon) = authority[..at].find(':') {
+                let mut redacted = String::with_capacity(url.len());
+                redacted.push_str(&url[..scheme_end + colon + 1]);
+                redacted.push_str("***");
+                redacted.push_str(&url[scheme_end + at..]);
+                return redacted;
+            }
+        }
+        url.to_string()
+    }
+
     /// Build the input URL from current settings.
     fn build_input_url(settings: &AppSettings) -> String {
         match settings.stream.protocol.as_str() {
@@ -94,7 +115,7 @@ impl StreamManager {
     ) -> Result<(), AppError> {
         // GStreamer init runs in a background thread at startup; block here
         // until it's ready (usually instant, only slow on first cold launch).
-        crate::ensure_gstreamer();
+        crate::ensure_gstreamer()?;
 
         let mut state = self.state.lock().await;
 
@@ -110,7 +131,7 @@ impl StreamManager {
             }
             _ => {
                 let url = Self::build_input_url(settings);
-                log::info!("Starting RTSP playback from: {}", url);
+                log::info!("Starting RTSP playback from: {}", Self::redact_url(&url));
                 PlaybackPipeline::new_rtsp(&url, 200, true, window_handle)?
             }
         };
@@ -154,7 +175,7 @@ impl StreamManager {
     }
 
     pub async fn start_rtsp_server(&self, settings: &AppSettings) -> Result<RtspServerInfo, AppError> {
-        crate::ensure_gstreamer();
+        crate::ensure_gstreamer()?;
 
         let port = settings.rtsp_server.port;
 
@@ -408,6 +429,38 @@ mod tests {
             },
             adopted_subnets: std::collections::HashMap::new(),
         }
+    }
+
+    // ── redact_url ─────────────────────────────────────────────────
+
+    #[test]
+    fn redact_url_with_credentials() {
+        let url = "rtsp://admin:hunter2@192.168.1.50:554/live";
+        assert_eq!(
+            StreamManager::redact_url(url),
+            "rtsp://admin:***@192.168.1.50:554/live"
+        );
+    }
+
+    #[test]
+    fn redact_url_without_credentials() {
+        let url = "rtsp://192.168.1.50:554/live";
+        assert_eq!(StreamManager::redact_url(url), url);
+    }
+
+    #[test]
+    fn redact_url_empty_password() {
+        let url = "rtsp://admin:@192.168.1.50:554/live";
+        assert_eq!(
+            StreamManager::redact_url(url),
+            "rtsp://admin:***@192.168.1.50:554/live"
+        );
+    }
+
+    #[test]
+    fn redact_url_udp() {
+        let url = "udp://@:8600";
+        assert_eq!(StreamManager::redact_url(url), url);
     }
 
     // ── build_input_url ─────────────────────────────────────────────

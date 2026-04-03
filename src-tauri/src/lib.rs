@@ -11,23 +11,34 @@ use tauri::Manager;
 
 pub use error::AppError;
 
-/// Lazily-initialized GStreamer guard.  The background thread kicks off
+/// Lazily-initialized GStreamer result.  The background thread kicks off
 /// `gstreamer::init()` early, but if a streaming command arrives before
 /// it finishes, `ensure_gstreamer()` will block until init completes.
-static GST_READY: OnceLock<()> = OnceLock::new();
+static GST_READY: OnceLock<Result<(), String>> = OnceLock::new();
 
 /// Log directory path, set once during startup.
 static LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-pub fn ensure_gstreamer() {
-    GST_READY.get_or_init(|| {
-        gstreamer::init().expect(
-            "Failed to initialize GStreamer. \
-             Ensure GStreamer MSVC x86_64 runtime is installed \
-             (https://gstreamer.freedesktop.org/download/)",
-        );
-        log::info!("GStreamer {} initialized", gstreamer::version_string());
+pub fn ensure_gstreamer() -> Result<(), AppError> {
+    let result = GST_READY.get_or_init(|| {
+        match gstreamer::init() {
+            Ok(()) => {
+                log::info!("GStreamer {} initialized", gstreamer::version_string());
+                Ok(())
+            }
+            Err(e) => {
+                let msg = format!(
+                    "Failed to initialize GStreamer: {}. \
+                     Ensure GStreamer MSVC x86_64 runtime is installed \
+                     (https://gstreamer.freedesktop.org/download/)",
+                    e
+                );
+                log::error!("{}", msg);
+                Err(msg)
+            }
+        }
     });
+    result.clone().map_err(AppError::Stream)
 }
 
 /// Whether Npcap was successfully loaded at startup.
@@ -375,12 +386,17 @@ pub fn run() {
     // bundled plugin registry is cold.  ARP discovery (below) doesn't need
     // GStreamer, so letting them run in parallel eliminates the startup
     // blind window where ARP traffic goes uncaptured.
-    std::thread::spawn(|| ensure_gstreamer());
+    std::thread::spawn(|| {
+        if let Err(e) = ensure_gstreamer() {
+            log::error!("Background GStreamer init failed: {}", e);
+        }
+    });
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(config::AppConfig::load_or_default())
         .manage(streaming::StreamManager::new())
         .manage(network::NetworkManager::new())
@@ -476,5 +492,9 @@ pub fn run() {
             Ok(())
         })
         .run(tauri::generate_context!())
-        .expect("error while running PocketStream Desktop");
+        .unwrap_or_else(|e| {
+            log::error!("Fatal: failed to start PocketStream Desktop: {}", e);
+            eprintln!("Fatal: failed to start PocketStream Desktop: {}", e);
+            std::process::exit(1);
+        });
 }

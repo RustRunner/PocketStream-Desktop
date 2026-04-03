@@ -6,6 +6,18 @@ import * as api from "./tauri-api.js";
 import { $, state, log, nodeAliases, arpDevices, adoptedSubnets, tcpScanResults } from "./state.js";
 import { renderSubnetList, updateCameraIpDropdown } from "./network.js";
 
+// ── Helpers ─────────────────────────────────────────────────────────
+
+/** Escape HTML special characters to prevent injection via innerHTML. */
+function escapeHtml(str) {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
 // ── Local scanning state ────────────────────────────────────────────
 
 const scannedIps = new Set();
@@ -211,7 +223,7 @@ function renderArpDeviceList() {
       html += `
         <div class="device-item${state.selectedDevice === d.ip ? " selected" : ""}" data-ip="${d.ip}">
           <div class="device-name-row">
-            <span class="device-name">${name}</span>
+            <span class="device-name">${escapeHtml(name)}</span>
             <button class="edit-alias-btn" data-alias-ip="${d.ip}" title="Rename">${pencilSvg}</button>
           </div>
           <div class="device-detail-row">
