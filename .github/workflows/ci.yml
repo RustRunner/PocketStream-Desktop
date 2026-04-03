@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  GSTREAMER_VERSION: "1.24.12"
+
+jobs:
+  frontend:
+    name: Frontend Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+
+  rust:
+    name: Rust Clippy & Tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install GStreamer
+        shell: pwsh
+        run: |
+          $runtime = "https://gstreamer.freedesktop.org/data/pkg/windows/$env:GSTREAMER_VERSION/msvc/gstreamer-1.0-msvc-x86_64-$env:GSTREAMER_VERSION.msi"
+          $devel   = "https://gstreamer.freedesktop.org/data/pkg/windows/$env:GSTREAMER_VERSION/msvc/gstreamer-1.0-devel-msvc-x86_64-$env:GSTREAMER_VERSION.msi"
+
+          Write-Host "Downloading GStreamer runtime..."
+          Invoke-WebRequest -Uri $runtime -OutFile gstreamer.msi -UseBasicParsing
+          Write-Host "Downloading GStreamer devel..."
+          Invoke-WebRequest -Uri $devel -OutFile gstreamer-devel.msi -UseBasicParsing
+
+          Write-Host "Installing GStreamer runtime..."
+          Start-Process msiexec -ArgumentList "/i","gstreamer.msi","/quiet","/norestart","ADDLOCAL=ALL" -Wait
+          Write-Host "Installing GStreamer devel..."
+          Start-Process msiexec -ArgumentList "/i","gstreamer-devel.msi","/quiet","/norestart","ADDLOCAL=ALL" -Wait
+
+      - name: Configure GStreamer environment
+        shell: pwsh
+        run: |
+          # The MSI installs to C:\gstreamer\1.0\msvc_x86_64 by default
+          $gstRoot = "C:\gstreamer\1.0\msvc_x86_64"
+          echo "PKG_CONFIG=$gstRoot\bin\pkg-config.exe"  >> $env:GITHUB_ENV
+          echo "PKG_CONFIG_PATH=$gstRoot\lib\pkgconfig"  >> $env:GITHUB_ENV
+          echo "$gstRoot\bin"                             >> $env:GITHUB_PATH
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
+
+      - name: Tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml

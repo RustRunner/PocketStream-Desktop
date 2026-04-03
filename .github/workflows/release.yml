@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+  GSTREAMER_VERSION: "1.24.12"
+
+jobs:
+  build:
+    name: Build & Release
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install GStreamer
+        shell: pwsh
+        run: |
+          $runtime = "https://gstreamer.freedesktop.org/data/pkg/windows/$env:GSTREAMER_VERSION/msvc/gstreamer-1.0-msvc-x86_64-$env:GSTREAMER_VERSION.msi"
+          $devel   = "https://gstreamer.freedesktop.org/data/pkg/windows/$env:GSTREAMER_VERSION/msvc/gstreamer-1.0-devel-msvc-x86_64-$env:GSTREAMER_VERSION.msi"
+
+          Invoke-WebRequest -Uri $runtime -OutFile gstreamer.msi -UseBasicParsing
+          Invoke-WebRequest -Uri $devel -OutFile gstreamer-devel.msi -UseBasicParsing
+          Start-Process msiexec -ArgumentList "/i","gstreamer.msi","/quiet","/norestart","ADDLOCAL=ALL" -Wait
+          Start-Process msiexec -ArgumentList "/i","gstreamer-devel.msi","/quiet","/norestart","ADDLOCAL=ALL" -Wait
+
+      - name: Configure GStreamer environment
+        shell: pwsh
+        run: |
+          $gstRoot = "C:\gstreamer\1.0\msvc_x86_64"
+          echo "PKG_CONFIG=$gstRoot\bin\pkg-config.exe"  >> $env:GITHUB_ENV
+          echo "PKG_CONFIG_PATH=$gstRoot\lib\pkgconfig"  >> $env:GITHUB_ENV
+          echo "$gstRoot\bin"                             >> $env:GITHUB_PATH
+
+      - name: Bundle GStreamer runtime
+        shell: pwsh
+        run: |
+          $env:GSTREAMER_1_0_ROOT_MSVC_X86_64 = "C:\gstreamer\1.0\msvc_x86_64\"
+          .\scripts\bundle-gstreamer.ps1
+
+      - run: npm ci
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "PocketStream Desktop ${{ github.ref_name }}"
+          releaseBody: "See the [commit log](https://github.com/RustRunner/PocketStream-Desktop/commits/${{ github.ref_name }}) for details."
+          releaseDraft: true
+          prerelease: false
+          includeUpdaterJson: true

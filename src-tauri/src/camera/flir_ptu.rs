@@ -9,15 +9,18 @@ use std::sync::OnceLock;
 use crate::error::AppError;
 
 /// Shared HTTP client — reused across all PTU commands.
-fn client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(3))
-            .pool_max_idle_per_host(2)
-            .build()
-            .expect("Failed to build HTTP client")
-    })
+fn client() -> Result<&'static reqwest::Client, AppError> {
+    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(3))
+                .pool_max_idle_per_host(2)
+                .build()
+                .map_err(|e| format!("Failed to build HTTP client: {}", e))
+        })
+        .as_ref()
+        .map_err(|e| AppError::Stream(e.clone()))
 }
 
 /// Send a command to the FLIR PTU and return the JSON response.
@@ -30,7 +33,7 @@ pub async fn send_command(
 ) -> Result<HashMap<String, String>, AppError> {
     let url = format!("{}/API/PTCmd", base_url.trim_end_matches('/'));
 
-    let resp = client()
+    let resp = client()?
         .post(&url)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(cmd.to_string())

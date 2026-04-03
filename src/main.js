@@ -34,7 +34,32 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   // Load any devices the backend discovered before our listeners were ready
   await loadExistingArpState();
+
+  // Check for updates (non-blocking)
+  checkForUpdates();
 });
+
+// ── Auto-updater ───────────────────────────────────────────────────
+
+async function checkForUpdates() {
+  const updater = window.__TAURI__?.updater;
+  if (!updater) return;
+
+  try {
+    const update = await updater.check();
+    if (!update) return;
+
+    api.logToFile("info", `Update available: v${update.version}`);
+    showToast(`Update v${update.version} available — downloading...`);
+
+    await update.downloadAndInstall();
+    api.logToFile("info", "Update installed, prompting restart");
+    showToast("Update installed. Restart to apply.");
+  } catch (e) {
+    // Non-fatal — don't block the app if the update check fails
+    api.logToFile("warn", `Update check failed: ${e}`);
+  }
+}
 
 // ── Config ──────────────────────────────────────────────────────────
 

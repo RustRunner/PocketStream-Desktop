@@ -92,16 +92,34 @@ impl AppConfig {
     }
 
     pub fn save(&self) -> Result<(), crate::AppError> {
-        let settings = self.settings.lock().unwrap().clone();
+        let settings = match self.settings.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => {
+                log::error!("Config mutex poisoned during save, recovering");
+                poisoned.into_inner().clone()
+            }
+        };
         save_to_disk(&settings)
     }
 
     pub fn get(&self) -> AppSettings {
-        self.settings.lock().unwrap().clone()
+        match self.settings.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => {
+                log::error!("Config mutex poisoned during get, recovering");
+                poisoned.into_inner().clone()
+            }
+        }
     }
 
     pub fn update(&self, new_settings: AppSettings) -> Result<(), crate::AppError> {
-        *self.settings.lock().unwrap() = new_settings;
+        match self.settings.lock() {
+            Ok(mut guard) => *guard = new_settings,
+            Err(poisoned) => {
+                log::error!("Config mutex poisoned during update, recovering");
+                *poisoned.into_inner() = new_settings;
+            }
+        }
         self.save()
     }
 }
