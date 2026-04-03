@@ -26,20 +26,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install GStreamer
-        shell: bash
-        run: |
-          RUNTIME="https://gstreamer.freedesktop.org/data/pkg/windows/$GSTREAMER_VERSION/msvc/gstreamer-1.0-msvc-x86_64-$GSTREAMER_VERSION.msi"
-          DEVEL="https://gstreamer.freedesktop.org/data/pkg/windows/$GSTREAMER_VERSION/msvc/gstreamer-1.0-devel-msvc-x86_64-$GSTREAMER_VERSION.msi"
-
-          curl -L -o gstreamer.msi -A "Mozilla/5.0" --retry 3 "$RUNTIME"
-          curl -L -o gstreamer-devel.msi -A "Mozilla/5.0" --retry 3 "$DEVEL"
-          msiexec //i gstreamer.msi //quiet //norestart ADDLOCAL=ALL
-          msiexec //i gstreamer-devel.msi //quiet //norestart ADDLOCAL=ALL
+        uses: blinemedical/setup-gstreamer@v2
+        with:
+          version: 1.24.12
 
       - name: Configure GStreamer environment
         shell: pwsh
         run: |
-          $gstRoot = "C:\gstreamer\1.0\msvc_x86_64"
+          $gstRoot = "$env:GSTREAMER_1_0_ROOT_MSVC_X86_64"
+          if (-not $gstRoot) { $gstRoot = "C:\gstreamer\1.0\msvc_x86_64" }
           echo "PKG_CONFIG=$gstRoot\bin\pkg-config.exe"  >> $env:GITHUB_ENV
           echo "PKG_CONFIG_PATH=$gstRoot\lib\pkgconfig"  >> $env:GITHUB_ENV
           echo "$gstRoot\bin"                             >> $env:GITHUB_PATH
