@@ -26,15 +26,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install GStreamer
-        shell: pwsh
+        shell: bash
         run: |
-          $runtime = "https://gstreamer.freedesktop.org/data/pkg/windows/$env:GSTREAMER_VERSION/msvc/gstreamer-1.0-msvc-x86_64-$env:GSTREAMER_VERSION.msi"
-          $devel   = "https://gstreamer.freedesktop.org/data/pkg/windows/$env:GSTREAMER_VERSION/msvc/gstreamer-1.0-devel-msvc-x86_64-$env:GSTREAMER_VERSION.msi"
+          RUNTIME="https://gstreamer.freedesktop.org/data/pkg/windows/$GSTREAMER_VERSION/msvc/gstreamer-1.0-msvc-x86_64-$GSTREAMER_VERSION.msi"
+          DEVEL="https://gstreamer.freedesktop.org/data/pkg/windows/$GSTREAMER_VERSION/msvc/gstreamer-1.0-devel-msvc-x86_64-$GSTREAMER_VERSION.msi"
 
-          Invoke-WebRequest -Uri $runtime -OutFile gstreamer.msi -UseBasicParsing
-          Invoke-WebRequest -Uri $devel -OutFile gstreamer-devel.msi -UseBasicParsing
-          Start-Process msiexec -ArgumentList "/i","gstreamer.msi","/quiet","/norestart","ADDLOCAL=ALL" -Wait
-          Start-Process msiexec -ArgumentList "/i","gstreamer-devel.msi","/quiet","/norestart","ADDLOCAL=ALL" -Wait
+          curl -L -o gstreamer.msi -A "Mozilla/5.0" --retry 3 "$RUNTIME"
+          curl -L -o gstreamer-devel.msi -A "Mozilla/5.0" --retry 3 "$DEVEL"
+          msiexec //i gstreamer.msi //quiet //norestart ADDLOCAL=ALL
+          msiexec //i gstreamer-devel.msi //quiet //norestart ADDLOCAL=ALL
 
       - name: Configure GStreamer environment
         shell: pwsh

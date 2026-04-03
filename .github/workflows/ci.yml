@@ -36,20 +36,20 @@ jobs:
           components: clippy
 
       - name: Install GStreamer
-        shell: pwsh
+        shell: bash
         run: |
-          $runtime = "https://gstreamer.freedesktop.org/data/pkg/windows/$env:GSTREAMER_VERSION/msvc/gstreamer-1.0-msvc-x86_64-$env:GSTREAMER_VERSION.msi"
-          $devel   = "https://gstreamer.freedesktop.org/data/pkg/windows/$env:GSTREAMER_VERSION/msvc/gstreamer-1.0-devel-msvc-x86_64-$env:GSTREAMER_VERSION.msi"
+          RUNTIME="https://gstreamer.freedesktop.org/data/pkg/windows/$GSTREAMER_VERSION/msvc/gstreamer-1.0-msvc-x86_64-$GSTREAMER_VERSION.msi"
+          DEVEL="https://gstreamer.freedesktop.org/data/pkg/windows/$GSTREAMER_VERSION/msvc/gstreamer-1.0-devel-msvc-x86_64-$GSTREAMER_VERSION.msi"
 
-          Write-Host "Downloading GStreamer runtime..."
-          Invoke-WebRequest -Uri $runtime -OutFile gstreamer.msi -UseBasicParsing
-          Write-Host "Downloading GStreamer devel..."
-          Invoke-WebRequest -Uri $devel -OutFile gstreamer-devel.msi -UseBasicParsing
+          echo "Downloading GStreamer runtime..."
+          curl -L -o gstreamer.msi -A "Mozilla/5.0" --retry 3 "$RUNTIME"
+          echo "Downloading GStreamer devel..."
+          curl -L -o gstreamer-devel.msi -A "Mozilla/5.0" --retry 3 "$DEVEL"
 
-          Write-Host "Installing GStreamer runtime..."
-          Start-Process msiexec -ArgumentList "/i","gstreamer.msi","/quiet","/norestart","ADDLOCAL=ALL" -Wait
-          Write-Host "Installing GStreamer devel..."
-          Start-Process msiexec -ArgumentList "/i","gstreamer-devel.msi","/quiet","/norestart","ADDLOCAL=ALL" -Wait
+          echo "Installing GStreamer runtime..."
+          msiexec //i gstreamer.msi //quiet //norestart ADDLOCAL=ALL
+          echo "Installing GStreamer devel..."
+          msiexec //i gstreamer-devel.msi //quiet //norestart ADDLOCAL=ALL
 
       - name: Configure GStreamer environment
         shell: pwsh
