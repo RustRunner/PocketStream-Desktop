@@ -36,7 +36,7 @@ jobs:
           components: clippy
 
       - name: Install GStreamer
-        uses: blinemedical/setup-gstreamer@v2
+        uses: blinemedical/setup-gstreamer@v1
         with:
           version: 1.24.12
 
