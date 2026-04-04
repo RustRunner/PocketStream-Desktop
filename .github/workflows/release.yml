@@ -25,7 +25,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install GStreamer
-        run: choco install gstreamer gstreamer-devel --yes --no-progress
+        shell: pwsh
+        run: |
+          $tag = "deps"
+          $repo = "${{ github.repository }}"
+          $runtime = "gstreamer-1.0-msvc-x86_64-1.26.9.msi"
+          $devel   = "gstreamer-1.0-devel-msvc-x86_64-1.26.9.msi"
+
+          gh release download $tag --repo $repo --pattern $runtime --dir .
+          gh release download $tag --repo $repo --pattern $devel --dir .
+
+          Start-Process msiexec -ArgumentList "/i","$PWD\$runtime","/quiet","/norestart","ADDLOCAL=ALL" -Wait
+          Start-Process msiexec -ArgumentList "/i","$PWD\$devel","/quiet","/norestart","ADDLOCAL=ALL" -Wait
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Configure GStreamer environment
         shell: pwsh
