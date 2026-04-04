@@ -31,6 +31,7 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "createUpdaterArtifacts": "v1Compatible",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -53,7 +54,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEZFNkUwNDBDMDFCRDE4QzAKUldUQUdMMEJEQVJ1L3RrQU94cjhCMUNnWUZvSDVHcE1qV0QvcStPdTcwaTc4Qng5MnNHU0xRYksK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQ1Rjk2MDM3OEJBMDRFQTgKUldTb1RxQ0xOMkQ1MVV3Tll5UGhQaU5peTg0cm1iTk13eXpmUmRNWlRHdW1aVTlwRXdDbVl4UngK",
       "endpoints": [
         "https://github.com/RustRunner/PocketStream-Desktop/releases/latest/download/latest.json"
       ]
