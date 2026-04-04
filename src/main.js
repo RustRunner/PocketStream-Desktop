@@ -50,15 +50,91 @@ async function checkForUpdates() {
     if (!update) return;
 
     api.logToFile("info", `Update available: v${update.version}`);
-    showToast(`Update v${update.version} available — downloading...`);
-
-    await update.downloadAndInstall();
-    api.logToFile("info", "Update installed, prompting restart");
-    showToast("Update installed. Restart to apply.");
+    showUpdateToast(update);
   } catch (e) {
     // Non-fatal — don't block the app if the update check fails
     api.logToFile("warn", `Update check failed: ${e}`);
   }
+}
+
+function showUpdateToast(update) {
+  const existing = document.querySelector(".toast");
+  if (existing) existing.remove();
+
+  const toast = document.createElement("div");
+  toast.className = "toast update-toast";
+  toast.style.cssText = `
+    position: fixed;
+    bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--md-surface-variant);
+    color: var(--md-on-surface);
+    padding: 12px 20px;
+    border-radius: var(--md-radius-sm);
+    font-size: 14px;
+    z-index: 1000;
+    box-shadow: var(--md-elevation-2);
+    animation: toast-in 200ms ease-out;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  `;
+
+  const msg = document.createElement("span");
+  msg.textContent = `Update v${update.version} available`;
+
+  const btnInstall = document.createElement("button");
+  btnInstall.textContent = "Install";
+  btnInstall.style.cssText = `
+    background: var(--md-primary);
+    color: var(--md-on-primary);
+    border: none;
+    padding: 6px 16px;
+    border-radius: var(--md-radius-sm);
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+  `;
+
+  const btnDismiss = document.createElement("button");
+  btnDismiss.textContent = "Later";
+  btnDismiss.style.cssText = `
+    background: transparent;
+    color: var(--md-on-surface-variant);
+    border: none;
+    padding: 6px 12px;
+    cursor: pointer;
+    font-size: 13px;
+  `;
+
+  btnInstall.addEventListener("click", async () => {
+    msg.textContent = `Downloading v${update.version}...`;
+    btnInstall.remove();
+    btnDismiss.remove();
+    try {
+      await update.downloadAndInstall();
+      api.logToFile("info", "Update installed, prompting restart");
+      msg.textContent = "Update installed. Restart to apply.";
+      setTimeout(() => toast.remove(), 5000);
+    } catch (e) {
+      api.logToFile("warn", `Update install failed: ${e}`);
+      msg.textContent = "Update failed.";
+      setTimeout(() => toast.remove(), 3000);
+    }
+  });
+
+  btnDismiss.addEventListener("click", () => {
+    api.logToFile("info", "User dismissed update notification");
+    toast.style.opacity = "0";
+    toast.style.transition = "opacity 200ms";
+    setTimeout(() => toast.remove(), 200);
+  });
+
+  toast.appendChild(msg);
+  toast.appendChild(btnInstall);
+  toast.appendChild(btnDismiss);
+  document.body.appendChild(toast);
 }
 
 // ── Config ──────────────────────────────────────────────────────────
