@@ -8,7 +8,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  GSTREAMER_VERSION: "1.24.12"
 
 jobs:
   frontend:
@@ -36,14 +35,12 @@ jobs:
           components: clippy
 
       - name: Install GStreamer
-        uses: blinemedical/setup-gstreamer@v1
-        with:
-          version: 1.24.12
+        run: choco install gstreamer gstreamer-devel --yes --no-progress
 
       - name: Configure GStreamer environment
         shell: pwsh
         run: |
-          $gstRoot = "$env:GSTREAMER_1_0_ROOT_MSVC_X86_64"
+          $gstRoot = (Get-ItemProperty "HKLM:\SOFTWARE\GStreamer1.0\x86_64" -ErrorAction SilentlyContinue).InstallDir
           if (-not $gstRoot) { $gstRoot = "C:\gstreamer\1.0\msvc_x86_64" }
           echo "PKG_CONFIG=$gstRoot\bin\pkg-config.exe"  >> $env:GITHUB_ENV
           echo "PKG_CONFIG_PATH=$gstRoot\lib\pkgconfig"  >> $env:GITHUB_ENV
