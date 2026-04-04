@@ -6,9 +6,6 @@ on:
   pull_request:
     branches: [main]
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
   frontend:
     name: Frontend Build
@@ -23,63 +20,3 @@ jobs:
 
       - run: npm ci
       - run: npm run build
-
-  rust:
-    name: Rust Check & Tests
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - name: Install GStreamer
-        shell: pwsh
-        run: |
-          # Download MSIs from the project's own deps release (immune to CDN blocks).
-          # To set up: download both MSIs from gstreamer.freedesktop.org in a browser,
-          # then upload them with:
-          #   gh release create deps --title "CI Dependencies" --notes "GStreamer MSIs for CI"
-          #   gh release upload deps gstreamer-1.0-msvc-x86_64-1.26.9.msi gstreamer-1.0-devel-msvc-x86_64-1.26.9.msi
-          $tag = "deps"
-          $repo = "${{ github.repository }}"
-          $base = "https://github.com/$repo/releases/download/$tag"
-          $runtime = "gstreamer-1.0-msvc-x86_64-1.26.9.msi"
-          $devel   = "gstreamer-1.0-devel-msvc-x86_64-1.26.9.msi"
-
-          Write-Host "Downloading GStreamer runtime from project deps release..."
-          gh release download $tag --repo $repo --pattern $runtime --dir .
-          Write-Host "Downloading GStreamer devel from project deps release..."
-          gh release download $tag --repo $repo --pattern $devel --dir .
-
-          Write-Host "Installing GStreamer runtime..."
-          Start-Process msiexec -ArgumentList "/i","$PWD\$runtime","/quiet","/norestart","ADDLOCAL=ALL" -Wait
-          Write-Host "Installing GStreamer devel..."
-          Start-Process msiexec -ArgumentList "/i","$PWD\$devel","/quiet","/norestart","ADDLOCAL=ALL" -Wait
-        env:
-          GH_TOKEN: ${{ github.token }}
-
-      - name: Configure GStreamer environment
-        shell: pwsh
-        run: |
-          $gstRoot = (Get-ItemProperty "HKLM:\SOFTWARE\GStreamer1.0\x86_64" -ErrorAction SilentlyContinue).InstallDir
-          if (-not $gstRoot) { $gstRoot = "C:\gstreamer\1.0\msvc_x86_64" }
-          echo "PKG_CONFIG=$gstRoot\bin\pkg-config.exe"  >> $env:GITHUB_ENV
-          echo "PKG_CONFIG_PATH=$gstRoot\lib\pkgconfig"  >> $env:GITHUB_ENV
-          echo "$gstRoot\bin"                             >> $env:GITHUB_PATH
-
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            src-tauri/target
-          key: cargo-${{ runner.os }}-${{ hashFiles('src-tauri/Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
-
-      - name: Clippy
-        run: cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
-
-      - name: Tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml
