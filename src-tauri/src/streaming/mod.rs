@@ -85,10 +85,23 @@ impl StreamManager {
     }
 
     /// Build the input URL from current settings.
-    fn build_input_url(settings: &AppSettings) -> String {
+    fn build_input_url(settings: &AppSettings) -> Result<String, AppError> {
         match settings.stream.protocol.as_str() {
-            "udp" => format!("udp://@:{}", settings.stream.udp_port),
+            "udp" => Ok(format!("udp://@:{}", settings.stream.udp_port)),
             _ => {
+                // Validate camera IP before building URL (defense in depth)
+                if !settings.stream.camera_ip.is_empty() {
+                    settings
+                        .stream
+                        .camera_ip
+                        .parse::<std::net::Ipv4Addr>()
+                        .map_err(|_| {
+                            AppError::Stream(format!(
+                                "Invalid camera IP: {}",
+                                settings.stream.camera_ip
+                            ))
+                        })?;
+                }
                 let creds = if !settings.credentials.username.is_empty() {
                     format!(
                         "{}:{}@",
@@ -97,13 +110,13 @@ impl StreamManager {
                 } else {
                     String::new()
                 };
-                format!(
+                Ok(format!(
                     "rtsp://{}{}:{}{}",
                     creds,
                     settings.stream.camera_ip,
                     settings.stream.rtsp_port,
                     settings.stream.rtsp_path
-                )
+                ))
             }
         }
     }
@@ -130,7 +143,7 @@ impl StreamManager {
                 PlaybackPipeline::new_udp(settings.stream.udp_port, window_handle)?
             }
             _ => {
-                let url = Self::build_input_url(settings);
+                let url = Self::build_input_url(settings)?;
                 log::info!("Starting RTSP playback from: {}", Self::redact_url(&url));
                 PlaybackPipeline::new_rtsp(&url, 200, true, window_handle)?
             }
@@ -215,7 +228,7 @@ impl StreamManager {
                 bind_address.as_deref(),
             )?,
             _ => {
-                let input_url = Self::build_input_url(settings);
+                let input_url = Self::build_input_url(settings)?;
                 RtspRestreamer::start_from_rtsp(
                     &input_url,
                     port,
@@ -468,14 +481,14 @@ mod tests {
     #[test]
     fn build_url_rtsp_with_credentials() {
         let s = make_settings("rtsp", "192.168.1.10", "admin", "pass123");
-        let url = StreamManager::build_input_url(&s);
+        let url = StreamManager::build_input_url(&s).unwrap();
         assert_eq!(url, "rtsp://admin:pass123@192.168.1.10:554/live");
     }
 
     #[test]
     fn build_url_rtsp_without_credentials() {
         let s = make_settings("rtsp", "192.168.1.10", "", "");
-        let url = StreamManager::build_input_url(&s);
+        let url = StreamManager::build_input_url(&s).unwrap();
         assert_eq!(url, "rtsp://192.168.1.10:554/live");
     }
 
@@ -483,21 +496,21 @@ mod tests {
     fn build_url_rtsp_empty_password_still_has_creds() {
         // If username is set but password is empty, creds block is still added
         let s = make_settings("rtsp", "10.0.0.5", "admin", "");
-        let url = StreamManager::build_input_url(&s);
+        let url = StreamManager::build_input_url(&s).unwrap();
         assert_eq!(url, "rtsp://admin:@10.0.0.5:554/live");
     }
 
     #[test]
     fn build_url_udp() {
         let s = make_settings("udp", "", "", "");
-        let url = StreamManager::build_input_url(&s);
+        let url = StreamManager::build_input_url(&s).unwrap();
         assert_eq!(url, "udp://@:8600");
     }
 
     #[test]
     fn build_url_udp_ignores_camera_ip() {
         let s = make_settings("udp", "192.168.1.1", "admin", "pass");
-        let url = StreamManager::build_input_url(&s);
+        let url = StreamManager::build_input_url(&s).unwrap();
         assert_eq!(url, "udp://@:8600");
     }
 
@@ -506,7 +519,7 @@ mod tests {
         let mut s = make_settings("rtsp", "10.0.0.5", "", "");
         s.stream.rtsp_port = 8554;
         s.stream.rtsp_path = "/cam1/main".into();
-        let url = StreamManager::build_input_url(&s);
+        let url = StreamManager::build_input_url(&s).unwrap();
         assert_eq!(url, "rtsp://10.0.0.5:8554/cam1/main");
     }
 
@@ -514,7 +527,7 @@ mod tests {
     fn build_url_custom_udp_port() {
         let mut s = make_settings("udp", "", "", "");
         s.stream.udp_port = 9999;
-        let url = StreamManager::build_input_url(&s);
+        let url = StreamManager::build_input_url(&s).unwrap();
         assert_eq!(url, "udp://@:9999");
     }
 
@@ -522,8 +535,20 @@ mod tests {
     fn build_url_unknown_protocol_falls_to_rtsp() {
         // Any non-"udp" protocol defaults to RTSP path
         let s = make_settings("http", "1.2.3.4", "", "");
-        let url = StreamManager::build_input_url(&s);
+        let url = StreamManager::build_input_url(&s).unwrap();
         assert!(url.starts_with("rtsp://"));
+    }
+
+    #[test]
+    fn build_url_rejects_invalid_camera_ip() {
+        let s = make_settings("rtsp", "not-an-ip", "", "");
+        assert!(StreamManager::build_input_url(&s).is_err());
+    }
+
+    #[test]
+    fn build_url_rejects_pipeline_injection_in_ip() {
+        let s = make_settings("rtsp", "192.168.1.1 ! filesrc location=/etc/passwd", "", "");
+        assert!(StreamManager::build_input_url(&s).is_err());
     }
 
     // ── StreamStatus ────────────────────────────────────────────────

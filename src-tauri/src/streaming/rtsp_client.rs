@@ -30,9 +30,12 @@ impl PlaybackPipeline {
     ) -> Result<Self, AppError> {
         let protocols = if use_tcp { "tcp" } else { "udp+tcp" };
 
+        // User-controlled values (URL) are set as element properties below,
+        // never interpolated into the pipeline description string, to prevent
+        // GStreamer pipeline injection via crafted RTSP paths or credentials.
         let pipeline_str = format!(
             concat!(
-                "rtspsrc location={url} latency={latency} protocols={proto} ",
+                "rtspsrc name=src latency={latency} protocols={proto} ",
                 "! decodebin name=dec ",
                 "dec. ! videoconvert ! tee name=t ",
                 "t. ! queue leaky=downstream max-size-buffers=2 ! autovideosink name=videosink sync=false ",
@@ -41,12 +44,18 @@ impl PlaybackPipeline {
                 "! video/x-raw,format=RGB ",
                 "! appsink name=snap emit-signals=false drop=true max-buffers=1"
             ),
-            url = url,
             latency = latency_ms,
             proto = protocols,
         );
 
-        Self::from_pipeline_str(&pipeline_str, window_handle)
+        let result = Self::from_pipeline_str(&pipeline_str, window_handle)?;
+
+        result.pipeline
+            .by_name("src")
+            .expect("rtspsrc 'src' not found in pipeline")
+            .set_property("location", url);
+
+        Ok(result)
     }
 
     /// Create a playback pipeline for a UDP source.
@@ -200,20 +209,24 @@ impl PlaybackPipeline {
 
         let bin_name = "rec_bin";
 
-        let rec_bin_str = format!(
-            concat!(
-                "queue name=rec_queue leaky=downstream ",
-                "! videoconvert ",
-                "! x264enc tune=zerolatency bitrate=4000 speed-preset=ultrafast ",
-                "! h264parse ",
-                "! mp4mux fragment-duration=1000 ",
-                "! filesink location={path}"
-            ),
-            path = file_path,
+        // File path is set as an element property below, not interpolated into
+        // the pipeline string, to handle paths with spaces or special characters.
+        let rec_bin_str = concat!(
+            "queue name=rec_queue leaky=downstream ",
+            "! videoconvert ",
+            "! x264enc tune=zerolatency bitrate=4000 speed-preset=ultrafast ",
+            "! h264parse ",
+            "! mp4mux fragment-duration=1000 ",
+            "! filesink name=rec_sink"
         );
 
-        let rec_bin = gst::parse::bin_from_description(&rec_bin_str, true)
+        let rec_bin = gst::parse::bin_from_description(rec_bin_str, true)
             .map_err(|e| AppError::Stream(format!("Recording bin parse error: {}", e)))?;
+
+        rec_bin
+            .by_name("rec_sink")
+            .expect("filesink 'rec_sink' not found in recording bin")
+            .set_property("location", file_path);
         rec_bin.set_property("name", bin_name);
 
         self.pipeline

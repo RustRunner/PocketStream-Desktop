@@ -125,15 +125,27 @@ impl RtspRestreamer {
 
         let factory = gst_rtsp_server::RTSPMediaFactory::new();
 
-        let launch = format!(
-            "( rtspsrc location={url} latency=200 protocols=tcp \
+        // The RTSP source URL is set via a media-configure callback below,
+        // not interpolated into the launch string, to prevent GStreamer
+        // pipeline injection via crafted RTSP paths or credentials.
+        let launch = "( rtspsrc name=src latency=200 protocols=tcp \
              ! rtph264depay ! h264parse \
-             ! rtph264pay name=pay0 pt=96 )",
-            url = input_url,
-        );
+             ! rtph264pay name=pay0 pt=96 )";
 
-        factory.set_launch(&launch);
+        factory.set_launch(launch);
         factory.set_shared(true);
+
+        // Set the RTSP source URL each time the factory creates a new pipeline
+        // (once per connecting client). Fires before media-constructed.
+        let url_for_factory = input_url.to_string();
+        factory.connect_media_configure(move |_factory, media| {
+            let element = media.element();
+            if let Ok(bin) = element.downcast::<gst::Bin>() {
+                if let Some(src) = bin.by_name("src") {
+                    src.set_property("location", &url_for_factory);
+                }
+            }
+        });
         factory.set_latency(200);
         // Force TCP interleaved transport — all RTP data goes through the
         // existing TCP connection on port 8554. No extra UDP ports needed,
