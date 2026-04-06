@@ -17,7 +17,7 @@ The application supports two primary streaming modes:
 ### Automatic Device Discovery
 - ARP-based device detection on the Ethernet interface — no manual IP entry required
 - TCP port scanning of discovered hosts (RTSP, HTTP, SSH, and common camera ports)
-- Automatic subnet adoption when cameras are on foreign networks
+- Automatic subnet adoption when cameras are on non-native networks
 - Node aliasing with role assignment (CAM, PTU, or custom names)
 
 ### Video Streaming & Recording
@@ -28,7 +28,7 @@ The application supports two primary streaming modes:
 
 ### RTSP Re-Streaming Server
 - Token-protected RTSP server for sharing the camera feed over the network
-- Bind to a specific interface (Ethernet, Wi-Fi, or VPN)
+- Bind to local network IP or VPN IP
 - QR code generation for easy client connection
 - Bandwidth and uptime monitoring
 
@@ -38,7 +38,7 @@ The application supports two primary streaming modes:
 - VPN interface enumeration for secure remote streaming
 - Automatic Windows Firewall rule management for the RTSP server
 
-### PTZ Camera Control
+### PTZ Camera Control (Still in Development)
 - FLIR PTU control via directional D-pad with hold-to-move
 - Automatic speed limit negotiation with the pan-tilt unit
 - Homing with position convergence detection
