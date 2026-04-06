@@ -91,18 +91,15 @@ export function setupArpListeners() {
     adoptedSubnets.set(data.subnet, data.adopted_ip);
     renderSubnetList();
 
-    // Now that the route exists, scan all devices on this subnet.
-    // Delay gives netsh time to fully activate the new IP.
+    // Wait for netsh to fully activate the new IP, then reload all
+    // ARP state and re-scan. This is the same path as manual Refresh.
+    log(`Waiting for route to activate before scanning ${data.subnet}...`);
     setTimeout(() => {
-      for (const device of arpDevices.values()) {
-        if (device.subnet === data.subnet) {
-          scannedIps.delete(device.ip);
-          tcpScanResults.delete(device.ip);
-          showDiscoveryStatus("Port Scan...");
-          scanDevicePorts(device.ip);
-        }
-      }
-    }, 4000);
+      log(`Route should be active — reloading ARP state for ${data.subnet}`);
+      scannedIps.clear();
+      tcpScanResults.clear();
+      loadExistingArpState();
+    }, 6000);
   });
 
   loadExistingArpState();
