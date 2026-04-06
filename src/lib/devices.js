@@ -38,6 +38,41 @@ function hasRouteToSubnet(subnet) {
 const scannedIps = new Set();
 let pendingScans = 0;
 
+// ── Debounced scan trigger ─────────────────────────────────────────
+// Collect all ARP discoveries and subnet adoptions, then scan once
+// after activity settles. This prevents partial renders and flicker.
+
+const SETTLE_MS = 6000; // wait 6s after last ARP/adopt event
+let settleTimer = null;
+
+/** Reset the settle timer — called on every new ARP device or adoption. */
+function debounceScan() {
+  if (settleTimer) clearTimeout(settleTimer);
+  settleTimer = setTimeout(() => {
+    settleTimer = null;
+    scanAllRoutableDevices();
+  }, SETTLE_MS);
+}
+
+/** Scan all ARP-discovered devices that are on reachable subnets. */
+function scanAllRoutableDevices() {
+  const toScan = [];
+  for (const device of arpDevices.values()) {
+    if (!scannedIps.has(device.ip) && hasRouteToSubnet(device.subnet)) {
+      toScan.push(device.ip);
+    }
+  }
+  if (toScan.length === 0) {
+    showDiscoveryStatus(null);
+    return;
+  }
+  log(`Scanning ${toScan.length} routable device(s)...`);
+  showDiscoveryStatus("Port Scan...");
+  for (const ip of toScan) {
+    scanDevicePorts(ip);
+  }
+}
+
 // ── Discovery status ─────────────────────────────────────────────────
 
 function showDiscoveryStatus(label) {
@@ -53,6 +88,8 @@ function showDiscoveryStatus(label) {
 
 export function resetDiscoveryStatus() {
   scannedIps.clear();
+  if (settleTimer) clearTimeout(settleTimer);
+  settleTimer = null;
   showDiscoveryStatus("IP Discovery...");
 }
 
@@ -74,15 +111,8 @@ export function setupArpListeners() {
 
     if (isNew) {
       log(`ARP: discovered ${device.ip} (${device.mac})`);
-      // Only port-scan if we already have a route to this subnet.
-      // Devices on foreign subnets will be scanned after auto-adopt.
-      if (hasRouteToSubnet(device.subnet)) {
-        showDiscoveryStatus("Port Scan...");
-        scanDevicePorts(device.ip);
-      } else {
-        log(`ARP: ${device.ip} on foreign subnet ${device.subnet} — waiting for adopt`);
-        showDiscoveryStatus("IP Discovery...");
-      }
+      showDiscoveryStatus("IP Discovery...");
+      debounceScan();
     }
   });
 
@@ -90,16 +120,8 @@ export function setupArpListeners() {
     log(`Subnet adopted: ${data.subnet} -> ${data.adopted_ip}`);
     adoptedSubnets.set(data.subnet, data.adopted_ip);
     renderSubnetList();
-
-    // Wait for netsh to fully activate the new IP, then reload all
-    // ARP state and re-scan. This is the same path as manual Refresh.
-    log(`Waiting for route to activate before scanning ${data.subnet}...`);
-    setTimeout(() => {
-      log(`Route should be active — reloading ARP state for ${data.subnet}`);
-      scannedIps.clear();
-      tcpScanResults.clear();
-      loadExistingArpState();
-    }, 6000);
+    // Reset the settle timer — netsh needs time to activate the IP
+    debounceScan();
   });
 
   loadExistingArpState();
@@ -117,27 +139,20 @@ export async function loadExistingArpState() {
       api.getAdoptedSubnets(),
     ]);
 
-    if (devices && devices.length > 0) {
-      for (const d of devices) {
-        arpDevices.set(d.mac, d);
-      }
-      // Only scan devices on subnets we can already reach
-      const routableDevices = devices.filter((d) => hasRouteToSubnet(d.subnet));
-      if (routableDevices.length > 0) {
-        showDiscoveryStatus("Port Scan...");
-        for (const d of routableDevices) {
-          scanDevicePorts(d.ip);
-        }
-      }
-    } else {
-      showDiscoveryStatus("IP Discovery...");
-    }
-
     if (subnets) {
       for (const [subnet, ip] of Object.entries(subnets)) {
         adoptedSubnets.set(subnet, ip);
       }
       if (Object.keys(subnets).length > 0) renderSubnetList();
+    }
+
+    if (devices && devices.length > 0) {
+      for (const d of devices) {
+        arpDevices.set(d.mac, d);
+      }
+      scanAllRoutableDevices();
+    } else {
+      showDiscoveryStatus("IP Discovery...");
     }
   } catch (e) {
     console.error("Failed to load ARP state:", e);
