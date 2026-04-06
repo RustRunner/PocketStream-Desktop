@@ -1,9 +1,9 @@
 [package]
 name = "pocketstream-desktop"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "PocketStream for Desktop — IP Camera Monitoring & Relay Station"
-license = "AGPL-3.0"
+license = "GPL-3.0"
 
 [dependencies]
 tauri = { version = "2", features = [] }
