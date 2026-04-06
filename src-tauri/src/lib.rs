@@ -275,10 +275,15 @@ async fn watch_interface(mac: String, display_name: String, handle: tauri::AppHa
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-        let (is_up, ips) = match network::interface::quick_status_by_mac(&mac) {
+        let (raw_up, ips) = match network::interface::quick_status_by_mac(&mac) {
             Some(s) => s,
             None => (false, vec![]),
         };
+
+        // On Windows, pnet's is_up() can report false for adapters that
+        // are clearly operational (ARP/IP traffic is flowing). Treat the
+        // interface as up if it has at least one IPv4 address assigned.
+        let is_up = raw_up || !ips.is_empty();
 
         let current_ips: Vec<String> = ips.iter().map(|ip| ip.address.clone()).collect();
         if is_up == prev_up && current_ips == prev_ips {

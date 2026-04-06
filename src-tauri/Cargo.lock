@@ -3577,7 +3577,7 @@ dependencies = [
 
 [[package]]
 name = "pocketstream-desktop"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
