@@ -18,6 +18,21 @@ function escapeHtml(str) {
     .replace(/'/g, "&#039;");
 }
 
+// ── Subnet helpers ──────────────────────────────────────────────────
+
+/** Check if we have an IP on the same /24 subnet (native or adopted). */
+function hasRouteToSubnet(subnet) {
+  // Check adopted subnets
+  if (adoptedSubnets.has(subnet)) return true;
+  // Check native interface IPs
+  if (!state.activeInterface) return false;
+  return state.activeInterface.ips.some((ip) => {
+    const parts = ip.address.split(".");
+    if (parts.length !== 4) return false;
+    return `${parts[0]}.${parts[1]}.${parts[2]}.0/24` === subnet;
+  });
+}
+
 // ── Local scanning state ────────────────────────────────────────────
 
 const scannedIps = new Set();
@@ -59,8 +74,15 @@ export function setupArpListeners() {
 
     if (isNew) {
       log(`ARP: discovered ${device.ip} (${device.mac})`);
-      showDiscoveryStatus("Port Scan...");
-      scanDevicePorts(device.ip);
+      // Only port-scan if we already have a route to this subnet.
+      // Devices on foreign subnets will be scanned after auto-adopt.
+      if (hasRouteToSubnet(device.subnet)) {
+        showDiscoveryStatus("Port Scan...");
+        scanDevicePorts(device.ip);
+      } else {
+        log(`ARP: ${device.ip} on foreign subnet ${device.subnet} — waiting for adopt`);
+        showDiscoveryStatus("IP Discovery...");
+      }
     }
   });
 
@@ -69,8 +91,8 @@ export function setupArpListeners() {
     adoptedSubnets.set(data.subnet, data.adopted_ip);
     renderSubnetList();
 
-    // Re-scan devices on the adopted subnet after a delay.
-    // netsh takes a few seconds to fully activate the new IP.
+    // Now that the route exists, scan all devices on this subnet.
+    // Delay gives netsh time to fully activate the new IP.
     setTimeout(() => {
       for (const device of arpDevices.values()) {
         if (device.subnet === data.subnet) {
@@ -80,7 +102,7 @@ export function setupArpListeners() {
           scanDevicePorts(device.ip);
         }
       }
-    }, 2000);
+    }, 4000);
   });
 
   loadExistingArpState();
@@ -102,9 +124,13 @@ export async function loadExistingArpState() {
       for (const d of devices) {
         arpDevices.set(d.mac, d);
       }
-      showDiscoveryStatus("Port Scan...");
-      for (const d of devices) {
-        scanDevicePorts(d.ip);
+      // Only scan devices on subnets we can already reach
+      const routableDevices = devices.filter((d) => hasRouteToSubnet(d.subnet));
+      if (routableDevices.length > 0) {
+        showDiscoveryStatus("Port Scan...");
+        for (const d of routableDevices) {
+          scanDevicePorts(d.ip);
+        }
       }
     } else {
       showDiscoveryStatus("IP Discovery...");
