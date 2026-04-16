@@ -448,16 +448,61 @@ impl NetworkManager {
             return;
         }
 
+        // Snapshot the adapter's current IPs and the primary so we can
+        // refuse to remove anything that would either orphan the adapter
+        // (last IP) or strip its primary IP. Defense-in-depth: even if
+        // adopted_ips somehow contains an entry that matches the primary
+        // (shouldn't happen, but guards against a future bug or a
+        // corrupted config), cleanup will skip it instead of disabling
+        // the user's network.
+        let current_iface = interface::get_by_name(&iface_name).ok();
+        let current_ip_set: HashSet<String> = current_iface
+            .as_ref()
+            .map(|i| i.ips.iter().map(|ip| ip.address.clone()).collect())
+            .unwrap_or_default();
+        let primary_ip: Option<String> = current_iface
+            .as_ref()
+            .and_then(|i| i.ips.first().map(|ip| ip.address.clone()));
+        let total_ip_count = current_ip_set.len();
+
         log::info!(
-            "Removing {} adopted secondary IP(s) on shutdown",
-            entries.len()
+            "Removing {} adopted secondary IP(s) on shutdown (adapter has {} total)",
+            entries.len(),
+            total_ip_count
         );
 
         let mut tasks = tokio::task::JoinSet::new();
         for (subnet, ip) in entries {
+            let ip_str = ip.to_string();
+
+            // Safety check 1: if removing this would leave the adapter
+            // with zero IPv4 addresses, refuse. The remove still works
+            // mechanically, but Windows often disables an adapter that
+            // has no IPv4 assignment, which is much worse than a stray
+            // secondary IP lingering for one more session.
+            if total_ip_count <= 1 && current_ip_set.contains(&ip_str) {
+                log::warn!(
+                    "Skipping cleanup of {} ({}): would leave adapter with zero IPv4 addresses",
+                    ip_str,
+                    subnet
+                );
+                continue;
+            }
+
+            // Safety check 2: never remove the primary. If something put
+            // the primary IP in adopted_ips by mistake, removing it would
+            // break the user's normal connectivity.
+            if primary_ip.as_deref() == Some(&ip_str) {
+                log::warn!(
+                    "Skipping cleanup of {} ({}): is the adapter's primary IP",
+                    ip_str,
+                    subnet
+                );
+                continue;
+            }
+
             let iface = iface_name.clone();
             tasks.spawn(async move {
-                let ip_str = ip.to_string();
                 match auto_adopt::remove_adopted_ip(&iface, &ip_str).await {
                     Ok(()) => log::info!("Removed adopted IP {} ({})", ip_str, subnet),
                     Err(e) => {

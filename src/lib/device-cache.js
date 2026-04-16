@@ -130,13 +130,19 @@ export async function loadDeviceCache() {
 }
 
 /**
- * Targeted port scan for a cached device — fail-fast, no retries.
- * On success, the entry is refreshed in the on-disk cache. On failure,
- * we leave the cache entry intact (the device may just be offline
- * temporarily) but flag it as offline so the UI can dim it.
+ * Targeted port scan for a cached device. On success, the entry is
+ * refreshed in the on-disk cache. On failure, retries once with a short
+ * delay before flagging offline — cold-start has many sources of
+ * transient failure (Npcap loading, GStreamer init, OS ARP ping sweep,
+ * just-bound secondary IPs not yet in the routing table) and the first
+ * attempt routinely fails for devices that are perfectly reachable a
+ * second later.
  */
-async function fastVerifyCachedDevice(ip) {
-  markIpScanned(ip);
+const VERIFY_MAX_ATTEMPTS = 2;
+const VERIFY_RETRY_DELAY_MS = 1500;
+
+async function fastVerifyCachedDevice(ip, attempt = 0) {
+  if (attempt === 0) markIpScanned(ip);
   let verified = false;
   try {
     const results = await api.scanNetwork(`${ip}/32`);
@@ -157,16 +163,22 @@ async function fastVerifyCachedDevice(ip) {
     }
   } catch (e) {
     // Verification failure isn't fatal — keep the cached entry visible.
-    log(`Cache verify failed for ${ip}: ${e}`);
-  } finally {
+    log(`Cache verify failed for ${ip} (attempt ${attempt + 1}): ${e}`);
+  }
+
+  if (verified) {
     verifyingDevices.delete(ip);
-    if (verified) {
-      offlineDevices.delete(ip);
-    } else {
-      // Couldn't reach the device — flag offline so the UI can dim it
-      // and the user knows clicking it may not work right now.
-      offlineDevices.add(ip);
-    }
+    offlineDevices.delete(ip);
+    renderArpDeviceList();
+  } else if (attempt + 1 < VERIFY_MAX_ATTEMPTS) {
+    // Hold the verifying badge through the retry — flipping to offline
+    // just to flip back would be jarring.
+    setTimeout(() => fastVerifyCachedDevice(ip, attempt + 1), VERIFY_RETRY_DELAY_MS);
+  } else {
+    // Final attempt failed — flag offline so the UI can dim it and the
+    // user knows clicking it may not work right now.
+    verifyingDevices.delete(ip);
+    offlineDevices.add(ip);
     renderArpDeviceList();
   }
 }

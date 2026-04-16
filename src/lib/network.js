@@ -23,7 +23,11 @@ export async function refreshInterfaces() {
       state.activeInterface = eth;
       $("#iface-name").textContent = eth.display_name || eth.name;
       renderSubnetList();
-      updateCameraIpDropdown(null);
+      // Don't wipe the CAM/PTU dropdown here — refreshInterfaces is
+      // called from the manual refresh button and during reconnect
+      // flows, where wiping the dropdown would lose any populated
+      // node entries until the next render.
+      updateCameraIpDropdown(state.lastSubnetResults || null);
     } else {
       $("#iface-name").textContent = "None found";
     }
@@ -51,10 +55,23 @@ export function setupInterfaceWatcher() {
       arpDevices.clear();
       tcpScanResults.clear();
       $("#device-list").innerHTML = "";
+      renderSubnetList();
       updateCameraIpDropdown(null);
     } else {
       // ── Connected (or reconnected) ───────────────────────────────
       $("#iface-name").textContent = iface.display_name || iface.name;
+
+      // Refresh the subnet list since adopted IPs may have appeared
+      // (load_adopted_from_config completing during cold start triggers
+      // this event with the new IP set).
+      renderSubnetList();
+
+      // Preserve the existing CAM/PTU dropdown — arpDevices and
+      // tcpScanResults haven't changed, so wiping the dropdown to
+      // null would just make cached/discovered nodes vanish until the
+      // next render cycle (the original cause of the "nodes disappear
+      // from dropdown during discovery" bug).
+      updateCameraIpDropdown(state.lastSubnetResults || null);
 
       // If we just came back from disconnected, kick off ARP discovery
       if (wasDown) {
@@ -62,9 +79,6 @@ export function setupInterfaceWatcher() {
         api.startArpDiscovery(iface.name).catch(() => {});
       }
     }
-
-    renderSubnetList();
-    updateCameraIpDropdown(null);
   });
 }
 
