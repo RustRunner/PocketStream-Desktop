@@ -67,8 +67,14 @@ impl NetworkManager {
     /// exist on the adapter. Re-add any that are missing.
     ///
     /// Entries whose subnet matches the adapter's native IPs are pruned —
-    /// they were either saved by mistake or the adapter's primary IP changed
-    /// to cover that subnet since the adoption.
+    /// they were either saved by mistake or the adapter's primary IP
+    /// changed to cover that subnet since the adoption.
+    ///
+    /// Concurrency: the `adopted_ips` mutex is held only for the synchronous
+    /// classify+insert phase (microseconds). The slow netsh re-add calls run
+    /// outside the lock — and in parallel — so IPC handlers querying the map
+    /// during cold start aren't blocked behind a sequence of 100–500ms netsh
+    /// invocations.
     pub async fn load_adopted_from_config(&self, config: &crate::config::AppConfig) {
         let settings = config.get();
         if settings.adopted_subnets.is_empty() {
@@ -103,46 +109,49 @@ impl NetworkManager {
             })
             .collect();
 
-        let current_ips: std::collections::HashSet<String> =
-            iface.ips.iter().map(|ip| ip.address.clone()).collect();
+        let current_ips: HashSet<String> = iface.ips.iter().map(|ip| ip.address.clone()).collect();
 
-        let mut map = self.adopted_ips.lock().await;
-        let mut pruned = false;
+        // ── Phase 1: classify + insert under the lock (no awaits) ──
+        // Each entry produces (ip_str, needs_netsh_add). Pruned entries
+        // are dropped from both the in-memory map and the on-disk config.
+        let (work_items, save_snapshot) = {
+            let mut map = self.adopted_ips.lock().await;
+            let mut work: Vec<(String, bool)> = Vec::new();
+            let mut pruned = false;
 
-        for (subnet, ip_str) in &settings.adopted_subnets {
-            // Skip entries whose subnet the adapter already covers natively
-            if native_subnets.contains(subnet) {
-                log::info!(
-                    "Pruning adopted subnet {} ({}) — adapter already covers it natively",
-                    subnet,
-                    ip_str,
-                );
-                pruned = true;
-                continue;
-            }
+            for (subnet, ip_str) in &settings.adopted_subnets {
+                if native_subnets.contains(subnet) {
+                    log::info!(
+                        "Pruning adopted subnet {} ({}) — adapter already covers it natively",
+                        subnet,
+                        ip_str,
+                    );
+                    pruned = true;
+                    continue;
+                }
 
-            if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
-                map.insert(subnet.clone(), ip);
-
-                if current_ips.contains(ip_str) {
-                    log::info!("Adopted IP {} already on adapter", ip_str);
-                } else {
-                    log::info!("Re-adding missing adopted IP {} to {}", ip_str, iface.name);
-                    if let Err(e) =
-                        ip_config::add_secondary_ip(&iface.name, ip_str, "255.255.255.0").await
-                    {
-                        log::warn!("Failed to re-add adopted IP {}: {}", ip_str, e);
-                    }
+                if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                    map.insert(subnet.clone(), ip);
+                    work.push((ip_str.clone(), !current_ips.contains(ip_str)));
                 }
             }
-        }
 
-        // Persist the cleaned-up map so pruned entries don't come back
-        if pruned {
-            let adopted: HashMap<String, String> = map
-                .iter()
-                .map(|(k, v)| (k.clone(), v.to_string()))
-                .collect();
+            let snapshot: Option<HashMap<String, String>> = if pruned {
+                Some(
+                    map.iter()
+                        .map(|(k, v)| (k.clone(), v.to_string()))
+                        .collect(),
+                )
+            } else {
+                None
+            };
+            (work, snapshot)
+        }; // lock dropped here
+
+        // Persist the cleaned-up map so pruned entries don't come back.
+        // Outside the lock — config.update writes to disk and shouldn't
+        // block other readers of adopted_ips.
+        if let Some(adopted) = save_snapshot {
             let mut new_settings = config.get();
             new_settings.adopted_subnets = adopted;
             match config.update(new_settings) {
@@ -150,6 +159,25 @@ impl NetworkManager {
                 Err(e) => log::warn!("Failed to persist pruned adopted subnets: {}", e),
             }
         }
+
+        // ── Phase 2: netsh re-add in parallel, outside the lock ────
+        let mut tasks = tokio::task::JoinSet::new();
+        for (ip_str, needs_add) in work_items {
+            if !needs_add {
+                log::info!("Adopted IP {} already on adapter", ip_str);
+                continue;
+            }
+            let iface_name = iface.name.clone();
+            tasks.spawn(async move {
+                log::info!("Re-adding missing adopted IP {} to {}", ip_str, iface_name);
+                if let Err(e) =
+                    ip_config::add_secondary_ip(&iface_name, &ip_str, "255.255.255.0").await
+                {
+                    log::warn!("Failed to re-add adopted IP {}: {}", ip_str, e);
+                }
+            });
+        }
+        while tasks.join_next().await.is_some() {}
     }
 
     /// Save current adopted subnets to config.
