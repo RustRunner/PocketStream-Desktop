@@ -63,12 +63,14 @@ pub fn start_listener(
 
         // Match the pcap device that has one of the target Ethernet IPs.
         // This ensures we capture on the Ethernet adapter, not WiFi.
-        let target_addrs: Vec<std::net::IpAddr> =
-            ethernet_ips.iter().map(|ip| std::net::IpAddr::V4(*ip)).collect();
+        let target_addrs: Vec<std::net::IpAddr> = ethernet_ips
+            .iter()
+            .map(|ip| std::net::IpAddr::V4(*ip))
+            .collect();
 
-        let pcap_dev = pcap_devices.into_iter().find(|d| {
-            d.addresses.iter().any(|a| target_addrs.contains(&a.addr))
-        });
+        let pcap_dev = pcap_devices
+            .into_iter()
+            .find(|d| d.addresses.iter().any(|a| target_addrs.contains(&a.addr)));
 
         let pcap_dev = match pcap_dev {
             Some(d) => {
@@ -124,10 +126,7 @@ pub fn start_listener(
                         let app_handle = app_handle.clone();
                         tokio::spawn(async move {
                             let octets = ip.octets();
-                            let subnet = format!(
-                                "{}.{}.{}.0/24",
-                                octets[0], octets[1], octets[2]
-                            );
+                            let subnet = format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]);
                             let now = chrono::Utc::now().to_rfc3339();
 
                             let device = ArpDevice {
@@ -141,15 +140,13 @@ pub fn start_listener(
                             let mut map = devices.lock().await;
                             let is_new = !map.contains_key(&mac_str);
 
-                            let entry =
-                                map.entry(mac_str.clone()).or_insert(device.clone());
+                            let entry = map.entry(mac_str.clone()).or_insert(device.clone());
                             entry.last_seen = device.last_seen.clone();
                             entry.ip = device.ip.clone();
 
                             if is_new {
                                 log::info!("ARP: {} ({})", entry.ip, entry.mac);
-                                let _ =
-                                    app_handle.emit("arp-device-discovered", &device);
+                                let _ = app_handle.emit("arp-device-discovered", &device);
                             }
                         });
                     }
@@ -220,7 +217,11 @@ pub async fn read_system_arp_table(interface_ip: &str) -> Vec<(Ipv4Addr, String)
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    log::debug!("ARP table for {}: {} entries", interface_ip, stdout.lines().count());
+    log::debug!(
+        "ARP table for {}: {} entries",
+        interface_ip,
+        stdout.lines().count()
+    );
     parse_arp_table(&stdout)
 }
 
@@ -229,7 +230,7 @@ pub async fn read_system_arp_table(interface_ip: &str) -> Vec<(Ipv4Addr, String)
 fn parse_arp_table(output: &str) -> Vec<(Ipv4Addr, String)> {
     let mut entries = Vec::new();
     for line in output.lines() {
-        let parts: Vec<&str> = line.trim().split_whitespace().collect();
+        let parts: Vec<&str> = line.split_whitespace().collect();
         // Windows `arp -a` format: "  192.168.1.207  aa-bb-cc-dd-ee-ff  dynamic"
         if parts.len() >= 3 && parts[2].eq_ignore_ascii_case("dynamic") {
             if let Ok(ip) = parts[0].parse::<Ipv4Addr>() {
@@ -243,6 +244,34 @@ fn parse_arp_table(output: &str) -> Vec<(Ipv4Addr, String)> {
         }
     }
     entries
+}
+
+/// Check if `target_ip` is in use by pinging and checking ARP table.
+pub async fn send_arp_probe(
+    target_ip: Ipv4Addr,
+    timeout: std::time::Duration,
+) -> Result<bool, AppError> {
+    let timeout_ms = timeout.as_millis().to_string();
+    let _ = super::async_cmd("ping")
+        .args(["-n", "1", "-w", &timeout_ms, &target_ip.to_string()])
+        .output()
+        .await;
+
+    let output = super::async_cmd("arp")
+        .args(["-a"])
+        .output()
+        .await
+        .map_err(|e| AppError::Network(format!("arp failed: {}", e)))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let target_str = target_ip.to_string();
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 3 && parts[0] == target_str && parts[2].to_lowercase() == "dynamic" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -259,11 +288,14 @@ mod tests {
         pkt[13] = 0x06;
         // ARP header starts at offset 14
         let arp = &mut pkt[14..];
-        arp[0] = 0x00; arp[1] = 0x01; // Hardware type: Ethernet (1)
-        arp[2] = 0x08; arp[3] = 0x00; // Protocol type: IPv4 (0x0800)
-        arp[4] = 6;                     // Hardware address length
-        arp[5] = 4;                     // Protocol address length
-        arp[6] = 0x00; arp[7] = 0x02; // Opcode: Reply (2)
+        arp[0] = 0x00;
+        arp[1] = 0x01; // Hardware type: Ethernet (1)
+        arp[2] = 0x08;
+        arp[3] = 0x00; // Protocol type: IPv4 (0x0800)
+        arp[4] = 6; // Hardware address length
+        arp[5] = 4; // Protocol address length
+        arp[6] = 0x00;
+        arp[7] = 0x02; // Opcode: Reply (2)
         arp[8..14].copy_from_slice(&sender_mac);
         arp[14..18].copy_from_slice(&sender_ip);
         pkt
@@ -271,10 +303,7 @@ mod tests {
 
     #[test]
     fn parse_valid_arp_reply() {
-        let pkt = make_arp_packet(
-            [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01],
-            [192, 168, 1, 100],
-        );
+        let pkt = make_arp_packet([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01], [192, 168, 1, 100]);
         let (ip, mac) = parse_arp_packet(&pkt).unwrap();
         assert_eq!(ip, Ipv4Addr::new(192, 168, 1, 100));
         assert_eq!(mac, [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01]);
@@ -282,10 +311,7 @@ mod tests {
 
     #[test]
     fn parse_arp_different_subnet() {
-        let pkt = make_arp_packet(
-            [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
-            [10, 0, 0, 42],
-        );
+        let pkt = make_arp_packet([0x00, 0x11, 0x22, 0x33, 0x44, 0x55], [10, 0, 0, 42]);
         let (ip, mac) = parse_arp_packet(&pkt).unwrap();
         assert_eq!(ip, Ipv4Addr::new(10, 0, 0, 42));
         assert_eq!(mac, [0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
@@ -293,10 +319,7 @@ mod tests {
 
     #[test]
     fn parse_arp_high_octets() {
-        let pkt = make_arp_packet(
-            [0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54],
-            [172, 16, 255, 254],
-        );
+        let pkt = make_arp_packet([0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54], [172, 16, 255, 254]);
         let (ip, _mac) = parse_arp_packet(&pkt).unwrap();
         assert_eq!(ip, Ipv4Addr::new(172, 16, 255, 254));
     }
@@ -450,32 +473,4 @@ Interface: 192.168.1.100 --- 0x6
         let entries = parse_arp_table(output);
         assert_eq!(entries[0].1, "aa:bb:cc:dd:ee:ff");
     }
-}
-
-/// Check if `target_ip` is in use by pinging and checking ARP table.
-pub async fn send_arp_probe(
-    target_ip: Ipv4Addr,
-    timeout: std::time::Duration,
-) -> Result<bool, AppError> {
-    let timeout_ms = timeout.as_millis().to_string();
-    let _ = super::async_cmd("ping")
-        .args(["-n", "1", "-w", &timeout_ms, &target_ip.to_string()])
-        .output()
-        .await;
-
-    let output = super::async_cmd("arp")
-        .args(["-a"])
-        .output()
-        .await
-        .map_err(|e| AppError::Network(format!("arp failed: {}", e)))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let target_str = target_ip.to_string();
-    for line in stdout.lines() {
-        let parts: Vec<&str> = line.trim().split_whitespace().collect();
-        if parts.len() >= 3 && parts[0] == target_str && parts[2].to_lowercase() == "dynamic" {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }

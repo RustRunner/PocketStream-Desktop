@@ -114,7 +114,8 @@ impl NetworkManager {
             if native_subnets.contains(subnet) {
                 log::info!(
                     "Pruning adopted subnet {} ({}) — adapter already covers it natively",
-                    subnet, ip_str,
+                    subnet,
+                    ip_str,
                 );
                 pruned = true;
                 continue;
@@ -127,11 +128,9 @@ impl NetworkManager {
                     log::info!("Adopted IP {} already on adapter", ip_str);
                 } else {
                     log::info!("Re-adding missing adopted IP {} to {}", ip_str, iface.name);
-                    if let Err(e) = ip_config::add_secondary_ip(
-                        &iface.name,
-                        ip_str,
-                        "255.255.255.0",
-                    ).await {
+                    if let Err(e) =
+                        ip_config::add_secondary_ip(&iface.name, ip_str, "255.255.255.0").await
+                    {
                         log::warn!("Failed to re-add adopted IP {}: {}", ip_str, e);
                     }
                 }
@@ -211,10 +210,8 @@ impl NetworkManager {
         // and so the pcap listener can match the correct capture device.
         let iface_info = interface::get_by_name(interface_display_name)?;
         let known_ips: Vec<String> = iface_info.ips.iter().map(|ip| ip.address.clone()).collect();
-        let ethernet_ips: Vec<Ipv4Addr> = known_ips
-            .iter()
-            .filter_map(|ip| ip.parse().ok())
-            .collect();
+        let ethernet_ips: Vec<Ipv4Addr> =
+            known_ips.iter().filter_map(|ip| ip.parse().ok()).collect();
         log::info!(
             "Starting ARP discovery on '{}' (IPs: {:?})",
             interface_display_name,
@@ -294,13 +291,7 @@ impl NetworkManager {
 
                     log::info!("Foreign subnet detected: {}", device.subnet);
 
-                    match auto_adopt::adopt_subnet(
-                        &iface_name,
-                        device_ip,
-                        &current_ips,
-                    )
-                    .await
-                    {
+                    match auto_adopt::adopt_subnet(&iface_name, device_ip, &current_ips).await {
                         Ok(Some(adopted_ip)) => {
                             adopted
                                 .lock()
@@ -316,11 +307,7 @@ impl NetworkManager {
                                 }),
                             );
 
-                            log::info!(
-                                "Auto-adopted {} with IP {}",
-                                device.subnet,
-                                adopted_ip
-                            );
+                            log::info!("Auto-adopted {} with IP {}", device.subnet, adopted_ip);
 
                             // Persist to config so the adoption survives a
                             // restart. Failure here is non-fatal (the IP is
@@ -445,11 +432,9 @@ impl NetworkManager {
                 let ip_str = ip.to_string();
                 match auto_adopt::remove_adopted_ip(&iface, &ip_str).await {
                     Ok(()) => log::info!("Removed adopted IP {} ({})", ip_str, subnet),
-                    Err(e) => log::warn!(
-                        "Failed to remove adopted IP {} on shutdown: {}",
-                        ip_str,
-                        e
-                    ),
+                    Err(e) => {
+                        log::warn!("Failed to remove adopted IP {} on shutdown: {}", ip_str, e)
+                    }
                 }
             });
         }

@@ -20,22 +20,20 @@ static GST_READY: OnceLock<Result<(), String>> = OnceLock::new();
 static LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn ensure_gstreamer() -> Result<(), AppError> {
-    let result = GST_READY.get_or_init(|| {
-        match gstreamer::init() {
-            Ok(()) => {
-                log::info!("GStreamer {} initialized", gstreamer::version_string());
-                Ok(())
-            }
-            Err(e) => {
-                let msg = format!(
-                    "Failed to initialize GStreamer: {}. \
+    let result = GST_READY.get_or_init(|| match gstreamer::init() {
+        Ok(()) => {
+            log::info!("GStreamer {} initialized", gstreamer::version_string());
+            Ok(())
+        }
+        Err(e) => {
+            let msg = format!(
+                "Failed to initialize GStreamer: {}. \
                      Ensure GStreamer MSVC x86_64 runtime is installed \
                      (https://gstreamer.freedesktop.org/download/)",
-                    e
-                );
-                log::error!("{}", msg);
-                Err(msg)
-            }
+                e
+            );
+            log::error!("{}", msg);
+            Err(msg)
         }
     });
     result.clone().map_err(AppError::Stream)
@@ -43,8 +41,7 @@ pub fn ensure_gstreamer() -> Result<(), AppError> {
 
 /// Whether Npcap was successfully loaded at startup.
 /// Checked before any pcap operations to avoid delay-load crashes.
-static NPCAP_AVAILABLE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static NPCAP_AVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn is_npcap_available() -> bool {
     NPCAP_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
@@ -58,7 +55,10 @@ fn offer_npcap_install() -> bool {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
 
-    let exe_dir = match std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+    let exe_dir = match std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    {
         Some(d) => d,
         None => return false,
     };
@@ -178,9 +178,7 @@ fn setup_bundled_gstreamer() -> bool {
     // launches cuts GStreamer init from 5-15 s down to < 1 s, which is
     // critical for ARP discovery timing.
     if let Some(data_dir) = dirs::data_local_dir() {
-        let registry = data_dir
-            .join("PocketStream")
-            .join("gstreamer-registry.bin");
+        let registry = data_dir.join("PocketStream").join("gstreamer-registry.bin");
         if let Some(parent) = registry.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -238,9 +236,8 @@ fn setup_npcap() -> bool {
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
-        let handle = unsafe {
-            windows_sys::Win32::System::LibraryLoader::LoadLibraryW(wide.as_ptr())
-        };
+        let handle =
+            unsafe { windows_sys::Win32::System::LibraryLoader::LoadLibraryW(wide.as_ptr()) };
         if !handle.is_null() {
             log::info!("Loaded Npcap {}", dll);
         } else {
@@ -275,10 +272,7 @@ async fn watch_interface(mac: String, display_name: String, handle: tauri::AppHa
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-        let (raw_up, ips) = match network::interface::quick_status_by_mac(&mac) {
-            Some(s) => s,
-            None => (false, vec![]),
-        };
+        let (raw_up, ips) = network::interface::quick_status_by_mac(&mac).unwrap_or_default();
 
         // On Windows, pnet's is_up() can report false for adapters that
         // are clearly operational (ARP/IP traffic is flowing). Treat the
@@ -473,7 +467,8 @@ pub fn run() {
                                 let name = iface.name.clone();
                                 log::info!("Auto-starting ARP discovery on '{}'", name);
 
-                                if let Err(e) = manager.start_arp_discovery(&name, handle.clone()).await
+                                if let Err(e) =
+                                    manager.start_arp_discovery(&name, handle.clone()).await
                                 {
                                     log::warn!("Failed to auto-start ARP discovery: {}", e);
                                 }
@@ -520,8 +515,7 @@ pub fn run() {
             // process. block_on is safe here — the event loop is already
             // exiting and there's no UI to keep responsive.
             if let tauri::RunEvent::ExitRequested { .. } = event {
-                let manager: tauri::State<'_, network::NetworkManager> =
-                    app_handle.state();
+                let manager: tauri::State<'_, network::NetworkManager> = app_handle.state();
                 let _ = tauri::async_runtime::block_on(async {
                     tokio::time::timeout(
                         std::time::Duration::from_secs(5),

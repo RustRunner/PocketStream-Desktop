@@ -44,10 +44,7 @@ pub async fn adopt_subnet(
     current_ips: &[Ipv4Addr],
 ) -> Result<Option<Ipv4Addr>, AppError> {
     if already_on_subnet(device_ip, current_ips) {
-        log::info!(
-            "Already on subnet for {} — skipping auto-adopt",
-            device_ip
-        );
+        log::info!("Already on subnet for {} — skipping auto-adopt", device_ip);
         return Ok(None);
     }
 
@@ -58,11 +55,8 @@ pub async fn adopt_subnet(
 
     for candidate in candidates {
         // ARP probe to check if candidate is in use
-        let in_use = super::arp::send_arp_probe(
-            candidate,
-            std::time::Duration::from_secs(1),
-        )
-        .await?;
+        let in_use =
+            super::arp::send_arp_probe(candidate, std::time::Duration::from_secs(1)).await?;
 
         if !in_use {
             log::info!(
@@ -127,10 +121,7 @@ mod tests {
     #[test]
     fn already_on_subnet_multiple_ips_one_matches() {
         let device = Ipv4Addr::new(10, 0, 0, 50);
-        let ours = vec![
-            Ipv4Addr::new(192, 168, 1, 1),
-            Ipv4Addr::new(10, 0, 0, 100),
-        ];
+        let ours = vec![Ipv4Addr::new(192, 168, 1, 1), Ipv4Addr::new(10, 0, 0, 100)];
         assert!(already_on_subnet(device, &ours));
     }
 

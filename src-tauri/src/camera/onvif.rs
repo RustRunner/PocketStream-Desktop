@@ -25,10 +25,7 @@ const WS_DISCOVERY_ADDR: &str = "239.255.255.250:3702";
 /// Sends a multicast probe and collects responses.
 /// If `subnet` is provided, only returns devices in that range.
 pub async fn discover(subnet: Option<&str>) -> Result<Vec<OnvifDevice>, AppError> {
-    log::info!(
-        "Starting ONVIF discovery (subnet filter: {:?})",
-        subnet
-    );
+    log::info!("Starting ONVIF discovery (subnet filter: {:?})", subnet);
 
     // TODO: Implement WS-Discovery
     //

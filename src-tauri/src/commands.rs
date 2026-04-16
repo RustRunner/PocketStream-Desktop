@@ -19,8 +19,8 @@ pub fn log_frontend(level: String, message: String) {
 
 #[tauri::command]
 pub fn open_log_folder() -> Result<(), AppError> {
-    let dir = crate::log_dir()
-        .ok_or_else(|| AppError::Config("Log directory not initialised".into()))?;
+    let dir =
+        crate::log_dir().ok_or_else(|| AppError::Config("Log directory not initialised".into()))?;
 
     #[cfg(target_os = "windows")]
     {
@@ -62,9 +62,7 @@ pub async fn save_config(
 // ── Device Cache Commands ────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn get_device_cache(
-    config: State<'_, AppConfig>,
-) -> Result<Vec<CachedDevice>, AppError> {
+pub async fn get_device_cache(config: State<'_, AppConfig>) -> Result<Vec<CachedDevice>, AppError> {
     Ok(config.get().device_cache)
 }
 
@@ -85,9 +83,7 @@ pub async fn remove_cached_device(
 }
 
 #[tauri::command]
-pub async fn clear_device_cache(
-    config: State<'_, AppConfig>,
-) -> Result<(), AppError> {
+pub async fn clear_device_cache(config: State<'_, AppConfig>) -> Result<(), AppError> {
     config.clear_device_cache()
 }
 
@@ -128,8 +124,7 @@ pub async fn set_static_ip(
     subnet_mask: String,
     gateway: Option<String>,
 ) -> Result<(), AppError> {
-    crate::network::ip_config::assign_static_ip(&name, &ip, &subnet_mask, gateway.as_deref())
-        .await
+    crate::network::ip_config::assign_static_ip(&name, &ip, &subnet_mask, gateway.as_deref()).await
 }
 
 #[tauri::command]
@@ -142,10 +137,7 @@ pub async fn add_secondary_ip(
 }
 
 #[tauri::command]
-pub async fn remove_secondary_ip(
-    name: String,
-    ip: String,
-) -> Result<(), AppError> {
+pub async fn remove_secondary_ip(name: String, ip: String) -> Result<(), AppError> {
     crate::network::ip_config::remove_secondary_ip(&name, &ip).await
 }
 
@@ -168,9 +160,7 @@ pub async fn start_arp_discovery(
 }
 
 #[tauri::command]
-pub async fn stop_arp_discovery(
-    manager: State<'_, NetworkManager>,
-) -> Result<(), AppError> {
+pub async fn stop_arp_discovery(manager: State<'_, NetworkManager>) -> Result<(), AppError> {
     manager.stop_arp_discovery().await;
     Ok(())
 }
@@ -248,9 +238,7 @@ pub async fn stop_rtsp_server(stream: State<'_, StreamManager>) -> Result<(), Ap
 }
 
 #[tauri::command]
-pub async fn get_stream_status(
-    stream: State<'_, StreamManager>,
-) -> Result<StreamStatus, AppError> {
+pub async fn get_stream_status(stream: State<'_, StreamManager>) -> Result<StreamStatus, AppError> {
     stream.get_status().await
 }
 
@@ -309,13 +297,15 @@ pub async fn create_video_window(
             .map_err(|_| AppError::Stream("Main thread channel closed".into()))??;
 
         stream.set_video_child_hwnd(child);
-        return Ok(child.to_string());
+        Ok(child.to_string())
     }
 
     #[cfg(not(windows))]
     {
         let _ = (stream, x, y, width, height);
-        return Err(AppError::Stream("Video embedding only supported on Windows".into()));
+        return Err(AppError::Stream(
+            "Video embedding only supported on Windows".into(),
+        ));
     }
 }
 
@@ -347,7 +337,10 @@ pub async fn set_video_visible(
 // ── FLIR PTU Commands ────────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn ptu_send(ip: String, cmd: String) -> Result<std::collections::HashMap<String, String>, AppError> {
+pub async fn ptu_send(
+    ip: String,
+    cmd: String,
+) -> Result<std::collections::HashMap<String, String>, AppError> {
     let addr: std::net::Ipv4Addr = ip
         .parse()
         .map_err(|_| AppError::Network(format!("Invalid IP address: {}", ip)))?;
@@ -368,12 +361,7 @@ pub async fn discover_onvif(
 }
 
 #[tauri::command]
-pub async fn ptz_move(
-    camera_url: String,
-    pan: f64,
-    tilt: f64,
-    zoom: f64,
-) -> Result<(), AppError> {
+pub async fn ptz_move(camera_url: String, pan: f64, tilt: f64, zoom: f64) -> Result<(), AppError> {
     crate::camera::ptz::continuous_move(&camera_url, pan, tilt, zoom).await
 }
 
@@ -388,11 +376,7 @@ pub async fn ptz_goto_preset(camera_url: String, preset: u32) -> Result<(), AppE
 }
 
 #[tauri::command]
-pub async fn ptz_set_preset(
-    camera_url: String,
-    preset: u32,
-    name: String,
-) -> Result<(), AppError> {
+pub async fn ptz_set_preset(camera_url: String, preset: u32, name: String) -> Result<(), AppError> {
     crate::camera::ptz::set_preset(&camera_url, preset, &name).await
 }
 
@@ -415,7 +399,10 @@ pub async fn sony_cgi_zoom(
     }
 
     let url = if zoom_speed == 0 {
-        format!("http://{}/command/ptzf.cgi?ContinuousPanTiltZoom=0,0,0", addr)
+        format!(
+            "http://{}/command/ptzf.cgi?ContinuousPanTiltZoom=0,0,0",
+            addr
+        )
     } else {
         let speed = zoom_speed.clamp(-100, 100);
         format!(

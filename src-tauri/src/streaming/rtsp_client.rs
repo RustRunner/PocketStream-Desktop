@@ -55,11 +55,15 @@ impl PlaybackPipeline {
         // The named element must exist if the pipeline parsed, but a
         // GStreamer plugin-version mismatch could in theory remove it —
         // return an error rather than panicking the streaming task.
-        result.pipeline
+        result
+            .pipeline
             .by_name("src")
-            .ok_or_else(|| AppError::Stream(
-                "rtspsrc 'src' element not found in pipeline (GStreamer version mismatch?)".into()
-            ))?
+            .ok_or_else(|| {
+                AppError::Stream(
+                    "rtspsrc 'src' element not found in pipeline (GStreamer version mismatch?)"
+                        .into(),
+                )
+            })?
             .set_property("location", url);
 
         Ok(result)
@@ -97,17 +101,18 @@ impl PlaybackPipeline {
         // bus message so GStreamer renders into our child HWND instead of
         // creating its own top-level window.
         if let Some(handle) = window_handle {
-            let bus = pipeline.bus().ok_or_else(|| {
-                AppError::Stream("Pipeline has no bus".into())
-            })?;
+            let bus = pipeline
+                .bus()
+                .ok_or_else(|| AppError::Stream("Pipeline has no bus".into()))?;
 
             bus.set_sync_handler(move |_, msg| {
-                if msg.structure().is_some_and(|s| s.name() == "prepare-window-handle") {
+                if msg
+                    .structure()
+                    .is_some_and(|s| s.name() == "prepare-window-handle")
+                {
                     if let Some(overlay) = msg
                         .src()
-                        .and_then(|src| {
-                            src.dynamic_cast_ref::<gstreamer_video::VideoOverlay>()
-                        })
+                        .and_then(|src| src.dynamic_cast_ref::<gstreamer_video::VideoOverlay>())
                     {
                         unsafe {
                             overlay.set_window_handle(handle);
@@ -122,7 +127,10 @@ impl PlaybackPipeline {
                 gst::BusSyncReply::Pass
             });
 
-            log::info!("Bus sync handler installed for window handle 0x{:X}", handle);
+            log::info!(
+                "Bus sync handler installed for window handle 0x{:X}",
+                handle
+            );
         }
 
         let appsink = pipeline
@@ -150,8 +158,7 @@ impl PlaybackPipeline {
         // Always check bus first — errors may arrive before or after
         // the state transitions away from Playing.
         if let Some(bus) = self.pipeline.bus() {
-            if let Some(msg) = bus.pop_filtered(&[gst::MessageType::Error, gst::MessageType::Eos])
-            {
+            if let Some(msg) = bus.pop_filtered(&[gst::MessageType::Error, gst::MessageType::Eos]) {
                 if let gst::MessageView::Error(err) = msg.view() {
                     let raw = err.error().to_string();
                     let debug = err.debug().map(|d| d.to_string()).unwrap_or_default();
@@ -319,7 +326,8 @@ fn friendly_rtsp_error(error: &str, debug: &str) -> String {
 
     // Connection errors
     if combined.contains("could not connect") || combined.contains("connection refused") {
-        return "Cannot reach camera. Check IP address and that RTSP is enabled on port 554.".into();
+        return "Cannot reach camera. Check IP address and that RTSP is enabled on port 554."
+            .into();
     }
     if combined.contains("timed out") || combined.contains("timeout") {
         return "Connection timed out. Camera may be unreachable or RTSP port blocked.".into();

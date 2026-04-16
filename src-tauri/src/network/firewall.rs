@@ -52,7 +52,11 @@ fn ensure_allow_rule(port: u16) -> Result<(), AppError> {
                 ),
             ])
             .output();
-        log::info!("Firewall rule '{}' already exists (port {})", RULE_NAME, port);
+        log::info!(
+            "Firewall rule '{}' already exists (port {})",
+            RULE_NAME,
+            port
+        );
         return Ok(());
     }
 
@@ -70,11 +74,18 @@ fn ensure_allow_rule(port: u16) -> Result<(), AppError> {
         .map_err(|e| AppError::Network(format!("Failed to create firewall rule: {}", e)))?;
 
     if result.status.success() {
-        log::info!("Created firewall rule '{}' for TCP port {}", RULE_NAME, port);
+        log::info!(
+            "Created firewall rule '{}' for TCP port {}",
+            RULE_NAME,
+            port
+        );
     } else {
         let stderr = String::from_utf8_lossy(&result.stderr);
         // Non-fatal — the server still works on localhost without the rule
-        log::warn!("Could not create firewall rule (may need admin): {}", stderr.trim());
+        log::warn!(
+            "Could not create firewall rule (may need admin): {}",
+            stderr.trim()
+        );
     }
 
     Ok(())

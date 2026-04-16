@@ -187,7 +187,10 @@ impl StreamManager {
         Ok(())
     }
 
-    pub async fn start_rtsp_server(&self, settings: &AppSettings) -> Result<RtspServerInfo, AppError> {
+    pub async fn start_rtsp_server(
+        &self,
+        settings: &AppSettings,
+    ) -> Result<RtspServerInfo, AppError> {
         crate::ensure_gstreamer()?;
 
         let port = settings.rtsp_server.port;
@@ -208,15 +211,18 @@ impl StreamManager {
         let bind_address = if settings.rtsp_server.bind_interface.is_empty() {
             None
         } else {
-            let iface = crate::network::interface::get_by_name(
-                &settings.rtsp_server.bind_interface,
-            )?;
-            let ip = iface.ips.first().map(|ip| ip.address.clone()).ok_or_else(
-                || AppError::Stream(format!(
-                    "Interface '{}' has no IPv4 address",
-                    settings.rtsp_server.bind_interface
-                )),
-            )?;
+            let iface =
+                crate::network::interface::get_by_name(&settings.rtsp_server.bind_interface)?;
+            let ip = iface
+                .ips
+                .first()
+                .map(|ip| ip.address.clone())
+                .ok_or_else(|| {
+                    AppError::Stream(format!(
+                        "Interface '{}' has no IPv4 address",
+                        settings.rtsp_server.bind_interface
+                    ))
+                })?;
             Some(ip)
         };
 
@@ -239,9 +245,8 @@ impl StreamManager {
         };
 
         // Use bind address for client URL if set, otherwise detect local IP
-        let local_ip = bind_address.unwrap_or_else(|| {
-            get_local_ip().unwrap_or_else(|| "0.0.0.0".into())
-        });
+        let local_ip =
+            bind_address.unwrap_or_else(|| get_local_ip().unwrap_or_else(|| "0.0.0.0".into()));
         let info = RtspServerInfo {
             rtsp_url: server.client_url(&local_ip),
             display_url: server.display_url(&local_ip),
@@ -278,7 +283,9 @@ impl StreamManager {
             .unwrap_or(0);
 
         let cached_ip = state.rtsp_local_ip.as_deref().unwrap_or("0.0.0.0");
-        let bandwidth = state.rtsp_server.as_ref()
+        let bandwidth = state
+            .rtsp_server
+            .as_ref()
             .map(|s| s.bandwidth_kbps())
             .unwrap_or(0.0);
 
@@ -372,16 +379,22 @@ impl StreamManager {
     }
 
     pub fn set_video_child_hwnd(&self, hwnd: isize) {
-        self.video_hwnd.store(hwnd, std::sync::atomic::Ordering::Relaxed);
+        self.video_hwnd
+            .store(hwnd, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn get_video_child_hwnd(&self) -> Option<isize> {
         let val = self.video_hwnd.load(std::sync::atomic::Ordering::Relaxed);
-        if val == 0 { None } else { Some(val) }
+        if val == 0 {
+            None
+        } else {
+            Some(val)
+        }
     }
 
     pub fn clear_video_child_hwnd(&self) {
-        self.video_hwnd.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.video_hwnd
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -393,7 +406,8 @@ fn get_local_ip() -> Option<String> {
     let interfaces = crate::network::interface::list_all().ok()?;
 
     // Prefer WiFi interfaces first
-    let wifi_ip = interfaces.iter()
+    let wifi_ip = interfaces
+        .iter()
         .filter(|i| i.is_up && i.is_wifi && !i.is_vpn)
         .flat_map(|i| &i.ips)
         .next()
@@ -404,7 +418,8 @@ fn get_local_ip() -> Option<String> {
     }
 
     // Fallback: any non-VPN interface with an IP
-    interfaces.iter()
+    interfaces
+        .iter()
         .filter(|i| i.is_up && !i.is_vpn)
         .flat_map(|i| &i.ips)
         .next()

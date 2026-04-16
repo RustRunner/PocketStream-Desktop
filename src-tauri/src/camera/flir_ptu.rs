@@ -27,10 +27,7 @@ fn client() -> Result<&'static reqwest::Client, AppError> {
 ///
 /// `base_url` — e.g. `http://192.168.1.202`
 /// `cmd`      — e.g. `PS=100&TS=0` or `PP&TP`
-pub async fn send_command(
-    base_url: &str,
-    cmd: &str,
-) -> Result<HashMap<String, String>, AppError> {
+pub async fn send_command(base_url: &str, cmd: &str) -> Result<HashMap<String, String>, AppError> {
     let url = format!("{}/API/PTCmd", base_url.trim_end_matches('/'));
 
     let resp = client()?

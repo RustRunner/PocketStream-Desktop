@@ -149,10 +149,7 @@ impl AppConfig {
 
     /// Insert or update a cached device entry (keyed by MAC).
     /// Persists the full settings to disk after mutation.
-    pub fn upsert_cached_device(
-        &self,
-        device: CachedDevice,
-    ) -> Result<(), crate::AppError> {
+    pub fn upsert_cached_device(&self, device: CachedDevice) -> Result<(), crate::AppError> {
         match self.settings.lock() {
             Ok(mut guard) => {
                 let cache = &mut guard.device_cache;
@@ -256,13 +253,11 @@ fn save_to_disk(settings: &AppSettings) -> Result<(), crate::AppError> {
 
     // Encrypt credentials before saving
     let mut save_settings = settings.clone();
-    save_settings.credentials.username =
-        encrypt_string(&settings.credentials.username, &key_bytes);
-    save_settings.credentials.password =
-        encrypt_string(&settings.credentials.password, &key_bytes);
+    save_settings.credentials.username = encrypt_string(&settings.credentials.username, &key_bytes);
+    save_settings.credentials.password = encrypt_string(&settings.credentials.password, &key_bytes);
 
-    let content =
-        toml::to_string_pretty(&save_settings).map_err(|e| crate::AppError::Config(e.to_string()))?;
+    let content = toml::to_string_pretty(&save_settings)
+        .map_err(|e| crate::AppError::Config(e.to_string()))?;
     fs::write(config_path(), content).map_err(|e| crate::AppError::Config(e.to_string()))?;
     Ok(())
 }
@@ -393,10 +388,8 @@ mod tests {
     fn decrypt_truncated_ciphertext_fails() {
         let key = vec![0xCCu8; 32];
         // Base64 of 5 bytes (less than 12 byte nonce)
-        let short = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            &[1, 2, 3, 4, 5],
-        );
+        let short =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [1, 2, 3, 4, 5]);
         assert!(decrypt_string(&short, &key).is_none());
     }
 
@@ -410,19 +403,14 @@ mod tests {
     fn decrypt_corrupted_ciphertext_fails() {
         let key = vec![0xEEu8; 32];
         let encrypted = encrypt_string("secret", &key);
-        let mut combined = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            &encrypted,
-        )
-        .unwrap();
+        let mut combined =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &encrypted).unwrap();
         // Flip a byte in the ciphertext (after the 12-byte nonce)
         if combined.len() > 13 {
             combined[13] ^= 0xFF;
         }
-        let corrupted = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            &combined,
-        );
+        let corrupted =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &combined);
         assert!(decrypt_string(&corrupted, &key).is_none());
     }
 

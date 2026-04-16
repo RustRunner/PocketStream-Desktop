@@ -66,17 +66,13 @@ jobs:
         working-directory: src-tauri
         run: cargo test --lib
 
-      # Informational only — codebase isn't fully formatted/lint-clean yet.
-      # Promote to blocking once the queue is drained.
-      - name: cargo fmt (informational)
+      - name: cargo fmt
         working-directory: src-tauri
         run: cargo fmt --check
-        continue-on-error: true
 
-      - name: cargo clippy (informational)
+      - name: cargo clippy
         working-directory: src-tauri
-        run: cargo clippy --all-targets --no-deps
-        continue-on-error: true
+        run: cargo clippy --all-targets --no-deps -- -D warnings
 
   audit:
     name: Security Audit

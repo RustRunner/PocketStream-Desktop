@@ -62,9 +62,20 @@ pub fn list_all() -> Result<Vec<InterfaceInfo>, AppError> {
 
 #[cfg(target_os = "windows")]
 const VPN_KEYWORDS: &[&str] = &[
-    "vpn", "tunnel", "tap-windows", "tap0", "wintun", "wireguard",
-    "tailscale", "zerotier", "anyconnect", "fortinet", "pangp",
-    "softether", "openvpn", "nordlynx",
+    "vpn",
+    "tunnel",
+    "tap-windows",
+    "tap0",
+    "wintun",
+    "wireguard",
+    "tailscale",
+    "zerotier",
+    "anyconnect",
+    "fortinet",
+    "pangp",
+    "softether",
+    "openvpn",
+    "nordlynx",
 ];
 
 #[cfg(target_os = "windows")]
@@ -103,17 +114,20 @@ fn parse_adapter(a: &serde_json::Value, is_vpn: bool) -> InterfaceInfo {
         vec![]
     };
 
-    let ips: Vec<IpInfo> = ip_entries.iter().filter_map(|ip_val| {
-        let addr_str = ip_val["Address"].as_str()?;
-        let prefix = ip_val["PrefixLength"].as_u64().unwrap_or(24) as u8;
-        let addr: IpAddr = addr_str.parse().ok()?;
-        let net = ipnetwork::IpNetwork::new(addr, prefix).ok()?;
-        Some(IpInfo {
-            address: addr_str.to_string(),
-            prefix,
-            subnet: format!("{}/{}", net.network(), net.prefix()),
+    let ips: Vec<IpInfo> = ip_entries
+        .iter()
+        .filter_map(|ip_val| {
+            let addr_str = ip_val["Address"].as_str()?;
+            let prefix = ip_val["PrefixLength"].as_u64().unwrap_or(24) as u8;
+            let addr: IpAddr = addr_str.parse().ok()?;
+            let net = ipnetwork::IpNetwork::new(addr, prefix).ok()?;
+            Some(IpInfo {
+                address: addr_str.to_string(),
+                prefix,
+                subnet: format!("{}/{}", net.network(), net.prefix()),
+            })
         })
-    }).collect();
+        .collect();
 
     let is_ethernet = media.contains("802.3");
     let is_wifi = media.contains("802.11") || media.contains("Native 802.11");
@@ -197,7 +211,9 @@ fn list_all_pnet() -> Result<Vec<InterfaceInfo>, AppError> {
         .into_iter()
         .filter(|iface| !iface.is_loopback())
         .map(|iface| {
-            let ips: Vec<IpInfo> = iface.ips.iter()
+            let ips: Vec<IpInfo> = iface
+                .ips
+                .iter()
                 .filter(|ip| ip.is_ipv4())
                 .filter_map(|ip| {
                     let network: ipnetwork::IpNetwork = (*ip).into();
@@ -364,13 +380,16 @@ mod tests {
 
         #[test]
         fn parse_adapter_basic() {
-            let json: serde_json::Value = serde_json::from_str(r#"{
+            let json: serde_json::Value = serde_json::from_str(
+                r#"{
                 "Name": "Ethernet 2",
                 "Description": "Intel(R) I210 Gigabit Ethernet",
                 "MacAddress": "AA-BB-CC-DD-EE-FF",
                 "MediaType": "802.3",
                 "IPs": [{"Address": "192.168.1.100", "PrefixLength": 24}]
-            }"#).unwrap();
+            }"#,
+            )
+            .unwrap();
             let iface = parse_adapter(&json, false);
             assert_eq!(iface.name, "Ethernet 2");
             assert_eq!(iface.display_name, "Ethernet 2");
@@ -385,13 +404,16 @@ mod tests {
 
         #[test]
         fn parse_adapter_vpn() {
-            let json: serde_json::Value = serde_json::from_str(r#"{
+            let json: serde_json::Value = serde_json::from_str(
+                r#"{
                 "Name": "Tailscale",
                 "Description": "Tailscale Tunnel",
                 "MacAddress": "",
                 "MediaType": "",
                 "IPs": []
-            }"#).unwrap();
+            }"#,
+            )
+            .unwrap();
             let iface = parse_adapter(&json, true);
             assert!(iface.is_vpn);
             assert!(!iface.is_ethernet);
@@ -400,13 +422,16 @@ mod tests {
 
         #[test]
         fn parse_adapter_no_ips() {
-            let json: serde_json::Value = serde_json::from_str(r#"{
+            let json: serde_json::Value = serde_json::from_str(
+                r#"{
                 "Name": "Ethernet",
                 "Description": "Realtek",
                 "MacAddress": "",
                 "MediaType": "802.3",
                 "IPs": null
-            }"#).unwrap();
+            }"#,
+            )
+            .unwrap();
             let iface = parse_adapter(&json, false);
             assert!(iface.ips.is_empty());
         }
@@ -416,13 +441,16 @@ mod tests {
             // parse_adapter accepts any valid IP (including IPv6)
             // because the PowerShell query already filters to IPv4.
             // Verify it doesn't panic on IPv6 input.
-            let json: serde_json::Value = serde_json::from_str(r#"{
+            let json: serde_json::Value = serde_json::from_str(
+                r#"{
                 "Name": "Ethernet",
                 "Description": "Intel",
                 "MacAddress": "",
                 "MediaType": "802.3",
                 "IPs": [{"Address": "fe80::1", "PrefixLength": 64}]
-            }"#).unwrap();
+            }"#,
+            )
+            .unwrap();
             let iface = parse_adapter(&json, false);
             // IPv6 may or may not parse — the function shouldn't panic
             assert!(iface.ips.len() <= 1);
@@ -432,38 +460,50 @@ mod tests {
         fn parse_adapter_ethernet_requires_802_3_media_type() {
             // Only MediaType "802.3" qualifies as ethernet — name/description
             // containing "ethernet" is NOT enough (avoids WiFi false positives).
-            let json: serde_json::Value = serde_json::from_str(r#"{
+            let json: serde_json::Value = serde_json::from_str(
+                r#"{
                 "Name": "Connection 1",
                 "Description": "USB Ethernet Adapter",
                 "MacAddress": "",
                 "MediaType": "",
                 "IPs": []
-            }"#).unwrap();
+            }"#,
+            )
+            .unwrap();
             let iface = parse_adapter(&json, false);
             assert!(!iface.is_ethernet, "Empty MediaType should not be ethernet");
 
-            let json_802_3: serde_json::Value = serde_json::from_str(r#"{
+            let json_802_3: serde_json::Value = serde_json::from_str(
+                r#"{
                 "Name": "Connection 1",
                 "Description": "USB Ethernet Adapter",
                 "MacAddress": "",
                 "MediaType": "802.3",
                 "IPs": []
-            }"#).unwrap();
+            }"#,
+            )
+            .unwrap();
             let iface2 = parse_adapter(&json_802_3, false);
             assert!(iface2.is_ethernet, "802.3 MediaType should be ethernet");
         }
 
         #[test]
         fn parse_adapter_wifi_not_ethernet() {
-            let json: serde_json::Value = serde_json::from_str(r#"{
+            let json: serde_json::Value = serde_json::from_str(
+                r#"{
                 "Name": "Wi-Fi",
                 "Description": "Intel(R) Wi-Fi 6E AX211",
                 "MacAddress": "AA-BB-CC-DD-EE-FF",
                 "MediaType": "Native 802.11",
                 "IPs": [{"Address": "192.168.1.50", "PrefixLength": 24}]
-            }"#).unwrap();
+            }"#,
+            )
+            .unwrap();
             let iface = parse_adapter(&json, false);
-            assert!(!iface.is_ethernet, "WiFi (802.11) must not be marked ethernet");
+            assert!(
+                !iface.is_ethernet,
+                "WiFi (802.11) must not be marked ethernet"
+            );
             assert!(iface.is_wifi, "WiFi (802.11) must be marked as wifi");
         }
     }

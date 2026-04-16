@@ -9,7 +9,6 @@
 //! this dedicated context to dispatch RTSP client requests.
 
 use gstreamer as gst;
-use gst::prelude::*;
 use gstreamer_rtsp as gst_rtsp;
 use gstreamer_rtsp_server as gst_rtsp_server;
 use gstreamer_rtsp_server::prelude::*;
@@ -80,9 +79,7 @@ impl RtspRestreamer {
 
     /// Create the server source, attach to a dedicated context, and spawn
     /// a background thread running a MainLoop on that context.
-    fn attach_and_run(
-        server: &gst_rtsp_server::RTSPServer,
-    ) -> Result<glib::MainLoop, AppError> {
+    fn attach_and_run(server: &gst_rtsp_server::RTSPServer) -> Result<glib::MainLoop, AppError> {
         // create_source gives us the real error (port in use, permission denied, etc.)
         let source = server
             .create_source(gio::Cancellable::NONE)

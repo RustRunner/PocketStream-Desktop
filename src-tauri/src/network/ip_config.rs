@@ -48,8 +48,14 @@ async fn assign_windows(
 
     // Set primary static IP (replaces all existing IPs)
     let mut args = vec![
-        "interface", "ip", "set", "address",
-        interface, "static", ip, subnet_mask,
+        "interface",
+        "ip",
+        "set",
+        "address",
+        interface,
+        "static",
+        ip,
+        subnet_mask,
     ];
     if let Some(gw) = gateway {
         args.push(gw);
@@ -71,7 +77,9 @@ async fn assign_windows(
             if let Err(e) = run_command(
                 "netsh",
                 &["interface", "ip", "add", "address", &name_arg, &addr, &mask],
-            ).await {
+            )
+            .await
+            {
                 log::warn!("Failed to restore secondary IP {}: {}", addr, e);
             }
         }));
@@ -116,7 +124,11 @@ async fn assign_linux(
     // Add default gateway if provided
     if let Some(gw) = gateway {
         // Ignore error if route already exists
-        let _ = run_command("ip", &["route", "add", "default", "via", gw, "dev", interface]).await;
+        let _ = run_command(
+            "ip",
+            &["route", "add", "default", "via", gw, "dev", interface],
+        )
+        .await;
     }
 
     Ok(())
@@ -132,7 +144,11 @@ pub(crate) async fn run_command(program: &str, args: &[&str]) -> Result<String, 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let msg = if stderr.trim().is_empty() { stdout } else { stderr };
+        let msg = if stderr.trim().is_empty() {
+            stdout
+        } else {
+            stderr
+        };
         return Err(AppError::Network(format!(
             "{} failed: {}",
             program,

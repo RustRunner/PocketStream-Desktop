@@ -1,8 +1,8 @@
 #!/usr/bin/env pwsh
 # scripts/check.ps1 — local mirror of .github/workflows/ci.yml
 #
-# Runs the same checks CI runs, in the same order, with the same blocking
-# vs. informational policy. Use before pushing to catch failures early.
+# Runs the same checks CI runs, in the same order. cargo test, fmt, and
+# clippy are all blocking — anything that fails locally will fail in CI.
 #
 # Usage:
 #   pwsh ./scripts/check.ps1            # run everything
@@ -64,17 +64,17 @@ Step "cargo test" {
     try { cargo test --lib } finally { Pop-Location }
 }
 
-# ── Format check (mirrors `cargo fmt` — informational) ─────────────
-Step -Informational "cargo fmt --check" {
+# ── Format check (mirrors `cargo fmt` — blocking) ─────────────────
+Step "cargo fmt --check" {
     Push-Location "$repoRoot/src-tauri"
     try { cargo fmt --check } finally { Pop-Location }
 }
 
-# ── Clippy (mirrors `cargo clippy` — informational) ────────────────
+# ── Clippy (mirrors `cargo clippy` — blocking, -D warnings) ───────
 if (-not $Quick) {
-    Step -Informational "cargo clippy" {
+    Step "cargo clippy" {
         Push-Location "$repoRoot/src-tauri"
-        try { cargo clippy --all-targets --no-deps } finally { Pop-Location }
+        try { cargo clippy --all-targets --no-deps -- -D warnings } finally { Pop-Location }
     }
 }
 

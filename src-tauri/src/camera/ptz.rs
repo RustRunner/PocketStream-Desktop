@@ -99,17 +99,8 @@ pub async fn goto_preset(camera_url: &str, preset: u32) -> Result<(), AppError> 
 }
 
 /// Save the current camera position as a preset.
-pub async fn set_preset(
-    camera_url: &str,
-    preset: u32,
-    name: &str,
-) -> Result<(), AppError> {
-    log::info!(
-        "PTZ set preset {} ('{}') → {}",
-        preset,
-        name,
-        camera_url
-    );
+pub async fn set_preset(camera_url: &str, preset: u32, name: &str) -> Result<(), AppError> {
+    log::info!("PTZ set preset {} ('{}') → {}", preset, name, camera_url);
 
     // TODO: Send ONVIF SetPreset SOAP request
     //
