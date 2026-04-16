@@ -501,10 +501,34 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .unwrap_or_else(|e| {
             log::error!("Fatal: failed to start PocketStream Desktop: {}", e);
             eprintln!("Fatal: failed to start PocketStream Desktop: {}", e);
             std::process::exit(1);
+        })
+        .run(|app_handle, event| {
+            // Graceful-shutdown cleanup: remove every secondary IP that
+            // auto-adopt added during this session, so they don't survive
+            // across restarts and accumulate on the user's adapter when
+            // moving between sites. After a hard crash this won't run;
+            // the leftover IPs are recovered into in-memory state by
+            // `load_adopted_from_config` on the next startup and cleaned
+            // up by the next graceful exit (self-healing on one cycle).
+            //
+            // Bounded at 5 s total so a stalled netsh can't hang the
+            // process. block_on is safe here — the event loop is already
+            // exiting and there's no UI to keep responsive.
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                let manager: tauri::State<'_, network::NetworkManager> =
+                    app_handle.state();
+                let _ = tauri::async_runtime::block_on(async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        manager.cleanup_adopted_ips(),
+                    )
+                    .await
+                });
+            }
         });
 }

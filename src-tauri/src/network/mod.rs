@@ -400,6 +400,61 @@ impl NetworkManager {
 
         auto_adopt::remove_adopted_ip(&iface_name, &ip.to_string()).await
     }
+
+    /// Remove every currently-adopted secondary IP from the OS interface.
+    ///
+    /// Called from the `RunEvent::ExitRequested` handler so adopted IPs
+    /// don't survive a graceful shutdown — they were added at runtime to
+    /// reach foreign subnets and shouldn't pollute the user's persistent
+    /// adapter config when PocketStream is closed.
+    ///
+    /// In-memory state and the on-disk `config.toml` are deliberately left
+    /// untouched: the next startup's `load_adopted_from_config` will see
+    /// the same entries and re-add the IPs (a fast no-op if they were
+    /// already restored, otherwise a normal netsh add). After a hard crash
+    /// (no graceful exit), the IPs persist on the interface; the next
+    /// startup recovers them into in-memory state and the next graceful
+    /// exit cleans them up. The system self-heals after one clean cycle.
+    ///
+    /// Cleanup runs in parallel with a per-call timeout so a stalled netsh
+    /// can't hang the shutdown indefinitely.
+    pub async fn cleanup_adopted_ips(&self) {
+        let iface_name = match self.interface_name.lock().await.clone() {
+            Some(n) => n,
+            None => return,
+        };
+
+        let entries: Vec<(String, Ipv4Addr)> = {
+            let map = self.adopted_ips.lock().await;
+            map.iter().map(|(k, v)| (k.clone(), *v)).collect()
+        };
+
+        if entries.is_empty() {
+            return;
+        }
+
+        log::info!(
+            "Removing {} adopted secondary IP(s) on shutdown",
+            entries.len()
+        );
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for (subnet, ip) in entries {
+            let iface = iface_name.clone();
+            tasks.spawn(async move {
+                let ip_str = ip.to_string();
+                match auto_adopt::remove_adopted_ip(&iface, &ip_str).await {
+                    Ok(()) => log::info!("Removed adopted IP {} ({})", ip_str, subnet),
+                    Err(e) => log::warn!(
+                        "Failed to remove adopted IP {} on shutdown: {}",
+                        ip_str,
+                        e
+                    ),
+                }
+            });
+        }
+        while tasks.join_next().await.is_some() {}
+    }
 }
 
 fn get_interface_ips(name: &str) -> Vec<Ipv4Addr> {
