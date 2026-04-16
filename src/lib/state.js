@@ -34,6 +34,16 @@ export function log(msg) {
   console.log(`[PocketStream] ${msg}`);
 }
 
+/** Escape HTML special characters to prevent injection via innerHTML. */
+export function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
 export function showToast(message, isError = false) {
   // Write toast messages to the log file for diagnostics
   if (invoke) {

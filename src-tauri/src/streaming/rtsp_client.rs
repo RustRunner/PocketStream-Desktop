@@ -50,9 +50,16 @@ impl PlaybackPipeline {
 
         let result = Self::from_pipeline_str(&pipeline_str, window_handle)?;
 
+        // Set the URL via property (not pipeline-string interpolation) so
+        // crafted RTSP paths/credentials can't inject GStreamer syntax.
+        // The named element must exist if the pipeline parsed, but a
+        // GStreamer plugin-version mismatch could in theory remove it —
+        // return an error rather than panicking the streaming task.
         result.pipeline
             .by_name("src")
-            .expect("rtspsrc 'src' not found in pipeline")
+            .ok_or_else(|| AppError::Stream(
+                "rtspsrc 'src' element not found in pipeline (GStreamer version mismatch?)".into()
+            ))?
             .set_property("location", url);
 
         Ok(result)

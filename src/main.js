@@ -5,7 +5,8 @@
 import * as api from "./lib/tauri-api.js";
 import { $, $$, state, showToast } from "./lib/state.js";
 import { refreshInterfaces, setupIpConfigDialog, setupCameraIpDropdown, setupInterfaceWatcher } from "./lib/network.js";
-import { setupArpListeners, loadExistingArpState, setupAliasDialog, setupCacheDialog, resetDiscoveryStatus } from "./lib/devices.js";
+import { setupArpListeners, loadExistingArpState, setupAliasDialog, resetDiscoveryStatus } from "./lib/devices.js";
+import { setupCacheDialog } from "./lib/device-cache.js";
 import { setupStreamControls, setupRtspControls, setupVideoResize, getVideoAreaBounds } from "./lib/streaming.js";
 import { setupPtzControls } from "./lib/ptz.js";
 
