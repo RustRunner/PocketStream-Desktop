@@ -13,6 +13,22 @@
 //! - GotoPreset: Move to a saved preset position
 //! - SetPreset: Save current position as a preset
 //! - GetPresets: List all saved presets
+//!
+//! # SECURITY — validate `camera_url` before adding HTTP client calls
+//!
+//! These functions are stubs today (`log::info!` only). When the SOAP
+//! client lands, every function below MUST validate `camera_url` before
+//! making any outbound request, or this becomes an SSRF vector reachable
+//! from the IPC surface. Recommended check:
+//!
+//!   1. Parse with `url::Url`; reject if not http/https.
+//!   2. Extract host; require it parses as `Ipv4Addr`.
+//!   3. Reject loopback / link-local / broadcast / unspecified
+//!      (mirror `commands::ptu_send` and `commands::sony_cgi_zoom`).
+//!
+//! If ONVIF discovery surfaces hostname-based `<XAddr>` URLs, the host
+//! check needs to be revisited (resolve first, then validate the
+//! resolved IP — don't blindly trust DNS).
 
 use crate::camera::PtzPreset;
 use crate::error::AppError;

@@ -403,13 +403,24 @@ pub async fn sony_cgi_zoom(
     username: String,
     password: String,
 ) -> Result<(), AppError> {
+    // Validate `ip` as IPv4 and reject reserved ranges before building
+    // the HTTP URL. Without this, a compromised webview could pivot to
+    // arbitrary internal HTTP services via this IPC command (SSRF).
+    // Mirrors the validation done by `ptu_send`.
+    let addr: std::net::Ipv4Addr = ip
+        .parse()
+        .map_err(|_| AppError::Network(format!("Invalid IP address: {}", ip)))?;
+    if addr.is_loopback() || addr.is_link_local() || addr.is_broadcast() || addr.is_unspecified() {
+        return Err(AppError::Network(format!("IP address not allowed: {}", ip)));
+    }
+
     let url = if zoom_speed == 0 {
-        format!("http://{}/command/ptzf.cgi?ContinuousPanTiltZoom=0,0,0", ip)
+        format!("http://{}/command/ptzf.cgi?ContinuousPanTiltZoom=0,0,0", addr)
     } else {
         let speed = zoom_speed.clamp(-100, 100);
         format!(
             "http://{}/command/ptzf.cgi?ContinuousPanTiltZoom=0,0,{}",
-            ip, speed
+            addr, speed
         )
     };
 
