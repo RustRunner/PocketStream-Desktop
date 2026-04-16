@@ -277,6 +277,21 @@ fn get_or_create_key() -> Result<Vec<u8>, crate::AppError> {
     let mut key = vec![0u8; 32];
     rand::thread_rng().fill_bytes(&mut key);
     fs::write(&path, &key).map_err(|e| crate::AppError::Config(e.to_string()))?;
+
+    // Restrict the key file to the current user. On Windows this is
+    // typically already the case (AppData/Roaming inherits a user-only
+    // ACL), but enforcing it explicitly removes the dependency on that
+    // OS default. On Unix it depends on umask, which can default to
+    // world-readable — set 0600 explicitly so the AES key never leaks
+    // to other local users via a permissive umask.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = fs::set_permissions(&path, fs::Permissions::from_mode(0o600)) {
+            log::warn!("Failed to chmod 0600 on key file {}: {}", path.display(), e);
+        }
+    }
+
     Ok(key)
 }
 

@@ -146,8 +146,10 @@ impl NetworkManager {
                 .collect();
             let mut new_settings = config.get();
             new_settings.adopted_subnets = adopted;
-            let _ = config.update(new_settings);
-            log::info!("Saved pruned adopted subnets to config");
+            match config.update(new_settings) {
+                Ok(()) => log::info!("Saved pruned adopted subnets to config"),
+                Err(e) => log::warn!("Failed to persist pruned adopted subnets: {}", e),
+            }
         }
     }
 
@@ -320,7 +322,12 @@ impl NetworkManager {
                                 adopted_ip
                             );
 
-                            // Persist to config
+                            // Persist to config so the adoption survives a
+                            // restart. Failure here is non-fatal (the IP is
+                            // still bound to the interface for this session)
+                            // but we want a log entry — silent loss leaves
+                            // users debugging "where did my camera go?"
+                            // after restart with no breadcrumb.
                             let config: tauri::State<'_, crate::config::AppConfig> =
                                 app_handle_for_adopt.state();
                             let adopted_map = adopted.lock().await;
@@ -330,7 +337,13 @@ impl NetworkManager {
                                 .map(|(k, v)| (k.clone(), v.to_string()))
                                 .collect();
                             drop(adopted_map);
-                            let _ = config.update(settings);
+                            if let Err(e) = config.update(settings) {
+                                log::warn!(
+                                    "Failed to persist adopted subnet {} to config: {}",
+                                    device.subnet,
+                                    e
+                                );
+                            }
                         }
                         Ok(None) => {
                             known_subnets.insert(device.subnet.clone());
