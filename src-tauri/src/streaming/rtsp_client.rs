@@ -348,3 +348,106 @@ fn friendly_rtsp_error(error: &str, debug: &str) -> String {
         format!("{} ({})", error, debug)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::friendly_rtsp_error;
+
+    // Each pinned message is what the user sees in a toast — changing the
+    // contract requires deliberately updating the expectation, not silently
+    // editing the function.
+
+    #[test]
+    fn rtsp_503_recognized() {
+        let msg = friendly_rtsp_error("Service Unavailable", "rtspsrc gstrtspsrc.c:1234");
+        assert!(msg.contains("503"));
+        assert!(msg.to_lowercase().contains("path"));
+    }
+
+    #[test]
+    fn rtsp_503_via_status_phrase() {
+        // Some cameras return the phrase without the numeric status.
+        let msg = friendly_rtsp_error("RTSP server returned: service unavailable", "");
+        assert!(msg.contains("503"));
+    }
+
+    #[test]
+    fn rtsp_404_recognized() {
+        let msg = friendly_rtsp_error("Not Found", "");
+        assert!(msg.contains("404"));
+        assert!(msg.to_lowercase().contains("path"));
+    }
+
+    #[test]
+    fn rtsp_401_recognized() {
+        let msg = friendly_rtsp_error("Unauthorized", "");
+        assert!(msg.contains("401"));
+        assert!(msg.to_lowercase().contains("credentials"));
+    }
+
+    #[test]
+    fn rtsp_403_recognized() {
+        let msg = friendly_rtsp_error("Forbidden", "");
+        assert!(msg.contains("403"));
+        assert!(msg.to_lowercase().contains("access denied"));
+    }
+
+    #[test]
+    fn connection_refused_recognized() {
+        let msg = friendly_rtsp_error("Could not connect to host", "");
+        assert!(msg.to_lowercase().contains("cannot reach"));
+    }
+
+    #[test]
+    fn timeout_recognized() {
+        let msg = friendly_rtsp_error("Operation timed out", "");
+        assert!(msg.to_lowercase().contains("timed out"));
+    }
+
+    #[test]
+    fn missing_plugin_includes_original_error() {
+        let raw = "no element \"h264parse\"";
+        let msg = friendly_rtsp_error(raw, "");
+        assert!(msg.to_lowercase().contains("missing gstreamer plugin"));
+        // The raw error text is preserved so users can search for the
+        // specific plugin name.
+        assert!(msg.contains("h264parse"));
+    }
+
+    #[test]
+    fn not_negotiated_recognized() {
+        let msg = friendly_rtsp_error("not-negotiated", "");
+        assert!(msg.to_lowercase().contains("format"));
+    }
+
+    #[test]
+    fn fallback_includes_short_debug_verbatim() {
+        let msg = friendly_rtsp_error("Some unknown error", "short debug");
+        // No mapped category — falls through to the raw "(debug)" form.
+        assert!(msg.contains("Some unknown error"));
+        assert!(msg.contains("short debug"));
+    }
+
+    #[test]
+    fn fallback_truncates_long_debug() {
+        let long = "x".repeat(500);
+        let msg = friendly_rtsp_error("err", &long);
+        // 120-char cap + ellipsis suffix, plus the error prefix.
+        assert!(msg.contains("..."));
+        assert!(msg.len() < 200);
+    }
+
+    #[test]
+    fn matching_is_case_insensitive() {
+        // Real GStreamer messages mix case ("Connection Refused", etc.)
+        let msg = friendly_rtsp_error("CONNECTION REFUSED", "");
+        assert!(msg.to_lowercase().contains("cannot reach"));
+    }
+
+    #[test]
+    fn debug_can_carry_the_signal() {
+        // Sometimes the status phrase only appears in the debug field.
+        let msg = friendly_rtsp_error("Stream error", "rtspsrc.c:9999: 401 unauthorized");
+        assert!(msg.contains("401"));
+    }
+}
