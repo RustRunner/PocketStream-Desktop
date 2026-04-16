@@ -51,6 +51,14 @@ const verifyingDevices = new Set();
 /// was last known, but are visually marked as not-currently-reachable.
 const offlineDevices = new Set();
 
+/// MACs that were hydrated from the on-disk cache but haven't (yet) been
+/// confirmed by a live ARP discovery in this session. Used to scope
+/// rendering: cached entries on subnets we don't currently route to are
+/// hidden, since they're stale ghosts from a previous network. They stay
+/// in the cache file so they reappear automatically when the subnet
+/// becomes routable again.
+const cachedOnlyMacs = new Set();
+
 // ── Debounced scan trigger ─────────────────────────────────────────
 // Collect all ARP discoveries and subnet adoptions, then scan once
 // after activity settles. This prevents partial renders and flicker.
@@ -121,6 +129,8 @@ export function setupArpListeners() {
 
     const isNew = !arpDevices.has(device.mac);
     arpDevices.set(device.mac, device);
+    // Live ARP confirmation — the entry is no longer cache-only.
+    cachedOnlyMacs.delete(device.mac);
 
     if (isNew) {
       log(`ARP: discovered ${device.ip} (${device.mac})`);
@@ -214,6 +224,8 @@ async function loadDeviceCache() {
         first_seen: entry.last_seen,
         last_seen: entry.last_seen,
       });
+      // Mark as cache-only until live ARP confirms the device is here now.
+      cachedOnlyMacs.add(entry.mac);
     }
     // Pre-populate scan results so the device renders with its known ports.
     if (entry.open_ports && entry.open_ports.length > 0) {
@@ -230,16 +242,15 @@ async function loadDeviceCache() {
     }
   }
 
-  // Mark every cached device we're about to verify as "verifying" so
-  // the UI can show a subtle indicator until the targeted scan returns.
-  // Devices on unreachable subnets stay in the list but are immediately
-  // marked offline — there's no route to verify them.
+  // Mark cached devices on routable subnets as "verifying" so the UI
+  // shows a subtle indicator until the targeted scan returns. Entries on
+  // non-routable subnets aren't tracked here — they're hidden by the
+  // render filter (cachedOnlyMacs + hasRouteToSubnet) and will reappear
+  // automatically when the subnet becomes reachable again.
   for (const entry of cache) {
     if (!entry.ip) continue;
     if (hasRouteToSubnet(entry.subnet)) {
       verifyingDevices.add(entry.ip);
-    } else {
-      offlineDevices.add(entry.ip);
     }
   }
 
@@ -317,6 +328,151 @@ export function persistDeviceToCache(device, openPorts) {
     log(`Failed to persist device to cache: ${e}`);
   });
 }
+
+// ── Cached devices management dialog ────────────────────────────────
+
+/**
+ * Open the dialog that lists offline / stale cached devices and lets
+ * the user forget them individually or all at once. Triggered by
+ * clicking the "Nodes" card title.
+ */
+function openCacheDialog() {
+  const dialog = $("#cache-dialog");
+  if (!dialog) return;
+
+  // Build the candidate list: anything cached that is NOT currently
+  // confirmed working — i.e. visibly offline, or hidden because its
+  // subnet isn't routable right now (cache-only on unroutable subnet).
+  const entries = [];
+  for (const dev of arpDevices.values()) {
+    const isOffline = offlineDevices.has(dev.ip);
+    const isStaleHidden =
+      cachedOnlyMacs.has(dev.mac) && !hasRouteToSubnet(dev.subnet);
+    if (!isOffline && !isStaleHidden) continue;
+    entries.push({
+      mac: dev.mac,
+      ip: dev.ip,
+      subnet: dev.subnet,
+      alias: nodeAliases.get(dev.ip) || "",
+      reason: isOffline ? "offline" : "no route",
+    });
+  }
+  // Sort by subnet, then IP for predictable ordering.
+  entries.sort((a, b) => {
+    if (a.subnet !== b.subnet) return a.subnet.localeCompare(b.subnet);
+    return a.ip.localeCompare(b.ip, undefined, { numeric: true });
+  });
+
+  const listEl = $("#cache-dialog-list");
+  const emptyEl = $("#cache-dialog-empty");
+  const clearAllBtn = $("#cache-clear-all");
+
+  if (entries.length === 0) {
+    listEl.innerHTML = "";
+    emptyEl.style.display = "";
+    clearAllBtn.disabled = true;
+  } else {
+    emptyEl.style.display = "none";
+    clearAllBtn.disabled = false;
+    listEl.innerHTML = entries
+      .map((e) => {
+        const name = e.alias || `(unnamed)`;
+        return `
+          <div class="cache-item" data-mac="${escapeHtml(e.mac)}" data-ip="${escapeHtml(e.ip)}">
+            <div class="cache-item-info">
+              <div class="cache-item-name">${escapeHtml(name)}</div>
+              <div class="cache-item-detail">
+                <span class="cache-item-ip">${escapeHtml(e.ip)}</span>
+                <span class="cache-item-subnet">${escapeHtml(e.subnet)}</span>
+                <span class="cache-item-reason">${escapeHtml(e.reason)}</span>
+              </div>
+            </div>
+            <button class="cache-forget-btn icon-btn small" data-forget-mac="${escapeHtml(e.mac)}" title="Forget this device">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+            </button>
+          </div>`;
+      })
+      .join("");
+
+    // Per-row forget handlers
+    listEl.querySelectorAll(".cache-forget-btn").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const mac = btn.dataset.forgetMac;
+        await forgetCachedDevice(mac);
+        // Re-open with the refreshed list
+        openCacheDialog();
+      });
+    });
+  }
+
+  if (dialog.open) dialog.close();
+  api.setVideoVisible(false).catch(() => {});
+  dialog.showModal();
+  dialog.addEventListener(
+    "close",
+    () => api.setVideoVisible(true).catch(() => {}),
+    { once: true }
+  );
+}
+
+/**
+ * Drop a single cached device by MAC: remove from in-memory state,
+ * clear its visual flags, and delete from the persisted cache file.
+ */
+async function forgetCachedDevice(mac) {
+  if (!mac) return;
+  const dev = arpDevices.get(mac);
+  if (dev) {
+    arpDevices.delete(mac);
+    tcpScanResults.delete(dev.ip);
+    nodeAliases.delete(dev.ip);
+    verifyingDevices.delete(dev.ip);
+    offlineDevices.delete(dev.ip);
+    scannedIps.delete(dev.ip);
+  }
+  cachedOnlyMacs.delete(mac);
+  try {
+    await api.removeCachedDevice(mac);
+  } catch (e) {
+    log(`Failed to remove cached device ${mac}: ${e}`);
+  }
+  renderArpDeviceList();
+}
+
+/**
+ * Drop every offline + stale-hidden cached device. Walks the same
+ * candidate set the dialog displays so what's listed is what's cleared.
+ */
+async function clearAllOfflineCached() {
+  const macs = [];
+  for (const dev of arpDevices.values()) {
+    const isOffline = offlineDevices.has(dev.ip);
+    const isStaleHidden =
+      cachedOnlyMacs.has(dev.mac) && !hasRouteToSubnet(dev.subnet);
+    if (isOffline || isStaleHidden) macs.push(dev.mac);
+  }
+  for (const mac of macs) {
+    await forgetCachedDevice(mac);
+  }
+}
+
+export function setupCacheDialog() {
+  const titleEl = $("#nodes-title");
+  if (titleEl) {
+    titleEl.addEventListener("click", openCacheDialog);
+  }
+
+  const dialog = $("#cache-dialog");
+  if (!dialog) return;
+
+  $("#cache-close").addEventListener("click", () => dialog.close());
+  $("#cache-clear-all").addEventListener("click", async () => {
+    await clearAllOfflineCached();
+    openCacheDialog(); // refresh the now-empty list
+  });
+}
+
+// ── Alias persistence helper ────────────────────────────────────────
 
 /**
  * Persist the current alias for the device with this IP.
@@ -399,6 +555,12 @@ function renderArpDeviceList() {
 
   const bySubnet = new Map();
   for (const device of arpDevices.values()) {
+    // Hide cached-only entries on subnets we don't currently route to —
+    // they're stale ghosts from a different network. Stay in the cache
+    // file so they reappear when the subnet is reachable again.
+    if (cachedOnlyMacs.has(device.mac) && !hasRouteToSubnet(device.subnet)) {
+      continue;
+    }
     if (!bySubnet.has(device.subnet)) {
       bySubnet.set(device.subnet, []);
     }

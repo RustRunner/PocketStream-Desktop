@@ -1009,6 +1009,88 @@
   flex: 1;
 }
 
+/* Clickable card title (used by Nodes header to open the cache dialog).
+   Subtle hover + cursor so users discover the affordance without it
+   shouting for attention. */
+.clickable-title {
+  cursor: pointer;
+  transition: color var(--md-transition);
+  user-select: none;
+}
+.clickable-title:hover {
+  color: var(--md-primary-light);
+}
+
+/* Cached devices ("Clear Offline Devices") dialog */
+.cache-dialog {
+  min-width: 420px;
+  max-width: 520px;
+}
+.cache-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.cache-empty {
+  text-align: center;
+  padding: 24px 0;
+  color: var(--md-on-surface-variant);
+  font-size: 13px;
+}
+.cache-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  border-radius: var(--md-radius-sm);
+  background: var(--md-surface-variant);
+}
+.cache-item-info {
+  flex: 1;
+  min-width: 0;
+}
+.cache-item-name {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--md-on-surface);
+  margin-bottom: 2px;
+}
+.cache-item-detail {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  font-size: 12px;
+  color: var(--md-on-surface-variant);
+}
+.cache-item-ip {
+  font-family: var(--md-font-mono);
+  color: var(--md-primary-light);
+}
+.cache-item-subnet {
+  font-family: var(--md-font-mono);
+}
+.cache-item-reason {
+  margin-left: auto;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: var(--md-error);
+  color: var(--md-on-error);
+  opacity: 0.8;
+}
+.cache-forget-btn {
+  flex-shrink: 0;
+  color: var(--md-on-surface-variant);
+  transition: color var(--md-transition);
+}
+.cache-forget-btn:hover {
+  color: var(--md-error);
+}
+
 /* ── Scan Spinner ───────────────────────────────────────────────────── */
 
 .scan-spinner {
