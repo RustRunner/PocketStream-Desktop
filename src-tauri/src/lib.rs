@@ -412,6 +412,11 @@ pub fn run() {
             // Config
             commands::get_config,
             commands::save_config,
+            // Device Cache
+            commands::get_device_cache,
+            commands::upsert_cached_device,
+            commands::remove_cached_device,
+            commands::clear_device_cache,
             // Network
             commands::scan_network,
             commands::list_interfaces,

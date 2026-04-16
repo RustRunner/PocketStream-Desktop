@@ -44,6 +44,25 @@ pub struct Credentials {
     pub password: String,
 }
 
+/// Cached metadata for a previously-discovered device.
+///
+/// Persisted across sessions so the nodes panel can render immediately
+/// on startup with the last-known state, before any network activity.
+/// Cached entries are flagged as "verifying" in the UI until a fresh
+/// targeted port scan confirms they are still reachable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedDevice {
+    pub mac: String,
+    pub ip: String,
+    pub subnet: String,
+    #[serde(default)]
+    pub open_ports: Vec<u16>,
+    #[serde(default)]
+    pub alias: String,
+    /// RFC3339 timestamp of the last successful scan
+    pub last_seen: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub stream: StreamConfig,
@@ -52,6 +71,10 @@ pub struct AppSettings {
     /// Auto-adopted subnet IPs: subnet string -> adopted IP address
     #[serde(default)]
     pub adopted_subnets: HashMap<String, String>,
+    /// Cached devices from prior sessions, keyed by MAC.
+    /// Loaded at startup to render the nodes panel before any network activity.
+    #[serde(default)]
+    pub device_cache: Vec<CachedDevice>,
 }
 
 impl Default for AppSettings {
@@ -75,6 +98,7 @@ impl Default for AppSettings {
                 password: String::new(),
             },
             adopted_subnets: HashMap::new(),
+            device_cache: Vec::new(),
         }
     }
 }
@@ -118,6 +142,71 @@ impl AppConfig {
             Err(poisoned) => {
                 log::error!("Config mutex poisoned during update, recovering");
                 *poisoned.into_inner() = new_settings;
+            }
+        }
+        self.save()
+    }
+
+    /// Insert or update a cached device entry (keyed by MAC).
+    /// Persists the full settings to disk after mutation.
+    pub fn upsert_cached_device(
+        &self,
+        device: CachedDevice,
+    ) -> Result<(), crate::AppError> {
+        match self.settings.lock() {
+            Ok(mut guard) => {
+                let cache = &mut guard.device_cache;
+                if let Some(existing) = cache.iter_mut().find(|d| d.mac == device.mac) {
+                    *existing = device;
+                } else {
+                    cache.push(device);
+                }
+            }
+            Err(poisoned) => {
+                log::error!("Config mutex poisoned during cache upsert, recovering");
+                let mut guard = poisoned.into_inner();
+                let cache = &mut guard.device_cache;
+                if let Some(existing) = cache.iter_mut().find(|d| d.mac == device.mac) {
+                    *existing = device;
+                } else {
+                    cache.push(device);
+                }
+            }
+        }
+        self.save()
+    }
+
+    /// Remove a cached device by MAC address.
+    /// No-op if the MAC is not present.
+    pub fn remove_cached_device(&self, mac: &str) -> Result<(), crate::AppError> {
+        let removed = match self.settings.lock() {
+            Ok(mut guard) => {
+                let before = guard.device_cache.len();
+                guard.device_cache.retain(|d| d.mac != mac);
+                before != guard.device_cache.len()
+            }
+            Err(poisoned) => {
+                log::error!("Config mutex poisoned during cache remove, recovering");
+                let mut guard = poisoned.into_inner();
+                let before = guard.device_cache.len();
+                guard.device_cache.retain(|d| d.mac != mac);
+                before != guard.device_cache.len()
+            }
+        };
+        if removed {
+            self.save()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Clear the entire device cache.
+    pub fn clear_device_cache(&self) -> Result<(), crate::AppError> {
+        match self.settings.lock() {
+            Ok(mut guard) => guard.device_cache.clear(),
+            Err(poisoned) => {
+                log::error!("Config mutex poisoned during cache clear, recovering");
+                poisoned.into_inner().device_cache.clear();
             }
         }
         self.save()
@@ -451,6 +540,7 @@ mod tests {
                 password: "secret".into(),
             },
             adopted_subnets: std::collections::HashMap::new(),
+            device_cache: Vec::new(),
         };
         let toml_str = toml::to_string_pretty(&settings).unwrap();
         let parsed: AppSettings = toml::from_str(&toml_str).unwrap();

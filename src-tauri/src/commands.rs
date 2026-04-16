@@ -1,6 +1,6 @@
 use tauri::{Manager, State};
 
-use crate::config::{AppConfig, AppSettings};
+use crate::config::{AppConfig, AppSettings, CachedDevice};
 use crate::error::AppError;
 use crate::network::{ArpDevice, InterfaceInfo, NetworkManager, ScanResult};
 use crate::streaming::{RtspServerInfo, StreamManager, StreamStatus};
@@ -57,6 +57,38 @@ pub async fn save_config(
     settings: AppSettings,
 ) -> Result<(), AppError> {
     config.update(settings)
+}
+
+// ── Device Cache Commands ────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn get_device_cache(
+    config: State<'_, AppConfig>,
+) -> Result<Vec<CachedDevice>, AppError> {
+    Ok(config.get().device_cache)
+}
+
+#[tauri::command]
+pub async fn upsert_cached_device(
+    config: State<'_, AppConfig>,
+    device: CachedDevice,
+) -> Result<(), AppError> {
+    config.upsert_cached_device(device)
+}
+
+#[tauri::command]
+pub async fn remove_cached_device(
+    config: State<'_, AppConfig>,
+    mac: String,
+) -> Result<(), AppError> {
+    config.remove_cached_device(&mac)
+}
+
+#[tauri::command]
+pub async fn clear_device_cache(
+    config: State<'_, AppConfig>,
+) -> Result<(), AppError> {
+    config.clear_device_cache()
 }
 
 // ── Network Commands ─────────────────────────────────────────────────

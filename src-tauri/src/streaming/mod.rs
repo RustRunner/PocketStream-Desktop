@@ -441,6 +441,7 @@ mod tests {
                 password: password.into(),
             },
             adopted_subnets: std::collections::HashMap::new(),
+            device_cache: Vec::new(),
         }
     }
 

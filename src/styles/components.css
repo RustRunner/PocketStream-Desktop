@@ -878,6 +878,38 @@
 .device-item.selected {
 }
 
+/* Cached entries waiting on a fresh /32 verification scan after startup.
+   Subtle dim so the user knows the displayed state is from the cache,
+   not a fresh observation. Cleared as soon as verification completes. */
+.device-item.verifying {
+  opacity: 0.7;
+}
+
+/* Cache entries whose verification scan failed (no open ports observed
+   or the subnet isn't currently routable). The device may simply be
+   powered off — we keep the entry visible so the user can see what was
+   last there, but make it clear it's not currently reachable. */
+.device-item.offline {
+  opacity: 0.55;
+}
+
+.device-status {
+  font-size: 10px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: var(--md-surface-variant);
+  color: var(--md-on-surface-variant);
+}
+
+.device-item.offline .device-status {
+  background: var(--md-error);
+  color: var(--md-on-error);
+  opacity: 0.8;
+}
+
 .device-name-row {
   display: flex;
   align-items: center;

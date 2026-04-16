@@ -30,6 +30,24 @@ export async function saveConfig(settings) {
   return await invoke("save_config", { settings });
 }
 
+// ── Device Cache ────────────────────────────────────────────────────
+
+export async function getDeviceCache() {
+  return await invoke("get_device_cache");
+}
+
+export async function upsertCachedDevice(device) {
+  return await invoke("upsert_cached_device", { device });
+}
+
+export async function removeCachedDevice(mac) {
+  return await invoke("remove_cached_device", { mac });
+}
+
+export async function clearDeviceCache() {
+  return await invoke("clear_device_cache");
+}
+
 // ── Network ─────────────────────────────────────────────────────────
 
 export async function scanNetwork(subnet) {

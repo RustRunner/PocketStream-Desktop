@@ -38,6 +38,19 @@ function hasRouteToSubnet(subnet) {
 const scannedIps = new Set();
 let pendingScans = 0;
 
+/// Whether the persisted device cache has been loaded into memory yet.
+/// Cache load is a one-shot per-app-session — refresh buttons don't reload it.
+let cacheLoaded = false;
+
+/// IPs of cached devices that haven't been verified by a fresh scan yet.
+/// Cleared as fast-path verification completes for each entry.
+const verifyingDevices = new Set();
+
+/// IPs of cached devices whose verification scan failed (no open ports
+/// or network error). Stay in the list so the user can still see what
+/// was last known, but are visually marked as not-currently-reachable.
+const offlineDevices = new Set();
+
 // ── Debounced scan trigger ─────────────────────────────────────────
 // Collect all ARP discoveries and subnet adoptions, then scan once
 // after activity settles. This prevents partial renders and flicker.
@@ -146,16 +159,180 @@ export async function loadExistingArpState() {
       if (Object.keys(subnets).length > 0) renderSubnetList();
     }
 
+    // Load persisted device cache once per session — renders the nodes
+    // panel immediately with last-known state, before any new ARP/scan
+    // traffic. Done after adoptedSubnets is populated so hasRouteToSubnet()
+    // sees the right adopted IPs when deciding which entries to fast-scan.
+    if (!cacheLoaded) {
+      cacheLoaded = true;
+      await loadDeviceCache();
+    }
+
     if (devices && devices.length > 0) {
       for (const d of devices) {
         arpDevices.set(d.mac, d);
       }
       scanAllRoutableDevices();
-    } else {
+    } else if (arpDevices.size === 0) {
       showDiscoveryStatus("IP Discovery...");
     }
   } catch (e) {
     console.error("Failed to load ARP state:", e);
+  }
+}
+
+// ── Device cache (persisted across sessions) ───────────────────────
+
+/**
+ * Load the persisted device cache from disk and render immediately.
+ *
+ * Cached entries pre-populate `arpDevices`, `tcpScanResults`, and
+ * `nodeAliases` so the nodes panel paints with last-known state on
+ * startup. Then a fast-path port scan runs in parallel against entries
+ * on currently-routable subnets to confirm they're still reachable —
+ * no debounce, no retries, since this path exists to verify the cache
+ * not to discover new devices.
+ */
+async function loadDeviceCache() {
+  let cache;
+  try {
+    cache = await api.getDeviceCache();
+  } catch (e) {
+    log(`Failed to load device cache: ${e}`);
+    return;
+  }
+  if (!cache || cache.length === 0) return;
+
+  for (const entry of cache) {
+    if (!entry.mac || !entry.ip) continue;
+    // Don't clobber a fresh ARP discovery that arrived before the cache load.
+    if (!arpDevices.has(entry.mac)) {
+      arpDevices.set(entry.mac, {
+        mac: entry.mac,
+        ip: entry.ip,
+        subnet: entry.subnet,
+        first_seen: entry.last_seen,
+        last_seen: entry.last_seen,
+      });
+    }
+    // Pre-populate scan results so the device renders with its known ports.
+    if (entry.open_ports && entry.open_ports.length > 0) {
+      if (!tcpScanResults.has(entry.ip)) {
+        tcpScanResults.set(entry.ip, {
+          ip: entry.ip,
+          reachable: true,
+          open_ports: entry.open_ports,
+        });
+      }
+    }
+    if (entry.alias && !nodeAliases.has(entry.ip)) {
+      nodeAliases.set(entry.ip, entry.alias);
+    }
+  }
+
+  // Mark every cached device we're about to verify as "verifying" so
+  // the UI can show a subtle indicator until the targeted scan returns.
+  // Devices on unreachable subnets stay in the list but are immediately
+  // marked offline — there's no route to verify them.
+  for (const entry of cache) {
+    if (!entry.ip) continue;
+    if (hasRouteToSubnet(entry.subnet)) {
+      verifyingDevices.add(entry.ip);
+    } else {
+      offlineDevices.add(entry.ip);
+    }
+  }
+
+  log(`Loaded ${cache.length} cached device(s) from disk`);
+  renderArpDeviceList();
+
+  // Fast-path verify: targeted scans for cached devices on routable
+  // subnets. Parallel, no debounce, no retries — the cache is being
+  // verified, not discovered.
+  for (const entry of cache) {
+    if (!hasRouteToSubnet(entry.subnet)) continue;
+    if (scannedIps.has(entry.ip)) continue;
+    fastVerifyCachedDevice(entry.ip);
+  }
+}
+
+/**
+ * Targeted port scan for a cached device — fail-fast, no retries.
+ * On success, the entry is refreshed in the on-disk cache via the
+ * normal scanDevicePorts() path. On failure, we leave the cache entry
+ * intact (the device may just be offline temporarily) but the cached
+ * port data stays visible until the next discovery sweep.
+ */
+async function fastVerifyCachedDevice(ip) {
+  scannedIps.add(ip);
+  let verified = false;
+  try {
+    const results = await api.scanNetwork(`${ip}/32`);
+    if (results) {
+      for (const r of results) {
+        if (r.ip === ip && r.reachable && r.open_ports.length > 0) {
+          tcpScanResults.set(r.ip, r);
+          verified = true;
+          // Find the MAC for this IP so we can refresh the cache entry
+          for (const dev of arpDevices.values()) {
+            if (dev.ip === r.ip) {
+              persistDeviceToCache(dev, r.open_ports);
+              break;
+            }
+          }
+        }
+      }
+    }
+  } catch (e) {
+    // Verification failure isn't fatal — keep the cached entry visible.
+    log(`Cache verify failed for ${ip}: ${e}`);
+  } finally {
+    verifyingDevices.delete(ip);
+    if (verified) {
+      offlineDevices.delete(ip);
+    } else {
+      // Couldn't reach the device — flag offline so the UI can dim it
+      // and the user knows clicking it may not work right now.
+      offlineDevices.add(ip);
+    }
+    renderArpDeviceList();
+  }
+}
+
+/**
+ * Write a single device to the persistent cache.
+ * Called after every successful port scan that finds open ports.
+ */
+export function persistDeviceToCache(device, openPorts) {
+  if (!device || !device.mac || !openPorts || openPorts.length === 0) return;
+  const entry = {
+    mac: device.mac,
+    ip: device.ip,
+    subnet: device.subnet,
+    open_ports: openPorts,
+    alias: nodeAliases.get(device.ip) || "",
+    last_seen: new Date().toISOString(),
+  };
+  api.upsertCachedDevice(entry).catch((e) => {
+    log(`Failed to persist device to cache: ${e}`);
+  });
+}
+
+/**
+ * Persist the current alias for the device with this IP.
+ * Looks up the matching MAC and ports from in-memory state, then writes
+ * the cache entry. No-op if the device isn't in the cache-eligible set
+ * (no MAC known, or no open ports observed).
+ */
+function persistAliasForIp(ip) {
+  if (!ip) return;
+  const ports = tcpScanResults.get(ip)?.open_ports;
+  if (!ports || ports.length === 0) return;
+  for (const dev of arpDevices.values()) {
+    if (dev.ip === ip) {
+      persistDeviceToCache(dev, ports);
+      return;
+    }
   }
 }
 
@@ -177,6 +354,17 @@ async function scanDevicePorts(ip, attempt = 0) {
         if (r.reachable && r.open_ports.length > 0) {
           tcpScanResults.set(r.ip, r);
           found = true;
+          // Device just responded — clear any stale offline flag from
+          // a prior failed cache verification.
+          offlineDevices.delete(r.ip);
+          // Persist to disk so the next session can render this device
+          // immediately without waiting for ARP/scan to complete.
+          for (const dev of arpDevices.values()) {
+            if (dev.ip === r.ip) {
+              persistDeviceToCache(dev, r.open_ports);
+              break;
+            }
+          }
         }
       }
     }
@@ -258,10 +446,25 @@ function renderArpDeviceList() {
 
       devicesForDropdown.push({ ip: d.ip, open_ports: ports });
 
+      const classes = ["device-item"];
+      if (state.selectedDevice === d.ip) classes.push("selected");
+      // Cached devices being verified by an in-flight scan
+      if (verifyingDevices.has(d.ip)) classes.push("verifying");
+      // Cached devices whose verification scan failed (no route, or
+      // device isn't responding to a targeted port scan right now)
+      if (offlineDevices.has(d.ip)) classes.push("offline");
+
+      const statusBadge = verifyingDevices.has(d.ip)
+        ? '<span class="device-status" title="Verifying...">verifying</span>'
+        : offlineDevices.has(d.ip)
+          ? '<span class="device-status" title="Last-known state — device not responding">offline</span>'
+          : "";
+
       html += `
-        <div class="device-item${state.selectedDevice === d.ip ? " selected" : ""}" data-ip="${d.ip}">
+        <div class="${classes.join(" ")}" data-ip="${d.ip}">
           <div class="device-name-row">
             <span class="device-name">${escapeHtml(name)}</span>
+            ${statusBadge}
             <button class="edit-alias-btn" data-alias-ip="${d.ip}" title="Rename">${pencilSvg}</button>
           </div>
           <div class="device-detail-row">
@@ -388,12 +591,14 @@ export function setupAliasDialog() {
         nodeAliases.set(ip, "CAM");
         $("#camera-ip").value = ip;
         if (state.config) state.config.stream.camera_ip = ip;
+        persistAliasForIp(ip);
         dialog.close();
         renderArpDeviceList();
       } else if (role === "ptu") {
         const ip = dialog.dataset.ip;
         nodeAliases.set(ip, "PTU");
         $("#ptu-ip").value = ip;
+        persistAliasForIp(ip);
         dialog.close();
         renderArpDeviceList();
       } else {
@@ -412,6 +617,7 @@ export function setupAliasDialog() {
     } else {
       nodeAliases.delete(ip);
     }
+    persistAliasForIp(ip);
     dialog.close();
     renderArpDeviceList();
   });
@@ -420,6 +626,7 @@ export function setupAliasDialog() {
     const dialog = $("#alias-dialog");
     const ip = dialog.dataset.ip;
     nodeAliases.delete(ip);
+    persistAliasForIp(ip);
     dialog.close();
     renderArpDeviceList();
   });
