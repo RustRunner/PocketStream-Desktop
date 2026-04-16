@@ -310,6 +310,25 @@ impl PlaybackPipeline {
 fn friendly_rtsp_error(error: &str, debug: &str) -> String {
     let combined = format!("{} {}", error, debug).to_lowercase();
 
+    // Network-loss / mid-stream disconnect — checked first because
+    // GStreamer's debug payload often replays the last RTSP exchange,
+    // which can include cached 401/404 responses from earlier auth
+    // negotiation. Pattern-matching those naively gives misleading
+    // toasts ("bad credentials" when the cable was just unplugged).
+    if combined.contains("could not read from")
+        || combined.contains("connection reset")
+        || combined.contains("connection lost")
+        || combined.contains("no route to host")
+        || combined.contains("network unreachable")
+        || combined.contains("host unreachable")
+        || combined.contains("internal data stream error")
+        || combined.contains("internal data flow error")
+        || combined.contains("broken pipe")
+        || combined.contains("transport error")
+    {
+        return "Network connection lost. Check ethernet cable and camera link.".into();
+    }
+
     // RTSP status codes
     if combined.contains("503") || combined.contains("service unavailable") {
         return "RTSP 503: wrong stream path or camera busy. Check the Path in settings.".into();
@@ -447,7 +466,49 @@ mod tests {
     #[test]
     fn debug_can_carry_the_signal() {
         // Sometimes the status phrase only appears in the debug field.
+        // No network-loss keywords here, so 401 in debug should still win.
         let msg = friendly_rtsp_error("Stream error", "rtspsrc.c:9999: 401 unauthorized");
         assert!(msg.contains("401"));
+    }
+
+    // ── Network-loss / mid-stream disconnect ────────────────────────
+    // These must short-circuit BEFORE the HTTP-status checks because
+    // GStreamer's debug payload often replays a cached 401/404 from the
+    // earlier auth handshake. Without this priority, yanking the cable
+    // mid-stream surfaced "bad credentials" toasts to the user.
+
+    #[test]
+    fn mid_stream_disconnect_recognized_as_network_loss() {
+        let msg = friendly_rtsp_error(
+            "Internal data stream error",
+            "gstrtspsrc.c:1234: could not read from resource",
+        );
+        assert!(msg.to_lowercase().contains("network"));
+        assert!(!msg.contains("401"));
+    }
+
+    #[test]
+    fn cable_unplug_with_cached_401_in_debug_still_says_network() {
+        // The exact regression: cable yanked mid-stream, GStreamer
+        // surfaces an Internal data stream error whose debug payload
+        // includes the old 401 challenge from the initial DESCRIBE.
+        let msg = friendly_rtsp_error(
+            "Internal data stream error",
+            "rtspsrc.c:5678: connection reset, last response was 401 unauthorized",
+        );
+        assert!(msg.to_lowercase().contains("network"));
+        assert!(!msg.to_lowercase().contains("credentials"));
+    }
+
+    #[test]
+    fn no_route_to_host_recognized() {
+        let msg = friendly_rtsp_error("Could not write to resource", "no route to host");
+        assert!(msg.to_lowercase().contains("network"));
+    }
+
+    #[test]
+    fn broken_pipe_recognized() {
+        let msg = friendly_rtsp_error("Stream error", "broken pipe");
+        assert!(msg.to_lowercase().contains("network"));
     }
 }

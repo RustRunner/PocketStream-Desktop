@@ -138,7 +138,10 @@ export async function loadDeviceCache() {
  * attempt routinely fails for devices that are perfectly reachable a
  * second later.
  */
-const VERIFY_MAX_ATTEMPTS = 2;
+// Three attempts handles devices (notably the FLIR PTU) that need an
+// extra moment to respond to TCP probes on a freshly bound secondary
+// IP. Worst case before flagging offline: ~5s (1.5s + 3s + ~1s scans).
+const VERIFY_MAX_ATTEMPTS = 3;
 const VERIFY_RETRY_DELAY_MS = 1500;
 
 async function fastVerifyCachedDevice(ip, attempt = 0) {

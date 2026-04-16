@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicegui/tauri/dev/crates/tauri-config-schema/schema.json",
   "productName": "PocketStream Desktop",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "identifier": "com.pocketstream.desktop",
   "build": {
     "frontendDist": "../dist",
