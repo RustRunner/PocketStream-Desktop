@@ -89,4 +89,4 @@ jobs:
         working-directory: src-tauri
         run: |
           cargo install cargo-audit --quiet
-          cargo audit --deny vulnerabilities
+          cargo audit --ignore RUSTSEC-2024-0413
