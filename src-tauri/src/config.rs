@@ -578,15 +578,18 @@ mod tests {
     // ── Key Management ──────────────────────────────────────────────
 
     #[test]
+    #[cfg_attr(not(target_os = "windows"), ignore)]
     fn get_or_create_key_returns_32_bytes() {
-        // This test uses the real config dir — idempotent since it
-        // only creates the key if it doesn't already exist.
+        // Uses the real config dir (%APPDATA%/PocketStream/.key).
+        // Skipped on Linux CI where the dir doesn't exist.
         let key = get_or_create_key().unwrap();
         assert_eq!(key.len(), 32);
     }
 
     #[test]
+    #[cfg_attr(not(target_os = "windows"), ignore)]
     fn get_or_create_key_is_stable() {
+        // Uses the real config dir. Skipped on Linux CI.
         let k1 = get_or_create_key().unwrap();
         let k2 = get_or_create_key().unwrap();
         assert_eq!(k1, k2, "Same key should be returned on subsequent calls");
