@@ -35,10 +35,12 @@ jobs:
       # Windows-specific code (#[cfg(windows)]) is skipped by the
       # compiler on Linux; full Windows testing is done locally via
       # scripts/check.ps1 before pushing.
-      - name: Install GStreamer dev libs
+      - name: Install system dev libs (GStreamer + Tauri/GTK)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstrtspserver-1.0-dev
+          sudo apt-get install -y -qq \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstrtspserver-1.0-dev \
+            libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
       - uses: Swatinem/rust-cache@v2
         with:
