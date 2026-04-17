@@ -24,6 +24,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   setupCacheDialog();
   setupCameraIpDropdown();
   setupRefreshButton();
+  setupResetAdapterButton();
   setupPtzControls();
   setupVideoResize();
 
@@ -333,6 +334,59 @@ function setupRefreshButton() {
       await loadExistingArpState();
     } catch (e) {
       showToast("Refresh failed: " + e, true);
+    } finally {
+      btn.disabled = false;
+      btn.classList.remove("spinning");
+    }
+  });
+}
+
+// ── Reset Adapter Button ────────────────────────────────────────────
+// Forces Windows to re-probe NIC driver state via Restart-NetAdapter.
+// This is the programmatic equivalent of opening adapter Properties,
+// which is the known workaround for a Windows quirk where a plugged-in
+// Ethernet adapter stays marked "Disconnected" until the driver state
+// is forcibly refreshed. Triggers a UAC prompt when the app isn't
+// already elevated.
+
+function setupResetAdapterButton() {
+  $("#btn-reset-adapter").addEventListener("click", async () => {
+    const btn = $("#btn-reset-adapter");
+    const iface = state.activeInterface;
+
+    if (!iface || !iface.name) {
+      showToast(
+        "No Ethernet adapter to reset — plug one in and try again",
+        true
+      );
+      return;
+    }
+
+    if (!confirm(
+      `Reset "${iface.display_name || iface.name}"?\n\n` +
+      `This briefly drops the network connection and may trigger a ` +
+      `UAC prompt. Use this when the adapter seems stuck.`
+    )) {
+      return;
+    }
+
+    const name = iface.name;
+    btn.disabled = true;
+    btn.classList.add("spinning");
+
+    try {
+      await api.refreshAdapter(name, "hard");
+      showToast("Adapter reset");
+      // Give the driver a moment to come back, then re-enumerate.
+      // The event-driven watcher will also fire, but refreshing here
+      // makes the UI snap back faster on success.
+      await new Promise((r) => setTimeout(r, 1500));
+      await refreshInterfaces();
+      if (state.activeInterface) {
+        api.startArpDiscovery(state.activeInterface.name).catch(() => {});
+      }
+    } catch (e) {
+      showToast("Reset failed: " + e, true);
     } finally {
       btn.disabled = false;
       btn.classList.remove("spinning");

@@ -141,6 +141,21 @@ pub async fn remove_secondary_ip(name: String, ip: String) -> Result<(), AppErro
     crate::network::ip_config::remove_secondary_ip(&name, &ip).await
 }
 
+#[tauri::command]
+pub async fn refresh_adapter(name: String, mode: String) -> Result<(), AppError> {
+    let mode = match mode.as_str() {
+        "soft" => crate::network::adapter_refresh::RefreshMode::Soft,
+        "hard" => crate::network::adapter_refresh::RefreshMode::Hard,
+        other => {
+            return Err(AppError::Network(format!(
+                "Invalid refresh mode '{}' (expected 'soft' or 'hard')",
+                other
+            )))
+        }
+    };
+    crate::network::adapter_refresh::refresh_adapter(&name, mode).await
+}
+
 // ── ARP Discovery Commands ───────────────────────────────────────────
 
 #[tauri::command]

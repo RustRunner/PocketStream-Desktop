@@ -1,9 +1,11 @@
+pub mod adapter_refresh;
 pub mod arp;
 pub mod auto_adopt;
 pub mod firewall;
 pub mod interface;
 pub mod ip_config;
 pub mod scanner;
+pub mod watcher;
 
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;

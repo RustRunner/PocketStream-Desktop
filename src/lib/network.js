@@ -11,13 +11,8 @@ import { resetDiscoveryStatus } from "./devices.js";
 export async function refreshInterfaces() {
   try {
     const interfaces = await api.listInterfaces();
-    if (!interfaces || interfaces.length === 0) {
-      $("#iface-name").textContent = "None found";
-      return;
-    }
-
-    const eth =
-      interfaces.find((i) => i.is_up && i.is_ethernet && i.ips.length > 0);
+    const ethList = (interfaces || []).filter((i) => i.is_ethernet);
+    const eth = ethList.find((i) => i.is_up && i.ips.length > 0);
 
     if (eth) {
       state.activeInterface = eth;
@@ -28,13 +23,44 @@ export async function refreshInterfaces() {
       // flows, where wiping the dropdown would lose any populated
       // node entries until the next render.
       updateCameraIpDropdown(state.lastSubnetResults || null);
+      // Recovery — reset the dedup so the next failure toasts again.
+      lastAdapterWarningAt = 0;
+    } else if (ethList.length > 0) {
+      // Adapter is known to Windows but has no IP. Treat this the same
+      // as "no ethernet detected" from the user's perspective — the
+      // actionable state is identical (click Reset adapter).
+      const stale = ethList[0];
+      state.activeInterface = stale;
+      $("#iface-name").textContent =
+        (stale.display_name || stale.name) + " (Disconnected)";
+      renderSubnetList();
+      warnNoEthernet();
     } else {
+      state.activeInterface = null;
       $("#iface-name").textContent = "None found";
+      warnNoEthernet();
     }
   } catch (e) {
     console.error("Failed to list interfaces:", e);
     $("#iface-name").textContent = "Error";
+    warnNoEthernet();
   }
+}
+
+// ── No-Ethernet toast dedup ─────────────────────────────────────────
+// refreshInterfaces can fire rapidly (startup + manual refresh + watcher
+// events arriving during a disconnect), so rate-limit the toast to at
+// most once per window. Reset to 0 on a successful enumeration so the
+// next failure re-toasts.
+
+const NO_ETHERNET_COOLDOWN_MS = 15000;
+let lastAdapterWarningAt = 0;
+
+function warnNoEthernet() {
+  const now = Date.now();
+  if (now - lastAdapterWarningAt < NO_ETHERNET_COOLDOWN_MS) return;
+  lastAdapterWarningAt = now;
+  showToast("No Ethernet detected — use Reset adapter to retry", true);
 }
 
 // ── Interface status watcher ────────────────────────────────────────
@@ -44,6 +70,25 @@ export async function refreshInterfaces() {
 export function setupInterfaceWatcher() {
   api.onEvent("interface-status-changed", (iface) => {
     const wasDown = !state.activeInterface || state.activeInterface.ips.length === 0;
+
+    // Sentinel from the backend watcher: no ethernet adapter present at all.
+    //
+    // Deliberately does NOT raise the banner here — a mid-session unplug
+    // during active use is noise, not a call to action. Banner is reserved
+    // for explicit enumeration (startup + manual refresh), where the user
+    // is actively trying to get discovery running. Stream-break UX lives
+    // separately in streaming.js::showStreamLost.
+    if (!iface.name) {
+      state.activeInterface = null;
+      $("#iface-name").textContent = "None found";
+      arpDevices.clear();
+      tcpScanResults.clear();
+      $("#device-list").innerHTML = "";
+      renderSubnetList();
+      updateCameraIpDropdown(null);
+      return;
+    }
+
     state.activeInterface = iface;
 
     if (!iface.is_up || iface.ips.length === 0) {
@@ -60,6 +105,8 @@ export function setupInterfaceWatcher() {
     } else {
       // ── Connected (or reconnected) ───────────────────────────────
       $("#iface-name").textContent = iface.display_name || iface.name;
+      // Recovery — reset the toast dedup so a future failure re-toasts.
+      lastAdapterWarningAt = 0;
 
       // Refresh the subnet list since adopted IPs may have appeared
       // (load_adopted_from_config completing during cold start triggers

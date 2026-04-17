@@ -78,6 +78,16 @@ export async function removeSecondaryIp(name, ip) {
   return await invoke("remove_secondary_ip", { name, ip });
 }
 
+/**
+ * Reset an adapter to force Windows to re-probe the driver state.
+ * @param {string} name - Interface name (e.g. "Ethernet")
+ * @param {"soft"|"hard"} mode - "soft" uses ipconfig /release /renew (no admin);
+ *   "hard" uses Restart-NetAdapter (triggers UAC if not already elevated).
+ */
+export async function refreshAdapter(name, mode) {
+  return await invoke("refresh_adapter", { name, mode });
+}
+
 // ── ARP Discovery ───────────────────────────────────────────────────
 
 export async function startArpDiscovery(iface) {

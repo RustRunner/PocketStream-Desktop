@@ -106,6 +106,7 @@ fn parse_adapter(a: &serde_json::Value, is_vpn: bool) -> InterfaceInfo {
     let name = a["Name"].as_str().unwrap_or("").to_string();
     let mac = a["MacAddress"].as_str().unwrap_or("").replace('-', ":");
     let media = a["MediaType"].as_str().unwrap_or("");
+    let status = a["Status"].as_str().unwrap_or("");
 
     let ip_entries = if a["IPs"].is_array() {
         a["IPs"].as_array().unwrap().clone()
@@ -132,13 +133,17 @@ fn parse_adapter(a: &serde_json::Value, is_vpn: bool) -> InterfaceInfo {
 
     let is_ethernet = media.contains("802.3");
     let is_wifi = media.contains("802.11") || media.contains("Native 802.11");
+    // Windows reports 'Up' for fully operational adapters. Anything else
+    // (Disconnected, Disabled, NotPresent) is treated as down so the UI
+    // can surface a reset action without hiding the adapter entirely.
+    let is_up = status.eq_ignore_ascii_case("Up");
 
     InterfaceInfo {
         display_name: name.clone(),
         name,
         ips,
         mac,
-        is_up: true,
+        is_up,
         is_ethernet,
         is_wifi,
         is_vpn,
@@ -147,8 +152,13 @@ fn parse_adapter(a: &serde_json::Value, is_vpn: bool) -> InterfaceInfo {
 
 #[cfg(target_os = "windows")]
 fn run_adapter_query(filter: &str) -> Result<String, AppError> {
+    // Include both Up and Disconnected adapters. Disconnected adapters are
+    // surfaced in the UI as "detected but no link" so users can click
+    // Reset to provoke a driver re-probe — the workaround for the Windows
+    // quirk where the adapter stays marked disconnected after plug-in
+    // until someone opens its Properties dialog.
     let script = format!(
-        r#"Get-NetAdapter | Where-Object {{ $_.Status -eq 'Up' -and {} }} | ForEach-Object {{
+        r#"Get-NetAdapter | Where-Object {{ ($_.Status -eq 'Up' -or $_.Status -eq 'Disconnected') -and {} }} | ForEach-Object {{
             $adapter = $_
             $ips = @(Get-NetIPAddress -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue)
             [PSCustomObject]@{{
@@ -156,6 +166,7 @@ fn run_adapter_query(filter: &str) -> Result<String, AppError> {
                 Description = $adapter.InterfaceDescription
                 MacAddress = $adapter.MacAddress
                 MediaType = $adapter.MediaType
+                Status = $adapter.Status
                 Virtual = $adapter.Virtual
                 IPs = @($ips | ForEach-Object {{
                     [PSCustomObject]@{{
@@ -387,6 +398,7 @@ mod tests {
                 "Description": "Intel(R) I210 Gigabit Ethernet",
                 "MacAddress": "AA-BB-CC-DD-EE-FF",
                 "MediaType": "802.3",
+                "Status": "Up",
                 "IPs": [{"Address": "192.168.1.100", "PrefixLength": 24}]
             }"#,
             )
@@ -404,6 +416,25 @@ mod tests {
         }
 
         #[test]
+        fn parse_adapter_disconnected() {
+            let json: serde_json::Value = serde_json::from_str(
+                r#"{
+                "Name": "Ethernet",
+                "Description": "Realtek PCIe GbE",
+                "MacAddress": "11-22-33-44-55-66",
+                "MediaType": "802.3",
+                "Status": "Disconnected",
+                "IPs": []
+            }"#,
+            )
+            .unwrap();
+            let iface = parse_adapter(&json, false);
+            assert!(iface.is_ethernet);
+            assert!(!iface.is_up, "Disconnected adapter must report is_up=false");
+            assert!(iface.ips.is_empty());
+        }
+
+        #[test]
         fn parse_adapter_vpn() {
             let json: serde_json::Value = serde_json::from_str(
                 r#"{
@@ -411,6 +442,7 @@ mod tests {
                 "Description": "Tailscale Tunnel",
                 "MacAddress": "",
                 "MediaType": "",
+                "Status": "Up",
                 "IPs": []
             }"#,
             )

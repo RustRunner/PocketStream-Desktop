@@ -418,6 +418,7 @@ pub fn run() {
             commands::set_static_ip,
             commands::add_secondary_ip,
             commands::remove_secondary_ip,
+            commands::refresh_adapter,
             commands::get_interface_info,
             // ARP Discovery
             commands::start_arp_discovery,
@@ -450,6 +451,14 @@ pub fn run() {
         ])
         .setup(|app| {
             let handle = app.handle().clone();
+
+            // Start event-driven NIC watcher (Windows NotifyIpInterfaceChange +
+            // NotifyUnicastIpAddressChange). If it fails to register — or on
+            // non-Windows platforms — fall back to the legacy per-MAC pnet
+            // poller below. Successful registration makes the polling watcher
+            // redundant and we skip spawning it to avoid duplicate events.
+            let event_watcher_ok = network::watcher::start(handle.clone());
+
             // Load adopted subnets from config, then auto-start ARP discovery
             tauri::async_runtime::spawn(async move {
                 let config: tauri::State<'_, config::AppConfig> = handle.state();
@@ -478,12 +487,17 @@ pub fn run() {
 
                             // Start lightweight interface watcher (pnet-based,
                             // no network traffic — just reads OS adapter state).
-                            let mac = iface.mac.clone();
-                            let display = iface.display_name.clone();
-                            let wh = handle.clone();
-                            tokio::spawn(async move {
-                                watch_interface(mac, display, wh).await;
-                            });
+                            // Skipped when the event-driven watcher is active,
+                            // since both would emit `interface-status-changed`
+                            // and cause duplicate UI updates.
+                            if !event_watcher_ok {
+                                let mac = iface.mac.clone();
+                                let display = iface.display_name.clone();
+                                let wh = handle.clone();
+                                tokio::spawn(async move {
+                                    watch_interface(mac, display, wh).await;
+                                });
+                            }
                         } else {
                             log::info!("No active Ethernet interface found for ARP discovery");
                         }
