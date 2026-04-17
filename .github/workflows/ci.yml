@@ -40,7 +40,8 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstrtspserver-1.0-dev \
-            libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+            libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+            libpcap-dev
 
       # Tauri's generate_context!() macro requires the frontend dist
       # directory to exist, and tauri-build validates bundle resource
