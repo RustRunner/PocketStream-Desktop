@@ -83,10 +83,10 @@ jobs:
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          working-directory: src-tauri
+      - name: cargo audit
+        working-directory: src-tauri
+        run: |
+          cargo install cargo-audit --quiet
+          cargo audit --deny vulnerabilities
