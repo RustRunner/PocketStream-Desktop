@@ -42,9 +42,18 @@ jobs:
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstrtspserver-1.0-dev \
             libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
-      # Tauri's build script validates bundle resource globs even during
-      # cargo test. These directories only exist on Windows (populated
-      # by scripts/bundle-gstreamer.ps1), so create empty placeholders.
+      # Tauri's generate_context!() macro requires the frontend dist
+      # directory to exist, and tauri-build validates bundle resource
+      # globs. Create all required paths that only exist after a full
+      # build on Windows.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+
       - name: Create resource placeholders
         run: |
           mkdir -p src-tauri/resources/gstreamer/bin
