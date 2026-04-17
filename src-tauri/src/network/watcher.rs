@@ -128,7 +128,12 @@ mod imp {
         });
 
         log::info!("Event-driven NIC watcher active (NotifyIpInterfaceChange + NotifyUnicastIpAddressChange)");
-        tokio::spawn(debounce_loop(rx, handle));
+        // MUST use tauri::async_runtime::spawn, not tokio::spawn.
+        // This function is called synchronously from Tauri's setup closure,
+        // which runs outside any tokio runtime context — a bare tokio::spawn
+        // panics with "there is no reactor running", killing the process
+        // silently on a Windows GUI app (no stderr to see the panic).
+        tauri::async_runtime::spawn(debounce_loop(rx, handle));
         true
     }
 
