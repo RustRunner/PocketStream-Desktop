@@ -22,8 +22,8 @@ jobs:
       - run: npm run build
 
   rust:
-    name: Rust Tests (Windows)
-    runs-on: windows-latest
+    name: Rust Checks (Linux)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -31,32 +31,14 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      # GStreamer MSVC runtime is required to link the gstreamer-rs crates.
-      # Cache the install dir between runs — fresh install takes ~5 min,
-      # cache restore takes <30 s.
-      - name: Cache GStreamer install
-        id: gst-cache
-        uses: actions/cache@v4
-        with:
-          path: C:\gstreamer
-          key: gstreamer-msvc-1.24.10-v1
-
-      - name: Install GStreamer (MSVC x86_64)
-        if: steps.gst-cache.outputs.cache-hit != 'true'
-        shell: pwsh
+      # GStreamer dev libs via apt — fast, no bot-protection issues.
+      # Windows-specific code (#[cfg(windows)]) is skipped by the
+      # compiler on Linux; full Windows testing is done locally via
+      # scripts/check.ps1 before pushing.
+      - name: Install GStreamer dev libs
         run: |
-          $url = "https://gstreamer.freedesktop.org/data/pkg/windows/1.24.10/msvc/gstreamer-1.0-msvc-x86_64-1.24.10.msi"
-          $devUrl = "https://gstreamer.freedesktop.org/data/pkg/windows/1.24.10/msvc/gstreamer-1.0-devel-msvc-x86_64-1.24.10.msi"
-          Invoke-WebRequest -Uri $url -OutFile gst-runtime.msi
-          Invoke-WebRequest -Uri $devUrl -OutFile gst-devel.msi
-          Start-Process msiexec.exe -ArgumentList '/i','gst-runtime.msi','/quiet','ADDLOCAL=ALL' -Wait
-          Start-Process msiexec.exe -ArgumentList '/i','gst-devel.msi','/quiet','ADDLOCAL=ALL' -Wait
-
-      - name: Set GStreamer environment
-        shell: pwsh
-        run: |
-          "GSTREAMER_1_0_ROOT_MSVC_X86_64=C:\gstreamer\1.0\msvc_x86_64\" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "C:\gstreamer\1.0\msvc_x86_64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstrtspserver-1.0-dev
 
       - uses: Swatinem/rust-cache@v2
         with:
