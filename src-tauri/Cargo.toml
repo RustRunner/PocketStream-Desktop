@@ -1,6 +1,6 @@
 [package]
 name = "pocketstream-desktop"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "PocketStream for Desktop — IP Camera Monitoring & Relay Station"
 license = "GPL-3.0"
