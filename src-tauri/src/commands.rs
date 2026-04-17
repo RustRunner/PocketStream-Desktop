@@ -303,9 +303,9 @@ pub async fn create_video_window(
     #[cfg(not(windows))]
     {
         let _ = (stream, x, y, width, height);
-        return Err(AppError::Stream(
+        Err(AppError::Stream(
             "Video embedding only supported on Windows".into(),
-        ));
+        ))
     }
 }
 

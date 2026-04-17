@@ -92,6 +92,7 @@ async fn assign_windows(
 }
 
 /// Convert a CIDR prefix length to a dotted subnet mask.
+#[cfg(target_os = "windows")]
 fn prefix_to_mask(prefix: u8) -> String {
     let bits: u32 = if prefix >= 32 {
         0xFFFFFFFF

@@ -188,8 +188,12 @@ pub fn destroy_video_child(child_hwnd: isize) {
 }
 
 // ── Non-Windows stubs ──────────────────────────────────────────────
+// These are called from commands.rs behind #[cfg(not(windows))] blocks.
+// On Linux they appear "unused" to clippy because the Windows-only
+// callers are stripped, but they must exist for cross-platform compilation.
 
 #[cfg(not(windows))]
+#[allow(dead_code)]
 pub fn create_video_child(
     _p: isize,
     _x: i32,

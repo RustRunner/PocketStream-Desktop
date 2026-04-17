@@ -216,13 +216,13 @@ fn list_all_pnet() -> Result<Vec<InterfaceInfo>, AppError> {
                 .ips
                 .iter()
                 .filter(|ip| ip.is_ipv4())
-                .filter_map(|ip| {
-                    let network: ipnetwork::IpNetwork = (*ip).into();
-                    Some(IpInfo {
+                .map(|ip| {
+                    let network = *ip;
+                    IpInfo {
                         address: ip.ip().to_string(),
                         prefix: network.prefix(),
                         subnet: format!("{}/{}", network.network(), network.prefix()),
-                    })
+                    }
                 })
                 .collect();
 

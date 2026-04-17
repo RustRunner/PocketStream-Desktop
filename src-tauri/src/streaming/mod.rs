@@ -378,6 +378,7 @@ impl StreamManager {
         Ok(path)
     }
 
+    #[allow(dead_code)] // called from commands.rs behind #[cfg(windows)]
     pub fn set_video_child_hwnd(&self, hwnd: isize) {
         self.video_hwnd
             .store(hwnd, std::sync::atomic::Ordering::Relaxed);
