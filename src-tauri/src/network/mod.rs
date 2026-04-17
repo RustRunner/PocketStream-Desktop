@@ -25,6 +25,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Create a `std::process::Command` that won't flash a console window.
 pub(crate) fn cmd(program: &str) -> std::process::Command {
+    #[allow(unused_mut)] // mut needed only on Windows for creation_flags()
     let mut c = std::process::Command::new(program);
     #[cfg(windows)]
     {

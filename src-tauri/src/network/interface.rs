@@ -1,4 +1,5 @@
 use serde::Serialize;
+#[cfg(target_os = "windows")]
 use std::net::IpAddr;
 
 use crate::error::AppError;

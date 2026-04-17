@@ -6,6 +6,7 @@
 
 use crate::error::AppError;
 
+#[cfg(target_os = "windows")]
 const RULE_NAME: &str = "PocketStream RTSP Server";
 
 /// Ensure the RTSP server port is allowed through Windows Firewall.
