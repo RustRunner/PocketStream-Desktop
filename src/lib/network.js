@@ -4,7 +4,7 @@
 
 import * as api from "./tauri-api.js";
 import { $, $$, state, adoptedSubnets, nodeAliases, arpDevices, tcpScanResults, showToast } from "./state.js";
-import { resetDiscoveryStatus } from "./devices.js";
+import { resetDiscoveryStatus, hideDiscoveryStatus } from "./devices.js";
 
 // ── Interface discovery ─────────────────────────────────────────────
 
@@ -12,7 +12,14 @@ export async function refreshInterfaces() {
   try {
     const interfaces = await api.listInterfaces();
     const ethList = (interfaces || []).filter((i) => i.is_ethernet);
-    const eth = ethList.find((i) => i.is_up && i.ips.length > 0);
+    // Pick the first truly-connected adapter. "Connected" means link up AND
+    // at least one real IPv4 — APIPA (169.254.x.x) addresses don't count,
+    // since Windows assigns them when no real network is reachable.
+    const eth = ethList.find(
+      (i) =>
+        i.is_up &&
+        i.ips.some((ip) => !ip.address.startsWith("169.254."))
+    );
 
     if (eth) {
       state.activeInterface = eth;
@@ -56,11 +63,24 @@ export async function refreshInterfaces() {
 const NO_ETHERNET_COOLDOWN_MS = 15000;
 let lastAdapterWarningAt = 0;
 
-function warnNoEthernet() {
+export function warnNoEthernet() {
   const now = Date.now();
   if (now - lastAdapterWarningAt < NO_ETHERNET_COOLDOWN_MS) return;
   lastAdapterWarningAt = now;
-  showToast("No Ethernet detected — use Reset adapter to retry", true);
+  showToast(
+    "No Ethernet detected — check Ethernet connection and/or reset Ethernet adapter",
+    true
+  );
+}
+
+/** True when an Ethernet adapter is present, link is up, AND it has at
+ *  least one non-APIPA IPv4 address. Windows assigns 169.254.x.x (APIPA)
+ *  when the cable is unplugged or DHCP fails — those IPs satisfy a naive
+ *  "has any IP" check but don't represent a real connection. */
+export function isInterfaceConnected() {
+  if (!state.activeInterface) return false;
+  if (!state.activeInterface.is_up) return false;
+  return state.activeInterface.ips.some((ip) => !ip.address.startsWith("169.254."));
 }
 
 // ── Interface status watcher ────────────────────────────────────────
@@ -69,7 +89,11 @@ function warnNoEthernet() {
 
 export function setupInterfaceWatcher() {
   api.onEvent("interface-status-changed", (iface) => {
-    const wasDown = !state.activeInterface || state.activeInterface.ips.length === 0;
+    // Capture the prior connection state BEFORE overwriting activeInterface
+    // below. isInterfaceConnected() is our single source of truth — it also
+    // treats APIPA-only state as "down" so the reconnect branch will fire
+    // when a real IP is actually bound.
+    const wasDown = !isInterfaceConnected();
 
     // Sentinel from the backend watcher: no ethernet adapter present at all.
     //
@@ -86,13 +110,15 @@ export function setupInterfaceWatcher() {
       $("#device-list").innerHTML = "";
       renderSubnetList();
       updateCameraIpDropdown(null);
+      hideDiscoveryStatus();
       return;
     }
 
     state.activeInterface = iface;
 
-    if (!iface.is_up || iface.ips.length === 0) {
-      // ── Disconnected ─────────────────────────────────────────────
+    const hasRealIp = iface.ips.some((ip) => !ip.address.startsWith("169.254."));
+    if (!iface.is_up || !hasRealIp) {
+      // ── Disconnected (includes APIPA-only state) ─────────────────
       $("#iface-name").textContent =
         (iface.display_name || iface.name) + " (Disconnected)";
 
@@ -102,6 +128,8 @@ export function setupInterfaceWatcher() {
       $("#device-list").innerHTML = "";
       renderSubnetList();
       updateCameraIpDropdown(null);
+      // Hide the Nodes-card spinner — no link means no discovery to wait on.
+      hideDiscoveryStatus();
     } else {
       // ── Connected (or reconnected) ───────────────────────────────
       $("#iface-name").textContent = iface.display_name || iface.name;

@@ -32,10 +32,18 @@ impl ArpListenerHandle {
 ///
 /// `ethernet_ips` — IPv4 addresses assigned to the target Ethernet adapter.
 /// Used to match the correct pcap capture device (avoids picking WiFi).
+///
+/// `own_mac` — the target adapter's own MAC. ARP packets with this as the
+/// sender MAC are skipped, otherwise the gratuitous ARP we emit whenever
+/// we add a secondary IP gets captured and inserted into `devices` as if
+/// it were a peer. That phantom entry then gets port-scanned against our
+/// own IP, hits any local service listening on 0.0.0.0, and ends up in
+/// the persistent device cache as a ghost "node".
 pub fn start_listener(
     devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
     app_handle: tauri::AppHandle,
     ethernet_ips: Vec<Ipv4Addr>,
+    own_mac: Option<[u8; 6]>,
 ) -> Result<ArpListenerHandle, AppError> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -117,6 +125,12 @@ pub fn start_listener(
                     if let Some((ip, mac)) = parse_arp_packet(packet.data) {
                         if ip == Ipv4Addr::new(0, 0, 0, 0) {
                             continue;
+                        }
+                        // Skip our own announcements — see note on `own_mac`.
+                        if let Some(own) = own_mac {
+                            if mac == own {
+                                continue;
+                            }
                         }
 
                         let ip_str = ip.to_string();

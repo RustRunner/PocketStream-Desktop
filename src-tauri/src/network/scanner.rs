@@ -25,7 +25,7 @@ const PROBE_PORTS: &[u16] = &[
     8899, // Common camera port
 ];
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CONCURRENT: usize = 64;
 
 /// Scan a subnet (e.g. "192.168.1.0/24") for reachable hosts.

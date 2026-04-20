@@ -1176,6 +1176,15 @@
   gap: 4px;
 }
 
+.subnet-row-just-adopted {
+  animation: subnet-flash 2.5s ease-out;
+}
+
+@keyframes subnet-flash {
+  0%   { background-color: rgba(61, 220, 132, 0.35); }
+  100% { background-color: transparent; }
+}
+
 .auto-ip-group {
   margin-left: auto;
   display: flex;

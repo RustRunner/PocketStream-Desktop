@@ -3,7 +3,7 @@
  */
 
 import * as api from "./tauri-api.js";
-import { $, log, showToast } from "./state.js";
+import { $, state, log, showToast } from "./state.js";
 
 // ── Local PTU state ─────────────────────────────────────────────────
 
@@ -167,6 +167,153 @@ export function setupPtzControls() {
     });
   });
 
-  // TODO: Wire zoom slider to camera CGI zoom API
-  // Needs reverse-engineering of Sony EV-7520 web interface commands
+  setupZoomSlider();
+}
+
+// ── Zoom slider (EV-7520 via Nexus control.cgi) ─────────────────────
+// Absolute-position control: slider value 0–100 maps to the camera's raw
+// 0..ZOOM_MAX range. No spring-back — the slider reflects the current
+// zoom level, like the camera's own web UI.
+
+const ZOOM_MAX = 31424;
+
+function getCameraIp() {
+  return $("#camera-ip").value || null;
+}
+
+let zoomErrorToasted = false;
+
+async function sendZoomPosition(percent) {
+  const ip = getCameraIp();
+  if (!ip) {
+    if (!zoomErrorToasted) {
+      showToast("Select a CAM IP to use zoom", true);
+      zoomErrorToasted = true;
+    }
+    return;
+  }
+  const position = Math.round((percent / 100) * ZOOM_MAX);
+  log(`Zoom: ${percent}% (${position}) ip=${ip}`);
+  try {
+    await api.controlCgiZoomDirect(ip, position);
+    zoomErrorToasted = false;
+  } catch (e) {
+    log(`Zoom failed: ${e}`);
+    if (!zoomErrorToasted) {
+      showToast(`Zoom failed: ${e}`, true);
+      zoomErrorToasted = true;
+    }
+  }
+}
+
+function setupZoomSlider() {
+  const slider = $("#zoom-slider");
+  if (!slider) return;
+
+  // Existing HTML was wired for speed control (min=-100, max=100). For
+  // position control we want 0..100 representing Wide..Telephoto. Step=2
+  // halves the input-event rate during drag vs step=1, which means far
+  // fewer HTTP requests reach the camera's single-threaded handler.
+  slider.min = "0";
+  slider.max = "100";
+  slider.step = "2";
+  slider.value = "0";
+
+  // Serialize requests: exactly one in flight; coalesce rapid drag
+  // updates into a single "latest value" slot. Larger slider step + this
+  // serialization is enough to keep the camera happy; the cooldown can
+  // stay small since the retry in the backend absorbs any leftover
+  // transients.
+  const MIN_GAP_MS = 100;
+  let inFlight = false;
+  let queuedPercent = null;
+  let lastSentPercent = null;
+
+  async function drain() {
+    while (queuedPercent !== null) {
+      const target = queuedPercent;
+      queuedPercent = null;
+      if (target === lastSentPercent) continue;
+      lastSentPercent = target;
+      await sendZoomPosition(target);
+      if (queuedPercent !== null) {
+        await new Promise((r) => setTimeout(r, MIN_GAP_MS));
+      }
+    }
+    inFlight = false;
+  }
+
+  function request(percent) {
+    queuedPercent = percent;
+    if (inFlight) return;
+    inFlight = true;
+    drain();
+  }
+
+  slider.addEventListener("input", (e) => {
+    request(parseInt(e.target.value, 10));
+  });
+
+  // ── Position persistence ──────────────────────────────────────────
+  // The camera firmware doesn't expose a zoom-query endpoint, so we
+  // can't pull the live position on launch. Instead, persist the last
+  // slider percent per-IP and restore it on CAM selection. Accurate as
+  // long as we're the only controller; goes stale if someone also
+  // moves the camera via its own web UI.
+  async function persistCurrent(ip, percent) {
+    try {
+      await api.setZoomPosition(ip, percent);
+      if (state.config) {
+        state.config.zoom_positions = state.config.zoom_positions || {};
+        state.config.zoom_positions[ip] = percent;
+      }
+    } catch (e) {
+      log(`Save zoom position: ${e}`);
+    }
+  }
+
+  // Debounced save: write to config 500 ms after the user stops moving
+  // the slider. Keeps disk I/O minimal during a drag while still catching
+  // the final resting position.
+  let saveTimer = null;
+  slider.addEventListener("input", () => {
+    const ip = getCameraIp();
+    if (!ip) return;
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      saveTimer = null;
+      persistCurrent(ip, parseInt(slider.value, 10));
+    }, 500);
+  });
+
+  // Apply the persisted zoom for the currently-selected CAM IP:
+  // set the slider AND push the value to the camera so the slider
+  // becomes the source of truth if they've drifted apart. Skips when
+  // no IP is selected or no saved position exists.
+  function applySavedZoom() {
+    const ip = getCameraIp();
+    if (!ip) return;
+    const saved = state.config?.zoom_positions?.[ip];
+    if (typeof saved !== "number") return;
+    slider.value = String(saved);
+    // Don't pre-set lastSentPercent — we want request() below to fire
+    // so the camera catches up to the slider.
+    request(saved);
+  }
+
+  // Fires when the user picks a CAM from the dropdown.
+  $("#camera-ip").addEventListener("change", applySavedZoom);
+
+  // Programmatic dropdown population (via updateCameraIpDropdown) does
+  // NOT fire a change event, so we also poll briefly after startup for
+  // the dropdown+config to be ready, then apply once.
+  (async () => {
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 250));
+      if (state.config && getCameraIp()) {
+        applySavedZoom();
+        return;
+      }
+    }
+  })();
 }

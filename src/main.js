@@ -3,8 +3,8 @@
  */
 
 import * as api from "./lib/tauri-api.js";
-import { $, $$, state, showToast } from "./lib/state.js";
-import { refreshInterfaces, setupIpConfigDialog, setupCameraIpDropdown, setupInterfaceWatcher } from "./lib/network.js";
+import { $, $$, state, showToast, adoptedSubnets } from "./lib/state.js";
+import { refreshInterfaces, setupIpConfigDialog, setupCameraIpDropdown, setupInterfaceWatcher, isInterfaceConnected, warnNoEthernet } from "./lib/network.js";
 import { setupArpListeners, loadExistingArpState, setupAliasDialog, resetDiscoveryStatus } from "./lib/devices.js";
 import { setupCacheDialog } from "./lib/device-cache.js";
 import { setupStreamControls, setupRtspControls, setupVideoResize, getVideoAreaBounds } from "./lib/streaming.js";
@@ -29,6 +29,20 @@ document.addEventListener("DOMContentLoaded", async () => {
   setupVideoResize();
 
   await loadConfig();
+
+  // Preload adopted subnets before the first render so renderSubnetList
+  // can correctly badge "(auto)" on entries persisted from prior sessions.
+  // Without this, the first frame shows every IP as primary, and the
+  // badges only appear after loadExistingArpState() runs below.
+  try {
+    const subnets = await api.getAdoptedSubnets();
+    if (subnets) {
+      for (const [subnet, ip] of Object.entries(subnets)) {
+        adoptedSubnets.set(subnet, ip);
+      }
+    }
+  } catch (_) {}
+
   await refreshInterfaces();
 
   // Start listening for ARP events (backend auto-starts ARP discovery)
@@ -194,6 +208,7 @@ function setupSettingsSave() {
         password: $("#camera-pass").value,
       },
       adopted_subnets: state.config?.adopted_subnets || {},
+      zoom_positions: state.config?.zoom_positions || {},
     };
 
     try {
@@ -246,6 +261,14 @@ function setupMenuAndAbout() {
     e.stopPropagation();
     aboutPanel.classList.toggle("open");
   });
+
+  // Populate version from Tauri runtime so it can't drift from Cargo.toml.
+  (async () => {
+    try {
+      const v = await window.__TAURI__?.app?.getVersion?.();
+      if (v) $("#app-version").textContent = `PocketStream Desktop v${v}`;
+    } catch (_) {}
+  })();
 
   // Close about panel when clicking elsewhere
   document.addEventListener("click", (e) => {
@@ -306,13 +329,16 @@ function setupRefreshButton() {
 
     try {
       await refreshInterfaces();
-      // Start ARP discovery if an interface was found — handles the case
-      // where the app launched before the cable was connected.
-      if (state.activeInterface) {
+      // Only kick off discovery when the link is actually up. A stale
+      // disconnected adapter has no IPs and nothing to scan — running
+      // pcap/ARP against it is wasted effort.
+      if (isInterfaceConnected()) {
         await api.startArpDiscovery(state.activeInterface.name);
+        await loadExistingArpState();
+        showToast("Refreshed");
+      } else {
+        warnNoEthernet();
       }
-      await loadExistingArpState();
-      showToast("Refreshed");
     } catch (e) {
       showToast("Refresh failed: " + e, true);
     } finally {
@@ -327,10 +353,12 @@ function setupRefreshButton() {
     btn.classList.add("spinning");
 
     try {
-      resetDiscoveryStatus();
-      if (state.activeInterface) {
-        await api.startArpDiscovery(state.activeInterface.name);
+      if (!isInterfaceConnected()) {
+        warnNoEthernet();
+        return;
       }
+      resetDiscoveryStatus();
+      await api.startArpDiscovery(state.activeInterface.name);
       await loadExistingArpState();
     } catch (e) {
       showToast("Refresh failed: " + e, true);
@@ -362,11 +390,12 @@ function setupResetAdapterButton() {
       return;
     }
 
-    if (!confirm(
+    const ok = await confirm(
       `Reset "${iface.display_name || iface.name}"?\n\n` +
       `This briefly drops the network connection and may trigger a ` +
       `UAC prompt. Use this when the adapter seems stuck.`
-    )) {
+    );
+    if (!ok) {
       return;
     }
 
@@ -382,7 +411,7 @@ function setupResetAdapterButton() {
       // makes the UI snap back faster on success.
       await new Promise((r) => setTimeout(r, 1500));
       await refreshInterfaces();
-      if (state.activeInterface) {
+      if (isInterfaceConnected()) {
         api.startArpDiscovery(state.activeInterface.name).catch(() => {});
       }
     } catch (e) {

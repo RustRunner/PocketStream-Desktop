@@ -75,6 +75,12 @@ pub struct AppSettings {
     /// Loaded at startup to render the nodes panel before any network activity.
     #[serde(default)]
     pub device_cache: Vec<CachedDevice>,
+    /// Last zoom slider position (0–100 %) per camera IP.
+    /// Restored on launch so the slider doesn't reset to Wide when the
+    /// camera is still pointed at the last-set zoom. Stored as percent
+    /// rather than raw integer so different max ranges remain portable.
+    #[serde(default)]
+    pub zoom_positions: HashMap<String, i32>,
 }
 
 impl Default for AppSettings {
@@ -99,6 +105,7 @@ impl Default for AppSettings {
             },
             adopted_subnets: HashMap::new(),
             device_cache: Vec::new(),
+            zoom_positions: HashMap::new(),
         }
     }
 }
@@ -544,6 +551,7 @@ mod tests {
             },
             adopted_subnets: std::collections::HashMap::new(),
             device_cache: Vec::new(),
+            zoom_positions: std::collections::HashMap::new(),
         };
         let toml_str = toml::to_string_pretty(&settings).unwrap();
         let parsed: AppSettings = toml::from_str(&toml_str).unwrap();

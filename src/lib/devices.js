@@ -18,7 +18,7 @@ import {
   adoptedSubnets,
   tcpScanResults,
 } from "./state.js";
-import { renderSubnetList, updateCameraIpDropdown } from "./network.js";
+import { renderSubnetList, updateCameraIpDropdown, isInterfaceConnected } from "./network.js";
 import {
   loadDeviceCache,
   persistDeviceToCache,
@@ -118,6 +118,12 @@ function showDiscoveryStatus(label) {
   }
 }
 
+/** Hide the Nodes-card discovery spinner. Exported for the interface
+ *  watcher so it can cancel a stuck "IP Discovery..." on link-down. */
+export function hideDiscoveryStatus() {
+  showDiscoveryStatus(null);
+}
+
 export function resetDiscoveryStatus() {
   scannedIps.clear();
   if (settleTimer) clearTimeout(settleTimer);
@@ -128,14 +134,18 @@ export function resetDiscoveryStatus() {
 // ── ARP event listeners ─────────────────────────────────────────────
 
 export function setupArpListeners() {
-  if (state.activeInterface) {
+  // Only show the "IP Discovery..." spinner when the link is actually up.
+  // A stale disconnected adapter (state.activeInterface set, but ips=[])
+  // would otherwise leave the spinner running forever with no ARP traffic
+  // to ever satisfy it.
+  if (isInterfaceConnected()) {
     showDiscoveryStatus("IP Discovery...");
   } else {
     showDiscoveryStatus(null);
   }
 
   api.onEvent("arp-device-discovered", (device) => {
-    if (!state.activeInterface) return;
+    if (!isInterfaceConnected()) return;
     if (state.activeInterface.ips.some((ip) => ip.address === device.ip)) return;
 
     const isNew = !arpDevices.has(device.mac);
@@ -154,6 +164,15 @@ export function setupArpListeners() {
     log(`Subnet adopted: ${data.subnet} -> ${data.adopted_ip}`);
     adoptedSubnets.set(data.subnet, data.adopted_ip);
     renderSubnetList();
+    // Briefly flash the row so the user notices a live adoption. The
+    // class auto-clears after the CSS animation; the persistent "(auto)"
+    // badge stays put. No state to clean up because renderSubnetList
+    // rebuilds the row from scratch next render.
+    const row = $(`#subnet-list .subnet-row[data-subnet="${data.subnet}"]`);
+    if (row) {
+      row.classList.add("subnet-row-just-adopted");
+      setTimeout(() => row.classList.remove("subnet-row-just-adopted"), 2500);
+    }
     // Reset the settle timer — netsh needs time to activate the IP
     debounceScan();
   });
@@ -162,7 +181,7 @@ export function setupArpListeners() {
 }
 
 export async function loadExistingArpState() {
-  if (!state.activeInterface) {
+  if (!isInterfaceConnected()) {
     showDiscoveryStatus(null);
     return;
   }
@@ -260,12 +279,21 @@ async function scanDevicePorts(ip, attempt = 0) {
 export function renderArpDeviceList() {
   const list = $("#device-list");
 
+  const ownMac = state.activeInterface?.mac?.toLowerCase() || null;
+
   const bySubnet = new Map();
   for (const device of arpDevices.values()) {
     // Hide cached-only entries on subnets we don't currently route to —
     // they're stale ghosts from a different network. Stay in the cache
     // file so they reappear when the subnet is reachable again.
     if (cachedOnlyMacs.has(device.mac) && !hasRouteToSubnet(device.subnet)) {
+      continue;
+    }
+    // Hide entries whose MAC matches our own adapter. These are ghosts
+    // from a prior gratuitous ARP we captured when adding a secondary
+    // IP — the backend now filters these at capture time, but existing
+    // cache files can still contain them from older sessions.
+    if (ownMac && device.mac.toLowerCase() === ownMac) {
       continue;
     }
     if (!bySubnet.has(device.subnet)) {
@@ -275,7 +303,16 @@ export function renderArpDeviceList() {
   }
 
   if (bySubnet.size === 0 && pendingScans <= 0) {
-    list.innerHTML = '<p class="placeholder-text">No devices found.</p>';
+    // Distinguish "still discovering" from "finished with empty result".
+    // If the discovery spinner is up or a settle timer is pending, we're
+    // in the gap between reconnect and the first port-scan result — show
+    // a standby placeholder instead of a misleading "No devices found".
+    const discoveryActive =
+      settleTimer !== null ||
+      !$("#discovery-status")?.classList.contains("hidden");
+    list.innerHTML = discoveryActive
+      ? '<p class="placeholder-text">Standby…</p>'
+      : '<p class="placeholder-text">No devices found.</p>';
     updateCameraIpDropdown(null);
     return;
   }

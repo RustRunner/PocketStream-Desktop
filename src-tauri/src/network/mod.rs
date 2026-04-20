@@ -101,10 +101,17 @@ impl NetworkManager {
         };
 
         // Build the set of /24 subnets the adapter already covers natively.
-        // Any adopted entry on a native subnet is redundant.
+        // "Native" means: an IP on the adapter that is NOT the result of a
+        // previous adoption. Without this filter, Windows' registry-backed
+        // persistence of adopted secondary IPs makes every adopted subnet
+        // look native on the next launch, and the pruning loop below would
+        // wipe the config on every reboot — collapsing the primary/adopted
+        // distinction in the UI.
+        let adopted_ip_strs: HashSet<&String> = settings.adopted_subnets.values().collect();
         let native_subnets: HashSet<String> = iface
             .ips
             .iter()
+            .filter(|ip| !adopted_ip_strs.contains(&ip.address))
             .filter_map(|ip| ip.address.parse::<Ipv4Addr>().ok())
             .map(|ip| {
                 let o = ip.octets();
@@ -243,13 +250,16 @@ impl NetworkManager {
         let known_ips: Vec<String> = iface_info.ips.iter().map(|ip| ip.address.clone()).collect();
         let ethernet_ips: Vec<Ipv4Addr> =
             known_ips.iter().filter_map(|ip| ip.parse().ok()).collect();
+        let own_mac = parse_mac_bytes(&iface_info.mac);
         log::info!(
-            "Starting ARP discovery on '{}' (IPs: {:?})",
+            "Starting ARP discovery on '{}' (IPs: {:?}, mac: {})",
             interface_display_name,
-            known_ips
+            known_ips,
+            iface_info.mac
         );
 
-        let handle = arp::start_listener(devices.clone(), app_handle, ethernet_ips)?;
+        let handle =
+            arp::start_listener(devices.clone(), app_handle, ethernet_ips, own_mac)?;
         *self.arp_listener_handle.lock().await = Some(handle);
 
         // Ping sweep known subnets to provoke ARP traffic so pcap sees all devices,
@@ -272,6 +282,7 @@ impl NetworkManager {
         });
 
         // Auto-adopt handler for foreign subnets
+        let devices_for_adopt = devices.clone();
         let adopt_handle = tokio::spawn(async move {
             use tauri::Emitter;
             use tauri::Manager;
@@ -339,6 +350,50 @@ impl NetworkManager {
                             );
 
                             log::info!("Auto-adopted {} with IP {}", device.subnet, adopted_ip);
+
+                            // Kick active-discovery passes on the newly-adopted
+                            // /24. Without this, only the device that triggered
+                            // the adoption is in arpDevices — passive hosts on
+                            // the same subnet (cameras idle on their control
+                            // port, etc.) never ARP on their own and stay
+                            // invisible until the user manually refreshes.
+                            //
+                            // Multiple staggered passes cover three issues that
+                            // routinely break a single-shot sweep on Windows:
+                            //   1. The newly-bound secondary IP isn't fully
+                            //      usable for ~1–3s after netsh returns — the
+                            //      first ping via `-S adopted_ip` can silently
+                            //      fail during that window.
+                            //   2. If the /24 also overlaps WiFi, the route
+                            //      metric may settle unpredictably and later
+                            //      passes catch what an early pass missed.
+                            //   3. Devices behind a slow switch / PoE injector
+                            //      sometimes drop the first ARP broadcast.
+                            let sweep_ip = adopted_ip.to_string();
+                            let sweep_devices = devices_for_adopt.clone();
+                            let sweep_handle = app_handle_for_adopt.clone();
+                            tokio::spawn(async move {
+                                let passes: [u64; 3] = [1500, 5000, 12000];
+                                for (i, delay_ms) in passes.iter().enumerate() {
+                                    tokio::time::sleep(
+                                        std::time::Duration::from_millis(*delay_ms),
+                                    )
+                                    .await;
+                                    log::info!(
+                                        "Post-adoption sweep pass {}/{} on {}",
+                                        i + 1,
+                                        passes.len(),
+                                        sweep_ip
+                                    );
+                                    ping_sweep_subnets(std::slice::from_ref(&sweep_ip)).await;
+                                    merge_arp_table(
+                                        sweep_devices.clone(),
+                                        sweep_handle.clone(),
+                                        &sweep_ip,
+                                    )
+                                    .await;
+                                }
+                            });
 
                             // Persist to config so the adoption survives a
                             // restart. Failure here is non-fatal (the IP is
@@ -518,6 +573,21 @@ impl NetworkManager {
     }
 }
 
+/// Parse a "AA:BB:CC:DD:EE:FF" or "AA-BB-..." MAC string into 6 bytes.
+/// Returns None on any format mismatch so a missing/malformed MAC just
+/// disables the self-filter rather than killing the listener.
+fn parse_mac_bytes(mac: &str) -> Option<[u8; 6]> {
+    let parts: Vec<&str> = mac.split(|c| c == ':' || c == '-').collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let mut out = [0u8; 6];
+    for (i, p) in parts.iter().enumerate() {
+        out[i] = u8::from_str_radix(p, 16).ok()?;
+    }
+    Some(out)
+}
+
 fn get_interface_ips(name: &str) -> Vec<Ipv4Addr> {
     match interface::get_by_name(name) {
         Ok(info) => info
@@ -530,6 +600,13 @@ fn get_interface_ips(name: &str) -> Vec<Ipv4Addr> {
 }
 
 /// Fast parallel ping sweep of all /24 subnets to provoke ARP responses.
+///
+/// Each ping is issued with `-S <ip_str>` so Windows uses that address as
+/// the source and therefore routes the packet out the adapter that owns
+/// it. Without this, a /24 that overlaps another interface (very common:
+/// 192.168.1.0/24 on both Ethernet-camera-network and home WiFi) can
+/// silently route out the wrong NIC — the Ethernet pcap listener never
+/// sees the replies and passive devices on that subnet stay invisible.
 async fn ping_sweep_subnets(interface_ips: &[String]) {
     use tokio::task::JoinSet;
 
@@ -540,9 +617,10 @@ async fn ping_sweep_subnets(interface_ips: &[String]) {
             let o = ip.octets();
             for last in 1..=254 {
                 let target = format!("{}.{}.{}.{}", o[0], o[1], o[2], last);
+                let source = ip_str.clone();
                 join_set.spawn(async move {
                     let _ = async_cmd("ping")
-                        .args(["-n", "1", "-w", "200", &target])
+                        .args(["-n", "1", "-w", "200", "-S", &source, &target])
                         .output()
                         .await;
                 });

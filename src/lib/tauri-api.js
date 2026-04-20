@@ -199,3 +199,15 @@ export async function ptzSetPreset(cameraUrl, preset, name) {
 export async function sonyCgiZoom(ip, zoomSpeed, username, password) {
   return await invoke("sony_cgi_zoom", { ip, zoomSpeed, username, password });
 }
+
+export async function controlCgiZoomDirect(ip, position) {
+  return await invoke("control_cgi_zoom_direct", { ip, position });
+}
+
+export async function controlCgiProbeStatus(ip) {
+  return await invoke("control_cgi_probe_status", { ip });
+}
+
+export async function setZoomPosition(cameraIp, percent) {
+  return await invoke("set_zoom_position", { cameraIp, percent });
+}

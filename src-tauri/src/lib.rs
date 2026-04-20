@@ -448,6 +448,9 @@ pub fn run() {
             commands::ptz_goto_preset,
             commands::ptz_set_preset,
             commands::sony_cgi_zoom,
+            commands::control_cgi_zoom_direct,
+            commands::control_cgi_probe_status,
+            commands::set_zoom_position,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
