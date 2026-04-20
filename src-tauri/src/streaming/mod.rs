@@ -458,6 +458,7 @@ mod tests {
             },
             adopted_subnets: std::collections::HashMap::new(),
             device_cache: Vec::new(),
+            zoom_positions: std::collections::HashMap::new(),
         }
     }
 
