@@ -10,7 +10,12 @@ import { $, state, log, showToast } from "./state.js";
 let ptuSpeedBig = 100;
 let ptuSpeedSmall = 10;
 let ptuSpeedQueried = false;
-const ptuPresets = new Map(); // preset# -> { pan, tilt }
+const ptuPresets = new Map(); // preset# -> { pan, tilt, zoom }
+// Set by setupZoomSlider so preset recall can enqueue a zoom through the
+// same serialised drain loop as slider drags. Keeping preset-zoom off the
+// direct-send path avoids two concurrent HTTP requests wedging the camera's
+// single-threaded control.cgi handler.
+let zoomRequest = null;
 
 function getPtuIp() {
   return $("#ptu-ip").value || null;
@@ -149,23 +154,24 @@ export function setupPtzControls() {
         const saved = ptuPresets.get(preset);
         if (saved) {
           try {
-            // Fire PTU motion and zoom in parallel — they're independent
-            // devices (pan/tilt unit vs camera over HTTP), so no reason
-            // to serialise. waitForPtuHome polls PTU position
-            // independently.
-            ptuCmd(
+            // Await the goto ACK before the handler returns — otherwise a
+            // D-pad press arriving mid-goto lands while the PTU is still in
+            // C=I (absolute) mode, before waitForPtuHome flips it back to
+            // C=V. A PS=SPEED command in C=I mode can drive the unit past
+            // its limits (observed in 0.2.9 as runaway pan).
+            await ptuCmd(
               `C=I&PS=${ptuSpeedBig}&TS=${ptuSpeedBig}&PP=${saved.pan}&TP=${saved.tilt}`
-            )
-              .then(() => waitForPtuHome().catch(() => {}))
-              .catch((e) => log(`PTU preset ${preset}: ${e}`));
+            );
+            waitForPtuHome().catch(() => {});
 
-            // Only recall zoom if the preset captured one AND a CAM is
-            // currently selected. Updating the slider UI too so it
-            // reflects the new position.
+            // Route preset-zoom through the slider's drain queue so it
+            // can't overlap an in-flight slider request (two concurrent
+            // HTTP requests to control.cgi can wedge the camera's Lua
+            // server, freezing the RTSP stream).
             if (saved.zoom !== null && saved.zoom !== undefined && getCameraIp()) {
               const zoomEl = $("#zoom-slider");
               if (zoomEl) zoomEl.value = String(saved.zoom);
-              sendZoomPosition(saved.zoom);
+              if (zoomRequest) zoomRequest(saved.zoom);
             }
           } catch (e) {
             log(`PTU preset ${preset}: ${e}`);
@@ -273,6 +279,9 @@ function setupZoomSlider() {
     inFlight = true;
     drain();
   }
+
+  // Expose to preset-recall path so it shares this serialised queue.
+  zoomRequest = request;
 
   slider.addEventListener("input", (e) => {
     request(parseInt(e.target.value, 10));
