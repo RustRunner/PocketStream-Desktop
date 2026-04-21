@@ -978,9 +978,9 @@
   border: 1px solid var(--md-surface-variant);
   border-radius: var(--md-radius-sm);
   padding: 4px 8px;
-  font-size: 14px;
+  font-size: 12px;
   font-family: var(--md-font-mono);
-  font-weight: 500;
+  font-weight: 400;
   cursor: pointer;
   min-width: 144px;
 }

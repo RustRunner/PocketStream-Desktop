@@ -95,53 +95,78 @@ function scanAllRoutableDevices() {
     }
   }
   if (toScan.length === 0) {
-    showDiscoveryStatus(null);
+    // Nothing to scan — transition out of "discovering" into idle.
+    setDiscoveryPhase("idle");
     return;
   }
   log(`Scanning ${toScan.length} routable device(s)...`);
-  showDiscoveryStatus("Port Scan...");
+  setDiscoveryPhase("scanning");
   for (const ip of toScan) {
     scanDevicePorts(ip);
   }
 }
 
 // ── Discovery status ─────────────────────────────────────────────────
+//
+// Phase machine with three states driving the Nodes-card spinner:
+//   "discovering" → "IP Discovery..."  (ARP + subnet adoption in flight)
+//   "scanning"    → "Port Scan..."     (TCP probes in flight)
+//   "idle"        → no spinner         (everything settled)
+//
+// Transitions are centralised here so the user sees one continuous
+// status during startup instead of the old flicker between states as
+// each ARP / adopt event fired independently.
 
-function showDiscoveryStatus(label) {
+let discoveryPhase = "idle";
+
+function applyDiscoveryPhaseToDOM() {
   const container = $("#discovery-status");
   if (!container) return;
-  if (label) {
-    $("#discovery-label").textContent = label;
-    container.classList.remove("hidden");
-  } else {
+  if (discoveryPhase === "idle") {
     container.classList.add("hidden");
+    return;
   }
+  const label = discoveryPhase === "scanning" ? "Port Scan..." : "IP Discovery...";
+  $("#discovery-label").textContent = label;
+  container.classList.remove("hidden");
+}
+
+function setDiscoveryPhase(phase) {
+  discoveryPhase = phase;
+  applyDiscoveryPhaseToDOM();
+}
+
+/** True when the Nodes card should consider itself still working,
+ *  i.e. a spinner is visible. Used by renderArpDeviceList to decide
+ *  between "No devices found" (idle, empty) and no placeholder at
+ *  all (still working, empty is expected). */
+function isDiscoveryActive() {
+  return discoveryPhase !== "idle";
 }
 
 /** Hide the Nodes-card discovery spinner. Exported for the interface
- *  watcher so it can cancel a stuck "IP Discovery..." on link-down. */
+ *  watcher so it can cancel a stuck spinner on link-down. */
 export function hideDiscoveryStatus() {
-  showDiscoveryStatus(null);
+  setDiscoveryPhase("idle");
 }
 
 export function resetDiscoveryStatus() {
   scannedIps.clear();
   if (settleTimer) clearTimeout(settleTimer);
   settleTimer = null;
-  showDiscoveryStatus("IP Discovery...");
+  setDiscoveryPhase("discovering");
 }
 
 // ── ARP event listeners ─────────────────────────────────────────────
 
 export function setupArpListeners() {
-  // Only show the "IP Discovery..." spinner when the link is actually up.
-  // A stale disconnected adapter (state.activeInterface set, but ips=[])
-  // would otherwise leave the spinner running forever with no ARP traffic
-  // to ever satisfy it.
+  // Only show a spinner when the link is actually up. A stale
+  // disconnected adapter (state.activeInterface set, but ips=[]) would
+  // otherwise leave the spinner running forever with no ARP traffic.
   if (isInterfaceConnected()) {
-    showDiscoveryStatus("IP Discovery...");
+    setDiscoveryPhase("discovering");
   } else {
-    showDiscoveryStatus(null);
+    setDiscoveryPhase("idle");
   }
 
   api.onEvent("arp-device-discovered", (device) => {
@@ -155,7 +180,13 @@ export function setupArpListeners() {
 
     if (isNew) {
       log(`ARP: discovered ${device.ip} (${device.mac})`);
-      showDiscoveryStatus("IP Discovery...");
+      // Mid-scan ARPs flip us back to "discovering" only if we're not
+      // already showing "Port Scan..." for in-flight scans. That keeps
+      // the UX linear (Discovery → Scan → idle) instead of flickering
+      // back to Discovery every time a late ARP arrives during a scan.
+      if (discoveryPhase === "idle") {
+        setDiscoveryPhase("discovering");
+      }
       debounceScan();
     }
   });
@@ -182,7 +213,7 @@ export function setupArpListeners() {
 
 export async function loadExistingArpState() {
   if (!isInterfaceConnected()) {
-    showDiscoveryStatus(null);
+    setDiscoveryPhase("idle");
     return;
   }
 
@@ -211,7 +242,7 @@ export async function loadExistingArpState() {
       }
       scanAllRoutableDevices();
     } else if (arpDevices.size === 0) {
-      showDiscoveryStatus("IP Discovery...");
+      setDiscoveryPhase("discovering");
     }
   } catch (e) {
     console.error("Failed to load ARP state:", e);
@@ -270,7 +301,10 @@ async function scanDevicePorts(ip, attempt = 0) {
   pendingScans--;
   renderArpDeviceList();
   if (pendingScans <= 0) {
-    showDiscoveryStatus(null);
+    // All port scans done. If the settle timer is still armed from a
+    // late ARP / adoption event, drop back to "discovering" until it
+    // fires; otherwise we're fully idle.
+    setDiscoveryPhase(settleTimer !== null ? "discovering" : "idle");
   }
 }
 
@@ -313,15 +347,11 @@ export function renderArpDeviceList() {
   }
 
   if (bySubnet.size === 0 && pendingScans <= 0) {
-    // Distinguish "still discovering" from "finished with empty result".
-    // If the discovery spinner is up or a settle timer is pending, we're
-    // in the gap between reconnect and the first port-scan result — show
-    // a standby placeholder instead of a misleading "No devices found".
-    const discoveryActive =
-      settleTimer !== null ||
-      !$("#discovery-status")?.classList.contains("hidden");
-    list.innerHTML = discoveryActive
-      ? '<p class="placeholder-text">Standby…</p>'
+    // Spinner (IP Discovery / Port Scan) carries the "still working"
+    // signal — leave the list empty while it's visible. Only show
+    // the "No devices found" placeholder once everything's settled.
+    list.innerHTML = isDiscoveryActive()
+      ? ""
       : '<p class="placeholder-text">No devices found.</p>';
     updateCameraIpDropdown(null);
     return;

@@ -458,6 +458,12 @@ function showStreamLost(errorMsg) {
 
 function hideStreamLost() {
   state.streamLost = false;
+  // Reset the drop-detection streak: during the lost window pollStatus
+  // kept running and counted every `playing=false` poll (often 10+),
+  // which would otherwise instantly re-fire showStreamLost on the
+  // next tick after handleReconnect resets the lost state — faster
+  // than the newly-started pipeline can reach Playing.
+  notPlayingStreak = 0;
   api.setVideoVisible(true).catch(() => {});
   const overlay = $("#video-area").querySelector(".stream-lost-overlay");
   if (overlay) overlay.classList.remove("visible");

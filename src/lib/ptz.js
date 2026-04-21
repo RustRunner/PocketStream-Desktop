@@ -124,8 +124,16 @@ export function setupPtzControls() {
         try {
           const data = await ptuCmd("PP&TP");
           if (data) {
-            ptuPresets.set(preset, { pan: data.PP, tilt: data.TP });
-            showToast(`Preset ${preset} saved (P:${data.PP} T:${data.TP})`);
+            // Also snapshot current zoom slider position so recalling
+            // this preset restores framing on the CAM that's selected
+            // now. `zoom` is nullable: a preset saved with no CAM
+            // chosen just doesn't touch zoom on recall.
+            const zoomEl = $("#zoom-slider");
+            const zoomVal = zoomEl ? parseInt(zoomEl.value, 10) : NaN;
+            const zoom = Number.isFinite(zoomVal) ? zoomVal : null;
+            ptuPresets.set(preset, { pan: data.PP, tilt: data.TP, zoom });
+            const zoomLabel = zoom !== null ? ` Z:${zoom}%` : "";
+            showToast(`Preset ${preset} saved (P:${data.PP} T:${data.TP}${zoomLabel})`);
           }
         } catch (e) {
           showToast(`Failed: ${e}`, true);
@@ -141,8 +149,24 @@ export function setupPtzControls() {
         const saved = ptuPresets.get(preset);
         if (saved) {
           try {
-            await ptuCmd(`C=I&PS=${ptuSpeedBig}&TS=${ptuSpeedBig}&PP=${saved.pan}&TP=${saved.tilt}`);
-            waitForPtuHome().catch(() => {});
+            // Fire PTU motion and zoom in parallel — they're independent
+            // devices (pan/tilt unit vs camera over HTTP), so no reason
+            // to serialise. waitForPtuHome polls PTU position
+            // independently.
+            ptuCmd(
+              `C=I&PS=${ptuSpeedBig}&TS=${ptuSpeedBig}&PP=${saved.pan}&TP=${saved.tilt}`
+            )
+              .then(() => waitForPtuHome().catch(() => {}))
+              .catch((e) => log(`PTU preset ${preset}: ${e}`));
+
+            // Only recall zoom if the preset captured one AND a CAM is
+            // currently selected. Updating the slider UI too so it
+            // reflects the new position.
+            if (saved.zoom !== null && saved.zoom !== undefined && getCameraIp()) {
+              const zoomEl = $("#zoom-slider");
+              if (zoomEl) zoomEl.value = String(saved.zoom);
+              sendZoomPosition(saved.zoom);
+            }
           } catch (e) {
             log(`PTU preset ${preset}: ${e}`);
           }
