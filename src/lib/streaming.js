@@ -35,6 +35,8 @@ export function setupStreamControls() {
         state.streamLost = false;
         // User asked to stop — don't auto-resume on a later reconnect.
         resumeSnapshot = null;
+        // Clear any stuck overlay from an earlier drop in this session.
+        hideStreamLost();
         stopStatusPolling();
         await api.stopStream();
         updateStreamUI();
@@ -96,8 +98,12 @@ function updateStreamUI() {
   const btn = $("#btn-toggle-stream");
   btn.textContent = state.isStreaming ? "Stop Stream" : "Start Stream";
   btn.className = state.isStreaming ? "outlined-btn active-btn" : "filled-btn";
-  $("#btn-screenshot").disabled = !state.isStreaming;
-  $("#btn-record").disabled = !state.isStreaming;
+  // Screenshot and record need a healthy pipeline — disable them while
+  // the stream is lost even though isStreaming is still true (the user
+  // intends to stream; the stream just isn't alive right now).
+  const canInteract = state.isStreaming && !state.streamLost;
+  $("#btn-screenshot").disabled = !canInteract;
+  $("#btn-record").disabled = !canInteract;
 
   const area = $("#video-area");
   const placeholder = area.querySelector(".placeholder-text");
@@ -416,7 +422,8 @@ function showStreamLost(errorMsg) {
   state.streamLost = true;
   notPlayingStreak = 0;
 
-  // Hide stale video frame and show overlay
+  // Hide stale video frame and show overlay. Overlay defaults to
+  // display:none via CSS; the .visible class is what reveals it.
   api.setVideoVisible(false).catch(() => {});
   const area = $("#video-area");
   let overlay = area.querySelector(".stream-lost-overlay");
@@ -426,7 +433,7 @@ function showStreamLost(errorMsg) {
     overlay.textContent = "Stream Lost...";
     area.appendChild(overlay);
   }
-  overlay.style.display = "";
+  overlay.classList.add("visible");
 
   // Reset stream and RTSP server
   api.stopStream().catch(() => {});
@@ -435,10 +442,14 @@ function showStreamLost(errorMsg) {
     state.isRtspRunning = false;
     updateRtspUI(null);
   }
-  state.isStreaming = false;
+  // Deliberately leave state.isStreaming = true: the user's intent is
+  // still "I want to stream", the connection just failed. Keeps the
+  // button labelled "Stop Stream" so clicking it means "give up", not
+  // "start fresh". pollStatus keeps running (stopStatusPolling is a
+  // no-op while isStreaming is true) so recovery is detected.
   state.isRecording = false;
+  $("#btn-record").classList.remove("recording");
   updateStreamUI();
-  stopStatusPolling();
 
   // Show the actual GStreamer error if available
   const reason = errorMsg || "connection dropped";
@@ -446,11 +457,10 @@ function showStreamLost(errorMsg) {
 }
 
 function hideStreamLost() {
-  if (!state.streamLost) return;
   state.streamLost = false;
   api.setVideoVisible(true).catch(() => {});
   const overlay = $("#video-area").querySelector(".stream-lost-overlay");
-  if (overlay) overlay.style.display = "none";
+  if (overlay) overlay.classList.remove("visible");
 }
 
 // ── Video resize handler ────────────────────────────────────────────

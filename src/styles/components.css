@@ -653,7 +653,11 @@
   position: absolute;
   inset: 0;
   background: #000;
-  display: flex;
+  /* Hidden by default. Default-visible caused the overlay to flash
+     through when setVideoVisible(false) fired for an unrelated reason
+     (hamburger toggle, dialog open) after a previous stream-lost in
+     the same session left the element in the DOM. */
+  display: none;
   align-items: center;
   justify-content: center;
   color: var(--md-error);
@@ -661,6 +665,10 @@
   font-weight: 500;
   letter-spacing: 0.5px;
   z-index: 10;
+}
+
+.stream-lost-overlay.visible {
+  display: flex;
 }
 
 .video-frame {

@@ -104,6 +104,12 @@ export function setupInterfaceWatcher() {
     // is actively trying to get discovery running. Stream-break UX lives
     // separately in streaming.js::showStreamLost.
     if (!iface.name) {
+      // Capture the CAM/PTU selections BEFORE updateCameraIpDropdown
+      // wipes them below — otherwise handleHardDisconnect would
+      // snapshot an empty PTU value and auto-resume on replug wouldn't
+      // restore it. (camera_ip has a state.config fallback; ptu_ip
+      // doesn't.)
+      handleHardDisconnect("Ethernet disconnected");
       state.activeInterface = null;
       $("#iface-name").textContent = "None found";
       // Preserve arpDevices / tcpScanResults across a "no adapter" blip
@@ -113,10 +119,6 @@ export function setupInterfaceWatcher() {
       renderSubnetList();
       updateCameraIpDropdown(null);
       hideDiscoveryStatus();
-      // Physical unplug → tear the stream down immediately. Driven here
-      // rather than via the pollStatus debounce because GStreamer often
-      // won't notice the link is down until its RTCP keepalive expires.
-      handleHardDisconnect("Ethernet disconnected");
       return;
     }
 
@@ -125,6 +127,9 @@ export function setupInterfaceWatcher() {
     const hasRealIp = iface.ips.some((ip) => !ip.address.startsWith("169.254."));
     if (!iface.is_up || !hasRealIp) {
       // ── Disconnected (includes APIPA-only state) ─────────────────
+      // Snapshot first, before dropdown clear wipes PTU selection.
+      handleHardDisconnect("Ethernet disconnected");
+
       $("#iface-name").textContent =
         (iface.display_name || iface.name) + " (Disconnected)";
 
@@ -137,10 +142,6 @@ export function setupInterfaceWatcher() {
       updateCameraIpDropdown(null);
       // Hide the Nodes-card spinner — no link means no discovery to wait on.
       hideDiscoveryStatus();
-      // Fire "Stream Lost..." now instead of waiting for the pollStatus
-      // debounce + GStreamer RTCP timeout. The cable is gone; the
-      // stream is not coming back without reconnection.
-      handleHardDisconnect("Ethernet disconnected");
     } else {
       // ── Connected (or reconnected) ───────────────────────────────
       $("#iface-name").textContent = iface.display_name || iface.name;
