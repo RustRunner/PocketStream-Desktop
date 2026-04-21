@@ -162,14 +162,29 @@ impl PlaybackPipeline {
                 if let gst::MessageView::Error(err) = msg.view() {
                     let raw = err.error().to_string();
                     let debug = err.debug().map(|d| d.to_string()).unwrap_or_default();
+                    log::warn!("Stream bus error: {} | debug: {}", raw, debug);
                     return Err(friendly_rtsp_error(&raw, &debug));
                 }
+                log::warn!("Stream bus EOS received");
                 return Err("End of stream".into());
             }
         }
 
-        let (_, current, _) = self.pipeline.state(gst::ClockTime::from_mseconds(0));
-        Ok(current == gst::State::Playing)
+        let (_, current, pending) = self.pipeline.state(gst::ClockTime::from_mseconds(0));
+        let playing = current == gst::State::Playing;
+        if !playing {
+            // This path was previously silent — the frontend saw
+            // `playing=false` with no error and tore everything down.
+            // Log the exact states so we can diagnose transient blips
+            // vs. real drops without needing to reproduce under a
+            // debugger.
+            log::warn!(
+                "Stream health_check: not playing (current={:?}, pending={:?})",
+                current,
+                pending
+            );
+        }
+        Ok(playing)
     }
 
     /// Stop and clean up.

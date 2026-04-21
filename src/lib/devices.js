@@ -279,6 +279,16 @@ async function scanDevicePorts(ip, attempt = 0) {
 export function renderArpDeviceList() {
   const list = $("#device-list");
 
+  // While disconnected, render nothing — the devices may still be in
+  // our in-memory state (preserved deliberately so a replug restores
+  // them fast), but they're unreachable right now. Returning early
+  // keeps the card empty without having to drop the state.
+  if (!isInterfaceConnected()) {
+    list.innerHTML = "";
+    updateCameraIpDropdown(null);
+    return;
+  }
+
   const ownMac = state.activeInterface?.mac?.toLowerCase() || null;
 
   const bySubnet = new Map();

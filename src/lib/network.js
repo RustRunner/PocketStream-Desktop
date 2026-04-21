@@ -4,7 +4,7 @@
 
 import * as api from "./tauri-api.js";
 import { $, $$, state, adoptedSubnets, nodeAliases, arpDevices, tcpScanResults, showToast } from "./state.js";
-import { resetDiscoveryStatus, hideDiscoveryStatus } from "./devices.js";
+import { resetDiscoveryStatus, hideDiscoveryStatus, renderArpDeviceList } from "./devices.js";
 
 // ── Interface discovery ─────────────────────────────────────────────
 
@@ -105,9 +105,10 @@ export function setupInterfaceWatcher() {
     if (!iface.name) {
       state.activeInterface = null;
       $("#iface-name").textContent = "None found";
-      arpDevices.clear();
-      tcpScanResults.clear();
-      $("#device-list").innerHTML = "";
+      // Preserve arpDevices / tcpScanResults across a "no adapter" blip
+      // so a quick replug restores the UI without waiting for a full
+      // re-scan. renderArpDeviceList self-hides when not connected.
+      renderArpDeviceList();
       renderSubnetList();
       updateCameraIpDropdown(null);
       hideDiscoveryStatus();
@@ -122,10 +123,11 @@ export function setupInterfaceWatcher() {
       $("#iface-name").textContent =
         (iface.display_name || iface.name) + " (Disconnected)";
 
-      // Clear stale nodes — they're unreachable now
-      arpDevices.clear();
-      tcpScanResults.clear();
-      $("#device-list").innerHTML = "";
+      // Preserve arpDevices / tcpScanResults — a quick replug of the
+      // same cable should restore the Nodes list instantly instead of
+      // waiting 6+ seconds for ARP + port scan to rediscover what was
+      // there. renderArpDeviceList returns early when the link is down.
+      renderArpDeviceList();
       renderSubnetList();
       updateCameraIpDropdown(null);
       // Hide the Nodes-card spinner — no link means no discovery to wait on.
@@ -148,8 +150,12 @@ export function setupInterfaceWatcher() {
       // from dropdown during discovery" bug).
       updateCameraIpDropdown(state.lastSubnetResults || null);
 
-      // If we just came back from disconnected, kick off ARP discovery
+      // If we just came back from disconnected, re-render immediately
+      // from the preserved state so the Nodes list snaps back, then
+      // kick off discovery to verify. Verification will dim/mark any
+      // devices that genuinely vanished during the downtime.
       if (wasDown) {
+        renderArpDeviceList();
         resetDiscoveryStatus();
         api.startArpDiscovery(iface.name).catch(() => {});
       }

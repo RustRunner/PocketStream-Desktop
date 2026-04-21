@@ -4,7 +4,7 @@
 
 import QRCode from "qrcode";
 import * as api from "./tauri-api.js";
-import { $, state, showToast, formatUptime } from "./state.js";
+import { $, state, log, showToast, formatUptime } from "./state.js";
 
 /** Full RTSP URL (with token) — stored for QR code generation */
 let rtspFullUrl = null;
@@ -271,6 +271,7 @@ function setupQrDialog() {
 
 function startStatusPolling() {
   if (state.statusPollInterval) return;
+  notPlayingStreak = 0;
   state.statusPollInterval = setInterval(pollStatus, 1000);
 }
 
@@ -280,6 +281,13 @@ function stopStatusPolling() {
     state.statusPollInterval = null;
   }
 }
+
+// Require the backend to report `playing=false` across N consecutive
+// 1s polls before declaring the stream lost. A single blip (transient
+// state transition, RTCP jitter, GStreamer bus race) self-heals within
+// one poll and shouldn't nuke an otherwise-healthy stream.
+const DROP_THRESHOLD_POLLS = 3;
+let notPlayingStreak = 0;
 
 async function pollStatus() {
   try {
@@ -298,8 +306,15 @@ async function pollStatus() {
 
     // Detect stream drop — backend says not playing but we think we're streaming
     if (state.isStreaming && !status.playing) {
-      showStreamLost(status.error);
+      notPlayingStreak++;
+      if (notPlayingStreak >= DROP_THRESHOLD_POLLS) {
+        showStreamLost(status.error);
+      }
     } else if (state.isStreaming && status.playing) {
+      if (notPlayingStreak > 0) {
+        log(`Stream recovered after ${notPlayingStreak} bad poll(s)`);
+      }
+      notPlayingStreak = 0;
       hideStreamLost();
     }
   } catch (_) {}
@@ -308,6 +323,7 @@ async function pollStatus() {
 function showStreamLost(errorMsg) {
   if (state.streamLost) return;
   state.streamLost = true;
+  notPlayingStreak = 0;
 
   // Hide stale video frame and show overlay
   api.setVideoVisible(false).catch(() => {});
