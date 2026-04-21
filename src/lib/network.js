@@ -5,6 +5,7 @@
 import * as api from "./tauri-api.js";
 import { $, $$, state, adoptedSubnets, nodeAliases, arpDevices, tcpScanResults, showToast } from "./state.js";
 import { resetDiscoveryStatus, hideDiscoveryStatus, renderArpDeviceList } from "./devices.js";
+import { handleHardDisconnect, handleReconnect } from "./streaming.js";
 
 // ── Interface discovery ─────────────────────────────────────────────
 
@@ -112,6 +113,10 @@ export function setupInterfaceWatcher() {
       renderSubnetList();
       updateCameraIpDropdown(null);
       hideDiscoveryStatus();
+      // Physical unplug → tear the stream down immediately. Driven here
+      // rather than via the pollStatus debounce because GStreamer often
+      // won't notice the link is down until its RTCP keepalive expires.
+      handleHardDisconnect("Ethernet disconnected");
       return;
     }
 
@@ -132,6 +137,10 @@ export function setupInterfaceWatcher() {
       updateCameraIpDropdown(null);
       // Hide the Nodes-card spinner — no link means no discovery to wait on.
       hideDiscoveryStatus();
+      // Fire "Stream Lost..." now instead of waiting for the pollStatus
+      // debounce + GStreamer RTCP timeout. The cable is gone; the
+      // stream is not coming back without reconnection.
+      handleHardDisconnect("Ethernet disconnected");
     } else {
       // ── Connected (or reconnected) ───────────────────────────────
       $("#iface-name").textContent = iface.display_name || iface.name;
@@ -158,6 +167,10 @@ export function setupInterfaceWatcher() {
         renderArpDeviceList();
         resetDiscoveryStatus();
         api.startArpDiscovery(iface.name).catch(() => {});
+        // Restart the stream (and RTSP server) if they were running
+        // before the disconnect. Fires in the background; failures
+        // surface as toasts inside handleReconnect.
+        handleReconnect().catch((e) => log(`Auto-resume: ${e}`));
       }
     }
   });

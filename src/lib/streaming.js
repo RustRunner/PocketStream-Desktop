@@ -33,6 +33,8 @@ export function setupStreamControls() {
         // doesn't race and trigger a false "Stream Lost".
         state.isStreaming = false;
         state.streamLost = false;
+        // User asked to stop — don't auto-resume on a later reconnect.
+        resumeSnapshot = null;
         stopStatusPolling();
         await api.stopStream();
         updateStreamUI();
@@ -318,6 +320,95 @@ async function pollStatus() {
       hideStreamLost();
     }
   } catch (_) {}
+}
+
+/// Stream state captured at the moment of a hard network disconnect,
+/// so we can re-start the stream (and any associated RTSP server) as
+/// soon as the link comes back. Cleared on manual stop or after a
+/// successful resume.
+let resumeSnapshot = null;
+
+/// Called by the interface watcher when it detects a physical unplug /
+/// APIPA-only state. Bypasses the poll debounce so the user gets
+/// immediate "Stream Lost..." feedback instead of waiting for GStreamer
+/// to time out. Captures what was running so handleReconnect() can
+/// put it back together on replug.
+export function handleHardDisconnect(reason) {
+  if (state.isStreaming && !state.streamLost) {
+    resumeSnapshot = {
+      cameraIp:
+        $("#camera-ip").value ||
+        state.config?.stream?.camera_ip ||
+        null,
+      ptuIp: $("#ptu-ip").value || null,
+      wasRtspRunning: !!state.isRtspRunning,
+    };
+    log(`Stream lost on network disconnect: ${reason}`);
+    showStreamLost(reason);
+  }
+}
+
+/// Called by the interface watcher on reconnect (wasDown=true).
+/// Restores dropdown selections and restarts the stream + RTSP server
+/// if they were running before the disconnect.
+export async function handleReconnect() {
+  if (!resumeSnapshot) return;
+  const snap = resumeSnapshot;
+  resumeSnapshot = null;
+
+  // Give Windows + auto-adopt a moment to finish re-binding IPs and
+  // routes before we try to open a socket to the camera. Two seconds
+  // is long enough to catch most settling but short enough to feel
+  // responsive when the user's waiting for the stream to come back.
+  await new Promise((r) => setTimeout(r, 2000));
+
+  // Restore dropdown selections (dropdown may have been repopulated
+  // during reconnect; set values explicitly so the pre-disconnect
+  // choices are back).
+  if (snap.cameraIp) {
+    const camSelect = $("#camera-ip");
+    camSelect.value = snap.cameraIp;
+    if (state.config) {
+      state.config.stream.camera_ip = snap.cameraIp;
+    }
+  }
+  if (snap.ptuIp) $("#ptu-ip").value = snap.ptuIp;
+
+  if (!snap.cameraIp) return;
+
+  try {
+    const bounds = getVideoAreaBounds();
+    const handle = await api.createVideoWindow(
+      bounds.x,
+      bounds.y,
+      bounds.width,
+      bounds.height
+    );
+    await api.startStream(handle);
+    state.isStreaming = true;
+    state.streamLost = false;
+    hideStreamLost();
+    updateStreamUI();
+    startStatusPolling();
+    showToast("Stream resumed");
+
+    // RTSP server was running — bring it back too. Errors here aren't
+    // fatal (the stream is already back); toast and move on.
+    if (snap.wasRtspRunning) {
+      try {
+        const info = await api.startRtspServer();
+        state.isRtspRunning = true;
+        rtspFullUrl = info.rtsp_url;
+        updateRtspUI(info.display_url);
+      } catch (e) {
+        log(`RTSP auto-resume failed: ${e}`);
+        showToast("Stream back — RTSP server failed to resume", true);
+      }
+    }
+  } catch (e) {
+    log(`Stream auto-resume failed: ${e}`);
+    showToast("Auto-resume failed — restart stream manually", true);
+  }
 }
 
 function showStreamLost(errorMsg) {
