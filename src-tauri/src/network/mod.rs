@@ -117,7 +117,20 @@ impl NetworkManager {
     /// outside the lock — and in parallel — so IPC handlers querying the map
     /// during cold start aren't blocked behind a sequence of 100–500ms netsh
     /// invocations.
-    pub async fn load_adopted_from_config(&self, config: &crate::config::AppConfig) {
+    ///
+    /// `app_handle` is used to emit a `subnet-adopted` event for each
+    /// restored entry so the frontend can populate its `adoptedSubnets`
+    /// Map without racing the cold-start `getAdoptedSubnets` call. Without
+    /// this signal, the frontend would query the in-memory map BEFORE
+    /// Phase 1 completes (especially on slow Windows boxes where
+    /// `interface::list_physical()` takes 100–300 ms), find it empty, and
+    /// then never re-pull it — leaving restored IPs rendered as if they
+    /// were native (no `(auto)` badge, wrong sort order).
+    pub async fn load_adopted_from_config(
+        &self,
+        config: &crate::config::AppConfig,
+        app_handle: &tauri::AppHandle,
+    ) {
         let settings = config.get();
         if settings.adopted_subnets.is_empty() {
             return;
@@ -161,11 +174,12 @@ impl NetworkManager {
         let current_ips: HashSet<String> = iface.ips.iter().map(|ip| ip.address.clone()).collect();
 
         // ── Phase 1: classify + insert under the lock (no awaits) ──
-        // Each entry produces (ip_str, needs_netsh_add). Pruned entries
-        // are dropped from both the in-memory map and the on-disk config.
+        // Each entry produces (subnet, ip_str, needs_netsh_add). Pruned
+        // entries are dropped from both the in-memory map and the on-disk
+        // config.
         let (work_items, save_snapshot) = {
             let mut map = self.adopted_ips.lock().await;
-            let mut work: Vec<(String, bool)> = Vec::new();
+            let mut work: Vec<(String, String, bool)> = Vec::new();
             let mut pruned = false;
 
             for (subnet, ip_str) in &settings.adopted_subnets {
@@ -181,7 +195,7 @@ impl NetworkManager {
 
                 if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
                     map.insert(subnet.clone(), ip);
-                    work.push((ip_str.clone(), !current_ips.contains(ip_str)));
+                    work.push((subnet.clone(), ip_str.clone(), !current_ips.contains(ip_str)));
                 }
             }
 
@@ -210,19 +224,41 @@ impl NetworkManager {
         }
 
         // ── Phase 2: netsh re-add in parallel, outside the lock ────
+        // After each entry is confirmed on the adapter (either already
+        // present from a hard-crash recovery or freshly netsh-added),
+        // emit `subnet-adopted` so the frontend's existing handler can
+        // populate `adoptedSubnets` and re-render with the (auto) badge.
+        // Failed adds skip the emission — the frontend shouldn't badge
+        // an IP that isn't actually on the interface.
+        use tauri::Emitter;
         let mut tasks = tokio::task::JoinSet::new();
-        for (ip_str, needs_add) in work_items {
-            if !needs_add {
-                log::info!("Adopted IP {} already on adapter", ip_str);
-                continue;
-            }
+        for (subnet, ip_str, needs_add) in work_items {
             let iface_name = iface.name.clone();
+            let handle = app_handle.clone();
             tasks.spawn(async move {
-                log::info!("Re-adding missing adopted IP {} to {}", ip_str, iface_name);
-                if let Err(e) =
-                    ip_config::add_secondary_ip(&iface_name, &ip_str, "255.255.255.0").await
-                {
-                    log::warn!("Failed to re-add adopted IP {}: {}", ip_str, e);
+                let added_ok = if needs_add {
+                    log::info!("Re-adding missing adopted IP {} to {}", ip_str, iface_name);
+                    match ip_config::add_secondary_ip(&iface_name, &ip_str, "255.255.255.0").await
+                    {
+                        Ok(()) => true,
+                        Err(e) => {
+                            log::warn!("Failed to re-add adopted IP {}: {}", ip_str, e);
+                            false
+                        }
+                    }
+                } else {
+                    log::info!("Adopted IP {} already on adapter", ip_str);
+                    true
+                };
+
+                if added_ok {
+                    let _ = handle.emit(
+                        "subnet-adopted",
+                        serde_json::json!({
+                            "subnet": subnet,
+                            "adopted_ip": ip_str,
+                        }),
+                    );
                 }
             });
         }

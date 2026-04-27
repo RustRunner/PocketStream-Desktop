@@ -512,7 +512,7 @@ pub fn run() {
                 let config: tauri::State<'_, config::AppConfig> = handle.state();
                 let manager: tauri::State<'_, network::NetworkManager> = handle.state();
                 manager.hydrate_device_registry(&config);
-                manager.load_adopted_from_config(&config).await;
+                manager.load_adopted_from_config(&config, &handle).await;
 
                 match network::interface::list_physical() {
                     Ok(interfaces) => {
