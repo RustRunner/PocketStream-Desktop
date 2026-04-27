@@ -28,18 +28,57 @@ async function ptuCmd(cmd) {
   return api.ptuSend(ip, cmd);
 }
 
-async function waitForPtuHome(maxTries = 40) {
-  let lastPan = null, lastTilt = null;
+/**
+ * Block until a goto (`C=I&PP=...&TP=...`) finishes, then flip the PTU
+ * back to velocity mode (`C=V`) so subsequent D-pad presses are safe.
+ *
+ * Termination logic:
+ *   1. Reached the target (within encoder tolerance) → done.
+ *   2. Two consecutive identical samples *after* we've observed at
+ *      least one position change → done (stopped before reaching
+ *      target — stuck, hit a limit, or external cancel).
+ *   3. maxTries reached (10 s default) → bail anyway.
+ *
+ * The `started` gate in #2 fixes the short-stroke bug: previously the
+ * loop broke on the first two equal samples, which routinely fired
+ * during the PTU's motor-spool-up window before motion began. The
+ * trailing C=V then halted what little motion had started.
+ */
+async function waitForPtuTarget(targetPan, targetTilt, maxTries = 40) {
+  // PP/TP encoders can jitter by a unit or two even at rest; tolerance
+  // avoids missing the "reached target" detection on the last pixel.
+  const TOLERANCE = 2;
+  let last = null;
+  let started = false;
   for (let i = 0; i < maxTries; i++) {
     await new Promise((r) => setTimeout(r, 250));
     try {
       const data = await ptuCmd("PP&TP");
       if (!data) break;
-      const pan = data.PP;
-      const tilt = data.TP;
-      if (pan === lastPan && tilt === lastTilt) break;
-      lastPan = pan;
-      lastTilt = tilt;
+      const pan = parseInt(data.PP, 10);
+      const tilt = parseInt(data.TP, 10);
+      if (!Number.isFinite(pan) || !Number.isFinite(tilt)) break;
+
+      // Reached the target — done immediately, no further polls.
+      if (
+        Math.abs(pan - targetPan) <= TOLERANCE &&
+        Math.abs(tilt - targetTilt) <= TOLERANCE
+      ) {
+        break;
+      }
+
+      const sample = `${pan},${tilt}`;
+      if (last !== null) {
+        if (sample !== last) {
+          started = true;
+        } else if (started) {
+          // Stopped short of the target — stuck or limit reached.
+          break;
+        }
+        // sample === last && !started → motors haven't spooled up yet,
+        // keep polling.
+      }
+      last = sample;
     } catch (_) {
       break;
     }
@@ -92,7 +131,7 @@ export function setupPtzControls() {
         try {
           await ptuCmd(`C=I&PS=${ptuSpeedBig}&TS=${ptuSpeedBig}&PP=0&TP=0`);
           showToast("PTU homing");
-          await waitForPtuHome();
+          await waitForPtuTarget(0, 0);
         } catch (e) {
           log(`PTU home: ${formatError(e)}`);
         }
@@ -157,13 +196,16 @@ export function setupPtzControls() {
           try {
             // Await the goto ACK before the handler returns — otherwise a
             // D-pad press arriving mid-goto lands while the PTU is still in
-            // C=I (absolute) mode, before waitForPtuHome flips it back to
+            // C=I (absolute) mode, before waitForPtuTarget flips it back to
             // C=V. A PS=SPEED command in C=I mode can drive the unit past
             // its limits (observed in 0.2.9 as runaway pan).
             await ptuCmd(
               `C=I&PS=${ptuSpeedBig}&TS=${ptuSpeedBig}&PP=${saved.pan}&TP=${saved.tilt}`
             );
-            waitForPtuHome().catch(() => {});
+            waitForPtuTarget(
+              parseInt(saved.pan, 10),
+              parseInt(saved.tilt, 10),
+            ).catch(() => {});
 
             // Route preset-zoom through the slider's drain queue so it
             // can't overlap an in-flight slider request (two concurrent
