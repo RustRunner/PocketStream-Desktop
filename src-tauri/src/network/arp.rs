@@ -7,6 +7,7 @@ use tauri::Emitter;
 use tokio::sync::Mutex;
 
 use crate::error::AppError;
+use crate::network::device_registry::{DeviceListEmitter, DeviceRegistry};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArpDevice {
@@ -41,6 +42,8 @@ impl ArpListenerHandle {
 /// the persistent device cache as a ghost "node".
 pub fn start_listener(
     devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
+    registry: Arc<DeviceRegistry>,
+    emitter: Arc<DeviceListEmitter>,
     app_handle: tauri::AppHandle,
     ethernet_ips: Vec<Ipv4Addr>,
     own_mac: Option<[u8; 6]>,
@@ -137,6 +140,8 @@ pub fn start_listener(
                         let mac_str = format_mac(&mac);
 
                         let devices = devices.clone();
+                        let registry = registry.clone();
+                        let emitter = emitter.clone();
                         let app_handle = app_handle.clone();
                         tokio::spawn(async move {
                             let octets = ip.octets();
@@ -157,6 +162,15 @@ pub fn start_listener(
                             let entry = map.entry(mac_str.clone()).or_insert(device.clone());
                             entry.last_seen = device.last_seen.clone();
                             entry.ip = device.ip.clone();
+
+                            // Mirror into the canonical DeviceRegistry. The
+                            // legacy `devices` map above is still mutated for
+                            // existing readers (get_arp_devices IPC, the
+                            // auto-adopt loop) and will be retired once the
+                            // frontend is fully migrated.
+                            if registry.merge_arp(&device) {
+                                emitter.poke();
+                            }
 
                             if is_new {
                                 log::info!("ARP: {} ({})", entry.ip, entry.mac);

@@ -1,6 +1,7 @@
 pub mod adapter_refresh;
 pub mod arp;
 pub mod auto_adopt;
+pub mod device_registry;
 pub mod firewall;
 pub mod interface;
 pub mod ip_config;
@@ -13,6 +14,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 pub use arp::ArpDevice;
+pub use device_registry::{DeviceListEmitter, DeviceRecord, DeviceRegistry, DeviceStatus};
 pub use interface::InterfaceInfo;
 pub use scanner::ScanResult;
 
@@ -51,6 +53,15 @@ pub struct NetworkManager {
     auto_adopt_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     auto_adopt_enabled: Arc<Mutex<bool>>,
     interface_name: Arc<Mutex<Option<String>>>,
+    /// Canonical store of merged device records (ARP + scan + cache +
+    /// alias + status). Mutated alongside `arp_devices` during the
+    /// transition; once the frontend is fully migrated to subscribe-only
+    /// snapshots the legacy map can be deleted.
+    device_registry: Arc<DeviceRegistry>,
+    /// Late-bound emitter that turns registry mutations into debounced
+    /// `device-list-changed` events. None until `start_arp_discovery`
+    /// (which receives the AppHandle) wires it up.
+    device_emitter: Arc<Mutex<Option<Arc<DeviceListEmitter>>>>,
 }
 
 impl NetworkManager {
@@ -63,7 +74,35 @@ impl NetworkManager {
             auto_adopt_handle: Arc::new(Mutex::new(None)),
             auto_adopt_enabled: Arc::new(Mutex::new(true)),
             interface_name: Arc::new(Mutex::new(None)),
+            device_registry: Arc::new(DeviceRegistry::new()),
+            device_emitter: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Hydrate the device registry from the on-disk cache. Idempotent
+    /// (the registry's own one-shot guard prevents re-hydration), but
+    /// expected to be called once at startup before ARP discovery so
+    /// the initial snapshot reflects last-known state.
+    pub fn hydrate_device_registry(&self, config: &crate::config::AppConfig) {
+        let cached = config.get_cache();
+        let count = cached.len();
+        if self.device_registry.hydrate_from_cache(&cached) {
+            log::info!("DeviceRegistry: hydrated {} cached device(s)", count);
+        }
+    }
+
+    /// Borrow the device registry. Used by IPC handlers that need to
+    /// read snapshots or apply mutations.
+    pub fn registry(&self) -> Arc<DeviceRegistry> {
+        self.device_registry.clone()
+    }
+
+    /// Borrow the device-list emitter. None before the first call to
+    /// `start_arp_discovery` (which initializes it with the AppHandle).
+    /// Mutators that want to publish a `device-list-changed` event call
+    /// `.poke()` on the result.
+    pub async fn emitter(&self) -> Option<Arc<DeviceListEmitter>> {
+        self.device_emitter.lock().await.clone()
     }
 
     /// Load previously adopted subnets from config and verify they still
@@ -258,7 +297,26 @@ impl NetworkManager {
             iface_info.mac
         );
 
-        let handle = arp::start_listener(devices.clone(), app_handle, ethernet_ips, own_mac)?;
+        let registry = self.device_registry.clone();
+
+        // Late-bind the emitter now that we have an AppHandle. Replace
+        // any previous emitter (e.g. from a prior interface switch) so
+        // events fire under the current handle.
+        let emitter = DeviceListEmitter::new(app_handle.clone(), registry.clone());
+        *self.device_emitter.lock().await = Some(emitter.clone());
+        // Emit the initial snapshot so any frontend that's already
+        // subscribed sees cache-hydrated devices without having to
+        // separately call get_device_list.
+        emitter.poke();
+
+        let handle = arp::start_listener(
+            devices.clone(),
+            registry.clone(),
+            emitter.clone(),
+            app_handle,
+            ethernet_ips,
+            own_mac,
+        )?;
         *self.arp_listener_handle.lock().await = Some(handle);
 
         // Ping sweep known subnets to provoke ARP traffic so pcap sees all devices,
@@ -266,6 +324,8 @@ impl NetworkManager {
         // new ARP packets on the wire.
         let sweep_ips = known_ips.clone();
         let sweep_devices = self.arp_devices.clone();
+        let sweep_registry = registry.clone();
+        let sweep_emitter = emitter.clone();
         let sweep_app_handle = app_handle_for_adopt.clone();
         let sweep_iface_ip = sweep_ips.first().cloned().unwrap_or_default();
         tokio::spawn(async move {
@@ -276,12 +336,21 @@ impl NetworkManager {
 
             // Read OS ARP table scoped to the Ethernet interface only
             if !sweep_iface_ip.is_empty() {
-                merge_arp_table(sweep_devices, sweep_app_handle, &sweep_iface_ip).await;
+                merge_arp_table(
+                    sweep_devices,
+                    sweep_registry,
+                    sweep_emitter,
+                    sweep_app_handle,
+                    &sweep_iface_ip,
+                )
+                .await;
             }
         });
 
         // Auto-adopt handler for foreign subnets
         let devices_for_adopt = devices.clone();
+        let registry_for_adopt = registry.clone();
+        let emitter_for_adopt = emitter.clone();
         let adopt_handle = tokio::spawn(async move {
             use tauri::Emitter;
             use tauri::Manager;
@@ -370,6 +439,8 @@ impl NetworkManager {
                             //      sometimes drop the first ARP broadcast.
                             let sweep_ip = adopted_ip.to_string();
                             let sweep_devices = devices_for_adopt.clone();
+                            let sweep_registry = registry_for_adopt.clone();
+                            let sweep_emitter = emitter_for_adopt.clone();
                             let sweep_handle = app_handle_for_adopt.clone();
                             tokio::spawn(async move {
                                 let passes: [u64; 3] = [1500, 5000, 12000];
@@ -385,6 +456,8 @@ impl NetworkManager {
                                     ping_sweep_subnets(std::slice::from_ref(&sweep_ip)).await;
                                     merge_arp_table(
                                         sweep_devices.clone(),
+                                        sweep_registry.clone(),
+                                        sweep_emitter.clone(),
                                         sweep_handle.clone(),
                                         &sweep_ip,
                                     )
@@ -635,6 +708,8 @@ async fn ping_sweep_subnets(interface_ips: &[String]) {
 /// new ARP packets on the wire for those hosts.
 async fn merge_arp_table(
     devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
+    registry: Arc<DeviceRegistry>,
+    emitter: Arc<DeviceListEmitter>,
     app_handle: tauri::AppHandle,
     interface_ip: &str,
 ) {
@@ -642,6 +717,7 @@ async fn merge_arp_table(
 
     let entries = arp::read_system_arp_table(interface_ip).await;
     let mut added = 0u32;
+    let mut registry_changed = false;
 
     let mut map = devices.lock().await;
     let now = chrono::Utc::now().to_rfc3339();
@@ -662,11 +738,19 @@ async fn merge_arp_table(
 
         log::info!("ARP table: {} ({})", device.ip, device.mac);
         let _ = app_handle.emit("arp-device-discovered", &device);
+        if registry.merge_arp(&device) {
+            registry_changed = true;
+        }
         map.insert(mac, device);
         added += 1;
     }
 
     if added > 0 {
         log::info!("Merged {} devices from OS ARP table", added);
+    }
+    // Coalesce all the new entries into one event. The emitter's 150 ms
+    // window absorbs both this batch and any concurrent live-ARP merges.
+    if registry_changed {
+        emitter.poke();
     }
 }

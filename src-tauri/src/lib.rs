@@ -470,6 +470,7 @@ pub fn run() {
             commands::start_arp_discovery,
             commands::stop_arp_discovery,
             commands::get_arp_devices,
+            commands::get_device_list,
             commands::get_adopted_subnets,
             commands::remove_adopted_subnet,
             // Streaming
@@ -512,6 +513,7 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 let config: tauri::State<'_, config::AppConfig> = handle.state();
                 let manager: tauri::State<'_, network::NetworkManager> = handle.state();
+                manager.hydrate_device_registry(&config);
                 manager.load_adopted_from_config(&config).await;
 
                 match network::interface::list_physical() {

@@ -4,7 +4,7 @@ use tauri::State;
 
 use crate::config::AppConfig;
 use crate::error::AppError;
-use crate::network::{ArpDevice, InterfaceInfo, NetworkManager, ScanResult};
+use crate::network::{ArpDevice, DeviceRecord, InterfaceInfo, NetworkManager, ScanResult};
 
 #[tauri::command]
 pub async fn scan_network(
@@ -98,6 +98,18 @@ pub async fn get_arp_devices(
     manager: State<'_, NetworkManager>,
 ) -> Result<Vec<ArpDevice>, AppError> {
     Ok(manager.get_arp_devices().await)
+}
+
+/// Snapshot of every device the backend currently knows about — the
+/// canonical replacement for the frontend's old patchwork of arpDevices
+/// + tcpScanResults + nodeAliases + cache file. Frontend calls this once
+/// on startup, then subscribes to `device-list-changed` events for live
+/// updates.
+#[tauri::command]
+pub async fn get_device_list(
+    manager: State<'_, NetworkManager>,
+) -> Result<Vec<DeviceRecord>, AppError> {
+    Ok(manager.registry().snapshot())
 }
 
 #[tauri::command]
