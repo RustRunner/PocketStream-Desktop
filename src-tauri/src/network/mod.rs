@@ -258,8 +258,7 @@ impl NetworkManager {
             iface_info.mac
         );
 
-        let handle =
-            arp::start_listener(devices.clone(), app_handle, ethernet_ips, own_mac)?;
+        let handle = arp::start_listener(devices.clone(), app_handle, ethernet_ips, own_mac)?;
         *self.arp_listener_handle.lock().await = Some(handle);
 
         // Ping sweep known subnets to provoke ARP traffic so pcap sees all devices,
@@ -375,10 +374,8 @@ impl NetworkManager {
                             tokio::spawn(async move {
                                 let passes: [u64; 3] = [1500, 5000, 12000];
                                 for (i, delay_ms) in passes.iter().enumerate() {
-                                    tokio::time::sleep(
-                                        std::time::Duration::from_millis(*delay_ms),
-                                    )
-                                    .await;
+                                    tokio::time::sleep(std::time::Duration::from_millis(*delay_ms))
+                                        .await;
                                     log::info!(
                                         "Post-adoption sweep pass {}/{} on {}",
                                         i + 1,
@@ -577,7 +574,7 @@ impl NetworkManager {
 /// Returns None on any format mismatch so a missing/malformed MAC just
 /// disables the self-filter rather than killing the listener.
 fn parse_mac_bytes(mac: &str) -> Option<[u8; 6]> {
-    let parts: Vec<&str> = mac.split(|c| c == ':' || c == '-').collect();
+    let parts: Vec<&str> = mac.split([':', '-']).collect();
     if parts.len() != 6 {
         return None;
     }

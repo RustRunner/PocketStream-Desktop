@@ -13,27 +13,70 @@ pub use error::AppError;
 
 /// Lazily-initialized GStreamer result.  The background thread kicks off
 /// `gstreamer::init()` early, but if a streaming command arrives before
-/// it finishes, `ensure_gstreamer()` will block until init completes.
+/// it finishes, `ensure_gstreamer()` will block until init completes
+/// (bounded by `GST_INIT_TIMEOUT`).
 static GST_READY: OnceLock<Result<(), String>> = OnceLock::new();
+
+/// Hard upper bound on how long `gstreamer::init()` may run before we
+/// give up. Init is a synchronous C call into GStreamer; a corrupt
+/// plugin registry has been observed to make it spin indefinitely. 30s
+/// is generous for cold-start on a slow disk while still fast enough
+/// that the app fails loudly instead of appearing hung to the user.
+const GST_INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Log directory path, set once during startup.
 static LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn ensure_gstreamer() -> Result<(), AppError> {
-    let result = GST_READY.get_or_init(|| match gstreamer::init() {
-        Ok(()) => {
-            log::info!("GStreamer {} initialized", gstreamer::version_string());
-            Ok(())
-        }
-        Err(e) => {
-            let msg = format!(
-                "Failed to initialize GStreamer: {}. \
-                     Ensure GStreamer MSVC x86_64 runtime is installed \
-                     (https://gstreamer.freedesktop.org/download/)",
-                e
-            );
+    let result = GST_READY.get_or_init(|| {
+        // Run gstreamer::init() on a dedicated OS thread so a hang in
+        // GStreamer C code can't wedge the calling thread. recv_timeout
+        // enforces a hard upper bound; if it expires the init thread is
+        // leaked (still running, but unreachable). That's deliberate —
+        // the alternative would be unsafe abort and we'd rather lose a
+        // thread than risk UB.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawn_result = std::thread::Builder::new()
+            .name("gstreamer-init".into())
+            .spawn(move || {
+                let result = match gstreamer::init() {
+                    Ok(()) => {
+                        log::info!("GStreamer {} initialized", gstreamer::version_string());
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let msg = format!(
+                            "Failed to initialize GStreamer: {}. \
+                             Ensure GStreamer MSVC x86_64 runtime is installed \
+                             (https://gstreamer.freedesktop.org/download/)",
+                            e
+                        );
+                        log::error!("{}", msg);
+                        Err(msg)
+                    }
+                };
+                let _ = tx.send(result);
+            });
+
+        if let Err(e) = spawn_result {
+            let msg = format!("Failed to spawn GStreamer init thread: {}", e);
             log::error!("{}", msg);
-            Err(msg)
+            return Err(msg);
+        }
+
+        match rx.recv_timeout(GST_INIT_TIMEOUT) {
+            Ok(result) => result,
+            Err(_) => {
+                let msg = format!(
+                    "GStreamer initialization timed out after {}s. The plugin \
+                     registry may be corrupt — try deleting the registry cache \
+                     (Windows: %LOCALAPPDATA%\\gstreamer-1.0\\registry.x86_64.bin) \
+                     and relaunching.",
+                    GST_INIT_TIMEOUT.as_secs()
+                );
+                log::error!("{}", msg);
+                Err(msg)
+            }
         }
     });
     result.clone().map_err(AppError::Stream)
@@ -406,6 +449,9 @@ pub fn run() {
             // Config
             commands::get_config,
             commands::save_config,
+            commands::update_stream_settings,
+            commands::update_rtsp_settings,
+            commands::update_credentials,
             // Device Cache
             commands::get_device_cache,
             commands::upsert_cached_device,

@@ -4,6 +4,7 @@
 
 import * as api from "./tauri-api.js";
 import { $, state, log, showToast } from "./state.js";
+import { formatError } from "./errors.js";
 
 // ── Local PTU state ─────────────────────────────────────────────────
 
@@ -63,7 +64,7 @@ async function queryPtuSpeed() {
       await ptuCmd("C=V");
     }
   } catch (e) {
-    log(`PTU init failed: ${e}`);
+    log(`PTU init failed: ${formatError(e)}`);
   }
 }
 
@@ -93,7 +94,7 @@ export function setupPtzControls() {
           showToast("PTU homing");
           await waitForPtuHome();
         } catch (e) {
-          log(`PTU home: ${e}`);
+          log(`PTU home: ${formatError(e)}`);
         }
       });
       return;
@@ -103,7 +104,7 @@ export function setupPtzControls() {
       if (!getPtuIp()) return;
       if (!ptuSpeedQueried) await queryPtuSpeed();
       const cmdFn = speedCmds[action];
-      if (cmdFn) ptuCmd(cmdFn()).catch((e) => log(`PTU ${action}: ${e}`));
+      if (cmdFn) ptuCmd(cmdFn()).catch((e) => log(`PTU ${action}: ${formatError(e)}`));
     };
     const stopMove = () => {
       if (!getPtuIp()) return;
@@ -141,7 +142,7 @@ export function setupPtzControls() {
             showToast(`Preset ${preset} saved (P:${data.PP} T:${data.TP}${zoomLabel})`);
           }
         } catch (e) {
-          showToast(`Failed: ${e}`, true);
+          showToast(`Failed: ${formatError(e)}`, true);
         }
       }, 800);
     });
@@ -174,7 +175,7 @@ export function setupPtzControls() {
               if (zoomRequest) zoomRequest(saved.zoom);
             }
           } catch (e) {
-            log(`PTU preset ${preset}: ${e}`);
+            log(`PTU preset ${preset}: ${formatError(e)}`);
           }
         } else {
           showToast(`Preset ${preset} not saved yet`, true);
@@ -228,9 +229,9 @@ async function sendZoomPosition(percent) {
     await api.controlCgiZoomDirect(ip, position);
     zoomErrorToasted = false;
   } catch (e) {
-    log(`Zoom failed: ${e}`);
+    log(`Zoom failed: ${formatError(e)}`);
     if (!zoomErrorToasted) {
-      showToast(`Zoom failed: ${e}`, true);
+      showToast(`Zoom failed: ${formatError(e)}`, true);
       zoomErrorToasted = true;
     }
   }
@@ -301,7 +302,7 @@ function setupZoomSlider() {
         state.config.zoom_positions[ip] = percent;
       }
     } catch (e) {
-      log(`Save zoom position: ${e}`);
+      log(`Save zoom position: ${formatError(e)}`);
     }
   }
 

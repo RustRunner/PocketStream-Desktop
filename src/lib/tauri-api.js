@@ -30,6 +30,18 @@ export async function saveConfig(settings) {
   return await invoke("save_config", { settings });
 }
 
+export async function updateStreamSettings(stream) {
+  return await invoke("update_stream_settings", { stream });
+}
+
+export async function updateRtspSettings(rtspServer) {
+  return await invoke("update_rtsp_settings", { rtspServer });
+}
+
+export async function updateCredentials(credentials) {
+  return await invoke("update_credentials", { credentials });
+}
+
 // ── Device Cache ────────────────────────────────────────────────────
 
 export async function getDeviceCache() {

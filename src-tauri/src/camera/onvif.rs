@@ -54,7 +54,9 @@ pub async fn discover(subnet: Option<&str>) -> Result<Vec<OnvifDevice>, AppError
     // 5. Parse XAddrs from each response
     // 6. Query each device for capabilities
 
-    Ok(vec![])
+    Err(AppError::Camera(
+        "ONVIF discovery not yet implemented".into(),
+    ))
 }
 
 /// Get detailed info from an ONVIF device.
@@ -76,5 +78,38 @@ pub async fn get_stream_profiles(service_url: &str) -> Result<Vec<StreamProfile>
 
     // TODO: Send GetProfiles, then GetStreamUri for each profile token
 
-    Ok(vec![])
+    Err(AppError::Camera(
+        "ONVIF stream profiles not yet implemented".into(),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn discover_returns_not_implemented_error() {
+        let result = discover(None).await;
+        assert!(result.is_err(), "ONVIF discover must not silently no-op");
+        if let Err(AppError::Camera(msg)) = result {
+            assert!(msg.to_lowercase().contains("not yet implemented"));
+        } else {
+            panic!("expected AppError::Camera, got {:?}", result);
+        }
+    }
+
+    #[tokio::test]
+    async fn get_device_info_returns_not_implemented_error() {
+        let result = get_device_info("http://192.0.2.1/onvif/device_service").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn get_stream_profiles_returns_not_implemented_error() {
+        let result = get_stream_profiles("http://192.0.2.1/onvif/device_service").await;
+        assert!(
+            result.is_err(),
+            "ONVIF stream profiles must not silently no-op"
+        );
+    }
 }

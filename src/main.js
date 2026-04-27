@@ -4,6 +4,7 @@
 
 import * as api from "./lib/tauri-api.js";
 import { $, $$, state, showToast, adoptedSubnets } from "./lib/state.js";
+import { formatError } from "./lib/errors.js";
 import { refreshInterfaces, setupIpConfigDialog, setupCameraIpDropdown, setupInterfaceWatcher, isInterfaceConnected, warnNoEthernet } from "./lib/network.js";
 import { setupArpListeners, loadExistingArpState, setupAliasDialog, resetDiscoveryStatus } from "./lib/devices.js";
 import { setupCacheDialog } from "./lib/device-cache.js";
@@ -70,7 +71,7 @@ async function checkForUpdates() {
     showUpdateToast(update);
   } catch (e) {
     // Non-fatal — don't block the app if the update check fails
-    api.logToFile("warn", `Update check failed: ${e}`);
+    api.logToFile("warn", `Update check failed: ${formatError(e)}`);
   }
 }
 
@@ -135,7 +136,7 @@ function showUpdateToast(update) {
       msg.textContent = "Update installed. Restart to apply.";
       setTimeout(() => toast.remove(), 5000);
     } catch (e) {
-      api.logToFile("warn", `Update install failed: ${e}`);
+      api.logToFile("warn", `Update install failed: ${formatError(e)}`);
       msg.textContent = "Update failed.";
       setTimeout(() => toast.remove(), 3000);
     }
@@ -189,34 +190,38 @@ function setupSettingsSave() {
   $("#save-settings").addEventListener("click", async () => {
     const activeProto = $("[data-protocol].active")?.dataset.protocol || "rtsp";
 
-    const settings = {
-      stream: {
-        protocol: activeProto,
-        rtsp_port: parseInt($("#rtsp-port").value) || 554,
-        rtsp_path: $("#rtsp-path").value || "/z3-1.sdp",
-        udp_port: parseInt($("#udp-port").value) || 8600,
-        camera_ip: state.config?.stream?.camera_ip || "",
-      },
-      rtsp_server: {
-        enabled: $("#rtsp-server-enable").checked,
-        port: parseInt($("#rtsp-server-port").value) || 8554,
-        token: $("#rtsp-token").value,
-        bind_interface: state.config?.rtsp_server?.bind_interface || "",
-      },
-      credentials: {
-        username: $("#camera-user").value,
-        password: $("#camera-pass").value,
-      },
-      adopted_subnets: state.config?.adopted_subnets || {},
-      zoom_positions: state.config?.zoom_positions || {},
+    const stream = {
+      protocol: activeProto,
+      rtsp_port: parseInt($("#rtsp-port").value) || 554,
+      rtsp_path: $("#rtsp-path").value || "/z3-1.sdp",
+      udp_port: parseInt($("#udp-port").value) || 8600,
+      camera_ip: state.config?.stream?.camera_ip || "",
+    };
+    const rtspServer = {
+      enabled: $("#rtsp-server-enable").checked,
+      port: parseInt($("#rtsp-server-port").value) || 8554,
+      token: $("#rtsp-token").value,
+      bind_interface: state.config?.rtsp_server?.bind_interface || "",
+    };
+    const credentials = {
+      username: $("#camera-user").value,
+      password: $("#camera-pass").value,
     };
 
     try {
-      await api.saveConfig(settings);
-      state.config = settings;
+      // Sequential so a failure points clearly at one section. Each
+      // command mutates only its own slice of AppSettings server-side
+      // — backend-owned fields (device_cache, adopted_subnets,
+      // zoom_positions) stay intact.
+      await api.updateStreamSettings(stream);
+      await api.updateRtspSettings(rtspServer);
+      await api.updateCredentials(credentials);
+      // Re-pull the canonical settings so state.config reflects whatever
+      // the backend currently holds for the fields we don't own.
+      state.config = await api.getConfig();
       showToast("Settings saved");
     } catch (e) {
-      showToast("Failed to save: " + e, true);
+      showToast("Failed to save: " + formatError(e), true);
     }
   });
 
@@ -234,7 +239,7 @@ function setupSettingsSave() {
 function setupMenuAndAbout() {
   // Open Log Folder button
   $("#open-logs").addEventListener("click", () => {
-    api.openLogFolder().catch((e) => showToast("Failed to open logs: " + e, true));
+    api.openLogFolder().catch((e) => showToast("Failed to open logs: " + formatError(e), true));
   });
 
   // Hamburger toggles settings sidebar
@@ -340,7 +345,7 @@ function setupRefreshButton() {
         warnNoEthernet();
       }
     } catch (e) {
-      showToast("Refresh failed: " + e, true);
+      showToast("Refresh failed: " + formatError(e), true);
     } finally {
       btn.disabled = false;
       btn.classList.remove("spinning");
@@ -361,7 +366,7 @@ function setupRefreshButton() {
       await api.startArpDiscovery(state.activeInterface.name);
       await loadExistingArpState();
     } catch (e) {
-      showToast("Refresh failed: " + e, true);
+      showToast("Refresh failed: " + formatError(e), true);
     } finally {
       btn.disabled = false;
       btn.classList.remove("spinning");
@@ -415,7 +420,7 @@ function setupResetAdapterButton() {
         api.startArpDiscovery(state.activeInterface.name).catch(() => {});
       }
     } catch (e) {
-      showToast("Reset failed: " + e, true);
+      showToast("Reset failed: " + formatError(e), true);
     } finally {
       btn.disabled = false;
       btn.classList.remove("spinning");

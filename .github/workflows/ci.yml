@@ -32,9 +32,9 @@ jobs:
           components: clippy, rustfmt
 
       # GStreamer dev libs via apt — fast, no bot-protection issues.
-      # Windows-specific code (#[cfg(windows)]) is skipped by the
-      # compiler on Linux; full Windows testing is done locally via
-      # scripts/check.ps1 before pushing.
+      # The Linux job exists to gate fmt/clippy/audit and to type-check
+      # the cross-platform halves of the codebase. The Windows-only
+      # halves (#[cfg(windows)]) are gated by the `windows` job below.
       - name: Install system dev libs (GStreamer + Tauri/GTK)
         run: |
           sudo apt-get update -qq
@@ -79,6 +79,75 @@ jobs:
       - name: cargo clippy
         working-directory: src-tauri
         run: cargo clippy --all-targets --no-deps -- -D warnings
+
+  windows:
+    name: Rust Compile (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Install GStreamer SDK via Chocolatey. Both packages are required:
+      # `gstreamer` provides the runtime DLLs, `gstreamer-devel` provides
+      # the .lib import libraries that gstreamer-rs needs at link time
+      # (build.rs delay-loads the DLLs but link still resolves symbols
+      # against the .libs). Pinning the version keeps CI deterministic.
+      - name: Install GStreamer (MSVC x86_64)
+        shell: pwsh
+        run: |
+          choco install gstreamer --version=1.24.10 --no-progress -y
+          choco install gstreamer-devel --version=1.24.10 --no-progress -y
+
+      - name: Configure GStreamer environment
+        shell: pwsh
+        run: |
+          # gstreamer-rs locates the SDK via this env var. The trailing
+          # backslash matters — gstreamer-rs's build script joins paths
+          # with raw concatenation in places.
+          "GSTREAMER_1_0_ROOT_MSVC_X86_64=C:\gstreamer\1.0\msvc_x86_64\" `
+            | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "PKG_CONFIG_PATH=C:\gstreamer\1.0\msvc_x86_64\lib\pkgconfig" `
+            | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # Put bin/ on PATH so any DLLs needed at link-stage helper-tool
+          # invocation are resolvable.
+          "C:\gstreamer\1.0\msvc_x86_64\bin" `
+            | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      # tauri-build needs the frontend dist directory to exist and
+      # validates bundle resource globs at compile time.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+
+      - name: Create resource placeholders
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path src-tauri\resources\gstreamer\bin | Out-Null
+          New-Item -ItemType Directory -Force -Path src-tauri\resources\gstreamer\lib\gstreamer-1.0 | Out-Null
+          New-Item -ItemType Directory -Force -Path src-tauri\resources\prerequisites | Out-Null
+          New-Item -ItemType File -Force -Path src-tauri\resources\gstreamer\bin\.gitkeep | Out-Null
+          New-Item -ItemType File -Force -Path src-tauri\resources\gstreamer\lib\gstreamer-1.0\.gitkeep | Out-Null
+          New-Item -ItemType File -Force -Path src-tauri\resources\prerequisites\.gitkeep | Out-Null
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: windows
+
+      # Compile the entire crate, including the #[cfg(windows)] halves
+      # that the Linux job can't see. Tests aren't *run* — many depend on
+      # local resources (GStreamer plugin registry, real network adapters)
+      # and CI runners aren't a faithful production environment for them.
+      # `cargo build --tests` still type-checks every test, which is the
+      # actual gap we're closing here.
+      - name: cargo build (lib + tests)
+        working-directory: src-tauri
+        run: cargo build --lib --tests
 
   audit:
     name: Security Audit

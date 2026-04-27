@@ -42,7 +42,7 @@ export function setupStreamControls() {
         updateStreamUI();
         showToast("Stream stopped");
       } catch (e) {
-        showToast("Failed to stop: " + e, true);
+        showToast("Failed to stop: " + formatError(e), true);
       }
     } else {
       try {
@@ -63,7 +63,7 @@ export function setupStreamControls() {
         startStatusPolling();
         showToast("Stream started");
       } catch (e) {
-        showToast("Stream failed: " + e, true);
+        showToast("Stream failed: " + formatError(e), true);
       }
     }
   });
@@ -73,7 +73,7 @@ export function setupStreamControls() {
       const path = await api.takeScreenshot();
       showToast("Screenshot saved: " + path);
     } catch (e) {
-      showToast("Screenshot failed: " + e, true);
+      showToast("Screenshot failed: " + formatError(e), true);
     }
   });
 
@@ -135,7 +135,7 @@ export async function setupRtspControls() {
     try {
       await api.saveConfig(state.config);
     } catch (e) {
-      showToast("Failed to save VPN selection: " + e, true);
+      showToast("Failed to save VPN selection: " + formatError(e), true);
     }
   });
 
@@ -150,7 +150,7 @@ export async function setupRtspControls() {
         updateRtspUI(null);
         showToast("RTSP server stopped");
       } catch (e) {
-        showToast("Failed to stop: " + e, true);
+        showToast("Failed to stop: " + formatError(e), true);
       }
     } else {
       try {
@@ -166,7 +166,7 @@ export async function setupRtspControls() {
         startStatusPolling();
         showToast("RTSP server started");
       } catch (e) {
-        showToast("RTSP server failed: " + e, true);
+        showToast("RTSP server failed: " + formatError(e), true);
       }
     }
 
@@ -407,12 +407,12 @@ export async function handleReconnect() {
         rtspFullUrl = info.rtsp_url;
         updateRtspUI(info.display_url);
       } catch (e) {
-        log(`RTSP auto-resume failed: ${e}`);
+        log(`RTSP auto-resume failed: ${formatError(e)}`);
         showToast("Stream back — RTSP server failed to resume", true);
       }
     }
   } catch (e) {
-    log(`Stream auto-resume failed: ${e}`);
+    log(`Stream auto-resume failed: ${formatError(e)}`);
     showToast("Auto-resume failed — restart stream manually", true);
   }
 }

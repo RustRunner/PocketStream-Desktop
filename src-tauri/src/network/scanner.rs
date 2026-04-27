@@ -1,7 +1,9 @@
 use serde::Serialize;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::error::AppError;
@@ -26,7 +28,16 @@ const PROBE_PORTS: &[u16] = &[
 ];
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-const MAX_CONCURRENT: usize = 64;
+
+/// Maximum simultaneous TCP connect attempts across the whole scan.
+///
+/// Bounds the total in-flight count regardless of how many hosts or
+/// ports are involved. Without this, a /24 × 7 PROBE_PORTS could fan
+/// out to 1778 concurrent connects, enough to saturate slower links
+/// or trip IDS heuristics. The previous implementation only bounded
+/// per-host parallelism, which still allowed 64 hosts × 7 ports = 448
+/// concurrent connects at peak.
+const MAX_CONCURRENT_CONNECTS: usize = 64;
 
 /// Scan a subnet (e.g. "192.168.1.0/24") for reachable hosts.
 pub async fn scan(subnet: &str) -> Result<Vec<ScanResult>, AppError> {
@@ -34,10 +45,10 @@ pub async fn scan(subnet: &str) -> Result<Vec<ScanResult>, AppError> {
         .parse()
         .map_err(|e| AppError::Network(format!("Invalid subnet: {}", e)))?;
 
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTS));
     let hosts: Vec<IpAddr> = network.iter().collect();
     let mut results = Vec::new();
     let mut join_set = JoinSet::new();
-    let mut pending = 0;
 
     for host in hosts {
         // Skip network and broadcast addresses for /24+
@@ -50,24 +61,9 @@ pub async fn scan(subnet: &str) -> Result<Vec<ScanResult>, AppError> {
                 continue;
             }
         }
-
-        join_set.spawn(probe_host(host));
-        pending += 1;
-
-        // Limit concurrency
-        if pending >= MAX_CONCURRENT {
-            if let Some(result) = join_set.join_next().await {
-                pending -= 1;
-                if let Ok(scan_result) = result {
-                    if scan_result.reachable {
-                        results.push(scan_result);
-                    }
-                }
-            }
-        }
+        join_set.spawn(probe_host(host, semaphore.clone()));
     }
 
-    // Collect remaining
     while let Some(result) = join_set.join_next().await {
         if let Ok(scan_result) = result {
             if scan_result.reachable {
@@ -80,20 +76,29 @@ pub async fn scan(subnet: &str) -> Result<Vec<ScanResult>, AppError> {
     Ok(results)
 }
 
-async fn probe_host(ip: IpAddr) -> ScanResult {
-    probe_host_at(ip, PROBE_PORTS).await
+async fn probe_host(ip: IpAddr, semaphore: Arc<Semaphore>) -> ScanResult {
+    probe_host_at(ip, PROBE_PORTS, semaphore).await
 }
 
 /// Probe `ip` against an arbitrary port list. Split out from `probe_host`
 /// so tests can inject ephemeral OS-assigned ports instead of the
 /// hardcoded `PROBE_PORTS` set (which would collide with real services
-/// on a developer's machine).
-async fn probe_host_at(ip: IpAddr, ports: &[u16]) -> ScanResult {
+/// on a developer's machine). The `semaphore` argument bounds total
+/// in-flight connect attempts across all callers sharing it; tests can
+/// pass a generous one (or one with a single permit to verify
+/// serialisation).
+async fn probe_host_at(ip: IpAddr, ports: &[u16], semaphore: Arc<Semaphore>) -> ScanResult {
     let mut set = JoinSet::new();
 
     for &port in ports {
         let addr = SocketAddr::new(ip, port);
+        let sem = semaphore.clone();
         set.spawn(async move {
+            // Acquire one permit per TCP connect. The semaphore is never
+            // closed in production, so `acquire` only fails if the
+            // runtime is shutting down — in which case skipping the
+            // probe is the right thing to do.
+            let _permit = sem.acquire().await.ok()?;
             match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
                 Ok(Ok(_)) => Some(port),
                 _ => None,
@@ -133,10 +138,20 @@ mod tests {
         (listener, port)
     }
 
+    /// Generous semaphore for tests that don't care about throttling.
+    fn unbounded_semaphore() -> Arc<Semaphore> {
+        Arc::new(Semaphore::new(64))
+    }
+
     #[tokio::test]
     async fn probe_host_at_finds_listening_port() {
         let (_listener, port) = bind_loopback().await;
-        let result = probe_host_at(IpAddr::V4(Ipv4Addr::LOCALHOST), &[port]).await;
+        let result = probe_host_at(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            &[port],
+            unbounded_semaphore(),
+        )
+        .await;
         assert!(
             result.reachable,
             "expected loopback:{} to be reachable",
@@ -157,7 +172,12 @@ mod tests {
             drop(listener);
             port
         };
-        let result = probe_host_at(IpAddr::V4(Ipv4Addr::LOCALHOST), &[port]).await;
+        let result = probe_host_at(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            &[port],
+            unbounded_semaphore(),
+        )
+        .await;
         assert!(
             !result.reachable,
             "expected closed port {} to be unreachable",
@@ -174,10 +194,34 @@ mod tests {
             drop(listener);
             port
         };
-        let result =
-            probe_host_at(IpAddr::V4(Ipv4Addr::LOCALHOST), &[open_port, closed_port]).await;
+        let result = probe_host_at(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            &[open_port, closed_port],
+            unbounded_semaphore(),
+        )
+        .await;
         assert!(result.reachable);
         assert_eq!(result.open_ports, vec![open_port]);
+    }
+
+    #[tokio::test]
+    async fn probe_host_at_serialises_under_single_permit_semaphore() {
+        // Smoke test that the semaphore wiring works: with only one
+        // permit, three connects must all succeed sequentially. This
+        // catches a regression where the permit isn't acquired before
+        // the connect (which would silently fan out unbounded again).
+        let (_a, port_a) = bind_loopback().await;
+        let (_b, port_b) = bind_loopback().await;
+        let (_c, port_c) = bind_loopback().await;
+        let sem = Arc::new(Semaphore::new(1));
+        let result = probe_host_at(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            &[port_a, port_b, port_c],
+            sem,
+        )
+        .await;
+        assert!(result.reachable);
+        assert_eq!(result.open_ports.len(), 3);
     }
 
     #[tokio::test]

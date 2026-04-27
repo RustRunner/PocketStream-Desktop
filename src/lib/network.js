@@ -3,9 +3,10 @@
  */
 
 import * as api from "./tauri-api.js";
-import { $, $$, state, adoptedSubnets, nodeAliases, arpDevices, tcpScanResults, showToast } from "./state.js";
+import { $, $$, state, adoptedSubnets, nodeAliases, arpDevices, tcpScanResults, showToast, log } from "./state.js";
 import { resetDiscoveryStatus, hideDiscoveryStatus, renderArpDeviceList } from "./devices.js";
 import { handleHardDisconnect, handleReconnect } from "./streaming.js";
+import { formatError } from "./errors.js";
 
 // ── Interface discovery ─────────────────────────────────────────────
 
@@ -171,7 +172,7 @@ export function setupInterfaceWatcher() {
         // Restart the stream (and RTSP server) if they were running
         // before the disconnect. Fires in the background; failures
         // surface as toasts inside handleReconnect.
-        handleReconnect().catch((e) => log(`Auto-resume: ${e}`));
+        handleReconnect().catch((e) => log(`Auto-resume: ${formatError(e)}`));
       }
     }
   });
@@ -237,7 +238,7 @@ export function renderSubnetList() {
         renderSubnetList();
         showToast("Removed adopted IP");
       } catch (err) {
-        showToast("Failed to remove: " + err, true);
+        showToast("Failed to remove: " + formatError(err), true);
       }
     });
   });
@@ -451,7 +452,7 @@ function renderSecondaryIps(iface, primary) {
         showToast(`Removed ${ip}`);
         await reloadDialogInterfaces();
       } catch (e) {
-        showToast("Failed: " + e, true);
+        showToast("Failed: " + formatError(e), true);
       }
       spinner.style.display = "none";
     });

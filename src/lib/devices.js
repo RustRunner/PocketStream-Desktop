@@ -27,6 +27,7 @@ import {
   offlineDevices,
   cachedOnlyMacs,
 } from "./device-cache.js";
+import { formatError } from "./errors.js";
 
 // ── Subnet helpers ──────────────────────────────────────────────────
 
@@ -325,7 +326,7 @@ async function scanDevicePorts(ip, attempt = 0) {
       }
     }
   } catch (e) {
-    log(`Port scan failed for ${ip}: ${e}`);
+    log(`Port scan failed for ${ip}: ${formatError(e)}`);
     scannedIps.delete(ip);
     if (attempt < MAX_SCAN_RETRIES) {
       setTimeout(() => scanDevicePorts(ip, attempt + 1), RETRY_DELAY_MS);

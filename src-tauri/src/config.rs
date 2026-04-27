@@ -110,6 +110,22 @@ impl Default for AppSettings {
     }
 }
 
+impl AppSettings {
+    /// Apply only the user-editable sections (`stream`, `rtsp_server`,
+    /// `credentials`) from `incoming`, leaving backend-owned fields
+    /// (`adopted_subnets`, `device_cache`, `zoom_positions`) untouched.
+    ///
+    /// `save_config` runs this so a frontend payload that omits a
+    /// backend-owned field can't wipe it. Without the guard, the field
+    /// deserializes via `#[serde(default)]` to an empty value and the
+    /// next persist replaces the canonical state with empty.
+    pub fn merge_user_fields(&mut self, incoming: AppSettings) {
+        self.stream = incoming.stream;
+        self.rtsp_server = incoming.rtsp_server;
+        self.credentials = incoming.credentials;
+    }
+}
+
 pub struct AppConfig {
     pub settings: Mutex<AppSettings>,
 }
@@ -149,6 +165,57 @@ impl AppConfig {
             Err(poisoned) => {
                 log::error!("Config mutex poisoned during update, recovering");
                 *poisoned.into_inner() = new_settings;
+            }
+        }
+        self.save()
+    }
+
+    /// Apply user-editable sections from `incoming` and persist, preserving
+    /// backend-owned fields. Use from IPC handlers that take a full
+    /// `AppSettings` from the frontend; see `AppSettings::merge_user_fields`
+    /// for the rationale.
+    pub fn merge_user_settings(&self, incoming: AppSettings) -> Result<(), crate::AppError> {
+        match self.settings.lock() {
+            Ok(mut guard) => guard.merge_user_fields(incoming),
+            Err(poisoned) => {
+                log::error!("Config mutex poisoned during merge, recovering");
+                poisoned.into_inner().merge_user_fields(incoming);
+            }
+        }
+        self.save()
+    }
+
+    /// Replace just the stream config and persist.
+    pub fn update_stream(&self, stream: StreamConfig) -> Result<(), crate::AppError> {
+        match self.settings.lock() {
+            Ok(mut guard) => guard.stream = stream,
+            Err(poisoned) => {
+                log::error!("Config mutex poisoned during update_stream, recovering");
+                poisoned.into_inner().stream = stream;
+            }
+        }
+        self.save()
+    }
+
+    /// Replace just the RTSP server config and persist.
+    pub fn update_rtsp(&self, rtsp_server: RtspServerConfig) -> Result<(), crate::AppError> {
+        match self.settings.lock() {
+            Ok(mut guard) => guard.rtsp_server = rtsp_server,
+            Err(poisoned) => {
+                log::error!("Config mutex poisoned during update_rtsp, recovering");
+                poisoned.into_inner().rtsp_server = rtsp_server;
+            }
+        }
+        self.save()
+    }
+
+    /// Replace just the credentials and persist.
+    pub fn update_credentials(&self, credentials: Credentials) -> Result<(), crate::AppError> {
+        match self.settings.lock() {
+            Ok(mut guard) => guard.credentials = credentials,
+            Err(poisoned) => {
+                log::error!("Config mutex poisoned during update_credentials, recovering");
+                poisoned.into_inner().credentials = credentials;
             }
         }
         self.save()
@@ -601,5 +668,103 @@ mod tests {
         let k1 = get_or_create_key().unwrap();
         let k2 = get_or_create_key().unwrap();
         assert_eq!(k1, k2, "Same key should be returned on subsequent calls");
+    }
+
+    // ── User-Settings Merge ─────────────────────────────────────────
+    // Regression for the prior `save_config` behavior, where a frontend
+    // payload that omitted `device_cache` (or any other backend-owned
+    // field) would deserialize via serde-default to empty and the next
+    // save would persist the empty value, wiping cached devices on the
+    // next startup.
+
+    #[test]
+    fn merge_user_fields_preserves_device_cache() {
+        let mut current = AppSettings::default();
+        current.device_cache.push(CachedDevice {
+            mac: "AA:BB:CC:DD:EE:FF".into(),
+            ip: "192.168.1.10".into(),
+            subnet: "192.168.1.0/24".into(),
+            open_ports: vec![80, 443],
+            alias: "Test Camera".into(),
+            last_seen: "2026-04-27T12:00:00Z".into(),
+        });
+
+        // Frontend sends a payload that defaulted device_cache to empty.
+        let incoming = AppSettings::default();
+        current.merge_user_fields(incoming);
+
+        assert_eq!(
+            current.device_cache.len(),
+            1,
+            "device_cache must survive a save_config that omits it"
+        );
+        assert_eq!(current.device_cache[0].mac, "AA:BB:CC:DD:EE:FF");
+        assert_eq!(current.device_cache[0].alias, "Test Camera");
+    }
+
+    #[test]
+    fn merge_user_fields_preserves_adopted_subnets() {
+        let mut current = AppSettings::default();
+        current
+            .adopted_subnets
+            .insert("192.168.1.0/24".into(), "192.168.1.50".into());
+
+        let incoming = AppSettings::default();
+        current.merge_user_fields(incoming);
+
+        assert_eq!(current.adopted_subnets.len(), 1);
+        assert_eq!(
+            current.adopted_subnets.get("192.168.1.0/24"),
+            Some(&"192.168.1.50".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_user_fields_preserves_zoom_positions() {
+        let mut current = AppSettings::default();
+        current.zoom_positions.insert("192.168.1.10".into(), 75);
+
+        let incoming = AppSettings::default();
+        current.merge_user_fields(incoming);
+
+        assert_eq!(current.zoom_positions.len(), 1);
+        assert_eq!(current.zoom_positions.get("192.168.1.10"), Some(&75));
+    }
+
+    #[test]
+    fn merge_user_fields_applies_user_editable_fields() {
+        let mut current = AppSettings::default();
+        let mut incoming = AppSettings::default();
+        incoming.stream.protocol = "udp".into();
+        incoming.stream.rtsp_port = 9999;
+        incoming.rtsp_server.enabled = true;
+        incoming.rtsp_server.port = 7777;
+        incoming.credentials.username = "admin".into();
+        incoming.credentials.password = "hunter2".into();
+
+        current.merge_user_fields(incoming);
+
+        assert_eq!(current.stream.protocol, "udp");
+        assert_eq!(current.stream.rtsp_port, 9999);
+        assert!(current.rtsp_server.enabled);
+        assert_eq!(current.rtsp_server.port, 7777);
+        assert_eq!(current.credentials.username, "admin");
+        assert_eq!(current.credentials.password, "hunter2");
+    }
+
+    #[test]
+    fn merge_user_fields_clears_user_editable_fields_when_incoming_empty() {
+        // Sanity check: user-editable fields are *replaced*, not merged
+        // within. An empty username in `incoming` must clear the existing
+        // value — otherwise a user can't actually unset a credential.
+        let mut current = AppSettings::default();
+        current.credentials.username = "old_user".into();
+        current.credentials.password = "old_pass".into();
+
+        let incoming = AppSettings::default();
+        current.merge_user_fields(incoming);
+
+        assert!(current.credentials.username.is_empty());
+        assert!(current.credentials.password.is_empty());
     }
 }

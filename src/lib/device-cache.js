@@ -27,6 +27,7 @@ import {
 // inside function bodies (never at module top-level), which is the case
 // for both directions here.
 import { renderArpDeviceList, hasRouteToSubnet, markIpScanned, isIpScanned } from "./devices.js";
+import { formatError } from "./errors.js";
 
 // ── Cache state (exported for the render path in devices.js) ───────
 
@@ -70,7 +71,7 @@ export async function loadDeviceCache() {
   try {
     cache = await api.getDeviceCache();
   } catch (e) {
-    log(`Failed to load device cache: ${e}`);
+    log(`Failed to load device cache: ${formatError(e)}`);
     return;
   }
   if (!cache || cache.length === 0) return;
@@ -166,7 +167,7 @@ async function fastVerifyCachedDevice(ip, attempt = 0) {
     }
   } catch (e) {
     // Verification failure isn't fatal — keep the cached entry visible.
-    log(`Cache verify failed for ${ip} (attempt ${attempt + 1}): ${e}`);
+    log(`Cache verify failed for ${ip} (attempt ${attempt + 1}): ${formatError(e)}`);
   }
 
   if (verified) {
@@ -201,7 +202,7 @@ export function persistDeviceToCache(device, openPorts) {
     last_seen: new Date().toISOString(),
   };
   api.upsertCachedDevice(entry).catch((e) => {
-    log(`Failed to persist device to cache: ${e}`);
+    log(`Failed to persist device to cache: ${formatError(e)}`);
   });
 }
 
@@ -329,7 +330,7 @@ async function forgetCachedDevice(mac) {
   try {
     await api.removeCachedDevice(mac);
   } catch (e) {
-    log(`Failed to remove cached device ${mac}: ${e}`);
+    log(`Failed to remove cached device ${mac}: ${formatError(e)}`);
   }
   renderArpDeviceList();
 }

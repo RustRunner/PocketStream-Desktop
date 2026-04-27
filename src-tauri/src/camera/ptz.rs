@@ -66,7 +66,9 @@ pub async fn continuous_move(
     //   </Velocity>
     // </ContinuousMove>
 
-    Ok(())
+    Err(AppError::Camera(
+        "PTZ continuous move not yet implemented".into(),
+    ))
 }
 
 /// Stop all PTZ movement.
@@ -81,7 +83,7 @@ pub async fn stop(camera_url: &str) -> Result<(), AppError> {
     //   <Zoom>true</Zoom>
     // </Stop>
 
-    Ok(())
+    Err(AppError::Camera("PTZ stop not yet implemented".into()))
 }
 
 /// Move camera to a saved preset position.
@@ -95,7 +97,9 @@ pub async fn goto_preset(camera_url: &str, preset: u32) -> Result<(), AppError> 
     //   <PresetToken>{preset}</PresetToken>
     // </GotoPreset>
 
-    Ok(())
+    Err(AppError::Camera(
+        "PTZ goto preset not yet implemented".into(),
+    ))
 }
 
 /// Save the current camera position as a preset.
@@ -110,7 +114,9 @@ pub async fn set_preset(camera_url: &str, preset: u32, name: &str) -> Result<(),
     //   <PresetToken>{preset}</PresetToken>
     // </SetPreset>
 
-    Ok(())
+    Err(AppError::Camera(
+        "PTZ set preset not yet implemented".into(),
+    ))
 }
 
 /// List all saved presets on the camera.
@@ -120,5 +126,52 @@ pub async fn get_presets(camera_url: &str) -> Result<Vec<PtzPreset>, AppError> {
 
     // TODO: Send ONVIF GetPresets SOAP request
 
-    Ok(vec![])
+    Err(AppError::Camera(
+        "PTZ get presets not yet implemented".into(),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const URL: &str = "http://192.0.2.1/onvif/ptz_service";
+
+    #[tokio::test]
+    async fn continuous_move_returns_not_implemented_error() {
+        let result = continuous_move(URL, 0.5, -0.3, 0.0).await;
+        assert!(
+            result.is_err(),
+            "PTZ continuous_move must not silently no-op"
+        );
+        if let Err(AppError::Camera(msg)) = result {
+            assert!(msg.to_lowercase().contains("not yet implemented"));
+        } else {
+            panic!("expected AppError::Camera, got {:?}", result);
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_returns_not_implemented_error() {
+        let result = stop(URL).await;
+        assert!(result.is_err(), "PTZ stop must not silently no-op");
+    }
+
+    #[tokio::test]
+    async fn goto_preset_returns_not_implemented_error() {
+        let result = goto_preset(URL, 1).await;
+        assert!(result.is_err(), "PTZ goto_preset must not silently no-op");
+    }
+
+    #[tokio::test]
+    async fn set_preset_returns_not_implemented_error() {
+        let result = set_preset(URL, 1, "home").await;
+        assert!(result.is_err(), "PTZ set_preset must not silently no-op");
+    }
+
+    #[tokio::test]
+    async fn get_presets_returns_not_implemented_error() {
+        let result = get_presets(URL).await;
+        assert!(result.is_err(), "PTZ get_presets must not silently no-op");
+    }
 }
