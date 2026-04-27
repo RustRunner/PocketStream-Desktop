@@ -8,14 +8,15 @@ const invoke = window.__TAURI__?.core?.invoke;
 
 export const state = {
   config: null,
-  selectedDevice: null,
   activeInterface: null,
   isStreaming: false,
   isRtspRunning: false,
   isRecording: false,
   statusPollInterval: null,
-  lastSubnetResults: [],
 };
+// `selectedDevice` and `lastSubnetResults` previously lived here; they
+// are now in src/lib/store.js with subscribe/notify accessors. New
+// shared mutable state should land in store.js, not here.
 
 // Reference-type collections shared across modules
 export const nodeAliases = new Map();   // IP -> alias string

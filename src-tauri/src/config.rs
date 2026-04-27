@@ -71,10 +71,6 @@ pub struct AppSettings {
     /// Auto-adopted subnet IPs: subnet string -> adopted IP address
     #[serde(default)]
     pub adopted_subnets: HashMap<String, String>,
-    /// Cached devices from prior sessions, keyed by MAC.
-    /// Loaded at startup to render the nodes panel before any network activity.
-    #[serde(default)]
-    pub device_cache: Vec<CachedDevice>,
     /// Last zoom slider position (0–100 %) per camera IP.
     /// Restored on launch so the slider doesn't reset to Wide when the
     /// camera is still pointed at the last-set zoom. Stored as percent
@@ -104,7 +100,6 @@ impl Default for AppSettings {
                 password: String::new(),
             },
             adopted_subnets: HashMap::new(),
-            device_cache: Vec::new(),
             zoom_positions: HashMap::new(),
         }
     }
@@ -113,12 +108,11 @@ impl Default for AppSettings {
 impl AppSettings {
     /// Apply only the user-editable sections (`stream`, `rtsp_server`,
     /// `credentials`) from `incoming`, leaving backend-owned fields
-    /// (`adopted_subnets`, `device_cache`, `zoom_positions`) untouched.
-    ///
-    /// `save_config` runs this so a frontend payload that omits a
-    /// backend-owned field can't wipe it. Without the guard, the field
-    /// deserializes via `#[serde(default)]` to an empty value and the
-    /// next persist replaces the canonical state with empty.
+    /// (`adopted_subnets`, `zoom_positions`) untouched. The device cache
+    /// is no longer part of `AppSettings` at all (lives in its own
+    /// file — see `cache_path`), so `save_config` is structurally
+    /// incapable of wiping it now; this merge still guards the other
+    /// two backend-owned fields against the same class of bug.
     pub fn merge_user_fields(&mut self, incoming: AppSettings) {
         self.stream = incoming.stream;
         self.rtsp_server = incoming.rtsp_server;
@@ -126,15 +120,60 @@ impl AppSettings {
     }
 }
 
+/// On-disk shape of `device_cache.toml`. Wrapping `Vec<CachedDevice>`
+/// in a struct makes the file land as `[[devices]]` array-of-tables
+/// rather than a bare top-level array, which is more forgiving to
+/// hand-edit and lets us add sibling fields later without breaking
+/// older readers.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct CacheFile {
+    #[serde(default)]
+    devices: Vec<CachedDevice>,
+}
+
 pub struct AppConfig {
     pub settings: Mutex<AppSettings>,
+    /// Cached devices from prior sessions, keyed by MAC. Stored in
+    /// `device_cache.toml` separately from settings so that any future
+    /// settings-save bug structurally cannot wipe the cache. Mutated
+    /// only via `upsert_cached_device` / `remove_cached_device` /
+    /// `clear_device_cache`.
+    cache: Mutex<Vec<CachedDevice>>,
 }
 
 impl AppConfig {
     pub fn load_or_default() -> Self {
         let settings = load_from_disk().unwrap_or_default();
+
+        // Cache loading: prefer the dedicated file. If it doesn't exist,
+        // try to migrate the legacy `device_cache` field that lived in
+        // `config.toml` before this split (one-time read, then we never
+        // look there again — the next config.toml save naturally drops
+        // the field since AppSettings doesn't contain it anymore).
+        let cache = match load_cache_from_disk() {
+            Some(c) => c,
+            None => {
+                let migrated = std::fs::read_to_string(config_path())
+                    .ok()
+                    .and_then(|content| extract_legacy_device_cache(&content))
+                    .unwrap_or_default();
+                if !migrated.is_empty() {
+                    log::info!(
+                        "Migrating {} cached device(s) from legacy config.toml \
+                         to device_cache.toml",
+                        migrated.len()
+                    );
+                    if let Err(e) = save_cache_to_disk(&migrated) {
+                        log::warn!("Failed to write migrated cache file: {}", e);
+                    }
+                }
+                migrated
+            }
+        };
+
         Self {
             settings: Mutex::new(settings),
+            cache: Mutex::new(cache),
         }
     }
 
@@ -221,51 +260,61 @@ impl AppConfig {
         self.save()
     }
 
+    /// Snapshot of the current device cache. Returns a clone so the
+    /// caller can drop the lock immediately.
+    pub fn get_cache(&self) -> Vec<CachedDevice> {
+        match self.cache.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => {
+                log::error!("Cache mutex poisoned during get, recovering");
+                poisoned.into_inner().clone()
+            }
+        }
+    }
+
     /// Insert or update a cached device entry (keyed by MAC).
-    /// Persists the full settings to disk after mutation.
+    /// Persists the cache file after mutation.
     pub fn upsert_cached_device(&self, device: CachedDevice) -> Result<(), crate::AppError> {
-        match self.settings.lock() {
+        match self.cache.lock() {
             Ok(mut guard) => {
-                let cache = &mut guard.device_cache;
-                if let Some(existing) = cache.iter_mut().find(|d| d.mac == device.mac) {
+                if let Some(existing) = guard.iter_mut().find(|d| d.mac == device.mac) {
                     *existing = device;
                 } else {
-                    cache.push(device);
+                    guard.push(device);
                 }
             }
             Err(poisoned) => {
-                log::error!("Config mutex poisoned during cache upsert, recovering");
+                log::error!("Cache mutex poisoned during upsert, recovering");
                 let mut guard = poisoned.into_inner();
-                let cache = &mut guard.device_cache;
-                if let Some(existing) = cache.iter_mut().find(|d| d.mac == device.mac) {
+                if let Some(existing) = guard.iter_mut().find(|d| d.mac == device.mac) {
                     *existing = device;
                 } else {
-                    cache.push(device);
+                    guard.push(device);
                 }
             }
         }
-        self.save()
+        self.save_cache()
     }
 
     /// Remove a cached device by MAC address.
     /// No-op if the MAC is not present.
     pub fn remove_cached_device(&self, mac: &str) -> Result<(), crate::AppError> {
-        let removed = match self.settings.lock() {
+        let removed = match self.cache.lock() {
             Ok(mut guard) => {
-                let before = guard.device_cache.len();
-                guard.device_cache.retain(|d| d.mac != mac);
-                before != guard.device_cache.len()
+                let before = guard.len();
+                guard.retain(|d| d.mac != mac);
+                before != guard.len()
             }
             Err(poisoned) => {
-                log::error!("Config mutex poisoned during cache remove, recovering");
+                log::error!("Cache mutex poisoned during remove, recovering");
                 let mut guard = poisoned.into_inner();
-                let before = guard.device_cache.len();
-                guard.device_cache.retain(|d| d.mac != mac);
-                before != guard.device_cache.len()
+                let before = guard.len();
+                guard.retain(|d| d.mac != mac);
+                before != guard.len()
             }
         };
         if removed {
-            self.save()
+            self.save_cache()
         } else {
             Ok(())
         }
@@ -273,14 +322,25 @@ impl AppConfig {
 
     /// Clear the entire device cache.
     pub fn clear_device_cache(&self) -> Result<(), crate::AppError> {
-        match self.settings.lock() {
-            Ok(mut guard) => guard.device_cache.clear(),
+        match self.cache.lock() {
+            Ok(mut guard) => guard.clear(),
             Err(poisoned) => {
-                log::error!("Config mutex poisoned during cache clear, recovering");
-                poisoned.into_inner().device_cache.clear();
+                log::error!("Cache mutex poisoned during clear, recovering");
+                poisoned.into_inner().clear();
             }
         }
-        self.save()
+        self.save_cache()
+    }
+
+    fn save_cache(&self) -> Result<(), crate::AppError> {
+        let cache = match self.cache.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => {
+                log::error!("Cache mutex poisoned during save, recovering");
+                poisoned.into_inner().clone()
+            }
+        };
+        save_cache_to_disk(&cache)
     }
 }
 
@@ -294,8 +354,39 @@ fn config_path() -> PathBuf {
     config_dir().join("config.toml")
 }
 
+fn cache_path() -> PathBuf {
+    config_dir().join("device_cache.toml")
+}
+
 fn key_path() -> PathBuf {
     config_dir().join(".key")
+}
+
+fn load_cache_from_disk() -> Option<Vec<CachedDevice>> {
+    let content = fs::read_to_string(cache_path()).ok()?;
+    let parsed: CacheFile = toml::from_str(&content).ok()?;
+    Some(parsed.devices)
+}
+
+fn save_cache_to_disk(cache: &[CachedDevice]) -> Result<(), crate::AppError> {
+    let dir = config_dir();
+    fs::create_dir_all(&dir).map_err(|e| crate::AppError::Config(e.to_string()))?;
+    let file = CacheFile {
+        devices: cache.to_vec(),
+    };
+    let content =
+        toml::to_string_pretty(&file).map_err(|e| crate::AppError::Config(e.to_string()))?;
+    fs::write(cache_path(), content).map_err(|e| crate::AppError::Config(e.to_string()))?;
+    Ok(())
+}
+
+/// Pull the legacy `device_cache` array out of an older `config.toml`
+/// that pre-dates the cache-file split. Returns `None` if the field is
+/// absent or unparseable. One-shot use during `load_or_default` only.
+fn extract_legacy_device_cache(toml_content: &str) -> Option<Vec<CachedDevice>> {
+    let value: toml::Value = toml::from_str(toml_content).ok()?;
+    let cache_value = value.get("device_cache")?.clone();
+    cache_value.try_into().ok()
 }
 
 fn load_from_disk() -> Option<AppSettings> {
@@ -617,7 +708,6 @@ mod tests {
                 password: "secret".into(),
             },
             adopted_subnets: std::collections::HashMap::new(),
-            device_cache: Vec::new(),
             zoom_positions: std::collections::HashMap::new(),
         };
         let toml_str = toml::to_string_pretty(&settings).unwrap();
@@ -672,34 +762,27 @@ mod tests {
 
     // ── User-Settings Merge ─────────────────────────────────────────
     // Regression for the prior `save_config` behavior, where a frontend
-    // payload that omitted `device_cache` (or any other backend-owned
-    // field) would deserialize via serde-default to empty and the next
-    // save would persist the empty value, wiping cached devices on the
-    // next startup.
+    // payload that omitted a backend-owned field would deserialize via
+    // serde-default to empty and the next save would persist the empty
+    // value. The device_cache angle is now structurally impossible
+    // (cache lives in its own file outside AppSettings); these tests
+    // still cover the remaining backend-owned fields.
 
     #[test]
-    fn merge_user_fields_preserves_device_cache() {
-        let mut current = AppSettings::default();
-        current.device_cache.push(CachedDevice {
-            mac: "AA:BB:CC:DD:EE:FF".into(),
-            ip: "192.168.1.10".into(),
-            subnet: "192.168.1.0/24".into(),
-            open_ports: vec![80, 443],
-            alias: "Test Camera".into(),
-            last_seen: "2026-04-27T12:00:00Z".into(),
-        });
-
-        // Frontend sends a payload that defaulted device_cache to empty.
-        let incoming = AppSettings::default();
-        current.merge_user_fields(incoming);
-
-        assert_eq!(
-            current.device_cache.len(),
-            1,
-            "device_cache must survive a save_config that omits it"
+    fn appsettings_no_longer_carries_device_cache() {
+        // Compile-time check that AppSettings doesn't accidentally
+        // regrow a `device_cache` field — if someone re-adds it the
+        // round-trip TOML would carry it, and we'd be back where T0.1
+        // started. The field name must not appear in the serialized
+        // form.
+        let s = AppSettings::default();
+        let toml_str = toml::to_string_pretty(&s).unwrap();
+        assert!(
+            !toml_str.contains("device_cache"),
+            "AppSettings must not serialize a device_cache field — \
+             the cache lives in device_cache.toml. Found:\n{}",
+            toml_str
         );
-        assert_eq!(current.device_cache[0].mac, "AA:BB:CC:DD:EE:FF");
-        assert_eq!(current.device_cache[0].alias, "Test Camera");
     }
 
     #[test]
@@ -766,5 +849,148 @@ mod tests {
 
         assert!(current.credentials.username.is_empty());
         assert!(current.credentials.password.is_empty());
+    }
+
+    // ── Device Cache File ───────────────────────────────────────────
+
+    #[test]
+    fn cache_path_ends_with_device_cache_toml() {
+        let path = cache_path();
+        assert_eq!(path.file_name().unwrap(), "device_cache.toml");
+        assert!(path.to_string_lossy().contains("PocketStream"));
+    }
+
+    #[test]
+    fn cache_file_toml_roundtrip() {
+        let original = CacheFile {
+            devices: vec![
+                CachedDevice {
+                    mac: "AA:BB:CC:DD:EE:FF".into(),
+                    ip: "192.168.1.10".into(),
+                    subnet: "192.168.1.0/24".into(),
+                    open_ports: vec![80, 554],
+                    alias: "Front".into(),
+                    last_seen: "2026-04-27T12:00:00Z".into(),
+                },
+                CachedDevice {
+                    mac: "11:22:33:44:55:66".into(),
+                    ip: "192.168.1.20".into(),
+                    subnet: "192.168.1.0/24".into(),
+                    open_ports: vec![],
+                    alias: String::new(),
+                    last_seen: "2026-04-27T12:00:00Z".into(),
+                },
+            ],
+        };
+        let toml_str = toml::to_string_pretty(&original).unwrap();
+        let parsed: CacheFile = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.devices.len(), 2);
+        assert_eq!(parsed.devices[0].mac, "AA:BB:CC:DD:EE:FF");
+        assert_eq!(parsed.devices[0].open_ports, vec![80, 554]);
+        assert_eq!(parsed.devices[1].alias, "");
+    }
+
+    #[test]
+    fn cache_file_default_is_empty() {
+        let parsed: CacheFile = toml::from_str("").unwrap();
+        assert!(parsed.devices.is_empty());
+    }
+
+    // ── Legacy Cache Migration ──────────────────────────────────────
+    // T1.10 split the cache out of config.toml into device_cache.toml.
+    // On first load after the upgrade, extract_legacy_device_cache
+    // pulls the old field out of an existing config.toml so the cache
+    // migrates instead of disappearing.
+
+    #[test]
+    fn extract_legacy_cache_returns_devices_when_field_present() {
+        let toml_content = r#"
+[stream]
+protocol = "rtsp"
+rtsp_port = 554
+rtsp_path = "/z3-1.sdp"
+udp_port = 8600
+camera_ip = ""
+
+[rtsp_server]
+enabled = false
+port = 8554
+token = "abc"
+
+[credentials]
+username = ""
+password = ""
+
+[[device_cache]]
+mac = "AA:BB:CC:DD:EE:FF"
+ip = "192.168.1.10"
+subnet = "192.168.1.0/24"
+open_ports = [80, 554]
+alias = "Cam"
+last_seen = "2026-04-27T12:00:00Z"
+"#;
+        let extracted = extract_legacy_device_cache(toml_content);
+        assert!(extracted.is_some(), "must extract legacy device_cache");
+        let cache = extracted.unwrap();
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache[0].mac, "AA:BB:CC:DD:EE:FF");
+        assert_eq!(cache[0].open_ports, vec![80, 554]);
+    }
+
+    #[test]
+    fn extract_legacy_cache_returns_none_when_field_absent() {
+        // A modern config.toml (post-T1.10) doesn't have device_cache.
+        // The migration path must recognise that and not invent data.
+        let toml_content = r#"
+[stream]
+protocol = "rtsp"
+rtsp_port = 554
+rtsp_path = "/z3-1.sdp"
+udp_port = 8600
+camera_ip = ""
+
+[rtsp_server]
+enabled = false
+port = 8554
+token = "abc"
+
+[credentials]
+username = ""
+password = ""
+"#;
+        assert!(extract_legacy_device_cache(toml_content).is_none());
+    }
+
+    #[test]
+    fn extract_legacy_cache_returns_none_for_malformed_input() {
+        assert!(extract_legacy_device_cache("not toml at all !!! [[[").is_none());
+    }
+
+    #[test]
+    fn extract_legacy_cache_returns_empty_vec_for_empty_array() {
+        // device_cache must come BEFORE any [section] header — TOML
+        // top-level keys are illegal once a section is open.
+        let toml_content = r#"
+device_cache = []
+
+[stream]
+protocol = "rtsp"
+rtsp_port = 554
+rtsp_path = "/z3-1.sdp"
+udp_port = 8600
+camera_ip = ""
+
+[rtsp_server]
+enabled = false
+port = 8554
+token = "abc"
+
+[credentials]
+username = ""
+password = ""
+"#;
+        let extracted = extract_legacy_device_cache(toml_content);
+        assert!(extracted.is_some());
+        assert!(extracted.unwrap().is_empty());
     }
 }

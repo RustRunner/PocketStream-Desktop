@@ -4,12 +4,17 @@
  * Owns the on-disk cache of previously-discovered devices and the UI
  * for clearing offline / stale entries. Exposes:
  *
- *   - State sets (verifyingDevices / offlineDevices / cachedOnlyMacs)
- *     consumed by the render path in devices.js
  *   - loadDeviceCache() — hydrate from disk on startup
  *   - persistDeviceToCache() — called after every successful port scan
  *   - persistAliasForIp() — called whenever a device alias changes
  *   - setupCacheDialog() — wire the "Nodes" title click → modal
+ *
+ * Cache verification status sets (verifyingDevices, offlineDevices,
+ * cachedOnlyMacs), the scanned-IP tracker, and the routing helper all
+ * live in device-state.js so that module can be imported from both
+ * here and devices.js without re-introducing the prior circular
+ * dependency. When verification flips a device's status we fan out via
+ * notifyDevicesChanged() instead of importing the renderer directly.
  */
 
 import * as api from "./tauri-api.js";
@@ -22,31 +27,16 @@ import {
   arpDevices,
   tcpScanResults,
 } from "./state.js";
-// devices.js imports back from this module — ES module circular imports
-// resolve correctly as long as the imported symbols are only accessed
-// inside function bodies (never at module top-level), which is the case
-// for both directions here.
-import { renderArpDeviceList, hasRouteToSubnet, markIpScanned, isIpScanned } from "./devices.js";
+import {
+  cachedOnlyMacs,
+  hasRouteToSubnet,
+  isIpScanned,
+  markIpScanned,
+  notifyDevicesChanged,
+  offlineDevices,
+  verifyingDevices,
+} from "./device-state.js";
 import { formatError } from "./errors.js";
-
-// ── Cache state (exported for the render path in devices.js) ───────
-
-/// IPs of cached devices that haven't been verified by a fresh scan yet.
-/// Cleared as fast-path verification completes for each entry.
-export const verifyingDevices = new Set();
-
-/// IPs of cached devices whose verification scan failed (no open ports
-/// or network error). Stay in the list so the user can still see what
-/// was last known, but are visually marked as not-currently-reachable.
-export const offlineDevices = new Set();
-
-/// MACs that were hydrated from the on-disk cache but haven't (yet) been
-/// confirmed by a live ARP discovery in this session. Used to scope
-/// rendering: cached entries on subnets we don't currently route to are
-/// hidden, since they're stale ghosts from a previous network. They stay
-/// in the cache file so they reappear automatically when the subnet
-/// becomes routable again.
-export const cachedOnlyMacs = new Set();
 
 /// One-shot per-app-session: refresh buttons don't reload the cache.
 let cacheLoaded = false;
@@ -118,7 +108,7 @@ export async function loadDeviceCache() {
   }
 
   log(`Loaded ${cache.length} cached device(s) from disk`);
-  renderArpDeviceList();
+  notifyDevicesChanged();
 
   // Fast-path verify: targeted scans for cached devices on routable
   // subnets. Parallel, no debounce, no retries — the cache is being
@@ -173,7 +163,7 @@ async function fastVerifyCachedDevice(ip, attempt = 0) {
   if (verified) {
     verifyingDevices.delete(ip);
     offlineDevices.delete(ip);
-    renderArpDeviceList();
+    notifyDevicesChanged();
   } else if (attempt + 1 < VERIFY_MAX_ATTEMPTS) {
     // Hold the verifying badge through the retry — flipping to offline
     // just to flip back would be jarring.
@@ -183,7 +173,7 @@ async function fastVerifyCachedDevice(ip, attempt = 0) {
     // user knows clicking it may not work right now.
     verifyingDevices.delete(ip);
     offlineDevices.add(ip);
-    renderArpDeviceList();
+    notifyDevicesChanged();
   }
 }
 
@@ -332,7 +322,7 @@ async function forgetCachedDevice(mac) {
   } catch (e) {
     log(`Failed to remove cached device ${mac}: ${formatError(e)}`);
   }
-  renderArpDeviceList();
+  notifyDevicesChanged();
 }
 
 /**

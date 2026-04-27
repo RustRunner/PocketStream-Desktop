@@ -13,12 +13,12 @@ pub async fn get_config(config: State<'_, AppConfig>) -> Result<AppSettings, App
 }
 
 /// Save the user-editable sections of an `AppSettings` payload from the
-/// frontend. Backend-owned fields (`device_cache`, `adopted_subnets`,
-/// `zoom_positions`) are preserved server-side regardless of what the
-/// caller sends, so a frontend that forgets to round-trip them won't
-/// wipe persistent state. New code should prefer the narrower
-/// `update_stream_settings` / `update_rtsp_settings` / `update_credentials`
-/// commands.
+/// frontend. Backend-owned fields (`adopted_subnets`, `zoom_positions`)
+/// are preserved server-side regardless of what the caller sends. The
+/// device cache lives in its own file (see `cache_path` in config.rs)
+/// so this command is structurally incapable of touching it. New code
+/// should prefer the narrower `update_stream_settings` /
+/// `update_rtsp_settings` / `update_credentials` commands.
 #[tauri::command]
 pub async fn save_config(
     config: State<'_, AppConfig>,
@@ -55,7 +55,7 @@ pub async fn update_credentials(
 
 #[tauri::command]
 pub async fn get_device_cache(config: State<'_, AppConfig>) -> Result<Vec<CachedDevice>, AppError> {
-    Ok(config.get().device_cache)
+    Ok(config.get_cache())
 }
 
 #[tauri::command]

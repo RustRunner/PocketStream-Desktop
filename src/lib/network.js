@@ -6,6 +6,7 @@ import * as api from "./tauri-api.js";
 import { $, $$, state, adoptedSubnets, nodeAliases, arpDevices, tcpScanResults, showToast, log } from "./state.js";
 import { resetDiscoveryStatus, hideDiscoveryStatus, renderArpDeviceList } from "./devices.js";
 import { handleHardDisconnect, handleReconnect } from "./streaming.js";
+import { lastSubnetResults, selectedDevice } from "./store.js";
 import { formatError } from "./errors.js";
 
 // ── Interface discovery ─────────────────────────────────────────────
@@ -31,7 +32,7 @@ export async function refreshInterfaces() {
       // called from the manual refresh button and during reconnect
       // flows, where wiping the dropdown would lose any populated
       // node entries until the next render.
-      updateCameraIpDropdown(state.lastSubnetResults || null);
+      updateCameraIpDropdown(lastSubnetResults.get());
       // Recovery — reset the dedup so the next failure toasts again.
       lastAdapterWarningAt = 0;
     } else if (ethList.length > 0) {
@@ -159,7 +160,7 @@ export function setupInterfaceWatcher() {
       // null would just make cached/discovered nodes vanish until the
       // next render cycle (the original cause of the "nodes disappear
       // from dropdown during discovery" bug).
-      updateCameraIpDropdown(state.lastSubnetResults || null);
+      updateCameraIpDropdown(lastSubnetResults.get());
 
       // If we just came back from disconnected, re-render immediately
       // from the preserved state so the Nodes list snaps back, then
@@ -295,9 +296,10 @@ export function updateCameraIpDropdown(filteredSubnets) {
 
 export function setupCameraIpDropdown() {
   $("#camera-ip").addEventListener("change", (e) => {
-    state.selectedDevice = e.target.value || null;
-    if (state.config && state.selectedDevice) {
-      state.config.stream.camera_ip = state.selectedDevice;
+    selectedDevice.set(e.target.value || null);
+    const ip = selectedDevice.get();
+    if (state.config && ip) {
+      state.config.stream.camera_ip = ip;
     }
   });
 

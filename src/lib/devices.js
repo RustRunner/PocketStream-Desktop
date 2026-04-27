@@ -23,53 +23,23 @@ import {
   loadDeviceCache,
   persistDeviceToCache,
   persistAliasForIp,
-  verifyingDevices,
-  offlineDevices,
-  cachedOnlyMacs,
 } from "./device-cache.js";
+import {
+  cachedOnlyMacs,
+  clearScannedIps,
+  hasRouteToSubnet,
+  isIpScanned,
+  markIpScanned,
+  offlineDevices,
+  setOnDevicesChanged,
+  verifyingDevices,
+} from "./device-state.js";
+import { lastSubnetResults, selectedDevice } from "./store.js";
 import { formatError } from "./errors.js";
-
-// ── Subnet helpers ──────────────────────────────────────────────────
-
-/** Check if we have an IP on the same /24 subnet (native or adopted). */
-export function hasRouteToSubnet(subnet) {
-  // Check adopted subnets
-  if (adoptedSubnets.has(subnet)) return true;
-  // Check native interface IPs
-  if (!state.activeInterface) return false;
-  return state.activeInterface.ips.some((ip) => {
-    const parts = ip.address.split(".");
-    if (parts.length !== 4) return false;
-    return `${parts[0]}.${parts[1]}.${parts[2]}.0/24` === subnet;
-  });
-}
 
 // ── Local scanning state ────────────────────────────────────────────
 
-const scannedIps = new Set();
 let pendingScans = 0;
-
-/**
- * Accessor for the device-cache module: check whether an IP has been
- * scanned this session. Cache verification skips IPs already in flight
- * via the regular discovery path.
- */
-export function isIpScanned(ip) {
-  return scannedIps.has(ip);
-}
-
-/**
- * Accessor for the device-cache module: mark an IP as scanned, or clear
- * the mark when a cached entry is forgotten so it can be re-scanned if
- * the device ever returns.
- */
-export function markIpScanned(ip, clear = false) {
-  if (clear) {
-    scannedIps.delete(ip);
-  } else {
-    scannedIps.add(ip);
-  }
-}
 
 // ── Debounced scan trigger ─────────────────────────────────────────
 // Collect all ARP discoveries and subnet adoptions, then scan once
@@ -91,7 +61,7 @@ function debounceScan() {
 function scanAllRoutableDevices() {
   const toScan = [];
   for (const device of arpDevices.values()) {
-    if (!scannedIps.has(device.ip) && hasRouteToSubnet(device.subnet)) {
+    if (!isIpScanned(device.ip) && hasRouteToSubnet(device.subnet)) {
       toScan.push(device.ip);
     }
   }
@@ -173,7 +143,7 @@ export function hideDiscoveryStatus() {
 }
 
 export function resetDiscoveryStatus() {
-  scannedIps.clear();
+  clearScannedIps();
   if (settleTimer) clearTimeout(settleTimer);
   settleTimer = null;
   // Clear the one-shot lock so a reconnect / user-initiated rescan can
@@ -196,6 +166,13 @@ export function resetDiscoveryStatus() {
 // ── ARP event listeners ─────────────────────────────────────────────
 
 export function setupArpListeners() {
+  // Wire device-cache → render path. The cache module flips
+  // verifying/offline state asynchronously as targeted scans complete;
+  // it pings notifyDevicesChanged() and we re-render. Replaces the
+  // previous direct import of renderArpDeviceList that created a
+  // circular dep between devices.js and device-cache.js.
+  setOnDevicesChanged(renderArpDeviceList);
+
   // Only show a spinner when the link is actually up. A stale
   // disconnected adapter (state.activeInterface set, but ips=[]) would
   // otherwise leave the spinner running forever with no ARP traffic.
@@ -291,8 +268,8 @@ const MAX_SCAN_RETRIES = 2;
 const RETRY_DELAY_MS = 4000;
 
 async function scanDevicePorts(ip, attempt = 0) {
-  if (attempt === 0 && scannedIps.has(ip)) return;
-  scannedIps.add(ip);
+  if (attempt === 0 && isIpScanned(ip)) return;
+  markIpScanned(ip);
   if (attempt === 0) pendingScans++;
 
   try {
@@ -318,7 +295,7 @@ async function scanDevicePorts(ip, attempt = 0) {
       }
     }
     if (!found) {
-      scannedIps.delete(ip);
+      markIpScanned(ip, /* clear */ true);
       // Retry — the device may be on a subnet that was just adopted
       if (attempt < MAX_SCAN_RETRIES) {
         setTimeout(() => scanDevicePorts(ip, attempt + 1), RETRY_DELAY_MS);
@@ -327,7 +304,7 @@ async function scanDevicePorts(ip, attempt = 0) {
     }
   } catch (e) {
     log(`Port scan failed for ${ip}: ${formatError(e)}`);
-    scannedIps.delete(ip);
+    markIpScanned(ip, /* clear */ true);
     if (attempt < MAX_SCAN_RETRIES) {
       setTimeout(() => scanDevicePorts(ip, attempt + 1), RETRY_DELAY_MS);
       return;
@@ -429,7 +406,7 @@ export function renderArpDeviceList() {
       devicesForDropdown.push({ ip: d.ip, open_ports: ports });
 
       const classes = ["device-item"];
-      if (state.selectedDevice === d.ip) classes.push("selected");
+      if (selectedDevice.get() === d.ip) classes.push("selected");
       // Cached devices being verified by an in-flight scan
       if (verifyingDevices.has(d.ip)) classes.push("verifying");
       // Cached devices whose verification scan failed (no route, or
@@ -480,11 +457,11 @@ export function renderArpDeviceList() {
       if (e.target.closest(".device-ip") || e.target.closest(".edit-alias-btn")) return;
       list.querySelectorAll(".device-item").forEach((i) => i.classList.remove("selected"));
       item.classList.add("selected");
-      state.selectedDevice = item.dataset.ip;
+      selectedDevice.set(item.dataset.ip);
       const select = $("#camera-ip");
-      select.value = state.selectedDevice;
+      select.value = selectedDevice.get();
       if (state.config) {
-        state.config.stream.camera_ip = state.selectedDevice;
+        state.config.stream.camera_ip = selectedDevice.get();
       }
     });
   });
@@ -511,7 +488,7 @@ export function renderArpDeviceList() {
     });
   });
 
-  state.lastSubnetResults = subnetResults;
+  lastSubnetResults.set(subnetResults);
   updateCameraIpDropdown(subnetResults);
 }
 
