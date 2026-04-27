@@ -11,11 +11,12 @@ import * as api from "./tauri-api.js";
 import { $, log, escapeHtml } from "./state.js";
 import { hasRouteToSubnet } from "./device-state.js";
 import * as deviceList from "./device-list.js";
+import { showModalWithVideo } from "./streaming.js";
 import { formatError } from "./errors.js";
 
 /** Open the dialog that lists offline / stale cached devices and lets
  *  the user forget them individually or all at once. */
-function openCacheDialog() {
+async function openCacheDialog() {
   const dialog = $("#cache-dialog");
   if (!dialog) return;
 
@@ -84,13 +85,7 @@ function openCacheDialog() {
   }
 
   if (dialog.open) dialog.close();
-  api.setVideoVisible(false).catch(() => {});
-  dialog.showModal();
-  dialog.addEventListener(
-    "close",
-    () => api.setVideoVisible(true).catch(() => {}),
-    { once: true }
-  );
+  await showModalWithVideo(dialog);
 }
 
 /** Drop a single cached device by MAC. Backend removes from the

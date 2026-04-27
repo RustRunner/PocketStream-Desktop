@@ -31,6 +31,7 @@ import {
   markIpScanned,
 } from "./device-state.js";
 import * as deviceList from "./device-list.js";
+import { showModalWithVideo } from "./streaming.js";
 import { lastSubnetResults, selectedDevice } from "./store.js";
 import { formatError } from "./errors.js";
 
@@ -532,7 +533,7 @@ export function renderArpDeviceList() {
 
 // ── Alias dialog ────────────────────────────────────────────────────
 
-function openAliasDialog(ip) {
+async function openAliasDialog(ip) {
   const dialog = $("#alias-dialog");
   $("#alias-dialog-ip").textContent = ip;
   $("#alias-input").value = "";
@@ -561,9 +562,7 @@ function openAliasDialog(ip) {
   $("#alias-save").style.display = isCustom ? "" : "none";
 
   if (dialog.open) dialog.close();
-  api.setVideoVisible(false).catch(() => {});
-  dialog.showModal();
-  dialog.addEventListener("close", () => api.setVideoVisible(true).catch(() => {}), { once: true });
+  await showModalWithVideo(dialog);
 }
 
 /** Push an alias change to the backend. Render re-fires automatically

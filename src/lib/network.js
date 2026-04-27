@@ -5,7 +5,7 @@
 import * as api from "./tauri-api.js";
 import { $, $$, state, adoptedSubnets, showToast, log } from "./state.js";
 import { resetDiscoveryStatus, hideDiscoveryStatus, renderArpDeviceList } from "./devices.js";
-import { handleHardDisconnect, handleReconnect } from "./streaming.js";
+import { handleHardDisconnect, handleReconnect, showModalWithVideo } from "./streaming.js";
 import { lastSubnetResults, selectedDevice } from "./store.js";
 import { formatError } from "./errors.js";
 
@@ -325,9 +325,7 @@ export function setupIpConfigDialog() {
     const select = $("#static-iface");
     select.innerHTML = '<option value="">Loading…</option>';
 
-    api.setVideoVisible(false).catch(() => {});
-    dialog.showModal();
-    dialog.addEventListener("close", () => api.setVideoVisible(true).catch(() => {}), { once: true });
+    await showModalWithVideo(dialog);
 
     try {
       dialogInterfaces = (await api.listInterfaces() || []).filter((i) => i.is_ethernet);

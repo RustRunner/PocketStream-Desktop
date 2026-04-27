@@ -23,6 +23,57 @@ export function getVideoAreaBounds() {
   };
 }
 
+// ── Video visibility (centralized) ──────────────────────────────────
+//
+// The video child is a native Win32 window z-ordered above the WebView
+// content. Three independent inputs decide whether it should be visible
+// at any moment:
+//   - `state.isStreaming` — user wants a stream
+//   - `state.streamLost`  — connection dropped, render is stale
+//   - `openModalCount`    — number of modals currently demanding the
+//                            screen unobstructed
+//
+// Every place that flips one of those inputs calls `syncVideoVisibility`
+// instead of poking `setVideoVisible(true/false)` directly. Without this
+// centralization, a stream reconnect (which calls createVideoWindow,
+// born visible) covers any open dialog mid-flight, and a dialog close
+// during a lost-stream period would briefly re-show stale video.
+//
+// Counter rather than DOM check (`dialog[open]`) so the increment can
+// happen BEFORE showModal — synchronously gating the video without
+// chicken-and-egg ordering with the open attribute.
+let openModalCount = 0;
+
+export function syncVideoVisibility() {
+  const wantVisible =
+    state.isStreaming && !state.streamLost && openModalCount === 0;
+  return api.setVideoVisible(wantVisible).catch(() => {});
+}
+
+/**
+ * Open `dialog` as a modal with the video correctly hidden underneath.
+ * Awaiting the returned promise guarantees the video child window is
+ * gone before the modal paints (no race where the dialog appears
+ * behind the still-visible native video).
+ *
+ * Auto-decrements the counter on `close` so the video can come back
+ * when no other modal is open. Safe to call when another modal is
+ * already open (counter handles nesting).
+ */
+export async function showModalWithVideo(dialog) {
+  openModalCount++;
+  await syncVideoVisibility();
+  dialog.showModal();
+  dialog.addEventListener(
+    "close",
+    () => {
+      openModalCount = Math.max(0, openModalCount - 1);
+      syncVideoVisibility();
+    },
+    { once: true }
+  );
+}
+
 // ── Stream controls ─────────────────────────────────────────────────
 
 export function setupStreamControls() {
@@ -57,9 +108,14 @@ export function setupStreamControls() {
         }
         const bounds = getVideoAreaBounds();
         const handle = await api.createVideoWindow(bounds.x, bounds.y, bounds.width, bounds.height);
+        // Newly-created child window is born visible (WS_VISIBLE). If a
+        // dialog happens to be open right now, sync immediately so the
+        // child doesn't briefly cover it before startStream returns.
+        syncVideoVisibility();
         await api.startStream(handle);
         state.isStreaming = true;
         updateStreamUI();
+        syncVideoVisibility();
         startStatusPolling();
         showToast("Stream started");
       } catch (e) {
@@ -235,9 +291,7 @@ function setupQrDialog() {
     // rendering to a canvas inside a hidden <dialog> can produce
     // blank output on some WebView2 / Chromium builds.
     $("#qr-url").textContent = rtspFullUrl;
-    api.setVideoVisible(false).catch(() => {});
-    dialog.showModal();
-    dialog.addEventListener("close", () => api.setVideoVisible(true).catch(() => {}), { once: true });
+    await showModalWithVideo(dialog);
 
     const canvas = $("#qr-canvas");
     try {
@@ -424,7 +478,7 @@ function showStreamLost(errorMsg) {
 
   // Hide stale video frame and show overlay. Overlay defaults to
   // display:none via CSS; the .visible class is what reveals it.
-  api.setVideoVisible(false).catch(() => {});
+  syncVideoVisibility();
   const area = $("#video-area");
   let overlay = area.querySelector(".stream-lost-overlay");
   if (!overlay) {
@@ -464,7 +518,9 @@ function hideStreamLost() {
   // next tick after handleReconnect resets the lost state — faster
   // than the newly-started pipeline can reach Playing.
   notPlayingStreak = 0;
-  api.setVideoVisible(true).catch(() => {});
+  // syncVideoVisibility leaves the video hidden if a dialog is open —
+  // dialog close handler will sync again and reveal it then.
+  syncVideoVisibility();
   const overlay = $("#video-area").querySelector(".stream-lost-overlay");
   if (overlay) overlay.classList.remove("visible");
 }
