@@ -452,11 +452,6 @@ pub fn run() {
             commands::update_stream_settings,
             commands::update_rtsp_settings,
             commands::update_credentials,
-            // Device Cache
-            commands::get_device_cache,
-            commands::upsert_cached_device,
-            commands::remove_cached_device,
-            commands::clear_device_cache,
             // Network
             commands::scan_network,
             commands::list_interfaces,
@@ -469,8 +464,11 @@ pub fn run() {
             // ARP Discovery
             commands::start_arp_discovery,
             commands::stop_arp_discovery,
-            commands::get_arp_devices,
             commands::get_device_list,
+            commands::report_scan_result,
+            commands::set_device_alias,
+            commands::set_device_status,
+            commands::forget_device,
             commands::get_adopted_subnets,
             commands::remove_adopted_subnet,
             // Streaming

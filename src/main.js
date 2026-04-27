@@ -8,6 +8,7 @@ import { formatError } from "./lib/errors.js";
 import { refreshInterfaces, setupIpConfigDialog, setupCameraIpDropdown, setupInterfaceWatcher, isInterfaceConnected, warnNoEthernet } from "./lib/network.js";
 import { setupArpListeners, loadExistingArpState, setupAliasDialog, resetDiscoveryStatus } from "./lib/devices.js";
 import { setupCacheDialog } from "./lib/device-cache.js";
+import * as deviceList from "./lib/device-list.js";
 import { setupStreamControls, setupRtspControls, setupVideoResize, getVideoAreaBounds } from "./lib/streaming.js";
 import { setupPtzControls } from "./lib/ptz.js";
 
@@ -46,9 +47,12 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   await refreshInterfaces();
 
-  // Start listening for ARP events (backend auto-starts ARP discovery)
+  // Subscribe to the backend's canonical device list before wiring the
+  // render path, so the very first snapshot triggers an initial paint
+  // instead of requiring a separate kick.
   setupArpListeners();
   setupInterfaceWatcher();
+  await deviceList.start();
 
   // Load any devices the backend discovered before our listeners were ready
   await loadExistingArpState();

@@ -515,11 +515,6 @@ impl NetworkManager {
         }
     }
 
-    pub async fn get_arp_devices(&self) -> Vec<ArpDevice> {
-        let map = self.arp_devices.lock().await;
-        map.values().cloned().collect()
-    }
-
     pub async fn get_adopted_ips(&self) -> HashMap<String, String> {
         let map = self.adopted_ips.lock().await;
         map.iter()

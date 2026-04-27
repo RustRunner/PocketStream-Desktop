@@ -212,24 +212,6 @@ impl DeviceRegistry {
         map.remove(mac).is_some()
     }
 
-    /// Build the on-disk cache representation: only Live records with
-    /// at least one open port are worth persisting (an offline / unscanned
-    /// entry has nothing to render on the next cold start).
-    pub fn cache_entries(&self) -> Vec<CachedDevice> {
-        let map = self.lock();
-        map.values()
-            .filter(|r| !r.open_ports.is_empty())
-            .map(|r| CachedDevice {
-                mac: r.mac.clone(),
-                ip: r.ip.clone(),
-                subnet: r.subnet.clone(),
-                open_ports: r.open_ports.clone(),
-                alias: r.alias.clone(),
-                last_seen: r.last_seen.clone(),
-            })
-            .collect()
-    }
-
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, DeviceRecord>> {
         match self.devices.lock() {
             Ok(g) => g,
@@ -453,18 +435,6 @@ mod tests {
         assert_eq!(snap[0].ip, "10.0.0.5");
         assert_eq!(snap[1].ip, "192.168.1.3");
         assert_eq!(snap[2].ip, "192.168.1.20");
-    }
-
-    #[test]
-    fn cache_entries_only_includes_records_with_open_ports() {
-        let r = DeviceRegistry::new();
-        r.merge_arp(&arp("MAC:1", "192.168.1.10", "192.168.1.0/24"));
-        r.merge_arp(&arp("MAC:2", "192.168.1.11", "192.168.1.0/24"));
-        r.merge_scan_result("192.168.1.10", &[80]);
-
-        let entries = r.cache_entries();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].ip, "192.168.1.10");
     }
 
     #[test]

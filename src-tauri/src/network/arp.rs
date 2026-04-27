@@ -164,10 +164,10 @@ pub fn start_listener(
                             entry.ip = device.ip.clone();
 
                             // Mirror into the canonical DeviceRegistry. The
-                            // legacy `devices` map above is still mutated for
-                            // existing readers (get_arp_devices IPC, the
-                            // auto-adopt loop) and will be retired once the
-                            // frontend is fully migrated.
+                            // legacy `devices` map above is still mutated
+                            // because the auto-adopt loop iterates over it;
+                            // can be retired once auto-adopt switches to
+                            // the registry too.
                             if registry.merge_arp(&device) {
                                 emitter.poke();
                             }

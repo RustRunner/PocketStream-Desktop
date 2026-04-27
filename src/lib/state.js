@@ -17,12 +17,15 @@ export const state = {
 // `selectedDevice` and `lastSubnetResults` previously lived here; they
 // are now in src/lib/store.js with subscribe/notify accessors. New
 // shared mutable state should land in store.js, not here.
+//
+// Device records (formerly arpDevices, tcpScanResults, nodeAliases)
+// now live entirely on the backend's DeviceRegistry; the frontend
+// reads them via src/lib/device-list.js's subscribe accessor.
 
-// Reference-type collections shared across modules
-export const nodeAliases = new Map();   // IP -> alias string
-export const arpDevices = new Map();    // MAC -> ArpDevice
-export const adoptedSubnets = new Map(); // subnet -> adopted IP string
-export const tcpScanResults = new Map(); // IP -> ScanResult
+/** Subnet -> adopted secondary IP string. Mirrored from the backend's
+ *  `subnet-adopted` events; used by the routing helper and the subnet
+ *  list renderer. */
+export const adoptedSubnets = new Map();
 
 // ── DOM helpers ─────────────────────────────────────────────────────
 

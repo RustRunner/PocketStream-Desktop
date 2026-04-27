@@ -2,9 +2,9 @@
 
 use tauri::State;
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, CachedDevice};
 use crate::error::AppError;
-use crate::network::{ArpDevice, DeviceRecord, InterfaceInfo, NetworkManager, ScanResult};
+use crate::network::{DeviceRecord, DeviceStatus, InterfaceInfo, NetworkManager, ScanResult};
 
 #[tauri::command]
 pub async fn scan_network(
@@ -93,13 +93,6 @@ pub async fn stop_arp_discovery(manager: State<'_, NetworkManager>) -> Result<()
     Ok(())
 }
 
-#[tauri::command]
-pub async fn get_arp_devices(
-    manager: State<'_, NetworkManager>,
-) -> Result<Vec<ArpDevice>, AppError> {
-    Ok(manager.get_arp_devices().await)
-}
-
 /// Snapshot of every device the backend currently knows about — the
 /// canonical replacement for the frontend's old patchwork of arpDevices
 /// + tcpScanResults + nodeAliases + cache file. Frontend calls this once
@@ -110,6 +103,113 @@ pub async fn get_device_list(
     manager: State<'_, NetworkManager>,
 ) -> Result<Vec<DeviceRecord>, AppError> {
     Ok(manager.registry().snapshot())
+}
+
+/// Apply the result of a successful port scan to the canonical registry.
+/// Updates the matching record's `open_ports` and flips its status to
+/// `Live`, then persists the change to `device_cache.toml` so cold-start
+/// hydration sees it. Emits a debounced `device-list-changed` event.
+///
+/// No-op if no record matches `ip` — discovery has to land first.
+#[tauri::command]
+pub async fn report_scan_result(
+    manager: State<'_, NetworkManager>,
+    config: State<'_, AppConfig>,
+    ip: String,
+    open_ports: Vec<u16>,
+) -> Result<(), AppError> {
+    let registry = manager.registry();
+    if !registry.merge_scan_result(&ip, &open_ports) {
+        return Ok(());
+    }
+    persist_record_for_ip(&registry, &config, &ip)?;
+    if let Some(emitter) = manager.emitter().await {
+        emitter.poke();
+    }
+    Ok(())
+}
+
+/// Set or clear the user-assigned alias for the device with this IP.
+/// Empty string clears. Persists to cache (if the device has open
+/// ports — cache rows without ports aren't useful) and emits.
+#[tauri::command]
+pub async fn set_device_alias(
+    manager: State<'_, NetworkManager>,
+    config: State<'_, AppConfig>,
+    ip: String,
+    alias: String,
+) -> Result<(), AppError> {
+    let registry = manager.registry();
+    if !registry.set_alias(&ip, &alias) {
+        return Ok(());
+    }
+    persist_record_for_ip(&registry, &config, &ip)?;
+    if let Some(emitter) = manager.emitter().await {
+        emitter.poke();
+    }
+    Ok(())
+}
+
+/// Update the reachability status of a device by MAC. Used by the
+/// cache-verification path on the frontend to flip Verifying/Offline
+/// without changing scan results. Status is not persisted to the
+/// cache file — it's session-local.
+#[tauri::command]
+pub async fn set_device_status(
+    manager: State<'_, NetworkManager>,
+    mac: String,
+    status: DeviceStatus,
+) -> Result<(), AppError> {
+    if !manager.registry().set_status(&mac, status) {
+        return Ok(());
+    }
+    if let Some(emitter) = manager.emitter().await {
+        emitter.poke();
+    }
+    Ok(())
+}
+
+/// Drop a device from the registry and the on-disk cache. Used by the
+/// "forget this device" affordance in the offline-cache dialog.
+#[tauri::command]
+pub async fn forget_device(
+    manager: State<'_, NetworkManager>,
+    config: State<'_, AppConfig>,
+    mac: String,
+) -> Result<(), AppError> {
+    if !manager.registry().forget(&mac) {
+        return Ok(());
+    }
+    config.remove_cached_device(&mac)?;
+    if let Some(emitter) = manager.emitter().await {
+        emitter.poke();
+    }
+    Ok(())
+}
+
+/// Look up the registry record for `ip` and persist it to the cache
+/// file (if it has open ports). No-op for records with no open ports
+/// since the cache only stores entries useful for cold-start render.
+fn persist_record_for_ip(
+    registry: &crate::network::DeviceRegistry,
+    config: &AppConfig,
+    ip: &str,
+) -> Result<(), AppError> {
+    let record = match registry.snapshot().into_iter().find(|r| r.ip == ip) {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+    if record.open_ports.is_empty() {
+        return Ok(());
+    }
+    config.upsert_cached_device(CachedDevice {
+        mac: record.mac,
+        ip: record.ip,
+        subnet: record.subnet,
+        open_ports: record.open_ports,
+        alias: record.alias,
+        last_seen: record.last_seen,
+    })
 }
 
 #[tauri::command]

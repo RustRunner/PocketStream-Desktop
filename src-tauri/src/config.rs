@@ -136,8 +136,8 @@ pub struct AppConfig {
     /// Cached devices from prior sessions, keyed by MAC. Stored in
     /// `device_cache.toml` separately from settings so that any future
     /// settings-save bug structurally cannot wipe the cache. Mutated
-    /// only via `upsert_cached_device` / `remove_cached_device` /
-    /// `clear_device_cache`.
+    /// only via `upsert_cached_device` / `remove_cached_device` (called
+    /// from the DeviceRegistry-backed IPC handlers in commands::network).
     cache: Mutex<Vec<CachedDevice>>,
 }
 
@@ -318,18 +318,6 @@ impl AppConfig {
         } else {
             Ok(())
         }
-    }
-
-    /// Clear the entire device cache.
-    pub fn clear_device_cache(&self) -> Result<(), crate::AppError> {
-        match self.cache.lock() {
-            Ok(mut guard) => guard.clear(),
-            Err(poisoned) => {
-                log::error!("Cache mutex poisoned during clear, recovering");
-                poisoned.into_inner().clear();
-            }
-        }
-        self.save_cache()
     }
 
     fn save_cache(&self) -> Result<(), crate::AppError> {

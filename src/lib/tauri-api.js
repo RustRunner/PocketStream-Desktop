@@ -42,24 +42,6 @@ export async function updateCredentials(credentials) {
   return await invoke("update_credentials", { credentials });
 }
 
-// ── Device Cache ────────────────────────────────────────────────────
-
-export async function getDeviceCache() {
-  return await invoke("get_device_cache");
-}
-
-export async function upsertCachedDevice(device) {
-  return await invoke("upsert_cached_device", { device });
-}
-
-export async function removeCachedDevice(mac) {
-  return await invoke("remove_cached_device", { mac });
-}
-
-export async function clearDeviceCache() {
-  return await invoke("clear_device_cache");
-}
-
 // ── Network ─────────────────────────────────────────────────────────
 
 export async function scanNetwork(subnet) {
@@ -110,8 +92,26 @@ export async function stopArpDiscovery() {
   return await invoke("stop_arp_discovery");
 }
 
-export async function getArpDevices() {
-  return await invoke("get_arp_devices");
+// ── Device Registry (canonical device list) ─────────────────────────
+
+export async function getDeviceList() {
+  return await invoke("get_device_list");
+}
+
+export async function reportScanResult(ip, openPorts) {
+  return await invoke("report_scan_result", { ip, openPorts });
+}
+
+export async function setDeviceAlias(ip, alias) {
+  return await invoke("set_device_alias", { ip, alias });
+}
+
+export async function setDeviceStatus(mac, status) {
+  return await invoke("set_device_status", { mac, status });
+}
+
+export async function forgetDevice(mac) {
+  return await invoke("forget_device", { mac });
 }
 
 export async function getAdoptedSubnets() {

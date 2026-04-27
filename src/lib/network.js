@@ -3,7 +3,7 @@
  */
 
 import * as api from "./tauri-api.js";
-import { $, $$, state, adoptedSubnets, nodeAliases, arpDevices, tcpScanResults, showToast, log } from "./state.js";
+import { $, $$, state, adoptedSubnets, showToast, log } from "./state.js";
 import { resetDiscoveryStatus, hideDiscoveryStatus, renderArpDeviceList } from "./devices.js";
 import { handleHardDisconnect, handleReconnect } from "./streaming.js";
 import { lastSubnetResults, selectedDevice } from "./store.js";
@@ -114,9 +114,9 @@ export function setupInterfaceWatcher() {
       handleHardDisconnect("Ethernet disconnected");
       state.activeInterface = null;
       $("#iface-name").textContent = "None found";
-      // Preserve arpDevices / tcpScanResults across a "no adapter" blip
-      // so a quick replug restores the UI without waiting for a full
-      // re-scan. renderArpDeviceList self-hides when not connected.
+      // Preserve the backend's DeviceRegistry across a "no adapter"
+      // blip so a quick replug restores the UI without waiting for a
+      // full re-scan. renderArpDeviceList self-hides when not connected.
       renderArpDeviceList();
       renderSubnetList();
       updateCameraIpDropdown(null);
@@ -135,7 +135,7 @@ export function setupInterfaceWatcher() {
       $("#iface-name").textContent =
         (iface.display_name || iface.name) + " (Disconnected)";
 
-      // Preserve arpDevices / tcpScanResults — a quick replug of the
+      // Preserve the backend's DeviceRegistry — a quick replug of the
       // same cable should restore the Nodes list instantly instead of
       // waiting 6+ seconds for ARP + port scan to rediscover what was
       // there. renderArpDeviceList returns early when the link is down.
@@ -155,11 +155,11 @@ export function setupInterfaceWatcher() {
       // this event with the new IP set).
       renderSubnetList();
 
-      // Preserve the existing CAM/PTU dropdown — arpDevices and
-      // tcpScanResults haven't changed, so wiping the dropdown to
-      // null would just make cached/discovered nodes vanish until the
-      // next render cycle (the original cause of the "nodes disappear
-      // from dropdown during discovery" bug).
+      // Preserve the existing CAM/PTU dropdown — the backend registry
+      // hasn't changed, so wiping the dropdown to null would just make
+      // cached/discovered nodes vanish until the next render cycle (the
+      // original cause of the "nodes disappear from dropdown during
+      // discovery" bug).
       updateCameraIpDropdown(lastSubnetResults.get());
 
       // If we just came back from disconnected, re-render immediately
@@ -262,15 +262,17 @@ export function updateCameraIpDropdown(filteredSubnets) {
     options += '</optgroup>';
   }
 
-  // Node IPs (from ARP-discovered + scan results)
+  // Node IPs (from ARP-discovered + scan results). Each dropdown entry
+  // carries its alias inline — sourced from the DeviceRegistry snapshot
+  // by the render path in devices.js — so we don't need a separate
+  // alias Map here.
   if (filteredSubnets) {
     let hasNodes = false;
     let nodeOptions = "";
     filteredSubnets.forEach((sr) => {
       sr.devices.forEach((d) => {
         hasNodes = true;
-        const alias = nodeAliases.get(d.ip);
-        const label = alias ? `${d.ip} (${alias})` : d.ip;
+        const label = d.alias ? `${d.ip} (${d.alias})` : d.ip;
         nodeOptions += `<option value="${d.ip}">${label}</option>`;
       });
     });

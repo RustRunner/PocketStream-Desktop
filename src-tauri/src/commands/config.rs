@@ -1,10 +1,14 @@
-//! Config persistence and device-cache IPC handlers.
+//! Config persistence IPC handlers.
+//!
+//! The device-cache IPC handlers that used to live here are gone — the
+//! cache is now exclusively a side-effect of DeviceRegistry mutations
+//! on the backend (see `commands/network.rs::report_scan_result`,
+//! `set_device_alias`, `forget_device`). Frontend reads device state
+//! via `get_device_list` and the `device-list-changed` event.
 
 use tauri::State;
 
-use crate::config::{
-    AppConfig, AppSettings, CachedDevice, Credentials, RtspServerConfig, StreamConfig,
-};
+use crate::config::{AppConfig, AppSettings, Credentials, RtspServerConfig, StreamConfig};
 use crate::error::AppError;
 
 #[tauri::command]
@@ -49,32 +53,4 @@ pub async fn update_credentials(
     credentials: Credentials,
 ) -> Result<(), AppError> {
     config.update_credentials(credentials)
-}
-
-// ── Device Cache ────────────────────────────────────────────────────
-
-#[tauri::command]
-pub async fn get_device_cache(config: State<'_, AppConfig>) -> Result<Vec<CachedDevice>, AppError> {
-    Ok(config.get_cache())
-}
-
-#[tauri::command]
-pub async fn upsert_cached_device(
-    config: State<'_, AppConfig>,
-    device: CachedDevice,
-) -> Result<(), AppError> {
-    config.upsert_cached_device(device)
-}
-
-#[tauri::command]
-pub async fn remove_cached_device(
-    config: State<'_, AppConfig>,
-    mac: String,
-) -> Result<(), AppError> {
-    config.remove_cached_device(&mac)
-}
-
-#[tauri::command]
-pub async fn clear_device_cache(config: State<'_, AppConfig>) -> Result<(), AppError> {
-    config.clear_device_cache()
 }
