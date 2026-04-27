@@ -5,6 +5,7 @@
 import QRCode from "qrcode";
 import * as api from "./tauri-api.js";
 import { $, state, log, showToast, formatUptime } from "./state.js";
+import { formatError } from "./errors.js";
 
 /** Full RTSP URL (with token) — stored for QR code generation */
 let rtspFullUrl = null;
@@ -174,12 +175,25 @@ function updateStreamUI() {
 // ── RTSP server controls ────────────────────────────────────────────
 
 export async function setupRtspControls() {
-  // Sync Start button disabled state with the Enable toggle
+  // The Enable toggle is also a kill switch: turning it off while the
+  // server is running stops it immediately (rather than only blocking
+  // a future start). Persistence still happens on Save Settings — the
+  // toggle change here only affects live state.
   const enableToggle = $("#rtsp-server-enable");
   const startBtn = $("#btn-toggle-rtsp");
   startBtn.disabled = !enableToggle.checked;
-  enableToggle.addEventListener("change", () => {
+  enableToggle.addEventListener("change", async () => {
     startBtn.disabled = !enableToggle.checked;
+    if (!enableToggle.checked && state.isRtspRunning) {
+      try {
+        await api.stopRtspServer();
+        state.isRtspRunning = false;
+        updateRtspUI(null);
+        showToast("RTSP server stopped");
+      } catch (e) {
+        showToast("Failed to stop RTSP server: " + formatError(e), true);
+      }
+    }
   });
 
   // Populate VPN dropdown in background — don't block other setup
