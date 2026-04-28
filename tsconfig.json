@@ -17,6 +17,7 @@
     "isolatedModules": true,
     "verbatimModuleSyntax": true,
     "forceConsistentCasingInFileNames": true,
+    "allowImportingTsExtensions": true,
 
     "noEmit": true,
     "skipLibCheck": true,

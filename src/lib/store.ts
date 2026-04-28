@@ -21,19 +21,36 @@
  * truth.
  */
 
-function makeAccessor(initial) {
+import type { ScanResult } from "./types.ts";
+
+/** Read-only listener invoked with the latest value on every change. */
+export type Subscriber<T> = (value: T) => void;
+/** Returned by `subscribe` — call to detach. */
+export type Unsubscribe = () => void;
+
+/** Reactive value with subscribe/notify semantics. The reference is
+ *  identity-stable; only `value` changes via `set`. */
+export interface Accessor<T> {
+  get: () => T;
+  set: (newValue: T) => void;
+  subscribe: (callback: Subscriber<T>) => Unsubscribe;
+}
+
+function makeAccessor<T>(initial: T): Accessor<T> {
   let value = initial;
-  const subscribers = new Set();
+  const subscribers = new Set<Subscriber<T>>();
   return {
     get: () => value,
-    set: (newValue) => {
+    set: (newValue: T) => {
       if (Object.is(value, newValue)) return;
       value = newValue;
       for (const cb of subscribers) cb(value);
     },
-    subscribe: (callback) => {
+    subscribe: (callback: Subscriber<T>) => {
       subscribers.add(callback);
-      return () => subscribers.delete(callback);
+      return () => {
+        subscribers.delete(callback);
+      };
     },
   };
 }
@@ -44,7 +61,14 @@ function makeAccessor(initial) {
  * click) and network.js (dropdown change); read by the render path to
  * decide which list item gets the .selected class.
  */
-export const selectedDevice = makeAccessor(null);
+export const selectedDevice: Accessor<string | null> = makeAccessor<string | null>(null);
+
+/** One subnet's worth of devices in the order the render path emits.
+ *  Mirrors what devices.js builds before passing to updateCameraIpDropdown. */
+export interface SubnetRenderResult {
+  subnet: string;
+  devices: ScanResult[];
+}
 
 /**
  * Result of the most recent device-list render — array of subnet
@@ -53,4 +77,5 @@ export const selectedDevice = makeAccessor(null);
  * consumed by network.js refreshInterfaces / interface watcher when
  * the dropdown needs to be repopulated without re-running the render.
  */
-export const lastSubnetResults = makeAccessor(null);
+export const lastSubnetResults: Accessor<SubnetRenderResult[] | null> =
+  makeAccessor<SubnetRenderResult[] | null>(null);

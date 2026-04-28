@@ -2,11 +2,30 @@
  * PocketStream Desktop — Shared state & utilities
  */
 
+import type { AppSettings, InterfaceInfo } from "./types.ts";
+
 const invoke = window.__TAURI__?.core?.invoke;
 
 // ── Shared mutable state ────────────────────────────────────────────
 
-export const state = {
+/** Top-level mutable state shared across modules. Field shapes match
+ *  the matching Rust IPC types. New cross-module state should land in
+ *  `store.js` with a subscribe/notify accessor instead of being added
+ *  here — this object is kept around for the legacy fields that haven't
+ *  been migrated yet. */
+export interface AppState {
+  config: AppSettings | null;
+  activeInterface: InterfaceInfo | null;
+  isStreaming: boolean;
+  isRtspRunning: boolean;
+  isRecording: boolean;
+  /** Set by streaming.js when the connection drops mid-session. The
+   *  video child window is hidden and the "Stream Lost..." overlay is
+   *  shown until the next successful health-check or manual stop. */
+  streamLost?: boolean;
+}
+
+export const state: AppState = {
   config: null,
   activeInterface: null,
   isStreaming: false,
@@ -24,21 +43,34 @@ export const state = {
 /** Subnet -> adopted secondary IP string. Mirrored from the backend's
  *  `subnet-adopted` events; used by the routing helper and the subnet
  *  list renderer. */
-export const adoptedSubnets = new Map();
+export const adoptedSubnets: Map<string, string> = new Map();
 
 // ── DOM helpers ─────────────────────────────────────────────────────
 
-export const $ = (sel) => document.querySelector(sel);
-export const $$ = (sel) => document.querySelectorAll(sel);
+/** querySelector with a generic element type. Defaults to HTMLElement
+ *  for the common case; pass a more specific type when you need
+ *  `.value` / `.checked` / etc. — e.g., `$<HTMLInputElement>("#x")`.
+ *
+ *  Returns the cast as non-null for ergonomics: every consumer in this
+ *  codebase queries by an ID that is statically present in index.html,
+ *  so a null return would just push a check to every site without
+ *  catching real bugs. If a selector starts producing null at runtime,
+ *  the resulting `Cannot read properties of null` is the real signal
+ *  and the right fix is at that call site, not here. */
+export const $ = <E extends Element = HTMLElement>(sel: string): E =>
+  document.querySelector(sel) as E;
+
+export const $$ = <E extends Element = HTMLElement>(sel: string): NodeListOf<E> =>
+  document.querySelectorAll(sel) as NodeListOf<E>;
 
 // ── Utilities ───────────────────────────────────────────────────────
 
-export function log(msg) {
+export function log(msg: string): void {
   console.log(`[PocketStream] ${msg}`);
 }
 
 /** Escape HTML special characters to prevent injection via innerHTML. */
-export function escapeHtml(str) {
+export function escapeHtml(str: unknown): string {
   return String(str)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
@@ -47,7 +79,7 @@ export function escapeHtml(str) {
     .replace(/'/g, "&#039;");
 }
 
-export function showToast(message, isError = false) {
+export function showToast(message: string, isError = false): void {
   // Write toast messages to the log file for diagnostics
   if (invoke) {
     invoke("log_frontend", {
@@ -85,7 +117,7 @@ export function showToast(message, isError = false) {
   }, 3000);
 }
 
-export function formatUptime(secs) {
+export function formatUptime(secs: number): string {
   const h = Math.floor(secs / 3600);
   const m = Math.floor((secs % 3600) / 60);
   const s = secs % 60;

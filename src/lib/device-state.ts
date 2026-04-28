@@ -11,19 +11,19 @@
  * state plus small pure helpers; safe to import from anywhere.
  */
 
-import { state, adoptedSubnets } from "./state.js";
+import { state, adoptedSubnets } from "./state.ts";
 
 // ── Scanned-IP tracking (deduplicates port scans this session) ────
 
-const scannedIps = new Set();
+const scannedIps = new Set<string>();
 
-export function isIpScanned(ip) {
+export function isIpScanned(ip: string): boolean {
   return scannedIps.has(ip);
 }
 
 /** Mark `ip` as scanned. Pass `clear=true` to allow it to be re-scanned
  *  if the device ever returns (called when a cached entry is forgotten). */
-export function markIpScanned(ip, clear = false) {
+export function markIpScanned(ip: string, clear = false): void {
   if (clear) {
     scannedIps.delete(ip);
   } else {
@@ -33,14 +33,14 @@ export function markIpScanned(ip, clear = false) {
 
 /** Reset all scanned-IP tracking. Used on manual refresh / reconnect
  *  paths so the next discovery cycle starts fresh. */
-export function clearScannedIps() {
+export function clearScannedIps(): void {
   scannedIps.clear();
 }
 
 // ── Routing helper ────────────────────────────────────────────────
 
 /** Check if we have an IP on the same /24 subnet (native or adopted). */
-export function hasRouteToSubnet(subnet) {
+export function hasRouteToSubnet(subnet: string): boolean {
   // Check adopted subnets first
   if (adoptedSubnets.has(subnet)) return true;
   // Check native interface IPs

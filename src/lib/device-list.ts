@@ -17,26 +17,24 @@
  * device-list-changed snapshot, and this module's subscriber picks
  * up the change. That round-trip is the whole point — frontend never
  * gets to disagree with the backend about what the device list is.
- *
- * DeviceRecord shape (defined in src-tauri/src/network/device_registry.rs):
- *   { mac, ip, subnet, open_ports: u16[], alias: string,
- *     status: "live" | "verifying" | "offline" | "cached_only",
- *     first_seen: string, last_seen: string }
  */
 
-import * as api from "./tauri-api.js";
-import { log } from "./state.js";
-import { formatError } from "./errors.js";
+import * as api from "./tauri-api.ts";
+import { log } from "./state.ts";
+import { formatError } from "./errors.ts";
+import type { DeviceRecord } from "./types.ts";
 
 // ── Subscribe/notify accessor ─────────────────────────────────────
 
-let value = [];
-const subscribers = new Set();
+type Subscriber = (snapshot: DeviceRecord[]) => void;
 
-function setSnapshot(next) {
+let value: DeviceRecord[] = [];
+const subscribers = new Set<Subscriber>();
+
+function setSnapshot(next: unknown): void {
   // Reference equality is enough — backend always sends a fresh array.
   if (value === next) return;
-  value = Array.isArray(next) ? next : [];
+  value = Array.isArray(next) ? (next as DeviceRecord[]) : [];
   for (const cb of subscribers) {
     try {
       cb(value);
@@ -48,39 +46,43 @@ function setSnapshot(next) {
 
 /** Current snapshot. Reference is replaced on every update — do not
  *  mutate the returned array. */
-export function getDevices() {
+export function getDevices(): DeviceRecord[] {
   return value;
 }
 
 /** Register a callback fired with the latest snapshot whenever it
  *  changes. Returns an unsubscribe function. */
-export function subscribe(callback) {
+export function subscribe(callback: Subscriber): () => void {
   subscribers.add(callback);
-  return () => subscribers.delete(callback);
+  return () => {
+    subscribers.delete(callback);
+  };
 }
 
 // ── Lookup helpers (read-only views over the snapshot) ───────────
 
 /** Find a record by IP. Returns undefined if not present. */
-export function deviceByIp(ip) {
+export function deviceByIp(ip: string | null | undefined): DeviceRecord | undefined {
   if (!ip) return undefined;
   return value.find((r) => r.ip === ip);
 }
 
 /** Find a record by MAC. Returns undefined if not present. */
-export function deviceByMac(mac) {
+export function deviceByMac(mac: string | null | undefined): DeviceRecord | undefined {
   if (!mac) return undefined;
   return value.find((r) => r.mac === mac);
 }
 
 /** Group records by subnet, preserving the registry's sort order. */
-export function devicesBySubnet() {
-  const groups = new Map();
+export function devicesBySubnet(): Map<string, DeviceRecord[]> {
+  const groups = new Map<string, DeviceRecord[]>();
   for (const record of value) {
-    if (!groups.has(record.subnet)) {
-      groups.set(record.subnet, []);
+    const bucket = groups.get(record.subnet);
+    if (bucket) {
+      bucket.push(record);
+    } else {
+      groups.set(record.subnet, [record]);
     }
-    groups.get(record.subnet).push(record);
   }
   return groups;
 }
@@ -90,8 +92,8 @@ export function devicesBySubnet() {
 /** Hydrate the snapshot from the backend and start listening for
  *  push updates. Call once during app startup, before any subscriber
  *  expects data to be available. */
-export async function start() {
-  api.onEvent("device-list-changed", (snapshot) => {
+export async function start(): Promise<void> {
+  api.onEvent<DeviceRecord[]>("device-list-changed", (snapshot) => {
     setSnapshot(snapshot);
   });
 
