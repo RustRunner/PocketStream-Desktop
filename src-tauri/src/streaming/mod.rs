@@ -318,10 +318,15 @@ impl StreamManager {
     /// change). Idempotent only in the sense that the watch's
     /// `send_if_modified` deduplicates — calling twice would spawn two
     /// tickers, so call exactly once at app startup.
+    ///
+    /// Uses `tauri::async_runtime::spawn` rather than `tokio::spawn`
+    /// because Tauri's `setup` hook runs on the main thread before any
+    /// tokio runtime is bound to the current thread; a bare `tokio::spawn`
+    /// here panics with "no reactor running."
     pub fn start_status_emitter(&self, handle: tauri::AppHandle) {
         let state_for_tick = self.state.clone();
         let tx_for_tick = self.status_tx.clone();
-        tokio::spawn(async move {
+        tauri::async_runtime::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -339,7 +344,7 @@ impl StreamManager {
         });
 
         let mut rx = self.status_tx.subscribe();
-        tokio::spawn(async move {
+        tauri::async_runtime::spawn(async move {
             use tauri::Emitter;
             while rx.changed().await.is_ok() {
                 let snap = rx.borrow().clone();
