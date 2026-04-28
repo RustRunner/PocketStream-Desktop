@@ -21,8 +21,6 @@
  * truth.
  */
 
-import type { ScanResult } from "./types.ts";
-
 /** Read-only listener invoked with the latest value on every change. */
 export type Subscriber<T> = (value: T) => void;
 /** Returned by `subscribe` — call to detach. */
@@ -63,11 +61,26 @@ function makeAccessor<T>(initial: T): Accessor<T> {
  */
 export const selectedDevice: Accessor<string | null> = makeAccessor<string | null>(null);
 
+/** One device entry as the render path projects it for the dropdown.
+ *  Distinct from ScanResult (no `reachable` flag, carries the user-set
+ *  alias). Built fresh in devices.ts on every render and pushed through
+ *  lastSubnetResults so network.ts can repopulate the dropdown without
+ *  re-running the render path. */
+export interface DropdownDevice {
+  ip: string;
+  open_ports: number[];
+  alias: string;
+}
+
 /** One subnet's worth of devices in the order the render path emits.
- *  Mirrors what devices.js builds before passing to updateCameraIpDropdown. */
+ *  Mirrors what devices.ts builds before passing to updateCameraIpDropdown. */
 export interface SubnetRenderResult {
   subnet: string;
-  devices: ScanResult[];
+  /** First IP we have on this subnet — the source address scans /
+   *  HTTP requests would use. Optional because not every consumer
+   *  cares; devices.ts always sets it. */
+  localIp?: string;
+  devices: DropdownDevice[];
 }
 
 /**

@@ -285,14 +285,8 @@ export function updateCameraIpDropdown(
     filteredSubnets.forEach((sr) => {
       sr.devices.forEach((d) => {
         hasNodes = true;
-        // ScanResult doesn't carry an alias today, but the render path
-        // synthesizes objects with the alias attached when calling this
-        // function. Cast through unknown so the field is read leniently.
-        const dWithAlias = d as unknown as { ip: string; alias?: string };
-        const label = dWithAlias.alias
-          ? `${dWithAlias.ip} (${dWithAlias.alias})`
-          : dWithAlias.ip;
-        nodeOptions += `<option value="${dWithAlias.ip}">${label}</option>`;
+        const label = d.alias ? `${d.ip} (${d.alias})` : d.ip;
+        nodeOptions += `<option value="${d.ip}">${label}</option>`;
       });
     });
     if (hasNodes) {

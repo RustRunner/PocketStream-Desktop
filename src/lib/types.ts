@@ -153,16 +153,27 @@ export type DeviceListChangedPayload = DeviceRecord[];
  *  status broadcaster on every change to the watch channel snapshot. */
 export type StreamStatusPayload = StreamStatus;
 
+/** Payload for the `arp-device-discovered` event emitted by the pcap
+ *  ARP listener. Mirrors `network/arp.rs::ArpDevice`. */
+export interface ArpDevicePayload {
+  mac: string;
+  ip: string;
+  subnet: string;
+  /** RFC3339 timestamp */
+  first_seen: string;
+  /** RFC3339 timestamp */
+  last_seen: string;
+}
+
 /** Payload for the `subnet-adopted` event emitted by the network
- *  manager when a foreign-subnet auto-adoption completes. */
+ *  manager when a foreign-subnet auto-adoption completes. The wire
+ *  field is `adopted_ip` (not `ip`) — matches the JSON the backend
+ *  builds via `serde_json::json!`. */
 export interface SubnetAdoptedPayload {
   subnet: string;
-  ip: string;
+  adopted_ip: string;
 }
 
 /** Payload for the `interface-status-changed` event emitted by the
  *  Windows NotifyIpInterfaceChange watcher (or pnet poller fallback). */
-export interface InterfaceStatusChangedPayload {
-  iface: InterfaceInfo | { name: ""; ips: [] };
-  was_down: boolean;
-}
+export type InterfaceStatusChangedPayload = InterfaceInfo;
