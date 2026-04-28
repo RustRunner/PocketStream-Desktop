@@ -195,7 +195,11 @@ impl NetworkManager {
 
                 if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
                     map.insert(subnet.clone(), ip);
-                    work.push((subnet.clone(), ip_str.clone(), !current_ips.contains(ip_str)));
+                    work.push((
+                        subnet.clone(),
+                        ip_str.clone(),
+                        !current_ips.contains(ip_str),
+                    ));
                 }
             }
 
@@ -238,8 +242,7 @@ impl NetworkManager {
             tasks.spawn(async move {
                 let added_ok = if needs_add {
                     log::info!("Re-adding missing adopted IP {} to {}", ip_str, iface_name);
-                    match ip_config::add_secondary_ip(&iface_name, &ip_str, "255.255.255.0").await
-                    {
+                    match ip_config::add_secondary_ip(&iface_name, &ip_str, "255.255.255.0").await {
                         Ok(()) => true,
                         Err(e) => {
                             log::warn!("Failed to re-add adopted IP {}: {}", ip_str, e);

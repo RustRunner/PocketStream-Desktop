@@ -343,7 +343,10 @@ mod tests {
         let r = DeviceRegistry::new();
         let dev = arp("AA:BB:CC:DD:EE:01", "192.168.1.10", "192.168.1.0/24");
         assert!(r.merge_arp(&dev));
-        assert!(!r.merge_arp(&dev), "second merge with identical data must be a no-op");
+        assert!(
+            !r.merge_arp(&dev),
+            "second merge with identical data must be a no-op"
+        );
     }
 
     #[test]
@@ -395,7 +398,10 @@ mod tests {
         r.merge_arp(&arp("AA:BB:CC:DD:EE:01", "192.168.1.10", "192.168.1.0/24"));
         assert!(r.set_alias("192.168.1.10", "CAM"));
         assert_eq!(r.snapshot()[0].alias, "CAM");
-        assert!(!r.set_alias("192.168.1.10", "CAM"), "identical write is a no-op");
+        assert!(
+            !r.set_alias("192.168.1.10", "CAM"),
+            "identical write is a no-op"
+        );
         assert!(r.set_alias("192.168.1.10", ""), "empty string clears");
         assert_eq!(r.snapshot()[0].alias, "");
     }
@@ -420,7 +426,10 @@ mod tests {
             vec![],
             "",
         )]);
-        assert!(!did_hydrate, "hydrate is a one-shot — must skip if registry isn't empty");
+        assert!(
+            !did_hydrate,
+            "hydrate is a one-shot — must skip if registry isn't empty"
+        );
         assert_eq!(r.snapshot().len(), 1);
     }
 
