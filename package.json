@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "qrcode": "^1.5.4"
@@ -15,6 +16,7 @@
   "devDependencies": {
     "@tauri-apps/cli": "^2",
     "sharp": "^0.34.5",
+    "typescript": "^6.0.3",
     "vite": "^6"
   }
 }
