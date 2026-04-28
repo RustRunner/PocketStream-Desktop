@@ -151,11 +151,6 @@ export async function stopRtspServer() {
   return await invoke("stop_rtsp_server");
 }
 
-export async function getStreamStatus() {
-  return await invoke("get_stream_status");
-}
-
-
 export async function takeScreenshot() {
   return await invoke("take_screenshot");
 }

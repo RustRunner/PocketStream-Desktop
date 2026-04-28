@@ -4,7 +4,7 @@ use tauri::{Manager, State};
 
 use crate::config::AppConfig;
 use crate::error::AppError;
-use crate::streaming::{RtspServerInfo, StreamManager, StreamStatus};
+use crate::streaming::{RtspServerInfo, StreamManager};
 
 #[tauri::command]
 pub async fn start_stream(
@@ -49,11 +49,6 @@ pub async fn start_rtsp_server(
 #[tauri::command]
 pub async fn stop_rtsp_server(stream: State<'_, StreamManager>) -> Result<(), AppError> {
     stream.stop_rtsp_server().await
-}
-
-#[tauri::command]
-pub async fn get_stream_status(stream: State<'_, StreamManager>) -> Result<StreamStatus, AppError> {
-    stream.get_status().await
 }
 
 #[tauri::command]

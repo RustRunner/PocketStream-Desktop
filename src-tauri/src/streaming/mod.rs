@@ -5,7 +5,7 @@ pub mod video_embed;
 
 use serde::Serialize;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 
 use crate::config::AppSettings;
 use crate::error::AppError;
@@ -19,7 +19,7 @@ pub struct RtspServerInfo {
 use rtsp_client::PlaybackPipeline;
 use rtsp_server::RtspRestreamer;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StreamStatus {
     pub playing: bool,
     pub rtsp_server_running: bool,
@@ -31,13 +31,29 @@ pub struct StreamStatus {
     pub error: Option<String>,
 }
 
+impl StreamStatus {
+    fn idle() -> Self {
+        Self {
+            playing: false,
+            rtsp_server_running: false,
+            rtsp_url: None,
+            display_url: None,
+            recording: false,
+            uptime_secs: 0,
+            bandwidth_kbps: 0.0,
+            error: None,
+        }
+    }
+}
+
 pub struct StreamManager {
     state: Arc<Mutex<StreamState>>,
     video_hwnd: Arc<std::sync::atomic::AtomicIsize>,
+    status_tx: Arc<watch::Sender<StreamStatus>>,
 }
 
 struct StreamState {
-    playback: Option<PlaybackPipeline>,
+    playback: Option<Arc<PlaybackPipeline>>,
     rtsp_server: Option<RtspRestreamer>,
     recording: bool,
     recording_path: Option<String>,
@@ -49,6 +65,7 @@ struct StreamState {
 
 impl StreamManager {
     pub fn new() -> Self {
+        let (status_tx, _) = watch::channel(StreamStatus::idle());
         Self {
             state: Arc::new(Mutex::new(StreamState {
                 playback: None,
@@ -60,6 +77,7 @@ impl StreamManager {
                 rtsp_local_ip: None,
             })),
             video_hwnd: Arc::new(std::sync::atomic::AtomicIsize::new(0)),
+            status_tx: Arc::new(status_tx),
         }
     }
 
@@ -133,7 +151,7 @@ impl StreamManager {
         let mut state = self.state.lock().await;
 
         // Stop existing playback if any
-        if let Some(ref pipeline) = state.playback {
+        if let Some(pipeline) = state.playback.take() {
             let _ = pipeline.stop();
         }
 
@@ -150,39 +168,40 @@ impl StreamManager {
         };
 
         pipeline.play()?;
-        state.playback = Some(pipeline);
+        state.playback = Some(Arc::new(pipeline));
         state.start_time = Some(std::time::Instant::now());
 
+        drop(state);
+        self.refresh_status().await;
         Ok(())
     }
 
     pub async fn stop_playback(&self) -> Result<(), AppError> {
-        // Take the pipeline out of state quickly, then stop it outside the lock
-        let pipeline = {
+        // Take everything out of state under the lock, then do the slow
+        // GStreamer transitions outside it. The pipeline is owned (not
+        // borrowed) by the time we await, so the lock can drop cleanly.
+        let (pipeline, was_recording) = {
             let mut state = self.state.lock().await;
-
-            if state.recording {
-                if let Some(ref p) = state.playback {
-                    // Must .await so the EOS flushes and the MP4 moov atom is written.
-                    let _ = p.detach_recording().await;
-                }
-                state.recording = false;
-                state.recording_path = None;
-            }
-
-            let p = state.playback.take();
+            let was_recording = state.recording;
+            let pb = state.playback.take();
+            state.recording = false;
+            state.recording_path = None;
             state.start_time = None;
-            p
+            (pb, was_recording)
         };
 
-        // Stop pipeline outside the lock — GStreamer Null transition can be slow
         if let Some(p) = pipeline {
+            if was_recording {
+                // Must .await so the EOS flushes and the MP4 moov atom is written.
+                let _ = p.detach_recording().await;
+            }
             p.stop()?;
         }
 
         // Clear HWND — actual window destruction handled by the command layer
         // on the main thread to avoid cross-thread DestroyWindow hangs.
         self.clear_video_child_hwnd();
+        self.refresh_status().await;
 
         Ok(())
     }
@@ -256,6 +275,8 @@ impl StreamManager {
         state.rtsp_start_time = Some(std::time::Instant::now());
         state.rtsp_local_ip = Some(local_ip);
 
+        drop(state);
+        self.refresh_status().await;
         Ok(info)
     }
 
@@ -272,50 +293,70 @@ impl StreamManager {
             });
         }
         log::info!("RTSP server stopped");
+        drop(state);
+        self.refresh_status().await;
         Ok(())
     }
 
-    pub async fn get_status(&self) -> Result<StreamStatus, AppError> {
-        let state = self.state.lock().await;
-        let uptime = state
-            .rtsp_start_time
-            .map(|t| t.elapsed().as_secs())
-            .unwrap_or(0);
+    /// Recompute status from internal state and publish to subscribers.
+    /// Called after every command-side mutation, plus on the 1Hz ticker
+    /// for uptime / bandwidth refresh.
+    async fn refresh_status(&self) {
+        let snapshot = compute_status(&self.state).await;
+        self.status_tx.send_if_modified(|cur| {
+            if *cur == snapshot {
+                false
+            } else {
+                *cur = snapshot;
+                true
+            }
+        });
+    }
 
-        let cached_ip = state.rtsp_local_ip.as_deref().unwrap_or("0.0.0.0");
-        let bandwidth = state
-            .rtsp_server
-            .as_ref()
-            .map(|s| s.bandwidth_kbps())
-            .unwrap_or(0.0);
+    /// Spawn the status ticker (1Hz refresh of uptime/bandwidth/health)
+    /// and the broadcaster (emit `stream-status` to the frontend on every
+    /// change). Idempotent only in the sense that the watch's
+    /// `send_if_modified` deduplicates — calling twice would spawn two
+    /// tickers, so call exactly once at app startup.
+    pub fn start_status_emitter(&self, handle: tauri::AppHandle) {
+        let state_for_tick = self.state.clone();
+        let tx_for_tick = self.status_tx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let snap = compute_status(&state_for_tick).await;
+                tx_for_tick.send_if_modified(|cur| {
+                    if *cur == snap {
+                        false
+                    } else {
+                        *cur = snap;
+                        true
+                    }
+                });
+            }
+        });
 
-        let (playing, error) = match state.playback.as_ref() {
-            Some(p) => match p.health_check() {
-                Ok(healthy) => (healthy, None),
-                Err(msg) => (false, Some(msg)),
-            },
-            None => (false, None),
-        };
-
-        Ok(StreamStatus {
-            playing,
-            rtsp_server_running: state.rtsp_server.is_some(),
-            rtsp_url: state.rtsp_server.as_ref().map(|s| s.client_url(cached_ip)),
-            display_url: state.rtsp_server.as_ref().map(|s| s.display_url(cached_ip)),
-            recording: state.recording,
-            uptime_secs: uptime,
-            bandwidth_kbps: bandwidth,
-            error,
-        })
+        let mut rx = self.status_tx.subscribe();
+        tokio::spawn(async move {
+            use tauri::Emitter;
+            while rx.changed().await.is_ok() {
+                let snap = rx.borrow().clone();
+                let _ = handle.emit("stream-status", &snap);
+            }
+        });
     }
 
     pub async fn take_screenshot(&self) -> Result<String, AppError> {
-        let state = self.state.lock().await;
-
-        let pipeline = state
-            .playback
-            .as_ref()
-            .ok_or_else(|| AppError::Stream("No active playback for screenshot".into()))?;
+        let pipeline = {
+            let state = self.state.lock().await;
+            state
+                .playback
+                .as_ref()
+                .ok_or_else(|| AppError::Stream("No active playback for screenshot".into()))?
+                .clone()
+        };
 
         let (width, height, rgb_data) = pipeline.pull_snapshot()?;
 
@@ -329,52 +370,63 @@ impl StreamManager {
     }
 
     pub async fn start_recording(&self) -> Result<(), AppError> {
-        let mut state = self.state.lock().await;
+        {
+            let mut state = self.state.lock().await;
 
-        if state.recording {
-            return Err(AppError::Stream("Already recording".into()));
+            if state.recording {
+                return Err(AppError::Stream("Already recording".into()));
+            }
+
+            let pipeline = state
+                .playback
+                .as_ref()
+                .ok_or_else(|| AppError::Stream("No active playback to record".into()))?
+                .clone();
+
+            let output_dir = dirs::video_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join("PocketStream");
+
+            let path = recorder::recording_path(&output_dir)?;
+            let path_str = path.to_string_lossy().to_string();
+
+            pipeline.attach_recording(&path_str)?;
+            state.recording = true;
+            state.recording_path = Some(path_str);
         }
 
-        let pipeline = state
-            .playback
-            .as_ref()
-            .ok_or_else(|| AppError::Stream("No active playback to record".into()))?;
-
-        let output_dir = dirs::video_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join("PocketStream");
-
-        let path = recorder::recording_path(&output_dir)?;
-        let path_str = path.to_string_lossy().to_string();
-
-        pipeline.attach_recording(&path_str)?;
-        state.recording = true;
-        state.recording_path = Some(path_str);
-
+        self.refresh_status().await;
         Ok(())
     }
 
     pub async fn stop_recording(&self) -> Result<String, AppError> {
-        let mut state = self.state.lock().await;
+        // Clone the pipeline Arc and capture path under the lock, then
+        // drop the lock before awaiting on the slow EOS flush.
+        let (pipeline, path) = {
+            let mut state = self.state.lock().await;
 
-        if !state.recording {
-            return Err(AppError::Stream("Not currently recording".into()));
-        }
+            if !state.recording {
+                return Err(AppError::Stream("Not currently recording".into()));
+            }
 
-        let pipeline = state
-            .playback
-            .as_ref()
-            .ok_or_else(|| AppError::Stream("No active playback".into()))?;
+            let pipeline = state
+                .playback
+                .as_ref()
+                .ok_or_else(|| AppError::Stream("No active playback".into()))?
+                .clone();
+
+            state.recording = false;
+            let path = state
+                .recording_path
+                .take()
+                .unwrap_or_else(|| "unknown".into());
+            (pipeline, path)
+        };
 
         pipeline.detach_recording().await?;
 
-        state.recording = false;
-        let path = state
-            .recording_path
-            .take()
-            .unwrap_or_else(|| "unknown".into());
-
         log::info!("Recording saved: {}", path);
+        self.refresh_status().await;
         Ok(path)
     }
 
@@ -396,6 +448,43 @@ impl StreamManager {
     pub fn clear_video_child_hwnd(&self) {
         self.video_hwnd
             .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Compute a status snapshot from the underlying state. Lifted out of
+/// `StreamManager` so the background ticker can call it without holding
+/// a `StreamManager` reference (it only needs the state Arc).
+async fn compute_status(state: &Arc<Mutex<StreamState>>) -> StreamStatus {
+    let state = state.lock().await;
+    let uptime = state
+        .rtsp_start_time
+        .map(|t| t.elapsed().as_secs())
+        .unwrap_or(0);
+
+    let cached_ip = state.rtsp_local_ip.as_deref().unwrap_or("0.0.0.0");
+    let bandwidth = state
+        .rtsp_server
+        .as_ref()
+        .map(|s| s.bandwidth_kbps())
+        .unwrap_or(0.0);
+
+    let (playing, error) = match state.playback.as_ref() {
+        Some(p) => match p.health_check() {
+            Ok(healthy) => (healthy, None),
+            Err(msg) => (false, Some(msg)),
+        },
+        None => (false, None),
+    };
+
+    StreamStatus {
+        playing,
+        rtsp_server_running: state.rtsp_server.is_some(),
+        rtsp_url: state.rtsp_server.as_ref().map(|s| s.client_url(cached_ip)),
+        display_url: state.rtsp_server.as_ref().map(|s| s.display_url(cached_ip)),
+        recording: state.recording,
+        uptime_secs: uptime,
+        bandwidth_kbps: bandwidth,
+        error,
     }
 }
 
@@ -610,12 +699,39 @@ mod tests {
     #[tokio::test]
     async fn stream_manager_initial_status() {
         let mgr = StreamManager::new();
-        let status = mgr.get_status().await.unwrap();
+        let status = mgr.status_tx.borrow().clone();
         assert!(!status.playing);
         assert!(!status.rtsp_server_running);
         assert!(!status.recording);
         assert_eq!(status.uptime_secs, 0);
         assert!(status.rtsp_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_status_updates_watch_channel() {
+        let mgr = StreamManager::new();
+        let mut rx = mgr.status_tx.subscribe();
+        // Mark recording without going through start_recording so we can
+        // verify refresh_status actually publishes the new state.
+        {
+            let mut state = mgr.state.lock().await;
+            state.recording = true;
+        }
+        mgr.refresh_status().await;
+        let snap = rx.borrow_and_update().clone();
+        assert!(snap.recording);
+    }
+
+    #[tokio::test]
+    async fn refresh_status_dedupes_identical_snapshots() {
+        let mgr = StreamManager::new();
+        let mut rx = mgr.status_tx.subscribe();
+        // Drain initial value so `has_changed` reflects only post-init events.
+        rx.borrow_and_update();
+        mgr.refresh_status().await;
+        // No mutation happened — snapshot is identical to the initial one,
+        // so the watch channel must not have ticked.
+        assert!(!rx.has_changed().unwrap());
     }
 
     #[test]

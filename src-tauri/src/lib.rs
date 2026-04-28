@@ -476,7 +476,6 @@ pub fn run() {
             commands::stop_stream,
             commands::start_rtsp_server,
             commands::stop_rtsp_server,
-            commands::get_stream_status,
             commands::take_screenshot,
             commands::start_recording,
             commands::stop_recording,
@@ -499,6 +498,13 @@ pub fn run() {
         ])
         .setup(|app| {
             let handle = app.handle().clone();
+
+            // Spawn the stream-status emitter: a 1Hz internal ticker that
+            // refreshes the watch channel snapshot, plus a broadcaster that
+            // emits `stream-status` to the frontend on every change.
+            // Replaces the old 1Hz frontend poll of get_stream_status.
+            let stream_mgr: tauri::State<'_, streaming::StreamManager> = handle.state();
+            stream_mgr.start_status_emitter(handle.clone());
 
             // Start event-driven NIC watcher (Windows NotifyIpInterfaceChange +
             // NotifyUnicastIpAddressChange). If it fails to register — or on

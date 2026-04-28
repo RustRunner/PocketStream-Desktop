@@ -81,7 +81,7 @@ export function setupStreamControls() {
   $("#btn-toggle-stream").addEventListener("click", async () => {
     if (state.isStreaming) {
       try {
-        // Set flags BEFORE the async stop so the status poll
+        // Set flags BEFORE the async stop so an in-flight status event
         // doesn't race and trigger a false "Stream Lost".
         state.isStreaming = false;
         state.streamLost = false;
@@ -89,7 +89,6 @@ export function setupStreamControls() {
         resumeSnapshot = null;
         // Clear any stuck overlay from an earlier drop in this session.
         hideStreamLost();
-        stopStatusPolling();
         await api.stopStream();
         updateStreamUI();
         showToast("Stream stopped");
@@ -117,7 +116,7 @@ export function setupStreamControls() {
         state.isStreaming = true;
         updateStreamUI();
         syncVideoVisibility();
-        startStatusPolling();
+        notPlayingStreak = 0;
         showToast("Stream started");
       } catch (e) {
         showToast("Stream failed: " + formatError(e), true);
@@ -233,7 +232,6 @@ export async function setupRtspControls() {
         state.isRtspRunning = true;
         rtspFullUrl = info.rtsp_url;
         updateRtspUI(info.display_url);
-        startStatusPolling();
         showToast("RTSP server started");
       } catch (e) {
         showToast("RTSP server failed: " + formatError(e), true);
@@ -343,57 +341,52 @@ function setupQrDialog() {
   });
 }
 
-// ── Status polling ──────────────────────────────────────────────────
-
-function startStatusPolling() {
-  if (state.statusPollInterval) return;
-  notPlayingStreak = 0;
-  state.statusPollInterval = setInterval(pollStatus, 1000);
-}
-
-function stopStatusPolling() {
-  if (!state.isStreaming && !state.isRtspRunning) {
-    clearInterval(state.statusPollInterval);
-    state.statusPollInterval = null;
-  }
-}
+// ── Status events ───────────────────────────────────────────────────
+//
+// Backend pushes `stream-status` events whenever the snapshot changes
+// (1Hz internal ticker plus an immediate refresh after every command-
+// side mutation). Frontend subscribes once at startup; no polling.
 
 // Require the backend to report `playing=false` across N consecutive
-// 1s polls before declaring the stream lost. A single blip (transient
-// state transition, RTCP jitter, GStreamer bus race) self-heals within
-// one poll and shouldn't nuke an otherwise-healthy stream.
-const DROP_THRESHOLD_POLLS = 3;
+// status events before declaring the stream lost. A single blip
+// (transient state transition, RTCP jitter, GStreamer bus race)
+// self-heals on the next event and shouldn't nuke an otherwise-healthy
+// stream. The backend ticks at 1Hz, so this is ~3 seconds.
+const DROP_THRESHOLD_EVENTS = 3;
 let notPlayingStreak = 0;
 
-async function pollStatus() {
-  try {
-    const status = await api.getStreamStatus();
-    if (!status) return;
+/** Subscribe to backend stream-status push events. Call once at app
+ *  startup. Replaces the old setInterval(pollStatus, 1000). */
+export function startStatusListener() {
+  api.onEvent("stream-status", handleStatus);
+}
 
-    if (status.rtsp_server_running) {
-      $("#rtsp-uptime").textContent = formatUptime(status.uptime_secs);
-      $("#rtsp-bandwidth").textContent = `${status.bandwidth_kbps.toFixed(1)} kbps`;
-      // Keep rtspFullUrl in sync — it may have been cleared by a
-      // transient stream-loss event while the server kept running.
-      if (!rtspFullUrl && status.rtsp_url) {
-        rtspFullUrl = status.rtsp_url;
-      }
-    }
+function handleStatus(status) {
+  if (!status) return;
 
-    // Detect stream drop — backend says not playing but we think we're streaming
-    if (state.isStreaming && !status.playing) {
-      notPlayingStreak++;
-      if (notPlayingStreak >= DROP_THRESHOLD_POLLS) {
-        showStreamLost(status.error);
-      }
-    } else if (state.isStreaming && status.playing) {
-      if (notPlayingStreak > 0) {
-        log(`Stream recovered after ${notPlayingStreak} bad poll(s)`);
-      }
-      notPlayingStreak = 0;
-      hideStreamLost();
+  if (status.rtsp_server_running) {
+    $("#rtsp-uptime").textContent = formatUptime(status.uptime_secs);
+    $("#rtsp-bandwidth").textContent = `${status.bandwidth_kbps.toFixed(1)} kbps`;
+    // Keep rtspFullUrl in sync — it may have been cleared by a
+    // transient stream-loss event while the server kept running.
+    if (!rtspFullUrl && status.rtsp_url) {
+      rtspFullUrl = status.rtsp_url;
     }
-  } catch (_) {}
+  }
+
+  // Detect stream drop — backend says not playing but we think we're streaming
+  if (state.isStreaming && !status.playing) {
+    notPlayingStreak++;
+    if (notPlayingStreak >= DROP_THRESHOLD_EVENTS) {
+      showStreamLost(status.error);
+    }
+  } else if (state.isStreaming && status.playing) {
+    if (notPlayingStreak > 0) {
+      log(`Stream recovered after ${notPlayingStreak} bad event(s)`);
+    }
+    notPlayingStreak = 0;
+    hideStreamLost();
+  }
 }
 
 /// Stream state captured at the moment of a hard network disconnect,
@@ -463,7 +456,7 @@ export async function handleReconnect() {
     state.streamLost = false;
     hideStreamLost();
     updateStreamUI();
-    startStatusPolling();
+    notPlayingStreak = 0;
     showToast("Stream resumed");
 
     // RTSP server was running — bring it back too. Errors here aren't
@@ -513,8 +506,8 @@ function showStreamLost(errorMsg) {
   // Deliberately leave state.isStreaming = true: the user's intent is
   // still "I want to stream", the connection just failed. Keeps the
   // button labelled "Stop Stream" so clicking it means "give up", not
-  // "start fresh". pollStatus keeps running (stopStatusPolling is a
-  // no-op while isStreaming is true) so recovery is detected.
+  // "start fresh". The status-event subscriber keeps running so
+  // recovery is detected on the next push.
   state.isRecording = false;
   $("#btn-record").classList.remove("recording");
   updateStreamUI();
@@ -526,10 +519,10 @@ function showStreamLost(errorMsg) {
 
 function hideStreamLost() {
   state.streamLost = false;
-  // Reset the drop-detection streak: during the lost window pollStatus
-  // kept running and counted every `playing=false` poll (often 10+),
+  // Reset the drop-detection streak: during the lost window the status
+  // listener kept counting every `playing=false` event (often 10+),
   // which would otherwise instantly re-fire showStreamLost on the
-  // next tick after handleReconnect resets the lost state — faster
+  // next event after handleReconnect resets the lost state — faster
   // than the newly-started pipeline can reach Playing.
   notPlayingStreak = 0;
   // syncVideoVisibility leaves the video hidden if a dialog is open —

@@ -12,7 +12,6 @@ export const state = {
   isStreaming: false,
   isRtspRunning: false,
   isRecording: false,
-  statusPollInterval: null,
 };
 // `selectedDevice` and `lastSubnetResults` previously lived here; they
 // are now in src/lib/store.js with subscribe/notify accessors. New

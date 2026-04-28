@@ -9,7 +9,7 @@ import { refreshInterfaces, setupIpConfigDialog, setupCameraIpDropdown, setupInt
 import { setupArpListeners, loadExistingArpState, setupAliasDialog, resetDiscoveryStatus } from "./lib/devices.js";
 import { setupCacheDialog } from "./lib/device-cache.js";
 import * as deviceList from "./lib/device-list.js";
-import { setupStreamControls, setupRtspControls, setupVideoResize, getVideoAreaBounds } from "./lib/streaming.js";
+import { setupStreamControls, setupRtspControls, setupVideoResize, getVideoAreaBounds, startStatusListener } from "./lib/streaming.js";
 import { setupPtzControls } from "./lib/ptz.js";
 
 // ── Init ────────────────────────────────────────────────────────────
@@ -29,6 +29,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   setupResetAdapterButton();
   setupPtzControls();
   setupVideoResize();
+  startStatusListener();
 
   await loadConfig();
 
