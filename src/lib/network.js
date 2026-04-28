@@ -109,8 +109,9 @@ export function setupInterfaceWatcher() {
       // Capture the CAM/PTU selections BEFORE updateCameraIpDropdown
       // wipes them below — otherwise handleHardDisconnect would
       // snapshot an empty PTU value and auto-resume on replug wouldn't
-      // restore it. (camera_ip has a state.config fallback; ptu_ip
-      // doesn't.)
+      // restore it. (camera_ip has a state.config fallback because it
+      // persists; ptu_ip is session-only so the dropdown value is the
+      // sole source of truth.)
       handleHardDisconnect("Ethernet disconnected");
       state.activeInterface = null;
       $("#iface-name").textContent = "None found";
@@ -305,11 +306,12 @@ export function setupCameraIpDropdown() {
     }
   });
 
-  $("#ptu-ip").addEventListener("change", (e) => {
-    if (state.config) {
-      state.config.stream.ptu_ip = e.target.value || "";
-    }
-  });
+  // PTU IP is session-only — the user picks it each launch from the
+  // Nodes dropdown. Backend StreamConfig deliberately has no ptu_ip
+  // field (asymmetric with camera_ip), since auto-discovery rebuilds
+  // the candidate list every session. If we ever want PTU persistence,
+  // add `ptu_ip: String` to StreamConfig and read it back on launch
+  // before populating the dropdown.
 }
 
 // ── IP Configuration dialog ─────────────────────────────────────────

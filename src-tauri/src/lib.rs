@@ -4,6 +4,7 @@ mod config;
 mod error;
 mod network;
 mod streaming;
+mod validation;
 
 use std::path::PathBuf;
 use std::sync::OnceLock;

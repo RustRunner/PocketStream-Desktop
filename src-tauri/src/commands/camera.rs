@@ -5,6 +5,7 @@ use tauri::State;
 
 use crate::config::AppConfig;
 use crate::error::AppError;
+use crate::validation::parse_camera_ip;
 
 // ── FLIR PTU ────────────────────────────────────────────────────────
 
@@ -13,12 +14,7 @@ pub async fn ptu_send(
     ip: String,
     cmd: String,
 ) -> Result<std::collections::HashMap<String, String>, AppError> {
-    let addr: std::net::Ipv4Addr = ip
-        .parse()
-        .map_err(|_| AppError::Network(format!("Invalid IP address: {}", ip)))?;
-    if addr.is_loopback() || addr.is_link_local() || addr.is_broadcast() || addr.is_unspecified() {
-        return Err(AppError::Network(format!("IP address not allowed: {}", ip)));
-    }
+    let addr = parse_camera_ip(&ip)?;
     let base_url = format!("http://{}", addr);
     crate::camera::flir_ptu::send_command(&base_url, &cmd).await
 }
@@ -61,16 +57,7 @@ pub async fn sony_cgi_zoom(
     username: String,
     password: String,
 ) -> Result<(), AppError> {
-    // Validate `ip` as IPv4 and reject reserved ranges before building
-    // the HTTP URL. Without this, a compromised webview could pivot to
-    // arbitrary internal HTTP services via this IPC command (SSRF).
-    // Mirrors the validation done by `ptu_send`.
-    let addr: std::net::Ipv4Addr = ip
-        .parse()
-        .map_err(|_| AppError::Network(format!("Invalid IP address: {}", ip)))?;
-    if addr.is_loopback() || addr.is_link_local() || addr.is_broadcast() || addr.is_unspecified() {
-        return Err(AppError::Network(format!("IP address not allowed: {}", ip)));
-    }
+    let addr = parse_camera_ip(&ip)?;
 
     let url = if zoom_speed == 0 {
         format!(
@@ -118,14 +105,7 @@ pub async fn sony_cgi_zoom(
 /// this hardware. The frontend maps its 0–100% slider into that range.
 #[tauri::command]
 pub async fn control_cgi_zoom_direct(ip: String, position: i32) -> Result<(), AppError> {
-    // Mirror the SSRF guard on sony_cgi_zoom / ptu_send.
-    let addr: std::net::Ipv4Addr = ip
-        .parse()
-        .map_err(|_| AppError::Network(format!("Invalid IP address: {}", ip)))?;
-    if addr.is_loopback() || addr.is_link_local() || addr.is_broadcast() || addr.is_unspecified() {
-        return Err(AppError::Network(format!("IP address not allowed: {}", ip)));
-    }
-
+    let addr = parse_camera_ip(&ip)?;
     let url = format!("http://{}/cgi-bin/control.cgi", addr);
     let command = format!("zoom_direct {}", position);
     let form = [
@@ -185,13 +165,7 @@ pub async fn control_cgi_zoom_direct(ip: String, position: i32) -> Result<(), Ap
 /// we can wire up launch-time slider sync.
 #[tauri::command]
 pub async fn control_cgi_probe_status(ip: String) -> Result<String, AppError> {
-    let addr: std::net::Ipv4Addr = ip
-        .parse()
-        .map_err(|_| AppError::Network(format!("Invalid IP address: {}", ip)))?;
-    if addr.is_loopback() || addr.is_link_local() || addr.is_broadcast() || addr.is_unspecified() {
-        return Err(AppError::Network(format!("IP address not allowed: {}", ip)));
-    }
-
+    let addr = parse_camera_ip(&ip)?;
     let url = format!("http://{}/cgi-bin/control.cgi", addr);
     let client = reqwest::Client::new();
 

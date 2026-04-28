@@ -5,12 +5,18 @@ use tauri::State;
 use crate::config::{AppConfig, CachedDevice};
 use crate::error::AppError;
 use crate::network::{DeviceRecord, DeviceStatus, InterfaceInfo, NetworkManager, ScanResult};
+use crate::validation::parse_cidr;
 
 #[tauri::command]
 pub async fn scan_network(
     manager: State<'_, NetworkManager>,
     subnet: String,
 ) -> Result<Vec<ScanResult>, AppError> {
+    // Reject malformed CIDR at the boundary so the active-scans
+    // dedupe set doesn't cache a garbage key, and the user sees a
+    // clean error instead of whatever scanner::scan() would emit
+    // mid-iteration.
+    parse_cidr(&subnet)?;
     manager.scan_subnet(&subnet).await
 }
 
