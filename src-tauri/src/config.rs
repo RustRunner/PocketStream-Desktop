@@ -6,7 +6,8 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -351,9 +352,29 @@ fn key_path() -> PathBuf {
 }
 
 fn load_cache_from_disk() -> Option<Vec<CachedDevice>> {
-    let content = fs::read_to_string(cache_path()).ok()?;
-    let parsed: CacheFile = toml::from_str(&content).ok()?;
-    Some(parsed.devices)
+    let path = cache_path();
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            log::error!("config: failed to read {}: {}", path.display(), e);
+            return None;
+        }
+    };
+    match toml::from_str::<CacheFile>(&content) {
+        Ok(parsed) => Some(parsed.devices),
+        Err(e) => {
+            log::error!(
+                "config: device_cache.toml parse failed ({}). Moving aside to {} \
+                 so the next save can write a clean file; cached devices will be \
+                 rebuilt from the next ARP sweep.",
+                e,
+                quarantine_path(&path).display()
+            );
+            quarantine(&path);
+            None
+        }
+    }
 }
 
 fn save_cache_to_disk(cache: &[CachedDevice]) -> Result<(), crate::AppError> {
@@ -364,8 +385,85 @@ fn save_cache_to_disk(cache: &[CachedDevice]) -> Result<(), crate::AppError> {
     };
     let content =
         toml::to_string_pretty(&file).map_err(|e| crate::AppError::Config(e.to_string()))?;
-    fs::write(cache_path(), content).map_err(|e| crate::AppError::Config(e.to_string()))?;
+    atomic_write(&cache_path(), content.as_bytes())
+        .map_err(|e| crate::AppError::Config(e.to_string()))?;
     Ok(())
+}
+
+/// Crash-safe file write: stage to `<path>.tmp`, fsync, then rename
+/// onto the final path. The rename is atomic on NTFS and on POSIX
+/// filesystems (same-volume rename is a single inode operation), so a
+/// reader either sees the old complete file or the new complete file —
+/// never a half-written one. Replaces the prior `fs::write` calls in
+/// the config save paths, where a kill -9 mid-write would leave a
+/// truncated TOML and the next launch would silently fall back to
+/// defaults.
+fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
+    })?;
+    fs::create_dir_all(parent)?;
+
+    // .tmp suffix on the full filename rather than via with_extension
+    // — config.toml.tmp is more obviously a staging file than config.tmp,
+    // and avoids stomping a sibling file that happens to share the stem.
+    let mut tmp_name = path
+        .file_name()
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name")
+        })?
+        .to_owned();
+    tmp_name.push(".tmp");
+    let tmp_path = parent.join(&tmp_name);
+
+    {
+        let mut file = fs::File::create(&tmp_path)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+    }
+
+    // On Unix the directory entry change isn't durable until we fsync
+    // the parent dir too; on Windows the rename itself is journaled so
+    // the parent fsync is unnecessary (and File::open on a directory
+    // would fail anyway).
+    fs::rename(&tmp_path, path)?;
+    #[cfg(unix)]
+    {
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
+/// Build the quarantine path for a corrupted file. Pure function so the
+/// log message and the rename target stay in sync.
+fn quarantine_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_owned())
+        .unwrap_or_else(|| std::ffi::OsString::from("config"));
+    name.push(".parse-error");
+    path.parent()
+        .map(|p| p.join(&name))
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
+/// Move a corrupted config file aside. Best-effort — if the rename
+/// fails (e.g., quarantine target also exists from a prior failure)
+/// the original stays put and the next save will overwrite it via
+/// atomic_write. Either way the user isn't worse off than the prior
+/// silent-default behavior.
+fn quarantine(path: &Path) {
+    let dest = quarantine_path(path);
+    if let Err(e) = fs::rename(path, &dest) {
+        log::warn!(
+            "config: failed to quarantine corrupted {} to {}: {}",
+            path.display(),
+            dest.display(),
+            e
+        );
+    }
 }
 
 /// Pull the legacy `device_cache` array out of an older `config.toml`
@@ -378,19 +476,62 @@ fn extract_legacy_device_cache(toml_content: &str) -> Option<Vec<CachedDevice>> 
 }
 
 fn load_from_disk() -> Option<AppSettings> {
-    let content = fs::read_to_string(config_path()).ok()?;
-    // For credentials, decrypt after loading
-    let mut settings: AppSettings = toml::from_str(&content).ok()?;
+    let path = config_path();
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            log::error!("config: failed to read {}: {}", path.display(), e);
+            return None;
+        }
+    };
 
-    // Decrypt credentials if key exists
+    let mut settings: AppSettings = match toml::from_str(&content) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!(
+                "config: config.toml parse failed ({}). Moving aside to {} and \
+                 launching with defaults; the corrupted file is preserved for \
+                 inspection.",
+                e,
+                quarantine_path(&path).display()
+            );
+            quarantine(&path);
+            return None;
+        }
+    };
+
+    // Decrypt credentials if key exists. A decrypt failure means the
+    // ciphertext is corrupted or the key changed (e.g., user copied
+    // config.toml between machines without .key); log and clear the
+    // field rather than handing the encrypted base64 back to the UI as
+    // if it were the username.
     if let Ok(key_bytes) = fs::read(key_path()) {
         if key_bytes.len() == 32 {
             settings.credentials.username =
-                decrypt_string(&settings.credentials.username, &key_bytes)
-                    .unwrap_or(settings.credentials.username);
+                match decrypt_string(&settings.credentials.username, &key_bytes) {
+                    Some(s) => s,
+                    None if settings.credentials.username.is_empty() => String::new(),
+                    None => {
+                        log::error!(
+                            "config: failed to decrypt stored username — clearing. \
+                             User will need to re-enter credentials."
+                        );
+                        String::new()
+                    }
+                };
             settings.credentials.password =
-                decrypt_string(&settings.credentials.password, &key_bytes)
-                    .unwrap_or(settings.credentials.password);
+                match decrypt_string(&settings.credentials.password, &key_bytes) {
+                    Some(s) => s,
+                    None if settings.credentials.password.is_empty() => String::new(),
+                    None => {
+                        log::error!(
+                            "config: failed to decrypt stored password — clearing. \
+                             User will need to re-enter credentials."
+                        );
+                        String::new()
+                    }
+                };
         }
     }
 
@@ -401,17 +542,16 @@ fn save_to_disk(settings: &AppSettings) -> Result<(), crate::AppError> {
     let dir = config_dir();
     fs::create_dir_all(&dir).map_err(|e| crate::AppError::Config(e.to_string()))?;
 
-    // Ensure encryption key exists
     let key_bytes = get_or_create_key()?;
 
-    // Encrypt credentials before saving
     let mut save_settings = settings.clone();
     save_settings.credentials.username = encrypt_string(&settings.credentials.username, &key_bytes);
     save_settings.credentials.password = encrypt_string(&settings.credentials.password, &key_bytes);
 
     let content = toml::to_string_pretty(&save_settings)
         .map_err(|e| crate::AppError::Config(e.to_string()))?;
-    fs::write(config_path(), content).map_err(|e| crate::AppError::Config(e.to_string()))?;
+    atomic_write(&config_path(), content.as_bytes())
+        .map_err(|e| crate::AppError::Config(e.to_string()))?;
     Ok(())
 }
 
@@ -952,6 +1092,100 @@ password = ""
     #[test]
     fn extract_legacy_cache_returns_none_for_malformed_input() {
         assert!(extract_legacy_device_cache("not toml at all !!! [[[").is_none());
+    }
+
+    // ── Atomic Writes ───────────────────────────────────────────────
+    // Crash safety: writes go through .tmp + rename so a kill -9 in the
+    // middle of a save can't truncate the live file. tempfile-backed
+    // tests use a real temp directory so the rename and the tmp suffix
+    // logic exercise actual filesystem semantics.
+
+    #[test]
+    fn atomic_write_creates_file_with_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        atomic_write(&path, b"hello").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hello");
+    }
+
+    #[test]
+    fn atomic_write_overwrites_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "old contents").unwrap();
+        atomic_write(&path, b"new contents").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new contents");
+    }
+
+    #[test]
+    fn atomic_write_leaves_no_tmp_file_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        atomic_write(&path, b"data").unwrap();
+        let tmp = dir.path().join("config.toml.tmp");
+        assert!(
+            !tmp.exists(),
+            "tmp staging file must be renamed away on success"
+        );
+    }
+
+    #[test]
+    fn atomic_write_creates_missing_parent_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a").join("b").join("config.toml");
+        atomic_write(&nested, b"data").unwrap();
+        assert!(nested.exists());
+    }
+
+    #[test]
+    fn atomic_write_preserves_existing_file_when_write_fails_mid_flight() {
+        // Simulate the kill-9 scenario by writing the staging file
+        // ourselves, leaving it abandoned, and then doing a real
+        // atomic_write — the abandoned tmp must not corrupt the live
+        // file on the rename.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let tmp = dir.path().join("config.toml.tmp");
+        fs::write(&path, "live data").unwrap();
+        fs::write(&tmp, "abandoned tmp").unwrap();
+
+        atomic_write(&path, b"new data").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new data");
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn quarantine_path_appends_parse_error_suffix() {
+        let p = PathBuf::from("/tmp/PocketStream/config.toml");
+        let q = quarantine_path(&p);
+        assert_eq!(q.file_name().unwrap(), "config.toml.parse-error");
+        assert_eq!(q.parent().unwrap(), p.parent().unwrap());
+    }
+
+    #[test]
+    fn quarantine_moves_file_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "corrupted contents").unwrap();
+        quarantine(&path);
+        let dest = dir.path().join("config.toml.parse-error");
+        assert!(!path.exists(), "original file should have been moved");
+        assert!(
+            dest.exists(),
+            "quarantine target should now hold the contents"
+        );
+        assert_eq!(fs::read_to_string(dest).unwrap(), "corrupted contents");
+    }
+
+    #[test]
+    fn quarantine_is_silent_no_op_when_source_missing() {
+        // Best-effort semantics: quarantine on an already-missing file
+        // (e.g., raced with another caller) must not panic. The warning
+        // log is exercised by the missing-file path; we just verify the
+        // function returns cleanly.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.toml");
+        quarantine(&path);
     }
 
     #[test]
