@@ -64,6 +64,10 @@ export interface CurrentWindow {
   close: () => Promise<void>;
   minimize: () => Promise<void>;
   toggleMaximize: () => Promise<void>;
+  isMaximized: () => Promise<boolean>;
+  /** Optional because the runtime may or may not expose it depending
+   *  on the @tauri-apps/window version Tauri ships. Caller uses `?.`. */
+  onResized?: (handler: () => void) => Promise<UnlistenFn>;
 }
 
 /** Shape of `window.__TAURI__.updater` used by main.js. The plugin's

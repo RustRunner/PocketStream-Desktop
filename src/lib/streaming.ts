@@ -3,16 +3,24 @@
  */
 
 import QRCode from "qrcode";
-import * as api from "./tauri-api.js";
-import { $, state, log, showToast, formatUptime } from "./state.js";
-import { formatError } from "./errors.js";
+import * as api from "./tauri-api.ts";
+import { $, state, log, showToast, formatUptime } from "./state.ts";
+import { formatError } from "./errors.ts";
+import type { StreamStatus } from "./types.ts";
 
 /** Full RTSP URL (with token) — stored for QR code generation */
-let rtspFullUrl = null;
+let rtspFullUrl: string | null = null;
 
 // ── Video area bounds ───────────────────────────────────────────────
 
-export function getVideoAreaBounds() {
+export interface VideoBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export function getVideoAreaBounds(): VideoBounds {
   const el = $("#video-area");
   const rect = el.getBoundingClientRect();
   const dpr = window.devicePixelRatio || 1;
@@ -45,7 +53,7 @@ export function getVideoAreaBounds() {
 // chicken-and-egg ordering with the open attribute.
 let openModalCount = 0;
 
-export function syncVideoVisibility() {
+export function syncVideoVisibility(): Promise<void> {
   const wantVisible =
     state.isStreaming && !state.streamLost && openModalCount === 0;
   return api.setVideoVisible(wantVisible).catch(() => {});
@@ -61,7 +69,7 @@ export function syncVideoVisibility() {
  * when no other modal is open. Safe to call when another modal is
  * already open (counter handles nesting).
  */
-export async function showModalWithVideo(dialog) {
+export async function showModalWithVideo(dialog: HTMLDialogElement): Promise<void> {
   openModalCount++;
   await syncVideoVisibility();
   dialog.showModal();
@@ -77,8 +85,8 @@ export async function showModalWithVideo(dialog) {
 
 // ── Stream controls ─────────────────────────────────────────────────
 
-export function setupStreamControls() {
-  $("#btn-toggle-stream").addEventListener("click", async () => {
+export function setupStreamControls(): void {
+  $<HTMLButtonElement>("#btn-toggle-stream").addEventListener("click", async () => {
     if (state.isStreaming) {
       try {
         // Set flags BEFORE the async stop so an in-flight status event
@@ -97,7 +105,7 @@ export function setupStreamControls() {
       }
     } else {
       try {
-        const selectedIp = $("#camera-ip").value;
+        const selectedIp = $<HTMLSelectElement>("#camera-ip").value;
         if (!selectedIp) {
           showToast("Select a camera IP first", true);
           return;
@@ -107,7 +115,12 @@ export function setupStreamControls() {
           await api.saveConfig(state.config);
         }
         const bounds = getVideoAreaBounds();
-        const handle = await api.createVideoWindow(bounds.x, bounds.y, bounds.width, bounds.height);
+        const handle = await api.createVideoWindow(
+          bounds.x,
+          bounds.y,
+          bounds.width,
+          bounds.height
+        );
         // Newly-created child window is born visible (WS_VISIBLE). If a
         // dialog happens to be open right now, sync immediately so the
         // child doesn't briefly cover it before startStream returns.
@@ -124,7 +137,7 @@ export function setupStreamControls() {
     }
   });
 
-  $("#btn-screenshot").addEventListener("click", async () => {
+  $<HTMLButtonElement>("#btn-screenshot").addEventListener("click", async () => {
     try {
       const path = await api.takeScreenshot();
       showToast("Screenshot saved: " + path);
@@ -133,7 +146,7 @@ export function setupStreamControls() {
     }
   });
 
-  $("#btn-record").addEventListener("click", async () => {
+  $<HTMLButtonElement>("#btn-record").addEventListener("click", async () => {
     if (state.isRecording) {
       const path = await api.stopRecording();
       state.isRecording = false;
@@ -150,19 +163,20 @@ export function setupStreamControls() {
 
 // ── Stream UI updates ───────────────────────────────────────────────
 
-function updateStreamUI() {
-  const btn = $("#btn-toggle-stream");
+function updateStreamUI(): void {
+  const btn = $<HTMLButtonElement>("#btn-toggle-stream");
   btn.textContent = state.isStreaming ? "Stop Stream" : "Start Stream";
   btn.className = state.isStreaming ? "outlined-btn active-btn" : "filled-btn";
   // Screenshot and record need a healthy pipeline — disable them while
   // the stream is lost even though isStreaming is still true (the user
   // intends to stream; the stream just isn't alive right now).
   const canInteract = state.isStreaming && !state.streamLost;
-  $("#btn-screenshot").disabled = !canInteract;
-  $("#btn-record").disabled = !canInteract;
+  $<HTMLButtonElement>("#btn-screenshot").disabled = !canInteract;
+  $<HTMLButtonElement>("#btn-record").disabled = !canInteract;
 
   const area = $("#video-area");
-  const placeholder = area.querySelector(".placeholder-text");
+  const placeholder = area.querySelector<HTMLElement>(".placeholder-text");
+  if (!placeholder) return;
   if (state.isStreaming) {
     placeholder.style.display = "none";
   } else {
@@ -173,13 +187,13 @@ function updateStreamUI() {
 
 // ── RTSP server controls ────────────────────────────────────────────
 
-export async function setupRtspControls() {
+export function setupRtspControls(): void {
   // The Enable toggle is also a kill switch: turning it off while the
   // server is running stops it immediately (rather than only blocking
   // a future start). Persistence still happens on Save Settings — the
   // toggle change here only affects live state.
-  const enableToggle = $("#rtsp-server-enable");
-  const startBtn = $("#btn-toggle-rtsp");
+  const enableToggle = $<HTMLInputElement>("#rtsp-server-enable");
+  const startBtn = $<HTMLButtonElement>("#btn-toggle-rtsp");
   startBtn.disabled = !enableToggle.checked;
   enableToggle.addEventListener("change", async () => {
     startBtn.disabled = !enableToggle.checked;
@@ -198,9 +212,11 @@ export async function setupRtspControls() {
   // Populate VPN dropdown in background — don't block other setup
   populateVpnDropdown();
 
-  $("#rtsp-bind-interface").addEventListener("change", async () => {
+  $<HTMLSelectElement>("#rtsp-bind-interface").addEventListener("change", async () => {
     if (!state.config) return;
-    state.config.rtsp_server.bind_interface = $("#rtsp-bind-interface").value;
+    state.config.rtsp_server.bind_interface = $<HTMLSelectElement>(
+      "#rtsp-bind-interface"
+    ).value;
     try {
       await api.saveConfig(state.config);
     } catch (e) {
@@ -208,8 +224,8 @@ export async function setupRtspControls() {
     }
   });
 
-  $("#btn-toggle-rtsp").addEventListener("click", async () => {
-    const spinner = $("#rtsp-spinner");
+  $<HTMLButtonElement>("#btn-toggle-rtsp").addEventListener("click", async () => {
+    const spinner = $<HTMLElement>("#rtsp-spinner");
     spinner.style.display = "";
 
     if (state.isRtspRunning) {
@@ -225,7 +241,9 @@ export async function setupRtspControls() {
       try {
         // Save bind_interface selection before starting
         if (state.config) {
-          state.config.rtsp_server.bind_interface = $("#rtsp-bind-interface").value;
+          state.config.rtsp_server.bind_interface = $<HTMLSelectElement>(
+            "#rtsp-bind-interface"
+          ).value;
           await api.saveConfig(state.config);
         }
         const info = await api.startRtspServer();
@@ -245,14 +263,15 @@ export async function setupRtspControls() {
   setupQrDialog();
 }
 
-async function populateVpnDropdown() {
-  const select = $("#rtsp-bind-interface");
+async function populateVpnDropdown(): Promise<void> {
+  const select = $<HTMLSelectElement>("#rtsp-bind-interface");
   try {
     const vpns = (await api.listVpnInterfaces()).filter((i) => i.ips.length > 0);
     for (const iface of vpns) {
       const opt = document.createElement("option");
       opt.value = iface.name;
-      opt.textContent = `${iface.name} (${iface.ips[0].address})`;
+      const firstIp = iface.ips[0];
+      opt.textContent = firstIp ? `${iface.name} (${firstIp.address})` : iface.name;
       select.appendChild(opt);
     }
     // Restore saved selection
@@ -264,14 +283,16 @@ async function populateVpnDropdown() {
   }
 }
 
-function updateRtspUI(displayUrl) {
-  const btn = $("#btn-toggle-rtsp");
+function updateRtspUI(displayUrl: string | null): void {
+  const btn = $<HTMLButtonElement>("#btn-toggle-rtsp");
   btn.textContent = state.isRtspRunning ? "Stop Server" : "Start Server";
   // Always allow stopping; respect Enable toggle when stopped
-  btn.disabled = state.isRtspRunning ? false : !$("#rtsp-server-enable").checked;
+  btn.disabled = state.isRtspRunning
+    ? false
+    : !$<HTMLInputElement>("#rtsp-server-enable").checked;
 
   const statusEl = $("#rtsp-status");
-  const qrBtn = $("#btn-show-qr");
+  const qrBtn = $<HTMLButtonElement>("#btn-show-qr");
 
   if (state.isRtspRunning) {
     statusEl.textContent = "Online";
@@ -291,10 +312,10 @@ function updateRtspUI(displayUrl) {
 
 // ── QR Code Dialog ──────────────────────────────────────────────────
 
-function setupQrDialog() {
-  const dialog = $("#qr-dialog");
-  const qrBtn = $("#btn-show-qr");
-  const closeBtn = $("#qr-close");
+function setupQrDialog(): void {
+  const dialog = $<HTMLDialogElement>("#qr-dialog");
+  const qrBtn = $<HTMLButtonElement>("#btn-show-qr");
+  const closeBtn = $<HTMLButtonElement>("#qr-close");
 
   qrBtn.addEventListener("click", async () => {
     if (!rtspFullUrl) return;
@@ -305,7 +326,7 @@ function setupQrDialog() {
     $("#qr-url").textContent = rtspFullUrl;
     await showModalWithVideo(dialog);
 
-    const canvas = $("#qr-canvas");
+    const canvas = $<HTMLCanvasElement>("#qr-canvas");
     try {
       await QRCode.toCanvas(canvas, rtspFullUrl, {
         width: 256,
@@ -357,11 +378,11 @@ let notPlayingStreak = 0;
 
 /** Subscribe to backend stream-status push events. Call once at app
  *  startup. Replaces the old setInterval(pollStatus, 1000). */
-export function startStatusListener() {
-  api.onEvent("stream-status", handleStatus);
+export function startStatusListener(): void {
+  api.onEvent<StreamStatus>("stream-status", handleStatus);
 }
 
-function handleStatus(status) {
+function handleStatus(status: StreamStatus | null): void {
   if (!status) return;
 
   if (status.rtsp_server_running) {
@@ -389,25 +410,31 @@ function handleStatus(status) {
   }
 }
 
-/// Stream state captured at the moment of a hard network disconnect,
-/// so we can re-start the stream (and any associated RTSP server) as
-/// soon as the link comes back. Cleared on manual stop or after a
-/// successful resume.
-let resumeSnapshot = null;
+interface ResumeSnapshot {
+  cameraIp: string | null;
+  ptuIp: string | null;
+  wasRtspRunning: boolean;
+}
 
-/// Called by the interface watcher when it detects a physical unplug /
-/// APIPA-only state. Bypasses the poll debounce so the user gets
-/// immediate "Stream Lost..." feedback instead of waiting for GStreamer
-/// to time out. Captures what was running so handleReconnect() can
-/// put it back together on replug.
-export function handleHardDisconnect(reason) {
+/** Stream state captured at the moment of a hard network disconnect,
+ *  so we can re-start the stream (and any associated RTSP server) as
+ *  soon as the link comes back. Cleared on manual stop or after a
+ *  successful resume. */
+let resumeSnapshot: ResumeSnapshot | null = null;
+
+/** Called by the interface watcher when it detects a physical unplug /
+ *  APIPA-only state. Bypasses the poll debounce so the user gets
+ *  immediate "Stream Lost..." feedback instead of waiting for GStreamer
+ *  to time out. Captures what was running so handleReconnect() can
+ *  put it back together on replug. */
+export function handleHardDisconnect(reason: string): void {
   if (state.isStreaming && !state.streamLost) {
     resumeSnapshot = {
       cameraIp:
-        $("#camera-ip").value ||
+        $<HTMLSelectElement>("#camera-ip").value ||
         state.config?.stream?.camera_ip ||
         null,
-      ptuIp: $("#ptu-ip").value || null,
+      ptuIp: $<HTMLSelectElement>("#ptu-ip").value || null,
       wasRtspRunning: !!state.isRtspRunning,
     };
     log(`Stream lost on network disconnect: ${reason}`);
@@ -415,10 +442,10 @@ export function handleHardDisconnect(reason) {
   }
 }
 
-/// Called by the interface watcher on reconnect (wasDown=true).
-/// Restores dropdown selections and restarts the stream + RTSP server
-/// if they were running before the disconnect.
-export async function handleReconnect() {
+/** Called by the interface watcher on reconnect (wasDown=true).
+ *  Restores dropdown selections and restarts the stream + RTSP server
+ *  if they were running before the disconnect. */
+export async function handleReconnect(): Promise<void> {
   if (!resumeSnapshot) return;
   const snap = resumeSnapshot;
   resumeSnapshot = null;
@@ -433,13 +460,13 @@ export async function handleReconnect() {
   // during reconnect; set values explicitly so the pre-disconnect
   // choices are back).
   if (snap.cameraIp) {
-    const camSelect = $("#camera-ip");
+    const camSelect = $<HTMLSelectElement>("#camera-ip");
     camSelect.value = snap.cameraIp;
     if (state.config) {
       state.config.stream.camera_ip = snap.cameraIp;
     }
   }
-  if (snap.ptuIp) $("#ptu-ip").value = snap.ptuIp;
+  if (snap.ptuIp) $<HTMLSelectElement>("#ptu-ip").value = snap.ptuIp;
 
   if (!snap.cameraIp) return;
 
@@ -478,7 +505,7 @@ export async function handleReconnect() {
   }
 }
 
-function showStreamLost(errorMsg) {
+function showStreamLost(errorMsg: string | null | undefined): void {
   if (state.streamLost) return;
   state.streamLost = true;
   notPlayingStreak = 0;
@@ -487,7 +514,7 @@ function showStreamLost(errorMsg) {
   // display:none via CSS; the .visible class is what reveals it.
   syncVideoVisibility();
   const area = $("#video-area");
-  let overlay = area.querySelector(".stream-lost-overlay");
+  let overlay = area.querySelector<HTMLDivElement>(".stream-lost-overlay");
   if (!overlay) {
     overlay = document.createElement("div");
     overlay.className = "stream-lost-overlay";
@@ -517,7 +544,7 @@ function showStreamLost(errorMsg) {
   showToast("Stream lost — " + reason, true);
 }
 
-function hideStreamLost() {
+function hideStreamLost(): void {
   state.streamLost = false;
   // Reset the drop-detection streak: during the lost window the status
   // listener kept counting every `playing=false` event (often 10+),
@@ -534,11 +561,11 @@ function hideStreamLost() {
 
 // ── Video resize handler ────────────────────────────────────────────
 
-export function setupVideoResize() {
-  let resizeTimer = null;
+export function setupVideoResize(): void {
+  let resizeTimer: ReturnType<typeof setTimeout> | null = null;
   window.addEventListener("resize", () => {
     if (!state.isStreaming) return;
-    clearTimeout(resizeTimer);
+    if (resizeTimer) clearTimeout(resizeTimer);
     resizeTimer = setTimeout(async () => {
       try {
         const bounds = getVideoAreaBounds();

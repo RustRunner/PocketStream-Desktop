@@ -2,15 +2,39 @@
  * PocketStream Desktop — Main Application (orchestrator)
  */
 
-import * as api from "./lib/tauri-api.js";
-import { $, $$, state, showToast, adoptedSubnets } from "./lib/state.js";
-import { formatError } from "./lib/errors.js";
-import { refreshInterfaces, setupIpConfigDialog, setupCameraIpDropdown, setupInterfaceWatcher, isInterfaceConnected, warnNoEthernet } from "./lib/network.js";
-import { setupArpListeners, loadExistingArpState, setupAliasDialog, resetDiscoveryStatus } from "./lib/devices.js";
-import { setupCacheDialog } from "./lib/device-cache.js";
-import * as deviceList from "./lib/device-list.js";
-import { setupStreamControls, setupRtspControls, setupVideoResize, getVideoAreaBounds, startStatusListener } from "./lib/streaming.js";
-import { setupPtzControls } from "./lib/ptz.js";
+import * as api from "./lib/tauri-api.ts";
+import { $, $$, state, showToast, adoptedSubnets } from "./lib/state.ts";
+import { formatError } from "./lib/errors.ts";
+import {
+  refreshInterfaces,
+  setupIpConfigDialog,
+  setupCameraIpDropdown,
+  setupInterfaceWatcher,
+  isInterfaceConnected,
+  warnNoEthernet,
+} from "./lib/network.ts";
+import {
+  setupArpListeners,
+  loadExistingArpState,
+  setupAliasDialog,
+  resetDiscoveryStatus,
+} from "./lib/devices.ts";
+import { setupCacheDialog } from "./lib/device-cache.ts";
+import * as deviceList from "./lib/device-list.ts";
+import {
+  setupStreamControls,
+  setupRtspControls,
+  setupVideoResize,
+  getVideoAreaBounds,
+  startStatusListener,
+} from "./lib/streaming.ts";
+import { setupPtzControls } from "./lib/ptz.ts";
+import type {
+  Credentials,
+  RtspServerConfig,
+  StreamConfig,
+} from "./lib/types.ts";
+import type { TauriUpdate } from "./lib/tauri-global.d.ts";
 
 // ── Init ────────────────────────────────────────────────────────────
 
@@ -64,7 +88,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
 // ── Auto-updater ───────────────────────────────────────────────────
 
-async function checkForUpdates() {
+async function checkForUpdates(): Promise<void> {
   const updater = window.__TAURI__?.updater;
   if (!updater) return;
 
@@ -80,7 +104,7 @@ async function checkForUpdates() {
   }
 }
 
-function showUpdateToast(update) {
+function showUpdateToast(update: TauriUpdate): void {
   const existing = document.querySelector(".toast");
   if (existing) existing.remove();
 
@@ -162,28 +186,29 @@ function showUpdateToast(update) {
 
 // ── Config ──────────────────────────────────────────────────────────
 
-async function loadConfig() {
+async function loadConfig(): Promise<void> {
   try {
     state.config = await api.getConfig();
     if (!state.config) return;
 
     // Populate settings UI
-    $("#rtsp-port").value = state.config.stream.rtsp_port;
-    $("#rtsp-path").value = state.config.stream.rtsp_path;
-    $("#udp-port").value = state.config.stream.udp_port;
-    $("#camera-user").value = state.config.credentials.username;
-    $("#camera-pass").value = state.config.credentials.password;
-    $("#rtsp-server-enable").checked = state.config.rtsp_server.enabled;
-    $("#rtsp-server-port").value = state.config.rtsp_server.port;
-    $("#rtsp-token").value = state.config.rtsp_server.token;
+    $<HTMLInputElement>("#rtsp-port").value = String(state.config.stream.rtsp_port);
+    $<HTMLInputElement>("#rtsp-path").value = state.config.stream.rtsp_path;
+    $<HTMLInputElement>("#udp-port").value = String(state.config.stream.udp_port);
+    $<HTMLInputElement>("#camera-user").value = state.config.credentials.username;
+    $<HTMLInputElement>("#camera-pass").value = state.config.credentials.password;
+    $<HTMLInputElement>("#rtsp-server-enable").checked = state.config.rtsp_server.enabled;
+    $<HTMLInputElement>("#rtsp-server-port").value = String(state.config.rtsp_server.port);
+    $<HTMLInputElement>("#rtsp-token").value = state.config.rtsp_server.token;
     if (state.config.rtsp_server.bind_interface) {
-      $("#rtsp-bind-interface").value = state.config.rtsp_server.bind_interface;
+      $<HTMLSelectElement>("#rtsp-bind-interface").value =
+        state.config.rtsp_server.bind_interface;
     }
 
     // Set active protocol
     const proto = state.config.stream.protocol;
-    $$("[data-protocol]").forEach((btn) => {
-      btn.classList.toggle("active", btn.dataset.protocol === proto);
+    $$<HTMLElement>("[data-protocol]").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset["protocol"] === proto);
     });
     updateProtocolVisibility(proto);
   } catch (e) {
@@ -191,26 +216,27 @@ async function loadConfig() {
   }
 }
 
-function setupSettingsSave() {
-  $("#save-settings").addEventListener("click", async () => {
-    const activeProto = $("[data-protocol].active")?.dataset.protocol || "rtsp";
+function setupSettingsSave(): void {
+  $<HTMLButtonElement>("#save-settings").addEventListener("click", async () => {
+    const activeProto =
+      $<HTMLElement>("[data-protocol].active")?.dataset["protocol"] || "rtsp";
 
-    const stream = {
+    const stream: StreamConfig = {
       protocol: activeProto,
-      rtsp_port: parseInt($("#rtsp-port").value) || 554,
-      rtsp_path: $("#rtsp-path").value || "/z3-1.sdp",
-      udp_port: parseInt($("#udp-port").value) || 8600,
+      rtsp_port: parseInt($<HTMLInputElement>("#rtsp-port").value) || 554,
+      rtsp_path: $<HTMLInputElement>("#rtsp-path").value || "/z3-1.sdp",
+      udp_port: parseInt($<HTMLInputElement>("#udp-port").value) || 8600,
       camera_ip: state.config?.stream?.camera_ip || "",
     };
-    const rtspServer = {
-      enabled: $("#rtsp-server-enable").checked,
-      port: parseInt($("#rtsp-server-port").value) || 8554,
-      token: $("#rtsp-token").value,
+    const rtspServer: RtspServerConfig = {
+      enabled: $<HTMLInputElement>("#rtsp-server-enable").checked,
+      port: parseInt($<HTMLInputElement>("#rtsp-server-port").value) || 8554,
+      token: $<HTMLInputElement>("#rtsp-token").value,
       bind_interface: state.config?.rtsp_server?.bind_interface || "",
     };
-    const credentials = {
-      username: $("#camera-user").value,
-      password: $("#camera-pass").value,
+    const credentials: Credentials = {
+      username: $<HTMLInputElement>("#camera-user").value,
+      password: $<HTMLInputElement>("#camera-pass").value,
     };
 
     try {
@@ -231,24 +257,26 @@ function setupSettingsSave() {
   });
 
   // Regenerate token
-  $("#regen-token").addEventListener("click", () => {
+  $<HTMLButtonElement>("#regen-token").addEventListener("click", () => {
     const hex = Array.from(crypto.getRandomValues(new Uint8Array(8)))
       .map((b) => b.toString(16).padStart(2, "0"))
       .join("");
-    $("#rtsp-token").value = hex;
+    $<HTMLInputElement>("#rtsp-token").value = hex;
   });
 }
 
 // ── Sidebar ─────────────────────────────────────────────────────────
 
-function setupMenuAndAbout() {
+function setupMenuAndAbout(): void {
   // Open Log Folder button
-  $("#open-logs").addEventListener("click", () => {
-    api.openLogFolder().catch((e) => showToast("Failed to open logs: " + formatError(e), true));
+  $<HTMLButtonElement>("#open-logs").addEventListener("click", () => {
+    api
+      .openLogFolder()
+      .catch((e: unknown) => showToast("Failed to open logs: " + formatError(e), true));
   });
 
   // Hamburger toggles settings sidebar
-  $("#menu-toggle").addEventListener("click", () => {
+  $<HTMLButtonElement>("#menu-toggle").addEventListener("click", () => {
     const sidebar = $("#sidebar");
     sidebar.classList.toggle("collapsed");
 
@@ -267,7 +295,7 @@ function setupMenuAndAbout() {
 
   // About icon toggles about panel
   const aboutPanel = $("#about-panel");
-  $("#about-toggle").addEventListener("click", (e) => {
+  $<HTMLButtonElement>("#about-toggle").addEventListener("click", (e) => {
     e.stopPropagation();
     aboutPanel.classList.toggle("open");
   });
@@ -282,7 +310,8 @@ function setupMenuAndAbout() {
 
   // Close about panel when clicking elsewhere
   document.addEventListener("click", (e) => {
-    if (!e.target.closest(".about-wrapper")) {
+    const target = e.target as Element | null;
+    if (!target?.closest(".about-wrapper")) {
       aboutPanel.classList.remove("open");
     }
   });
@@ -290,23 +319,23 @@ function setupMenuAndAbout() {
 
 // ── Window Controls ─────────────────────────────────────────────────
 
-function setupWindowControls() {
+function setupWindowControls(): void {
   const win = window.__TAURI__?.window?.getCurrentWindow?.();
   if (!win) return;
 
   const maximizeIcon = `<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M3 3v10h10V3H3zm9 9H4V4h8v8z"/></svg>`;
   const restoreIcon = `<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M3 5v8h8V5H3zm7 7H4V6h6v6zm1-9H5v1h7v7h1V3h-2z"/></svg>`;
 
-  async function updateMaximizeIcon() {
-    $("#btn-maximize").innerHTML = (await win.isMaximized()) ? restoreIcon : maximizeIcon;
+  async function updateMaximizeIcon(): Promise<void> {
+    $("#btn-maximize").innerHTML = (await win!.isMaximized()) ? restoreIcon : maximizeIcon;
   }
 
-  $("#btn-minimize").addEventListener("click", () => win.minimize());
-  $("#btn-maximize").addEventListener("click", async () => {
+  $<HTMLButtonElement>("#btn-minimize").addEventListener("click", () => win.minimize());
+  $<HTMLButtonElement>("#btn-maximize").addEventListener("click", async () => {
     await win.toggleMaximize();
     updateMaximizeIcon();
   });
-  $("#btn-close").addEventListener("click", () => win.close());
+  $<HTMLButtonElement>("#btn-close").addEventListener("click", () => win.close());
 
   win.onResized?.(() => updateMaximizeIcon());
   updateMaximizeIcon();
@@ -314,26 +343,27 @@ function setupWindowControls() {
 
 // ── Protocol Toggle ─────────────────────────────────────────────────
 
-function setupProtocolToggle() {
-  $$("[data-protocol]").forEach((btn) => {
+function setupProtocolToggle(): void {
+  $$<HTMLElement>("[data-protocol]").forEach((btn) => {
     btn.addEventListener("click", () => {
-      $$("[data-protocol]").forEach((b) => b.classList.remove("active"));
+      $$<HTMLElement>("[data-protocol]").forEach((b) => b.classList.remove("active"));
       btn.classList.add("active");
-      updateProtocolVisibility(btn.dataset.protocol);
+      const proto = btn.dataset["protocol"];
+      if (proto) updateProtocolVisibility(proto);
     });
   });
 }
 
-function updateProtocolVisibility(protocol) {
-  $("#rtsp-settings").style.display = protocol === "rtsp" ? "" : "none";
-  $("#udp-settings").style.display = protocol === "udp" ? "" : "none";
+function updateProtocolVisibility(protocol: string): void {
+  $<HTMLElement>("#rtsp-settings").style.display = protocol === "rtsp" ? "" : "none";
+  $<HTMLElement>("#udp-settings").style.display = protocol === "udp" ? "" : "none";
 }
 
 // ── Refresh Button ──────────────────────────────────────────────────
 
-function setupRefreshButton() {
-  $("#btn-refresh-host").addEventListener("click", async () => {
-    const btn = $("#btn-refresh-host");
+function setupRefreshButton(): void {
+  $<HTMLButtonElement>("#btn-refresh-host").addEventListener("click", async () => {
+    const btn = $<HTMLButtonElement>("#btn-refresh-host");
     btn.disabled = true;
     btn.classList.add("spinning");
 
@@ -342,7 +372,7 @@ function setupRefreshButton() {
       // Only kick off discovery when the link is actually up. A stale
       // disconnected adapter has no IPs and nothing to scan — running
       // pcap/ARP against it is wasted effort.
-      if (isInterfaceConnected()) {
+      if (isInterfaceConnected() && state.activeInterface) {
         await api.startArpDiscovery(state.activeInterface.name);
         await loadExistingArpState();
         showToast("Refreshed");
@@ -357,13 +387,13 @@ function setupRefreshButton() {
     }
   });
 
-  $("#btn-refresh-nodes").addEventListener("click", async () => {
-    const btn = $("#btn-refresh-nodes");
+  $<HTMLButtonElement>("#btn-refresh-nodes").addEventListener("click", async () => {
+    const btn = $<HTMLButtonElement>("#btn-refresh-nodes");
     btn.disabled = true;
     btn.classList.add("spinning");
 
     try {
-      if (!isInterfaceConnected()) {
+      if (!isInterfaceConnected() || !state.activeInterface) {
         warnNoEthernet();
         return;
       }
@@ -387,9 +417,9 @@ function setupRefreshButton() {
 // is forcibly refreshed. Triggers a UAC prompt when the app isn't
 // already elevated.
 
-function setupResetAdapterButton() {
-  $("#btn-reset-adapter").addEventListener("click", async () => {
-    const btn = $("#btn-reset-adapter");
+function setupResetAdapterButton(): void {
+  $<HTMLButtonElement>("#btn-reset-adapter").addEventListener("click", async () => {
+    const btn = $<HTMLButtonElement>("#btn-reset-adapter");
     const iface = state.activeInterface;
 
     if (!iface || !iface.name) {
@@ -400,10 +430,10 @@ function setupResetAdapterButton() {
       return;
     }
 
-    const ok = await confirm(
+    const ok = confirm(
       `Reset "${iface.display_name || iface.name}"?\n\n` +
-      `This briefly drops the network connection and may trigger a ` +
-      `UAC prompt. Use this when the adapter seems stuck.`
+        `This briefly drops the network connection and may trigger a ` +
+        `UAC prompt. Use this when the adapter seems stuck.`
     );
     if (!ok) {
       return;
@@ -421,7 +451,7 @@ function setupResetAdapterButton() {
       // makes the UI snap back faster on success.
       await new Promise((r) => setTimeout(r, 1500));
       await refreshInterfaces();
-      if (isInterfaceConnected()) {
+      if (isInterfaceConnected() && state.activeInterface) {
         api.startArpDiscovery(state.activeInterface.name).catch(() => {});
       }
     } catch (e) {
