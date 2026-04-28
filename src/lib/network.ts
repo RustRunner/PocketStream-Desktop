@@ -2,16 +2,23 @@
  * PocketStream Desktop — Network interfaces, subnets, IP config
  */
 
-import * as api from "./tauri-api.js";
-import { $, $$, state, adoptedSubnets, showToast, log } from "./state.js";
+import * as api from "./tauri-api.ts";
+import { $, $$, state, adoptedSubnets, showToast, log } from "./state.ts";
 import { resetDiscoveryStatus, hideDiscoveryStatus, renderArpDeviceList } from "./devices.js";
 import { handleHardDisconnect, handleReconnect, showModalWithVideo } from "./streaming.js";
-import { lastSubnetResults, selectedDevice } from "./store.js";
-import { formatError } from "./errors.js";
+import { lastSubnetResults, selectedDevice } from "./store.ts";
+import type { SubnetRenderResult } from "./store.ts";
+import { formatError } from "./errors.ts";
+import type { InterfaceInfo } from "./types.ts";
+
+// Reference $$ once so the import isn't dropped — used elsewhere via the
+// state.ts re-export, but TS's verbatimModuleSyntax keeps unused value
+// imports as runtime imports. Touching the binding here keeps imports tidy.
+void $$;
 
 // ── Interface discovery ─────────────────────────────────────────────
 
-export async function refreshInterfaces() {
+export async function refreshInterfaces(): Promise<void> {
   try {
     const interfaces = await api.listInterfaces();
     const ethList = (interfaces || []).filter((i) => i.is_ethernet);
@@ -19,9 +26,7 @@ export async function refreshInterfaces() {
     // at least one real IPv4 — APIPA (169.254.x.x) addresses don't count,
     // since Windows assigns them when no real network is reachable.
     const eth = ethList.find(
-      (i) =>
-        i.is_up &&
-        i.ips.some((ip) => !ip.address.startsWith("169.254."))
+      (i) => i.is_up && i.ips.some((ip) => !ip.address.startsWith("169.254."))
     );
 
     if (eth) {
@@ -39,7 +44,7 @@ export async function refreshInterfaces() {
       // Adapter is known to Windows but has no IP. Treat this the same
       // as "no ethernet detected" from the user's perspective — the
       // actionable state is identical (click Reset adapter).
-      const stale = ethList[0];
+      const stale = ethList[0]!;
       state.activeInterface = stale;
       $("#iface-name").textContent =
         (stale.display_name || stale.name) + " (Disconnected)";
@@ -66,7 +71,7 @@ export async function refreshInterfaces() {
 const NO_ETHERNET_COOLDOWN_MS = 15000;
 let lastAdapterWarningAt = 0;
 
-export function warnNoEthernet() {
+export function warnNoEthernet(): void {
   const now = Date.now();
   if (now - lastAdapterWarningAt < NO_ETHERNET_COOLDOWN_MS) return;
   lastAdapterWarningAt = now;
@@ -80,7 +85,7 @@ export function warnNoEthernet() {
  *  least one non-APIPA IPv4 address. Windows assigns 169.254.x.x (APIPA)
  *  when the cable is unplugged or DHCP fails — those IPs satisfy a naive
  *  "has any IP" check but don't represent a real connection. */
-export function isInterfaceConnected() {
+export function isInterfaceConnected(): boolean {
   if (!state.activeInterface) return false;
   if (!state.activeInterface.is_up) return false;
   return state.activeInterface.ips.some((ip) => !ip.address.startsWith("169.254."));
@@ -90,8 +95,8 @@ export function isInterfaceConnected() {
 // Backend polls pnet every 3s (zero network traffic) and emits this
 // event when the active Ethernet interface changes state.
 
-export function setupInterfaceWatcher() {
-  api.onEvent("interface-status-changed", (iface) => {
+export function setupInterfaceWatcher(): void {
+  api.onEvent<InterfaceInfo>("interface-status-changed", (iface) => {
     // Capture the prior connection state BEFORE overwriting activeInterface
     // below. isInterfaceConnected() is our single source of truth — it also
     // treats APIPA-only state as "down" so the reconnect branch will fire
@@ -174,7 +179,9 @@ export function setupInterfaceWatcher() {
         // Restart the stream (and RTSP server) if they were running
         // before the disconnect. Fires in the background; failures
         // surface as toasts inside handleReconnect.
-        handleReconnect().catch((e) => log(`Auto-resume: ${formatError(e)}`));
+        handleReconnect().catch((e: unknown) =>
+          log(`Auto-resume: ${formatError(e)}`)
+        );
       }
     }
   });
@@ -182,7 +189,7 @@ export function setupInterfaceWatcher() {
 
 // ── Subnet list rendering ───────────────────────────────────────────
 
-export function renderSubnetList() {
+export function renderSubnetList(): void {
   const subnetList = $("#subnet-list");
   if (!state.activeInterface) return;
 
@@ -230,26 +237,31 @@ export function renderSubnetList() {
   subnetList.innerHTML = html;
 
   // Wire up remove buttons
-  subnetList.querySelectorAll(".btn-remove-ip").forEach((btn) => {
-    btn.addEventListener("click", async (e) => {
-      e.stopPropagation();
-      const subnet = btn.dataset.removeSubnet;
-      try {
-        await api.removeAdoptedSubnet(subnet);
-        adoptedSubnets.delete(subnet);
-        renderSubnetList();
-        showToast("Removed adopted IP");
-      } catch (err) {
-        showToast("Failed to remove: " + formatError(err), true);
-      }
+  subnetList
+    .querySelectorAll<HTMLButtonElement>(".btn-remove-ip")
+    .forEach((btn) => {
+      btn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const subnet = btn.dataset["removeSubnet"];
+        if (!subnet) return;
+        try {
+          await api.removeAdoptedSubnet(subnet);
+          adoptedSubnets.delete(subnet);
+          renderSubnetList();
+          showToast("Removed adopted IP");
+        } catch (err) {
+          showToast("Failed to remove: " + formatError(err), true);
+        }
+      });
     });
-  });
 }
 
 // ── Camera / PTU IP dropdown ────────────────────────────────────────
 
-export function updateCameraIpDropdown(filteredSubnets) {
-  const select = $("#camera-ip");
+export function updateCameraIpDropdown(
+  filteredSubnets: SubnetRenderResult[] | null
+): void {
+  const select = $<HTMLSelectElement>("#camera-ip");
   const currentVal = select.value;
 
   let options = '<option value="">-- Select --</option>';
@@ -260,7 +272,7 @@ export function updateCameraIpDropdown(filteredSubnets) {
     state.activeInterface.ips.forEach((ip) => {
       options += `<option value="${ip.address}">${ip.address}</option>`;
     });
-    options += '</optgroup>';
+    options += "</optgroup>";
   }
 
   // Node IPs (from ARP-discovered + scan results). Each dropdown entry
@@ -273,8 +285,14 @@ export function updateCameraIpDropdown(filteredSubnets) {
     filteredSubnets.forEach((sr) => {
       sr.devices.forEach((d) => {
         hasNodes = true;
-        const label = d.alias ? `${d.ip} (${d.alias})` : d.ip;
-        nodeOptions += `<option value="${d.ip}">${label}</option>`;
+        // ScanResult doesn't carry an alias today, but the render path
+        // synthesizes objects with the alias attached when calling this
+        // function. Cast through unknown so the field is read leniently.
+        const dWithAlias = d as unknown as { ip: string; alias?: string };
+        const label = dWithAlias.alias
+          ? `${dWithAlias.ip} (${dWithAlias.alias})`
+          : dWithAlias.ip;
+        nodeOptions += `<option value="${dWithAlias.ip}">${label}</option>`;
       });
     });
     if (hasNodes) {
@@ -289,7 +307,7 @@ export function updateCameraIpDropdown(filteredSubnets) {
   }
 
   // Update PTU dropdown with the same options
-  const ptuSelect = $("#ptu-ip");
+  const ptuSelect = $<HTMLSelectElement>("#ptu-ip");
   const ptuVal = ptuSelect.value;
   ptuSelect.innerHTML = options;
   if (ptuVal) {
@@ -297,9 +315,10 @@ export function updateCameraIpDropdown(filteredSubnets) {
   }
 }
 
-export function setupCameraIpDropdown() {
-  $("#camera-ip").addEventListener("change", (e) => {
-    selectedDevice.set(e.target.value || null);
+export function setupCameraIpDropdown(): void {
+  $<HTMLSelectElement>("#camera-ip").addEventListener("change", (e) => {
+    const target = e.target as HTMLSelectElement;
+    selectedDevice.set(target.value || null);
     const ip = selectedDevice.get();
     if (state.config && ip) {
       state.config.stream.camera_ip = ip;
@@ -317,23 +336,23 @@ export function setupCameraIpDropdown() {
 // ── IP Configuration dialog ─────────────────────────────────────────
 
 /** Interfaces loaded when dialog opens — used by add/remove handlers. */
-let dialogInterfaces = [];
+let dialogInterfaces: InterfaceInfo[] = [];
 
-export function setupIpConfigDialog() {
-  const dialog = $("#ip-config-dialog");
+export function setupIpConfigDialog(): void {
+  const dialog = $<HTMLDialogElement>("#ip-config-dialog");
 
   // ── Open dialog ──────────────────────────────────────────────────
-  $("#btn-ip-config").addEventListener("click", async () => {
-    const select = $("#static-iface");
+  $<HTMLButtonElement>("#btn-ip-config").addEventListener("click", async () => {
+    const select = $<HTMLSelectElement>("#static-iface");
     select.innerHTML = '<option value="">Loading…</option>';
 
     await showModalWithVideo(dialog);
 
     try {
-      dialogInterfaces = (await api.listInterfaces() || []).filter((i) => i.is_ethernet);
+      dialogInterfaces = ((await api.listInterfaces()) || []).filter((i) => i.is_ethernet);
       select.innerHTML = dialogInterfaces
         .map((i) => {
-          const ip = i.ips.length > 0 ? i.ips[0].address : "no IP";
+          const ip = i.ips.length > 0 ? i.ips[0]!.address : "no IP";
           return `<option value="${i.name}">${i.display_name || i.name} (${ip})</option>`;
         })
         .join("");
@@ -344,46 +363,46 @@ export function setupIpConfigDialog() {
   });
 
   // Re-populate when interface selection changes
-  $("#static-iface").addEventListener("change", populateDialogFields);
+  $<HTMLSelectElement>("#static-iface").addEventListener("change", populateDialogFields);
 
   // ── Add secondary IP ─────────────────────────────────────────────
-  $("#btn-add-sec-ip").addEventListener("click", async () => {
-    const iface = $("#static-iface").value;
-    const ip = $("#add-sec-ip").value.trim();
-    const mask = $("#add-sec-mask").value.trim();
+  $<HTMLButtonElement>("#btn-add-sec-ip").addEventListener("click", async () => {
+    const iface = $<HTMLSelectElement>("#static-iface").value;
+    const ip = $<HTMLInputElement>("#add-sec-ip").value.trim();
+    const mask = $<HTMLInputElement>("#add-sec-mask").value.trim();
     if (!iface || !ip || !mask) {
       showToast("Enter an IP and mask", true);
       return;
     }
-    const spinner = $("#ip-config-spinner");
+    const spinner = $<HTMLElement>("#ip-config-spinner");
     spinner.style.display = "";
     try {
       await api.addSecondaryIp(iface, ip, mask);
-      $("#add-sec-ip").value = "";
+      $<HTMLInputElement>("#add-sec-ip").value = "";
       showToast("Secondary IP added");
       await reloadDialogInterfaces();
     } catch (e) {
-      showToast("Failed: " + e, true);
+      showToast("Failed: " + formatError(e), true);
     }
     spinner.style.display = "none";
   });
 
   // ── Cancel ───────────────────────────────────────────────────────
-  $("#ip-config-cancel").addEventListener("click", () => dialog.close());
+  $<HTMLButtonElement>("#ip-config-cancel").addEventListener("click", () => dialog.close());
 
   // ── Apply (primary IP only) ──────────────────────────────────────
-  $("#ip-config-apply").addEventListener("click", async () => {
-    const iface = $("#static-iface").value;
-    const ip = $("#static-ip").value.trim();
-    const mask = $("#static-mask").value.trim();
-    const gw = $("#static-gateway").value.trim() || null;
+  $<HTMLButtonElement>("#ip-config-apply").addEventListener("click", async () => {
+    const iface = $<HTMLSelectElement>("#static-iface").value;
+    const ip = $<HTMLInputElement>("#static-ip").value.trim();
+    const mask = $<HTMLInputElement>("#static-mask").value.trim();
+    const gw = $<HTMLInputElement>("#static-gateway").value.trim() || null;
 
     if (!iface || !ip || !mask) {
       showToast("Fill in address and mask", true);
       return;
     }
 
-    const spinner = $("#ip-config-spinner");
+    const spinner = $<HTMLElement>("#ip-config-spinner");
     spinner.style.display = "";
     try {
       await api.setStaticIp(iface, ip, mask, gw);
@@ -391,31 +410,34 @@ export function setupIpConfigDialog() {
       dialog.close();
       await refreshInterfaces();
     } catch (e) {
-      showToast("Failed: " + e, true);
+      showToast("Failed: " + formatError(e), true);
     }
     spinner.style.display = "none";
   });
 }
 
 /** Fill primary IP fields and secondary IP list from the selected interface. */
-function populateDialogFields() {
-  const name = $("#static-iface").value;
+function populateDialogFields(): void {
+  const name = $<HTMLSelectElement>("#static-iface").value;
   const iface = dialogInterfaces.find((i) => i.name === name);
   if (!iface) return;
 
   // Find the first non-auto-adopted IP as primary
   const adoptedIps = new Set(adoptedSubnets.values());
   const primary = iface.ips.find((ip) => !adoptedIps.has(ip.address)) || iface.ips[0];
-  $("#static-ip").value = primary ? primary.address : "";
-  $("#static-mask").value = primary ? prefixToMask(primary.prefix) : "255.255.255.0";
-  $("#static-gateway").value = "";
+  $<HTMLInputElement>("#static-ip").value = primary ? primary.address : "";
+  $<HTMLInputElement>("#static-mask").value = primary ? prefixToMask(primary.prefix) : "255.255.255.0";
+  $<HTMLInputElement>("#static-gateway").value = "";
 
   // Secondary = all IPs except the primary
   renderSecondaryIps(iface, primary);
 }
 
 /** Render the secondary IP list with remove buttons. */
-function renderSecondaryIps(iface, primary) {
+function renderSecondaryIps(
+  iface: InterfaceInfo,
+  primary: { address: string } | undefined
+): void {
   const list = $("#secondary-ip-list");
   const secondaries = iface.ips.filter((ip) => !primary || ip.address !== primary.address);
 
@@ -438,35 +460,38 @@ function renderSecondaryIps(iface, primary) {
     .join("");
 
   // Wire remove buttons
-  list.querySelectorAll("[data-remove-sec-ip]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const ip = btn.dataset.removeSecIp;
-      const ifaceName = $("#static-iface").value;
-      const spinner = $("#ip-config-spinner");
-      spinner.style.display = "";
-      try {
-        await api.removeSecondaryIp(ifaceName, ip);
-        // Also remove from adopted map if it was auto-adopted
-        for (const [subnet, adoptedIp] of adoptedSubnets) {
-          if (adoptedIp === ip) {
-            adoptedSubnets.delete(subnet);
-            break;
+  list
+    .querySelectorAll<HTMLButtonElement>("[data-remove-sec-ip]")
+    .forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const ip = btn.dataset["removeSecIp"];
+        if (!ip) return;
+        const ifaceName = $<HTMLSelectElement>("#static-iface").value;
+        const spinner = $<HTMLElement>("#ip-config-spinner");
+        spinner.style.display = "";
+        try {
+          await api.removeSecondaryIp(ifaceName, ip);
+          // Also remove from adopted map if it was auto-adopted
+          for (const [subnet, adoptedIp] of adoptedSubnets) {
+            if (adoptedIp === ip) {
+              adoptedSubnets.delete(subnet);
+              break;
+            }
           }
+          showToast(`Removed ${ip}`);
+          await reloadDialogInterfaces();
+        } catch (e) {
+          showToast("Failed: " + formatError(e), true);
         }
-        showToast(`Removed ${ip}`);
-        await reloadDialogInterfaces();
-      } catch (e) {
-        showToast("Failed: " + formatError(e), true);
-      }
-      spinner.style.display = "none";
+        spinner.style.display = "none";
+      });
     });
-  });
 }
 
 /** Reload interfaces and refresh dialog fields without closing. */
-async function reloadDialogInterfaces() {
+async function reloadDialogInterfaces(): Promise<void> {
   try {
-    dialogInterfaces = (await api.listInterfaces() || []).filter((i) => i.is_ethernet);
+    dialogInterfaces = ((await api.listInterfaces()) || []).filter((i) => i.is_ethernet);
     populateDialogFields();
     // Also refresh the host card
     await refreshInterfaces();
@@ -474,7 +499,7 @@ async function reloadDialogInterfaces() {
 }
 
 /** Convert CIDR prefix to dotted mask (e.g. 24 → "255.255.255.0"). */
-function prefixToMask(prefix) {
-  const bits = prefix >= 32 ? 0xFFFFFFFF : (0xFFFFFFFF << (32 - prefix)) >>> 0;
-  return [bits >>> 24, (bits >>> 16) & 0xFF, (bits >>> 8) & 0xFF, bits & 0xFF].join(".");
+function prefixToMask(prefix: number): string {
+  const bits = prefix >= 32 ? 0xffffffff : (0xffffffff << (32 - prefix)) >>> 0;
+  return [bits >>> 24, (bits >>> 16) & 0xff, (bits >>> 8) & 0xff, bits & 0xff].join(".");
 }

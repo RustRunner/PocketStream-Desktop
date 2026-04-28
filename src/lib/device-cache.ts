@@ -7,24 +7,32 @@
  * Triggered by clicking the "Nodes" card title.
  */
 
-import * as api from "./tauri-api.js";
-import { $, log, escapeHtml } from "./state.js";
-import { hasRouteToSubnet } from "./device-state.js";
-import * as deviceList from "./device-list.js";
+import * as api from "./tauri-api.ts";
+import { $, log, escapeHtml } from "./state.ts";
+import { hasRouteToSubnet } from "./device-state.ts";
+import * as deviceList from "./device-list.ts";
 import { showModalWithVideo } from "./streaming.js";
-import { formatError } from "./errors.js";
+import { formatError } from "./errors.ts";
+
+interface CacheEntry {
+  mac: string;
+  ip: string;
+  subnet: string;
+  alias: string;
+  reason: "offline" | "no route";
+}
 
 /** Open the dialog that lists offline / stale cached devices and lets
  *  the user forget them individually or all at once. */
-async function openCacheDialog() {
-  const dialog = $("#cache-dialog");
+async function openCacheDialog(): Promise<void> {
+  const dialog = $<HTMLDialogElement>("#cache-dialog");
   if (!dialog) return;
 
   // Build the candidate list: anything in the registry that is NOT
   // currently confirmed working — i.e. visibly offline, or hidden
   // because its subnet isn't routable right now (cache-only on
   // unroutable subnet).
-  const entries = [];
+  const entries: CacheEntry[] = [];
   for (const r of deviceList.getDevices()) {
     const isOffline = r.status === "offline";
     const isStaleHidden = r.status === "cached_only" && !hasRouteToSubnet(r.subnet);
@@ -43,8 +51,8 @@ async function openCacheDialog() {
   });
 
   const listEl = $("#cache-dialog-list");
-  const emptyEl = $("#cache-dialog-empty");
-  const clearAllBtn = $("#cache-clear-all");
+  const emptyEl = $<HTMLElement>("#cache-dialog-empty");
+  const clearAllBtn = $<HTMLButtonElement>("#cache-clear-all");
 
   if (entries.length === 0) {
     listEl.innerHTML = "";
@@ -74,14 +82,16 @@ async function openCacheDialog() {
       .join("");
 
     // Per-row forget handlers
-    listEl.querySelectorAll(".cache-forget-btn").forEach((btn) => {
-      btn.addEventListener("click", async () => {
-        const mac = btn.dataset.forgetMac;
-        await forgetCachedDevice(mac);
-        // Re-open with the refreshed list
-        openCacheDialog();
+    listEl
+      .querySelectorAll<HTMLButtonElement>(".cache-forget-btn")
+      .forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          const mac = btn.dataset["forgetMac"];
+          await forgetCachedDevice(mac);
+          // Re-open with the refreshed list
+          openCacheDialog();
+        });
       });
-    });
   }
 
   if (dialog.open) dialog.close();
@@ -91,7 +101,7 @@ async function openCacheDialog() {
 /** Drop a single cached device by MAC. Backend removes from the
  *  registry, deletes from the cache file, and emits a snapshot —
  *  the render path picks up the change automatically. */
-async function forgetCachedDevice(mac) {
+async function forgetCachedDevice(mac: string | undefined): Promise<void> {
   if (!mac) return;
   try {
     await api.forgetDevice(mac);
@@ -102,8 +112,8 @@ async function forgetCachedDevice(mac) {
 
 /** Drop every offline + stale-hidden cached device. Walks the same
  *  candidate set the dialog displays so what's listed is what's cleared. */
-async function clearAllOfflineCached() {
-  const macs = [];
+async function clearAllOfflineCached(): Promise<void> {
+  const macs: string[] = [];
   for (const r of deviceList.getDevices()) {
     const isOffline = r.status === "offline";
     const isStaleHidden = r.status === "cached_only" && !hasRouteToSubnet(r.subnet);
@@ -114,17 +124,17 @@ async function clearAllOfflineCached() {
   }
 }
 
-export function setupCacheDialog() {
+export function setupCacheDialog(): void {
   const titleEl = $("#nodes-title");
   if (titleEl) {
     titleEl.addEventListener("click", openCacheDialog);
   }
 
-  const dialog = $("#cache-dialog");
+  const dialog = $<HTMLDialogElement>("#cache-dialog");
   if (!dialog) return;
 
-  $("#cache-close").addEventListener("click", () => dialog.close());
-  $("#cache-clear-all").addEventListener("click", async () => {
+  $<HTMLButtonElement>("#cache-close").addEventListener("click", () => dialog.close());
+  $<HTMLButtonElement>("#cache-clear-all").addEventListener("click", async () => {
     await clearAllOfflineCached();
     openCacheDialog(); // refresh the now-empty list
   });

@@ -2,27 +2,39 @@
  * PocketStream Desktop — FLIR PTU controls
  */
 
-import * as api from "./tauri-api.js";
-import { $, state, log, showToast } from "./state.js";
-import { formatError } from "./errors.js";
+import * as api from "./tauri-api.ts";
+import { $, state, log, showToast } from "./state.ts";
+import { formatError } from "./errors.ts";
 
 // ── Local PTU state ─────────────────────────────────────────────────
 
 let ptuSpeedBig = 100;
 let ptuSpeedSmall = 10;
 let ptuSpeedQueried = false;
-const ptuPresets = new Map(); // preset# -> { pan, tilt, zoom }
-// Set by setupZoomSlider so preset recall can enqueue a zoom through the
-// same serialised drain loop as slider drags. Keeping preset-zoom off the
-// direct-send path avoids two concurrent HTTP requests wedging the camera's
-// single-threaded control.cgi handler.
-let zoomRequest = null;
 
-function getPtuIp() {
-  return $("#ptu-ip").value || null;
+interface SavedPreset {
+  /** PP value as the camera returned it — kept as string so re-sending
+   *  it doesn't introduce a parseInt round-trip. */
+  pan: string;
+  tilt: string;
+  /** Zoom slider percent at the time of save, or null if no CAM was
+   *  selected. Recall touches zoom only when this is non-null. */
+  zoom: number | null;
 }
 
-async function ptuCmd(cmd) {
+const ptuPresets = new Map<number, SavedPreset>();
+
+/** Set by setupZoomSlider so preset recall can enqueue a zoom through the
+ *  same serialised drain loop as slider drags. Keeping preset-zoom off the
+ *  direct-send path avoids two concurrent HTTP requests wedging the camera's
+ *  single-threaded control.cgi handler. */
+let zoomRequest: ((percent: number) => void) | null = null;
+
+function getPtuIp(): string | null {
+  return $<HTMLInputElement>("#ptu-ip").value || null;
+}
+
+async function ptuCmd(cmd: string): Promise<Record<string, string> | null> {
   const ip = getPtuIp();
   if (!ip) return null;
   return api.ptuSend(ip, cmd);
@@ -44,19 +56,23 @@ async function ptuCmd(cmd) {
  * during the PTU's motor-spool-up window before motion began. The
  * trailing C=V then halted what little motion had started.
  */
-async function waitForPtuTarget(targetPan, targetTilt, maxTries = 40) {
+async function waitForPtuTarget(
+  targetPan: number,
+  targetTilt: number,
+  maxTries = 40
+): Promise<void> {
   // PP/TP encoders can jitter by a unit or two even at rest; tolerance
   // avoids missing the "reached target" detection on the last pixel.
   const TOLERANCE = 2;
-  let last = null;
+  let last: string | null = null;
   let started = false;
   for (let i = 0; i < maxTries; i++) {
     await new Promise((r) => setTimeout(r, 250));
     try {
       const data = await ptuCmd("PP&TP");
       if (!data) break;
-      const pan = parseInt(data.PP, 10);
-      const tilt = parseInt(data.TP, 10);
+      const pan = parseInt(data["PP"] ?? "", 10);
+      const tilt = parseInt(data["TP"] ?? "", 10);
       if (!Number.isFinite(pan) || !Number.isFinite(tilt)) break;
 
       // Reached the target — done immediately, no further polls.
@@ -89,15 +105,18 @@ async function waitForPtuTarget(targetPan, targetTilt, maxTries = 40) {
 
 // ── PTZ control setup ───────────────────────────────────────────────
 
-async function queryPtuSpeed() {
+async function queryPtuSpeed(): Promise<void> {
   if (!getPtuIp()) return;
   try {
     const data = await ptuCmd("PU&TU&PL&TL");
     if (data) {
-      const panUpper = parseInt(data.PU) || 100;
-      const tiltUpper = parseInt(data.TU) || 100;
+      const panUpper = parseInt(data["PU"] ?? "") || 100;
+      const tiltUpper = parseInt(data["TU"] ?? "") || 100;
       ptuSpeedBig = Math.min(panUpper, tiltUpper);
-      ptuSpeedSmall = Math.max(Math.round(ptuSpeedBig / 10), parseInt(data.PL) || 1);
+      ptuSpeedSmall = Math.max(
+        Math.round(ptuSpeedBig / 10),
+        parseInt(data["PL"] ?? "") || 1
+      );
       ptuSpeedQueried = true;
       log(`PTU limits: big=${ptuSpeedBig} small=${ptuSpeedSmall}`);
       await ptuCmd("C=V");
@@ -107,23 +126,25 @@ async function queryPtuSpeed() {
   }
 }
 
-export function setupPtzControls() {
+type SpeedAction = "up" | "down" | "left" | "right";
+
+export function setupPtzControls(): void {
   // Query PTU speed limits when PTU IP is selected
-  $("#ptu-ip").addEventListener("change", () => {
+  $<HTMLSelectElement>("#ptu-ip").addEventListener("change", () => {
     ptuSpeedQueried = false;
     queryPtuSpeed();
   });
 
   // D-pad buttons — hold to move at speed, release to stop
-  const speedCmds = {
-    up:    () => `TS=${ptuSpeedBig}`,
-    down:  () => `TS=${-ptuSpeedBig}`,
-    left:  () => `PS=${ptuSpeedBig}`,
+  const speedCmds: Record<SpeedAction, () => string> = {
+    up: () => `TS=${ptuSpeedBig}`,
+    down: () => `TS=${-ptuSpeedBig}`,
+    left: () => `PS=${ptuSpeedBig}`,
     right: () => `PS=${-ptuSpeedBig}`,
   };
 
-  document.querySelectorAll(".ptz-btn[data-ptz]").forEach((btn) => {
-    const action = btn.dataset.ptz;
+  document.querySelectorAll<HTMLElement>(".ptz-btn[data-ptz]").forEach((btn) => {
+    const action = btn.dataset["ptz"];
 
     if (action === "home") {
       btn.addEventListener("click", async () => {
@@ -139,106 +160,119 @@ export function setupPtzControls() {
       return;
     }
 
-    const startMove = async () => {
+    const startMove = async (): Promise<void> => {
       if (!getPtuIp()) return;
       if (!ptuSpeedQueried) await queryPtuSpeed();
-      const cmdFn = speedCmds[action];
-      if (cmdFn) ptuCmd(cmdFn()).catch((e) => log(`PTU ${action}: ${formatError(e)}`));
+      if (action && action in speedCmds) {
+        const cmdFn = speedCmds[action as SpeedAction];
+        ptuCmd(cmdFn()).catch((e) => log(`PTU ${action}: ${formatError(e)}`));
+      }
     };
-    const stopMove = () => {
+    const stopMove = (): void => {
       if (!getPtuIp()) return;
       ptuCmd("PS=0&TS=0").catch(() => {});
     };
 
-    btn.addEventListener("pointerdown", (e) => { e.preventDefault(); startMove(); });
+    btn.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      startMove();
+    });
     btn.addEventListener("pointerup", stopMove);
     btn.addEventListener("pointerleave", stopMove);
     btn.addEventListener("pointercancel", stopMove);
   });
 
   // Preset buttons — click to recall, long-press to save current position
-  document.querySelectorAll(".ptz-preset-btn[data-preset]").forEach((btn) => {
-    let pressTimer = null;
-    const preset = parseInt(btn.dataset.preset);
+  document
+    .querySelectorAll<HTMLElement>(".ptz-preset-btn[data-preset]")
+    .forEach((btn) => {
+      let pressTimer: ReturnType<typeof setTimeout> | null = null;
+      const preset = parseInt(btn.dataset["preset"] ?? "", 10);
 
-    btn.addEventListener("pointerdown", (e) => {
-      e.preventDefault();
-      pressTimer = setTimeout(async () => {
-        pressTimer = null;
-        if (!getPtuIp()) return;
-        try {
-          const data = await ptuCmd("PP&TP");
-          if (data) {
-            // Also snapshot current zoom slider position so recalling
-            // this preset restores framing on the CAM that's selected
-            // now. `zoom` is nullable: a preset saved with no CAM
-            // chosen just doesn't touch zoom on recall.
-            const zoomEl = $("#zoom-slider");
-            const zoomVal = zoomEl ? parseInt(zoomEl.value, 10) : NaN;
-            const zoom = Number.isFinite(zoomVal) ? zoomVal : null;
-            ptuPresets.set(preset, { pan: data.PP, tilt: data.TP, zoom });
-            const zoomLabel = zoom !== null ? ` Z:${zoom}%` : "";
-            showToast(`Preset ${preset} saved (P:${data.PP} T:${data.TP}${zoomLabel})`);
-          }
-        } catch (e) {
-          showToast(`Failed: ${formatError(e)}`, true);
-        }
-      }, 800);
-    });
-
-    btn.addEventListener("pointerup", async () => {
-      if (pressTimer) {
-        clearTimeout(pressTimer);
-        pressTimer = null;
-        if (!getPtuIp()) return;
-        const saved = ptuPresets.get(preset);
-        if (saved) {
+      btn.addEventListener("pointerdown", (e) => {
+        e.preventDefault();
+        pressTimer = setTimeout(async () => {
+          pressTimer = null;
+          if (!getPtuIp()) return;
           try {
-            // Await the goto ACK before the handler returns — otherwise a
-            // D-pad press arriving mid-goto lands while the PTU is still in
-            // C=I (absolute) mode, before waitForPtuTarget flips it back to
-            // C=V. A PS=SPEED command in C=I mode can drive the unit past
-            // its limits (observed in 0.2.9 as runaway pan).
-            await ptuCmd(
-              `C=I&PS=${ptuSpeedBig}&TS=${ptuSpeedBig}&PP=${saved.pan}&TP=${saved.tilt}`
-            );
-            waitForPtuTarget(
-              parseInt(saved.pan, 10),
-              parseInt(saved.tilt, 10),
-            ).catch(() => {});
-
-            // Route preset-zoom through the slider's drain queue so it
-            // can't overlap an in-flight slider request (two concurrent
-            // HTTP requests to control.cgi can wedge the camera's Lua
-            // server, freezing the RTSP stream).
-            if (saved.zoom !== null && saved.zoom !== undefined && getCameraIp()) {
-              const zoomEl = $("#zoom-slider");
-              if (zoomEl) zoomEl.value = String(saved.zoom);
-              if (zoomRequest) zoomRequest(saved.zoom);
+            const data = await ptuCmd("PP&TP");
+            if (data) {
+              // Also snapshot current zoom slider position so recalling
+              // this preset restores framing on the CAM that's selected
+              // now. `zoom` is nullable: a preset saved with no CAM
+              // chosen just doesn't touch zoom on recall.
+              const zoomEl = $<HTMLInputElement>("#zoom-slider");
+              const zoomVal = zoomEl ? parseInt(zoomEl.value, 10) : NaN;
+              const zoom = Number.isFinite(zoomVal) ? zoomVal : null;
+              ptuPresets.set(preset, {
+                pan: data["PP"] ?? "0",
+                tilt: data["TP"] ?? "0",
+                zoom,
+              });
+              const zoomLabel = zoom !== null ? ` Z:${zoom}%` : "";
+              showToast(
+                `Preset ${preset} saved (P:${data["PP"]} T:${data["TP"]}${zoomLabel})`
+              );
             }
           } catch (e) {
-            log(`PTU preset ${preset}: ${formatError(e)}`);
+            showToast(`Failed: ${formatError(e)}`, true);
           }
-        } else {
-          showToast(`Preset ${preset} not saved yet`, true);
+        }, 800);
+      });
+
+      btn.addEventListener("pointerup", async () => {
+        if (pressTimer) {
+          clearTimeout(pressTimer);
+          pressTimer = null;
+          if (!getPtuIp()) return;
+          const saved = ptuPresets.get(preset);
+          if (saved) {
+            try {
+              // Await the goto ACK before the handler returns — otherwise a
+              // D-pad press arriving mid-goto lands while the PTU is still in
+              // C=I (absolute) mode, before waitForPtuTarget flips it back to
+              // C=V. A PS=SPEED command in C=I mode can drive the unit past
+              // its limits (observed in 0.2.9 as runaway pan).
+              await ptuCmd(
+                `C=I&PS=${ptuSpeedBig}&TS=${ptuSpeedBig}&PP=${saved.pan}&TP=${saved.tilt}`
+              );
+              waitForPtuTarget(
+                parseInt(saved.pan, 10),
+                parseInt(saved.tilt, 10)
+              ).catch(() => {});
+
+              // Route preset-zoom through the slider's drain queue so it
+              // can't overlap an in-flight slider request (two concurrent
+              // HTTP requests to control.cgi can wedge the camera's Lua
+              // server, freezing the RTSP stream).
+              if (saved.zoom !== null && getCameraIp()) {
+                const zoomEl = $<HTMLInputElement>("#zoom-slider");
+                if (zoomEl) zoomEl.value = String(saved.zoom);
+                if (zoomRequest) zoomRequest(saved.zoom);
+              }
+            } catch (e) {
+              log(`PTU preset ${preset}: ${formatError(e)}`);
+            }
+          } else {
+            showToast(`Preset ${preset} not saved yet`, true);
+          }
         }
-      }
-    });
+      });
 
-    btn.addEventListener("pointerleave", () => {
-      if (pressTimer) {
-        clearTimeout(pressTimer);
-        pressTimer = null;
-      }
-    });
+      btn.addEventListener("pointerleave", () => {
+        if (pressTimer) {
+          clearTimeout(pressTimer);
+          pressTimer = null;
+        }
+      });
 
-    btn.addEventListener("pointercancel", () => {
-      if (pressTimer) {
-        clearTimeout(pressTimer);
-        pressTimer = null;
-      }
+      btn.addEventListener("pointercancel", () => {
+        if (pressTimer) {
+          clearTimeout(pressTimer);
+          pressTimer = null;
+        }
+      });
     });
-  });
 
   setupZoomSlider();
 }
@@ -250,13 +284,13 @@ export function setupPtzControls() {
 
 const ZOOM_MAX = 31424;
 
-function getCameraIp() {
-  return $("#camera-ip").value || null;
+function getCameraIp(): string | null {
+  return $<HTMLInputElement>("#camera-ip").value || null;
 }
 
 let zoomErrorToasted = false;
 
-async function sendZoomPosition(percent) {
+async function sendZoomPosition(percent: number): Promise<void> {
   const ip = getCameraIp();
   if (!ip) {
     if (!zoomErrorToasted) {
@@ -279,8 +313,8 @@ async function sendZoomPosition(percent) {
   }
 }
 
-function setupZoomSlider() {
-  const slider = $("#zoom-slider");
+function setupZoomSlider(): void {
+  const slider = $<HTMLInputElement>("#zoom-slider");
   if (!slider) return;
 
   // Existing HTML was wired for speed control (min=-100, max=100). For
@@ -299,10 +333,10 @@ function setupZoomSlider() {
   // transients.
   const MIN_GAP_MS = 100;
   let inFlight = false;
-  let queuedPercent = null;
-  let lastSentPercent = null;
+  let queuedPercent: number | null = null;
+  let lastSentPercent: number | null = null;
 
-  async function drain() {
+  async function drain(): Promise<void> {
     while (queuedPercent !== null) {
       const target = queuedPercent;
       queuedPercent = null;
@@ -316,7 +350,7 @@ function setupZoomSlider() {
     inFlight = false;
   }
 
-  function request(percent) {
+  function request(percent: number): void {
     queuedPercent = percent;
     if (inFlight) return;
     inFlight = true;
@@ -327,7 +361,8 @@ function setupZoomSlider() {
   zoomRequest = request;
 
   slider.addEventListener("input", (e) => {
-    request(parseInt(e.target.value, 10));
+    const target = e.target as HTMLInputElement;
+    request(parseInt(target.value, 10));
   });
 
   // ── Position persistence ──────────────────────────────────────────
@@ -336,7 +371,7 @@ function setupZoomSlider() {
   // slider percent per-IP and restore it on CAM selection. Accurate as
   // long as we're the only controller; goes stale if someone also
   // moves the camera via its own web UI.
-  async function persistCurrent(ip, percent) {
+  async function persistCurrent(ip: string, percent: number): Promise<void> {
     try {
       await api.setZoomPosition(ip, percent);
       if (state.config) {
@@ -351,7 +386,7 @@ function setupZoomSlider() {
   // Debounced save: write to config 500 ms after the user stops moving
   // the slider. Keeps disk I/O minimal during a drag while still catching
   // the final resting position.
-  let saveTimer = null;
+  let saveTimer: ReturnType<typeof setTimeout> | null = null;
   slider.addEventListener("input", () => {
     const ip = getCameraIp();
     if (!ip) return;
@@ -366,7 +401,7 @@ function setupZoomSlider() {
   // set the slider AND push the value to the camera so the slider
   // becomes the source of truth if they've drifted apart. Skips when
   // no IP is selected or no saved position exists.
-  function applySavedZoom() {
+  function applySavedZoom(): void {
     const ip = getCameraIp();
     if (!ip) return;
     const saved = state.config?.zoom_positions?.[ip];
@@ -378,7 +413,7 @@ function setupZoomSlider() {
   }
 
   // Fires when the user picks a CAM from the dropdown.
-  $("#camera-ip").addEventListener("change", applySavedZoom);
+  $<HTMLSelectElement>("#camera-ip").addEventListener("change", applySavedZoom);
 
   // Programmatic dropdown population (via updateCameraIpDropdown) does
   // NOT fire a change event, so we also poll briefly after startup for
