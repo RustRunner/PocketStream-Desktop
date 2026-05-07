@@ -376,6 +376,24 @@ function setupQrDialog(): void {
 const DROP_THRESHOLD_EVENTS = 3;
 let notPlayingStreak = 0;
 
+// ── Stall auto-recovery ─────────────────────────────────────────────
+//
+// When health_check reports "Stream stalled — no frames for Ns" the
+// pipeline is sitting on a TCP socket the OS still thinks is alive
+// (default Windows keepalive is 2 hours). Manually clicking
+// stop/start would fix it but the user shouldn't have to babysit a
+// long-running camera. Auto-restart with backoff: try immediately,
+// then 60s, then 60s. After three failed attempts fall through to
+// the manual "Stream Lost" UX so we don't loop on a genuinely broken
+// camera.
+const STALL_RETRY_SCHEDULE_MS = [0, 60_000, 60_000];
+let stallRetryIndex = 0;
+let stallRetryTimer: ReturnType<typeof setTimeout> | null = null;
+
+function isStallError(msg: string | null | undefined): boolean {
+  return !!msg && msg.toLowerCase().includes("stalled");
+}
+
 /** Subscribe to backend stream-status push events. Call once at app
  *  startup. Replaces the old setInterval(pollStatus, 1000). */
 export function startStatusListener(): void {
@@ -542,6 +560,10 @@ function showStreamLost(errorMsg: string | null | undefined): void {
   // Show the actual GStreamer error if available
   const reason = errorMsg || "connection dropped";
   showToast("Stream lost — " + reason, true);
+
+  if (isStallError(errorMsg)) {
+    scheduleStallRecovery();
+  }
 }
 
 function hideStreamLost(): void {
@@ -552,11 +574,87 @@ function hideStreamLost(): void {
   // next event after handleReconnect resets the lost state — faster
   // than the newly-started pipeline can reach Playing.
   notPlayingStreak = 0;
+  // Stream is healthy again — reset the auto-recovery counter and
+  // cancel any pending retry. This also covers the "user manually
+  // stopped" case indirectly: the next status event with playing=true
+  // can't happen if state.isStreaming is false, but if the user
+  // restarts and the previous run had retries pending, those should
+  // not carry over.
+  stallRetryIndex = 0;
+  if (stallRetryTimer) {
+    clearTimeout(stallRetryTimer);
+    stallRetryTimer = null;
+  }
   // syncVideoVisibility leaves the video hidden if a dialog is open —
   // dialog close handler will sync again and reveal it then.
   syncVideoVisibility();
   const overlay = $("#video-area").querySelector(".stream-lost-overlay");
   if (overlay) overlay.classList.remove("visible");
+}
+
+function scheduleStallRecovery(): void {
+  if (stallRetryIndex >= STALL_RETRY_SCHEDULE_MS.length) {
+    log(
+      `Stall recovery exhausted after ${STALL_RETRY_SCHEDULE_MS.length} attempts; manual restart required`
+    );
+    return;
+  }
+  const delay = STALL_RETRY_SCHEDULE_MS[stallRetryIndex]!;
+  const attempt = stallRetryIndex + 1;
+  stallRetryIndex++;
+  log(
+    `Scheduling stall recovery attempt ${attempt}/${STALL_RETRY_SCHEDULE_MS.length} in ${delay}ms`
+  );
+  if (stallRetryTimer) clearTimeout(stallRetryTimer);
+  stallRetryTimer = setTimeout(attemptStallRecovery, delay);
+}
+
+async function attemptStallRecovery(): Promise<void> {
+  stallRetryTimer = null;
+  // User may have manually stopped or the watcher path may have
+  // taken over — bail without consuming another retry slot.
+  if (!state.isStreaming || !state.streamLost) return;
+
+  const cameraIp =
+    $<HTMLSelectElement>("#camera-ip").value ||
+    state.config?.stream?.camera_ip ||
+    null;
+  if (!cameraIp) {
+    log("Stall recovery: no camera IP available, aborting");
+    return;
+  }
+
+  log("Stall recovery: restarting pipeline");
+  try {
+    // Make sure the previous pipeline is fully torn down before we
+    // ask for a new video window — startStream below will fail
+    // ambiguously if a stale pipeline still owns the HWND.
+    await api.stopStream().catch(() => {});
+    const bounds = getVideoAreaBounds();
+    const handle = await api.createVideoWindow(
+      bounds.x,
+      bounds.y,
+      bounds.width,
+      bounds.height
+    );
+    await api.startStream(handle);
+    log("Stall recovery: stream restart submitted");
+    // startStream returns when set_state(Playing) was REQUESTED, not
+    // when the pipeline actually reaches Playing. Set a watchdog that
+    // schedules another retry if the new pipeline doesn't recover
+    // within 30s. Cleared by hideStreamLost on success (status event
+    // with playing=true) or by manual stop.
+    stallRetryTimer = setTimeout(() => {
+      stallRetryTimer = null;
+      if (state.isStreaming && state.streamLost) {
+        log("Stall recovery: restart did not reach Playing within 30s");
+        scheduleStallRecovery();
+      }
+    }, 30_000);
+  } catch (e) {
+    log(`Stall recovery attempt failed: ${formatError(e)}`);
+    scheduleStallRecovery();
+  }
 }
 
 // ── Video resize handler ────────────────────────────────────────────

@@ -5,6 +5,9 @@
 //! 2. Optionally recorded to MP4
 //! 3. Snapshot-captured via an appsink
 
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
@@ -13,10 +16,26 @@ use gstreamer_video::prelude::VideoOverlayExtManual;
 
 use crate::error::AppError;
 
+/// How long the pipeline can sit in `Playing` state with no buffers
+/// arriving at the tee's sink pad before `health_check` declares the
+/// stream stalled. Catches the failure mode where rtspsrc sits on a
+/// TCP socket the OS still reports as Established but is no longer
+/// carrying data — Windows' default 2-hour TCP keepalive means the OS
+/// won't surface this in any usable timeframe, so the user sees a
+/// frozen last frame and no error. 8s tolerates bursty delivery
+/// without making real freezes feel sluggish.
+const STALL_THRESHOLD: Duration = Duration::from_secs(8);
+
 /// A live playback pipeline with tee for recording/screenshots.
 pub struct PlaybackPipeline {
     pub pipeline: gst::Pipeline,
     pub appsink: gst_app::AppSink,
+    /// Updated by a buffer probe on the tee's sink pad on every decoded
+    /// frame. Stays `None` until the first buffer arrives so the
+    /// watchdog doesn't misfire during caps negotiation — pipelines
+    /// that never reach Playing are already covered by the existing
+    /// `playing=false` path in `health_check`.
+    last_buffer_at: Arc<Mutex<Option<Instant>>>,
 }
 
 impl PlaybackPipeline {
@@ -139,7 +158,32 @@ impl PlaybackPipeline {
             .downcast::<gst_app::AppSink>()
             .map_err(|_| AppError::Stream("Failed to cast to AppSink".into()))?;
 
-        Ok(Self { pipeline, appsink })
+        // Stall watchdog: probe the tee's sink pad so every decoded
+        // buffer ticks `last_buffer_at`. The probe runs on a streaming
+        // thread; the mutex is uncontended at frame rate. Tee sink
+        // (rather than appsink) is the right tap point — appsink has
+        // `drop=true max-buffers=1` and a leaky upstream queue, so
+        // most frames never reach it; the tee input sees them all.
+        let last_buffer_at = Arc::new(Mutex::new(None::<Instant>));
+        let tee = pipeline
+            .by_name("t")
+            .ok_or_else(|| AppError::Stream("tee 't' not found in pipeline".into()))?;
+        let tee_sink = tee
+            .static_pad("sink")
+            .ok_or_else(|| AppError::Stream("tee sink pad missing".into()))?;
+        let last_buffer_for_probe = last_buffer_at.clone();
+        tee_sink.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            if let Ok(mut guard) = last_buffer_for_probe.lock() {
+                *guard = Some(Instant::now());
+            }
+            gst::PadProbeReturn::Ok
+        });
+
+        Ok(Self {
+            pipeline,
+            appsink,
+            last_buffer_at,
+        })
     }
 
     /// Start playback.
@@ -172,7 +216,27 @@ impl PlaybackPipeline {
 
         let (_, current, pending) = self.pipeline.state(gst::ClockTime::from_mseconds(0));
         let playing = current == gst::State::Playing;
-        if !playing {
+
+        if playing {
+            // Stall watchdog. Skipped while `last_buffer_at` is None
+            // (haven't decoded a frame yet) so a slow caps negotiation
+            // doesn't trip it.
+            if let Ok(guard) = self.last_buffer_at.lock() {
+                if let Some(last) = *guard {
+                    let elapsed = last.elapsed();
+                    if elapsed >= STALL_THRESHOLD {
+                        log::warn!(
+                            "Stream stalled: pipeline Playing but no buffers for {:.1}s",
+                            elapsed.as_secs_f32()
+                        );
+                        return Err(format!(
+                            "Stream stalled — no frames for {}s",
+                            elapsed.as_secs()
+                        ));
+                    }
+                }
+            }
+        } else {
             // This path was previously silent — the frontend saw
             // `playing=false` with no error and tore everything down.
             // Log the exact states so we can diagnose transient blips

@@ -97,7 +97,17 @@ pub fn start_listener(
         let mut cap = match pcap::Capture::from_device(pcap_dev)
             .map_err(|e| format!("{}", e))
             .and_then(|c| {
-                c.promisc(true)
+                // Non-promiscuous: ARP requests are broadcast (so we
+                // see every host that asks for a MAC), and ARP replies
+                // to our own ping sweep come back unicast to us. We
+                // lose visibility into ARP exchanges between *other*
+                // hosts, which is acceptable — passive devices on the
+                // subnet are still discovered via the ping sweep + OS
+                // ARP cache merge in `mod.rs`. Promiscuous mode is a
+                // known stress vector on USB Ethernet drivers (notably
+                // the ASIX AX88179) and offers no functional benefit
+                // for the BPF-filtered ARP-only capture.
+                c.promisc(false)
                     .timeout(500)
                     .snaplen(64)
                     .open()
