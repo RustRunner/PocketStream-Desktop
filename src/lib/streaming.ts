@@ -85,6 +85,18 @@ export async function showModalWithVideo(dialog: HTMLDialogElement): Promise<voi
 
 // ── Stream controls ─────────────────────────────────────────────────
 
+// Stuck-input defense for the record button. Phantom touches on the
+// Getac touchscreen (electrostatic noise, water droplets, foreign
+// objects on a rugged tablet's screen) have driven the record toggle
+// into a sub-second start/stop cycle in the field, producing a
+// clutter of useless tiny MP4s. Drop any record-button click that
+// arrives within RECORD_DEBOUNCE_MS of the previous one — a real
+// user can't legitimately need to start+stop a recording faster
+// than this. Bump the threshold if a recurrence shows the phantom
+// cadence is slower than 1Hz.
+const RECORD_DEBOUNCE_MS = 1000;
+let lastRecordToggleAt = 0;
+
 export function setupStreamControls(): void {
   $<HTMLButtonElement>("#btn-toggle-stream").addEventListener("click", async () => {
     if (state.isStreaming) {
@@ -147,6 +159,16 @@ export function setupStreamControls(): void {
   });
 
   $<HTMLButtonElement>("#btn-record").addEventListener("click", async () => {
+    const now = Date.now();
+    const sinceLast = now - lastRecordToggleAt;
+    if (sinceLast < RECORD_DEBOUNCE_MS) {
+      // Logged so a stuck-input event in the wild leaves a
+      // breadcrumb instead of failing silently.
+      log(`Record click ignored (${sinceLast}ms since last toggle)`);
+      return;
+    }
+    lastRecordToggleAt = now;
+
     if (state.isRecording) {
       const path = await api.stopRecording();
       state.isRecording = false;
