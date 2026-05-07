@@ -67,6 +67,17 @@ export const $$ = <E extends Element = HTMLElement>(sel: string): NodeListOf<E> 
 
 export function log(msg: string): void {
   console.log(`[PocketStream] ${msg}`);
+  // Mirror to the backend log file too — without this, diagnostic
+  // breadcrumbs left around stream-lifecycle paths (debounce
+  // suppression, stall recovery attempts, click-ignored notices)
+  // only land in DevTools and are invisible when a user sends in
+  // pocketstream.log to investigate a drop.
+  if (invoke) {
+    invoke("log_frontend", {
+      level: "info",
+      message: msg,
+    }).catch(() => {});
+  }
 }
 
 /** Escape HTML special characters to prevent injection via innerHTML. */
