@@ -81,14 +81,26 @@ export function warnNoEthernet(): void {
   );
 }
 
+/** True if `address` is in the APIPA range (169.254.0.0/16). Windows
+ *  assigns these as a fallback when DHCP fails — they technically count
+ *  as "an IP" but linger as a secondary on the adapter after DHCP
+ *  recovers (Windows doesn't auto-clean them). Used to hide them from
+ *  the host subnet list and dropdowns where they'd just be confusing
+ *  selectable entries that can't carry usable host-originated traffic.
+ *
+ *  NOTE: discovered *devices* in 169.254.x.x are NOT filtered — some
+ *  cameras (FLIR in particular) fall back to APIPA on DHCP failure
+ *  and the auto-adopt path is the user's recovery route. */
+export function isApipa(address: string): boolean {
+  return address.startsWith("169.254.");
+}
+
 /** True when an Ethernet adapter is present, link is up, AND it has at
- *  least one non-APIPA IPv4 address. Windows assigns 169.254.x.x (APIPA)
- *  when the cable is unplugged or DHCP fails — those IPs satisfy a naive
- *  "has any IP" check but don't represent a real connection. */
+ *  least one non-APIPA IPv4 address. */
 export function isInterfaceConnected(): boolean {
   if (!state.activeInterface) return false;
   if (!state.activeInterface.is_up) return false;
-  return state.activeInterface.ips.some((ip) => !ip.address.startsWith("169.254."));
+  return state.activeInterface.ips.some((ip) => !isApipa(ip.address));
 }
 
 // ── Interface status watcher ────────────────────────────────────────
@@ -194,11 +206,17 @@ export function renderSubnetList(): void {
   if (!state.activeInterface) return;
 
   const adoptedIpSet = new Set(adoptedSubnets.values());
-  const sortedIps = [...state.activeInterface.ips].sort((a, b) => {
-    const aAuto = adoptedIpSet.has(a.address) ? 1 : 0;
-    const bAuto = adoptedIpSet.has(b.address) ? 1 : 0;
-    return aAuto - bAuto;
-  });
+  // Hide APIPA addresses — Windows leaves them as a secondary after
+  // any brief DHCP failure and they can't carry usable traffic, so
+  // showing them as if they were a selectable subnet just confuses
+  // users (seen on multiple Getac installs in the field).
+  const sortedIps = [...state.activeInterface.ips]
+    .filter((ip) => !isApipa(ip.address))
+    .sort((a, b) => {
+      const aAuto = adoptedIpSet.has(a.address) ? 1 : 0;
+      const bAuto = adoptedIpSet.has(b.address) ? 1 : 0;
+      return aAuto - bAuto;
+    });
   let html = sortedIps
     .map((ip) => {
       const isAuto = adoptedIpSet.has(ip.address);
@@ -266,13 +284,16 @@ export function updateCameraIpDropdown(
 
   let options = '<option value="">-- Select --</option>';
 
-  // Host IPs
+  // Host IPs (skip APIPA — same reasoning as renderSubnetList)
   if (state.activeInterface) {
-    options += '<optgroup label="Host">';
-    state.activeInterface.ips.forEach((ip) => {
-      options += `<option value="${ip.address}">${ip.address}</option>`;
-    });
-    options += "</optgroup>";
+    const usableIps = state.activeInterface.ips.filter((ip) => !isApipa(ip.address));
+    if (usableIps.length > 0) {
+      options += '<optgroup label="Host">';
+      usableIps.forEach((ip) => {
+        options += `<option value="${ip.address}">${ip.address}</option>`;
+      });
+      options += "</optgroup>";
+    }
   }
 
   // Node IPs (from ARP-discovered + scan results). Each dropdown entry
@@ -416,9 +437,16 @@ function populateDialogFields(): void {
   const iface = dialogInterfaces.find((i) => i.name === name);
   if (!iface) return;
 
-  // Find the first non-auto-adopted IP as primary
+  // Find the first non-auto-adopted, non-APIPA IP as primary. Without
+  // the APIPA filter, an adapter with a stale 169.254.* secondary IP
+  // ahead of the real DHCP IP would surface APIPA as the "primary" in
+  // the dialog — and the user could overwrite their real config by
+  // hitting Apply.
   const adoptedIps = new Set(adoptedSubnets.values());
-  const primary = iface.ips.find((ip) => !adoptedIps.has(ip.address)) || iface.ips[0];
+  const primary =
+    iface.ips.find((ip) => !adoptedIps.has(ip.address) && !isApipa(ip.address)) ||
+    iface.ips.find((ip) => !adoptedIps.has(ip.address)) ||
+    iface.ips[0];
   $<HTMLInputElement>("#static-ip").value = primary ? primary.address : "";
   $<HTMLInputElement>("#static-mask").value = primary ? prefixToMask(primary.prefix) : "255.255.255.0";
   $<HTMLInputElement>("#static-gateway").value = "";
