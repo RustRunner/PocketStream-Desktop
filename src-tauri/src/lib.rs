@@ -367,10 +367,20 @@ fn setup_logging() {
 
     let log_file = log_dir.join("pocketstream.log");
 
-    // Basic rotation: truncate if the file exceeds 10 MB.
-    if let Ok(meta) = std::fs::metadata(&log_file) {
-        if meta.len() > 10 * 1024 * 1024 {
-            let _ = std::fs::remove_file(&log_file);
+    // Trim to the last MAX_LOG_LINES lines on startup. Replaces the
+    // previous "delete entire file at 10 MB" rotation, which nuked
+    // all history at the worst possible moment. Within a long-running
+    // session the file can still grow past this cap; the trim only
+    // runs at process start, so the user sees a bounded file when
+    // they next open the log. Read failures are non-fatal — leaving
+    // the file alone is preferable to losing data on a transient
+    // I/O error.
+    const MAX_LOG_LINES: usize = 1000;
+    if let Ok(content) = std::fs::read_to_string(&log_file) {
+        let lines: Vec<&str> = content.lines().collect();
+        if lines.len() > MAX_LOG_LINES {
+            let kept = lines[lines.len() - MAX_LOG_LINES..].join("\n");
+            let _ = std::fs::write(&log_file, format!("{}\n", kept));
         }
     }
 
