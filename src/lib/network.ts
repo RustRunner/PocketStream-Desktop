@@ -104,99 +104,152 @@ export function isInterfaceConnected(): boolean {
 }
 
 // ── Interface status watcher ────────────────────────────────────────
-// Backend polls pnet every 3s (zero network traffic) and emits this
-// event when the active Ethernet interface changes state.
+// Backend's NotifyIpInterfaceChange watcher emits `interface-status-
+// changed` whenever Windows reports an IP/link transition. The
+// payload reflects whatever the OS sees at the 300ms-debounced moment
+// — including transient sub-second blips that the link self-heals
+// from.
+
+// Stable-down debounce. A "down" event (adapter sentinel, link down,
+// or APIPA-only) is held for STABLE_DOWN_MS before the teardown UI
+// fires; if an "up" event arrives within that window the down is
+// discarded and the user sees nothing. Catches the ASIX/USB-Ethernet
+// blip case where a real outage of <2s would otherwise produce a
+// Stream Lost / Stream Resumed cycle for no useful reason.
+//
+// GStreamer's bus error path is not gated by this — if the underlying
+// TCP socket actually died during the blip, rtspsrc surfaces a bus
+// error and showStreamLost still fires through streaming.ts. The
+// debounce only suppresses network-watcher-driven teardowns; pipeline-
+// driven teardowns are independent.
+const STABLE_DOWN_MS = 2000;
+let pendingDownTimer: ReturnType<typeof setTimeout> | null = null;
+let pendingDownIface: InterfaceInfo | null = null;
+
+function isDownEvent(iface: InterfaceInfo): boolean {
+  if (!iface.name) return true; // sentinel: no adapter at all
+  if (!iface.is_up) return true;
+  return !iface.ips.some((ip) => !isApipa(ip.address));
+}
 
 export function setupInterfaceWatcher(): void {
   api.onEvent<InterfaceInfo>("interface-status-changed", (iface) => {
-    // Capture the prior connection state BEFORE overwriting activeInterface
-    // below. isInterfaceConnected() is our single source of truth — it also
-    // treats APIPA-only state as "down" so the reconnect branch will fire
-    // when a real IP is actually bound.
+    // Capture the prior connection state BEFORE any state mutation so
+    // applyUpEvent can decide whether this is a true reconnect.
+    // isInterfaceConnected() is our single source of truth — it also
+    // treats APIPA-only state as "down" so the reconnect branch will
+    // fire when a real IP is actually bound.
     const wasDown = !isInterfaceConnected();
 
-    // Sentinel from the backend watcher: no ethernet adapter present at all.
-    //
-    // Deliberately does NOT raise the banner here — a mid-session unplug
-    // during active use is noise, not a call to action. Banner is reserved
-    // for explicit enumeration (startup + manual refresh), where the user
-    // is actively trying to get discovery running. Stream-break UX lives
-    // separately in streaming.js::showStreamLost.
-    if (!iface.name) {
-      // Capture the CAM/PTU selections BEFORE updateCameraIpDropdown
-      // wipes them below — otherwise handleHardDisconnect would
-      // snapshot an empty PTU value and auto-resume on replug wouldn't
-      // restore it. (camera_ip has a state.config fallback because it
-      // persists; ptu_ip is session-only so the dropdown value is the
-      // sole source of truth.)
-      handleHardDisconnect("Ethernet disconnected");
-      state.activeInterface = null;
-      $("#iface-name").textContent = "None found";
-      // Preserve the backend's DeviceRegistry across a "no adapter"
-      // blip so a quick replug restores the UI without waiting for a
-      // full re-scan. renderArpDeviceList self-hides when not connected.
-      renderArpDeviceList();
-      renderSubnetList();
-      updateCameraIpDropdown(null);
-      hideDiscoveryStatus();
+    if (isDownEvent(iface)) {
+      // Defer the teardown. Repeat downs (link still bouncing) just
+      // keep the timer running with the most recent iface payload.
+      pendingDownIface = iface;
+      if (!pendingDownTimer) {
+        log(`Network: down event received, debouncing ${STABLE_DOWN_MS}ms`);
+        pendingDownTimer = setTimeout(() => {
+          pendingDownTimer = null;
+          const downIface = pendingDownIface;
+          pendingDownIface = null;
+          if (!downIface) return;
+          applyDownEvent(downIface);
+        }, STABLE_DOWN_MS);
+      }
       return;
     }
 
-    state.activeInterface = iface;
-
-    const hasRealIp = iface.ips.some((ip) => !ip.address.startsWith("169.254."));
-    if (!iface.is_up || !hasRealIp) {
-      // ── Disconnected (includes APIPA-only state) ─────────────────
-      // Snapshot first, before dropdown clear wipes PTU selection.
-      handleHardDisconnect("Ethernet disconnected");
-
-      $("#iface-name").textContent =
-        (iface.display_name || iface.name) + " (Disconnected)";
-
-      // Preserve the backend's DeviceRegistry — a quick replug of the
-      // same cable should restore the Nodes list instantly instead of
-      // waiting 6+ seconds for ARP + port scan to rediscover what was
-      // there. renderArpDeviceList returns early when the link is down.
-      renderArpDeviceList();
-      renderSubnetList();
-      updateCameraIpDropdown(null);
-      // Hide the Nodes-card spinner — no link means no discovery to wait on.
-      hideDiscoveryStatus();
-    } else {
-      // ── Connected (or reconnected) ───────────────────────────────
-      $("#iface-name").textContent = iface.display_name || iface.name;
-      // Recovery — reset the toast dedup so a future failure re-toasts.
-      lastAdapterWarningAt = 0;
-
-      // Refresh the subnet list since adopted IPs may have appeared
-      // (load_adopted_from_config completing during cold start triggers
-      // this event with the new IP set).
-      renderSubnetList();
-
-      // Preserve the existing CAM/PTU dropdown — the backend registry
-      // hasn't changed, so wiping the dropdown to null would just make
-      // cached/discovered nodes vanish until the next render cycle (the
-      // original cause of the "nodes disappear from dropdown during
-      // discovery" bug).
-      updateCameraIpDropdown(lastSubnetResults.get());
-
-      // If we just came back from disconnected, re-render immediately
-      // from the preserved state so the Nodes list snaps back, then
-      // kick off discovery to verify. Verification will dim/mark any
-      // devices that genuinely vanished during the downtime.
-      if (wasDown) {
-        renderArpDeviceList();
-        resetDiscoveryStatus();
-        api.startArpDiscovery(iface.name).catch(() => {});
-        // Restart the stream (and RTSP server) if they were running
-        // before the disconnect. Fires in the background; failures
-        // surface as toasts inside handleReconnect.
-        handleReconnect().catch((e: unknown) =>
-          log(`Auto-resume: ${formatError(e)}`)
-        );
-      }
+    // Up event. Cancel any pending teardown — link recovered before
+    // the threshold expired, so the user never saw an outage. Note:
+    // we deliberately treat this as a clean "no event happened"
+    // case, not as a reconnect — wasDown will already be false
+    // because state.activeInterface still reflects the prior up
+    // state (we never updated it during the suppressed window).
+    if (pendingDownTimer) {
+      log("Network: down event suppressed (recovered within debounce window)");
+      clearTimeout(pendingDownTimer);
+      pendingDownTimer = null;
+      pendingDownIface = null;
     }
+
+    applyUpEvent(iface, wasDown);
   });
+}
+
+function applyDownEvent(iface: InterfaceInfo): void {
+  // Sentinel from the backend watcher: no ethernet adapter present
+  // at all. Deliberately does NOT raise the banner here — a mid-
+  // session unplug during active use is noise, not a call to action.
+  // Banner is reserved for explicit enumeration (startup + manual
+  // refresh), where the user is actively trying to get discovery
+  // running. Stream-break UX lives separately in streaming.ts::
+  // showStreamLost.
+  if (!iface.name) {
+    // Capture the CAM/PTU selections BEFORE updateCameraIpDropdown
+    // wipes them below — otherwise handleHardDisconnect would
+    // snapshot an empty PTU value and auto-resume on replug wouldn't
+    // restore it. (camera_ip has a state.config fallback because it
+    // persists; ptu_ip is session-only so the dropdown value is the
+    // sole source of truth.)
+    handleHardDisconnect("Ethernet disconnected");
+    state.activeInterface = null;
+    $("#iface-name").textContent = "None found";
+    // Preserve the backend's DeviceRegistry across a "no adapter"
+    // blip so a quick replug restores the UI without waiting for a
+    // full re-scan. renderArpDeviceList self-hides when not connected.
+    renderArpDeviceList();
+    renderSubnetList();
+    updateCameraIpDropdown(null);
+    hideDiscoveryStatus();
+    return;
+  }
+
+  // Adapter present but down or APIPA-only. Snapshot first, before
+  // dropdown clear wipes PTU selection.
+  state.activeInterface = iface;
+  handleHardDisconnect("Ethernet disconnected");
+  $("#iface-name").textContent =
+    (iface.display_name || iface.name) + " (Disconnected)";
+  // Preserve the backend's DeviceRegistry — a quick replug of the
+  // same cable should restore the Nodes list instantly instead of
+  // waiting 6+ seconds for ARP + port scan to rediscover what was
+  // there. renderArpDeviceList returns early when the link is down.
+  renderArpDeviceList();
+  renderSubnetList();
+  updateCameraIpDropdown(null);
+  // Hide the Nodes-card spinner — no link means no discovery to wait on.
+  hideDiscoveryStatus();
+}
+
+function applyUpEvent(iface: InterfaceInfo, wasDown: boolean): void {
+  state.activeInterface = iface;
+  $("#iface-name").textContent = iface.display_name || iface.name;
+  // Recovery — reset the toast dedup so a future failure re-toasts.
+  lastAdapterWarningAt = 0;
+  // Refresh the subnet list since adopted IPs may have appeared
+  // (load_adopted_from_config completing during cold start triggers
+  // this event with the new IP set).
+  renderSubnetList();
+  // Preserve the existing CAM/PTU dropdown — the backend registry
+  // hasn't changed, so wiping the dropdown to null would just make
+  // cached/discovered nodes vanish until the next render cycle (the
+  // original cause of the "nodes disappear from dropdown during
+  // discovery" bug).
+  updateCameraIpDropdown(lastSubnetResults.get());
+  if (wasDown) {
+    // If we just came back from disconnected, re-render immediately
+    // from the preserved state so the Nodes list snaps back, then
+    // kick off discovery to verify. Verification will dim/mark any
+    // devices that genuinely vanished during the downtime.
+    renderArpDeviceList();
+    resetDiscoveryStatus();
+    api.startArpDiscovery(iface.name).catch(() => {});
+    // Restart the stream (and RTSP server) if they were running
+    // before the disconnect. Fires in the background; failures
+    // surface as toasts inside handleReconnect.
+    handleReconnect().catch((e: unknown) =>
+      log(`Auto-resume: ${formatError(e)}`)
+    );
+  }
 }
 
 // ── Subnet list rendering ───────────────────────────────────────────
