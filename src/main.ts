@@ -525,19 +525,28 @@ function setupRefreshButton(): void {
   });
 }
 
-// ── Reset Adapter Button ────────────────────────────────────────────
+// ── Reset Adapter Dialog ────────────────────────────────────────────
 // Forces Windows to re-probe NIC driver state via Restart-NetAdapter.
 // This is the programmatic equivalent of opening adapter Properties,
 // which is the known workaround for a Windows quirk where a plugged-in
 // Ethernet adapter stays marked "Disconnected" until the driver state
 // is forcibly refreshed. Triggers a UAC prompt when the app isn't
 // already elevated.
+//
+// Behind a dedicated dialog (rather than an icon + native confirm())
+// to make accidental triggers harmless: the previous icon in the Host
+// card header could be hit by a stray click and the native confirm()
+// proved easy to dismiss-by-Enter without a deliberate read. The
+// dialog pattern matches "Clear Offline Devices" — destructive
+// action is the unobtrusive text button, Cancel is the prominent
+// filled button.
 
 function setupResetAdapterButton(): void {
-  $<HTMLButtonElement>("#btn-reset-adapter").addEventListener("click", async () => {
-    const btn = $<HTMLButtonElement>("#btn-reset-adapter");
-    const iface = state.activeInterface;
+  const titleEl = $<HTMLElement>("#host-title");
+  const dialog = $<HTMLDialogElement>("#reset-adapter-dialog");
 
+  titleEl.addEventListener("click", () => {
+    const iface = state.activeInterface;
     if (!iface || !iface.name) {
       showToast(
         "No Ethernet adapter to reset — plug one in and try again",
@@ -545,36 +554,37 @@ function setupResetAdapterButton(): void {
       );
       return;
     }
-
-    const ok = confirm(
-      `Reset "${iface.display_name || iface.name}"?\n\n` +
-        `This briefly drops the network connection and may trigger a ` +
-        `UAC prompt. Use this when the adapter seems stuck.`
-    );
-    if (!ok) {
-      return;
-    }
-
-    const name = iface.name;
-    btn.disabled = true;
-    btn.classList.add("spinning");
-
-    try {
-      await api.refreshAdapter(name, "hard");
-      showToast("Adapter reset");
-      // Give the driver a moment to come back, then re-enumerate.
-      // The event-driven watcher will also fire, but refreshing here
-      // makes the UI snap back faster on success.
-      await new Promise((r) => setTimeout(r, 1500));
-      await refreshInterfaces();
-      if (isInterfaceConnected() && state.activeInterface) {
-        api.startArpDiscovery(state.activeInterface.name).catch(() => {});
-      }
-    } catch (e) {
-      showToast("Reset failed: " + formatError(e), true);
-    } finally {
-      btn.disabled = false;
-      btn.classList.remove("spinning");
-    }
+    $<HTMLElement>("#reset-adapter-name").textContent =
+      iface.display_name || iface.name;
+    dialog.showModal();
   });
+
+  $<HTMLButtonElement>("#reset-adapter-cancel").addEventListener("click", () => {
+    dialog.close();
+  });
+
+  $<HTMLButtonElement>("#reset-adapter-confirm").addEventListener(
+    "click",
+    async () => {
+      dialog.close();
+      const iface = state.activeInterface;
+      if (!iface || !iface.name) return;
+      const name = iface.name;
+
+      try {
+        await api.refreshAdapter(name, "hard");
+        showToast("Adapter reset");
+        // Give the driver a moment to come back, then re-enumerate.
+        // The event-driven watcher will also fire, but refreshing here
+        // makes the UI snap back faster on success.
+        await new Promise((r) => setTimeout(r, 1500));
+        await refreshInterfaces();
+        if (isInterfaceConnected() && state.activeInterface) {
+          api.startArpDiscovery(state.activeInterface.name).catch(() => {});
+        }
+      } catch (e) {
+        showToast("Reset failed: " + formatError(e), true);
+      }
+    }
+  );
 }
