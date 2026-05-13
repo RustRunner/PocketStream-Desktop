@@ -501,8 +501,12 @@ export function renderArpDeviceList(): void {
     });
   }
 
-  if (!html && pendingScans > 0) return;
   if (!html) {
+    // Keep the list empty while either ARP discovery is still running
+    // (no devices yet, but they may show up) OR a port scan is still
+    // in flight (devices exist but haven't qualified for display yet).
+    // Only show "No devices found." once both have settled.
+    if (pendingScans > 0 || isDiscoveryActive()) return;
     list.innerHTML = '<p class="placeholder-text">No devices found.</p>';
     updateCameraIpDropdown(null);
     return;
