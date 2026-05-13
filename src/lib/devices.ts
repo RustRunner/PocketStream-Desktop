@@ -275,6 +275,15 @@ export async function loadExistingArpState(): Promise<void> {
 const VERIFY_MAX_ATTEMPTS = 3;
 const VERIFY_RETRY_DELAY_MS = 1500;
 
+/** How long to wait before re-verifying a device that's currently
+ *  flagged offline. Without this, a device that failed the startup
+ *  verify race (e.g., a brief ping-sweep saturation during cold
+ *  start) stays flagged offline forever — the isIpScanned guard
+ *  would normally block any future scan anyway, so we also clear
+ *  that on offline-set. */
+const OFFLINE_RETRY_INTERVAL_MS = 60_000;
+const offlineRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
 function verifyCachedRoutableDevices(): void {
   for (const record of deviceList.getDevices()) {
     if (record.status !== "cached_only") continue;
@@ -282,6 +291,26 @@ function verifyCachedRoutableDevices(): void {
     if (isIpScanned(record.ip)) continue;
     fastVerifyCachedDevice(record.mac, record.ip);
   }
+}
+
+/** Schedule a periodic re-verify for an offline device so the status
+ *  self-heals once the device responds again (without requiring the
+ *  user to click the Nodes refresh button). Replaces any previously
+ *  pending retry for the same MAC. */
+function scheduleOfflineRetry(mac: string, ip: string): void {
+  const existing = offlineRetryTimers.get(mac);
+  if (existing) clearTimeout(existing);
+  const timer = setTimeout(() => {
+    offlineRetryTimers.delete(mac);
+    const record = deviceList.getDevices().find((r) => r.mac === mac);
+    // Bail if the device went away (forgot), is no longer offline
+    // (something else verified it), or the subnet is no longer
+    // routable (Ethernet down / subnet dropped).
+    if (!record || record.status !== "offline") return;
+    if (!hasRouteToSubnet(record.subnet)) return;
+    fastVerifyCachedDevice(mac, ip);
+  }, OFFLINE_RETRY_INTERVAL_MS);
+  offlineRetryTimers.set(mac, timer);
 }
 
 async function fastVerifyCachedDevice(
@@ -325,11 +354,18 @@ async function fastVerifyCachedDevice(
       VERIFY_RETRY_DELAY_MS
     );
   } else {
-    // Final attempt failed — flag offline so the UI can dim it and the
-    // user knows clicking it may not work right now.
+    // Final attempt failed — flag offline so the UI can dim it and
+    // the user knows clicking it may not work right now. Clear the
+    // scanned flag so future scans CAN retry this IP (without this,
+    // isIpScanned blocks every later attempt and the device stays
+    // offline forever even after it comes back), and schedule a
+    // periodic re-verify so the status self-heals when conditions
+    // improve.
+    markIpScanned(ip, /* clear */ true);
     api.setDeviceStatus(mac, "offline").catch((e: unknown) => {
       log(`set offline status failed for ${ip}: ${formatError(e)}`);
     });
+    scheduleOfflineRetry(mac, ip);
   }
 }
 
