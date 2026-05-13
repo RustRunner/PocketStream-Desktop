@@ -64,7 +64,20 @@
               </div>
               <div class="input-field">
                 <label for="rtsp-path">Path</label>
-                <input type="text" id="rtsp-path" value="/z3-1.sdp" />
+                <select id="rtsp-path">
+                  <option value="/z3-1.sdp">/z3-1.sdp (Z3 Technologies)</option>
+                  <option value="/z3-2.sdp">/z3-2.sdp (Z3 Technologies)</option>
+                  <option value="/live">/live (Sony / ONVIF)</option>
+                  <option value="/Streaming/Channels/101">/Streaming/Channels/101 (Hikvision main)</option>
+                  <option value="/Streaming/Channels/102">/Streaming/Channels/102 (Hikvision sub)</option>
+                  <option value="/cam/realmonitor?channel=1&amp;subtype=0">/cam/realmonitor?channel=1&amp;subtype=0 (Dahua)</option>
+                  <option value="/axis-media/media.amp">/axis-media/media.amp (Axis)</option>
+                  <option value="__custom__">Custom…</option>
+                </select>
+              </div>
+              <div class="input-field" id="rtsp-path-custom-field" style="display:none">
+                <label for="rtsp-path-custom">Custom Path</label>
+                <input type="text" id="rtsp-path-custom" placeholder="/your/path" />
               </div>
               <div class="input-field">
                 <label for="camera-user">Username</label>

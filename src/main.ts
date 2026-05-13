@@ -186,6 +186,40 @@ function showUpdateToast(update: TauriUpdate): void {
 
 // ── Config ──────────────────────────────────────────────────────────
 
+/** Set the Path dropdown from a saved config value. If the saved path
+ *  matches one of the preset options, select it and hide the custom
+ *  input. Otherwise switch to Custom… and put the saved value into
+ *  the custom input so it round-trips through Save Settings without
+ *  loss for users on non-listed cameras. */
+function applyRtspPath(path: string): void {
+  const select = $<HTMLSelectElement>("#rtsp-path");
+  const customField = $<HTMLElement>("#rtsp-path-custom-field");
+  const customInput = $<HTMLInputElement>("#rtsp-path-custom");
+  const presets = Array.from(select.options)
+    .map((o) => o.value)
+    .filter((v) => v !== "__custom__");
+  if (presets.includes(path)) {
+    select.value = path;
+    customField.style.display = "none";
+    customInput.value = "";
+  } else {
+    select.value = "__custom__";
+    customInput.value = path;
+    customField.style.display = "";
+  }
+}
+
+/** Read the effective Path value from the dropdown (or custom input
+ *  when Custom… is selected). Whitespace-trimmed so a stray trailing
+ *  space doesn't break the RTSP URL build. */
+function readRtspPath(): string {
+  const select = $<HTMLSelectElement>("#rtsp-path");
+  if (select.value === "__custom__") {
+    return $<HTMLInputElement>("#rtsp-path-custom").value.trim();
+  }
+  return select.value;
+}
+
 async function loadConfig(): Promise<void> {
   try {
     state.config = await api.getConfig();
@@ -193,7 +227,7 @@ async function loadConfig(): Promise<void> {
 
     // Populate settings UI
     $<HTMLInputElement>("#rtsp-port").value = String(state.config.stream.rtsp_port);
-    $<HTMLInputElement>("#rtsp-path").value = state.config.stream.rtsp_path;
+    applyRtspPath(state.config.stream.rtsp_path);
     $<HTMLInputElement>("#udp-port").value = String(state.config.stream.udp_port);
     $<HTMLInputElement>("#camera-user").value = state.config.credentials.username;
     $<HTMLInputElement>("#camera-pass").value = state.config.credentials.password;
@@ -217,6 +251,17 @@ async function loadConfig(): Promise<void> {
 }
 
 function setupSettingsSave(): void {
+  // Path dropdown: reveal the custom-path text input when the user
+  // picks "Custom…" so they can type in a path the presets don't
+  // cover. Saved as the effective path via readRtspPath().
+  $<HTMLSelectElement>("#rtsp-path").addEventListener("change", () => {
+    const isCustom = $<HTMLSelectElement>("#rtsp-path").value === "__custom__";
+    $<HTMLElement>("#rtsp-path-custom-field").style.display = isCustom ? "" : "none";
+    if (isCustom) {
+      $<HTMLInputElement>("#rtsp-path-custom").focus();
+    }
+  });
+
   $<HTMLButtonElement>("#save-settings").addEventListener("click", async () => {
     const activeProto =
       $<HTMLElement>("[data-protocol].active")?.dataset["protocol"] || "rtsp";
@@ -224,7 +269,7 @@ function setupSettingsSave(): void {
     const stream: StreamConfig = {
       protocol: activeProto,
       rtsp_port: parseInt($<HTMLInputElement>("#rtsp-port").value) || 554,
-      rtsp_path: $<HTMLInputElement>("#rtsp-path").value || "/z3-1.sdp",
+      rtsp_path: readRtspPath() || "/z3-1.sdp",
       udp_port: parseInt($<HTMLInputElement>("#udp-port").value) || 8600,
       camera_ip: state.config?.stream?.camera_ip || "",
     };
