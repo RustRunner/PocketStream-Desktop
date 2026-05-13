@@ -207,6 +207,10 @@ function applyRtspPath(path: string): void {
     customInput.value = path;
     customField.style.display = "";
   }
+  // Record this as the applied path so an immediate blur on the
+  // custom input (after a click-in / click-out with no edit) doesn't
+  // re-fire applyPathChange and restart the stream.
+  lastAppliedRtspPath = path;
 }
 
 /** Read the effective Path value from the dropdown (or custom input
@@ -218,6 +222,54 @@ function readRtspPath(): string {
     return $<HTMLInputElement>("#rtsp-path-custom").value.trim();
   }
   return select.value;
+}
+
+/** Tracks the last successfully-applied path so consecutive Custom…
+ *  blurs without an edit don't trigger redundant restarts. */
+let lastAppliedRtspPath: string | null = null;
+
+/** Persist the current Path selection to backend config and, if a
+ *  stream is running, restart the pipeline so the new URL takes
+ *  effect immediately. Treated as a channel switch rather than a
+ *  settings change — no Save Settings click required.
+ *
+ *  No-op when the path didn't actually change (avoids restarting
+ *  the stream on a blur that follows a no-edit click on the custom
+ *  input). */
+async function applyPathChange(): Promise<void> {
+  const newPath = readRtspPath();
+  if (!newPath) return;
+  if (newPath === lastAppliedRtspPath) return;
+  if (!state.config) return;
+
+  state.config.stream.rtsp_path = newPath;
+  try {
+    await api.updateStreamSettings(state.config.stream);
+  } catch (e) {
+    showToast("Failed to save path: " + formatError(e), true);
+    return;
+  }
+  lastAppliedRtspPath = newPath;
+
+  // Only restart if there's actually a stream to switch. If the user
+  // hasn't started one yet, the new path is queued for the next
+  // Start Stream click via state.config.stream.rtsp_path.
+  if (!state.isStreaming || state.streamLost) return;
+
+  try {
+    await api.stopStream();
+    const bounds = getVideoAreaBounds();
+    const handle = await api.createVideoWindow(
+      bounds.x,
+      bounds.y,
+      bounds.width,
+      bounds.height
+    );
+    await api.startStream(handle);
+    showToast("Switched to " + newPath);
+  } catch (e) {
+    showToast("Failed to switch path: " + formatError(e), true);
+  }
 }
 
 async function loadConfig(): Promise<void> {
@@ -251,15 +303,34 @@ async function loadConfig(): Promise<void> {
 }
 
 function setupSettingsSave(): void {
-  // Path dropdown: reveal the custom-path text input when the user
-  // picks "Custom…" so they can type in a path the presets don't
-  // cover. Saved as the effective path via readRtspPath().
+  // Path dropdown: act like a channel selector. Picking a preset
+  // immediately persists the new path AND restarts the stream if
+  // one is running, so the user doesn't have to click Save Settings
+  // then Stop then Start to switch between e.g. /z3-1.sdp and
+  // /z3-2.sdp. Picking Custom… reveals the text input but does
+  // NOT apply yet — the user is mid-edit; apply on Enter or blur.
   $<HTMLSelectElement>("#rtsp-path").addEventListener("change", () => {
     const isCustom = $<HTMLSelectElement>("#rtsp-path").value === "__custom__";
     $<HTMLElement>("#rtsp-path-custom-field").style.display = isCustom ? "" : "none";
     if (isCustom) {
       $<HTMLInputElement>("#rtsp-path-custom").focus();
+      return;
     }
+    applyPathChange();
+  });
+
+  // Custom path text input: apply on Enter (explicit commit) or on
+  // blur (implicit commit when the user clicks away). Both feel
+  // natural for form-style text entry and avoid restarting the
+  // stream on every keystroke.
+  $<HTMLInputElement>("#rtsp-path-custom").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      applyPathChange();
+    }
+  });
+  $<HTMLInputElement>("#rtsp-path-custom").addEventListener("blur", () => {
+    applyPathChange();
   });
 
   $<HTMLButtonElement>("#save-settings").addEventListener("click", async () => {
