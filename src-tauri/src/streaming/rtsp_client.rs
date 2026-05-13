@@ -26,6 +26,18 @@ use crate::error::AppError;
 /// without making real freezes feel sluggish.
 const STALL_THRESHOLD: Duration = Duration::from_secs(8);
 
+/// How long the pipeline can sit at `current=Paused, pending=Playing`
+/// before `health_check` declares the stream stalled. Catches the
+/// failure mode where rtspsrc errors during SDP/SETUP (e.g., a
+/// DESCRIBE timeout caused by a concurrent ping-sweep saturating the
+/// USB Ethernet adapter): the bus error gets popped once on the
+/// following health_check tick, but the pipeline state stays at
+/// Paused indefinitely and the buffer-arrival watchdog never fires
+/// because Playing was never reached. 10s is comfortably longer than
+/// a normal RTSP handshake on a healthy network while still tripping
+/// well before the user notices.
+const PAUSED_STALL_THRESHOLD: Duration = Duration::from_secs(10);
+
 /// A live playback pipeline with tee for recording/screenshots.
 pub struct PlaybackPipeline {
     pub pipeline: gst::Pipeline,
@@ -36,6 +48,14 @@ pub struct PlaybackPipeline {
     /// that never reach Playing are already covered by the existing
     /// `playing=false` path in `health_check`.
     last_buffer_at: Arc<Mutex<Option<Instant>>>,
+    /// First `Instant` we observed `current=Paused && pending=Playing`
+    /// in the current stuck-state window. Cleared whenever the
+    /// pipeline leaves that state (reaches Playing, or transitions
+    /// somewhere unexpected). Used to time out a pipeline that
+    /// silently fails to complete its Paused→Playing transition —
+    /// the buffer-arrival watchdog can't catch that case because
+    /// it gates on `current=Playing`.
+    paused_pending_play_at: Arc<Mutex<Option<Instant>>>,
 }
 
 impl PlaybackPipeline {
@@ -183,6 +203,7 @@ impl PlaybackPipeline {
             pipeline,
             appsink,
             last_buffer_at,
+            paused_pending_play_at: Arc::new(Mutex::new(None::<Instant>)),
         })
     }
 
@@ -218,9 +239,14 @@ impl PlaybackPipeline {
         let playing = current == gst::State::Playing;
 
         if playing {
-            // Stall watchdog. Skipped while `last_buffer_at` is None
-            // (haven't decoded a frame yet) so a slow caps negotiation
-            // doesn't trip it.
+            // Pipeline reached Playing — clear stuck-Paused tracking
+            // so a future failed transition starts fresh.
+            if let Ok(mut g) = self.paused_pending_play_at.lock() {
+                *g = None;
+            }
+            // Buffer-arrival watchdog. Skipped while `last_buffer_at`
+            // is None (haven't decoded a frame yet) so slow caps
+            // negotiation doesn't trip it.
             if let Ok(guard) = self.last_buffer_at.lock() {
                 if let Some(last) = *guard {
                     let elapsed = last.elapsed();
@@ -236,12 +262,45 @@ impl PlaybackPipeline {
                     }
                 }
             }
+        } else if current == gst::State::Paused && pending == gst::State::Playing {
+            // Stuck-Paused watchdog. rtspsrc may have errored during
+            // SDP/SETUP — the bus error was popped above on whichever
+            // tick happened to catch it, but the pipeline state stays
+            // at Paused indefinitely afterward. Without this we'd
+            // spam `not playing` warnings forever and never trigger
+            // stall recovery (the buffer-arrival watchdog can't fire
+            // because Playing was never reached).
+            //
+            // The `stalled` keyword in the returned error routes to
+            // `isStallError` on the frontend, which schedules the
+            // existing stall-recovery flow.
+            let elapsed = match self.paused_pending_play_at.lock() {
+                Ok(mut g) => g.get_or_insert_with(Instant::now).elapsed(),
+                Err(_) => Duration::ZERO,
+            };
+            if elapsed >= PAUSED_STALL_THRESHOLD {
+                log::warn!(
+                    "Stream stalled: stuck Paused→Playing for {:.1}s",
+                    elapsed.as_secs_f32()
+                );
+                return Err(format!(
+                    "Stream stalled — pipeline stuck transitioning to Playing for {}s",
+                    elapsed.as_secs()
+                ));
+            }
+            log::warn!(
+                "Stream health_check: not playing (current={:?}, pending={:?})",
+                current,
+                pending
+            );
         } else {
-            // This path was previously silent — the frontend saw
-            // `playing=false` with no error and tore everything down.
-            // Log the exact states so we can diagnose transient blips
-            // vs. real drops without needing to reproduce under a
-            // debugger.
+            // Some other non-Playing state (Null/Ready/transitioning
+            // elsewhere) — clear stuck-Paused tracking so the watchdog
+            // only counts continuous time spent stuck specifically at
+            // Paused→Playing.
+            if let Ok(mut g) = self.paused_pending_play_at.lock() {
+                *g = None;
+            }
             log::warn!(
                 "Stream health_check: not playing (current={:?}, pending={:?})",
                 current,

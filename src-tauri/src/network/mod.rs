@@ -712,8 +712,20 @@ fn get_interface_ips(name: &str) -> Vec<Ipv4Addr> {
 /// silently route out the wrong NIC — the Ethernet pcap listener never
 /// sees the replies and passive devices on that subnet stay invisible.
 async fn ping_sweep_subnets(interface_ips: &[String]) {
+    use tokio::sync::Semaphore;
     use tokio::task::JoinSet;
 
+    // Cap concurrent ping.exe spawns. Without this we were spawning all
+    // 254 pings per interface IP simultaneously — on a USB Ethernet
+    // adapter (notably ASIX AX88179) that burst was saturating the NIC
+    // / Windows socket stack at exactly the moment a parallel stream
+    // restart was trying to complete its RTSP DESCRIBE handshake, and
+    // the camera would time out before the SDP exchange finished,
+    // leaving the GStreamer pipeline stuck at Paused→Playing forever.
+    // 32 is well under typical Windows ephemeral-port and process
+    // pressure thresholds while still draining a /24 in ~1.5 s.
+    const MAX_CONCURRENT_PINGS: usize = 32;
+    let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_PINGS));
     let mut join_set = JoinSet::new();
 
     for ip_str in interface_ips {
@@ -722,7 +734,12 @@ async fn ping_sweep_subnets(interface_ips: &[String]) {
             for last in 1..=254 {
                 let target = format!("{}.{}.{}.{}", o[0], o[1], o[2], last);
                 let source = ip_str.clone();
+                let sem = sem.clone();
                 join_set.spawn(async move {
+                    let _permit = match sem.acquire().await {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    };
                     let _ = async_cmd("ping")
                         .args(["-n", "1", "-w", "200", "-S", &source, &target])
                         .output()
