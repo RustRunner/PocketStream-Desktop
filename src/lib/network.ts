@@ -10,6 +10,7 @@ import { lastSubnetResults, selectedDevice } from "./store.ts";
 import type { SubnetRenderResult } from "./store.ts";
 import { formatError } from "./errors.ts";
 import type { InterfaceInfo } from "./types.ts";
+import * as deviceList from "./device-list.ts";
 
 // Reference $$ once so the import isn't dropped — used elsewhere via the
 // state.ts re-export, but TS's verbatimModuleSyntax keeps unused value
@@ -329,6 +330,23 @@ export function renderSubnetList(): void {
 
 // ── Camera / PTU IP dropdown ────────────────────────────────────────
 
+// Once-per-session flags so the alias-based auto-select runs exactly
+// when the dropdown first has a populated option for the target IP
+// — and never again after that. Prevents the auto-default from
+// re-applying every render and overriding a user's later manual
+// pick (or their deliberate clear back to "-- Select --").
+let camDropdownAutoApplied = false;
+let ptuDropdownAutoApplied = false;
+
+/** Look up the device IP that the Naming dialog has been assigned a
+ *  given role alias for. Aliases are persisted server-side via
+ *  set_device_alias and hydrated into the registry from the device
+ *  cache on cold start, so this round-trips a role designation
+ *  across program restarts. */
+function findDeviceIpByAlias(alias: string): string | undefined {
+  return deviceList.getDevices().find((r) => r.alias === alias)?.ip;
+}
+
 export function updateCameraIpDropdown(
   filteredSubnets: SubnetRenderResult[] | null
 ): void {
@@ -372,6 +390,22 @@ export function updateCameraIpDropdown(
 
   if (currentVal) {
     select.value = currentVal;
+  } else if (!camDropdownAutoApplied) {
+    // Cold-start auto-select. Prefer the IP saved in config (user's
+    // last Start Stream / CAM-role pick) and fall back to whatever
+    // device is currently aliased CAM in the Naming dialog. Either
+    // way the dropdown returns to the user's last intent across
+    // program restarts instead of starting empty.
+    const targetIp =
+      state.config?.stream.camera_ip || findDeviceIpByAlias("CAM");
+    if (
+      targetIp &&
+      Array.from(select.options).some((o) => o.value === targetIp)
+    ) {
+      select.value = targetIp;
+      selectedDevice.set(targetIp);
+      camDropdownAutoApplied = true;
+    }
   }
 
   // Update PTU dropdown with the same options
@@ -380,6 +414,17 @@ export function updateCameraIpDropdown(
   ptuSelect.innerHTML = options;
   if (ptuVal) {
     ptuSelect.value = ptuVal;
+  } else if (!ptuDropdownAutoApplied) {
+    // PTU has no equivalent in StreamConfig (deliberately session-
+    // only there), so the alias is the only persisted breadcrumb.
+    const targetIp = findDeviceIpByAlias("PTU");
+    if (
+      targetIp &&
+      Array.from(ptuSelect.options).some((o) => o.value === targetIp)
+    ) {
+      ptuSelect.value = targetIp;
+      ptuDropdownAutoApplied = true;
+    }
   }
 }
 

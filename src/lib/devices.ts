@@ -625,8 +625,12 @@ async function openAliasDialog(ip: string): Promise<void> {
     $<HTMLElement>("#alias-custom-field").style.display = "";
   }
 
-  // Show Clear/Save only for custom role
-  $<HTMLElement>("#alias-clear").style.display = isCustom ? "" : "none";
+  // Save is only meaningful when the user has a custom name typed.
+  // Clear Name is always visible — it's a no-op for devices with no
+  // alias yet, but means the user can revert a CAM/PTU/custom-named
+  // node back to the default "Node N" display directly from any
+  // dialog state instead of having to switch to Custom first.
+  $<HTMLElement>("#alias-clear").style.display = "";
   $<HTMLElement>("#alias-save").style.display = isCustom ? "" : "none";
 
   if (dialog.open) dialog.close();
@@ -646,7 +650,11 @@ export function setupAliasDialog(): void {
 
   function updateAliasActions(role: string): void {
     const isCustom = role === "custom";
-    $<HTMLElement>("#alias-clear").style.display = isCustom ? "" : "none";
+    // Save is only meaningful when there's a custom name to commit.
+    // Clear Name stays visible whenever the current record actually
+    // has an alias (handled at open time in openAliasDialog); for
+    // the in-dialog role switch we keep it visible while the user
+    // is editing so they can back out of an in-progress rename.
     $<HTMLElement>("#alias-save").style.display = isCustom ? "" : "none";
   }
 
