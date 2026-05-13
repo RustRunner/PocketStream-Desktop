@@ -27,6 +27,7 @@ import {
   setupVideoResize,
   getVideoAreaBounds,
   startStatusListener,
+  handleHardDisconnect,
 } from "./lib/streaming.ts";
 import { setupPtzControls } from "./lib/ptz.ts";
 import type {
@@ -571,13 +572,27 @@ function setupResetAdapterButton(): void {
       if (!iface || !iface.name) return;
       const name = iface.name;
 
+      // Tear down the stream before pulling the rug out from under
+      // the adapter. Restart-NetAdapter would kill the TCP socket
+      // anyway, but doing it explicitly:
+      //   - captures resumeSnapshot so handleReconnect picks up the
+      //     stream cleanly after the adapter comes back
+      //   - avoids the pipeline holding a dead socket through the
+      //     restart window (which 0.3.7's stuck-Paused watchdog
+      //     would eventually catch, but starting clean is cheaper)
+      if (state.isStreaming && !state.streamLost) {
+        handleHardDisconnect("Resetting adapter");
+      }
+
       try {
         await api.refreshAdapter(name, "hard");
         showToast("Adapter reset");
-        // Give the driver a moment to come back, then re-enumerate.
-        // The event-driven watcher will also fire, but refreshing here
-        // makes the UI snap back faster on success.
-        await new Promise((r) => setTimeout(r, 1500));
+        // Restart-NetAdapter on USB Ethernet takes 2–4 s in practice.
+        // 1.5 s wasn't always long enough — refreshInterfaces could
+        // run before the adapter finished coming back up, which left
+        // the auto-resume relying entirely on the watcher's up event.
+        // 3 s puts us comfortably past the slow case.
+        await new Promise((r) => setTimeout(r, 3000));
         await refreshInterfaces();
         if (isInterfaceConnected() && state.activeInterface) {
           api.startArpDiscovery(state.activeInterface.name).catch(() => {});
