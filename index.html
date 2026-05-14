@@ -424,38 +424,48 @@
           <select id="static-iface"></select>
         </div>
 
-        <!-- Primary IP -->
-        <h3 class="ip-section-label">Primary IP</h3>
-        <div class="ip-row-fields">
-          <div class="input-field" style="flex:2">
-            <label for="static-ip">Address</label>
-            <input type="text" id="static-ip" placeholder="192.168.1.100" />
-          </div>
-          <div class="input-field" style="flex:1">
-            <label for="static-mask">Mask</label>
-            <input type="text" id="static-mask" value="255.255.255.0" />
-          </div>
-        </div>
-        <div class="input-field">
-          <label for="static-gateway">Gateway (optional)</label>
-          <input type="text" id="static-gateway" placeholder="192.168.1.1" />
+        <!-- Mode toggle (DHCP vs Static) -->
+        <h3 class="ip-section-label">Mode</h3>
+        <div class="ip-mode-toggle">
+          <label><input type="radio" name="ip-mode" id="ip-mode-dhcp" value="dhcp" /> DHCP</label>
+          <label><input type="radio" name="ip-mode" id="ip-mode-static" value="static" checked /> Static</label>
         </div>
 
-        <!-- Secondary IPs -->
-        <h3 class="ip-section-label">Secondary IPs</h3>
-        <div id="secondary-ip-list" class="secondary-ip-list"></div>
-        <div class="ip-row-fields ip-add-row">
-          <div class="input-field" style="flex:2">
-            <input type="text" id="add-sec-ip" placeholder="10.0.0.100" />
+        <!-- Static-only section (hidden when DHCP is selected) -->
+        <div id="ip-static-section">
+          <!-- Primary IP -->
+          <h3 class="ip-section-label">Primary IP</h3>
+          <div class="ip-row-fields">
+            <div class="input-field" style="flex:2">
+              <label for="static-ip">Address</label>
+              <input type="text" id="static-ip" placeholder="192.168.1.100" />
+            </div>
+            <div class="input-field" style="flex:1">
+              <label for="static-mask">Mask</label>
+              <input type="text" id="static-mask" value="255.255.255.0" />
+            </div>
           </div>
-          <div class="input-field" style="flex:1">
-            <input type="text" id="add-sec-mask" value="255.255.255.0" />
+          <div class="input-field">
+            <label for="static-gateway">Gateway (optional)</label>
+            <input type="text" id="static-gateway" placeholder="192.168.1.1" />
           </div>
-          <button id="btn-add-sec-ip" class="icon-btn small" title="Add secondary IP">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
-              <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/>
-            </svg>
-          </button>
+
+          <!-- Secondary IPs -->
+          <h3 class="ip-section-label">Secondary IPs</h3>
+          <div id="secondary-ip-list" class="secondary-ip-list"></div>
+          <div class="ip-row-fields ip-add-row">
+            <div class="input-field" style="flex:2">
+              <input type="text" id="add-sec-ip" placeholder="10.0.0.100" />
+            </div>
+            <div class="input-field" style="flex:1">
+              <input type="text" id="add-sec-mask" value="255.255.255.0" />
+            </div>
+            <button id="btn-add-sec-ip" class="icon-btn small" title="Add secondary IP">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/>
+              </svg>
+            </button>
+          </div>
         </div>
       </div>
       <div class="dialog-actions">

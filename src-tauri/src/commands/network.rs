@@ -65,6 +65,16 @@ pub async fn remove_secondary_ip(name: String, ip: String) -> Result<(), AppErro
 }
 
 #[tauri::command]
+pub async fn set_dhcp(name: String) -> Result<(), AppError> {
+    crate::network::ip_config::set_dhcp(&name).await
+}
+
+#[tauri::command]
+pub async fn get_dhcp_state(name: String) -> Result<bool, AppError> {
+    crate::network::ip_config::get_dhcp_state(&name).await
+}
+
+#[tauri::command]
 pub async fn refresh_adapter(name: String, mode: String) -> Result<(), AppError> {
     let mode = match mode.as_str() {
         "soft" => crate::network::adapter_refresh::RefreshMode::Soft,

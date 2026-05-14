@@ -212,6 +212,133 @@ pub async fn add_secondary_ip(interface: &str, ip: &str, mask: &str) -> Result<(
     Ok(())
 }
 
+/// Switch the interface to DHCP mode (clears static IPs, enables DHCP for
+/// IPv4 and DNS, renews the lease). Requires admin; same fast-path-then-
+/// elevate pattern as `adapter_refresh::hard_refresh_windows`.
+pub async fn set_dhcp(interface: &str) -> Result<(), AppError> {
+    validate_interface_name(interface)?;
+
+    #[cfg(target_os = "windows")]
+    {
+        set_dhcp_windows(interface).await
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err(AppError::Network(
+            "DHCP toggle is only implemented on Windows".into(),
+        ))
+    }
+}
+
+#[cfg(target_os = "windows")]
+async fn set_dhcp_windows(interface: &str) -> Result<(), AppError> {
+    use tokio::time::{timeout, Duration};
+
+    let escaped = interface.replace('\'', "''");
+
+    // Multi-step: drop existing manual IPv4 addresses (DHCP doesn't displace
+    // them on its own), flip the interface to DHCP, reset DNS to auto, then
+    // force an immediate lease renewal so the new state is visible right
+    // away. ErrorAction SilentlyContinue on the cleanup steps so an
+    // already-DHCP adapter with no manual IPs doesn't fail the whole script.
+    let inner_script = format!(
+        "$alias='{}'; \
+         Get-NetIPAddress -InterfaceAlias $alias -AddressFamily IPv4 -PrefixOrigin Manual -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue; \
+         Set-NetIPInterface -InterfaceAlias $alias -Dhcp Enabled; \
+         Set-DnsClientServerAddress -InterfaceAlias $alias -ResetServerAddresses; \
+         ipconfig /renew $alias | Out-Null",
+        escaped
+    );
+
+    // Fast path: try unelevated first.
+    let direct = super::async_cmd("powershell")
+        .args(["-NoProfile", "-Command", &inner_script])
+        .output();
+    if let Ok(Ok(out)) = timeout(Duration::from_secs(30), direct).await {
+        if out.status.success() {
+            log::info!("Switched '{}' to DHCP (unelevated)", interface);
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        log::info!(
+            "Unelevated DHCP set failed, attempting elevation: {}",
+            stderr.trim()
+        );
+    }
+
+    // Slow path: spawn an elevated PowerShell via Start-Process -Verb RunAs.
+    // Double every single-quote inside the inner script so the outer
+    // PowerShell parser passes the original script through unchanged.
+    let inner_for_arglist = inner_script.replace('\'', "''");
+    let elevated_cmd = format!(
+        "$ErrorActionPreference='Stop'; \
+         Start-Process powershell.exe -Verb RunAs -WindowStyle Hidden -Wait \
+         -ArgumentList '-NoProfile','-Command','{}'",
+        inner_for_arglist
+    );
+    let elevated = super::async_cmd("powershell")
+        .args(["-NoProfile", "-Command", &elevated_cmd])
+        .output();
+
+    let out = timeout(Duration::from_secs(60), elevated)
+        .await
+        .map_err(|_| AppError::Network("DHCP toggle timed out after 60s".into()))?
+        .map_err(|e| AppError::Network(format!("Failed to launch elevation: {}", e)))?;
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(AppError::Network(format!(
+            "DHCP toggle failed (UAC may have been declined): {}",
+            stderr.trim()
+        )));
+    }
+
+    log::info!("Switched '{}' to DHCP (elevated)", interface);
+    Ok(())
+}
+
+/// Read whether the interface is currently in DHCP mode for IPv4. No admin
+/// required. Called by the dialog at open time to position the mode toggle.
+pub async fn get_dhcp_state(interface: &str) -> Result<bool, AppError> {
+    validate_interface_name(interface)?;
+
+    #[cfg(target_os = "windows")]
+    {
+        let escaped = interface.replace('\'', "''");
+        let script = format!(
+            "(Get-NetIPInterface -InterfaceAlias '{}' -AddressFamily IPv4).Dhcp",
+            escaped
+        );
+        let output = super::async_cmd("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .output()
+            .await
+            .map_err(|e| AppError::Network(format!("Failed to read DHCP state: {}", e)))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(AppError::Network(format!(
+                "Get-NetIPInterface failed: {}",
+                stderr.trim()
+            )));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .to_lowercase();
+        Ok(stdout == "enabled")
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = interface;
+        Err(AppError::Network(
+            "DHCP state query is only implemented on Windows".into(),
+        ))
+    }
+}
+
 /// Remove a secondary IP address from an interface.
 pub async fn remove_secondary_ip(interface: &str, ip: &str) -> Result<(), AppError> {
     validate_interface_name(interface)?;

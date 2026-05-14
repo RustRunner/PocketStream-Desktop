@@ -470,13 +470,22 @@ export function setupIpConfigDialog(): void {
         })
         .join("");
       populateDialogFields();
+      await syncModeFromInterface();
     } catch (_) {
       select.innerHTML = '<option value="">Failed to load</option>';
     }
   });
 
   // Re-populate when interface selection changes
-  $<HTMLSelectElement>("#static-iface").addEventListener("change", populateDialogFields);
+  $<HTMLSelectElement>("#static-iface").addEventListener("change", () => {
+    populateDialogFields();
+    void syncModeFromInterface();
+  });
+
+  // Mode toggle: hide/show the static-only fields. Applying happens via
+  // the existing Apply button — see branch below.
+  $<HTMLInputElement>("#ip-mode-dhcp").addEventListener("change", updateModeVisibility);
+  $<HTMLInputElement>("#ip-mode-static").addEventListener("change", updateModeVisibility);
 
   // ── Add secondary IP ─────────────────────────────────────────────
   $<HTMLButtonElement>("#btn-add-sec-ip").addEventListener("click", async () => {
@@ -503,19 +512,38 @@ export function setupIpConfigDialog(): void {
   // ── Cancel ───────────────────────────────────────────────────────
   $<HTMLButtonElement>("#ip-config-cancel").addEventListener("click", () => dialog.close());
 
-  // ── Apply (primary IP only) ──────────────────────────────────────
+  // ── Apply (DHCP or primary IP, branched by mode) ─────────────────
   $<HTMLButtonElement>("#ip-config-apply").addEventListener("click", async () => {
     const iface = $<HTMLSelectElement>("#static-iface").value;
-    const ip = $<HTMLInputElement>("#static-ip").value.trim();
-    const mask = $<HTMLInputElement>("#static-mask").value.trim();
-    const gw = $<HTMLInputElement>("#static-gateway").value.trim() || null;
-
-    if (!iface || !ip || !mask) {
-      showToast("Fill in address and mask", true);
+    if (!iface) {
+      showToast("Select an interface", true);
       return;
     }
 
     const spinner = $<HTMLElement>("#ip-config-spinner");
+    const dhcpMode = $<HTMLInputElement>("#ip-mode-dhcp").checked;
+
+    if (dhcpMode) {
+      spinner.style.display = "";
+      try {
+        await api.setDhcp(iface);
+        showToast("Switched to DHCP");
+        dialog.close();
+        await refreshInterfaces();
+      } catch (e) {
+        showToast("Failed: " + formatError(e), true);
+      }
+      spinner.style.display = "none";
+      return;
+    }
+
+    const ip = $<HTMLInputElement>("#static-ip").value.trim();
+    const mask = $<HTMLInputElement>("#static-mask").value.trim();
+    const gw = $<HTMLInputElement>("#static-gateway").value.trim() || null;
+    if (!ip || !mask) {
+      showToast("Fill in address and mask", true);
+      return;
+    }
     spinner.style.display = "";
     try {
       await api.setStaticIp(iface, ip, mask, gw);
@@ -527,6 +555,28 @@ export function setupIpConfigDialog(): void {
     }
     spinner.style.display = "none";
   });
+}
+
+/** Hide or show the static-only fields based on which radio is selected. */
+function updateModeVisibility(): void {
+  const isStatic = $<HTMLInputElement>("#ip-mode-static").checked;
+  $<HTMLElement>("#ip-static-section").style.display = isStatic ? "" : "none";
+}
+
+/** Read the current DHCP state for the selected interface and set the
+ *  radio accordingly. Errors are non-fatal — the radio falls back to its
+ *  prior position (defaulting to Static for fresh opens). */
+async function syncModeFromInterface(): Promise<void> {
+  const name = $<HTMLSelectElement>("#static-iface").value;
+  if (!name) return;
+  try {
+    const isDhcp = await api.getDhcpState(name);
+    $<HTMLInputElement>("#ip-mode-dhcp").checked = isDhcp;
+    $<HTMLInputElement>("#ip-mode-static").checked = !isDhcp;
+  } catch (_) {
+    // Leave the radio at its current position on error.
+  }
+  updateModeVisibility();
 }
 
 /** Fill primary IP fields and secondary IP list from the selected interface. */

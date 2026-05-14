@@ -470,6 +470,8 @@ pub fn run() {
             commands::set_static_ip,
             commands::add_secondary_ip,
             commands::remove_secondary_ip,
+            commands::set_dhcp,
+            commands::get_dhcp_state,
             commands::refresh_adapter,
             commands::get_interface_info,
             // ARP Discovery

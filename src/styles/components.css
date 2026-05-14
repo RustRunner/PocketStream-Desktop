@@ -799,6 +799,24 @@
   align-items: flex-end;
 }
 
+.ip-mode-toggle {
+  display: flex;
+  gap: 24px;
+  padding: 4px 0 8px;
+}
+
+.ip-mode-toggle label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.ip-mode-toggle input[type="radio"] {
+  cursor: pointer;
+}
+
 .ip-add-row {
   margin-top: 8px;
 }
@@ -1030,7 +1048,8 @@
 }
 
 /* Cached devices ("Clear Offline Devices") dialog */
-.cache-dialog {
+.cache-dialog,
+#reset-adapter-dialog {
   min-width: 420px;
   max-width: 520px;
 }

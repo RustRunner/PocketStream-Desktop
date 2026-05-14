@@ -110,6 +110,19 @@ export async function removeSecondaryIp(name: string, ip: string): Promise<void>
 }
 
 /**
+ * Switch the interface to DHCP. Clears static IPs, enables DHCP for IPv4
+ * and DNS, and renews the lease. May trigger a UAC prompt.
+ */
+export async function setDhcp(name: string): Promise<void> {
+  return await invoke("set_dhcp", { name });
+}
+
+/** Returns true if the interface is currently in DHCP mode for IPv4. */
+export async function getDhcpState(name: string): Promise<boolean> {
+  return await invoke<boolean>("get_dhcp_state", { name });
+}
+
+/**
  * Reset an adapter to force Windows to re-probe the driver state.
  * `soft` uses ipconfig /release /renew (no admin); `hard` uses
  * Restart-NetAdapter (triggers UAC if not already elevated).

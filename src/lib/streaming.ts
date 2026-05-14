@@ -411,6 +411,14 @@ let notPlayingStreak = 0;
 const STALL_RETRY_SCHEDULE_MS = [0, 60_000, 60_000];
 let stallRetryIndex = 0;
 let stallRetryTimer: ReturnType<typeof setTimeout> | null = null;
+// Was the RTSP server running at the moment showStreamLost fired? Stall
+// recovery uses this to bring the server back after the playback
+// pipeline recovers. Without this, an ASIX-style link flap that fails
+// to trip the watcher's hardDisconnect path (link stays "Up", IPs intact)
+// would leave the re-stream dead even after local playback returned.
+// Cleared by hideStreamLost on recovery and by manual stop (which calls
+// hideStreamLost via the toggle handler).
+let wasRtspRunningBeforeLost = false;
 
 function isStallError(msg: string | null | undefined): boolean {
   return !!msg && msg.toLowerCase().includes("stalled");
@@ -566,6 +574,7 @@ function showStreamLost(errorMsg: string | null | undefined): void {
   // Reset stream and RTSP server
   api.stopStream().catch(() => {});
   if (state.isRtspRunning) {
+    wasRtspRunningBeforeLost = true;
     api.stopRtspServer().catch(() => {});
     state.isRtspRunning = false;
     updateRtspUI(null);
@@ -603,6 +612,7 @@ function hideStreamLost(): void {
   // restarts and the previous run had retries pending, those should
   // not carry over.
   stallRetryIndex = 0;
+  wasRtspRunningBeforeLost = false;
   if (stallRetryTimer) {
     clearTimeout(stallRetryTimer);
     stallRetryTimer = null;
@@ -661,6 +671,21 @@ async function attemptStallRecovery(): Promise<void> {
     );
     await api.startStream(handle);
     log("Stall recovery: stream restart submitted");
+    // Bring the RTSP server back if it was running at the moment of
+    // loss. The hardDisconnect path has its own resumeSnapshot for
+    // this; stall recovery has to do it here because showStreamLost
+    // tore the server down. Failure isn't fatal — playback is alive.
+    if (wasRtspRunningBeforeLost) {
+      try {
+        const info = await api.startRtspServer();
+        state.isRtspRunning = true;
+        rtspFullUrl = info.rtsp_url;
+        updateRtspUI(info.display_url);
+        log("Stall recovery: RTSP server restarted");
+      } catch (e) {
+        log(`Stall recovery: RTSP server restart failed: ${formatError(e)}`);
+      }
+    }
     // startStream returns when set_state(Playing) was REQUESTED, not
     // when the pipeline actually reaches Playing. Set a watchdog that
     // schedules another retry if the new pipeline doesn't recover
