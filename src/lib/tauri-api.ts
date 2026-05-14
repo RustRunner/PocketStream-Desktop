@@ -123,6 +123,17 @@ export async function getDhcpState(name: string): Promise<boolean> {
 }
 
 /**
+ * Look up the MAC currently bound to `ip` from the live ARP cache.
+ * Returns null if the IP doesn't respond. Used by the cache verify
+ * path to confirm the responder at a cached IP is the same physical
+ * device (matching MAC), not an unrelated host that happens to share
+ * the address today.
+ */
+export async function resolveMac(ip: string): Promise<string | null> {
+  return await invoke<string | null>("resolve_mac", { ip });
+}
+
+/**
  * Reset an adapter to force Windows to re-probe the driver state.
  * `soft` uses ipconfig /release /renew (no admin); `hard` uses
  * Restart-NetAdapter (triggers UAC if not already elevated).

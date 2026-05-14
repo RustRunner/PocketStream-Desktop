@@ -3,7 +3,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use tokio::sync::Mutex;
 
 use crate::error::AppError;
@@ -178,8 +178,23 @@ pub fn start_listener(
                             // because the auto-adopt loop iterates over it;
                             // can be retired once auto-adopt switches to
                             // the registry too.
-                            if registry.merge_arp(&device) {
+                            let result = registry.merge_arp(&device);
+                            if result.changed {
                                 emitter.poke();
+                            }
+                            if !result.dropped_macs.is_empty() {
+                                let cfg: tauri::State<'_, crate::config::AppConfig> =
+                                    app_handle.state();
+                                for dropped in &result.dropped_macs {
+                                    if let Err(e) = cfg.remove_cached_device(dropped) {
+                                        log::warn!(
+                                            "Failed to evict dupe cache row {} (same IP as {}): {}",
+                                            dropped,
+                                            device.mac,
+                                            e
+                                        );
+                                    }
+                                }
                             }
 
                             if is_new {
@@ -282,6 +297,48 @@ fn parse_arp_table(output: &str) -> Vec<(Ipv4Addr, String)> {
         }
     }
     entries
+}
+
+/// Resolve the MAC address currently bound to `target_ip` from the
+/// Windows ARP cache. Pings the target first so the cache entry is fresh
+/// (a stale entry could otherwise return the MAC of a *previous* device
+/// at this IP, defeating the purpose of identity verification). Returns
+/// None if the IP doesn't respond or no ARP entry exists.
+///
+/// Used by the cache-verify path: a successful port scan only proves
+/// *something* answers at the IP — to claim a cached record is "still
+/// live" we additionally need the MAC to match. Otherwise an unrelated
+/// device that happens to have the same IP today will resurrect a stale
+/// record as a false-positive Live.
+pub async fn resolve_mac_for_ip(
+    target_ip: Ipv4Addr,
+    timeout: std::time::Duration,
+) -> Result<Option<String>, AppError> {
+    let timeout_ms = timeout.as_millis().to_string();
+    let _ = super::async_cmd("ping")
+        .args(["-n", "1", "-w", &timeout_ms, &target_ip.to_string()])
+        .output()
+        .await;
+
+    let output = super::async_cmd("arp")
+        .args(["-a"])
+        .output()
+        .await
+        .map_err(|e| AppError::Network(format!("arp failed: {}", e)))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let target_str = target_ip.to_string();
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 3 && parts[0] == target_str && parts[2].eq_ignore_ascii_case("dynamic") {
+            // Normalize MAC: arp -a uses aa-bb-cc-dd-ee-ff; rest of codebase uses colons.
+            let mac = parts[1].replace('-', ":").to_lowercase();
+            if mac != "ff:ff:ff:ff:ff:ff" && mac != "00:00:00:00:00:00" {
+                return Ok(Some(mac));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Check if `target_ip` is in use by pinging and checking ARP table.

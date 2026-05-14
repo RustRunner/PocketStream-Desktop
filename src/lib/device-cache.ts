@@ -1,9 +1,9 @@
 /**
- * "Clear Offline Devices" management dialog.
+ * "Clear Cached Devices" management dialog.
  *
  * The persistent device cache itself lives entirely on the backend
  * (device_cache.toml + DeviceRegistry); this module only owns the UI
- * for letting the user prune offline / unreachable cached entries.
+ * for letting the user prune any cached entry it chooses.
  * Triggered by clicking the "Nodes" card title.
  */
 
@@ -19,30 +19,44 @@ interface CacheEntry {
   ip: string;
   subnet: string;
   alias: string;
-  reason: "offline" | "no route";
+  reason: string;
 }
 
-/** Open the dialog that lists offline / stale cached devices and lets
- *  the user forget them individually or all at once. */
+/** Open the dialog that lists every cached device and lets the user
+ *  forget them individually or all at once. */
 async function openCacheDialog(): Promise<void> {
   const dialog = $<HTMLDialogElement>("#cache-dialog");
   if (!dialog) return;
 
-  // Build the candidate list: anything in the registry that is NOT
-  // currently confirmed working — i.e. visibly offline, or hidden
-  // because its subnet isn't routable right now (cache-only on
-  // unroutable subnet).
+  // Show every record in the registry — live, verifying, offline, and
+  // unroutable cached_only — so the user can prune stale entries that
+  // accumulated from prior networks (e.g. an old CAM IP that responds
+  // to port scans but isn't actually the cached device).
   const entries: CacheEntry[] = [];
   for (const r of deviceList.getDevices()) {
-    const isOffline = r.status === "offline";
-    const isStaleHidden = r.status === "cached_only" && !hasRouteToSubnet(r.subnet);
-    if (!isOffline && !isStaleHidden) continue;
+    let reason: string;
+    switch (r.status) {
+      case "offline":
+        reason = "offline";
+        break;
+      case "cached_only":
+        reason = hasRouteToSubnet(r.subnet) ? "cached" : "no route";
+        break;
+      case "verifying":
+        reason = "verifying";
+        break;
+      case "live":
+        reason = "live";
+        break;
+      default:
+        reason = r.status;
+    }
     entries.push({
       mac: r.mac,
       ip: r.ip,
       subnet: r.subnet,
       alias: r.alias || "",
-      reason: isOffline ? "offline" : "no route",
+      reason,
     });
   }
   entries.sort((a, b) => {
@@ -110,15 +124,10 @@ async function forgetCachedDevice(mac: string | undefined): Promise<void> {
   }
 }
 
-/** Drop every offline + stale-hidden cached device. Walks the same
- *  candidate set the dialog displays so what's listed is what's cleared. */
-async function clearAllOfflineCached(): Promise<void> {
-  const macs: string[] = [];
-  for (const r of deviceList.getDevices()) {
-    const isOffline = r.status === "offline";
-    const isStaleHidden = r.status === "cached_only" && !hasRouteToSubnet(r.subnet);
-    if (isOffline || isStaleHidden) macs.push(r.mac);
-  }
+/** Drop every cached device. Walks the same candidate set the dialog
+ *  displays so what's listed is what's cleared. */
+async function clearAllCached(): Promise<void> {
+  const macs = deviceList.getDevices().map((r) => r.mac);
   for (const mac of macs) {
     await forgetCachedDevice(mac);
   }
@@ -135,7 +144,7 @@ export function setupCacheDialog(): void {
 
   $<HTMLButtonElement>("#cache-close").addEventListener("click", () => dialog.close());
   $<HTMLButtonElement>("#cache-clear-all").addEventListener("click", async () => {
-    await clearAllOfflineCached();
+    await clearAllCached();
     openCacheDialog(); // refresh the now-empty list
   });
 }

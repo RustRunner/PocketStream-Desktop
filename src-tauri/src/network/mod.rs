@@ -86,9 +86,23 @@ impl NetworkManager {
     pub fn hydrate_device_registry(&self, config: &crate::config::AppConfig) {
         let cached = config.get_cache();
         let count = cached.len();
-        if self.device_registry.hydrate_from_cache(&cached) {
-            log::info!("DeviceRegistry: hydrated {} cached device(s)", count);
+        let result = self.device_registry.hydrate_from_cache(&cached);
+        if !result.changed {
+            return;
         }
+        // Mirror same-IP dedup decisions onto the on-disk cache so the
+        // orphans don't reappear on next startup. Cache file mutations
+        // are best-effort: a failure logs but doesn't block boot.
+        for mac in &result.dropped_macs {
+            if let Err(e) = config.remove_cached_device(mac) {
+                log::warn!("Failed to evict dupe cache row {}: {}", mac, e);
+            }
+        }
+        log::info!(
+            "DeviceRegistry: hydrated {} cached device(s) (dropped {} dupe(s))",
+            count - result.dropped_macs.len(),
+            result.dropped_macs.len()
+        );
     }
 
     /// Borrow the device registry. Used by IPC handlers that need to
@@ -561,6 +575,18 @@ impl NetworkManager {
             .collect()
     }
 
+    /// Forget that `ip` was auto-adopted. Used when the user manually
+    /// claims an IP via Apply / Add Secondary — once they've taken
+    /// ownership, the registry shouldn't keep tagging it as ours,
+    /// otherwise the "(auto)" badge stays on a user-set IP forever.
+    /// Returns true if any entry was removed.
+    pub async fn untrack_adopted_ip(&self, ip: &str) -> bool {
+        let mut map = self.adopted_ips.lock().await;
+        let before = map.len();
+        map.retain(|_, v| v.to_string() != ip);
+        before != map.len()
+    }
+
     pub async fn remove_adopted_subnet(&self, subnet: &str) -> Result<(), AppError> {
         let iface_name = self
             .interface_name
@@ -764,7 +790,7 @@ async fn merge_arp_table(
     app_handle: tauri::AppHandle,
     interface_ip: &str,
 ) {
-    use tauri::Emitter;
+    use tauri::{Emitter, Manager};
 
     let entries = arp::read_system_arp_table(interface_ip).await;
     let mut added = 0u32;
@@ -789,8 +815,24 @@ async fn merge_arp_table(
 
         log::info!("ARP table: {} ({})", device.ip, device.mac);
         let _ = app_handle.emit("arp-device-discovered", &device);
-        if registry.merge_arp(&device) {
+        let result = registry.merge_arp(&device);
+        if result.changed {
             registry_changed = true;
+        }
+        // Mirror same-IP dedup to the on-disk cache so reloads don't
+        // resurrect the orphan rows.
+        if !result.dropped_macs.is_empty() {
+            let config: tauri::State<'_, crate::config::AppConfig> = app_handle.state();
+            for dropped in &result.dropped_macs {
+                if let Err(e) = config.remove_cached_device(dropped) {
+                    log::warn!(
+                        "Failed to evict dupe cache row {} (same IP as {}): {}",
+                        dropped,
+                        device.mac,
+                        e
+                    );
+                }
+            }
         }
         map.insert(mac, device);
         added += 1;

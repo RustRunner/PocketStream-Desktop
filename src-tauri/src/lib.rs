@@ -472,6 +472,7 @@ pub fn run() {
             commands::remove_secondary_ip,
             commands::set_dhcp,
             commands::get_dhcp_state,
+            commands::resolve_mac,
             commands::refresh_adapter,
             commands::get_interface_info,
             // ARP Discovery

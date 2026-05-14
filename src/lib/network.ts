@@ -616,9 +616,14 @@ function renderSecondaryIps(
     return;
   }
 
+  // Only the specific IPs we auto-adopted carry the "(auto)" badge.
+  // adoptedSubnets is keyed by subnet → IP we added on that subnet; a
+  // user-set static IP on the same /24 is a different value and must
+  // not get tagged "auto" just because the subnet is in the map.
+  const adoptedIpSet = new Set(adoptedSubnets.values());
   list.innerHTML = secondaries
     .map((ip) => {
-      const isAuto = adoptedSubnets.has(ip.subnet);
+      const isAuto = adoptedIpSet.has(ip.address);
       const badge = isAuto ? '<span class="badge-auto">(auto)</span>' : "";
       return `<div class="secondary-ip-item">
         <span>${ip.address}/${ip.prefix} ${badge}</span>

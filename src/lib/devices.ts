@@ -332,10 +332,22 @@ async function fastVerifyCachedDevice(
     if (results) {
       for (const r of results) {
         if (r.ip === ip && r.reachable && r.open_ports.length > 0) {
-          // Backend's report_scan_result auto-flips the record to
-          // "live" + persists to cache + emits a new snapshot.
-          await api.reportScanResult(r.ip, r.open_ports);
-          verified = true;
+          // Identity check: a successful port scan only proves *some
+          // host* answers at this IP. To claim our cached record is
+          // still live, the responder's MAC must also match — otherwise
+          // a different device that happens to occupy this IP today
+          // would resurrect the record as a false-positive Live.
+          const liveMac = await api.resolveMac(ip);
+          if (liveMac && liveMac.toLowerCase() === mac.toLowerCase()) {
+            // Backend's report_scan_result auto-flips the record to
+            // "live" + persists to cache + emits a new snapshot.
+            await api.reportScanResult(r.ip, r.open_ports);
+            verified = true;
+          } else {
+            log(
+              `Cache verify: identity mismatch at ${ip} — expected ${mac}, found ${liveMac ?? "no ARP"}`
+            );
+          }
         }
       }
     }

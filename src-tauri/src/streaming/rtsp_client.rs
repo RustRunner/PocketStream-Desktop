@@ -22,9 +22,11 @@ use crate::error::AppError;
 /// TCP socket the OS still reports as Established but is no longer
 /// carrying data — Windows' default 2-hour TCP keepalive means the OS
 /// won't surface this in any usable timeframe, so the user sees a
-/// frozen last frame and no error. 8s tolerates bursty delivery
-/// without making real freezes feel sluggish.
-const STALL_THRESHOLD: Duration = Duration::from_secs(8);
+/// frozen last frame and no error. 3s is well above the per-frame
+/// gap on any normal RTSP stream (~30-66ms at 15-30fps) but tight
+/// enough that an ASIX-style link flap surfaces as Stream Lost in
+/// ~5s end-to-end instead of ~10s.
+const STALL_THRESHOLD: Duration = Duration::from_secs(3);
 
 /// How long the pipeline can sit at `current=Paused, pending=Playing`
 /// before `health_check` declares the stream stalled. Catches the

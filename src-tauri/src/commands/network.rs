@@ -42,21 +42,37 @@ pub async fn get_interface_info(
 
 #[tauri::command]
 pub async fn set_static_ip(
+    manager: State<'_, NetworkManager>,
+    config: State<'_, AppConfig>,
     name: String,
     ip: String,
     subnet_mask: String,
     gateway: Option<String>,
 ) -> Result<(), AppError> {
-    crate::network::ip_config::assign_static_ip(&name, &ip, &subnet_mask, gateway.as_deref()).await
+    crate::network::ip_config::assign_static_ip(&name, &ip, &subnet_mask, gateway.as_deref())
+        .await?;
+    // Manual ownership trumps auto-adopt: drop any registry entry for
+    // this IP so the "(auto)" badge stops shadowing a user-set IP, and
+    // persist the prune so the state survives a restart.
+    if manager.untrack_adopted_ip(&ip).await {
+        manager.save_adopted_to_config(&config).await;
+    }
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn add_secondary_ip(
+    manager: State<'_, NetworkManager>,
+    config: State<'_, AppConfig>,
     name: String,
     ip: String,
     subnet_mask: String,
 ) -> Result<(), AppError> {
-    crate::network::ip_config::add_secondary_ip(&name, &ip, &subnet_mask).await
+    crate::network::ip_config::add_secondary_ip(&name, &ip, &subnet_mask).await?;
+    if manager.untrack_adopted_ip(&ip).await {
+        manager.save_adopted_to_config(&config).await;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -72,6 +88,18 @@ pub async fn set_dhcp(name: String) -> Result<(), AppError> {
 #[tauri::command]
 pub async fn get_dhcp_state(name: String) -> Result<bool, AppError> {
     crate::network::ip_config::get_dhcp_state(&name).await
+}
+
+/// Look up the MAC at `ip` from the live ARP cache. Used by the
+/// cache-verify path to confirm a cached record at an IP is still the
+/// same physical device, not just *something else* with the same
+/// address today. Returns null if the IP doesn't respond.
+#[tauri::command]
+pub async fn resolve_mac(ip: String) -> Result<Option<String>, AppError> {
+    let parsed: std::net::Ipv4Addr = ip
+        .parse()
+        .map_err(|_| AppError::Network(format!("Invalid IP: {}", ip)))?;
+    crate::network::arp::resolve_mac_for_ip(parsed, std::time::Duration::from_secs(1)).await
 }
 
 #[tauri::command]
