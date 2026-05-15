@@ -17,6 +17,20 @@ import * as deviceList from "./device-list.ts";
 // imports as runtime imports. Touching the binding here keeps imports tidy.
 void $$;
 
+// ── Host adapter mode (DHCP vs Static) ──────────────────────────────
+// Tracked alongside the active interface so the Hosts panel can surface
+// the mode badge and the auto-adopt block (backend) has a matching
+// frontend cue. null = unknown / not yet probed.
+let hostModeIsDhcp: boolean | null = null;
+
+async function refreshHostMode(name: string): Promise<void> {
+  try {
+    hostModeIsDhcp = await api.getDhcpState(name);
+  } catch (_) {
+    hostModeIsDhcp = null;
+  }
+}
+
 // ── Interface discovery ─────────────────────────────────────────────
 
 export async function refreshInterfaces(): Promise<void> {
@@ -33,6 +47,7 @@ export async function refreshInterfaces(): Promise<void> {
     if (eth) {
       state.activeInterface = eth;
       $("#iface-name").textContent = eth.display_name || eth.name;
+      await refreshHostMode(eth.name);
       renderSubnetList();
       // Don't wipe the CAM/PTU dropdown here — refreshInterfaces is
       // called from the manual refresh button and during reconnect
@@ -255,8 +270,41 @@ function applyUpEvent(iface: InterfaceInfo, wasDown: boolean): void {
 
 // ── Subnet list rendering ───────────────────────────────────────────
 
+/** Drive the existing `#ip-mode` span in the Host card. Two states:
+ *   - Static → "Static — auto-adopt ready" (green)
+ *   - DHCP   → "DHCP — set static to enable auto-adopt" (amber,
+ *              clickable, opens IP Config)
+ *  Backend's auto-adopt loop has nuance the badge intentionally hides
+ *  (it still rescue-adopts when DHCP fails to APIPA), since the action
+ *  the user needs to take is the same either way: go Static. */
+export function renderModeBadge(): void {
+  const modeEl = $("#ip-mode");
+  if (!state.activeInterface || hostModeIsDhcp === null) {
+    modeEl.textContent = "--";
+    modeEl.className = "status-value";
+    return;
+  }
+
+  if (!hostModeIsDhcp) {
+    modeEl.textContent = "Static — auto-adopt ready";
+    modeEl.className = "status-value mode-static";
+    return;
+  }
+
+  modeEl.innerHTML =
+    `<button type="button" id="mode-cta-static" class="mode-cta-inline" title="Open IP Config to set a static IP">` +
+    `DHCP — set static to enable auto-adopt` +
+    `</button>`;
+  modeEl.className = "status-value mode-dhcp";
+  const btn = modeEl.querySelector<HTMLButtonElement>("#mode-cta-static");
+  btn?.addEventListener("click", () => {
+    $<HTMLButtonElement>("#btn-ip-config").click();
+  });
+}
+
 export function renderSubnetList(): void {
   const subnetList = $("#subnet-list");
+  renderModeBadge();
   if (!state.activeInterface) return;
 
   const adoptedIpSet = new Set(adoptedSubnets.values());
@@ -585,16 +633,16 @@ function populateDialogFields(): void {
   const iface = dialogInterfaces.find((i) => i.name === name);
   if (!iface) return;
 
-  // Find the first non-auto-adopted, non-APIPA IP as primary. Without
-  // the APIPA filter, an adapter with a stale 169.254.* secondary IP
-  // ahead of the real DHCP IP would surface APIPA as the "primary" in
-  // the dialog — and the user could overwrite their real config by
-  // hitting Apply.
+  // Find the first non-auto-adopted, non-APIPA IP as primary. APIPA is
+  // never used as a fallback — when the adapter has only APIPA (DHCP
+  // failed to acquire a real lease) the field is left empty so the user
+  // types fresh against the `192.168.1.100` placeholder. Seeding the
+  // APIPA value would invite a partial-edit collision that yields a
+  // hybrid like `169.168.1.100` and writes it as a static primary.
   const adoptedIps = new Set(adoptedSubnets.values());
   const primary =
     iface.ips.find((ip) => !adoptedIps.has(ip.address) && !isApipa(ip.address)) ||
-    iface.ips.find((ip) => !adoptedIps.has(ip.address)) ||
-    iface.ips[0];
+    iface.ips.find((ip) => !isApipa(ip.address));
   $<HTMLInputElement>("#static-ip").value = primary ? primary.address : "";
   $<HTMLInputElement>("#static-mask").value = primary ? prefixToMask(primary.prefix) : "255.255.255.0";
   $<HTMLInputElement>("#static-gateway").value = "";

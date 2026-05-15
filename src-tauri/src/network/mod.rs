@@ -417,11 +417,57 @@ impl NetworkManager {
                 }
             }
 
+            // DHCP-state cache: re-reading via PowerShell on every iteration
+            // would spam Get-NetIPInterface every 2s. Cache for 5s — short
+            // enough that a user toggling Static via the dialog sees adoption
+            // resume promptly.
+            let mut cached_dhcp_state: Option<(bool, std::time::Instant)> = None;
+            const DHCP_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
                 if !*auto_adopt.lock().await {
                     continue;
+                }
+
+                // Gate the adoption pass on host mode: while the adapter
+                // is DHCP and *has a real lease*, any secondary we add is
+                // at the mercy of the next renew/release cycle, so pause
+                // until the user transitions to Static. BUT when DHCP has
+                // failed to a 169.254/16 APIPA-only state, auto-adopt is
+                // the user's only path to connectivity — keep it running
+                // as a rescue. Read failures fail-open (treat as Static)
+                // so a broken cmdlet doesn't permanently silence adoption.
+                let needs_refresh = cached_dhcp_state
+                    .map(|(_, t)| t.elapsed() > DHCP_CACHE_TTL)
+                    .unwrap_or(true);
+                let is_dhcp = if needs_refresh {
+                    match ip_config::get_dhcp_state(&iface_name).await {
+                        Ok(d) => {
+                            cached_dhcp_state = Some((d, std::time::Instant::now()));
+                            d
+                        }
+                        Err(e) => {
+                            log::debug!(
+                                "DHCP-state probe failed for {} ({}), allowing adoption",
+                                iface_name,
+                                e
+                            );
+                            false
+                        }
+                    }
+                } else {
+                    cached_dhcp_state.map(|(d, _)| d).unwrap_or(false)
+                };
+
+                if is_dhcp {
+                    let current_ips = get_interface_ips(&iface_name);
+                    let has_real_lease = current_ips.iter().any(|ip| !ip.is_link_local());
+                    if has_real_lease {
+                        continue;
+                    }
+                    // APIPA-only DHCP: fall through and adopt as rescue.
                 }
 
                 let device_list: Vec<ArpDevice> = {

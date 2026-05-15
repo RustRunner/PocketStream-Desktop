@@ -1212,6 +1212,29 @@
   100% { background-color: transparent; }
 }
 
+/* ── Host mode badge (Static vs DHCP) ─────────────────────────────── */
+
+#ip-mode.mode-static {
+  color: var(--md-primary-light);
+  font-weight: 600;
+}
+
+.mode-cta-inline {
+  background: rgba(255, 176, 32, 0.16);
+  color: #ffb020;
+  border: 1px solid rgba(255, 176, 32, 0.45);
+  font: inherit;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background-color var(--md-transition);
+}
+
+.mode-cta-inline:hover {
+  background: rgba(255, 176, 32, 0.28);
+}
+
 .auto-ip-group {
   margin-left: auto;
   display: flex;
