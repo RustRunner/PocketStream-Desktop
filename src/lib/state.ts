@@ -3,8 +3,7 @@
  */
 
 import type { AppSettings, InterfaceInfo } from "./types.ts";
-
-const invoke = window.__TAURI__?.core?.invoke;
+import { logToFile } from "./tauri-api.ts";
 
 // ── Shared mutable state ────────────────────────────────────────────
 
@@ -72,12 +71,7 @@ export function log(msg: string): void {
   // suppression, stall recovery attempts, click-ignored notices)
   // only land in DevTools and are invisible when a user sends in
   // pocketstream.log to investigate a drop.
-  if (invoke) {
-    invoke("log_frontend", {
-      level: "info",
-      message: msg,
-    }).catch(() => {});
-  }
+  logToFile("info", msg);
 }
 
 /** Escape HTML special characters to prevent injection via innerHTML. */
@@ -92,12 +86,7 @@ export function escapeHtml(str: unknown): string {
 
 export function showToast(message: string, isError = false): void {
   // Write toast messages to the log file for diagnostics
-  if (invoke) {
-    invoke("log_frontend", {
-      level: isError ? "error" : "info",
-      message: `toast: ${message}`,
-    }).catch(() => {});
-  }
+  logToFile(isError ? "error" : "info", `toast: ${message}`);
 
   const existing = document.querySelector(".toast");
   if (existing) existing.remove();
