@@ -45,6 +45,43 @@ pub struct Credentials {
     pub password: String,
 }
 
+/// User's chosen network mode. Drives which discovery subsystems run.
+///
+/// - `Dhcp`: adapter on DHCP. ARP listener + auto-adopt loop run, but
+///   auto-adopt is gated to APIPA-rescue (when DHCP failed and only
+///   169.254/16 is on the adapter); otherwise paused.
+/// - `StaticAuto`: adapter on a user-set static IP. ARP listener,
+///   auto-adopt loop, and port scanner all run.
+/// - `StaticManual`: adapter on a user-set static IP. None of the
+///   discovery subsystems run; the Nodes panel reflects only the
+///   explicitly-added `manual_nodes` list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkMode {
+    Dhcp,
+    StaticAuto,
+    StaticManual,
+}
+
+impl Default for NetworkMode {
+    fn default() -> Self {
+        // Existing installs (config.toml predates this field) keep the
+        // historic behavior — ARP discovery + auto-adopt. Fresh installs
+        // hit this default too; the IP Config dialog is how users move to
+        // DHCP or Static-Manual.
+        NetworkMode::StaticAuto
+    }
+}
+
+/// A user-pinned device for `NetworkMode::StaticManual`. Survives mode
+/// toggles so users can flip Auto → Manual → Auto without losing pins.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManualNode {
+    pub ip: String,
+    #[serde(default)]
+    pub alias: String,
+}
+
 /// Cached metadata for a previously-discovered device.
 ///
 /// Persisted across sessions so the nodes panel can render immediately
@@ -78,6 +115,15 @@ pub struct AppSettings {
     /// rather than raw integer so different max ranges remain portable.
     #[serde(default)]
     pub zoom_positions: HashMap<String, i32>,
+    /// User's chosen network mode. See `NetworkMode` doc-comment.
+    #[serde(default)]
+    pub network_mode: NetworkMode,
+    /// User-pinned nodes for `NetworkMode::StaticManual`. Persisted
+    /// across mode toggles; the typical workflow is to use `StaticAuto`
+    /// to discover IPs, then switch to `StaticManual` for steady-state
+    /// operation against the discovered set.
+    #[serde(default)]
+    pub manual_nodes: Vec<ManualNode>,
 }
 
 impl Default for AppSettings {
@@ -102,6 +148,8 @@ impl Default for AppSettings {
             },
             adopted_subnets: HashMap::new(),
             zoom_positions: HashMap::new(),
+            network_mode: NetworkMode::default(),
+            manual_nodes: Vec::new(),
         }
     }
 }
@@ -256,6 +304,94 @@ impl AppConfig {
             Err(poisoned) => {
                 log::error!("Config mutex poisoned during update_credentials, recovering");
                 poisoned.into_inner().credentials = credentials;
+            }
+        }
+        self.save()
+    }
+
+    /// Read the current network mode.
+    pub fn get_network_mode(&self) -> NetworkMode {
+        match self.settings.lock() {
+            Ok(guard) => guard.network_mode,
+            Err(poisoned) => {
+                log::error!("Config mutex poisoned during get_network_mode, recovering");
+                poisoned.into_inner().network_mode
+            }
+        }
+    }
+
+    /// Replace the network mode and persist.
+    pub fn set_network_mode(&self, mode: NetworkMode) -> Result<(), crate::AppError> {
+        match self.settings.lock() {
+            Ok(mut guard) => guard.network_mode = mode,
+            Err(poisoned) => {
+                log::error!("Config mutex poisoned during set_network_mode, recovering");
+                poisoned.into_inner().network_mode = mode;
+            }
+        }
+        self.save()
+    }
+
+    /// Snapshot of the manual-nodes list.
+    pub fn get_manual_nodes(&self) -> Vec<ManualNode> {
+        match self.settings.lock() {
+            Ok(guard) => guard.manual_nodes.clone(),
+            Err(poisoned) => {
+                log::error!("Config mutex poisoned during get_manual_nodes, recovering");
+                poisoned.into_inner().manual_nodes.clone()
+            }
+        }
+    }
+
+    /// Add a manual node. If an entry with the same IP exists, its alias
+    /// is updated in place rather than producing a duplicate row.
+    pub fn add_manual_node(&self, node: ManualNode) -> Result<(), crate::AppError> {
+        let mut guard = match self.settings.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                log::error!("Config mutex poisoned during add_manual_node, recovering");
+                poisoned.into_inner()
+            }
+        };
+        if let Some(existing) = guard.manual_nodes.iter_mut().find(|n| n.ip == node.ip) {
+            existing.alias = node.alias;
+        } else {
+            guard.manual_nodes.push(node);
+        }
+        drop(guard);
+        self.save()
+    }
+
+    /// Remove a manual node by IP. No-op if the IP isn't pinned.
+    pub fn remove_manual_node(&self, ip: &str) -> Result<(), crate::AppError> {
+        let removed = match self.settings.lock() {
+            Ok(mut guard) => {
+                let before = guard.manual_nodes.len();
+                guard.manual_nodes.retain(|n| n.ip != ip);
+                before != guard.manual_nodes.len()
+            }
+            Err(poisoned) => {
+                log::error!("Config mutex poisoned during remove_manual_node, recovering");
+                let mut guard = poisoned.into_inner();
+                let before = guard.manual_nodes.len();
+                guard.manual_nodes.retain(|n| n.ip != ip);
+                before != guard.manual_nodes.len()
+            }
+        };
+        if removed {
+            self.save()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Drop every pinned manual node.
+    pub fn clear_manual_nodes(&self) -> Result<(), crate::AppError> {
+        match self.settings.lock() {
+            Ok(mut guard) => guard.manual_nodes.clear(),
+            Err(poisoned) => {
+                log::error!("Config mutex poisoned during clear_manual_nodes, recovering");
+                poisoned.into_inner().manual_nodes.clear();
             }
         }
         self.save()
@@ -837,6 +973,8 @@ mod tests {
             },
             adopted_subnets: std::collections::HashMap::new(),
             zoom_positions: std::collections::HashMap::new(),
+            network_mode: NetworkMode::default(),
+            manual_nodes: Vec::new(),
         };
         let toml_str = toml::to_string_pretty(&settings).unwrap();
         let parsed: AppSettings = toml::from_str(&toml_str).unwrap();
@@ -940,6 +1078,100 @@ mod tests {
 
         assert_eq!(current.zoom_positions.len(), 1);
         assert_eq!(current.zoom_positions.get("192.168.1.10"), Some(&75));
+    }
+
+    #[test]
+    fn merge_user_fields_preserves_network_mode() {
+        // A partial frontend payload (just stream/rtsp/credentials) must
+        // not clobber the user's chosen mode via serde defaults.
+        let mut current = AppSettings::default();
+        current.network_mode = NetworkMode::StaticManual;
+        current.merge_user_fields(AppSettings::default());
+        assert_eq!(current.network_mode, NetworkMode::StaticManual);
+    }
+
+    #[test]
+    fn merge_user_fields_preserves_manual_nodes() {
+        let mut current = AppSettings::default();
+        current.manual_nodes.push(ManualNode {
+            ip: "192.168.1.50".into(),
+            alias: "CAM".into(),
+        });
+        current.merge_user_fields(AppSettings::default());
+        assert_eq!(current.manual_nodes.len(), 1);
+        assert_eq!(current.manual_nodes[0].ip, "192.168.1.50");
+        assert_eq!(current.manual_nodes[0].alias, "CAM");
+    }
+
+    // ── Network Mode ────────────────────────────────────────────────
+
+    #[test]
+    fn network_mode_default_is_static_auto() {
+        assert_eq!(NetworkMode::default(), NetworkMode::StaticAuto);
+    }
+
+    #[test]
+    fn network_mode_serializes_snake_case() {
+        // Frontend matches strings exactly; renaming a variant would
+        // silently break the IPC contract. Lock in the expected wire shape.
+        assert_eq!(
+            serde_json::to_string(&NetworkMode::StaticManual).unwrap(),
+            "\"static_manual\""
+        );
+        assert_eq!(
+            serde_json::to_string(&NetworkMode::StaticAuto).unwrap(),
+            "\"static_auto\""
+        );
+        assert_eq!(
+            serde_json::to_string(&NetworkMode::Dhcp).unwrap(),
+            "\"dhcp\""
+        );
+    }
+
+    #[test]
+    fn manual_node_toml_roundtrip() {
+        let mut settings = AppSettings::default();
+        settings.manual_nodes.push(ManualNode {
+            ip: "192.168.1.202".into(),
+            alias: "PTU".into(),
+        });
+        settings.manual_nodes.push(ManualNode {
+            ip: "10.13.248.55".into(),
+            alias: String::new(),
+        });
+        let toml_str = toml::to_string_pretty(&settings).unwrap();
+        let parsed: AppSettings = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.manual_nodes.len(), 2);
+        assert_eq!(parsed.manual_nodes[0].ip, "192.168.1.202");
+        assert_eq!(parsed.manual_nodes[0].alias, "PTU");
+        assert_eq!(parsed.manual_nodes[1].alias, "");
+    }
+
+    #[test]
+    fn old_config_without_new_fields_loads_with_defaults() {
+        // Existing v0.4.x users have config.toml without network_mode or
+        // manual_nodes. serde defaults must kick in so an upgrade doesn't
+        // refuse to load.
+        let legacy = r#"
+[stream]
+protocol = "rtsp"
+rtsp_port = 554
+rtsp_path = "/z3-1.sdp"
+udp_port = 8600
+camera_ip = ""
+
+[rtsp_server]
+enabled = false
+port = 8554
+token = "abc"
+
+[credentials]
+username = ""
+password = ""
+"#;
+        let parsed: AppSettings = toml::from_str(legacy).unwrap();
+        assert_eq!(parsed.network_mode, NetworkMode::StaticAuto);
+        assert!(parsed.manual_nodes.is_empty());
     }
 
     #[test]

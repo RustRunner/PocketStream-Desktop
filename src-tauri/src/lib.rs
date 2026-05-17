@@ -473,6 +473,12 @@ pub fn run() {
             commands::set_dhcp,
             commands::get_dhcp_state,
             commands::resolve_mac,
+            commands::get_network_mode,
+            commands::set_network_mode,
+            commands::get_manual_nodes,
+            commands::add_manual_node,
+            commands::remove_manual_node,
+            commands::clear_manual_nodes,
             commands::refresh_adapter,
             commands::get_interface_info,
             // ARP Discovery

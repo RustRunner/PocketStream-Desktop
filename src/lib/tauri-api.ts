@@ -18,6 +18,8 @@ import type {
   DeviceRecord,
   DeviceStatus,
   InterfaceInfo,
+  ManualNode,
+  NetworkMode,
   RtspServerConfig,
   RtspServerInfo,
   ScanResult,
@@ -335,4 +337,30 @@ export async function setZoomPosition(
   percent: number
 ): Promise<void> {
   return await invoke("set_zoom_position", { cameraIp, percent });
+}
+
+// ── Network mode + manual nodes ─────────────────────────────────────
+
+export async function getNetworkMode(): Promise<NetworkMode> {
+  return await invoke<NetworkMode>("get_network_mode");
+}
+
+export async function setNetworkMode(mode: NetworkMode): Promise<void> {
+  return await invoke("set_network_mode", { mode });
+}
+
+export async function getManualNodes(): Promise<ManualNode[]> {
+  return await invoke<ManualNode[]>("get_manual_nodes");
+}
+
+export async function addManualNode(ip: string, alias: string): Promise<void> {
+  return await invoke("add_manual_node", { ip, alias });
+}
+
+export async function removeManualNode(ip: string): Promise<void> {
+  return await invoke("remove_manual_node", { ip });
+}
+
+export async function clearManualNodes(): Promise<void> {
+  return await invoke("clear_manual_nodes");
 }

@@ -34,6 +34,20 @@ export interface DeviceRecord {
   last_seen: string;
 }
 
+// ── Network mode + manual nodes (config.rs) ──────────────────────────
+
+/** User's chosen network mode. Drives which discovery subsystems run.
+ *  Wire shape uses snake_case via `#[serde(rename_all = "snake_case")]`
+ *  on the Rust enum. */
+export type NetworkMode = "dhcp" | "static_auto" | "static_manual";
+
+/** User-pinned device for `NetworkMode = "static_manual"`. Persists
+ *  across mode toggles. */
+export interface ManualNode {
+  ip: string;
+  alias: string;
+}
+
 // ── Network interface (network/interface.rs) ─────────────────────────
 
 export interface IpInfo {

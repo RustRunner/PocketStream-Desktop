@@ -552,6 +552,8 @@ mod tests {
             },
             adopted_subnets: std::collections::HashMap::new(),
             zoom_positions: std::collections::HashMap::new(),
+            network_mode: NetworkMode::default(),
+            manual_nodes: Vec::new(),
         }
     }
 

@@ -2,7 +2,7 @@
 
 use tauri::State;
 
-use crate::config::{AppConfig, CachedDevice};
+use crate::config::{AppConfig, CachedDevice, ManualNode, NetworkMode};
 use crate::error::AppError;
 use crate::network::{DeviceRecord, DeviceStatus, InterfaceInfo, NetworkManager, ScanResult};
 use crate::validation::parse_cidr;
@@ -88,6 +88,59 @@ pub async fn set_dhcp(name: String) -> Result<(), AppError> {
 #[tauri::command]
 pub async fn get_dhcp_state(name: String) -> Result<bool, AppError> {
     crate::network::ip_config::get_dhcp_state(&name).await
+}
+
+// ── Network Mode ────────────────────────────────────────────────────
+// The user's chosen mode drives which discovery subsystems run. Slice 1
+// just persists the value; the subsystem gating lands in slice 2.
+
+#[tauri::command]
+pub fn get_network_mode(config: State<'_, AppConfig>) -> NetworkMode {
+    config.get_network_mode()
+}
+
+#[tauri::command]
+pub fn set_network_mode(
+    config: State<'_, AppConfig>,
+    mode: NetworkMode,
+) -> Result<(), AppError> {
+    config.set_network_mode(mode)
+}
+
+// ── Manual Nodes ────────────────────────────────────────────────────
+// Pinned devices for `NetworkMode::StaticManual`. The list persists
+// across mode toggles so users can flip between Auto and Manual without
+// losing their pins.
+
+#[tauri::command]
+pub fn get_manual_nodes(config: State<'_, AppConfig>) -> Vec<ManualNode> {
+    config.get_manual_nodes()
+}
+
+#[tauri::command]
+pub fn add_manual_node(
+    config: State<'_, AppConfig>,
+    ip: String,
+    alias: String,
+) -> Result<(), AppError> {
+    // Validate IP shape at the boundary so a malformed string can't end
+    // up persisted and re-served to the frontend.
+    ip.parse::<std::net::Ipv4Addr>()
+        .map_err(|_| AppError::Network(format!("Invalid IP: {}", ip)))?;
+    config.add_manual_node(ManualNode { ip, alias })
+}
+
+#[tauri::command]
+pub fn remove_manual_node(
+    config: State<'_, AppConfig>,
+    ip: String,
+) -> Result<(), AppError> {
+    config.remove_manual_node(&ip)
+}
+
+#[tauri::command]
+pub fn clear_manual_nodes(config: State<'_, AppConfig>) -> Result<(), AppError> {
+    config.clear_manual_nodes()
 }
 
 /// Look up the MAC at `ip` from the live ARP cache. Used by the
