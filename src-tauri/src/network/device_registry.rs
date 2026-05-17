@@ -77,6 +77,17 @@ impl DeviceRegistry {
         }
     }
 
+    /// Drop every record. Used by `apply_mode_change` when the source
+    /// of truth flips (e.g., Static-Auto → Static-Manual replaces the
+    /// cache+ARP set with the user's pinned list). Returns true if
+    /// anything was actually removed.
+    pub fn clear(&self) -> bool {
+        let mut map = self.lock();
+        let had_entries = !map.is_empty();
+        map.clear();
+        had_entries
+    }
+
     /// Snapshot of all records, sorted by subnet then IP for stable
     /// ordering across emissions.
     pub fn snapshot(&self) -> Vec<DeviceRecord> {
@@ -748,6 +759,24 @@ mod tests {
     fn hydrate_manual_nodes_empty_list_is_noop() {
         let r = DeviceRegistry::new();
         assert!(!r.hydrate_manual_nodes(&[]));
+        assert!(r.snapshot().is_empty());
+    }
+
+    // ── clear ───────────────────────────────────────────────────────
+
+    #[test]
+    fn clear_returns_false_when_empty() {
+        let r = DeviceRegistry::new();
+        assert!(!r.clear());
+    }
+
+    #[test]
+    fn clear_drops_all_records_and_returns_true() {
+        let r = DeviceRegistry::new();
+        r.merge_arp(&arp("AA:BB:CC:DD:EE:01", "192.168.1.10", "192.168.1.0/24"));
+        r.hydrate_manual_nodes(&[manual("192.168.1.50", "CAM")]);
+        assert_eq!(r.snapshot().len(), 2);
+        assert!(r.clear());
         assert!(r.snapshot().is_empty());
     }
 }

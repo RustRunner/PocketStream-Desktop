@@ -117,10 +117,25 @@ impl NetworkManager {
         self.device_registry.clone()
     }
 
+    /// Create the device-list emitter if not already initialized. Safe
+    /// to call multiple times — the first call wins so all subsequent
+    /// callers see the same emitter. Decoupled from `start_arp_discovery`
+    /// so Static-Manual (which never starts ARP) still has a working
+    /// emitter for registry-change events.
+    pub async fn init_emitter(&self, app_handle: tauri::AppHandle) -> Arc<DeviceListEmitter> {
+        let mut slot = self.device_emitter.lock().await;
+        if let Some(existing) = slot.as_ref() {
+            return existing.clone();
+        }
+        let emitter = DeviceListEmitter::new(app_handle, self.device_registry.clone());
+        *slot = Some(emitter.clone());
+        emitter
+    }
+
     /// Hydrate the device registry from the user's pinned manual-nodes
     /// list. Used by `NetworkMode::StaticManual` startup to populate the
     /// Nodes panel without going through ARP discovery.
-    pub fn hydrate_manual_nodes(&self, config: &crate::config::AppConfig) {
+    pub async fn hydrate_manual_nodes(&self, config: &crate::config::AppConfig) {
         let nodes = config.get_manual_nodes();
         if nodes.is_empty() {
             return;
@@ -128,7 +143,74 @@ impl NetworkManager {
         let count = nodes.len();
         if self.device_registry.hydrate_manual_nodes(&nodes) {
             log::info!("DeviceRegistry: hydrated {} manual node(s)", count);
+            if let Some(emitter) = self.device_emitter.lock().await.clone() {
+                emitter.poke();
+            }
         }
+    }
+
+    /// Apply a runtime mode change: swap the active subsystems and
+    /// rehydrate the registry to match what the new mode considers
+    /// the source of truth. The caller has already persisted the new
+    /// mode to config.
+    ///
+    /// Manual ↔ non-Manual transitions are the only ones that move
+    /// real machinery — Auto ↔ DHCP is handled implicitly by the
+    /// auto-adopt loop's per-iteration DHCP-state probe.
+    pub async fn apply_mode_change(
+        &self,
+        app_handle: tauri::AppHandle,
+        config: &crate::config::AppConfig,
+        old_mode: crate::config::NetworkMode,
+        new_mode: crate::config::NetworkMode,
+    ) -> Result<(), crate::error::AppError> {
+        use crate::config::NetworkMode;
+
+        if old_mode == new_mode {
+            return Ok(());
+        }
+        log::info!("Mode change: {:?} → {:?}", old_mode, new_mode);
+
+        if new_mode == NetworkMode::StaticManual {
+            // Going INTO Manual: stop ARP (and the auto-adopt loop it
+            // owns), replace the registry contents with manual_nodes.
+            self.stop_arp_discovery().await;
+            self.device_registry.clear();
+            self.hydrate_manual_nodes(config).await;
+        } else if old_mode == NetworkMode::StaticManual {
+            // Leaving Manual: drop manual hydrations, restore the
+            // cache, restart ARP discovery if an interface is known.
+            self.device_registry.clear();
+            self.hydrate_device_registry(config);
+            if let Some(emitter) = self.device_emitter.lock().await.clone() {
+                emitter.poke();
+            }
+            if crate::is_npcap_available() {
+                let iface = self
+                    .interface_name
+                    .lock()
+                    .await
+                    .clone()
+                    .or_else(|| {
+                        interface::list_physical()
+                            .ok()
+                            .and_then(|list| {
+                                list.into_iter()
+                                    .find(|i| i.is_up && i.is_ethernet && !i.ips.is_empty())
+                                    .map(|i| i.name)
+                            })
+                    });
+                if let Some(name) = iface {
+                    if let Err(e) = self.start_arp_discovery(&name, app_handle.clone()).await {
+                        log::warn!("Failed to start ARP after mode change: {}", e);
+                    }
+                }
+            }
+        }
+
+        // Refresh the pinger so the next sweep targets the new set.
+        self.start_ping_dot(app_handle).await;
+        Ok(())
     }
 
     /// Start the ICMP-based reachability pinger. Mode-independent — the

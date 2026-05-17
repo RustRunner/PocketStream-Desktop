@@ -539,6 +539,12 @@ pub fn run() {
                 let config: tauri::State<'_, config::AppConfig> = handle.state();
                 let manager: tauri::State<'_, network::NetworkManager> = handle.state();
 
+                // Init the emitter before any registry mutation so
+                // hydration pokes land on a real emitter — required
+                // for Static-Manual which never reaches start_arp_discovery
+                // (the historic emitter init site).
+                manager.init_emitter(handle.clone()).await;
+
                 let mode = config.get_network_mode();
                 log::info!("Network mode: {:?}", mode);
 
@@ -547,7 +553,7 @@ pub fn run() {
                 // Hydrating the cache here would surface ghost entries
                 // from the last Auto session.
                 if mode == config::NetworkMode::StaticManual {
-                    manager.hydrate_manual_nodes(&config);
+                    manager.hydrate_manual_nodes(&config).await;
                 } else {
                     manager.hydrate_device_registry(&config);
                 }

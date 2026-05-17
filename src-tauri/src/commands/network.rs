@@ -100,11 +100,18 @@ pub fn get_network_mode(config: State<'_, AppConfig>) -> NetworkMode {
 }
 
 #[tauri::command]
-pub fn set_network_mode(
+pub async fn set_network_mode(
     config: State<'_, AppConfig>,
+    manager: State<'_, NetworkManager>,
+    app: tauri::AppHandle,
     mode: NetworkMode,
 ) -> Result<(), AppError> {
-    config.set_network_mode(mode)
+    let old_mode = config.get_network_mode();
+    if old_mode == mode {
+        return Ok(());
+    }
+    config.set_network_mode(mode)?;
+    manager.apply_mode_change(app, &config, old_mode, mode).await
 }
 
 // ── Manual Nodes ────────────────────────────────────────────────────
