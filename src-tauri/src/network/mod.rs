@@ -172,32 +172,33 @@ impl NetworkManager {
         log::info!("Mode change: {:?} → {:?}", old_mode, new_mode);
 
         if new_mode == NetworkMode::StaticManual {
-            // Going INTO Manual: seed manual_nodes from whatever the
-            // Nodes panel is currently showing — devices with at least
-            // one discovered open port. ARP-only entries (no scan yet)
-            // are skipped because they aren't surfaced to the user, so
-            // pinning them would silently inflate the list.
+            // Going INTO Manual: merge everything the Nodes panel is
+            // currently showing (real-MAC entries with at least one
+            // discovered open port) into manual_nodes. add_manual_node
+            // is IP-keyed so existing pins keep their state — the
+            // merge is additive, not replacing.
             //
-            // Only runs when the pinned pool is empty so a user who's
-            // already curated their list doesn't get it re-polluted on
-            // every mode flip (e.g., Manual → Auto → Manual would
-            // otherwise re-pin anything they deleted in between).
-            if config.get_manual_nodes().is_empty() {
-                let snapshot = self.device_registry.snapshot();
-                for record in snapshot {
-                    if record.mac.starts_with("manual:") {
-                        continue;
-                    }
-                    if record.open_ports.is_empty() {
-                        continue;
-                    }
-                    let node = crate::config::ManualNode {
-                        ip: record.ip,
-                        alias: record.alias,
-                    };
-                    if let Err(e) = config.add_manual_node(node) {
-                        log::warn!("Failed to auto-pin discovered device: {}", e);
-                    }
+            // Runs on every Auto→Manual transition so a user who runs
+            // discovery, switches to Manual, later flips back to Auto
+            // to find more devices, then returns to Manual gets the
+            // newly-discovered items merged in. If they don't want a
+            // pin, they delete it from the modal; if the underlying
+            // device is still on the broadcast domain a future
+            // round-trip will re-pin it.
+            let snapshot = self.device_registry.snapshot();
+            for record in snapshot {
+                if record.mac.starts_with("manual:") {
+                    continue;
+                }
+                if record.open_ports.is_empty() {
+                    continue;
+                }
+                let node = crate::config::ManualNode {
+                    ip: record.ip,
+                    alias: record.alias,
+                };
+                if let Err(e) = config.add_manual_node(node) {
+                    log::warn!("Failed to auto-pin discovered device: {}", e);
                 }
             }
             self.stop_arp_discovery().await;

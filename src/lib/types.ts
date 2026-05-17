@@ -118,6 +118,11 @@ export interface AppSettings {
   adopted_subnets: Record<string, string>;
   /** camera IP -> last zoom slider position (0..100) */
   zoom_positions: Record<string, number>;
+  /** User's chosen network mode. Drives ARP/auto-adopt subsystem
+   *  gating; persists across sessions. */
+  network_mode: NetworkMode;
+  /** User-pinned nodes for Static — Manual mode. */
+  manual_nodes: ManualNode[];
 }
 
 // ── Streaming (streaming/mod.rs) ─────────────────────────────────────

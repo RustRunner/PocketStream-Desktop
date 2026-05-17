@@ -891,7 +891,7 @@
 }
 
 .device-item {
-  padding: 8px 12px;
+  padding: 7px 12px;
   border-radius: var(--md-radius-sm);
   transition: background var(--md-transition);
   cursor: pointer;

@@ -22,6 +22,14 @@ void $$;
 // unknown / not yet probed.
 let hostMode: NetworkMode | null = null;
 
+/** Sync hostMode from state.config (no IPC). Cheap and synchronous —
+ *  callable as soon as loadConfig() resolves, which lets the Host card
+ *  paint the mode badge before the slower interface enumeration lands. */
+export function syncHostModeFromConfig(): void {
+  hostMode = state.config?.network_mode ?? null;
+  renderModeBadge();
+}
+
 async function refreshHostMode(): Promise<void> {
   try {
     hostMode = await api.getNetworkMode();
@@ -259,7 +267,13 @@ function applyUpEvent(iface: InterfaceInfo, wasDown: boolean): void {
  *  "DHCP" vs "Static." */
 export function renderModeBadge(): void {
   const modeEl = $("#ip-mode");
-  if (!state.activeInterface || hostMode === null) {
+  // Render as soon as the mode is known. The mode is independent of
+  // interface state — it's the user's preference, not a property of
+  // the adapter — so waiting on state.activeInterface (the slow
+  // listInterfaces enumeration) would leave the badge blank for a
+  // second or two of cold start. syncHostModeFromConfig calls this
+  // right after loadConfig resolves.
+  if (hostMode === null) {
     modeEl.textContent = "--";
     modeEl.className = "status-value";
     return;
@@ -490,6 +504,7 @@ export function setupIpConfigDialog(): void {
       try {
         await api.setDhcp(iface);
         await api.setNetworkMode("dhcp");
+        if (state.config) state.config.network_mode = "dhcp";
         showToast("Switched to DHCP");
         dialog.close();
         await refreshInterfaces();
@@ -514,6 +529,7 @@ export function setupIpConfigDialog(): void {
     try {
       await api.setStaticIp(iface, ip, mask, gw);
       await api.setNetworkMode(selectedMode);
+      if (state.config) state.config.network_mode = selectedMode;
       showToast(
         selectedMode === "static_manual"
           ? "Switched to Static — Manual"

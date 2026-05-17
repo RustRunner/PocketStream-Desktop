@@ -10,6 +10,7 @@ import {
   setupIpConfigDialog,
   setupInterfaceWatcher,
   isInterfaceConnected,
+  syncHostModeFromConfig,
   warnNoEthernet,
 } from "./lib/network.ts";
 import {
@@ -55,6 +56,12 @@ document.addEventListener("DOMContentLoaded", async () => {
   startStatusListener();
 
   await loadConfig();
+  // Paint the mode badge as soon as config is loaded, well before the
+  // slower listInterfaces enumeration in refreshInterfaces lands. The
+  // mode is a user-set preference that doesn't depend on adapter
+  // state — no reason to leave the Host card showing "--" while we
+  // wait on Windows to enumerate physical adapters.
+  syncHostModeFromConfig();
 
   // Preload adopted subnets before the first render so renderSubnetList
   // can correctly badge "(auto)" on entries persisted from prior sessions.
