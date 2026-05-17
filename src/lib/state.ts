@@ -31,9 +31,9 @@ export const state: AppState = {
   isRtspRunning: false,
   isRecording: false,
 };
-// `selectedDevice` and `lastSubnetResults` previously lived here; they
-// are now in src/lib/store.js with subscribe/notify accessors. New
-// shared mutable state should land in store.js, not here.
+// `selectedDevice` previously lived here; it's now in store.ts with a
+// subscribe/notify accessor. New shared mutable state should land in
+// store.ts, not here.
 //
 // Device records (formerly arpDevices, tcpScanResults, nodeAliases)
 // now live entirely on the backend's DeviceRegistry; the frontend

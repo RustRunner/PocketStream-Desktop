@@ -6,8 +6,7 @@ import * as api from "./tauri-api.ts";
 import { $, $$, state, adoptedSubnets, showToast, log } from "./state.ts";
 import { resetDiscoveryStatus, hideDiscoveryStatus, renderArpDeviceList } from "./devices.js";
 import { handleHardDisconnect, handleReconnect, showModalWithVideo } from "./streaming.js";
-import { lastSubnetResults, selectedDevice } from "./store.ts";
-import type { SubnetRenderResult } from "./store.ts";
+import { selectedDevice } from "./store.ts";
 import { formatError } from "./errors.ts";
 import type { InterfaceInfo, NetworkMode } from "./types.ts";
 import * as deviceList from "./device-list.ts";
@@ -49,11 +48,6 @@ export async function refreshInterfaces(): Promise<void> {
       $("#iface-name").textContent = eth.display_name || eth.name;
       await refreshHostMode();
       renderSubnetList();
-      // Don't wipe the CAM/PTU dropdown here — refreshInterfaces is
-      // called from the manual refresh button and during reconnect
-      // flows, where wiping the dropdown would lose any populated
-      // node entries until the next render.
-      updateCameraIpDropdown(lastSubnetResults.get());
       // Recovery — reset the dedup so the next failure toasts again.
       lastAdapterWarningAt = 0;
     } else if (ethList.length > 0) {
@@ -200,12 +194,6 @@ function applyDownEvent(iface: InterfaceInfo): void {
   // running. Stream-break UX lives separately in streaming.ts::
   // showStreamLost.
   if (!iface.name) {
-    // Capture the CAM/PTU selections BEFORE updateCameraIpDropdown
-    // wipes them below — otherwise handleHardDisconnect would
-    // snapshot an empty PTU value and auto-resume on replug wouldn't
-    // restore it. (camera_ip has a state.config fallback because it
-    // persists; ptu_ip is session-only so the dropdown value is the
-    // sole source of truth.)
     handleHardDisconnect("Ethernet disconnected");
     state.activeInterface = null;
     $("#iface-name").textContent = "None found";
@@ -214,13 +202,11 @@ function applyDownEvent(iface: InterfaceInfo): void {
     // full re-scan. renderArpDeviceList self-hides when not connected.
     renderArpDeviceList();
     renderSubnetList();
-    updateCameraIpDropdown(null);
     hideDiscoveryStatus();
     return;
   }
 
-  // Adapter present but down or APIPA-only. Snapshot first, before
-  // dropdown clear wipes PTU selection.
+  // Adapter present but down or APIPA-only.
   state.activeInterface = iface;
   handleHardDisconnect("Ethernet disconnected");
   $("#iface-name").textContent =
@@ -231,7 +217,6 @@ function applyDownEvent(iface: InterfaceInfo): void {
   // there. renderArpDeviceList returns early when the link is down.
   renderArpDeviceList();
   renderSubnetList();
-  updateCameraIpDropdown(null);
   // Hide the Nodes-card spinner — no link means no discovery to wait on.
   hideDiscoveryStatus();
 }
@@ -245,12 +230,6 @@ function applyUpEvent(iface: InterfaceInfo, wasDown: boolean): void {
   // (load_adopted_from_config completing during cold start triggers
   // this event with the new IP set).
   renderSubnetList();
-  // Preserve the existing CAM/PTU dropdown — the backend registry
-  // hasn't changed, so wiping the dropdown to null would just make
-  // cached/discovered nodes vanish until the next render cycle (the
-  // original cause of the "nodes disappear from dropdown during
-  // discovery" bug).
-  updateCameraIpDropdown(lastSubnetResults.get());
   if (wasDown) {
     // If we just came back from disconnected, re-render immediately
     // from the preserved state so the Nodes list snaps back, then
@@ -383,122 +362,42 @@ export function renderSubnetList(): void {
     });
 }
 
-// ── Camera / PTU IP dropdown ────────────────────────────────────────
+// ── CAM / PTU target resolution ─────────────────────────────────────
+// Replaces the legacy #camera-ip / #ptu-ip dropdowns. Targets now flow
+// from a precedence chain: current click selection → persisted config
+// (CAM only) → alias designation → none. Callers ask the resolver
+// at the moment they need to act (Start Stream, PTZ command, etc.),
+// so any state shift in the Nodes panel takes effect on the next
+// action without needing dropdown re-population.
 
-// Once-per-session flags so the alias-based auto-select runs exactly
-// when the dropdown first has a populated option for the target IP
-// — and never again after that. Prevents the auto-default from
-// re-applying every render and overriding a user's later manual
-// pick (or their deliberate clear back to "-- Select --").
-let camDropdownAutoApplied = false;
-let ptuDropdownAutoApplied = false;
-
-/** Look up the device IP that the Naming dialog has been assigned a
- *  given role alias for. Aliases are persisted server-side via
- *  set_device_alias and hydrated into the registry from the device
- *  cache on cold start, so this round-trips a role designation
- *  across program restarts. */
+/** Look up the device IP currently aliased to a role string (CAM /
+ *  PTU / custom). Aliases are persisted server-side via set_device_alias
+ *  and hydrated into the registry from the device cache on cold start,
+ *  so this round-trips a role designation across program restarts. */
 function findDeviceIpByAlias(alias: string): string | undefined {
   return deviceList.getDevices().find((r) => r.alias === alias)?.ip;
 }
 
-export function updateCameraIpDropdown(
-  filteredSubnets: SubnetRenderResult[] | null
-): void {
-  const select = $<HTMLSelectElement>("#camera-ip");
-  const currentVal = select.value;
-
-  let options = '<option value="">-- Select --</option>';
-
-  // Host IPs (skip APIPA — same reasoning as renderSubnetList)
-  if (state.activeInterface) {
-    const usableIps = state.activeInterface.ips.filter((ip) => !isApipa(ip.address));
-    if (usableIps.length > 0) {
-      options += '<optgroup label="Host">';
-      usableIps.forEach((ip) => {
-        options += `<option value="${ip.address}">${ip.address}</option>`;
-      });
-      options += "</optgroup>";
-    }
-  }
-
-  // Node IPs (from ARP-discovered + scan results). Each dropdown entry
-  // carries its alias inline — sourced from the DeviceRegistry snapshot
-  // by the render path in devices.js — so we don't need a separate
-  // alias Map here.
-  if (filteredSubnets) {
-    let hasNodes = false;
-    let nodeOptions = "";
-    filteredSubnets.forEach((sr) => {
-      sr.devices.forEach((d) => {
-        hasNodes = true;
-        const label = d.alias ? `${d.ip} (${d.alias})` : d.ip;
-        nodeOptions += `<option value="${d.ip}">${label}</option>`;
-      });
-    });
-    if (hasNodes) {
-      options += `<optgroup label="Nodes">${nodeOptions}</optgroup>`;
-    }
-  }
-
-  select.innerHTML = options;
-
-  if (currentVal) {
-    select.value = currentVal;
-  } else if (!camDropdownAutoApplied) {
-    // Cold-start auto-select. Prefer the IP saved in config (user's
-    // last Start Stream / CAM-role pick) and fall back to whatever
-    // device is currently aliased CAM in the Naming dialog. Either
-    // way the dropdown returns to the user's last intent across
-    // program restarts instead of starting empty.
-    const targetIp =
-      state.config?.stream.camera_ip || findDeviceIpByAlias("CAM");
-    if (
-      targetIp &&
-      Array.from(select.options).some((o) => o.value === targetIp)
-    ) {
-      select.value = targetIp;
-      selectedDevice.set(targetIp);
-      camDropdownAutoApplied = true;
-    }
-  }
-
-  // Update PTU dropdown with the same options
-  const ptuSelect = $<HTMLSelectElement>("#ptu-ip");
-  const ptuVal = ptuSelect.value;
-  ptuSelect.innerHTML = options;
-  if (ptuVal) {
-    ptuSelect.value = ptuVal;
-  } else if (!ptuDropdownAutoApplied) {
-    // PTU has no equivalent in StreamConfig (deliberately session-
-    // only there), so the alias is the only persisted breadcrumb.
-    const targetIp = findDeviceIpByAlias("PTU");
-    if (
-      targetIp &&
-      Array.from(ptuSelect.options).some((o) => o.value === targetIp)
-    ) {
-      ptuSelect.value = targetIp;
-      ptuDropdownAutoApplied = true;
-    }
-  }
+/** The IP to use as the camera target right now. Tries (in order):
+ *    1. The user's current click selection in the Nodes panel
+ *    2. The IP persisted to StreamConfig from the last successful pick
+ *    3. The device currently aliased CAM in the Naming dialog
+ *  Returns null if none of these resolve — Start Stream surfaces a
+ *  "select a CAM" toast in that case. */
+export function getActiveCamIp(): string | null {
+  const selected = selectedDevice.get();
+  if (selected) return selected;
+  const fromConfig = state.config?.stream.camera_ip;
+  if (fromConfig) return fromConfig;
+  return findDeviceIpByAlias("CAM") ?? null;
 }
 
-export function setupCameraIpDropdown(): void {
-  $<HTMLSelectElement>("#camera-ip").addEventListener("change", (e) => {
-    const target = e.target as HTMLSelectElement;
-    selectedDevice.set(target.value || null);
-    const ip = selectedDevice.get();
-    if (state.config && ip) {
-      state.config.stream.camera_ip = ip;
-    }
-  });
-
-  // PTU IP is session-only — the user picks it each launch from the
-  // Nodes dropdown. Backend StreamConfig deliberately has no ptu_ip
-  // field (asymmetric with camera_ip), since auto-discovery rebuilds
-  // the candidate list every session. If we ever want PTU persistence,
-  // add `ptu_ip: String` to StreamConfig and read it back on launch
-  // before populating the dropdown.
+/** The IP to use as the PTU target right now. PTU is alias-driven
+ *  only — there's no per-session click override for it (the click on
+ *  a node row is reserved for the CAM target). To switch PTU targets,
+ *  re-alias the device via the Naming dialog. */
+export function getActivePtuIp(): string | null {
+  return findDeviceIpByAlias("PTU") ?? null;
 }
 
 // ── IP Configuration dialog ─────────────────────────────────────────

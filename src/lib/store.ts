@@ -60,35 +60,3 @@ function makeAccessor<T>(initial: T): Accessor<T> {
  * decide which list item gets the .selected class.
  */
 export const selectedDevice: Accessor<string | null> = makeAccessor<string | null>(null);
-
-/** One device entry as the render path projects it for the dropdown.
- *  Distinct from ScanResult (no `reachable` flag, carries the user-set
- *  alias). Built fresh in devices.ts on every render and pushed through
- *  lastSubnetResults so network.ts can repopulate the dropdown without
- *  re-running the render path. */
-export interface DropdownDevice {
-  ip: string;
-  open_ports: number[];
-  alias: string;
-}
-
-/** One subnet's worth of devices in the order the render path emits.
- *  Mirrors what devices.ts builds before passing to updateCameraIpDropdown. */
-export interface SubnetRenderResult {
-  subnet: string;
-  /** First IP we have on this subnet — the source address scans /
-   *  HTTP requests would use. Optional because not every consumer
-   *  cares; devices.ts always sets it. */
-  localIp?: string;
-  devices: DropdownDevice[];
-}
-
-/**
- * Result of the most recent device-list render — array of subnet
- * result objects passed to updateCameraIpDropdown so the dropdown
- * reflects current discovery state. Set by devices.js render path,
- * consumed by network.js refreshInterfaces / interface watcher when
- * the dropdown needs to be repopulated without re-running the render.
- */
-export const lastSubnetResults: Accessor<SubnetRenderResult[] | null> =
-  makeAccessor<SubnetRenderResult[] | null>(null);

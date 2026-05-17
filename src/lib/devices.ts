@@ -19,11 +19,7 @@
 
 import * as api from "./tauri-api.ts";
 import { $, state, log, escapeHtml, adoptedSubnets } from "./state.ts";
-import {
-  renderSubnetList,
-  updateCameraIpDropdown,
-  isInterfaceConnected,
-} from "./network.ts";
+import { renderSubnetList, isInterfaceConnected } from "./network.ts";
 import {
   clearScannedIps,
   hasRouteToSubnet,
@@ -32,8 +28,7 @@ import {
 } from "./device-state.ts";
 import * as deviceList from "./device-list.ts";
 import { showModalWithVideo } from "./streaming.js";
-import { lastSubnetResults, selectedDevice } from "./store.ts";
-import type { DropdownDevice, SubnetRenderResult } from "./store.ts";
+import { selectedDevice } from "./store.ts";
 import { formatError } from "./errors.ts";
 import type {
   ArpDevicePayload,
@@ -472,7 +467,6 @@ export function renderArpDeviceList(): void {
   // keeps the card empty without having to drop the state.
   if (!isInterfaceConnected()) {
     list.innerHTML = "";
-    updateCameraIpDropdown(null);
     return;
   }
 
@@ -508,11 +502,8 @@ export function renderArpDeviceList(): void {
     list.innerHTML = isDiscoveryActive()
       ? ""
       : '<p class="placeholder-text">No devices found.</p>';
-    updateCameraIpDropdown(null);
     return;
   }
-
-  const subnetResults: SubnetRenderResult[] = [];
 
   const pencilSvg =
     '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1.001 1.001 0 000-1.41l-2.34-2.34a1.001 1.001 0 00-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>';
@@ -540,16 +531,12 @@ export function renderArpDeviceList(): void {
     });
     if (filtered.length === 0) continue;
 
-    const devicesForDropdown: DropdownDevice[] = [];
-
     html += `<div class="subnet-group">`;
 
     for (const r of filtered) {
       nodeIndex++;
       const name = r.alias || `Node ${nodeIndex}`;
       const ports = r.open_ports;
-
-      devicesForDropdown.push({ ip: r.ip, open_ports: ports, alias: r.alias });
 
       const classes = ["device-item"];
       if (selectedDevice.get() === r.ip) classes.push("selected");
@@ -574,13 +561,6 @@ export function renderArpDeviceList(): void {
     }
 
     html += `</div>`;
-
-    subnetResults.push({
-      subnet,
-      localIp:
-        adoptedSubnets.get(subnet) ?? state.activeInterface?.ips[0]?.address ?? "",
-      devices: devicesForDropdown,
-    });
   }
 
   if (!html) {
@@ -590,7 +570,6 @@ export function renderArpDeviceList(): void {
     // Only show "No devices found." once both have settled.
     if (pendingScans > 0 || isDiscoveryActive()) return;
     list.innerHTML = '<p class="placeholder-text">No devices found.</p>';
-    updateCameraIpDropdown(null);
     return;
   }
 
@@ -605,8 +584,9 @@ export function renderArpDeviceList(): void {
       item.classList.add("selected");
       const ip = item.dataset["ip"] ?? null;
       selectedDevice.set(ip);
-      const select = $<HTMLSelectElement>("#camera-ip");
-      select.value = selectedDevice.get() ?? "";
+      // Persist the CAM pick to config so next launch defaults to
+      // the same target. PTU is alias-driven only — no equivalent
+      // persistence here.
       if (state.config && ip) {
         state.config.stream.camera_ip = ip;
       }
@@ -640,9 +620,6 @@ export function renderArpDeviceList(): void {
         if (ip) openAliasDialog(ip);
       });
     });
-
-  lastSubnetResults.set(subnetResults);
-  updateCameraIpDropdown(subnetResults);
 }
 
 // ── Alias dialog ────────────────────────────────────────────────────
@@ -719,14 +696,18 @@ export function setupAliasDialog(): void {
         const ip = dialog.dataset["ip"];
         if (!ip) return;
         persistAlias(ip, "CAM");
-        $<HTMLSelectElement>("#camera-ip").value = ip;
+        // Persist as the default CAM target so getActiveCamIp picks it
+        // up on next session — same intent the old dropdown carried.
         if (state.config) state.config.stream.camera_ip = ip;
+        // Mirror into selectedDevice so subscribers (zoom restore,
+        // Nodes panel highlight) react immediately. Same store the
+        // click-to-select path uses.
+        selectedDevice.set(ip);
         dialog.close();
       } else if (role === "ptu") {
         const ip = dialog.dataset["ip"];
         if (!ip) return;
         persistAlias(ip, "PTU");
-        $<HTMLSelectElement>("#ptu-ip").value = ip;
         dialog.close();
       } else {
         $<HTMLElement>("#alias-custom-field").style.display = "";

@@ -8,7 +8,6 @@ import { formatError } from "./lib/errors.ts";
 import {
   refreshInterfaces,
   setupIpConfigDialog,
-  setupCameraIpDropdown,
   setupInterfaceWatcher,
   isInterfaceConnected,
   warnNoEthernet,
@@ -49,7 +48,6 @@ document.addEventListener("DOMContentLoaded", async () => {
   setupSettingsSave();
   setupAliasDialog();
   setupCacheDialog();
-  setupCameraIpDropdown();
   setupRefreshButton();
   setupResetAdapterButton();
   setupPtzControls();

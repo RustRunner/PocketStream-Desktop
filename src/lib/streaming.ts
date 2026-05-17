@@ -6,6 +6,7 @@ import QRCode from "qrcode";
 import * as api from "./tauri-api.ts";
 import { $, state, log, showToast, formatUptime } from "./state.ts";
 import { formatError } from "./errors.ts";
+import { getActiveCamIp, getActivePtuIp } from "./network.ts";
 import type { StreamStatus } from "./types.ts";
 
 /** Full RTSP URL (with token) — stored for QR code generation */
@@ -117,9 +118,9 @@ export function setupStreamControls(): void {
       }
     } else {
       try {
-        const selectedIp = $<HTMLSelectElement>("#camera-ip").value;
+        const selectedIp = getActiveCamIp();
         if (!selectedIp) {
-          showToast("Select a camera IP first", true);
+          showToast("Pick a node first (click it in the Nodes panel)", true);
           return;
         }
         if (state.config) {
@@ -478,11 +479,8 @@ let resumeSnapshot: ResumeSnapshot | null = null;
 export function handleHardDisconnect(reason: string): void {
   if (state.isStreaming && !state.streamLost) {
     resumeSnapshot = {
-      cameraIp:
-        $<HTMLSelectElement>("#camera-ip").value ||
-        state.config?.stream?.camera_ip ||
-        null,
-      ptuIp: $<HTMLSelectElement>("#ptu-ip").value || null,
+      cameraIp: getActiveCamIp(),
+      ptuIp: getActivePtuIp(),
       wasRtspRunning: !!state.isRtspRunning,
     };
     log(`Stream lost on network disconnect: ${reason}`);
@@ -505,16 +503,12 @@ export async function handleReconnect(): Promise<void> {
   await new Promise((r) => setTimeout(r, 2000));
 
   // Restore dropdown selections (dropdown may have been repopulated
-  // during reconnect; set values explicitly so the pre-disconnect
-  // choices are back).
-  if (snap.cameraIp) {
-    const camSelect = $<HTMLSelectElement>("#camera-ip");
-    camSelect.value = snap.cameraIp;
-    if (state.config) {
-      state.config.stream.camera_ip = snap.cameraIp;
-    }
+  // during reconnect; set the persisted CAM so getActiveCamIp picks
+  // it up. PTU is alias-driven, which survives across the disconnect
+  // since aliases live in the registry/cache.
+  if (snap.cameraIp && state.config) {
+    state.config.stream.camera_ip = snap.cameraIp;
   }
-  if (snap.ptuIp) $<HTMLSelectElement>("#ptu-ip").value = snap.ptuIp;
 
   if (!snap.cameraIp) return;
 
@@ -647,10 +641,7 @@ async function attemptStallRecovery(): Promise<void> {
   // taken over — bail without consuming another retry slot.
   if (!state.isStreaming || !state.streamLost) return;
 
-  const cameraIp =
-    $<HTMLSelectElement>("#camera-ip").value ||
-    state.config?.stream?.camera_ip ||
-    null;
+  const cameraIp = getActiveCamIp();
   if (!cameraIp) {
     log("Stall recovery: no camera IP available, aborting");
     return;

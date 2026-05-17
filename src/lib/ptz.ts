@@ -5,6 +5,9 @@
 import * as api from "./tauri-api.ts";
 import { $, state, log, showToast } from "./state.ts";
 import { formatError } from "./errors.ts";
+import { getActiveCamIp, getActivePtuIp } from "./network.ts";
+import { selectedDevice } from "./store.ts";
+import * as deviceList from "./device-list.ts";
 
 // ── Local PTU state ─────────────────────────────────────────────────
 
@@ -31,7 +34,7 @@ const ptuPresets = new Map<number, SavedPreset>();
 let zoomRequest: ((percent: number) => void) | null = null;
 
 function getPtuIp(): string | null {
-  return $<HTMLInputElement>("#ptu-ip").value || null;
+  return getActivePtuIp();
 }
 
 async function ptuCmd(cmd: string): Promise<Record<string, string> | null> {
@@ -129,10 +132,16 @@ async function queryPtuSpeed(): Promise<void> {
 type SpeedAction = "up" | "down" | "left" | "right";
 
 export function setupPtzControls(): void {
-  // Query PTU speed limits when PTU IP is selected
-  $<HTMLSelectElement>("#ptu-ip").addEventListener("change", () => {
-    ptuSpeedQueried = false;
-    queryPtuSpeed();
+  // PTU IP is alias-driven now (no dropdown). Watch the device list
+  // and re-query speed limits whenever the PTU-aliased device changes.
+  let lastPtuIp: string | null = null;
+  deviceList.subscribe(() => {
+    const current = getActivePtuIp();
+    if (current !== lastPtuIp) {
+      lastPtuIp = current;
+      ptuSpeedQueried = false;
+      queryPtuSpeed();
+    }
   });
 
   // D-pad buttons — hold to move at speed, release to stop
@@ -285,7 +294,7 @@ export function setupPtzControls(): void {
 const ZOOM_MAX = 31424;
 
 function getCameraIp(): string | null {
-  return $<HTMLInputElement>("#camera-ip").value || null;
+  return getActiveCamIp();
 }
 
 let zoomErrorToasted = false;
@@ -412,12 +421,13 @@ function setupZoomSlider(): void {
     request(saved);
   }
 
-  // Fires when the user picks a CAM from the dropdown.
-  $<HTMLSelectElement>("#camera-ip").addEventListener("change", applySavedZoom);
+  // Fires when the user clicks a different node (selectedDevice
+  // moves) — the equivalent of the old dropdown change event.
+  selectedDevice.subscribe(applySavedZoom);
 
-  // Programmatic dropdown population (via updateCameraIpDropdown) does
-  // NOT fire a change event, so we also poll briefly after startup for
-  // the dropdown+config to be ready, then apply once.
+  // Cold start: the click hasn't happened yet, so selectedDevice
+  // is null. Poll briefly for state.config to land and the alias-
+  // backed CAM to resolve, then apply once.
   (async () => {
     for (let i = 0; i < 20; i++) {
       await new Promise((r) => setTimeout(r, 250));

@@ -1034,14 +1034,6 @@
   border-color: var(--md-primary);
 }
 
-#camera-ip,
-#ptu-ip {
-  min-width: 140px;
-  max-width: 140px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
 #rtsp-bind-interface {
   min-width: 120px;
   max-width: 120px;
