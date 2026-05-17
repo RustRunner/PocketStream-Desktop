@@ -9,7 +9,7 @@
  */
 
 import * as api from "./tauri-api.ts";
-import { $, state, log, escapeHtml, showToast } from "./state.ts";
+import { $, state, log, escapeHtml, showToast, adoptedSubnets } from "./state.ts";
 import * as deviceList from "./device-list.ts";
 import { showModalWithVideo } from "./streaming.js";
 import { formatError } from "./errors.ts";
@@ -24,15 +24,40 @@ interface NodeEntry {
 
 /** Render the current node list into the dialog. Called on open and
  *  after any add/remove so the list reflects the latest state without
- *  the user having to close and re-open. */
+ *  the user having to close and re-open.
+ *
+ *  Uses the same filter as the Nodes panel render path so the two
+ *  views stay consistent: manual pins always show, real-MAC entries
+ *  need at least one discovered open port. Without this, cache rows
+ *  whose verify scan came back with zero ports linger here as
+ *  phantoms while being invisible in the panel — the asymmetry
+ *  bit a user in the field after they ran a Manual mode session
+ *  and accumulated ARP-discovered devices that later lost their
+ *  ports. (Auto-eviction of those stale cache rows is tracked
+ *  separately for a v0.5.x follow-up.) */
 function renderDialogList(): void {
-  const entries: NodeEntry[] = deviceList.getDevices().map((r) => ({
-    mac: r.mac,
-    ip: r.ip,
-    subnet: r.subnet,
-    alias: r.alias || "",
-    isManual: r.mac.startsWith("manual:"),
-  }));
+  const ownIps = new Set<string>();
+  if (state.activeInterface) {
+    state.activeInterface.ips.forEach((ip) => ownIps.add(ip.address));
+  }
+  for (const ip of adoptedSubnets.values()) {
+    ownIps.add(ip);
+  }
+
+  const entries: NodeEntry[] = deviceList
+    .getDevices()
+    .filter((r) => {
+      if (ownIps.has(r.ip)) return false;
+      if (r.mac.startsWith("manual:")) return true;
+      return r.open_ports && r.open_ports.length > 0;
+    })
+    .map((r) => ({
+      mac: r.mac,
+      ip: r.ip,
+      subnet: r.subnet,
+      alias: r.alias || "",
+      isManual: r.mac.startsWith("manual:"),
+    }));
   entries.sort((a, b) => {
     if (a.subnet !== b.subnet) return a.subnet.localeCompare(b.subnet);
     return a.ip.localeCompare(b.ip, undefined, { numeric: true });
