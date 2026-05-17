@@ -533,11 +533,24 @@ pub fn run() {
             // redundant and we skip spawning it to avoid duplicate events.
             let event_watcher_ok = network::watcher::start(handle.clone());
 
-            // Load adopted subnets from config, then auto-start ARP discovery
+            // Load adopted subnets from config, then start discovery
+            // subsystems gated on the user's chosen network mode.
             tauri::async_runtime::spawn(async move {
                 let config: tauri::State<'_, config::AppConfig> = handle.state();
                 let manager: tauri::State<'_, network::NetworkManager> = handle.state();
-                manager.hydrate_device_registry(&config);
+
+                let mode = config.get_network_mode();
+                log::info!("Network mode: {:?}", mode);
+
+                // Static-Manual replaces the cache + ARP world entirely:
+                // the Nodes panel reflects only the user's pinned list.
+                // Hydrating the cache here would surface ghost entries
+                // from the last Auto session.
+                if mode == config::NetworkMode::StaticManual {
+                    manager.hydrate_manual_nodes(&config);
+                } else {
+                    manager.hydrate_device_registry(&config);
+                }
                 manager.load_adopted_from_config(&config, &handle).await;
 
                 match network::interface::list_physical() {
@@ -547,17 +560,30 @@ pub fn run() {
                             .find(|i| i.is_up && i.is_ethernet && !i.ips.is_empty());
 
                         if let Some(iface) = eth {
-                            if is_npcap_available() {
-                                let name = iface.name.clone();
-                                log::info!("Auto-starting ARP discovery on '{}'", name);
+                            // ARP discovery (and the auto-adopt loop it
+                            // spawns internally) only runs in non-Manual
+                            // modes. Static-Manual is intentionally quiet:
+                            // no ARP, no auto-adopt, no port scanner.
+                            if mode != config::NetworkMode::StaticManual {
+                                if is_npcap_available() {
+                                    let name = iface.name.clone();
+                                    log::info!("Auto-starting ARP discovery on '{}'", name);
 
-                                if let Err(e) =
-                                    manager.start_arp_discovery(&name, handle.clone()).await
-                                {
-                                    log::warn!("Failed to auto-start ARP discovery: {}", e);
+                                    if let Err(e) =
+                                        manager.start_arp_discovery(&name, handle.clone()).await
+                                    {
+                                        log::warn!(
+                                            "Failed to auto-start ARP discovery: {}",
+                                            e
+                                        );
+                                    }
+                                } else {
+                                    log::info!("Skipping ARP discovery (Npcap not installed)");
                                 }
                             } else {
-                                log::info!("Skipping ARP discovery (Npcap not installed)");
+                                log::info!(
+                                    "Static-Manual mode — skipping ARP discovery / auto-adopt"
+                                );
                             }
 
                             // Start lightweight interface watcher (pnet-based,
@@ -581,6 +607,11 @@ pub fn run() {
                         log::warn!("Failed to enumerate interfaces for ARP: {}", e);
                     }
                 }
+
+                // ICMP pinger drives the green/red reachability dot in
+                // every mode. Starts after registry hydration so the
+                // first sweep has something to ping.
+                manager.start_ping_dot(handle.clone()).await;
             });
 
             Ok(())
@@ -606,6 +637,7 @@ pub fn run() {
             if let tauri::RunEvent::ExitRequested { .. } = event {
                 let manager: tauri::State<'_, network::NetworkManager> = app_handle.state();
                 let _ = tauri::async_runtime::block_on(async {
+                    manager.stop_ping_dot().await;
                     tokio::time::timeout(
                         std::time::Duration::from_secs(5),
                         manager.cleanup_adopted_ips(),

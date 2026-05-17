@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::CachedDevice;
+use crate::config::{CachedDevice, ManualNode};
 use crate::network::ArpDevice;
 
 /// User-visible reachability status of a device record.
@@ -171,6 +171,53 @@ impl DeviceRegistry {
             changed: !map.is_empty() || !dropped.is_empty(),
             dropped_macs: dropped,
         }
+    }
+
+    /// Populate the registry from a list of user-pinned manual nodes.
+    /// Used by `NetworkMode::StaticManual` to seed the Nodes panel
+    /// without going through ARP discovery.
+    ///
+    /// Manual nodes don't have a real MAC at pin time — the user only
+    /// types IP + alias — so the registry key uses a synthetic prefix
+    /// `manual:<ip>`. This is intentionally not a valid MAC: any code
+    /// path that parses MACs will reject it cleanly rather than mis-
+    /// using the synthetic value. Replaces any existing record at the
+    /// same key so a second hydration (e.g., user added a node) takes
+    /// effect.
+    pub fn hydrate_manual_nodes(&self, nodes: &[ManualNode]) -> bool {
+        let mut map = self.lock();
+        let mut changed = false;
+        for node in nodes {
+            let key = format!("manual:{}", node.ip);
+            let subnet = subnet_for(&node.ip);
+            // Idempotency check uses ip + alias only — re-generating
+            // timestamps each call would otherwise force a no-op
+            // hydration to report changed=true and burn an emission.
+            let already_current = map
+                .get(&key)
+                .map(|r| r.ip == node.ip && r.alias == node.alias && r.subnet == subnet)
+                .unwrap_or(false);
+            if already_current {
+                continue;
+            }
+            let now = chrono::Utc::now().to_rfc3339();
+            let new_record = DeviceRecord {
+                mac: key.clone(),
+                ip: node.ip.clone(),
+                subnet,
+                open_ports: Vec::new(),
+                alias: node.alias.clone(),
+                // Live as a placeholder — the pinger sweep will start
+                // overriding the visible state via ping-result events
+                // within seconds of hydration.
+                status: DeviceStatus::Live,
+                first_seen: now.clone(),
+                last_seen: now,
+            };
+            map.insert(key, new_record);
+            changed = true;
+        }
+        changed
     }
 
     /// Insert or refresh a record from a live ARP discovery. New entries
@@ -340,6 +387,20 @@ fn compare_ips(a: &str, b: &str) -> std::cmp::Ordering {
     match (a.parse::<Ipv4Addr>(), b.parse::<Ipv4Addr>()) {
         (Ok(ai), Ok(bi)) => ai.cmp(&bi),
         _ => a.cmp(b),
+    }
+}
+
+/// Derive the `/24` subnet string from an IPv4 address. Returns
+/// `0.0.0.0/24` if the input is unparseable — the registry tolerates
+/// a missing subnet for synthetic records like manual-pin hydrations
+/// rather than refusing to insert them.
+fn subnet_for(ip: &str) -> String {
+    match ip.parse::<std::net::Ipv4Addr>() {
+        Ok(addr) => {
+            let o = addr.octets();
+            format!("{}.{}.{}.0/24", o[0], o[1], o[2])
+        }
+        Err(_) => "0.0.0.0/24".to_string(),
     }
 }
 
@@ -626,5 +687,67 @@ mod tests {
             snap[0].alias, "PTU",
             "alias inherits from the dropped duplicate when survivor is unnamed"
         );
+    }
+
+    // ── hydrate_manual_nodes ────────────────────────────────────────
+
+    fn manual(ip: &str, alias: &str) -> ManualNode {
+        ManualNode {
+            ip: ip.into(),
+            alias: alias.into(),
+        }
+    }
+
+    #[test]
+    fn hydrate_manual_nodes_inserts_records_with_synthetic_mac() {
+        let r = DeviceRegistry::new();
+        let changed = r.hydrate_manual_nodes(&[
+            manual("192.168.1.50", "CAM"),
+            manual("192.168.1.202", "PTU"),
+        ]);
+        assert!(changed);
+        let snap = r.snapshot();
+        assert_eq!(snap.len(), 2);
+        // Synthetic MAC keys mark these as manual hydrations, so any
+        // MAC-parsing code path will reject them cleanly rather than
+        // mistaking them for real ARP records.
+        assert!(snap.iter().all(|d| d.mac.starts_with("manual:")));
+    }
+
+    #[test]
+    fn hydrate_manual_nodes_derives_subnet_from_ip() {
+        let r = DeviceRegistry::new();
+        r.hydrate_manual_nodes(&[manual("10.13.248.55", "")]);
+        let snap = r.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].subnet, "10.13.248.0/24");
+    }
+
+    #[test]
+    fn hydrate_manual_nodes_idempotent_for_unchanged_input() {
+        let r = DeviceRegistry::new();
+        let nodes = vec![manual("192.168.1.50", "CAM")];
+        assert!(r.hydrate_manual_nodes(&nodes));
+        // Second call with identical input must report no-change so
+        // callers can skip a redundant device-list-changed emission.
+        assert!(!r.hydrate_manual_nodes(&nodes));
+    }
+
+    #[test]
+    fn hydrate_manual_nodes_updates_alias_in_place() {
+        let r = DeviceRegistry::new();
+        r.hydrate_manual_nodes(&[manual("192.168.1.50", "OLD")]);
+        let changed = r.hydrate_manual_nodes(&[manual("192.168.1.50", "NEW")]);
+        assert!(changed, "alias rename must register as a change");
+        let snap = r.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].alias, "NEW");
+    }
+
+    #[test]
+    fn hydrate_manual_nodes_empty_list_is_noop() {
+        let r = DeviceRegistry::new();
+        assert!(!r.hydrate_manual_nodes(&[]));
+        assert!(r.snapshot().is_empty());
     }
 }

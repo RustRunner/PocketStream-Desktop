@@ -5,6 +5,7 @@ pub mod device_registry;
 pub mod firewall;
 pub mod interface;
 pub mod ip_config;
+pub mod ping_dot;
 pub mod scanner;
 pub mod watcher;
 
@@ -62,6 +63,10 @@ pub struct NetworkManager {
     /// `device-list-changed` events. None until `start_arp_discovery`
     /// (which receives the AppHandle) wires it up.
     device_emitter: Arc<Mutex<Option<Arc<DeviceListEmitter>>>>,
+    /// Handle to the ICMP pinger task (green/red dot driver). Started
+    /// by `start_ping_dot`, stopped on shutdown. Mode-independent: the
+    /// pinger watches whatever the registry contains.
+    ping_dot_handle: Arc<Mutex<Option<ping_dot::PingDotHandle>>>,
 }
 
 impl NetworkManager {
@@ -76,6 +81,7 @@ impl NetworkManager {
             interface_name: Arc::new(Mutex::new(None)),
             device_registry: Arc::new(DeviceRegistry::new()),
             device_emitter: Arc::new(Mutex::new(None)),
+            ping_dot_handle: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -109,6 +115,42 @@ impl NetworkManager {
     /// read snapshots or apply mutations.
     pub fn registry(&self) -> Arc<DeviceRegistry> {
         self.device_registry.clone()
+    }
+
+    /// Hydrate the device registry from the user's pinned manual-nodes
+    /// list. Used by `NetworkMode::StaticManual` startup to populate the
+    /// Nodes panel without going through ARP discovery.
+    pub fn hydrate_manual_nodes(&self, config: &crate::config::AppConfig) {
+        let nodes = config.get_manual_nodes();
+        if nodes.is_empty() {
+            return;
+        }
+        let count = nodes.len();
+        if self.device_registry.hydrate_manual_nodes(&nodes) {
+            log::info!("DeviceRegistry: hydrated {} manual node(s)", count);
+        }
+    }
+
+    /// Start the ICMP-based reachability pinger. Mode-independent — the
+    /// pinger reads the registry, so it works equally well for ARP-
+    /// populated entries (Static-Auto, DHCP) and manual hydrations
+    /// (Static-Manual). Safe to call multiple times; replaces any
+    /// previously-running pinger.
+    pub async fn start_ping_dot(&self, app_handle: tauri::AppHandle) {
+        let mut slot = self.ping_dot_handle.lock().await;
+        if let Some(prev) = slot.take() {
+            prev.stop().await;
+        }
+        *slot = Some(ping_dot::start(app_handle, self.device_registry.clone()));
+        log::info!("Started ICMP ping-dot loop");
+    }
+
+    /// Stop the pinger task and drain. No-op if not running.
+    pub async fn stop_ping_dot(&self) {
+        if let Some(handle) = self.ping_dot_handle.lock().await.take() {
+            handle.stop().await;
+            log::info!("Stopped ICMP ping-dot loop");
+        }
     }
 
     /// Borrow the device-list emitter. None before the first call to
