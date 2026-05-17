@@ -345,15 +345,24 @@
     </div>
 
     <!-- Node Alias Dialog -->
-    <!-- Cached Devices Dialog (clear offline / stale entries) -->
+    <!-- Add/Remove Nodes Dialog -->
     <dialog id="cache-dialog" class="dialog cache-dialog">
-      <h2>Clear Cached Devices</h2>
+      <h2>Add/Remove Nodes</h2>
       <div class="dialog-body">
-        <p id="cache-dialog-empty" class="cache-empty muted" style="display:none">No cached devices to clear.</p>
+        <div class="add-node-row">
+          <input type="text" id="add-node-ip" placeholder="192.168.1.50" />
+          <input type="text" id="add-node-alias" placeholder="Alias (optional)" />
+          <button id="btn-add-node" class="icon-btn small" title="Add node">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/>
+            </svg>
+          </button>
+        </div>
+        <p id="cache-dialog-empty" class="cache-empty muted" style="display:none">No nodes to show. Add one above.</p>
         <div id="cache-dialog-list" class="cache-list"></div>
       </div>
       <div class="dialog-actions">
-        <button class="text-btn" id="cache-clear-all">Forget All</button>
+        <button class="text-btn" id="cache-clear-all">Clear All</button>
         <div class="dialog-spacer"></div>
         <button class="filled-btn" id="cache-close">Close</button>
       </div>
@@ -424,11 +433,12 @@
           <select id="static-iface"></select>
         </div>
 
-        <!-- Mode toggle (DHCP vs Static) -->
+        <!-- Mode toggle (DHCP / Static Auto-adopt / Static Manual) -->
         <h3 class="ip-section-label">Mode</h3>
         <div class="ip-mode-toggle">
           <label><input type="radio" name="ip-mode" id="ip-mode-dhcp" value="dhcp" /> DHCP</label>
-          <label><input type="radio" name="ip-mode" id="ip-mode-static" value="static" checked /> Static</label>
+          <label><input type="radio" name="ip-mode" id="ip-mode-static-auto" value="static_auto" checked /> Static — Auto-adopt</label>
+          <label><input type="radio" name="ip-mode" id="ip-mode-static-manual" value="static_manual" /> Static — Manual</label>
         </div>
 
         <!-- Static-only section (hidden when DHCP is selected) -->

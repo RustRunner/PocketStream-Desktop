@@ -88,6 +88,24 @@ impl DeviceRegistry {
         had_entries
     }
 
+    /// Drop a single record by MAC key. Returns true if the key existed.
+    /// Used by `remove_manual_node` to clear the synthetic registry
+    /// entry — real-MAC entries are owned by ARP/cache and stay put.
+    pub fn remove_by_mac(&self, mac: &str) -> bool {
+        let mut map = self.lock();
+        map.remove(mac).is_some()
+    }
+
+    /// Drop every synthetic manual entry (keys starting with `manual:`),
+    /// leaving real-MAC ARP/cache records intact. Used by Clear All so
+    /// pins are dropped without nuking discovered devices.
+    pub fn remove_manual_entries(&self) -> bool {
+        let mut map = self.lock();
+        let before = map.len();
+        map.retain(|key, _| !key.starts_with("manual:"));
+        before != map.len()
+    }
+
     /// Snapshot of all records, sorted by subnet then IP for stable
     /// ordering across emissions.
     pub fn snapshot(&self) -> Vec<DeviceRecord> {
@@ -199,33 +217,46 @@ impl DeviceRegistry {
         let mut map = self.lock();
         let mut changed = false;
         for node in nodes {
-            let key = format!("manual:{}", node.ip);
             let subnet = subnet_for(&node.ip);
-            // Idempotency check uses ip + alias only — re-generating
-            // timestamps each call would otherwise force a no-op
-            // hydration to report changed=true and burn an emission.
-            let already_current = map
-                .get(&key)
-                .map(|r| r.ip == node.ip && r.alias == node.alias && r.subnet == subnet)
-                .unwrap_or(false);
-            if already_current {
+
+            // If a record (manual or ARP-derived) already lives at this
+            // IP, patch its alias / subnet in place rather than spawning
+            // a duplicate. This is what lets a user pin an existing
+            // discovered device by IP without ending up with two rows
+            // for the same physical box in the Nodes panel.
+            let existing_key = map
+                .values()
+                .find(|r| r.ip == node.ip)
+                .map(|r| r.mac.clone());
+            if let Some(key) = existing_key {
+                if let Some(existing) = map.get_mut(&key) {
+                    if existing.alias != node.alias || existing.subnet != subnet {
+                        existing.alias = node.alias.clone();
+                        existing.subnet = subnet;
+                        changed = true;
+                    }
+                }
                 continue;
             }
+
+            // No record at this IP yet — insert the synthetic manual
+            // entry. The pinger will flip its dot via the ping-result
+            // event stream within seconds of hydration.
+            let key = format!("manual:{}", node.ip);
             let now = chrono::Utc::now().to_rfc3339();
-            let new_record = DeviceRecord {
-                mac: key.clone(),
-                ip: node.ip.clone(),
-                subnet,
-                open_ports: Vec::new(),
-                alias: node.alias.clone(),
-                // Live as a placeholder — the pinger sweep will start
-                // overriding the visible state via ping-result events
-                // within seconds of hydration.
-                status: DeviceStatus::Live,
-                first_seen: now.clone(),
-                last_seen: now,
-            };
-            map.insert(key, new_record);
+            map.insert(
+                key.clone(),
+                DeviceRecord {
+                    mac: key,
+                    ip: node.ip.clone(),
+                    subnet,
+                    open_ports: Vec::new(),
+                    alias: node.alias.clone(),
+                    status: DeviceStatus::Live,
+                    first_seen: now.clone(),
+                    last_seen: now,
+                },
+            );
             changed = true;
         }
         changed

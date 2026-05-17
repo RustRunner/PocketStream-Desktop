@@ -125,8 +125,9 @@ pub fn get_manual_nodes(config: State<'_, AppConfig>) -> Vec<ManualNode> {
 }
 
 #[tauri::command]
-pub fn add_manual_node(
+pub async fn add_manual_node(
     config: State<'_, AppConfig>,
+    manager: State<'_, NetworkManager>,
     ip: String,
     alias: String,
 ) -> Result<(), AppError> {
@@ -134,20 +135,45 @@ pub fn add_manual_node(
     // up persisted and re-served to the frontend.
     ip.parse::<std::net::Ipv4Addr>()
         .map_err(|_| AppError::Network(format!("Invalid IP: {}", ip)))?;
-    config.add_manual_node(ManualNode { ip, alias })
+    config.add_manual_node(ManualNode { ip, alias })?;
+    // Reflect the new pin in the live registry so the Nodes panel
+    // updates without a full mode-switch. hydrate_manual_nodes patches
+    // an existing record at the same IP rather than spawning a dupe.
+    manager.hydrate_manual_nodes(&config).await;
+    Ok(())
 }
 
 #[tauri::command]
-pub fn remove_manual_node(
+pub async fn remove_manual_node(
     config: State<'_, AppConfig>,
+    manager: State<'_, NetworkManager>,
     ip: String,
 ) -> Result<(), AppError> {
-    config.remove_manual_node(&ip)
+    config.remove_manual_node(&ip)?;
+    // Drop the synthetic registry entry too. Real-MAC entries that the
+    // pin may have aliased stay in the registry — the user's "remove
+    // this row" intent only un-pins, not forget.
+    let synthetic_key = format!("manual:{}", ip);
+    if manager.registry().remove_by_mac(&synthetic_key) {
+        if let Some(emitter) = manager.emitter().await {
+            emitter.poke();
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
-pub fn clear_manual_nodes(config: State<'_, AppConfig>) -> Result<(), AppError> {
-    config.clear_manual_nodes()
+pub async fn clear_manual_nodes(
+    config: State<'_, AppConfig>,
+    manager: State<'_, NetworkManager>,
+) -> Result<(), AppError> {
+    config.clear_manual_nodes()?;
+    if manager.registry().remove_manual_entries() {
+        if let Some(emitter) = manager.emitter().await {
+            emitter.poke();
+        }
+    }
+    Ok(())
 }
 
 /// Look up the MAC at `ip` from the live ARP cache. Used by the

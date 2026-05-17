@@ -172,8 +172,25 @@ impl NetworkManager {
         log::info!("Mode change: {:?} → {:?}", old_mode, new_mode);
 
         if new_mode == NetworkMode::StaticManual {
-            // Going INTO Manual: stop ARP (and the auto-adopt loop it
-            // owns), replace the registry contents with manual_nodes.
+            // Going INTO Manual: pin every currently-visible device as
+            // a manual node so the user's workflow ("use Auto to find,
+            // switch to Manual to lock in") doesn't lose what was just
+            // discovered. Skip duplicates by IP — add_manual_node
+            // already updates aliases in place for existing pins. Then
+            // stop ARP and rehydrate from the (now-augmented) list.
+            let snapshot = self.device_registry.snapshot();
+            for record in snapshot {
+                if record.mac.starts_with("manual:") {
+                    continue;
+                }
+                let node = crate::config::ManualNode {
+                    ip: record.ip,
+                    alias: record.alias,
+                };
+                if let Err(e) = config.add_manual_node(node) {
+                    log::warn!("Failed to auto-pin discovered device: {}", e);
+                }
+            }
             self.stop_arp_discovery().await;
             self.device_registry.clear();
             self.hydrate_manual_nodes(config).await;

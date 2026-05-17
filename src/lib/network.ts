@@ -9,7 +9,7 @@ import { handleHardDisconnect, handleReconnect, showModalWithVideo } from "./str
 import { lastSubnetResults, selectedDevice } from "./store.ts";
 import type { SubnetRenderResult } from "./store.ts";
 import { formatError } from "./errors.ts";
-import type { InterfaceInfo } from "./types.ts";
+import type { InterfaceInfo, NetworkMode } from "./types.ts";
 import * as deviceList from "./device-list.ts";
 
 // Reference $$ once so the import isn't dropped — used elsewhere via the
@@ -17,17 +17,17 @@ import * as deviceList from "./device-list.ts";
 // imports as runtime imports. Touching the binding here keeps imports tidy.
 void $$;
 
-// ── Host adapter mode (DHCP vs Static) ──────────────────────────────
-// Tracked alongside the active interface so the Hosts panel can surface
-// the mode badge and the auto-adopt block (backend) has a matching
-// frontend cue. null = unknown / not yet probed.
-let hostModeIsDhcp: boolean | null = null;
+// ── Host network mode (DHCP / Static-Auto / Static-Manual) ──────────
+// Mirrors the backend's NetworkMode. Drives the mode badge in the
+// Host card and the radio state in the IP Config dialog. null =
+// unknown / not yet probed.
+let hostMode: NetworkMode | null = null;
 
-async function refreshHostMode(name: string): Promise<void> {
+async function refreshHostMode(): Promise<void> {
   try {
-    hostModeIsDhcp = await api.getDhcpState(name);
+    hostMode = await api.getNetworkMode();
   } catch (_) {
-    hostModeIsDhcp = null;
+    hostMode = null;
   }
 }
 
@@ -47,7 +47,7 @@ export async function refreshInterfaces(): Promise<void> {
     if (eth) {
       state.activeInterface = eth;
       $("#iface-name").textContent = eth.display_name || eth.name;
-      await refreshHostMode(eth.name);
+      await refreshHostMode();
       renderSubnetList();
       // Don't wipe the CAM/PTU dropdown here — refreshInterfaces is
       // called from the manual refresh button and during reconnect
@@ -270,24 +270,31 @@ function applyUpEvent(iface: InterfaceInfo, wasDown: boolean): void {
 
 // ── Subnet list rendering ───────────────────────────────────────────
 
-/** Drive the existing `#ip-mode` span in the Host card. Two states:
- *   - Static → "Static — auto-adopt ready" (green)
- *   - DHCP   → "DHCP — set static to enable auto-adopt" (amber,
- *              clickable, opens IP Config)
- *  Backend's auto-adopt loop has nuance the badge intentionally hides
- *  (it still rescue-adopts when DHCP fails to APIPA), since the action
- *  the user needs to take is the same either way: go Static. */
+/** Drive the existing `#ip-mode` span in the Host card. Three states:
+ *   - Static-Auto    → "Static — auto-adopt ready" (green)
+ *   - Static-Manual  → "Static — manual nodes" (blue)
+ *   - DHCP           → "DHCP — set static to enable auto-adopt"
+ *                       (amber, clickable, opens IP Config)
+ *  Backend's auto-adopt loop has DHCP/APIPA nuance the badge
+ *  intentionally hides — the user-actionable distinction is just
+ *  "DHCP" vs "Static." */
 export function renderModeBadge(): void {
   const modeEl = $("#ip-mode");
-  if (!state.activeInterface || hostModeIsDhcp === null) {
+  if (!state.activeInterface || hostMode === null) {
     modeEl.textContent = "--";
     modeEl.className = "status-value";
     return;
   }
 
-  if (!hostModeIsDhcp) {
+  if (hostMode === "static_auto") {
     modeEl.textContent = "Static — auto-adopt ready";
     modeEl.className = "status-value mode-static";
+    return;
+  }
+
+  if (hostMode === "static_manual") {
+    modeEl.textContent = "Static — manual nodes";
+    modeEl.className = "status-value mode-manual";
     return;
   }
 
@@ -533,7 +540,8 @@ export function setupIpConfigDialog(): void {
   // Mode toggle: hide/show the static-only fields. Applying happens via
   // the existing Apply button — see branch below.
   $<HTMLInputElement>("#ip-mode-dhcp").addEventListener("change", updateModeVisibility);
-  $<HTMLInputElement>("#ip-mode-static").addEventListener("change", updateModeVisibility);
+  $<HTMLInputElement>("#ip-mode-static-auto").addEventListener("change", updateModeVisibility);
+  $<HTMLInputElement>("#ip-mode-static-manual").addEventListener("change", updateModeVisibility);
 
   // ── Add secondary IP ─────────────────────────────────────────────
   $<HTMLButtonElement>("#btn-add-sec-ip").addEventListener("click", async () => {
@@ -560,7 +568,14 @@ export function setupIpConfigDialog(): void {
   // ── Cancel ───────────────────────────────────────────────────────
   $<HTMLButtonElement>("#ip-config-cancel").addEventListener("click", () => dialog.close());
 
-  // ── Apply (DHCP or primary IP, branched by mode) ─────────────────
+  // ── Apply ────────────────────────────────────────────────────────
+  // Three-mode branching:
+  //   DHCP            → setDhcp + setNetworkMode("dhcp")
+  //   Static-Auto     → setStaticIp + setNetworkMode("static_auto")
+  //   Static-Manual   → setStaticIp + setNetworkMode("static_manual")
+  // The OS-level change goes first so the new mode applies against a
+  // settled adapter (auto-adopt loop reads current IPs to decide
+  // rescue vs pause).
   $<HTMLButtonElement>("#ip-config-apply").addEventListener("click", async () => {
     const iface = $<HTMLSelectElement>("#static-iface").value;
     if (!iface) {
@@ -569,12 +584,13 @@ export function setupIpConfigDialog(): void {
     }
 
     const spinner = $<HTMLElement>("#ip-config-spinner");
-    const dhcpMode = $<HTMLInputElement>("#ip-mode-dhcp").checked;
+    const selectedMode = readSelectedMode();
 
-    if (dhcpMode) {
+    if (selectedMode === "dhcp") {
       spinner.style.display = "";
       try {
         await api.setDhcp(iface);
+        await api.setNetworkMode("dhcp");
         showToast("Switched to DHCP");
         dialog.close();
         await refreshInterfaces();
@@ -585,6 +601,9 @@ export function setupIpConfigDialog(): void {
       return;
     }
 
+    // Both Static-Auto and Static-Manual need a host primary IP — same
+    // form, same OS call. The difference is the program mode that gets
+    // saved afterward (which drives ARP/auto-adopt/pinger behavior).
     const ip = $<HTMLInputElement>("#static-ip").value.trim();
     const mask = $<HTMLInputElement>("#static-mask").value.trim();
     const gw = $<HTMLInputElement>("#static-gateway").value.trim() || null;
@@ -595,7 +614,12 @@ export function setupIpConfigDialog(): void {
     spinner.style.display = "";
     try {
       await api.setStaticIp(iface, ip, mask, gw);
-      showToast("Primary IP updated");
+      await api.setNetworkMode(selectedMode);
+      showToast(
+        selectedMode === "static_manual"
+          ? "Switched to Static — Manual"
+          : "Primary IP updated"
+      );
       dialog.close();
       await refreshInterfaces();
     } catch (e) {
@@ -605,22 +629,32 @@ export function setupIpConfigDialog(): void {
   });
 }
 
-/** Hide or show the static-only fields based on which radio is selected. */
-function updateModeVisibility(): void {
-  const isStatic = $<HTMLInputElement>("#ip-mode-static").checked;
-  $<HTMLElement>("#ip-static-section").style.display = isStatic ? "" : "none";
+/** Read the dialog's currently-selected mode radio. */
+function readSelectedMode(): NetworkMode {
+  if ($<HTMLInputElement>("#ip-mode-dhcp").checked) return "dhcp";
+  if ($<HTMLInputElement>("#ip-mode-static-manual").checked) return "static_manual";
+  return "static_auto";
 }
 
-/** Read the current DHCP state for the selected interface and set the
- *  radio accordingly. Errors are non-fatal — the radio falls back to its
- *  prior position (defaulting to Static for fresh opens). */
+/** Hide the static-only fields only in DHCP mode — both static modes
+ *  share the host-IP fields (the difference is program behavior, not
+ *  adapter config). */
+function updateModeVisibility(): void {
+  const isDhcp = $<HTMLInputElement>("#ip-mode-dhcp").checked;
+  $<HTMLElement>("#ip-static-section").style.display = isDhcp ? "none" : "";
+}
+
+/** Sync the dialog's mode radio to the backend's currently-saved
+ *  NetworkMode. Errors are non-fatal — the radio falls back to its
+ *  prior position (defaulting to Static-Auto on fresh opens). */
 async function syncModeFromInterface(): Promise<void> {
   const name = $<HTMLSelectElement>("#static-iface").value;
   if (!name) return;
   try {
-    const isDhcp = await api.getDhcpState(name);
-    $<HTMLInputElement>("#ip-mode-dhcp").checked = isDhcp;
-    $<HTMLInputElement>("#ip-mode-static").checked = !isDhcp;
+    const mode = await api.getNetworkMode();
+    $<HTMLInputElement>("#ip-mode-dhcp").checked = mode === "dhcp";
+    $<HTMLInputElement>("#ip-mode-static-auto").checked = mode === "static_auto";
+    $<HTMLInputElement>("#ip-mode-static-manual").checked = mode === "static_manual";
   } catch (_) {
     // Leave the radio at its current position on error.
   }

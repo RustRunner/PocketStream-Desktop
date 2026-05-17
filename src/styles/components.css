@@ -943,6 +943,32 @@
   margin-bottom: 2px;
 }
 
+/* ── ICMP reachability dot ────────────────────────────────────────── */
+
+.device-dot {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.25);
+}
+
+.dot-pending {
+  background: var(--md-on-surface-variant);
+  opacity: 0.55;
+}
+
+.dot-green {
+  background: #3ddc84;
+  box-shadow: 0 0 6px rgba(61, 220, 132, 0.55);
+}
+
+.dot-red {
+  background: var(--md-error);
+  box-shadow: 0 0 6px rgba(255, 80, 80, 0.4);
+}
+
 .device-name {
   font-size: 14px;
   font-weight: 500;
@@ -1053,6 +1079,45 @@
   min-width: 420px;
   max-width: 520px;
 }
+/* ── Add Node row (Add/Remove Nodes modal) ───────────────────────── */
+
+.add-node-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.add-node-row input[type="text"] {
+  flex: 1;
+  min-width: 0;
+  background: var(--md-surface);
+  border: 1px solid var(--md-outline);
+  border-radius: var(--md-radius-sm);
+  color: var(--md-on-surface);
+  padding: 6px 10px;
+  font-size: 13px;
+}
+
+.add-node-row input[type="text"]:focus {
+  outline: none;
+  border-color: var(--md-primary-light);
+}
+
+.cache-item-pin {
+  display: inline-block;
+  margin-left: 6px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: rgba(106, 183, 255, 0.18);
+  color: #6ab7ff;
+  vertical-align: middle;
+}
+
 .cache-list {
   display: flex;
   flex-direction: column;
@@ -1216,6 +1281,11 @@
 
 #ip-mode.mode-static {
   color: var(--md-primary-light);
+  font-weight: 600;
+}
+
+#ip-mode.mode-manual {
+  color: #6ab7ff;
   font-weight: 600;
 }
 

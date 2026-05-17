@@ -37,6 +37,7 @@ import type { DropdownDevice, SubnetRenderResult } from "./store.ts";
 import { formatError } from "./errors.ts";
 import type {
   ArpDevicePayload,
+  DevicePingResultPayload,
   DeviceRecord,
   SubnetAdoptedPayload,
 } from "./types.ts";
@@ -44,6 +45,26 @@ import type {
 // ── Local scanning state ────────────────────────────────────────────
 
 let pendingScans = 0;
+
+// ── ICMP reachability dots ──────────────────────────────────────────
+// IP → latest ping result. Missing entry = no probe yet (gray dot).
+// The backend pinger publishes `device-ping-result` events; we treat
+// the latest value per IP as the source of truth for the dot.
+const pingResults = new Map<string, boolean>();
+
+/** Render a status dot for a device's IP based on the latest ping
+ *  result. Gray if no probe has come back yet, green if reachable,
+ *  red if the last probe failed. */
+function renderReachabilityDot(ip: string): string {
+  const result = pingResults.get(ip);
+  if (result === undefined) {
+    return '<span class="device-dot dot-pending" title="Checking reachability..."></span>';
+  }
+  if (result) {
+    return '<span class="device-dot dot-green" title="Reachable"></span>';
+  }
+  return '<span class="device-dot dot-red" title="No response on last probe"></span>';
+}
 
 // ── Debounced scan trigger ─────────────────────────────────────────
 // Collect all ARP discoveries and subnet adoptions, then scan once
@@ -206,6 +227,17 @@ export function setupArpListeners(): void {
         setDiscoveryPhase("discovering");
       }
       debounceScan();
+    }
+  });
+
+  api.onEvent<DevicePingResultPayload>("device-ping-result", (data) => {
+    const prev = pingResults.get(data.ip);
+    pingResults.set(data.ip, data.reachable);
+    // Only re-render when the dot color would change. ICMP results
+    // are inherently noisy; redrawing every device row twice per
+    // minute regardless of change would be a wasted render.
+    if (prev !== data.reachable) {
+      renderArpDeviceList();
     }
   });
 
@@ -498,6 +530,12 @@ export function renderArpDeviceList(): void {
 
     const filtered = records.filter((r) => {
       if (ownIps.has(r.ip)) return false;
+      // Manual-pinned nodes carry no scan results — the user has
+      // explicitly asked for them to be in the list, so they show
+      // even before (or without) a port scan. Other entries still
+      // need an open port to qualify, otherwise the panel fills up
+      // with discovered-but-not-a-service hosts.
+      if (r.mac.startsWith("manual:")) return true;
       return r.open_ports && r.open_ports.length > 0;
     });
     if (filtered.length === 0) continue;
@@ -515,21 +553,17 @@ export function renderArpDeviceList(): void {
 
       const classes = ["device-item"];
       if (selectedDevice.get() === r.ip) classes.push("selected");
-      if (r.status === "verifying") classes.push("verifying");
-      if (r.status === "offline") classes.push("offline");
 
-      const statusBadge =
-        r.status === "verifying"
-          ? '<span class="device-status" title="Verifying...">verifying</span>'
-          : r.status === "offline"
-            ? '<span class="device-status" title="Last-known state — device not responding">offline</span>'
-            : "";
+      // ICMP-result dot replaces the old verifying/offline/cached
+      // badges — one signal, three colors. Missing entry = no probe
+      // yet (gray); the pinger fills it in within seconds.
+      const dot = renderReachabilityDot(r.ip);
 
       html += `
         <div class="${classes.join(" ")}" data-ip="${r.ip}">
           <div class="device-name-row">
+            ${dot}
             <span class="device-name">${escapeHtml(name)}</span>
-            ${statusBadge}
             <button class="edit-alias-btn" data-alias-ip="${r.ip}" title="Rename">${pencilSvg}</button>
           </div>
           <div class="device-detail-row">

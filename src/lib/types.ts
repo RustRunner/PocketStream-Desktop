@@ -191,3 +191,11 @@ export interface SubnetAdoptedPayload {
 /** Payload for the `interface-status-changed` event emitted by the
  *  Windows NotifyIpInterfaceChange watcher (or pnet poller fallback). */
 export type InterfaceStatusChangedPayload = InterfaceInfo;
+
+/** Payload for the `device-ping-result` event emitted by the ICMP
+ *  pinger on every probe completion. Drives the green/red reachability
+ *  dot in the Nodes panel. */
+export interface DevicePingResultPayload {
+  ip: string;
+  reachable: boolean;
+}
