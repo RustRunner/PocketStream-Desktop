@@ -172,23 +172,32 @@ impl NetworkManager {
         log::info!("Mode change: {:?} → {:?}", old_mode, new_mode);
 
         if new_mode == NetworkMode::StaticManual {
-            // Going INTO Manual: pin every currently-visible device as
-            // a manual node so the user's workflow ("use Auto to find,
-            // switch to Manual to lock in") doesn't lose what was just
-            // discovered. Skip duplicates by IP — add_manual_node
-            // already updates aliases in place for existing pins. Then
-            // stop ARP and rehydrate from the (now-augmented) list.
-            let snapshot = self.device_registry.snapshot();
-            for record in snapshot {
-                if record.mac.starts_with("manual:") {
-                    continue;
-                }
-                let node = crate::config::ManualNode {
-                    ip: record.ip,
-                    alias: record.alias,
-                };
-                if let Err(e) = config.add_manual_node(node) {
-                    log::warn!("Failed to auto-pin discovered device: {}", e);
+            // Going INTO Manual: seed manual_nodes from whatever the
+            // Nodes panel is currently showing — devices with at least
+            // one discovered open port. ARP-only entries (no scan yet)
+            // are skipped because they aren't surfaced to the user, so
+            // pinning them would silently inflate the list.
+            //
+            // Only runs when the pinned pool is empty so a user who's
+            // already curated their list doesn't get it re-polluted on
+            // every mode flip (e.g., Manual → Auto → Manual would
+            // otherwise re-pin anything they deleted in between).
+            if config.get_manual_nodes().is_empty() {
+                let snapshot = self.device_registry.snapshot();
+                for record in snapshot {
+                    if record.mac.starts_with("manual:") {
+                        continue;
+                    }
+                    if record.open_ports.is_empty() {
+                        continue;
+                    }
+                    let node = crate::config::ManualNode {
+                        ip: record.ip,
+                        alias: record.alias,
+                    };
+                    if let Err(e) = config.add_manual_node(node) {
+                        log::warn!("Failed to auto-pin discovered device: {}", e);
+                    }
                 }
             }
             self.stop_arp_discovery().await;

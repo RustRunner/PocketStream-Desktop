@@ -1105,8 +1105,8 @@
   letter-spacing: 0.5px;
   padding: 1px 6px;
   border-radius: 8px;
-  background: rgba(106, 183, 255, 0.18);
-  color: #6ab7ff;
+  background: rgba(61, 220, 132, 0.2);
+  color: var(--md-primary-light);
   vertical-align: middle;
 }
 
@@ -1277,7 +1277,7 @@
 }
 
 #ip-mode.mode-manual {
-  color: #6ab7ff;
+  color: var(--md-primary-light);
   font-weight: 600;
 }
 
