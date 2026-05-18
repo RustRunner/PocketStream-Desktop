@@ -58,6 +58,16 @@ pub struct PlaybackPipeline {
     /// the buffer-arrival watchdog can't catch that case because
     /// it gates on `current=Playing`.
     paused_pending_play_at: Arc<Mutex<Option<Instant>>>,
+    /// Camera IP for the stall diagnostic ping. None for UDP receive,
+    /// where there's no single peer to probe.
+    camera_ip: Option<String>,
+    /// Set when a diagnostic ping has already been issued for the
+    /// current stall window. Cleared by the buffer pad probe when
+    /// frames resume, so each fresh stall gets its own ping log.
+    /// Distinguishes camera-side stalls (ping succeeds) from
+    /// network/adapter stalls (ping fails) without the user having to
+    /// guess.
+    stall_diag_sent: Arc<Mutex<bool>>,
 }
 
 impl PlaybackPipeline {
@@ -68,6 +78,7 @@ impl PlaybackPipeline {
         latency_ms: u32,
         use_tcp: bool,
         window_handle: Option<usize>,
+        camera_ip: Option<String>,
     ) -> Result<Self, AppError> {
         let protocols = if use_tcp { "tcp" } else { "udp+tcp" };
 
@@ -89,7 +100,7 @@ impl PlaybackPipeline {
             proto = protocols,
         );
 
-        let result = Self::from_pipeline_str(&pipeline_str, window_handle)?;
+        let result = Self::from_pipeline_str(&pipeline_str, window_handle, camera_ip)?;
 
         // Set the URL via property (not pipeline-string interpolation) so
         // crafted RTSP paths/credentials can't inject GStreamer syntax.
@@ -126,12 +137,13 @@ impl PlaybackPipeline {
             port = port,
         );
 
-        Self::from_pipeline_str(&pipeline_str, window_handle)
+        Self::from_pipeline_str(&pipeline_str, window_handle, None)
     }
 
     fn from_pipeline_str(
         pipeline_str: &str,
         window_handle: Option<usize>,
+        camera_ip: Option<String>,
     ) -> Result<Self, AppError> {
         let pipeline = gst::parse::launch(pipeline_str)
             .map_err(|e| AppError::Stream(format!("Pipeline parse error: {}", e)))?
@@ -193,10 +205,20 @@ impl PlaybackPipeline {
         let tee_sink = tee
             .static_pad("sink")
             .ok_or_else(|| AppError::Stream("tee sink pad missing".into()))?;
+        let stall_diag_sent = Arc::new(Mutex::new(false));
         let last_buffer_for_probe = last_buffer_at.clone();
+        let stall_diag_for_probe = stall_diag_sent.clone();
         tee_sink.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
             if let Ok(mut guard) = last_buffer_for_probe.lock() {
                 *guard = Some(Instant::now());
+            }
+            // Frames are arriving — any active stall window is over.
+            // Reset the diagnostic flag so the next stall (if any)
+            // logs its own ping result.
+            if let Ok(mut guard) = stall_diag_for_probe.lock() {
+                if *guard {
+                    *guard = false;
+                }
             }
             gst::PadProbeReturn::Ok
         });
@@ -206,6 +228,8 @@ impl PlaybackPipeline {
             appsink,
             last_buffer_at,
             paused_pending_play_at: Arc::new(Mutex::new(None::<Instant>)),
+            camera_ip,
+            stall_diag_sent,
         })
     }
 
@@ -257,6 +281,7 @@ impl PlaybackPipeline {
                             "Stream stalled: pipeline Playing but no buffers for {:.1}s",
                             elapsed.as_secs_f32()
                         );
+                        self.maybe_fire_stall_diag_ping();
                         return Err(format!(
                             "Stream stalled — no frames for {}s",
                             elapsed.as_secs()
@@ -310,6 +335,40 @@ impl PlaybackPipeline {
             );
         }
         Ok(playing)
+    }
+
+    /// Fire a one-shot ICMP probe at the camera IP if we haven't
+    /// already pinged for the current stall window. Result goes to
+    /// the log so a successful ping (camera reachable, stream pause is
+    /// RTSP/camera-side) is distinguishable from a failed ping (path
+    /// loss, USB-Ethernet hiccup, cable). Each fresh stall gets a
+    /// fresh ping — the buffer pad probe clears the flag when frames
+    /// resume.
+    fn maybe_fire_stall_diag_ping(&self) {
+        let Some(ip) = self.camera_ip.clone() else {
+            return;
+        };
+        let Ok(mut guard) = self.stall_diag_sent.lock() else {
+            return;
+        };
+        if *guard {
+            return;
+        }
+        *guard = true;
+        tokio::spawn(async move {
+            let reachable = crate::network::ping_dot::probe(&ip).await;
+            if reachable {
+                log::warn!(
+                    "Stall diagnostic: {} responds to ICMP — stall is RTSP/camera-side, not network",
+                    ip
+                );
+            } else {
+                log::warn!(
+                    "Stall diagnostic: {} unreachable (ICMP timeout) — stall is network/adapter-side",
+                    ip
+                );
+            }
+        });
     }
 
     /// Stop and clean up.

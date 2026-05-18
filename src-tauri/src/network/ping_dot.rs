@@ -119,7 +119,7 @@ pub fn start(app_handle: AppHandle, registry: Arc<DeviceRegistry>) -> PingDotHan
 /// real response came back. Same approach the existing
 /// `ping_sweep_subnets` relies on implicitly via its successful-output
 /// check.
-async fn probe(ip: &str) -> bool {
+pub(crate) async fn probe(ip: &str) -> bool {
     let timeout = PING_TIMEOUT_MS.to_string();
     let output = async_cmd("ping")
         .args(["-n", "1", "-w", &timeout, ip])
