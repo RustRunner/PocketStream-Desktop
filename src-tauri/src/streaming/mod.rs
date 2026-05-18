@@ -163,7 +163,7 @@ impl StreamManager {
             _ => {
                 let url = Self::build_input_url(settings)?;
                 log::info!("Starting RTSP playback from: {}", Self::redact_url(&url));
-                PlaybackPipeline::new_rtsp(&url, 200, true, window_handle)?
+                PlaybackPipeline::new_rtsp(&url, 500, true, window_handle)?
             }
         };
 
