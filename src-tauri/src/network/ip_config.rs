@@ -238,22 +238,31 @@ async fn set_dhcp_windows(interface: &str) -> Result<(), AppError> {
     let escaped = interface.replace('\'', "''");
 
     // Multi-step: drop existing manual IPv4 addresses (DHCP doesn't displace
-    // them on its own), flip the interface to DHCP, reset DNS to auto, then
-    // force an immediate lease renewal so the new state is visible right
-    // away. ErrorAction SilentlyContinue on the cleanup steps so an
-    // already-DHCP adapter with no manual IPs doesn't fail the whole script.
+    // them on its own), drop any static default route (a gateway set via
+    // `netsh set address` persists across the DHCP flip and — often at lower
+    // metric than the DHCP-provided route — blackholes all off-subnet
+    // traffic), flip the interface to DHCP, reset DNS to auto, then force an
+    // immediate lease renewal so the new state is visible right away.
+    // ErrorAction SilentlyContinue on the cleanup steps so an already-DHCP
+    // adapter with no manual IPs or static route doesn't fail the whole
+    // script.
     let inner_script = format!(
         "$alias='{}'; \
          Get-NetIPAddress -InterfaceAlias $alias -AddressFamily IPv4 -PrefixOrigin Manual -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue; \
+         Remove-NetRoute -InterfaceAlias $alias -AddressFamily IPv4 -DestinationPrefix 0.0.0.0/0 -Confirm:$false -ErrorAction SilentlyContinue; \
          Set-NetIPInterface -InterfaceAlias $alias -Dhcp Enabled; \
          Set-DnsClientServerAddress -InterfaceAlias $alias -ResetServerAddresses; \
          ipconfig /renew $alias | Out-Null",
         escaped
     );
 
-    // Fast path: try unelevated first.
+    // Fast path: try unelevated first. kill_on_drop matters here: the
+    // timeout below drops this future, and without it the orphaned
+    // PowerShell would keep mutating the adapter concurrently with the
+    // elevated attempt that follows.
     let direct = super::async_cmd("powershell")
         .args(["-NoProfile", "-Command", &inner_script])
+        .kill_on_drop(true)
         .output();
     if let Ok(Ok(out)) = timeout(Duration::from_secs(30), direct).await {
         if out.status.success() {
@@ -279,6 +288,7 @@ async fn set_dhcp_windows(interface: &str) -> Result<(), AppError> {
     );
     let elevated = super::async_cmd("powershell")
         .args(["-NoProfile", "-Command", &elevated_cmd])
+        .kill_on_drop(true)
         .output();
 
     let out = timeout(Duration::from_secs(60), elevated)
