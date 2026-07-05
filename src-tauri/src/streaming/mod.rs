@@ -151,11 +151,36 @@ impl StreamManager {
         // until it's ready (usually instant, only slow on first cold launch).
         crate::ensure_gstreamer()?;
 
-        let mut state = self.state.lock().await;
+        // Take the old pipeline (and any recording state) out under the
+        // lock; do the slow GStreamer teardown outside it — same
+        // discipline as stop_playback.
+        let (old_pipeline, was_recording, old_rec_path) = {
+            let mut state = self.state.lock().await;
+            let was_recording = state.recording;
+            state.recording = false;
+            let rec_path = state.recording_path.take();
+            (state.playback.take(), was_recording, rec_path)
+        };
 
-        // Stop existing playback if any
-        if let Some(pipeline) = state.playback.take() {
-            let _ = pipeline.stop();
+        if let Some(p) = old_pipeline {
+            if was_recording {
+                // Finalize the MP4 before killing the pipeline. Restart
+                // while recording (reconnect path) used to drop the old
+                // pipeline without detaching: the file lost everything
+                // after its last fragment AND recording stayed true
+                // against a pipeline with no recording bin, making the
+                // next stop_recording fail too.
+                if let Err(e) = p.detach_recording().await {
+                    log::error!(
+                        "Recording finalize during stream restart failed ({}): {}",
+                        old_rec_path.as_deref().unwrap_or("unknown path"),
+                        e
+                    );
+                }
+            }
+            if let Err(e) = p.stop() {
+                log::warn!("Old pipeline stop during restart failed: {}", e);
+            }
         }
 
         let pipeline = match settings.stream.protocol.as_str() {
@@ -177,10 +202,17 @@ impl StreamManager {
         };
 
         pipeline.play()?;
-        state.playback = Some(Arc::new(pipeline));
-        state.start_time = Some(std::time::Instant::now());
 
-        drop(state);
+        // Second lock acquisition (take-old above, store-new here). The
+        // window between them is harmless today — the frontend
+        // serializes stream starts — but concurrent starts would race
+        // to store their pipeline; revisit if that assumption changes.
+        {
+            let mut state = self.state.lock().await;
+            state.playback = Some(Arc::new(pipeline));
+            state.start_time = Some(std::time::Instant::now());
+        }
+
         self.refresh_status().await;
         Ok(())
     }
@@ -384,7 +416,18 @@ impl StreamManager {
     }
 
     pub async fn start_recording(&self) -> Result<(), AppError> {
-        {
+        // Path computation involves filesystem I/O — keep it outside
+        // the lock.
+        let output_dir = dirs::video_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("PocketStream");
+        let path = recorder::recording_path(&output_dir)?;
+        let path_str = path.to_string_lossy().to_string();
+
+        // Reserve the recording slot under the lock so a concurrent
+        // start errors out instead of double-attaching; roll back on
+        // attach failure below.
+        let pipeline = {
             let mut state = self.state.lock().await;
 
             if state.recording {
@@ -397,16 +440,21 @@ impl StreamManager {
                 .ok_or_else(|| AppError::Stream("No active playback to record".into()))?
                 .clone();
 
-            let output_dir = dirs::video_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                .join("PocketStream");
-
-            let path = recorder::recording_path(&output_dir)?;
-            let path_str = path.to_string_lossy().to_string();
-
-            pipeline.attach_recording(&path_str)?;
             state.recording = true;
-            state.recording_path = Some(path_str);
+            state.recording_path = Some(path_str.clone());
+            pipeline
+        };
+
+        // GStreamer pad request/link/state ops outside the lock — the
+        // one lock discipline for StreamManager (stop_playback is the
+        // model).
+        if let Err(e) = pipeline.attach_recording(&path_str) {
+            let mut state = self.state.lock().await;
+            state.recording = false;
+            state.recording_path = None;
+            drop(state);
+            self.refresh_status().await;
+            return Err(e);
         }
 
         self.refresh_status().await;
