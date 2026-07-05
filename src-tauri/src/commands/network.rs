@@ -111,7 +111,9 @@ pub async fn set_network_mode(
         return Ok(());
     }
     config.set_network_mode(mode)?;
-    manager.apply_mode_change(app, &config, old_mode, mode).await
+    manager
+        .apply_mode_change(app, &config, old_mode, mode)
+        .await
 }
 
 // ── Manual Nodes ────────────────────────────────────────────────────

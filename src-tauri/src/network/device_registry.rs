@@ -569,7 +569,10 @@ mod tests {
         assert_eq!(r.snapshot()[0].status, DeviceStatus::CachedOnly);
 
         let result = r.merge_arp(&arp("AA:BB:CC:DD:EE:01", "192.168.1.10", "192.168.1.0/24"));
-        assert!(result.changed, "promoting CachedOnly → Live counts as a change");
+        assert!(
+            result.changed,
+            "promoting CachedOnly → Live counts as a change"
+        );
         assert_eq!(r.snapshot()[0].status, DeviceStatus::Live);
     }
 
@@ -687,7 +690,13 @@ mod tests {
     fn merge_arp_preserves_explicit_alias_over_inherited() {
         let r = DeviceRegistry::new();
         r.hydrate_from_cache(&[
-            cached("OLD:MAC", "192.168.1.202", "192.168.1.0/24", vec![80], "Old"),
+            cached(
+                "OLD:MAC",
+                "192.168.1.202",
+                "192.168.1.0/24",
+                vec![80],
+                "Old",
+            ),
             cached("NEW:MAC", "10.0.0.5", "10.0.0.0/24", vec![80], "Explicit"),
         ]);
         // NEW:MAC moves to PTU's IP. Its existing alias should not be

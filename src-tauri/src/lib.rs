@@ -578,10 +578,7 @@ pub fn run() {
                                     if let Err(e) =
                                         manager.start_arp_discovery(&name, handle.clone()).await
                                     {
-                                        log::warn!(
-                                            "Failed to auto-start ARP discovery: {}",
-                                            e
-                                        );
+                                        log::warn!("Failed to auto-start ARP discovery: {}", e);
                                     }
                                 } else {
                                     log::info!("Skipping ARP discovery (Npcap not installed)");

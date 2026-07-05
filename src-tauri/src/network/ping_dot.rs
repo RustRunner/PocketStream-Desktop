@@ -70,11 +70,7 @@ pub fn start(app_handle: AppHandle, registry: Arc<DeviceRegistry>) -> PingDotHan
 
             // Snapshot IPs once per pass. New devices arriving mid-pass
             // get picked up on the next iteration — within 30 s.
-            let ips: Vec<String> = registry
-                .snapshot()
-                .into_iter()
-                .map(|d| d.ip)
-                .collect();
+            let ips: Vec<String> = registry.snapshot().into_iter().map(|d| d.ip).collect();
 
             for ip in ips {
                 if *cancel_rx.borrow() {

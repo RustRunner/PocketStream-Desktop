@@ -213,20 +213,13 @@ impl NetworkManager {
                 emitter.poke();
             }
             if crate::is_npcap_available() {
-                let iface = self
-                    .interface_name
-                    .lock()
-                    .await
-                    .clone()
-                    .or_else(|| {
-                        interface::list_physical()
-                            .ok()
-                            .and_then(|list| {
-                                list.into_iter()
-                                    .find(|i| i.is_up && i.is_ethernet && !i.ips.is_empty())
-                                    .map(|i| i.name)
-                            })
-                    });
+                let iface = self.interface_name.lock().await.clone().or_else(|| {
+                    interface::list_physical().ok().and_then(|list| {
+                        list.into_iter()
+                            .find(|i| i.is_up && i.is_ethernet && !i.ips.is_empty())
+                            .map(|i| i.name)
+                    })
+                });
                 if let Some(name) = iface {
                     if let Err(e) = self.start_arp_discovery(&name, app_handle.clone()).await {
                         log::warn!("Failed to start ARP after mode change: {}", e);
