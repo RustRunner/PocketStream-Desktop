@@ -221,20 +221,28 @@ impl StreamManager {
         // Take everything out of state under the lock, then do the slow
         // GStreamer transitions outside it. The pipeline is owned (not
         // borrowed) by the time we await, so the lock can drop cleanly.
-        let (pipeline, was_recording) = {
+        let (pipeline, was_recording, rec_path) = {
             let mut state = self.state.lock().await;
             let was_recording = state.recording;
             let pb = state.playback.take();
             state.recording = false;
-            state.recording_path = None;
+            let rec_path = state.recording_path.take();
             state.start_time = None;
-            (pb, was_recording)
+            (pb, was_recording, rec_path)
         };
 
         if let Some(p) = pipeline {
             if was_recording {
-                // Must .await so the EOS flushes and the MP4 moov atom is written.
-                let _ = p.detach_recording().await;
+                // Must .await so the EOS flushes and the file finalizes.
+                // The stop itself proceeds either way, but a finalize
+                // failure names the file instead of vanishing silently.
+                if let Err(e) = p.detach_recording().await {
+                    log::error!(
+                        "Recording finalize during stop failed ({}): {}",
+                        rec_path.as_deref().unwrap_or("unknown path"),
+                        e
+                    );
+                }
             }
             p.stop()?;
         }
@@ -462,10 +470,12 @@ impl StreamManager {
     }
 
     pub async fn stop_recording(&self) -> Result<String, AppError> {
-        // Clone the pipeline Arc and capture path under the lock, then
-        // drop the lock before awaiting on the slow EOS flush.
+        // Snapshot under the lock but do NOT clear the recording state
+        // yet: a failed detach used to leave recording=false with the
+        // path gone — status lied and the path only lived in the log.
+        // State is cleared only after the finalize succeeds.
         let (pipeline, path) = {
-            let mut state = self.state.lock().await;
+            let state = self.state.lock().await;
 
             if !state.recording {
                 return Err(AppError::Stream("Not currently recording".into()));
@@ -477,15 +487,25 @@ impl StreamManager {
                 .ok_or_else(|| AppError::Stream("No active playback".into()))?
                 .clone();
 
-            state.recording = false;
             let path = state
                 .recording_path
-                .take()
+                .clone()
                 .unwrap_or_else(|| "unknown".into());
             (pipeline, path)
         };
 
-        pipeline.detach_recording().await?;
+        if let Err(e) = pipeline.detach_recording().await {
+            return Err(AppError::Stream(format!(
+                "Failed to finalize recording {}: {}",
+                path, e
+            )));
+        }
+
+        {
+            let mut state = self.state.lock().await;
+            state.recording = false;
+            state.recording_path = None;
+        }
 
         log::info!("Recording saved: {}", path);
         self.refresh_status().await;

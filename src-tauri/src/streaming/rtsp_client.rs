@@ -505,11 +505,21 @@ impl PlaybackPipeline {
     }
 
     /// Detach the recording branch and finalize the MP4.
+    ///
+    /// Teardown discipline (each step is load-bearing):
+    /// 1. Unlink inside an IDLE pad probe on the tee's request pad, so
+    ///    an in-flight buffer can't race the unlink.
+    /// 2. Inject EOS into the bin's **sink pad** — sending it to the
+    ///    bin routed it to the bin's source elements, of which a
+    ///    queue→mux→filesink branch has none, so it never arrived and
+    ///    only mp4mux's 1 s fragments saved recordings.
+    /// 3. Wait (bounded) for the EOS to actually reach the filesink via
+    ///    a pad probe there — the pipeline bus won't post EOS for one
+    ///    branch while other sinks keep playing, and `health_check`
+    ///    destructively pops the same bus, so a second bus consumer
+    ///    would race it.
     pub async fn detach_recording(&self) -> Result<(), AppError> {
-        let tee = self
-            .pipeline
-            .by_name("t")
-            .ok_or_else(|| AppError::Stream("Tee element not found".into()))?;
+        const EOS_WAIT: Duration = Duration::from_secs(3);
 
         let rec_bin = self
             .pipeline
@@ -520,15 +530,74 @@ impl PlaybackPipeline {
             .static_pad("sink")
             .ok_or_else(|| AppError::Stream("Recording bin has no sink pad".into()))?;
 
+        // EOS-arrival watcher on the filesink's sink pad, armed before
+        // the EOS is injected so a fast flush can't be missed.
+        let filesink_sink = rec_bin
+            .downcast_ref::<gst::Bin>()
+            .and_then(|b| b.by_name("rec_sink"))
+            .and_then(|sink| sink.static_pad("sink"))
+            .ok_or_else(|| AppError::Stream("Recording filesink pad not found".into()))?;
+        let (eos_tx, eos_rx) = tokio::sync::oneshot::channel::<()>();
+        let eos_tx = std::sync::Mutex::new(Some(eos_tx));
+        filesink_sink.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+            if let Some(gst::PadProbeData::Event(ref ev)) = info.data {
+                if ev.type_() == gst::EventType::Eos {
+                    if let Ok(mut g) = eos_tx.lock() {
+                        if let Some(tx) = g.take() {
+                            let _ = tx.send(());
+                        }
+                    }
+                    return gst::PadProbeReturn::Remove;
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+
         if let Some(tee_src_pad) = bin_sink_pad.peer() {
-            tee_src_pad
-                .unlink(&bin_sink_pad)
-                .map_err(|e| AppError::Stream(format!("Failed to unlink recording: {}", e)))?;
-            tee.release_request_pad(&tee_src_pad);
+            // Unlink from inside an IDLE probe: the callback runs when
+            // the pad is not pushing data (immediately if idle), so an
+            // in-flight buffer can't race the teardown.
+            let (unlinked_tx, unlinked_rx) = tokio::sync::oneshot::channel::<()>();
+            let unlinked_tx = std::sync::Mutex::new(Some(unlinked_tx));
+            let bin_sink_for_probe = bin_sink_pad.clone();
+            let tee = self
+                .pipeline
+                .by_name("t")
+                .ok_or_else(|| AppError::Stream("Tee element not found".into()))?;
+            tee_src_pad.add_probe(gst::PadProbeType::IDLE, move |pad, _| {
+                let _ = pad.unlink(&bin_sink_for_probe);
+                // EOS in through the now-unlinked branch's sink pad so
+                // it drains queue→encoder→mux→filesink.
+                let _ = bin_sink_for_probe.send_event(gst::event::Eos::new());
+                tee.release_request_pad(pad);
+                if let Ok(mut g) = unlinked_tx.lock() {
+                    if let Some(tx) = g.take() {
+                        let _ = tx.send(());
+                    }
+                }
+                gst::PadProbeReturn::Remove
+            });
+            if tokio::time::timeout(EOS_WAIT, unlinked_rx).await.is_err() {
+                return Err(AppError::Stream(
+                    "Recording unlink timed out — branch never went idle".into(),
+                ));
+            }
+        } else {
+            // Already unlinked (shouldn't happen) — still flush the bin.
+            let _ = bin_sink_pad.send_event(gst::event::Eos::new());
         }
 
-        rec_bin.send_event(gst::event::Eos::new());
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Bounded wait for the EOS to reach the filesink instead of the
+        // old unconditional 500 ms sleep. On timeout, proceed to Null —
+        // fragmented MP4 keeps everything up to the last fragment, which
+        // is no worse than the old behavior, but say so in the log.
+        match tokio::time::timeout(EOS_WAIT, eos_rx).await {
+            Ok(Ok(())) => log::info!("Recording EOS reached the file sink"),
+            _ => log::warn!(
+                "Recording EOS did not reach the file sink within {}s — finalizing anyway",
+                EOS_WAIT.as_secs()
+            ),
+        }
 
         rec_bin
             .set_state(gst::State::Null)
