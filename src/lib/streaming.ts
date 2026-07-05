@@ -98,55 +98,69 @@ export async function showModalWithVideo(dialog: HTMLDialogElement): Promise<voi
 const RECORD_DEBOUNCE_MS = 1000;
 let lastRecordToggleAt = 0;
 
+// Busy latch for the stream toggle. A touchscreen double-tap used to
+// race two full start sequences (two child windows, two pipelines)
+// through the same handler before the first await resolved.
+let streamToggleBusy = false;
+
 export function setupStreamControls(): void {
   $<HTMLButtonElement>("#btn-toggle-stream").addEventListener("click", async () => {
-    if (state.isStreaming) {
-      try {
-        // Set flags BEFORE the async stop so an in-flight status event
-        // doesn't race and trigger a false "Stream Lost".
-        state.isStreaming = false;
-        state.streamLost = false;
-        // User asked to stop — don't auto-resume on a later reconnect.
-        resumeSnapshot = null;
-        // Clear any stuck overlay from an earlier drop in this session.
-        hideStreamLost();
-        await api.stopStream();
-        updateStreamUI();
-        showToast("Stream stopped");
-      } catch (e) {
-        showToast("Failed to stop: " + formatError(e), true);
-      }
-    } else {
-      try {
-        const selectedIp = getActiveCamIp();
-        if (!selectedIp) {
-          showToast("Pick a node first (click it in the Nodes panel)", true);
-          return;
+    if (streamToggleBusy) return;
+    streamToggleBusy = true;
+    const toggleBtn = $<HTMLButtonElement>("#btn-toggle-stream");
+    toggleBtn.disabled = true;
+    try {
+      if (state.isStreaming) {
+        try {
+          // Set flags BEFORE the async stop so an in-flight status event
+          // doesn't race and trigger a false "Stream Lost".
+          state.isStreaming = false;
+          state.streamLost = false;
+          // User asked to stop — don't auto-resume on a later reconnect.
+          resumeSnapshot = null;
+          // Clear any stuck overlay from an earlier drop in this session.
+          hideStreamLost();
+          await api.stopStream();
+          updateStreamUI();
+          showToast("Stream stopped");
+        } catch (e) {
+          showToast("Failed to stop: " + formatError(e), true);
         }
-        if (state.config) {
-          state.config.stream.camera_ip = selectedIp;
-          await api.saveConfig(state.config);
+      } else {
+        try {
+          const selectedIp = getActiveCamIp();
+          if (!selectedIp) {
+            showToast("Pick a node first (click it in the Nodes panel)", true);
+            return;
+          }
+          if (state.config) {
+            state.config.stream.camera_ip = selectedIp;
+            await api.saveConfig(state.config);
+          }
+          const bounds = getVideoAreaBounds();
+          const handle = await api.createVideoWindow(
+            bounds.x,
+            bounds.y,
+            bounds.width,
+            bounds.height
+          );
+          // Newly-created child window is born visible (WS_VISIBLE). If a
+          // dialog happens to be open right now, sync immediately so the
+          // child doesn't briefly cover it before startStream returns.
+          syncVideoVisibility();
+          await api.startStream(handle);
+          state.isStreaming = true;
+          updateStreamUI();
+          syncVideoVisibility();
+          notPlayingStreak = 0;
+          showToast("Stream started");
+        } catch (e) {
+          showToast("Stream failed: " + formatError(e), true);
         }
-        const bounds = getVideoAreaBounds();
-        const handle = await api.createVideoWindow(
-          bounds.x,
-          bounds.y,
-          bounds.width,
-          bounds.height
-        );
-        // Newly-created child window is born visible (WS_VISIBLE). If a
-        // dialog happens to be open right now, sync immediately so the
-        // child doesn't briefly cover it before startStream returns.
-        syncVideoVisibility();
-        await api.startStream(handle);
-        state.isStreaming = true;
-        updateStreamUI();
-        syncVideoVisibility();
-        notPlayingStreak = 0;
-        showToast("Stream started");
-      } catch (e) {
-        showToast("Stream failed: " + formatError(e), true);
       }
+    } finally {
+      streamToggleBusy = false;
+      toggleBtn.disabled = false;
     }
   });
 
@@ -171,15 +185,30 @@ export function setupStreamControls(): void {
     lastRecordToggleAt = now;
 
     if (state.isRecording) {
-      const path = await api.stopRecording();
-      state.isRecording = false;
-      $("#btn-record").classList.remove("recording");
-      showToast("Recording saved: " + path);
+      try {
+        const path = await api.stopRecording();
+        state.isRecording = false;
+        $("#btn-record").classList.remove("recording");
+        showToast("Recording saved: " + path);
+      } catch (e) {
+        // Backend keeps its recording state on a failed finalize so the
+        // user can retry — stay in sync by keeping ours too.
+        showToast(formatError(e), true);
+      }
     } else {
-      await api.startRecording();
-      state.isRecording = true;
-      $("#btn-record").classList.add("recording");
-      showToast("Recording started");
+      try {
+        await api.startRecording();
+        state.isRecording = true;
+        $("#btn-record").classList.add("recording");
+        showToast("Recording started");
+      } catch (e) {
+        // A rejected start (no playback, already recording) used to
+        // reject unhandled — no toast, and the button state could
+        // drift from the backend.
+        showToast(formatError(e), true);
+        state.isRecording = false;
+        $("#btn-record").classList.remove("recording");
+      }
     }
   });
 }
@@ -209,6 +238,23 @@ function updateStreamUI(): void {
 }
 
 // ── RTSP server controls ────────────────────────────────────────────
+
+/** Busy latch for the RTSP toggle (see streamToggleBusy). */
+let rtspToggleBusy = false;
+
+/**
+ * Re-derive the RTSP Start button's enabled state from the Enable
+ * checkbox. `loadConfig` sets `.checked` programmatically, which fires
+ * no `change` event — without this call, a user whose config has the
+ * server enabled got a dead Start button until they toggled the
+ * checkbox off and on.
+ */
+export function syncRtspStartButton(): void {
+  const startBtn = $<HTMLButtonElement>("#btn-toggle-rtsp");
+  startBtn.disabled = state.isRtspRunning
+    ? false
+    : !$<HTMLInputElement>("#rtsp-server-enable").checked;
+}
 
 export function setupRtspControls(): void {
   // The Enable toggle is also a kill switch: turning it off while the
@@ -248,6 +294,11 @@ export function setupRtspControls(): void {
   });
 
   $<HTMLButtonElement>("#btn-toggle-rtsp").addEventListener("click", async () => {
+    // Same double-tap defense as the stream toggle.
+    if (rtspToggleBusy) return;
+    rtspToggleBusy = true;
+    startBtn.disabled = true;
+
     const spinner = $<HTMLElement>("#rtsp-spinner");
     spinner.style.display = "";
 
@@ -280,6 +331,10 @@ export function setupRtspControls(): void {
     }
 
     spinner.style.display = "none";
+    rtspToggleBusy = false;
+    // updateRtspUI ran in the happy paths; re-derive here so a thrown
+    // start/stop doesn't leave the button stuck disabled.
+    startBtn.disabled = state.isRtspRunning ? false : !enableToggle.checked;
   });
 
   // QR code button + dialog
@@ -434,6 +489,20 @@ export function startStatusListener(): void {
 function handleStatus(status: StreamStatus | null): void {
   if (!status) return;
 
+  // Heal the webview-reload desync: after a reload the backend may
+  // still be serving while the fresh UI shows Offline (uptime used to
+  // tick under an "Offline" label). State is set BEFORE updateRtspUI,
+  // which reads it. Note the backend field is handle-presence, not
+  // liveness — a dead server loop still reports true, and detecting
+  // that belongs to the backend shutdown/liveness work, not here.
+  if (state.isRtspRunning !== status.rtsp_server_running) {
+    state.isRtspRunning = status.rtsp_server_running;
+    if (status.rtsp_url) {
+      rtspFullUrl = status.rtsp_url;
+    }
+    updateRtspUI(status.display_url ?? null);
+  }
+
   if (status.rtsp_server_running) {
     $("#rtsp-uptime").textContent = formatUptime(status.uptime_secs);
     $("#rtsp-bandwidth").textContent = `${status.bandwidth_kbps.toFixed(1)} kbps`;
@@ -501,6 +570,11 @@ export async function handleReconnect(): Promise<void> {
   // is long enough to catch most settling but short enough to feel
   // responsive when the user's waiting for the stream to come back.
   await new Promise((r) => setTimeout(r, 2000));
+
+  // The user may have hit Stop during that grace window — a manual
+  // stop clears both flags, and resuming anyway would override their
+  // decision (same guard attemptStallRecovery uses).
+  if (!state.isStreaming || !state.streamLost) return;
 
   // Restore dropdown selections (dropdown may have been repopulated
   // during reconnect; set the persisted CAM so getActiveCamIp picks

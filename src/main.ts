@@ -28,6 +28,7 @@ import {
   getVideoAreaBounds,
   startStatusListener,
   handleHardDisconnect,
+  syncRtspStartButton,
 } from "./lib/streaming.ts";
 import { setupPtzControls } from "./lib/ptz.ts";
 import type {
@@ -290,6 +291,10 @@ async function loadConfig(): Promise<void> {
     $<HTMLInputElement>("#camera-user").value = state.config.credentials.username;
     $<HTMLInputElement>("#camera-pass").value = state.config.credentials.password;
     $<HTMLInputElement>("#rtsp-server-enable").checked = state.config.rtsp_server.enabled;
+    // Programmatic .checked fires no change event — re-derive the Start
+    // button's enabled state, or enabled-in-config users get a dead
+    // button until they toggle the checkbox off and on.
+    syncRtspStartButton();
     $<HTMLInputElement>("#rtsp-server-port").value = String(state.config.rtsp_server.port);
     $<HTMLInputElement>("#rtsp-token").value = state.config.rtsp_server.token;
     if (state.config.rtsp_server.bind_interface) {
