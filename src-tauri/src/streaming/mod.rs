@@ -52,6 +52,16 @@ pub struct StreamManager {
     status_tx: Arc<watch::Sender<StreamStatus>>,
 }
 
+/// What a running consumer is ingesting, captured at start time. The
+/// double-bind guard compares "what's running" against "what's being
+/// started" using this — re-deriving it from settings would be wrong,
+/// since settings can change between the two starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceMode {
+    Udp { port: u16 },
+    Rtsp,
+}
+
 struct StreamState {
     playback: Option<Arc<PlaybackPipeline>>,
     rtsp_server: Option<RtspRestreamer>,
@@ -61,6 +71,8 @@ struct StreamState {
     rtsp_start_time: Option<std::time::Instant>,
     /// Cached IP resolved at RTSP server start — avoids running PowerShell every poll.
     rtsp_local_ip: Option<String>,
+    /// Source the running playback was started with (None when idle).
+    playback_source: Option<SourceMode>,
 }
 
 impl StreamManager {
@@ -75,6 +87,7 @@ impl StreamManager {
                 start_time: None,
                 rtsp_start_time: None,
                 rtsp_local_ip: None,
+                playback_source: None,
             })),
             video_hwnd: Arc::new(std::sync::atomic::AtomicIsize::new(0)),
             status_tx: Arc::new(status_tx),
@@ -156,6 +169,27 @@ impl StreamManager {
         // discipline as stop_playback.
         let (old_pipeline, was_recording, old_rec_path) = {
             let mut state = self.state.lock().await;
+
+            // Double-bind guard (checked before touching the old
+            // pipeline, so a refused start leaves it running): on
+            // Windows only one socket receives a unicast UDP datagram,
+            // so preview and the restreamer ingesting the same port
+            // means one of them silently gets nothing. The restreamer's
+            // udpsrc binds lazily on first client connect, which is why
+            // this is guarded at start time rather than probed.
+            if settings.stream.protocol == "udp" {
+                let conflict = state.rtsp_server.as_ref().and_then(|s| s.udp_ingest_port())
+                    == Some(settings.stream.udp_port);
+                if conflict {
+                    return Err(AppError::Stream(format!(
+                        "UDP port {} is already claimed by the RTSP re-stream \
+                         server — only one consumer can receive a UDP stream. \
+                         Stop the RTSP server first, or switch the input to RTSP.",
+                        settings.stream.udp_port
+                    )));
+                }
+            }
+
             let was_recording = state.recording;
             state.recording = false;
             let rec_path = state.recording_path.take();
@@ -211,6 +245,12 @@ impl StreamManager {
             let mut state = self.state.lock().await;
             state.playback = Some(Arc::new(pipeline));
             state.start_time = Some(std::time::Instant::now());
+            state.playback_source = Some(match settings.stream.protocol.as_str() {
+                "udp" => SourceMode::Udp {
+                    port: settings.stream.udp_port,
+                },
+                _ => SourceMode::Rtsp,
+            });
         }
 
         self.refresh_status().await;
@@ -228,6 +268,7 @@ impl StreamManager {
             state.recording = false;
             let rec_path = state.recording_path.take();
             state.start_time = None;
+            state.playback_source = None;
             (pb, was_recording, rec_path)
         };
 
@@ -282,6 +323,23 @@ impl StreamManager {
         }
 
         let mut state = self.state.lock().await;
+
+        // Double-bind guard, mirror of the one in start_playback: the
+        // restreamer's UDP ingest must not claim the port the running
+        // preview is already receiving on.
+        if settings.stream.protocol == "udp" {
+            if let Some(SourceMode::Udp { port }) = state.playback_source {
+                if port == settings.stream.udp_port {
+                    return Err(AppError::Stream(format!(
+                        "UDP port {} is already claimed by the running preview — \
+                         only one consumer can receive a UDP stream. Stop the \
+                         stream first, or switch the input to RTSP.",
+                        port
+                    )));
+                }
+            }
+        }
+
         let mount_path = format!("/stream-{}", settings.rtsp_server.token);
 
         // Resolve bind interface to an IP address

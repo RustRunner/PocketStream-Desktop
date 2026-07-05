@@ -41,6 +41,11 @@ pub struct RtspRestreamer {
     loop_done_rx: Option<tokio::sync::oneshot::Receiver<()>>,
     port: u16,
     mount_path: String,
+    /// UDP port the factory's `udpsrc` ingests from (None for the RTSP
+    /// source mode). Captured at start time for the double-bind guard —
+    /// the bind itself happens lazily on first client connect, so the
+    /// claim isn't observable from the socket table at start.
+    udp_ingest_port: Option<u16>,
     bytes_sent: Arc<AtomicU64>,
     bandwidth_start: std::time::Instant,
 }
@@ -255,6 +260,7 @@ impl RtspRestreamer {
             loop_done_rx: Some(loop_done_rx),
             port,
             mount_path: mount_path.into(),
+            udp_ingest_port: None,
             bytes_sent,
             bandwidth_start: std::time::Instant::now(),
         })
@@ -309,6 +315,7 @@ impl RtspRestreamer {
             loop_done_rx: Some(loop_done_rx),
             port: server_port,
             mount_path: mount_path.into(),
+            udp_ingest_port: Some(udp_port),
             bytes_sent,
             bandwidth_start: std::time::Instant::now(),
         })
@@ -338,6 +345,12 @@ impl RtspRestreamer {
     #[allow(dead_code)]
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// UDP port the media factory ingests from, if this server was
+    /// started in UDP source mode. Used by the double-bind guard.
+    pub fn udp_ingest_port(&self) -> Option<u16> {
+        self.udp_ingest_port
     }
 }
 
