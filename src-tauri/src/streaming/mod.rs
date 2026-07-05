@@ -269,10 +269,19 @@ impl StreamManager {
             log::warn!("Firewall setup: {}", e);
         }
 
-        let mut state = self.state.lock().await;
+        // Replace path: tear any existing server down fully (outside
+        // the lock) before binding the new one — dropping it in place
+        // left the port claimed by a socket whose loop was still
+        // running, so quick restarts hit "port in use".
+        let old_server = {
+            let mut state = self.state.lock().await;
+            state.rtsp_server.take()
+        };
+        if let Some(old) = old_server {
+            old.shutdown().await;
+        }
 
-        // Stop existing server if any
-        state.rtsp_server = None;
+        let mut state = self.state.lock().await;
         let mount_path = format!("/stream-{}", settings.rtsp_server.token);
 
         // Resolve bind interface to an IP address
@@ -330,19 +339,24 @@ impl StreamManager {
     }
 
     pub async fn stop_rtsp_server(&self) -> Result<(), AppError> {
-        let mut state = self.state.lock().await;
-        if let Some(server) = state.rtsp_server.take() {
-            state.rtsp_start_time = None;
-            state.rtsp_local_ip = None;
-            // Drop the server in a blocking thread so GLib cleanup
-            // (closing active RTSP sessions) doesn't block the async runtime.
-            tokio::task::spawn_blocking(move || {
-                drop(server);
-                log::info!("RTSP server fully cleaned up");
-            });
+        let server = {
+            let mut state = self.state.lock().await;
+            let server = state.rtsp_server.take();
+            if server.is_some() {
+                state.rtsp_start_time = None;
+                state.rtsp_local_ip = None;
+            }
+            server
+        };
+        if let Some(server) = server {
+            // Await the full teardown (sessions filtered while the loop
+            // is alive, loop quit, thread joined with a bound) so a
+            // quick stop→start can't hit "port in use" against the old
+            // socket.
+            server.shutdown().await;
+            log::info!("RTSP server fully cleaned up");
         }
         log::info!("RTSP server stopped");
-        drop(state);
         self.refresh_status().await;
         Ok(())
     }

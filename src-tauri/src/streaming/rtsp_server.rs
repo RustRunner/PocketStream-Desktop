@@ -30,9 +30,15 @@ fn redact_mount_path(mount_path: &str) -> String {
 }
 
 pub struct RtspRestreamer {
-    #[allow(dead_code)]
     server: gst_rtsp_server::RTSPServer,
     main_loop: glib::MainLoop,
+    /// The dedicated GLib loop thread. Joined by `shutdown`; a plain
+    /// drop leaves it to exit on its own after the Drop-quit.
+    loop_thread: Option<std::thread::JoinHandle<()>>,
+    /// Signalled by the loop thread right before it exits — the only
+    /// way to bound the join (`std::thread::JoinHandle` has no
+    /// join-with-timeout).
+    loop_done_rx: Option<tokio::sync::oneshot::Receiver<()>>,
     port: u16,
     mount_path: String,
     bytes_sent: Arc<AtomicU64>,
@@ -41,6 +47,9 @@ pub struct RtspRestreamer {
 
 impl Drop for RtspRestreamer {
     fn drop(&mut self) {
+        // Backstop only — the deliberate path is `shutdown`, which
+        // tears sessions down while the loop can still dispatch and
+        // then joins the thread.
         self.main_loop.quit();
         log::info!("RTSP server main loop quit signalled");
     }
@@ -89,8 +98,19 @@ impl RtspRestreamer {
     }
 
     /// Create the server source, attach to a dedicated context, and spawn
-    /// a background thread running a MainLoop on that context.
-    fn attach_and_run(server: &gst_rtsp_server::RTSPServer) -> Result<glib::MainLoop, AppError> {
+    /// a background thread running a MainLoop on that context. Returns
+    /// the loop plus the thread handle and a completion channel so
+    /// `shutdown` can join with a bound.
+    fn attach_and_run(
+        server: &gst_rtsp_server::RTSPServer,
+    ) -> Result<
+        (
+            glib::MainLoop,
+            std::thread::JoinHandle<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        ),
+        AppError,
+    > {
         // create_source gives us the real error (port in use, permission denied, etc.)
         let source = server
             .create_source(gio::Cancellable::NONE)
@@ -103,8 +123,9 @@ impl RtspRestreamer {
 
         let main_loop = glib::MainLoop::new(Some(&ctx), false);
         let loop_clone = main_loop.clone();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
 
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("rtsp-server-glib".into())
             .spawn(move || {
                 let _ = ctx.with_thread_default(|| {
@@ -112,10 +133,57 @@ impl RtspRestreamer {
                     loop_clone.run();
                     log::info!("RTSP server GLib main loop exited");
                 });
+                let _ = done_tx.send(());
             })
             .map_err(|e| AppError::Stream(format!("Failed to spawn RTSP server thread: {}", e)))?;
 
-        Ok(main_loop)
+        Ok((main_loop, handle, done_rx))
+    }
+
+    /// Deterministic teardown. Ordering is load-bearing:
+    /// 1. Remove the mount so no new client connects mid-teardown.
+    /// 2. Filter every session out of the pool **while the loop is
+    ///    still alive** — client and camera-side RTSP session teardown
+    ///    dispatches on it; after quit they'd linger until TCP death
+    ///    (which matters for Nexus encoders with session limits).
+    /// 3. Quit the loop and join the thread, bounded by the completion
+    ///    channel — if the loop never exits, leak the thread rather
+    ///    than hang stop.
+    pub async fn shutdown(mut self) {
+        if let Some(mounts) = self.server.mount_points() {
+            mounts.remove_factory(&self.mount_path);
+        }
+
+        if let Some(pool) = self.server.session_pool() {
+            let removed = pool.filter(Some(&mut |_pool: &_, _session: &_| {
+                gst_rtsp_server::RTSPFilterResult::Remove
+            }));
+            if !removed.is_empty() {
+                log::info!("RTSP server: removed {} active session(s)", removed.len());
+            }
+        }
+
+        self.main_loop.quit();
+
+        let done_rx = self.loop_done_rx.take();
+        let handle = self.loop_thread.take();
+        let exited = match done_rx {
+            Some(rx) => tokio::time::timeout(std::time::Duration::from_secs(3), rx)
+                .await
+                .is_ok(),
+            None => false,
+        };
+        if exited {
+            if let Some(h) = handle {
+                let _ = tokio::task::spawn_blocking(move || h.join()).await;
+            }
+            log::info!("RTSP server loop thread joined");
+        } else {
+            log::warn!(
+                "RTSP server loop did not exit within 3s — leaking its thread instead of hanging stop"
+            );
+            drop(handle);
+        }
     }
 
     /// Start an RTSP server that re-streams from an RTSP source.
@@ -172,7 +240,7 @@ impl RtspRestreamer {
             log::info!("RTSP client connected");
         });
 
-        let main_loop = Self::attach_and_run(&server)?;
+        let (main_loop, loop_thread, loop_done_rx) = Self::attach_and_run(&server)?;
 
         log::info!(
             "RTSP server started on port {} at {}",
@@ -183,6 +251,8 @@ impl RtspRestreamer {
         Ok(Self {
             server,
             main_loop,
+            loop_thread: Some(loop_thread),
+            loop_done_rx: Some(loop_done_rx),
             port,
             mount_path: mount_path.into(),
             bytes_sent,
@@ -224,7 +294,7 @@ impl RtspRestreamer {
             .ok_or_else(|| AppError::Stream("Failed to get mount points".into()))?;
         mounts.add_factory(mount_path, factory);
 
-        let main_loop = Self::attach_and_run(&server)?;
+        let (main_loop, loop_thread, loop_done_rx) = Self::attach_and_run(&server)?;
 
         log::info!(
             "RTSP server (UDP source) started on port {} at {}",
@@ -235,6 +305,8 @@ impl RtspRestreamer {
         Ok(Self {
             server,
             main_loop,
+            loop_thread: Some(loop_thread),
+            loop_done_rx: Some(loop_done_rx),
             port: server_port,
             mount_path: mount_path.into(),
             bytes_sent,
