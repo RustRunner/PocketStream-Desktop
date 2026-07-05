@@ -15,6 +15,12 @@ let ptuSpeedBig = 100;
 let ptuSpeedSmall = 10;
 let ptuSpeedQueried = false;
 
+/** Monotonic D-pad press counter. */
+let ptuPressSeq = 0;
+/** Highest press sequence whose release has been recorded. A queued
+ *  move with seq <= this is dropped at dequeue (see startMove). */
+let ptuReleasedThrough = 0;
+
 interface SavedPreset {
   /** PP value as the camera returned it — kept as string so re-sending
    *  it doesn't introduce a parseInt round-trip. */
@@ -37,10 +43,70 @@ function getPtuIp(): string | null {
   return getActivePtuIp();
 }
 
+// ── PTU command FIFO ────────────────────────────────────────────────
+// Every PTU HTTP send goes through this queue, so exactly one request
+// is in flight and commands reach the unit in the order they were
+// issued. Without it, a quick D-pad tap could deliver stop before move
+// (the move used to wait behind a speed-limit query while the stop
+// fired immediately) and the PTU would drive at full speed until the
+// next command. One global queue is enough: only one PTU is active at
+// a time (alias-driven), and the target IP is resolved at dequeue so a
+// PTU re-alias mid-queue sends to the current unit.
+
+interface QueuedPtuCmd {
+  /** Command string, or a thunk evaluated at dequeue time — used by
+   *  D-pad moves so a just-completed speed-limit query ahead of them in
+   *  the queue is reflected in the speed they send. */
+  cmd: string | (() => string);
+  resolve: (v: Record<string, string> | null) => void;
+  reject: (e: unknown) => void;
+  /** Checked at dequeue: return false to drop the command unsent
+   *  (resolves null). Used to drop a queued move whose release already
+   *  happened. */
+  stillWanted?: () => boolean;
+}
+
+const ptuQueue: QueuedPtuCmd[] = [];
+let ptuDraining = false;
+
+function enqueuePtuCmd(
+  cmd: string | (() => string),
+  opts?: { stillWanted?: () => boolean }
+): Promise<Record<string, string> | null> {
+  return new Promise((resolve, reject) => {
+    ptuQueue.push({ cmd, resolve, reject, stillWanted: opts?.stillWanted });
+    if (!ptuDraining) {
+      ptuDraining = true;
+      void drainPtuQueue();
+    }
+  });
+}
+
+async function drainPtuQueue(): Promise<void> {
+  while (ptuQueue.length > 0) {
+    const item = ptuQueue.shift()!;
+    if (item.stillWanted && !item.stillWanted()) {
+      item.resolve(null);
+      continue;
+    }
+    const ip = getPtuIp();
+    if (!ip) {
+      item.resolve(null);
+      continue;
+    }
+    const cmdStr = typeof item.cmd === "function" ? item.cmd() : item.cmd;
+    try {
+      item.resolve(await api.ptuSend(ip, cmdStr));
+    } catch (e) {
+      item.reject(e);
+    }
+  }
+  ptuDraining = false;
+}
+
 async function ptuCmd(cmd: string): Promise<Record<string, string> | null> {
-  const ip = getPtuIp();
-  if (!ip) return null;
-  return api.ptuSend(ip, cmd);
+  if (!getPtuIp()) return null;
+  return enqueuePtuCmd(cmd);
 }
 
 /**
@@ -169,17 +235,33 @@ export function setupPtzControls(): void {
       return;
     }
 
-    const startMove = async (): Promise<void> => {
+    // Press bookkeeping for the FIFO: each press gets a sequence number,
+    // and a queued move whose release has already been recorded is
+    // dropped at dequeue instead of sent — a tap released while the move
+    // was still waiting in the queue must not start motion that only the
+    // (already-processed) stop could end.
+    //
+    // All speed commands are C=V-prefixed: a D-pad press landing during
+    // a Home/preset goto used to arrive while the PTU was still in C=I
+    // (absolute) mode, where a PS=<speed> can drive the unit past its
+    // limits (the 0.2.9 runaway-pan case). The prefix flips the unit
+    // back to velocity mode in the same command, which both closes that
+    // window and makes grabbing the D-pad cancel an in-flight goto.
+    const startMove = (): void => {
       if (!getPtuIp()) return;
-      if (!ptuSpeedQueried) await queryPtuSpeed();
+      if (!ptuSpeedQueried) void queryPtuSpeed();
+      const seq = ++ptuPressSeq;
       if (action && action in speedCmds) {
         const cmdFn = speedCmds[action as SpeedAction];
-        ptuCmd(cmdFn()).catch((e) => log(`PTU ${action}: ${formatError(e)}`));
+        enqueuePtuCmd(() => `C=V&${cmdFn()}`, {
+          stillWanted: () => ptuReleasedThrough < seq,
+        }).catch((e) => log(`PTU ${action}: ${formatError(e)}`));
       }
     };
     const stopMove = (): void => {
       if (!getPtuIp()) return;
-      ptuCmd("PS=0&TS=0").catch(() => {});
+      ptuReleasedThrough = ptuPressSeq;
+      ptuCmd("C=V&PS=0&TS=0").catch(() => {});
     };
 
     btn.addEventListener("pointerdown", (e) => {
