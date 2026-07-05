@@ -5,16 +5,30 @@ use tauri::State;
 
 use crate::config::AppConfig;
 use crate::error::AppError;
-use crate::validation::parse_camera_ip;
+use crate::network::NetworkManager;
+use crate::validation::parse_known_camera_ip;
+
+/// Resolve and validate a camera-control target. Camera-control commands
+/// use the known-device validator so a FLIR that fell back to APIPA stays
+/// controllable while it's discovered/adopted (see `parse_known_camera_ip`
+/// for the exact conditions).
+async fn control_target(
+    ip: &str,
+    manager: &NetworkManager,
+) -> Result<std::net::Ipv4Addr, AppError> {
+    let adopted: Vec<String> = manager.get_adopted_ips().await.into_keys().collect();
+    parse_known_camera_ip(ip, &manager.registry(), &adopted)
+}
 
 // ── FLIR PTU ────────────────────────────────────────────────────────
 
 #[tauri::command]
 pub async fn ptu_send(
+    manager: State<'_, NetworkManager>,
     ip: String,
     cmd: String,
 ) -> Result<std::collections::HashMap<String, String>, AppError> {
-    let addr = parse_camera_ip(&ip)?;
+    let addr = control_target(&ip, &manager).await?;
     let base_url = format!("http://{}", addr);
     crate::camera::flir_ptu::send_command(&base_url, &cmd).await
 }
@@ -52,12 +66,13 @@ pub async fn ptz_set_preset(camera_url: String, preset: u32, name: String) -> Re
 
 #[tauri::command]
 pub async fn sony_cgi_zoom(
+    manager: State<'_, NetworkManager>,
     ip: String,
     zoom_speed: i32,
     username: String,
     password: String,
 ) -> Result<(), AppError> {
-    let addr = parse_camera_ip(&ip)?;
+    let addr = control_target(&ip, &manager).await?;
 
     let url = if zoom_speed == 0 {
         format!(
@@ -104,8 +119,12 @@ pub async fn sony_cgi_zoom(
 /// raw integer the web UI emits — 0 = Wide end, 31424 = Telephoto end for
 /// this hardware. The frontend maps its 0–100% slider into that range.
 #[tauri::command]
-pub async fn control_cgi_zoom_direct(ip: String, position: i32) -> Result<(), AppError> {
-    let addr = parse_camera_ip(&ip)?;
+pub async fn control_cgi_zoom_direct(
+    manager: State<'_, NetworkManager>,
+    ip: String,
+    position: i32,
+) -> Result<(), AppError> {
+    let addr = control_target(&ip, &manager).await?;
     let url = format!("http://{}/cgi-bin/control.cgi", addr);
     let command = format!("zoom_direct {}", position);
     let form = [
@@ -164,8 +183,11 @@ pub async fn control_cgi_zoom_direct(ip: String, position: i32) -> Result<(), Ap
 /// out which endpoint carries the current zoom position on this model so
 /// we can wire up launch-time slider sync.
 #[tauri::command]
-pub async fn control_cgi_probe_status(ip: String) -> Result<String, AppError> {
-    let addr = parse_camera_ip(&ip)?;
+pub async fn control_cgi_probe_status(
+    manager: State<'_, NetworkManager>,
+    ip: String,
+) -> Result<String, AppError> {
+    let addr = control_target(&ip, &manager).await?;
     let url = format!("http://{}/cgi-bin/control.cgi", addr);
     let client = reqwest::Client::new();
 
