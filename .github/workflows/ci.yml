@@ -88,16 +88,43 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # Install GStreamer SDK via Chocolatey. Both packages are required:
-      # `gstreamer` provides the runtime DLLs, `gstreamer-devel` provides
-      # the .lib import libraries that gstreamer-rs needs at link time
-      # (build.rs delay-loads the DLLs but link still resolves symbols
-      # against the .libs). Pinning the version keeps CI deterministic.
+      # Install the GStreamer SDK from upstream MSIs, pinned by URL and
+      # SHA256. Both installers are required: the runtime MSI provides
+      # the DLLs, the devel MSI provides the .lib import libraries that
+      # gstreamer-rs needs at link time (build.rs delay-loads the DLLs
+      # but link still resolves symbols against the .libs). Chocolatey
+      # is not usable here: it stopped publishing gstreamer-devel after
+      # 1.24.9, so the runtime and devel packages can no longer be
+      # version-matched, and upstream prunes non-terminal patch MSIs
+      # (1.24.13 is the terminal 1.24.x release). ADDLOCAL=ALL because
+      # the crate links optional components (e.g. gstrtspserver) that a
+      # default install omits. The MSIs install to
+      # C:\gstreamer\1.0\msvc_x86_64\, which the environment step below
+      # depends on.
       - name: Install GStreamer (MSVC x86_64)
         shell: pwsh
         run: |
-          choco install gstreamer --version=1.24.10 --no-progress -y
-          choco install gstreamer-devel --version=1.24.10 --no-progress -y
+          $base = 'https://gstreamer.freedesktop.org/data/pkg/windows/1.24.13/msvc'
+          $msis = @(
+            @{ Name = 'gstreamer-1.0-msvc-x86_64-1.24.13.msi'
+               Sha256 = '66915D82ADDA34189703C36A5D2EF145D2E3AFB7AFC12C66FCF2EA506E2466D2' },
+            @{ Name = 'gstreamer-1.0-devel-msvc-x86_64-1.24.13.msi'
+               Sha256 = '0AFB4394C2CBA3999C0F5E74F28C2AC5D98F03131140E09246D4DCD60A0A0395' }
+          )
+          foreach ($msi in $msis) {
+            $path = Join-Path $env:RUNNER_TEMP $msi.Name
+            curl.exe -fsSL --retry 3 --retry-delay 5 -o $path "$base/$($msi.Name)"
+            if ($LASTEXITCODE -ne 0) { throw "download failed: $($msi.Name)" }
+            $hash = (Get-FileHash -Path $path -Algorithm SHA256).Hash
+            if ($hash -ne $msi.Sha256) {
+              throw "SHA256 mismatch for $($msi.Name): expected $($msi.Sha256), got $hash"
+            }
+            $proc = Start-Process msiexec.exe -Wait -PassThru `
+              -ArgumentList '/i', $path, '/qn', 'ADDLOCAL=ALL'
+            if ($proc.ExitCode -ne 0) {
+              throw "msiexec exit $($proc.ExitCode) for $($msi.Name)"
+            }
+          }
 
       - name: Configure GStreamer environment
         shell: pwsh
