@@ -110,11 +110,12 @@ pub fn start(app_handle: AppHandle, registry: Arc<DeviceRegistry>) -> PingDotHan
 ///
 /// Windows `ping` is sloppy about exit codes — it can exit 0 on
 /// "Destination host unreachable" depending on routing, and exit
-/// non-zero only when *every* probe times out. Checking the stdout
-/// for the `Reply from` marker is the only reliable signal that a
-/// real response came back. Same approach the existing
-/// `ping_sweep_subnets` relies on implicitly via its successful-output
-/// check.
+/// non-zero only when *every* probe times out. And `Reply from` alone
+/// is not the signal either: an unreachable local-subnet device (ARP
+/// failure) prints `Reply from <own-ip>: Destination host unreachable.`
+/// — a "reply" from ourselves or a router saying the target is dead.
+/// Only real echo replies carry a `TTL=` field, and localized Windows
+/// keeps that token untranslated, so it's the discriminator.
 pub(crate) async fn probe(ip: &str) -> bool {
     let timeout = PING_TIMEOUT_MS.to_string();
     let output = async_cmd("ping")
@@ -123,10 +124,54 @@ pub(crate) async fn probe(ip: &str) -> bool {
         .await;
 
     match output {
-        Ok(o) => {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            stdout.contains("Reply from")
-        }
+        Ok(o) => is_echo_reply(&String::from_utf8_lossy(&o.stdout)),
         Err(_) => false,
+    }
+}
+
+/// True only for output containing a genuine echo reply. See `probe`
+/// for why `TTL=` and not `Reply from`.
+fn is_echo_reply(stdout: &str) -> bool {
+    stdout.contains("TTL=")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_echo_reply;
+
+    #[test]
+    fn real_echo_reply_is_reachable() {
+        let out = "\r\nPinging 192.168.12.1 with 32 bytes of data:\r\n\
+                   Reply from 192.168.12.1: bytes=32 time=1ms TTL=64\r\n\r\n\
+                   Ping statistics for 192.168.12.1:\r\n\
+                       Packets: Sent = 1, Received = 1, Lost = 0 (0% loss),\r\n";
+        assert!(is_echo_reply(out));
+    }
+
+    #[test]
+    fn unreachable_reported_by_self_is_not_reachable() {
+        // ARP failure on the local subnet: our own adapter "replies".
+        // This is the exact output for an unplugged camera.
+        let out = "\r\nPinging 192.168.12.77 with 32 bytes of data:\r\n\
+                   Reply from 192.168.12.64: Destination host unreachable.\r\n\r\n\
+                   Ping statistics for 192.168.12.77:\r\n\
+                       Packets: Sent = 1, Received = 1, Lost = 0 (0% loss),\r\n";
+        assert!(!is_echo_reply(out));
+    }
+
+    #[test]
+    fn unreachable_reported_by_router_is_not_reachable() {
+        let out = "\r\nPinging 10.20.30.40 with 32 bytes of data:\r\n\
+                   Reply from 192.168.12.1: Destination host unreachable.\r\n";
+        assert!(!is_echo_reply(out));
+    }
+
+    #[test]
+    fn timeout_is_not_reachable() {
+        let out = "\r\nPinging 192.168.12.77 with 32 bytes of data:\r\n\
+                   Request timed out.\r\n\r\n\
+                   Ping statistics for 192.168.12.77:\r\n\
+                       Packets: Sent = 1, Received = 0, Lost = 1 (100% loss),\r\n";
+        assert!(!is_echo_reply(out));
     }
 }
