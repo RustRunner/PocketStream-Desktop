@@ -271,8 +271,5 @@ pub async fn set_zoom_position(
     camera_ip: String,
     percent: i32,
 ) -> Result<(), AppError> {
-    let mut settings = config.get();
-    let clamped = percent.clamp(0, 100);
-    settings.zoom_positions.insert(camera_ip, clamped);
-    config.update(settings)
+    config.update_zoom_position(camera_ip, percent)
 }

@@ -377,9 +377,7 @@ impl NetworkManager {
         // Outside the lock — config.update writes to disk and shouldn't
         // block other readers of adopted_ips.
         if let Some(adopted) = save_snapshot {
-            let mut new_settings = config.get();
-            new_settings.adopted_subnets = adopted;
-            match config.update(new_settings) {
+            match config.update_adopted_subnets(adopted) {
                 Ok(()) => log::info!("Saved pruned adopted subnets to config"),
                 Err(e) => log::warn!("Failed to persist pruned adopted subnets: {}", e),
             }
@@ -428,14 +426,13 @@ impl NetworkManager {
 
     /// Save current adopted subnets to config.
     pub async fn save_adopted_to_config(&self, config: &crate::config::AppConfig) {
-        let map = self.adopted_ips.lock().await;
-        let adopted: HashMap<String, String> = map
-            .iter()
-            .map(|(k, v)| (k.clone(), v.to_string()))
-            .collect();
-        let mut settings = config.get();
-        settings.adopted_subnets = adopted;
-        if let Err(e) = config.update(settings) {
+        let adopted: HashMap<String, String> = {
+            let map = self.adopted_ips.lock().await;
+            map.iter()
+                .map(|(k, v)| (k.clone(), v.to_string()))
+                .collect()
+        };
+        if let Err(e) = config.update_adopted_subnets(adopted) {
             log::warn!("Failed to save adopted subnets: {}", e);
         }
     }
@@ -717,13 +714,12 @@ impl NetworkManager {
                             let config: tauri::State<'_, crate::config::AppConfig> =
                                 app_handle_for_adopt.state();
                             let adopted_map = adopted.lock().await;
-                            let mut settings = config.get();
-                            settings.adopted_subnets = adopted_map
+                            let snapshot: HashMap<String, String> = adopted_map
                                 .iter()
                                 .map(|(k, v)| (k.clone(), v.to_string()))
                                 .collect();
                             drop(adopted_map);
-                            if let Err(e) = config.update(settings) {
+                            if let Err(e) = config.update_adopted_subnets(snapshot) {
                                 log::warn!(
                                     "Failed to persist adopted subnet {} to config: {}",
                                     device.subnet,

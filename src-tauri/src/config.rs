@@ -245,16 +245,11 @@ impl AppConfig {
         }
     }
 
-    pub fn update(&self, new_settings: AppSettings) -> Result<(), crate::AppError> {
-        match self.settings.lock() {
-            Ok(mut guard) => *guard = new_settings,
-            Err(poisoned) => {
-                log::error!("Config mutex poisoned during update, recovering");
-                *poisoned.into_inner() = new_settings;
-            }
-        }
-        self.save()
-    }
+    // NOTE: there is deliberately no whole-struct `update(AppSettings)`
+    // setter. Every writer is either `merge_user_settings` (IPC saves,
+    // preserving backend-owned fields) or a field-scoped updater below —
+    // a get→mutate→update cycle over the whole struct is a lost-update
+    // race against concurrent writers of the other sections.
 
     /// Apply user-editable sections from `incoming` and persist, preserving
     /// backend-owned fields. Use from IPC handlers that take a full
@@ -290,6 +285,49 @@ impl AppConfig {
             Err(poisoned) => {
                 log::error!("Config mutex poisoned during update_rtsp, recovering");
                 poisoned.into_inner().rtsp_server = rtsp_server;
+            }
+        }
+        self.save()
+    }
+
+    /// Replace just the adopted-subnets map and persist. Field-scoped so
+    /// the background adopt/prune tasks can't revert a concurrent user
+    /// save of unrelated sections — the previous whole-struct
+    /// get→mutate→update cycle raced user settings saves in both
+    /// directions (user edit reverted, or a still-bound adopted subnet
+    /// dropped).
+    pub fn update_adopted_subnets(
+        &self,
+        adopted: HashMap<String, String>,
+    ) -> Result<(), crate::AppError> {
+        match self.settings.lock() {
+            Ok(mut guard) => guard.adopted_subnets = adopted,
+            Err(poisoned) => {
+                log::error!("Config mutex poisoned during update_adopted_subnets, recovering");
+                poisoned.into_inner().adopted_subnets = adopted;
+            }
+        }
+        self.save()
+    }
+
+    /// Persist one zoom-slider position (clamped to 0–100). Field-scoped
+    /// for the same reason as `update_adopted_subnets`.
+    pub fn update_zoom_position(
+        &self,
+        camera_ip: String,
+        percent: i32,
+    ) -> Result<(), crate::AppError> {
+        let clamped = percent.clamp(0, 100);
+        match self.settings.lock() {
+            Ok(mut guard) => {
+                guard.zoom_positions.insert(camera_ip, clamped);
+            }
+            Err(poisoned) => {
+                log::error!("Config mutex poisoned during update_zoom_position, recovering");
+                poisoned
+                    .into_inner()
+                    .zoom_positions
+                    .insert(camera_ip, clamped);
             }
         }
         self.save()
