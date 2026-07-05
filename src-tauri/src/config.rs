@@ -55,22 +55,17 @@ pub struct Credentials {
 /// - `StaticManual`: adapter on a user-set static IP. None of the
 ///   discovery subsystems run; the Nodes panel reflects only the
 ///   explicitly-added `manual_nodes` list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkMode {
     Dhcp,
+    // Existing installs (config.toml predates this field) keep the
+    // historic behavior — ARP discovery + auto-adopt. Fresh installs
+    // hit this default too; the IP Config dialog is how users move to
+    // DHCP or Static-Manual.
+    #[default]
     StaticAuto,
     StaticManual,
-}
-
-impl Default for NetworkMode {
-    fn default() -> Self {
-        // Existing installs (config.toml predates this field) keep the
-        // historic behavior — ARP discovery + auto-adopt. Fresh installs
-        // hit this default too; the IP Config dialog is how users move to
-        // DHCP or Static-Manual.
-        NetworkMode::StaticAuto
-    }
 }
 
 /// A user-pinned device for `NetworkMode::StaticManual`. Survives mode
@@ -1084,8 +1079,10 @@ mod tests {
     fn merge_user_fields_preserves_network_mode() {
         // A partial frontend payload (just stream/rtsp/credentials) must
         // not clobber the user's chosen mode via serde defaults.
-        let mut current = AppSettings::default();
-        current.network_mode = NetworkMode::StaticManual;
+        let mut current = AppSettings {
+            network_mode: NetworkMode::StaticManual,
+            ..Default::default()
+        };
         current.merge_user_fields(AppSettings::default());
         assert_eq!(current.network_mode, NetworkMode::StaticManual);
     }
