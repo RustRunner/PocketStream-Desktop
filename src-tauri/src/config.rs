@@ -222,6 +222,9 @@ impl AppConfig {
     }
 
     pub fn save(&self) -> Result<(), crate::AppError> {
+        let _save_guard = CONFIG_SAVE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let settings = match self.settings.lock() {
             Ok(guard) => guard.clone(),
             Err(poisoned) => {
@@ -453,6 +456,9 @@ impl AppConfig {
     }
 
     fn save_cache(&self) -> Result<(), crate::AppError> {
+        let _save_guard = CACHE_SAVE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let cache = match self.cache.lock() {
             Ok(guard) => guard.clone(),
             Err(poisoned) => {
@@ -463,6 +469,16 @@ impl AppConfig {
         save_cache_to_disk(&cache)
     }
 }
+
+/// Serialize complete save cycles (snapshot clone → serialize → write)
+/// per file. Unique staging names in `atomic_write` prevent torn staging
+/// files, but two concurrent saves could still clone their snapshots in
+/// one order and rename in the other, persisting the older snapshot.
+/// Holding one of these across the clone makes snapshot order match
+/// write order — which is why `save`/`save_cache` take it BEFORE locking
+/// the data mutex, not inside the write helper.
+static CONFIG_SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static CACHE_SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn config_dir() -> PathBuf {
     dirs::config_dir()
@@ -521,30 +537,42 @@ fn save_cache_to_disk(cache: &[CachedDevice]) -> Result<(), crate::AppError> {
     Ok(())
 }
 
-/// Crash-safe file write: stage to `<path>.tmp`, fsync, then rename
-/// onto the final path. The rename is atomic on NTFS and on POSIX
-/// filesystems (same-volume rename is a single inode operation), so a
-/// reader either sees the old complete file or the new complete file —
-/// never a half-written one. Replaces the prior `fs::write` calls in
-/// the config save paths, where a kill -9 mid-write would leave a
-/// truncated TOML and the next launch would silently fall back to
-/// defaults.
+/// Monotonic discriminator for staging-file names. Combined with the
+/// process id it gives every in-flight write its own staging file, so
+/// concurrent writers to the same path can't truncate each other's
+/// staged bytes and rename a torn file into place.
+static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Crash-safe file write: stage to a uniquely-named `.tmp` sibling,
+/// fsync, then rename onto the final path. The rename is atomic on NTFS
+/// and on POSIX filesystems (same-volume rename is a single inode
+/// operation), so a reader either sees the old complete file or the new
+/// complete file — never a half-written one. Replaces the prior
+/// `fs::write` calls in the config save paths, where a kill -9
+/// mid-write would leave a truncated TOML and the next launch would
+/// silently fall back to defaults.
 fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
     })?;
     fs::create_dir_all(parent)?;
 
-    // .tmp suffix on the full filename rather than via with_extension
-    // — config.toml.tmp is more obviously a staging file than config.tmp,
-    // and avoids stomping a sibling file that happens to share the stem.
+    // Suffix on the full filename rather than via with_extension —
+    // config.toml.<pid>.<n>.tmp is more obviously a staging file than
+    // config.tmp, and avoids stomping a sibling file that happens to
+    // share the stem. pid+counter uniqueness means an abandoned staging
+    // file from a crashed run is simply ignored, never renamed over.
     let mut tmp_name = path
         .file_name()
         .ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name")
         })?
         .to_owned();
-    tmp_name.push(".tmp");
+    tmp_name.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let tmp_path = parent.join(&tmp_name);
 
     {
@@ -557,7 +585,11 @@ fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
     // the parent dir too; on Windows the rename itself is journaled so
     // the parent fsync is unnecessary (and File::open on a directory
     // would fail anyway).
-    fs::rename(&tmp_path, path)?;
+    if let Err(e) = fs::rename(&tmp_path, path) {
+        // Don't leave uniquely-named staging orphans behind on failure.
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
     #[cfg(unix)]
     {
         if let Ok(dir) = fs::File::open(parent) {
@@ -1351,10 +1383,17 @@ password = ""
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         atomic_write(&path, b"data").unwrap();
-        let tmp = dir.path().join("config.toml.tmp");
+        // Staging names are unique per write, so scan for any leftover
+        // rather than probing one fixed name.
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
         assert!(
-            !tmp.exists(),
-            "tmp staging file must be renamed away on success"
+            leftovers.is_empty(),
+            "staging file must be renamed away on success: {:?}",
+            leftovers
         );
     }
 
@@ -1368,19 +1407,63 @@ password = ""
 
     #[test]
     fn atomic_write_preserves_existing_file_when_write_fails_mid_flight() {
-        // Simulate the kill-9 scenario by writing the staging file
-        // ourselves, leaving it abandoned, and then doing a real
-        // atomic_write — the abandoned tmp must not corrupt the live
-        // file on the rename.
+        // Simulate the kill-9 scenario by planting an abandoned staging
+        // file from a "previous run", then doing a real atomic_write —
+        // the abandoned tmp must never be renamed over the live file.
+        // Staging names are unique per write, so the abandoned file is
+        // simply ignored, not consumed.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let tmp = dir.path().join("config.toml.tmp");
+        let tmp = dir.path().join("config.toml.99999.0.tmp");
         fs::write(&path, "live data").unwrap();
         fs::write(&tmp, "abandoned tmp").unwrap();
 
         atomic_write(&path, b"new data").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "new data");
-        assert!(!tmp.exists());
+        assert_eq!(fs::read_to_string(&tmp).unwrap(), "abandoned tmp");
+    }
+
+    #[test]
+    fn atomic_write_survives_concurrent_writers_to_same_path() {
+        // Regression for the fixed-staging-name race: concurrent writers
+        // used to truncate each other's staged bytes via File::create on
+        // the shared .tmp name, so a torn file could be renamed into
+        // place. With unique staging names, the final file must always
+        // be exactly ONE writer's complete payload.
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = Arc::new(dir.path().join("config.toml"));
+
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let path = Arc::clone(&path);
+                std::thread::spawn(move || {
+                    for i in 0..25 {
+                        // Distinct, self-describing payloads long enough
+                        // that a torn write is detectable.
+                        let payload = format!("writer={} iteration={} {}", t, i, "x".repeat(512));
+                        atomic_write(&path, payload.as_bytes()).unwrap();
+                        // A read racing a rename can transiently fail on
+                        // Windows sharing semantics — that's fine; what
+                        // must never happen is reading TORN content.
+                        if let Ok(read_back) = fs::read_to_string(&*path) {
+                            assert!(
+                                read_back.starts_with("writer=") && read_back.ends_with('x'),
+                                "torn read: {:?}",
+                                &read_back[..read_back.len().min(60)]
+                            );
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        let final_content = fs::read_to_string(&*path).unwrap();
+        assert!(final_content.starts_with("writer=") && final_content.ends_with('x'));
     }
 
     #[test]
