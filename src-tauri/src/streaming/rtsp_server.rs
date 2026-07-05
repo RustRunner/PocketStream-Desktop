@@ -18,6 +18,17 @@ use std::sync::Arc;
 
 use crate::error::AppError;
 
+/// Redact the RTSP access token embedded in a mount path for logging.
+/// The path is `/stream-<token>` — the same capability secret
+/// `display_url` deliberately hides from the UI — and `redact_url`
+/// can't help here (no scheme, no credentials to match).
+fn redact_mount_path(mount_path: &str) -> String {
+    match mount_path.strip_prefix("/stream-") {
+        Some(_) => "/stream-***".into(),
+        None => mount_path.into(),
+    }
+}
+
 pub struct RtspRestreamer {
     #[allow(dead_code)]
     server: gst_rtsp_server::RTSPServer,
@@ -163,7 +174,11 @@ impl RtspRestreamer {
 
         let main_loop = Self::attach_and_run(&server)?;
 
-        log::info!("RTSP server started on port {} at {}", port, mount_path);
+        log::info!(
+            "RTSP server started on port {} at {}",
+            port,
+            redact_mount_path(mount_path)
+        );
 
         Ok(Self {
             server,
@@ -214,7 +229,7 @@ impl RtspRestreamer {
         log::info!(
             "RTSP server (UDP source) started on port {} at {}",
             server_port,
-            mount_path
+            redact_mount_path(mount_path)
         );
 
         Ok(Self {
@@ -251,5 +266,20 @@ impl RtspRestreamer {
     #[allow(dead_code)]
     pub fn port(&self) -> u16 {
         self.port
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_mount_path;
+
+    #[test]
+    fn mount_path_token_is_redacted() {
+        assert_eq!(redact_mount_path("/stream-s3cr3ttoken"), "/stream-***");
+    }
+
+    #[test]
+    fn non_token_paths_pass_through() {
+        assert_eq!(redact_mount_path("/live"), "/live");
     }
 }

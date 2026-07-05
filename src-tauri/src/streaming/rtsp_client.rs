@@ -68,6 +68,12 @@ pub struct PlaybackPipeline {
     /// network/adapter stalls (ping fails) without the user having to
     /// guess.
     stall_diag_sent: Arc<Mutex<bool>>,
+    /// First bus error seen on this pipeline, latched. Bus reads are
+    /// destructive (`pop_filtered`), so without the latch the real
+    /// error is visible for exactly one status tick and every later
+    /// tick degrades to a generic "stalled"/not-playing verdict.
+    /// Cleared on `play()` so a restarted pipeline reports fresh state.
+    first_error: Arc<Mutex<Option<String>>>,
 }
 
 impl PlaybackPipeline {
@@ -230,11 +236,15 @@ impl PlaybackPipeline {
             paused_pending_play_at: Arc::new(Mutex::new(None::<Instant>)),
             camera_ip,
             stall_diag_sent,
+            first_error: Arc::new(Mutex::new(None)),
         })
     }
 
     /// Start playback.
     pub fn play(&self) -> Result<(), AppError> {
+        if let Ok(mut g) = self.first_error.lock() {
+            *g = None;
+        }
         self.pipeline
             .set_state(gst::State::Playing)
             .map_err(|e| AppError::Stream(format!("Failed to start playback: {}", e)))?;
@@ -247,17 +257,32 @@ impl PlaybackPipeline {
     /// or Err(message) with a user-friendly error description.
     pub fn health_check(&self) -> Result<bool, String> {
         // Always check bus first — errors may arrive before or after
-        // the state transitions away from Playing.
+        // the state transitions away from Playing. Error and debug text
+        // are redacted BEFORE any logging or storage: rtspsrc debug
+        // payloads can replay the input URL including `user:pass@`.
         if let Some(bus) = self.pipeline.bus() {
             if let Some(msg) = bus.pop_filtered(&[gst::MessageType::Error, gst::MessageType::Eos]) {
                 if let gst::MessageView::Error(err) = msg.view() {
-                    let raw = err.error().to_string();
-                    let debug = err.debug().map(|d| d.to_string()).unwrap_or_default();
+                    let raw = super::StreamManager::redact_url(&err.error().to_string());
+                    let debug = err
+                        .debug()
+                        .map(|d| super::StreamManager::redact_url(&d))
+                        .unwrap_or_default();
                     log::warn!("Stream bus error: {} | debug: {}", raw, debug);
-                    return Err(friendly_rtsp_error(&raw, &debug));
+                    return Err(self.latch_error(friendly_rtsp_error(&raw, &debug)));
                 }
                 log::warn!("Stream bus EOS received");
-                return Err("End of stream".into());
+                return Err(self.latch_error("End of stream".into()));
+            }
+        }
+
+        // A previously-latched bus error beats any generic verdict the
+        // state inspection below would produce — bus reads are
+        // destructive, so this is the only way the real error survives
+        // past its own tick.
+        if let Ok(g) = self.first_error.lock() {
+            if let Some(e) = g.as_ref() {
+                return Err(e.clone());
             }
         }
 
@@ -335,6 +360,19 @@ impl PlaybackPipeline {
             );
         }
         Ok(playing)
+    }
+
+    /// Latch the first error seen on this pipeline (later ones keep the
+    /// original — the first is the root cause) and return the message
+    /// for immediate use.
+    fn latch_error(&self, msg: String) -> String {
+        if let Ok(mut g) = self.first_error.lock() {
+            if let Some(existing) = g.as_ref() {
+                return existing.clone();
+            }
+            *g = Some(msg.clone());
+        }
+        msg
     }
 
     /// Fire a one-shot ICMP probe at the camera IP if we haven't
@@ -559,9 +597,13 @@ fn friendly_rtsp_error(error: &str, debug: &str) -> String {
         return "Stream format not supported. Camera may use an unsupported codec.".into();
     }
 
-    // Fallback: truncate long debug info
-    if debug.len() > 120 {
-        format!("{} ({}...)", error, &debug[..120])
+    // Fallback: truncate long debug info. Char-based, not byte-based —
+    // a byte slice at 120 panics on a multi-byte UTF-8 boundary, and
+    // this runs inside the 1 Hz status ticker, which the panic would
+    // kill permanently (UI status freeze).
+    if debug.chars().count() > 120 {
+        let truncated: String = debug.chars().take(120).collect();
+        format!("{} ({}...)", error, truncated)
     } else {
         format!("{} ({})", error, debug)
     }
@@ -653,6 +695,24 @@ mod tests {
         // 120-char cap + ellipsis suffix, plus the error prefix.
         assert!(msg.contains("..."));
         assert!(msg.len() < 200);
+    }
+
+    #[test]
+    fn fallback_truncation_survives_multibyte_utf8_at_boundary() {
+        // 119 ASCII chars then a stream of 3-byte chars — a byte slice
+        // at index 120 would land mid-€ and panic. This runs in the 1 Hz
+        // status ticker, so a panic here permanently froze UI status.
+        let debug = format!("{}{}", "x".repeat(119), "€".repeat(50));
+        let msg = friendly_rtsp_error("err", &debug);
+        assert!(msg.contains("..."));
+        assert!(msg.contains('€'));
+    }
+
+    #[test]
+    fn fallback_exact_120_chars_not_truncated() {
+        let debug = "y".repeat(120);
+        let msg = friendly_rtsp_error("err", &debug);
+        assert!(!msg.contains("..."));
     }
 
     #[test]

@@ -81,8 +81,11 @@ impl StreamManager {
         }
     }
 
-    /// Redact credentials from a URL for safe logging.
-    fn redact_url(url: &str) -> String {
+    /// Redact credentials from a URL (or any text containing one) for
+    /// safe logging. Rewrites the first `://user:pass@` occurrence;
+    /// that's sufficient for log lines and bus error/debug text, which
+    /// carry at most the input URL.
+    pub(crate) fn redact_url(url: &str) -> String {
         // rtsp://user:pass@host → rtsp://user:***@host
         // Only match when credentials appear between "://" and "@"
         let scheme_end = match url.find("://") {
@@ -593,6 +596,16 @@ mod tests {
     fn redact_url_udp() {
         let url = "udp://@:8600";
         assert_eq!(StreamManager::redact_url(url), url);
+    }
+
+    #[test]
+    fn redact_url_embedded_in_bus_debug_text() {
+        // Bus error/debug payloads replay the input URL mid-sentence;
+        // redaction must work there, not just on bare URLs.
+        let text = "gstrtspsrc.c:1234: could not connect to rtsp://admin:hunter2@10.0.0.5:554/live (timeout)";
+        let redacted = StreamManager::redact_url(text);
+        assert!(!redacted.contains("hunter2"));
+        assert!(redacted.contains("rtsp://admin:***@10.0.0.5:554/live"));
     }
 
     // ── build_input_url ─────────────────────────────────────────────
