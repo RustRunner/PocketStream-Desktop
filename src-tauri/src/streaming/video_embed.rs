@@ -147,6 +147,11 @@ pub fn reposition(
                 "Video child window no longer exists".into(),
             ));
         }
+        // No SWP_SHOWWINDOW here: a resize while the video is hidden
+        // (modal open — syncVideoVisibility hides it) must not force
+        // the native overlay back on top of the modal. Visibility is
+        // owned exclusively by set_visible. SWP_NOACTIVATE keeps the
+        // input-transparent overlay from stealing focus.
         SetWindowPos(
             hwnd,
             std::ptr::null_mut::<std::ffi::c_void>(), // HWND_TOP
@@ -154,7 +159,7 @@ pub fn reposition(
             y,
             width,
             height,
-            SWP_SHOWWINDOW,
+            SWP_NOACTIVATE,
         );
         Ok(())
     }
