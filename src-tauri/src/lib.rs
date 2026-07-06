@@ -432,6 +432,7 @@ pub fn run() {
             commands::set_video_visible,
             // FLIR PTU
             commands::ptu_send,
+            commands::open_device_browser,
             // Camera / PTZ
             commands::discover_onvif,
             commands::ptz_move,

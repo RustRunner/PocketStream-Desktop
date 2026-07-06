@@ -624,9 +624,11 @@ export function renderArpDeviceList(): void {
         e.preventDefault();
         const ip = link.dataset["browse"];
         if (!ip) return;
-        const invoke = window.__TAURI__?.core?.invoke;
-        if (invoke) {
-          invoke("plugin:shell|open", { path: `http://${ip}` }).catch(() => {
+        // Backend command validates the IP and opens http://<ip> —
+        // the webview no longer has a shell-open capability. Fall back
+        // to window.open only in a non-Tauri (dev) context.
+        if (window.__TAURI__) {
+          api.openDeviceBrowser(ip).catch(() => {
             window.open(`http://${ip}`, "_blank");
           });
         } else {

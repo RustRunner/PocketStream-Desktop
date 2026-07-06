@@ -20,6 +20,35 @@ async fn control_target(
     parse_known_camera_ip(ip, &manager.registry(), &adopted)
 }
 
+/// Open a discovered device's web UI in the system browser.
+///
+/// Replaces a frontend `plugin:shell|open` invoke: the elevated webview
+/// no longer holds the shell-open capability at all, so it can't be
+/// coerced into opening an arbitrary URL or path. The IP is validated
+/// against the known-device set (same guard as camera control), and the
+/// only thing that can be opened is `http://<validated-ipv4>`.
+#[tauri::command]
+pub async fn open_device_browser(
+    manager: State<'_, NetworkManager>,
+    ip: String,
+) -> Result<(), AppError> {
+    let addr = control_target(&ip, &manager).await?;
+    let url = format!("http://{}", addr);
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("explorer").arg(&url).spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(&url).spawn();
+    }
+    Ok(())
+}
+
 // ── FLIR PTU ────────────────────────────────────────────────────────
 
 #[tauri::command]

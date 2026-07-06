@@ -278,6 +278,13 @@ export async function ptuSend(
   return await invoke<Record<string, string>>("ptu_send", { ip, cmd });
 }
 
+/** Open a discovered device's web UI in the system browser. Backend
+ *  validates the IP against the known-device set and only ever opens
+ *  `http://<ip>` — the webview no longer holds a shell-open capability. */
+export async function openDeviceBrowser(ip: string): Promise<void> {
+  return await invoke("open_device_browser", { ip });
+}
+
 // ── Camera / PTZ ────────────────────────────────────────────────────
 
 /** ONVIF discovery currently returns Err("not yet implemented") —
