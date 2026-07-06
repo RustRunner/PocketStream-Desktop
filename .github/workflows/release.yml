@@ -115,12 +115,15 @@ jobs:
           # locate the real pkgconfig dir under the GStreamer root and set
           # PKG_CONFIG_PATH to it (forward slashes, accepted everywhere).
           # Dump the tree and fail loudly if the devel .pc files are absent.
-          $root = "C:\gstreamer\1.0\msvc_x86_64"
+          $root = "C:\gstreamer"
           $pc = Get-ChildItem -Path $root -Recurse -Filter "glib-2.0.pc" -File -ErrorAction SilentlyContinue
           if (-not $pc) {
-            Write-Host "glib-2.0.pc NOT found under $root. All .pc files present:"
-            Get-ChildItem -Path $root -Recurse -Filter "*.pc" -File -ErrorAction SilentlyContinue | Select-Object -First 60 -ExpandProperty FullName | ForEach-Object { Write-Host "  $_" }
-            throw "glib-2.0.pc not present under $root - GStreamer devel .pc files missing"
+            Write-Host "glib-2.0.pc NOT found under $root."
+            Write-Host "=== directory tree under $root ==="
+            Get-ChildItem -Path $root -Recurse -Directory -ErrorAction SilentlyContinue | Select-Object -First 150 -ExpandProperty FullName | ForEach-Object { Write-Host "  $_" }
+            Write-Host "=== all .pc files under $root ==="
+            Get-ChildItem -Path $root -Recurse -Filter "*.pc" -File -ErrorAction SilentlyContinue | Select-Object -First 80 -ExpandProperty FullName | ForEach-Object { Write-Host "  $_" }
+            throw "glib-2.0.pc not present under $root"
           }
           $dirs = $pc | ForEach-Object { $_.DirectoryName.Replace('\','/') } | Sort-Object -Unique
           $pcPath = ($dirs -join ';')
