@@ -498,7 +498,7 @@ function setupRefreshButton(): void {
       await refreshInterfaces();
       // Only kick off discovery when the link is actually up. A stale
       // disconnected adapter has no IPs and nothing to scan — running
-      // pcap/ARP against it is wasted effort.
+      // ARP capture against it is wasted effort.
       if (isInterfaceConnected() && state.activeInterface) {
         await api.startArpDiscovery(state.activeInterface.name);
         await loadExistingArpState();

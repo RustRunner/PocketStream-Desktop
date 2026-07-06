@@ -466,8 +466,8 @@ impl NetworkManager {
         result
     }
 
-    /// Start ARP discovery via pcap on the Ethernet interface.
-    /// Also spawns auto-adopt handler for foreign subnets.
+    /// Start ARP discovery (PacketMonitor capture) on the Ethernet
+    /// interface. Also spawns auto-adopt handler for foreign subnets.
     pub async fn start_arp_discovery(
         &self,
         interface_display_name: &str,
@@ -483,8 +483,10 @@ impl NetworkManager {
         let iface_name = interface_display_name.to_string();
         let app_handle_for_adopt = app_handle.clone();
 
-        // Get current IPs so auto-adopt knows which subnets are "known"
-        // and so the pcap listener can match the correct capture device.
+        // Get current IPs so auto-adopt knows which subnets are "known".
+        // (PacketMonitor captures unscoped — no capture-device matching
+        // needed — but the listener still uses the adapter's own MAC to
+        // filter our own gratuitous ARP.)
         let iface_info = interface::get_by_name(interface_display_name)?;
         let known_ips: Vec<String> = iface_info.ips.iter().map(|ip| ip.address.clone()).collect();
         let ethernet_ips: Vec<Ipv4Addr> =
@@ -519,9 +521,9 @@ impl NetworkManager {
         )?;
         *self.arp_listener_handle.lock().await = Some(handle);
 
-        // Ping sweep known subnets to provoke ARP traffic so pcap sees all devices,
-        // then read the OS ARP table to catch cached entries that didn't generate
-        // new ARP packets on the wire.
+        // Ping sweep known subnets to provoke ARP traffic so the capture
+        // listener sees all devices, then read the OS ARP table to catch
+        // cached entries that didn't generate new ARP packets on the wire.
         let sweep_ips = known_ips.clone();
         let sweep_devices = self.arp_devices.clone();
         let sweep_registry = registry.clone();
@@ -529,7 +531,7 @@ impl NetworkManager {
         let sweep_app_handle = app_handle_for_adopt.clone();
         let sweep_iface_ip = sweep_ips.first().cloned().unwrap_or_default();
         tokio::spawn(async move {
-            // Small delay to let pcap listener start first
+            // Small delay to let the capture listener start first
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             log::info!("Ping sweeping known subnets to populate ARP");
             ping_sweep_subnets(&sweep_ips).await;
@@ -927,8 +929,8 @@ fn get_interface_ips(name: &str) -> Vec<Ipv4Addr> {
 /// the source and therefore routes the packet out the adapter that owns
 /// it. Without this, a /24 that overlaps another interface (very common:
 /// 192.168.1.0/24 on both Ethernet-camera-network and home WiFi) can
-/// silently route out the wrong NIC — the Ethernet pcap listener never
-/// sees the replies and passive devices on that subnet stay invisible.
+/// silently route out the wrong NIC — the Ethernet capture listener
+/// never sees the replies and passive devices on that subnet stay invisible.
 async fn ping_sweep_subnets(interface_ips: &[String]) {
     use tokio::sync::Semaphore;
     use tokio::task::JoinSet;

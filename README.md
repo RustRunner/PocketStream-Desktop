@@ -49,12 +49,13 @@ The application supports two primary streaming modes:
 - Windows 10/11
 - Ethernet (for direct camera connection)
 - IP camera configured for static IP (program can detect a previous DHCP lease if it persists on the camera)
-- [Npcap](https://npcap.com/#download) (bundled installer included for device discovery)
 - GStreamer runtime (bundled with the application)
+
+Device discovery uses the in-box Windows PacketMonitor API — no separate capture driver to install.
 
 ## Installation
 
-Download the latest installer from [Releases](https://github.com/RustRunner/PocketStream-Desktop/releases). The NSIS installer includes all required GStreamer libraries. Npcap is installed separately on first launch if not already present.
+Download the latest installer from [Releases](https://github.com/RustRunner/PocketStream-Desktop/releases). The NSIS installer includes all required GStreamer libraries. Device discovery uses the OS-native PacketMonitor API, so there is no capture driver to install.
 
 ## Updater
 
@@ -67,7 +68,6 @@ An updater is configured that checks GitHub releases. The GUI shows an Install/L
 - [Node.js](https://nodejs.org/) 20+
 - [Rust](https://rustup.rs/) toolchain
 - GStreamer development libraries (place in `resources/gstreamer/`)
-- Npcap SDK
 
 ### Build
 
@@ -85,7 +85,7 @@ The installer will be generated in `src-tauri/target/release/bundle/nsis/`.
 | Frontend | HTML/JS + Material Web | UI, settings, device list |
 | Backend | Rust + Tauri 2 | Streaming, network ops, camera control |
 | Video | GStreamer | RTSP/UDP playback, recording, re-streaming |
-| Network | pcap + pnet | ARP discovery, interface management |
+| Network | PacketMonitor API + pnet | ARP discovery, interface management |
 | Crypto | AES-256-GCM | Credential encryption at rest |
 
 ## Licensing

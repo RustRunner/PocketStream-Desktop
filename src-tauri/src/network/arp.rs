@@ -368,9 +368,9 @@ fn format_mac(mac: &[u8; 6]) -> String {
 
 /// Read the OS ARP table for a specific interface and return dynamic entries.
 ///
-/// Supplements pcap-based discovery: if a host is already in the OS
-/// ARP cache (e.g. from a prior browser visit), the ping sweep won't
-/// generate a new ARP request on the wire, so pcap never sees it.
+/// Supplements live capture: if a host is already in the OS ARP cache
+/// (e.g. from a prior browser visit), the ping sweep won't generate a
+/// new ARP request on the wire, so the capture listener never sees it.
 ///
 /// `interface_ip` scopes the query to a single interface via `arp -a -N`,
 /// preventing WiFi entries from leaking in.

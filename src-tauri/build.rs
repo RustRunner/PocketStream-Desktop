@@ -1,5 +1,9 @@
 fn main() {
-    // Add src-tauri/lib to native library search path (wpcap.lib, Packet.lib)
+    // Native library search path for Packet.lib. The ARP capture backend
+    // is now the in-box PacketMonitor API (runtime LoadLibrary, no import
+    // library), but `pnet` still links Packet.lib on Windows for its
+    // interface layer — so this path and Packet.lib stay even though the
+    // pcap crate and wpcap.lib are gone.
     let lib_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("lib");
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
 
@@ -9,11 +13,13 @@ fn main() {
         // Delay-load ALL native DLLs so the exe starts even when they
         // live in a subdirectory (resources/gstreamer/bin/).  Our Rust
         // startup code adds that directory to PATH before any GStreamer
-        // or pcap function is actually called.
+        // function is actually called.
         println!("cargo:rustc-link-lib=delayimp");
 
-        // Npcap
-        println!("cargo:rustc-link-arg=/DELAYLOAD:wpcap.dll");
+        // Packet.dll (pnet's import). Delay-loaded so the exe starts
+        // without Npcap present: interface enumeration goes through IP
+        // Helper, never the capture path, so Packet.dll is never
+        // actually loaded. wpcap.dll is gone with the pcap crate.
         println!("cargo:rustc-link-arg=/DELAYLOAD:Packet.dll");
 
         // GLib / GObject / GIO
