@@ -26,6 +26,34 @@ $GstPlugins = Join-Path $GstRoot "lib\gstreamer-1.0"
 
 Write-Host "GStreamer root: $GstRoot" -ForegroundColor Cyan
 
+# ── Verify SDK version ────────────────────────────────────────────────
+# The bundle must match the version CI builds and links against (see the
+# pinned MSI in .github/workflows/ci.yml). A drifted local SDK would ship
+# a bundle whose DLLs don't match the import libs the exe was linked with.
+
+$ExpectedVersion = "1.24.13"
+$GstInspect = Join-Path $GstBin "gst-inspect-1.0.exe"
+if (-not (Test-Path $GstInspect)) {
+    Write-Error "gst-inspect-1.0.exe not found in $GstBin -- cannot verify the SDK version."
+    exit 1
+}
+$VersionOutput = & $GstInspect --version | Out-String
+if ($VersionOutput -match 'GStreamer\s+(\d+\.\d+\.\d+)') {
+    $InstalledVersion = $Matches[1]
+} else {
+    Write-Error "Could not parse the GStreamer version from gst-inspect output."
+    exit 1
+}
+if ($InstalledVersion -ne $ExpectedVersion) {
+    Write-Error @"
+GStreamer version mismatch: installed $InstalledVersion, expected $ExpectedVersion.
+The bundle must match the version CI builds against. Install $ExpectedVersion from
+https://gstreamer.freedesktop.org/data/pkg/windows/$ExpectedVersion/msvc/ and retry.
+"@
+    exit 1
+}
+Write-Host "GStreamer version: $InstalledVersion (matches expected)" -ForegroundColor Green
+
 # ── Output directories ────────────────────────────────────────────────
 
 $ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -225,12 +253,17 @@ Write-Host "  Copied: $copied files ($sizeMB MB)"
 Write-Host "  Output: src-tauri/resources/gstreamer/"
 
 if ($missing.Count -gt 0) {
-    Write-Host "`n  Missing ($($missing.Count)):" -ForegroundColor Yellow
+    Write-Host "`n  MISSING ($($missing.Count)):" -ForegroundColor Red
     foreach ($m in $missing) {
-        Write-Host "    - $m" -ForegroundColor Yellow
+        Write-Host "    - $m" -ForegroundColor Red
     }
-    Write-Host "`n  Missing DLLs are non-fatal -- the app may still work if" -ForegroundColor Yellow
-    Write-Host "  those features aren't used, or a system GStreamer provides them." -ForegroundColor Yellow
+    # Fatal: a partial bundle ships a broken installer silently. Every
+    # listed DLL is required by a pipeline the app actually runs.
+    Write-Error @"
+Bundle is incomplete -- $($missing.Count) required file(s) missing. Install the full
+GStreamer $ExpectedVersion runtime + devel (complete install, ADDLOCAL=ALL) and re-run.
+"@
+    exit 1
 }
 
 Write-Host "`nDone. Run 'cargo tauri build' to create the installer." -ForegroundColor Green
