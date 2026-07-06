@@ -103,16 +103,6 @@ export interface Credentials {
   password: string;
 }
 
-export interface CachedDevice {
-  mac: string;
-  ip: string;
-  subnet: string;
-  open_ports: number[];
-  alias: string;
-  /** RFC3339 timestamp */
-  last_seen: string;
-}
-
 export interface AppSettings {
   stream: StreamConfig;
   rtsp_server: RtspServerConfig;
@@ -167,14 +157,6 @@ export interface TypedAppError {
 
 // ── Tauri event payloads ─────────────────────────────────────────────
 
-/** Payload for the `device-list-changed` event emitted by
- *  DeviceListEmitter when the canonical device registry changes. */
-export type DeviceListChangedPayload = DeviceRecord[];
-
-/** Payload for the `stream-status` event emitted by the streaming
- *  status broadcaster on every change to the watch channel snapshot. */
-export type StreamStatusPayload = StreamStatus;
-
 /** Payload for the `arp-device-discovered` event emitted by the pcap
  *  ARP listener. Mirrors `network/arp.rs::ArpDevice`. */
 export interface ArpDevicePayload {
@@ -195,10 +177,6 @@ export interface SubnetAdoptedPayload {
   subnet: string;
   adopted_ip: string;
 }
-
-/** Payload for the `interface-status-changed` event emitted by the
- *  Windows NotifyIpInterfaceChange watcher (or pnet poller fallback). */
-export type InterfaceStatusChangedPayload = InterfaceInfo;
 
 /** Payload for the `device-ping-result` event emitted by the ICMP
  *  pinger on every probe completion. Drives the green/red reachability

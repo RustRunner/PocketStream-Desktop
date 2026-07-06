@@ -357,26 +357,12 @@ export function renderSubnetList(): void {
       </div>`;
   }
 
+  // The auto-adopted rows are informational only — there's no per-row
+  // remove control here (adopted subnets are dropped from the IP Config
+  // dialog's secondary-IP list, or auto-released by the manager). An
+  // earlier build wired a `.btn-remove-ip` handler here for a button
+  // that no longer renders; it matched nothing and has been removed.
   subnetList.innerHTML = html;
-
-  // Wire up remove buttons
-  subnetList
-    .querySelectorAll<HTMLButtonElement>(".btn-remove-ip")
-    .forEach((btn) => {
-      btn.addEventListener("click", async (e) => {
-        e.stopPropagation();
-        const subnet = btn.dataset["removeSubnet"];
-        if (!subnet) return;
-        try {
-          await api.removeAdoptedSubnet(subnet);
-          adoptedSubnets.delete(subnet);
-          renderSubnetList();
-          showToast("Removed adopted IP");
-        } catch (err) {
-          showToast("Failed to remove: " + formatError(err), true);
-        }
-      });
-    });
 }
 
 // ── CAM / PTU target resolution ─────────────────────────────────────
@@ -602,6 +588,10 @@ function populateDialogFields(): void {
     iface.ips.find((ip) => !isApipa(ip.address));
   $<HTMLInputElement>("#static-ip").value = primary ? primary.address : "";
   $<HTMLInputElement>("#static-mask").value = primary ? prefixToMask(primary.prefix) : "255.255.255.0";
+  // Left blank intentionally. The snapshot carries no gateway to seed it
+  // with, but a blank gateway on Apply no longer wipes the configured
+  // one — the backend preserves the existing default gateway when this
+  // field is empty. Type a value here only to change it.
   $<HTMLInputElement>("#static-gateway").value = "";
 
   // Secondary = all IPs except the primary

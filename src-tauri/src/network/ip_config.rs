@@ -75,6 +75,20 @@ async fn assign_windows(
         })
         .collect();
 
+    // Preserve the existing default gateway when the caller didn't
+    // specify one. `netsh set address ... static <ip> <mask>` with no
+    // gateway argument CLEARS the interface's default gateway, so a
+    // re-apply that left the gateway field blank (e.g. just to flip
+    // program mode) would silently drop the configured gateway and
+    // with it off-subnet connectivity. Look the current one up and
+    // feed it back in. An explicit gateway from the caller still wins.
+    let preserved_gw: Option<String> = if gateway.is_none() {
+        current_default_gateway(interface).await
+    } else {
+        None
+    };
+    let effective_gw: Option<&str> = gateway.or(preserved_gw.as_deref());
+
     // Set primary static IP (replaces all existing IPs)
     let mut args = vec![
         "interface",
@@ -86,7 +100,7 @@ async fn assign_windows(
         ip,
         subnet_mask,
     ];
-    if let Some(gw) = gateway {
+    if let Some(gw) = effective_gw {
         args.push(gw);
     }
     run_command("netsh", &args).await?;
@@ -115,6 +129,40 @@ async fn assign_windows(
     }
 
     Ok(())
+}
+
+/// The interface's current IPv4 default gateway, if it has one.
+///
+/// Locale-invariant: `Get-NetRoute` yields the raw NextHop IP, so no
+/// text parsing against a localized `netsh`/`ipconfig` layout. Any
+/// failure (no route, hung shell, parse miss) returns None — the caller
+/// then simply sets the address without a gateway, matching the prior
+/// behavior.
+#[cfg(target_os = "windows")]
+async fn current_default_gateway(interface: &str) -> Option<String> {
+    let script = format!(
+        "Get-NetRoute -InterfaceAlias '{}' -DestinationPrefix '0.0.0.0/0' \
+         -AddressFamily IPv4 -ErrorAction SilentlyContinue | \
+         Select-Object -ExpandProperty NextHop -First 1",
+        interface.replace('\'', "''")
+    );
+    let fut = super::async_cmd("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let gw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // A missing route yields empty output or the unspecified address.
+    if gw.is_empty() || gw == "0.0.0.0" {
+        return None;
+    }
+    gw.parse::<Ipv4Addr>().ok().map(|a| a.to_string())
 }
 
 /// Convert a CIDR prefix length to a dotted subnet mask.

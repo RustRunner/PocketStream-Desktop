@@ -25,6 +25,7 @@ import {
   hasRouteToSubnet,
   isIpScanned,
   markIpScanned,
+  visibleDevices,
 } from "./device-state.ts";
 import * as deviceList from "./device-list.ts";
 import { showModalWithVideo } from "./streaming.js";
@@ -519,23 +520,12 @@ export function renderArpDeviceList(): void {
     return;
   }
 
-  const ownMac = state.activeInterface?.mac?.toLowerCase() || null;
-
+  // Shared visibility filter (panel-strict): drops the host's own IPs,
+  // cached-only rows on unroutable subnets, own-MAC ghosts, and any
+  // non-manual entry without an open port. The Add/Remove Nodes dialog
+  // uses the same helper without the strict flag.
   const bySubnet = new Map<string, DeviceRecord[]>();
-  for (const record of deviceList.getDevices()) {
-    // Hide cached-only entries on subnets we don't currently route to —
-    // they're stale ghosts from a different network. Stay in the cache
-    // file so they reappear when the subnet is reachable again.
-    if (record.status === "cached_only" && !hasRouteToSubnet(record.subnet)) {
-      continue;
-    }
-    // Hide entries whose MAC matches our own adapter. These are ghosts
-    // from a prior gratuitous ARP we captured when adding a secondary
-    // IP — the backend now filters these at capture time, but existing
-    // cache files can still contain them from older sessions.
-    if (ownMac && record.mac.toLowerCase() === ownMac) {
-      continue;
-    }
+  for (const record of visibleDevices(deviceList.getDevices(), /* panelStrict */ true)) {
     const bucket = bySubnet.get(record.subnet);
     if (bucket) {
       bucket.push(record);
@@ -559,30 +549,12 @@ export function renderArpDeviceList(): void {
 
   let html = "";
   let nodeIndex = 0;
-  for (const [subnet, records] of bySubnet) {
-    const ownIps = new Set<string>();
-    if (state.activeInterface) {
-      state.activeInterface.ips.forEach((ip) => ownIps.add(ip.address));
-    }
-    for (const ip of adoptedSubnets.values()) {
-      ownIps.add(ip);
-    }
-
-    const filtered = records.filter((r) => {
-      if (ownIps.has(r.ip)) return false;
-      // Manual-pinned nodes carry no scan results — the user has
-      // explicitly asked for them to be in the list, so they show
-      // even before (or without) a port scan. Other entries still
-      // need an open port to qualify, otherwise the panel fills up
-      // with discovered-but-not-a-service hosts.
-      if (r.mac.startsWith("manual:")) return true;
-      return r.open_ports && r.open_ports.length > 0;
-    });
-    if (filtered.length === 0) continue;
+  for (const [, records] of bySubnet) {
+    if (records.length === 0) continue;
 
     html += `<div class="subnet-group">`;
 
-    for (const r of filtered) {
+    for (const r of records) {
       nodeIndex++;
       const name = r.alias || `Node ${nodeIndex}`;
       const ports = r.open_ports;

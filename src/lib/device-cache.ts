@@ -9,8 +9,9 @@
  */
 
 import * as api from "./tauri-api.ts";
-import { $, state, log, escapeHtml, showToast, adoptedSubnets } from "./state.ts";
+import { $, state, log, escapeHtml, showToast } from "./state.ts";
 import * as deviceList from "./device-list.ts";
+import { visibleDevices } from "./device-state.ts";
 import { showModalWithVideo } from "./streaming.js";
 import { formatError } from "./errors.ts";
 
@@ -36,28 +37,16 @@ interface NodeEntry {
  *  ports. (Auto-eviction of those stale cache rows is tracked
  *  separately for a v0.5.x follow-up.) */
 function renderDialogList(): void {
-  const ownIps = new Set<string>();
-  if (state.activeInterface) {
-    state.activeInterface.ips.forEach((ip) => ownIps.add(ip.address));
-  }
-  for (const ip of adoptedSubnets.values()) {
-    ownIps.add(ip);
-  }
-
-  const entries: NodeEntry[] = deviceList
-    .getDevices()
-    .filter((r) => {
-      if (ownIps.has(r.ip)) return false;
-      if (r.mac.startsWith("manual:")) return true;
-      return r.open_ports && r.open_ports.length > 0;
-    })
-    .map((r) => ({
-      mac: r.mac,
-      ip: r.ip,
-      subnet: r.subnet,
-      alias: r.alias || "",
-      isManual: r.mac.startsWith("manual:"),
-    }));
+  // Same visibility helper the Nodes panel uses, minus the panel-strict
+  // exclusions — the dialog must still list cached-only-unroutable and
+  // own-MAC rows so the user can remove them.
+  const entries: NodeEntry[] = visibleDevices(deviceList.getDevices()).map((r) => ({
+    mac: r.mac,
+    ip: r.ip,
+    subnet: r.subnet,
+    alias: r.alias || "",
+    isManual: r.mac.startsWith("manual:"),
+  }));
   entries.sort((a, b) => {
     if (a.subnet !== b.subnet) return a.subnet.localeCompare(b.subnet);
     return a.ip.localeCompare(b.ip, undefined, { numeric: true });

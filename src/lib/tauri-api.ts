@@ -18,7 +18,6 @@ import type {
   DeviceRecord,
   DeviceStatus,
   InterfaceInfo,
-  ManualNode,
   NetworkMode,
   RtspServerConfig,
   RtspServerInfo,
@@ -56,10 +55,6 @@ export async function getConfig(): Promise<AppSettings> {
   return await invoke<AppSettings>("get_config");
 }
 
-export async function saveConfig(settings: AppSettings): Promise<void> {
-  return await invoke("save_config", { settings });
-}
-
 export async function updateStreamSettings(stream: StreamConfig): Promise<void> {
   return await invoke("update_stream_settings", { stream });
 }
@@ -84,10 +79,6 @@ export async function listInterfaces(): Promise<InterfaceInfo[]> {
 
 export async function listVpnInterfaces(): Promise<InterfaceInfo[]> {
   return await invoke<InterfaceInfo[]>("list_vpn_interfaces");
-}
-
-export async function getInterfaceInfo(name: string): Promise<InterfaceInfo> {
-  return await invoke<InterfaceInfo>("get_interface_info", { name });
 }
 
 export async function setStaticIp(
@@ -119,11 +110,6 @@ export async function setDhcp(name: string): Promise<void> {
   return await invoke("set_dhcp", { name });
 }
 
-/** Returns true if the interface is currently in DHCP mode for IPv4. */
-export async function getDhcpState(name: string): Promise<boolean> {
-  return await invoke<boolean>("get_dhcp_state", { name });
-}
-
 /**
  * Look up the MAC currently bound to `ip` from the live ARP cache.
  * Returns null if the IP doesn't respond. Used by the cache verify
@@ -151,10 +137,6 @@ export async function refreshAdapter(
 
 export async function startArpDiscovery(iface: string): Promise<void> {
   return await invoke("start_arp_discovery", { interface: iface });
-}
-
-export async function stopArpDiscovery(): Promise<void> {
-  return await invoke("stop_arp_discovery");
 }
 
 // ── Device Registry (canonical device list) ─────────────────────────
@@ -195,10 +177,6 @@ export async function evictPhantomDevice(ip: string): Promise<boolean> {
 
 export async function getAdoptedSubnets(): Promise<Record<string, string>> {
   return await invoke<Record<string, string>>("get_adopted_subnets");
-}
-
-export async function removeAdoptedSubnet(subnet: string): Promise<void> {
-  return await invoke("remove_adopted_subnet", { subnet });
 }
 
 /** Listen for a Tauri event. Returns a Promise that resolves to the
@@ -294,6 +272,14 @@ export async function openDeviceBrowser(ip: string): Promise<void> {
 }
 
 // ── Camera / PTZ ────────────────────────────────────────────────────
+//
+// The generic ONVIF / multi-vendor camera surface below (discoverOnvif,
+// ptzMove/Stop/GotoPreset/SetPreset, sonyCgiZoom, controlCgiProbeStatus)
+// is intentionally retained but not yet wired to any UI. The live camera
+// path today is FLIR PTU (ptuSend) plus EV-7520 zoom (controlCgiZoomDirect
+// / setZoomPosition). These wrappers stay so a future ONVIF/multi-camera
+// impl lands without a frontend churn pass; keep them in sync with their
+// Rust commands during the IPC drift audit.
 
 /** ONVIF discovery currently returns Err("not yet implemented") —
  *  the wrapper is kept so a future ONVIF impl can land without a
@@ -362,10 +348,6 @@ export async function getNetworkMode(): Promise<NetworkMode> {
 
 export async function setNetworkMode(mode: NetworkMode): Promise<void> {
   return await invoke("set_network_mode", { mode });
-}
-
-export async function getManualNodes(): Promise<ManualNode[]> {
-  return await invoke<ManualNode[]>("get_manual_nodes");
 }
 
 export async function addManualNode(ip: string, alias: string): Promise<void> {
