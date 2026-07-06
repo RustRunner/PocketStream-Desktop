@@ -98,21 +98,21 @@ jobs:
       # but link still resolves symbols against the .libs). Chocolatey
       # is not usable here: it stopped publishing gstreamer-devel after
       # 1.24.9, so the runtime and devel packages can no longer be
-      # version-matched, and upstream prunes non-terminal patch MSIs
-      # (1.24.13 is the terminal 1.24.x release). ADDLOCAL=ALL because
-      # the crate links optional components (e.g. gstrtspserver) that a
-      # default install omits. The MSIs install to
-      # C:\gstreamer\1.0\msvc_x86_64\, which the environment step below
-      # depends on.
+      # version-matched. 1.26.11 is the newest MSI-based release — 1.28+
+      # ship a single .exe installer instead. ADDLOCAL=ALL because the
+      # crate links optional components (e.g. gstrtspserver) that a
+      # default install omits. The MSIs install under Program Files, not
+      # C:\gstreamer; the environment step below auto-detects the real
+      # root from the installer-set env var.
       - name: Install GStreamer (MSVC x86_64)
         shell: pwsh
         run: |
-          $base = 'https://gstreamer.freedesktop.org/data/pkg/windows/1.24.13/msvc'
+          $base = 'https://gstreamer.freedesktop.org/data/pkg/windows/1.26.11/msvc'
           $msis = @(
-            @{ Name = 'gstreamer-1.0-msvc-x86_64-1.24.13.msi'
-               Sha256 = '66915D82ADDA34189703C36A5D2EF145D2E3AFB7AFC12C66FCF2EA506E2466D2' },
-            @{ Name = 'gstreamer-1.0-devel-msvc-x86_64-1.24.13.msi'
-               Sha256 = '0AFB4394C2CBA3999C0F5E74F28C2AC5D98F03131140E09246D4DCD60A0A0395' }
+            @{ Name = 'gstreamer-1.0-msvc-x86_64-1.26.11.msi'
+               Sha256 = '31CBC21FA0950B5C1E79C80959B2799805CB05A7A35953A13A9F790776137605' },
+            @{ Name = 'gstreamer-1.0-devel-msvc-x86_64-1.26.11.msi'
+               Sha256 = 'AF0A0720692052AAF5FB0CF2847EF34A87016EF0F914328D516F049E6C86F587' }
           )
           foreach ($msi in $msis) {
             $path = Join-Path $env:RUNNER_TEMP $msi.Name

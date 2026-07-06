@@ -31,7 +31,7 @@ Write-Host "GStreamer root: $GstRoot" -ForegroundColor Cyan
 # pinned MSI in .github/workflows/ci.yml). A drifted local SDK would ship
 # a bundle whose DLLs don't match the import libs the exe was linked with.
 
-$ExpectedVersion = "1.24.13"
+$ExpectedVersion = "1.26.11"
 $GstInspect = Join-Path $GstBin "gst-inspect-1.0.exe"
 if (-not (Test-Path $GstInspect)) {
     Write-Error "gst-inspect-1.0.exe not found in $GstBin -- cannot verify the SDK version."
@@ -116,13 +116,9 @@ $CoreDlls = @(
     "z-1.dll"
     "orc-0.4-0.dll"
 
-    # Crypto / TLS (needed by rtspsrc for SRTP/TLS)
-    "gnutls-30.dll"
-    "gmp-10.dll"
-    "hogweed-6.dll"
-    "nettle-8.dll"
-    "p11-kit-0.dll"
-    "tasn1-6.dll"
+    # (No gnutls/nettle TLS stack: the MSVC runtime doesn't ship it and
+    # the app streams over plain RTP/RTSP, not SRTP/TLS — a complete
+    # install has none of these DLLs and the app runs fine without them.)
 
     # FFmpeg / libav (for avdec_h264)
     "avcodec-61.dll"
