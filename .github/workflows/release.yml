@@ -80,16 +80,36 @@ jobs:
           "C:\gstreamer\1.0\msvc_x86_64\bin" `
             | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
-      # The GStreamer MSVC devel package lays down the .pc files but ships
-      # no pkg-config executable, and windows-latest has none by default —
-      # so glib-sys / gstreamer-sys can't resolve their system deps and
-      # the build fails with "The pkg-config command could not be found".
-      # pkgconfiglite provides pkg-config.exe on PATH. GStreamer's install
-      # path has no spaces, so pkgconfiglite's space-in-path limitation
-      # doesn't bite.
-      - name: Install pkg-config
+      # glib-sys / gstreamer-sys resolve their system deps via pkg-config,
+      # which windows-latest lacks. pkgconfiglite 0.28 (the usual choco
+      # option) mis-parses GStreamer's .pc files, so use the maintained
+      # pkgconf that GStreamer's MSVC devel package bundles in bin/, and
+      # point the pkg-config crate at it via the PKG_CONFIG env var (the
+      # crate looks for an executable literally named "pkg-config", which
+      # is why the bundled pkgconf isn't picked up on its own).
+      - name: Use pkgconf for pkg-config resolution
         shell: pwsh
-        run: choco install pkgconfiglite -y --no-progress
+        run: |
+          # Prefer the pkgconf GStreamer bundles; fall back to choco, then
+          # the runner's preinstalled MSYS2. One of the three yields a
+          # maintained pkgconf that parses GStreamer's .pc files.
+          $pkgconf = $null
+          $bundled = "C:\gstreamer\1.0\msvc_x86_64\bin\pkgconf.exe"
+          if (Test-Path $bundled) { $pkgconf = $bundled }
+          if (-not $pkgconf) {
+            choco install pkgconf -y --no-progress
+            $c = Get-Command pkgconf.exe -ErrorAction SilentlyContinue
+            if ($c) { $pkgconf = $c.Source }
+          }
+          if (-not $pkgconf) {
+            & C:\msys64\usr\bin\pacman.exe -S --needed --noconfirm mingw-w64-x86_64-pkgconf
+            $m = "C:\msys64\mingw64\bin\pkgconf.exe"
+            if (Test-Path $m) { $pkgconf = $m }
+          }
+          if (-not $pkgconf) { throw "Could not obtain pkgconf (GStreamer bin, choco, MSYS2 all failed)" }
+          Write-Host "Using pkgconf: $pkgconf"
+          & $pkgconf --version
+          "PKG_CONFIG=$pkgconf" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - run: npm ci
 
@@ -108,8 +128,11 @@ jobs:
             cargo test --lib
             if ($LASTEXITCODE -ne 0) { throw "tests failed" }
             cargo install cargo-audit --locked --quiet
-            # Advisory ignores live in src-tauri/audit.toml.
-            cargo audit
+            # Advisory ignores are passed explicitly: cargo-audit does not
+            # read a project-local audit.toml (only ~/.cargo/audit.toml),
+            # so the file's ignores never applied. src-tauri/audit.toml is
+            # kept as the rationale record; these flags mirror it.
+            cargo audit --ignore RUSTSEC-2024-0413 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
             if ($LASTEXITCODE -ne 0) { throw "audit failed" }
           } finally {
             Pop-Location
