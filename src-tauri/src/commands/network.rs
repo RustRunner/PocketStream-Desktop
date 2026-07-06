@@ -15,8 +15,10 @@ pub async fn scan_network(
     // Reject malformed CIDR at the boundary so the active-scans
     // dedupe set doesn't cache a garbage key, and the user sees a
     // clean error instead of whatever scanner::scan() would emit
-    // mid-iteration.
-    parse_cidr(&subnet)?;
+    // mid-iteration. Also reject subnets too wide to scan before any
+    // scanning machinery spins up.
+    let (_, prefix) = parse_cidr(&subnet)?;
+    crate::network::scanner::check_scan_size(prefix)?;
     manager.scan_subnet(&subnet).await
 }
 

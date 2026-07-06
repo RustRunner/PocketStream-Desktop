@@ -39,36 +39,81 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// concurrent connects at peak.
 const MAX_CONCURRENT_CONNECTS: usize = 64;
 
+/// Largest subnet a single scan will enumerate: 4096 addresses (≈ /20).
+/// Bounds memory and task count against a `/8` interface subnet
+/// (16.7 M hosts) or a hand-typed `/0` arriving from one IPC call.
+pub const MAX_SCAN_ADDRESSES: u64 = 4096;
+
+/// Cap on hosts held in the JoinSet at once. With the address cap above
+/// this only matters for the wider allowed subnets (e.g. /20), keeping
+/// peak in-flight task count bounded while the connect semaphore bounds
+/// actual sockets.
+const MAX_INFLIGHT_HOSTS: usize = 256;
+
+/// Reject a subnet too wide to scan. A `/16` (65 k addresses) is
+/// rejected too — it previously "worked" but took minutes; the error
+/// says so. Prefix is 0..=32 (already validated upstream).
+pub fn check_scan_size(prefix: u8) -> Result<(), AppError> {
+    let addresses = 1u64 << (32u8.saturating_sub(prefix));
+    if addresses > MAX_SCAN_ADDRESSES {
+        return Err(AppError::Network(format!(
+            "Subnet /{} has {} addresses — too large to scan (limit {} ≈ /20). \
+             Narrow the range; /16 and wider are rejected to avoid a multi-minute scan.",
+            prefix, addresses, MAX_SCAN_ADDRESSES
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `host` is a scannable host address. Skips the network and
+/// broadcast addresses — but only for prefixes ≤ 30, which are the ones
+/// that actually reserve them. A /31 (RFC 3021 point-to-point) and a
+/// /32 (single host) have no reserved addresses, so every address is a
+/// host; the old octet-based `== 0 || == 255` check wrongly skipped one
+/// leg of a /31, scanned nothing for a /32 of a `.0`/`.255` host, and
+/// skipped the wrong addresses for /25–/30.
+fn is_scannable(host: &IpAddr, network: &ipnetwork::Ipv4Network) -> bool {
+    if network.prefix() > 30 {
+        return true;
+    }
+    match host {
+        IpAddr::V4(h) => *h != network.network() && *h != network.broadcast(),
+        IpAddr::V6(_) => false,
+    }
+}
+
 /// Scan a subnet (e.g. "192.168.1.0/24") for reachable hosts.
 pub async fn scan(subnet: &str) -> Result<Vec<ScanResult>, AppError> {
-    let network: ipnetwork::IpNetwork = subnet
+    let network: ipnetwork::Ipv4Network = subnet
         .parse()
         .map_err(|e| AppError::Network(format!("Invalid subnet: {}", e)))?;
 
+    // Defense in depth: the IPC boundary caps too, but scanner::scan
+    // re-parses the subnet independently, so enforce the cap here as well.
+    check_scan_size(network.prefix())?;
+
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTS));
-    let hosts: Vec<IpAddr> = network.iter().collect();
     let mut results = Vec::new();
     let mut join_set = JoinSet::new();
 
-    for host in hosts {
-        // Skip network and broadcast addresses for /24+
-        if network.prefix() >= 24 {
-            let octets = match host {
-                IpAddr::V4(v4) => v4.octets(),
-                _ => continue,
-            };
-            if octets[3] == 0 || octets[3] == 255 {
-                continue;
-            }
-        }
+    // Stream hosts into the JoinSet with bounded in-flight instead of
+    // collecting every address into a Vec first.
+    let mut hosts = network
+        .iter()
+        .map(IpAddr::V4)
+        .filter(|h| is_scannable(h, &network));
+    for host in hosts.by_ref().take(MAX_INFLIGHT_HOSTS) {
         join_set.spawn(probe_host(host, semaphore.clone()));
     }
-
     while let Some(result) = join_set.join_next().await {
         if let Ok(scan_result) = result {
             if scan_result.reachable {
                 results.push(scan_result);
             }
+        }
+        // Top up so at most MAX_INFLIGHT_HOSTS probes are pending.
+        if let Some(host) = hosts.next() {
+            join_set.spawn(probe_host(host, semaphore.clone()));
         }
     }
 
@@ -228,6 +273,74 @@ mod tests {
     async fn scan_invalid_subnet_returns_err() {
         let result = scan("not-a-subnet").await;
         assert!(result.is_err());
+    }
+
+    // ── Fan-out cap (H6) ────────────────────────────────────────────
+
+    #[test]
+    fn scan_size_cap_rejects_wide_subnets() {
+        assert!(check_scan_size(0).is_err()); // /0 — the whole IPv4 space
+        assert!(check_scan_size(8).is_err()); // /8 — 16.7 M
+        assert!(check_scan_size(16).is_err()); // /16 — 65 k, previously "worked" slowly
+        assert!(check_scan_size(19).is_err()); // 8192 > 4096
+    }
+
+    #[test]
+    fn scan_size_cap_allows_reasonable_subnets() {
+        assert!(check_scan_size(20).is_ok()); // exactly 4096
+        assert!(check_scan_size(24).is_ok()); // 256
+        assert!(check_scan_size(31).is_ok()); // 2
+        assert!(check_scan_size(32).is_ok()); // 1
+    }
+
+    #[tokio::test]
+    async fn scan_rejects_oversized_subnet_end_to_end() {
+        assert!(scan("10.0.0.0/8").await.is_err());
+        assert!(scan("192.168.0.0/16").await.is_err());
+    }
+
+    // ── Network/broadcast skipping (L6) ─────────────────────────────
+
+    fn net(cidr: &str) -> ipnetwork::Ipv4Network {
+        cidr.parse().unwrap()
+    }
+    fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
+    #[test]
+    fn is_scannable_slash24_skips_network_and_broadcast() {
+        let n = net("192.168.1.0/24");
+        assert!(!is_scannable(&v4(192, 168, 1, 0), &n));
+        assert!(!is_scannable(&v4(192, 168, 1, 255), &n));
+        assert!(is_scannable(&v4(192, 168, 1, 1), &n));
+        assert!(is_scannable(&v4(192, 168, 1, 254), &n));
+    }
+
+    #[test]
+    fn is_scannable_slash31_scans_both_legs() {
+        // RFC 3021: a /31 has no network/broadcast — both are hosts.
+        let n = net("10.0.0.0/31");
+        assert!(is_scannable(&v4(10, 0, 0, 0), &n));
+        assert!(is_scannable(&v4(10, 0, 0, 1), &n));
+    }
+
+    #[test]
+    fn is_scannable_slash32_scans_the_host() {
+        // Even a /32 of a .0 host must be scanned (old code skipped it).
+        let n = net("192.168.1.0/32");
+        assert!(is_scannable(&v4(192, 168, 1, 0), &n));
+    }
+
+    #[test]
+    fn is_scannable_slash25_uses_real_broadcast() {
+        // 192.168.1.0/25 → network .0, broadcast .127. The old octet
+        // check skipped .0/.255 and missed the real .127 broadcast.
+        let n = net("192.168.1.0/25");
+        assert!(!is_scannable(&v4(192, 168, 1, 0), &n));
+        assert!(!is_scannable(&v4(192, 168, 1, 127), &n));
+        assert!(is_scannable(&v4(192, 168, 1, 1), &n));
+        assert!(is_scannable(&v4(192, 168, 1, 126), &n));
     }
 
     #[tokio::test]
