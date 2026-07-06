@@ -342,7 +342,8 @@ impl StreamManager {
             None
         } else {
             let iface =
-                crate::network::interface::get_by_name(&settings.rtsp_server.bind_interface)?;
+                crate::network::interface::get_by_name(&settings.rtsp_server.bind_interface)
+                    .await?;
             let ip = iface
                 .ips
                 .first()
@@ -377,8 +378,10 @@ impl StreamManager {
         };
 
         // Use bind address for client URL if set, otherwise detect local IP
-        let local_ip =
-            bind_address.unwrap_or_else(|| get_local_ip().unwrap_or_else(|| "0.0.0.0".into()));
+        let local_ip = match bind_address {
+            Some(ip) => ip,
+            None => get_local_ip().await.unwrap_or_else(|| "0.0.0.0".into()),
+        };
         let info = RtspServerInfo {
             rtsp_url: server.client_url(&local_ip),
             display_url: server.display_url(&local_ip),
@@ -643,8 +646,8 @@ async fn compute_status(state: &Arc<Mutex<StreamState>>) -> StreamStatus {
 ///
 /// The camera occupies the Ethernet port, so the RTSP server should bind to
 /// WiFi or a VPN-over-WiFi interface for local network streaming.
-fn get_local_ip() -> Option<String> {
-    let interfaces = crate::network::interface::list_all().ok()?;
+async fn get_local_ip() -> Option<String> {
+    let interfaces = crate::network::interface::list_all().await.ok()?;
 
     // Prefer WiFi interfaces first
     let wifi_ip = interfaces

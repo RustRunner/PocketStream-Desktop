@@ -148,7 +148,7 @@ mod imp {
             tokio::time::sleep(Duration::from_millis(300)).await;
             while rx.try_recv().is_ok() {}
 
-            let list = match interface::list_physical() {
+            let list = match interface::list_physical().await {
                 Ok(l) => l,
                 Err(e) => {
                     log::debug!("Watcher enumeration failed: {}", e);

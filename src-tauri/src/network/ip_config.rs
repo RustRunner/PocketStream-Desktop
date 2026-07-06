@@ -11,7 +11,7 @@ pub async fn assign_static_ip(
     subnet_mask: &str,
     gateway: Option<&str>,
 ) -> Result<(), AppError> {
-    validate_interface_name(interface)?;
+    super::interface::validate_interface_name(interface).await?;
     validate_ip(ip)?;
     validate_ip(subnet_mask)?;
     if let Some(gw) = gateway {
@@ -43,6 +43,7 @@ async fn assign_windows(
 ) -> Result<(), AppError> {
     // Snapshot existing secondary IPs before the set (which replaces all).
     let secondaries: Vec<super::interface::IpInfo> = super::interface::get_by_name(interface)
+        .await
         .map(|info| info.ips.into_iter().skip(1).collect())
         .unwrap_or_default();
 
@@ -160,17 +161,6 @@ pub(crate) async fn run_command(program: &str, args: &[&str]) -> Result<String, 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-fn validate_interface_name(name: &str) -> Result<(), AppError> {
-    let known = super::interface::list_physical()?;
-    if !known.iter().any(|iface| iface.name == name) {
-        return Err(AppError::Network(format!(
-            "Unknown network interface: {}",
-            name
-        )));
-    }
-    Ok(())
-}
-
 fn validate_ip(ip: &str) -> Result<(), AppError> {
     ip.parse::<std::net::Ipv4Addr>()
         .map_err(|_| AppError::Network(format!("Invalid IP address: {}", ip)))?;
@@ -188,7 +178,7 @@ fn mask_to_prefix(mask: &str) -> Result<u8, AppError> {
 
 /// Add a secondary IP address to an interface (preserves existing IPs).
 pub async fn add_secondary_ip(interface: &str, ip: &str, mask: &str) -> Result<(), AppError> {
-    validate_interface_name(interface)?;
+    super::interface::validate_interface_name(interface).await?;
     validate_ip(ip)?;
     validate_ip(mask)?;
 
@@ -216,7 +206,7 @@ pub async fn add_secondary_ip(interface: &str, ip: &str, mask: &str) -> Result<(
 /// IPv4 and DNS, renews the lease). Requires admin; same fast-path-then-
 /// elevate pattern as `adapter_refresh::hard_refresh_windows`.
 pub async fn set_dhcp(interface: &str) -> Result<(), AppError> {
-    validate_interface_name(interface)?;
+    super::interface::validate_interface_name(interface).await?;
 
     #[cfg(target_os = "windows")]
     {
@@ -311,7 +301,7 @@ async fn set_dhcp_windows(interface: &str) -> Result<(), AppError> {
 /// Read whether the interface is currently in DHCP mode for IPv4. No admin
 /// required. Called by the dialog at open time to position the mode toggle.
 pub async fn get_dhcp_state(interface: &str) -> Result<bool, AppError> {
-    validate_interface_name(interface)?;
+    super::interface::validate_interface_name(interface).await?;
 
     #[cfg(target_os = "windows")]
     {
@@ -351,7 +341,7 @@ pub async fn get_dhcp_state(interface: &str) -> Result<bool, AppError> {
 
 /// Remove a secondary IP address from an interface.
 pub async fn remove_secondary_ip(interface: &str, ip: &str) -> Result<(), AppError> {
-    validate_interface_name(interface)?;
+    super::interface::validate_interface_name(interface).await?;
     validate_ip(ip)?;
 
     #[cfg(target_os = "windows")]

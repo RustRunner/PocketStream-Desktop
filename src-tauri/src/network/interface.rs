@@ -4,6 +4,59 @@ use std::net::IpAddr;
 
 use crate::error::AppError;
 
+/// How long a validated interface name stays trusted before the next
+/// `validate_interface_name` re-enumerates. Bounds staleness (an adapter
+/// removed within the window still validates) while keeping the 2 s
+/// auto-adopt loop from spawning PowerShell twice per cycle forever.
+const VALIDATION_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Names validated within [`VALIDATION_TTL`], with the time they were
+/// confirmed present. Read on the hot path; the enumeration behind it is
+/// the expensive part being skipped.
+static VALIDATED_NAMES: std::sync::Mutex<
+    Option<std::collections::HashMap<String, std::time::Instant>>,
+> = std::sync::Mutex::new(None);
+
+fn recently_validated(name: &str) -> bool {
+    let guard = VALIDATED_NAMES.lock();
+    let map = match guard {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    map.as_ref()
+        .and_then(|m| m.get(name))
+        .is_some_and(|t| t.elapsed() < VALIDATION_TTL)
+}
+
+fn remember_validated(name: &str) {
+    let mut guard = match VALIDATED_NAMES.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    map.insert(name.to_string(), std::time::Instant::now());
+}
+
+/// Validate that `name` is a currently-known physical interface. Cached
+/// for [`VALIDATION_TTL`] so the IP-config commands and the auto-adopt
+/// loop don't re-run the adapter enumeration on every call. Consolidates
+/// the two former per-module copies of this check.
+pub async fn validate_interface_name(name: &str) -> Result<(), AppError> {
+    if recently_validated(name) {
+        return Ok(());
+    }
+    let known = list_physical().await?;
+    if known.iter().any(|iface| iface.name == name) {
+        remember_validated(name);
+        Ok(())
+    } else {
+        Err(AppError::Network(format!(
+            "Unknown network interface: {}",
+            name
+        )))
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct IpInfo {
     pub address: String,
@@ -24,10 +77,10 @@ pub struct InterfaceInfo {
 }
 
 /// List physical (non-VPN) network interfaces.
-pub fn list_physical() -> Result<Vec<InterfaceInfo>, AppError> {
+pub async fn list_physical() -> Result<Vec<InterfaceInfo>, AppError> {
     #[cfg(target_os = "windows")]
     {
-        list_physical_windows()
+        list_physical_windows().await
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -36,10 +89,10 @@ pub fn list_physical() -> Result<Vec<InterfaceInfo>, AppError> {
 }
 
 /// List VPN interfaces only.
-pub fn list_vpn() -> Result<Vec<InterfaceInfo>, AppError> {
+pub async fn list_vpn() -> Result<Vec<InterfaceInfo>, AppError> {
     #[cfg(target_os = "windows")]
     {
-        list_vpn_windows()
+        list_vpn_windows().await
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -48,11 +101,11 @@ pub fn list_vpn() -> Result<Vec<InterfaceInfo>, AppError> {
 }
 
 /// List all network interfaces with their details (physical + VPN).
-pub fn list_all() -> Result<Vec<InterfaceInfo>, AppError> {
+pub async fn list_all() -> Result<Vec<InterfaceInfo>, AppError> {
     #[cfg(target_os = "windows")]
     {
-        let mut result = list_physical_windows()?;
-        result.extend(list_vpn_windows()?);
+        let mut result = list_physical_windows().await?;
+        result.extend(list_vpn_windows().await?);
         Ok(result)
     }
     #[cfg(not(target_os = "windows"))]
@@ -151,7 +204,7 @@ fn parse_adapter(a: &serde_json::Value, is_vpn: bool) -> InterfaceInfo {
 }
 
 #[cfg(target_os = "windows")]
-fn run_adapter_query(filter: &str) -> Result<String, AppError> {
+async fn run_adapter_query(filter: &str) -> Result<String, AppError> {
     // Include both Up and Disconnected adapters. Disconnected adapters are
     // surfaced in the UI as "detected but no link" so users can click
     // Reset to provoke a driver re-probe — the workaround for the Windows
@@ -178,30 +231,59 @@ fn run_adapter_query(filter: &str) -> Result<String, AppError> {
         }} | ConvertTo-Json -Depth 3 -Compress"#,
         filter
     );
-    let output = super::cmd("powershell")
+    // Bounded so a hung PowerShell (broken WMI has been observed) can't
+    // wedge the calling worker indefinitely. kill_on_drop ensures the
+    // child is reaped if the timeout fires and drops the future.
+    let fut = super::async_cmd("powershell")
         .args(["-NoProfile", "-Command", &script])
-        .output()
-        .map_err(|e| AppError::Network(format!("Failed to run PowerShell: {}", e)))?;
+        .kill_on_drop(true)
+        .output();
+    let output = match tokio::time::timeout(std::time::Duration::from_secs(10), fut).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            return Err(AppError::Network(format!(
+                "Failed to run PowerShell: {}",
+                e
+            )))
+        }
+        Err(_) => {
+            return Err(AppError::Network(
+                "Adapter enumeration timed out after 10s (PowerShell/WMI may be hung)".into(),
+            ))
+        }
+    };
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !stderr.is_empty() {
         log::warn!("PowerShell stderr: {}", stderr);
     }
 
+    // A non-zero exit must NOT be treated as an empty adapter list —
+    // that made validators fail with "Unknown network interface", the
+    // watcher emit its no-adapter sentinel, and adopted-subnet restore
+    // silently skip. Surface it as an error instead.
+    if !output.status.success() {
+        return Err(AppError::Network(format!(
+            "Adapter enumeration failed (exit {}): {}",
+            output.status.code().unwrap_or(-1),
+            stderr.trim()
+        )));
+    }
+
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 #[cfg(target_os = "windows")]
-fn list_physical_windows() -> Result<Vec<InterfaceInfo>, AppError> {
-    let stdout = run_adapter_query("$_.Virtual -eq $false")?;
+async fn list_physical_windows() -> Result<Vec<InterfaceInfo>, AppError> {
+    let stdout = run_adapter_query("$_.Virtual -eq $false").await?;
     log::info!("Windows physical adapter enumeration: {}", stdout);
     let adapters = parse_adapter_json(&stdout)?;
     Ok(adapters.iter().map(|a| parse_adapter(a, false)).collect())
 }
 
 #[cfg(target_os = "windows")]
-fn list_vpn_windows() -> Result<Vec<InterfaceInfo>, AppError> {
-    let stdout = run_adapter_query("$_.Virtual -eq $true")?;
+async fn list_vpn_windows() -> Result<Vec<InterfaceInfo>, AppError> {
+    let stdout = run_adapter_query("$_.Virtual -eq $true").await?;
     let adapters = parse_adapter_json(&stdout)?;
     Ok(adapters
         .iter()
@@ -285,8 +367,8 @@ pub fn quick_status_by_mac(mac: &str) -> Option<(bool, Vec<IpInfo>)> {
 }
 
 /// Get info for a specific interface by name.
-pub fn get_by_name(name: &str) -> Result<InterfaceInfo, AppError> {
-    let all = list_all()?;
+pub async fn get_by_name(name: &str) -> Result<InterfaceInfo, AppError> {
+    let all = list_all().await?;
     all.into_iter()
         .find(|i| i.name == name)
         .ok_or_else(|| AppError::Network(format!("Interface '{}' not found", name)))
@@ -543,24 +625,42 @@ mod tests {
 
     // ── Platform-independent tests ──────────────────────────────────
 
-    #[test]
-    fn list_physical_returns_ok() {
+    #[tokio::test]
+    async fn list_physical_returns_ok() {
         // Should succeed on any platform (may be empty in CI)
-        let result = list_physical();
+        let result = list_physical().await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn list_all_returns_ok() {
-        let result = list_all();
+    #[tokio::test]
+    async fn list_all_returns_ok() {
+        let result = list_all().await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn get_by_name_nonexistent_returns_err() {
-        let result = get_by_name("__nonexistent_interface_42__");
+    #[tokio::test]
+    async fn get_by_name_nonexistent_returns_err() {
+        let result = get_by_name("__nonexistent_interface_42__").await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("not found"));
+    }
+
+    #[test]
+    fn validation_cache_remembers_within_ttl() {
+        let name = "__ttl_cache_probe__";
+        assert!(!recently_validated(name));
+        remember_validated(name);
+        assert!(recently_validated(name));
+    }
+
+    #[tokio::test]
+    async fn validate_interface_name_rejects_unknown() {
+        let result = validate_interface_name("__nonexistent_interface_43__").await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unknown network interface"));
     }
 }

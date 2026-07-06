@@ -485,7 +485,7 @@ pub fn run() {
                 }
                 manager.load_adopted_from_config(&config, &handle).await;
 
-                match network::interface::list_physical() {
+                match network::interface::list_physical().await {
                     Ok(interfaces) => {
                         let eth = interfaces
                             .iter()

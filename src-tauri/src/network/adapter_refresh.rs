@@ -19,7 +19,7 @@ pub enum RefreshMode {
 }
 
 pub async fn refresh_adapter(interface: &str, mode: RefreshMode) -> Result<(), AppError> {
-    validate_interface_name(interface)?;
+    super::interface::validate_interface_name(interface).await?;
 
     #[cfg(target_os = "windows")]
     {
@@ -36,17 +36,6 @@ pub async fn refresh_adapter(interface: &str, mode: RefreshMode) -> Result<(), A
             "Adapter refresh is only implemented on Windows".into(),
         ))
     }
-}
-
-fn validate_interface_name(name: &str) -> Result<(), AppError> {
-    let known = super::interface::list_physical()?;
-    if !known.iter().any(|i| i.name == name) {
-        return Err(AppError::Network(format!(
-            "Unknown network interface: {}",
-            name
-        )));
-    }
-    Ok(())
 }
 
 #[cfg(target_os = "windows")]

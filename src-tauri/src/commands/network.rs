@@ -24,12 +24,12 @@ pub async fn scan_network(
 pub async fn list_interfaces(
     manager: State<'_, NetworkManager>,
 ) -> Result<Vec<InterfaceInfo>, AppError> {
-    manager.list_interfaces()
+    manager.list_interfaces().await
 }
 
 #[tauri::command]
 pub async fn list_vpn_interfaces() -> Result<Vec<InterfaceInfo>, AppError> {
-    crate::network::interface::list_vpn()
+    crate::network::interface::list_vpn().await
 }
 
 #[tauri::command]
@@ -37,7 +37,7 @@ pub async fn get_interface_info(
     manager: State<'_, NetworkManager>,
     name: String,
 ) -> Result<InterfaceInfo, AppError> {
-    manager.get_interface(&name)
+    manager.get_interface(&name).await
 }
 
 #[tauri::command]

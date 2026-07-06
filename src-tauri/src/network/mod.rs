@@ -224,13 +224,15 @@ impl NetworkManager {
                 emitter.poke();
             }
             if crate::is_discovery_available() {
-                let iface = self.interface_name.lock().await.clone().or_else(|| {
-                    interface::list_physical().ok().and_then(|list| {
+                let cached_name = self.interface_name.lock().await.clone();
+                let iface = match cached_name {
+                    Some(n) => Some(n),
+                    None => interface::list_physical().await.ok().and_then(|list| {
                         list.into_iter()
                             .find(|i| i.is_up && i.is_ethernet && !i.ips.is_empty())
                             .map(|i| i.name)
-                    })
-                });
+                    }),
+                };
                 if let Some(name) = iface {
                     if let Err(e) = self.start_arp_discovery(&name, app_handle.clone()).await {
                         log::warn!("Failed to start ARP after mode change: {}", e);
@@ -306,7 +308,7 @@ impl NetworkManager {
         }
 
         // Get the active ethernet interface
-        let iface = match interface::list_physical() {
+        let iface = match interface::list_physical().await {
             Ok(interfaces) => interfaces
                 .into_iter()
                 .find(|i| i.is_up && i.is_ethernet && !i.ips.is_empty()),
@@ -448,12 +450,12 @@ impl NetworkManager {
         }
     }
 
-    pub fn list_interfaces(&self) -> Result<Vec<InterfaceInfo>, AppError> {
-        interface::list_physical()
+    pub async fn list_interfaces(&self) -> Result<Vec<InterfaceInfo>, AppError> {
+        interface::list_physical().await
     }
 
-    pub fn get_interface(&self, name: &str) -> Result<InterfaceInfo, AppError> {
-        interface::get_by_name(name)
+    pub async fn get_interface(&self, name: &str) -> Result<InterfaceInfo, AppError> {
+        interface::get_by_name(name).await
     }
 
     pub async fn scan_subnet(&self, subnet: &str) -> Result<Vec<ScanResult>, AppError> {
@@ -492,7 +494,7 @@ impl NetworkManager {
         // (PacketMonitor captures unscoped — no capture-device matching
         // needed — but the listener still uses the adapter's own MAC to
         // filter our own gratuitous ARP.)
-        let iface_info = interface::get_by_name(interface_display_name)?;
+        let iface_info = interface::get_by_name(interface_display_name).await?;
         let known_ips: Vec<String> = iface_info.ips.iter().map(|ip| ip.address.clone()).collect();
         let ethernet_ips: Vec<Ipv4Addr> =
             known_ips.iter().filter_map(|ip| ip.parse().ok()).collect();
@@ -658,6 +660,11 @@ impl NetworkManager {
                                 iface_name,
                                 e
                             );
+                            // Cache the fail-open verdict with the same TTL
+                            // as a success — otherwise a persistent probe
+                            // failure re-spawns PowerShell every 2s instead
+                            // of every 5s.
+                            cached_dhcp_state = Some((false, std::time::Instant::now()));
                             false
                         }
                     }
@@ -666,7 +673,7 @@ impl NetworkManager {
                 };
 
                 if is_dhcp {
-                    let current_ips = get_interface_ips(&iface_name);
+                    let current_ips = get_interface_ips(&iface_name).await;
                     let has_real_lease = current_ips.iter().any(|ip| !ip.is_link_local());
                     if has_real_lease {
                         continue;
@@ -695,7 +702,7 @@ impl NetworkManager {
                     };
 
                     // Refresh current IPs (may have changed since startup)
-                    let current_ips = get_interface_ips(&iface_name);
+                    let current_ips = get_interface_ips(&iface_name).await;
 
                     if auto_adopt::already_on_subnet(device_ip, &current_ips) {
                         known_subnets.insert(device.subnet.clone());
@@ -895,7 +902,7 @@ impl NetworkManager {
         // (shouldn't happen, but guards against a future bug or a
         // corrupted config), cleanup will skip it instead of disabling
         // the user's network.
-        let current_iface = interface::get_by_name(&iface_name).ok();
+        let current_iface = interface::get_by_name(&iface_name).await.ok();
         let current_ip_set: HashSet<String> = current_iface
             .as_ref()
             .map(|i| i.ips.iter().map(|ip| ip.address.clone()).collect())
@@ -970,8 +977,8 @@ fn parse_mac_bytes(mac: &str) -> Option<[u8; 6]> {
     Some(out)
 }
 
-fn get_interface_ips(name: &str) -> Vec<Ipv4Addr> {
-    match interface::get_by_name(name) {
+async fn get_interface_ips(name: &str) -> Vec<Ipv4Addr> {
+    match interface::get_by_name(name).await {
         Ok(info) => info
             .ips
             .iter()
