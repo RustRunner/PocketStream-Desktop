@@ -425,6 +425,17 @@ async function fastVerifyCachedDevice(
     // periodic re-verify so the status self-heals when conditions
     // improve.
     markIpScanned(ip, /* clear */ true);
+    // Evict phantom cache rows: a device that never verifies is probably
+    // gone. The backend exempts aliased CAM/PTU, manual nodes, and Live
+    // entries, so only genuinely-unimportant phantoms are removed; the
+    // exempt ones fall through to the dim-and-re-verify self-heal path.
+    let evicted = false;
+    try {
+      evicted = await api.evictPhantomDevice(ip);
+    } catch (e) {
+      log(`evict phantom ${ip} failed: ${formatError(e)}`);
+    }
+    if (evicted) return;
     api.setDeviceStatus(mac, "offline").catch((e: unknown) => {
       log(`set offline status failed for ${ip}: ${formatError(e)}`);
     });

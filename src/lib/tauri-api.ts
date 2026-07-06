@@ -185,6 +185,14 @@ export async function forgetDevice(mac: string): Promise<void> {
   return await invoke("forget_device", { mac });
 }
 
+/** Evict a phantom cached device (targeted verify found no open ports).
+ *  The backend no-ops for aliased CAM/PTU, manual, and Live entries, so
+ *  this is safe to call unconditionally on a failed verify. Returns true
+ *  if a device was actually removed. */
+export async function evictPhantomDevice(ip: string): Promise<boolean> {
+  return await invoke<boolean>("evict_phantom_device", { ip });
+}
+
 export async function getAdoptedSubnets(): Promise<Record<string, string>> {
   return await invoke<Record<string, string>>("get_adopted_subnets");
 }

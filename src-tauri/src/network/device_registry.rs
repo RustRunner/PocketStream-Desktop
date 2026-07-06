@@ -369,12 +369,40 @@ impl DeviceRegistry {
                 record.open_ports = open_ports.to_vec();
                 changed = true;
             }
-            if record.status != DeviceStatus::Live {
+            // Promote to Live only on a non-empty port set. A zero-port
+            // scan is not evidence a device is alive — promoting on it
+            // would resurrect a dead device as Live (the eviction path
+            // handles the zero-port case instead).
+            if !open_ports.is_empty() && record.status != DeviceStatus::Live {
                 record.status = DeviceStatus::Live;
                 changed = true;
             }
         }
         changed
+    }
+
+    /// Evict a phantom cached device: a non-`Live` record at `ip` whose
+    /// targeted verify found no open ports and which the user hasn't
+    /// pinned. Aliased entries (the CAM/PTU the user labelled and treats
+    /// as fixed), manual nodes, and `Live` records (ARP-confirmed this
+    /// session) are never evicted. Returns the dropped MAC so the caller
+    /// can remove the cache row.
+    pub fn evict_phantom(&self, ip: &str) -> Option<String> {
+        let mut map = self.lock();
+        let mac = map
+            .iter()
+            .find(|(key, r)| {
+                r.ip == ip
+                    && r.alias.is_empty()
+                    && !key.starts_with("manual:")
+                    && matches!(
+                        r.status,
+                        DeviceStatus::CachedOnly | DeviceStatus::Offline | DeviceStatus::Verifying
+                    )
+            })
+            .map(|(k, _)| k.clone())?;
+        map.remove(&mac);
+        Some(mac)
     }
 
     /// Set or clear an alias for the device with this IP. Empty string
@@ -535,6 +563,63 @@ mod tests {
     fn snapshot_starts_empty() {
         let r = DeviceRegistry::new();
         assert!(r.snapshot().is_empty());
+    }
+
+    #[test]
+    fn merge_scan_result_zero_ports_does_not_promote_to_live() {
+        let r = DeviceRegistry::new();
+        r.hydrate_from_cache(&[cached(
+            "AA:BB:CC:DD:EE:01",
+            "192.168.1.10",
+            "192.168.1.0/24",
+            vec![80],
+            "",
+        )]);
+        // Cached row starts CachedOnly. A zero-port verify must NOT flip
+        // it to Live (that resurrected dead devices).
+        r.merge_scan_result("192.168.1.10", &[]);
+        assert_eq!(r.snapshot()[0].status, DeviceStatus::CachedOnly);
+        // A non-empty scan does promote.
+        r.merge_scan_result("192.168.1.10", &[80]);
+        assert_eq!(r.snapshot()[0].status, DeviceStatus::Live);
+    }
+
+    #[test]
+    fn evict_phantom_removes_unaliased_cached_row() {
+        let r = DeviceRegistry::new();
+        r.hydrate_from_cache(&[cached(
+            "AA:BB:CC:DD:EE:01",
+            "192.168.1.10",
+            "192.168.1.0/24",
+            vec![],
+            "",
+        )]);
+        assert_eq!(
+            r.evict_phantom("192.168.1.10").as_deref(),
+            Some("AA:BB:CC:DD:EE:01")
+        );
+        assert!(r.snapshot().is_empty());
+    }
+
+    #[test]
+    fn evict_phantom_exempts_aliased_and_live() {
+        // Aliased CAM/PTU are treated as fixed and never auto-removed.
+        let r = DeviceRegistry::new();
+        r.hydrate_from_cache(&[cached(
+            "AA:BB:CC:DD:EE:01",
+            "192.168.1.10",
+            "192.168.1.0/24",
+            vec![],
+            "CAM",
+        )]);
+        assert!(r.evict_phantom("192.168.1.10").is_none());
+        assert_eq!(r.snapshot().len(), 1);
+
+        // A Live (ARP-confirmed) device is never evicted either.
+        let r2 = DeviceRegistry::new();
+        r2.merge_arp(&arp("AA:BB:CC:DD:EE:02", "192.168.1.11", "192.168.1.0/24"));
+        assert!(r2.evict_phantom("192.168.1.11").is_none());
+        assert_eq!(r2.snapshot().len(), 1);
     }
 
     #[test]

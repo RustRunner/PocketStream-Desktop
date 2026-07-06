@@ -319,6 +319,32 @@ pub async fn set_device_status(
     Ok(())
 }
 
+/// Evict a phantom cached device whose targeted verify found no open
+/// ports. The backend enforces the exemptions: aliased CAM/PTU entries,
+/// manual nodes, and Live (ARP-confirmed) devices are never removed, so
+/// the frontend can call this unconditionally on a failed verify and a
+/// pinned device is left to keep re-verifying.
+/// Returns true if a device was evicted, false if `ip` was exempt (kept)
+/// or not tracked — the frontend keeps re-verifying only the kept ones.
+#[tauri::command]
+pub async fn evict_phantom_device(
+    manager: State<'_, NetworkManager>,
+    config: State<'_, AppConfig>,
+    ip: String,
+) -> Result<bool, AppError> {
+    match manager.registry().evict_phantom(&ip) {
+        Some(mac) => {
+            config.remove_cached_device(&mac)?;
+            if let Some(emitter) = manager.emitter().await {
+                emitter.poke();
+            }
+            log::info!("Evicted phantom device {} ({})", ip, mac);
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
 /// Drop a device from the registry and the on-disk cache. Used by the
 /// "forget this device" affordance in the offline-cache dialog.
 #[tauri::command]
