@@ -536,21 +536,27 @@ impl NetworkManager {
         let sweep_registry = registry.clone();
         let sweep_emitter = emitter.clone();
         let sweep_app_handle = app_handle_for_adopt.clone();
-        let sweep_iface_ip = sweep_ips.first().cloned().unwrap_or_default();
         tokio::spawn(async move {
             // Small delay to let the capture listener start first
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             log::info!("Ping sweeping known subnets to populate ARP");
             ping_sweep_subnets(&sweep_ips).await;
 
-            // Read OS ARP table scoped to the Ethernet interface only
-            if !sweep_iface_ip.is_empty() {
+            // Merge the OS neighbor table for EVERY local/adopted IP, not
+            // just the first — a neighbor learned via an adopted secondary
+            // subnet would otherwise be missed at boot (in-session sweeps
+            // cover it post-adoption, but not the cold-start merge). The
+            // map dedup makes the extra queries harmless.
+            for sweep_iface_ip in &sweep_ips {
+                if sweep_iface_ip.is_empty() {
+                    continue;
+                }
                 merge_arp_table(
-                    sweep_devices,
-                    sweep_registry,
-                    sweep_emitter,
-                    sweep_app_handle,
-                    &sweep_iface_ip,
+                    sweep_devices.clone(),
+                    sweep_registry.clone(),
+                    sweep_emitter.clone(),
+                    sweep_app_handle.clone(),
+                    sweep_iface_ip,
                 )
                 .await;
             }

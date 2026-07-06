@@ -490,21 +490,50 @@ impl PlaybackPipeline {
             .add(&rec_bin)
             .map_err(|e| AppError::Stream(format!("Failed to add recording bin: {}", e)))?;
 
-        let bin_sink_pad = rec_bin
-            .static_pad("sink")
-            .ok_or_else(|| AppError::Stream("Recording bin has no sink pad".into()))?;
+        // From here the bin is IN the pipeline. Any failure must unwind it
+        // (release the tee request pad, Null + remove the bin) — otherwise
+        // the half-added "rec_bin" and the leaked tee pad make every later
+        // attach fail until the whole pipeline restarts.
+        let unwind = |tee_pad: Option<&gst::Pad>| {
+            if let Some(p) = tee_pad {
+                tee.release_request_pad(p);
+            }
+            let _ = rec_bin.set_state(gst::State::Null);
+            let _ = self.pipeline.remove(&rec_bin);
+        };
 
-        let tee_src_pad = tee
-            .request_pad_simple("src_%u")
-            .ok_or_else(|| AppError::Stream("Failed to get tee src pad".into()))?;
+        let bin_sink_pad = match rec_bin.static_pad("sink") {
+            Some(p) => p,
+            None => {
+                unwind(None);
+                return Err(AppError::Stream("Recording bin has no sink pad".into()));
+            }
+        };
 
-        tee_src_pad
-            .link(&bin_sink_pad)
-            .map_err(|e| AppError::Stream(format!("Failed to link tee to recording: {}", e)))?;
+        let tee_src_pad = match tee.request_pad_simple("src_%u") {
+            Some(p) => p,
+            None => {
+                unwind(None);
+                return Err(AppError::Stream("Failed to get tee src pad".into()));
+            }
+        };
 
-        rec_bin
-            .sync_state_with_parent()
-            .map_err(|e| AppError::Stream(format!("Failed to sync recording bin: {}", e)))?;
+        if let Err(e) = tee_src_pad.link(&bin_sink_pad) {
+            unwind(Some(&tee_src_pad));
+            return Err(AppError::Stream(format!(
+                "Failed to link tee to recording: {}",
+                e
+            )));
+        }
+
+        if let Err(e) = rec_bin.sync_state_with_parent() {
+            let _ = tee_src_pad.unlink(&bin_sink_pad);
+            unwind(Some(&tee_src_pad));
+            return Err(AppError::Stream(format!(
+                "Failed to sync recording bin: {}",
+                e
+            )));
+        }
 
         log::info!("Recording branch attached: {}", file_path);
         Ok(bin_name.into())
@@ -615,6 +644,16 @@ impl PlaybackPipeline {
 
         log::info!("Recording branch detached and finalized");
         Ok(())
+    }
+}
+
+impl Drop for PlaybackPipeline {
+    fn drop(&mut self) {
+        // Force the pipeline to Null on drop so a PlaybackPipeline that's
+        // dropped without an explicit stop() — e.g. when play() fails
+        // right after construction, or an error path drops it — doesn't
+        // leak the GStreamer pipeline and its elements.
+        let _ = self.pipeline.set_state(gst::State::Null);
     }
 }
 
