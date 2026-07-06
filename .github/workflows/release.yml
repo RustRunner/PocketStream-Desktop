@@ -80,6 +80,17 @@ jobs:
           "C:\gstreamer\1.0\msvc_x86_64\bin" `
             | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
+      # The GStreamer MSVC devel package lays down the .pc files but ships
+      # no pkg-config executable, and windows-latest has none by default —
+      # so glib-sys / gstreamer-sys can't resolve their system deps and
+      # the build fails with "The pkg-config command could not be found".
+      # pkgconfiglite provides pkg-config.exe on PATH. GStreamer's install
+      # path has no spaces, so pkgconfiglite's space-in-path limitation
+      # doesn't bite.
+      - name: Install pkg-config
+        shell: pwsh
+        run: choco install pkgconfiglite -y --no-progress
+
       - run: npm ci
 
       # Same gates as CI, on the release commit.

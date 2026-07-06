@@ -9,4 +9,16 @@ ignore = [
     # this app's usage. Revisit by 2026-10-01: check for a patched
     # upstream and drop this ignore if one exists.
     "RUSTSEC-2024-0413",
+    # RUSTSEC-2026-0194 / RUSTSEC-2026-0195 — DoS advisories in quick-xml
+    # (quadratic duplicate-attribute scan; unbounded namespace-declaration
+    # allocation). Both require parsing attacker-controlled XML. quick-xml
+    # is transitive only: 0.37 via tauri-plugin-notification (WinRT toast
+    # XML this app generates itself) and 0.38 via tauri's Windows
+    # internals — neither parses untrusted external XML, so the DoS path
+    # is unreachable here. `cargo update` finds no compatible patched
+    # release in the current tree (both are pinned by upstream semver), so
+    # the fix has to arrive via a tauri bump. Revisit by 2026-10-01 and
+    # drop these when tauri pulls a patched quick-xml.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
