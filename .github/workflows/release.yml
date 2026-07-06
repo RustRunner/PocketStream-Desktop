@@ -1,0 +1,141 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Needed to create the draft GitHub release.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build, sign & draft (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # First gate: the tag must match the version in all three files.
+      # This — not the build — is what prevents a release built from the
+      # wrong commit / a forgotten version bump.
+      - name: Version consistency gate
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}" -replace '^v', ''
+          $pkg = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $conf = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $cargoLine = Select-String -Path src-tauri/Cargo.toml `
+            -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+          $cargo = $cargoLine.Matches[0].Groups[1].Value
+          Write-Host "tag=$tag package.json=$pkg tauri.conf.json=$conf Cargo.toml=$cargo"
+          if ($pkg -ne $tag -or $conf -ne $tag -or $cargo -ne $tag) {
+            throw "Version mismatch: tag '$tag' but package.json=$pkg, tauri.conf.json=$conf, Cargo.toml=$cargo. Run bump-version.ps1 so all three match the tag."
+          }
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # Same pinned-MSI install as ci.yml — Chocolatey can't version-match
+      # runtime and devel after 1.24.9, and upstream prunes non-terminal
+      # patch MSIs. Installs to C:\gstreamer\1.0\msvc_x86_64\.
+      - name: Install GStreamer (MSVC x86_64)
+        shell: pwsh
+        run: |
+          $base = 'https://gstreamer.freedesktop.org/data/pkg/windows/1.24.13/msvc'
+          $msis = @(
+            @{ Name = 'gstreamer-1.0-msvc-x86_64-1.24.13.msi'
+               Sha256 = '66915D82ADDA34189703C36A5D2EF145D2E3AFB7AFC12C66FCF2EA506E2466D2' },
+            @{ Name = 'gstreamer-1.0-devel-msvc-x86_64-1.24.13.msi'
+               Sha256 = '0AFB4394C2CBA3999C0F5E74F28C2AC5D98F03131140E09246D4DCD60A0A0395' }
+          )
+          foreach ($msi in $msis) {
+            $path = Join-Path $env:RUNNER_TEMP $msi.Name
+            curl.exe -fsSL --retry 3 --retry-delay 5 -o $path "$base/$($msi.Name)"
+            if ($LASTEXITCODE -ne 0) { throw "download failed: $($msi.Name)" }
+            $hash = (Get-FileHash -Path $path -Algorithm SHA256).Hash
+            if ($hash -ne $msi.Sha256) {
+              throw "SHA256 mismatch for $($msi.Name): expected $($msi.Sha256), got $hash"
+            }
+            $proc = Start-Process msiexec.exe -Wait -PassThru `
+              -ArgumentList '/i', $path, '/qn', 'ADDLOCAL=ALL'
+            if ($proc.ExitCode -ne 0) {
+              throw "msiexec exit $($proc.ExitCode) for $($msi.Name)"
+            }
+          }
+
+      - name: Configure GStreamer environment
+        shell: pwsh
+        run: |
+          "GSTREAMER_1_0_ROOT_MSVC_X86_64=C:\gstreamer\1.0\msvc_x86_64\" `
+            | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "PKG_CONFIG_PATH=C:\gstreamer\1.0\msvc_x86_64\lib\pkgconfig" `
+            | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "C:\gstreamer\1.0\msvc_x86_64\bin" `
+            | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - run: npm ci
+
+      # Same gates as CI, on the release commit.
+      - name: Checks (typecheck, fmt, clippy, test, audit)
+        shell: pwsh
+        run: |
+          npm run typecheck
+          if ($LASTEXITCODE -ne 0) { throw "typecheck failed" }
+          Push-Location src-tauri
+          try {
+            cargo fmt --check
+            if ($LASTEXITCODE -ne 0) { throw "fmt failed" }
+            cargo clippy --all-targets --no-deps -- -D warnings
+            if ($LASTEXITCODE -ne 0) { throw "clippy failed" }
+            cargo test --lib
+            if ($LASTEXITCODE -ne 0) { throw "tests failed" }
+            cargo install cargo-audit --locked --quiet
+            # Advisory ignores live in src-tauri/audit.toml.
+            cargo audit
+            if ($LASTEXITCODE -ne 0) { throw "audit failed" }
+          } finally {
+            Pop-Location
+          }
+
+      # Stage the GStreamer runtime into resources/. The hardened script
+      # fails on a version mismatch or any missing DLL, so a drifted SDK
+      # can't ship a broken installer.
+      - name: Bundle GStreamer runtime
+        shell: pwsh
+        run: pwsh -File scripts/bundle-gstreamer.ps1
+
+      # The bundle resource glob includes resources/prerequisites/*; keep
+      # a placeholder so the glob resolves. (Npcap bundling is gone — the
+      # capture backend is the in-box PacketMonitor API.)
+      - name: Create prerequisite placeholder
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path src-tauri\resources\prerequisites | Out-Null
+          if (-not (Test-Path src-tauri\resources\prerequisites\.gitkeep)) {
+            New-Item -ItemType File -Path src-tauri\resources\prerequisites\.gitkeep | Out-Null
+          }
+
+      # Build + sign + assemble latest.json + publish as a DRAFT release.
+      # POCKETSTREAM_RELEASE embeds the requireAdministrator manifest.
+      # The draft is a deliberate human approval gate: the updater only
+      # resolves published releases, so a bad build never auto-reaches the
+      # fleet until someone publishes it.
+      - name: Build, sign & draft release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          POCKETSTREAM_RELEASE: "1"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "PocketStream Desktop ${{ github.ref_name }}"
+          releaseDraft: true
+          prerelease: false

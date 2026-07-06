@@ -188,4 +188,6 @@ jobs:
         working-directory: src-tauri
         run: |
           cargo install cargo-audit --quiet
-          cargo audit --ignore RUSTSEC-2024-0413
+          # Advisory ignores (with rationale + revisit date) live in
+          # src-tauri/audit.toml, read automatically from this directory.
+          cargo audit
