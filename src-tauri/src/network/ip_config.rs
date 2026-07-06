@@ -120,10 +120,13 @@ async fn assign_windows(
 /// Convert a CIDR prefix length to a dotted subnet mask.
 #[cfg(target_os = "windows")]
 fn prefix_to_mask(prefix: u8) -> String {
-    let bits: u32 = if prefix >= 32 {
-        0xFFFFFFFF
-    } else {
-        0xFFFFFFFF << (32 - prefix)
+    // Both ends must be special-cased: `u32 << 32` (prefix 0) and
+    // `u32 << (32 - prefix)` for prefix > 32 are shift overflows that
+    // panic in debug and wrap in release.
+    let bits: u32 = match prefix {
+        0 => 0,
+        p if p >= 32 => u32::MAX,
+        p => u32::MAX << (32 - p),
     };
     let o = bits.to_be_bytes();
     format!("{}.{}.{}.{}", o[0], o[1], o[2], o[3])
@@ -425,6 +428,21 @@ mod tests {
         let err = validate_ip("bad").unwrap_err();
         assert!(err.to_string().contains("Invalid IP address"));
         assert!(err.to_string().contains("bad"));
+    }
+
+    // ── prefix_to_mask (Windows only) ───────────────────────────────
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn prefix_to_mask_boundaries_do_not_overflow() {
+        // /0 and /32 are the shift-overflow edges the old code hit.
+        assert_eq!(prefix_to_mask(0), "0.0.0.0");
+        assert_eq!(prefix_to_mask(32), "255.255.255.255");
+        assert_eq!(prefix_to_mask(24), "255.255.255.0");
+        assert_eq!(prefix_to_mask(16), "255.255.0.0");
+        assert_eq!(prefix_to_mask(30), "255.255.255.252");
+        // Out-of-range clamps to all-ones instead of panicking.
+        assert_eq!(prefix_to_mask(40), "255.255.255.255");
     }
 
     // ── mask_to_prefix (Linux only) ─────────────────────────────────

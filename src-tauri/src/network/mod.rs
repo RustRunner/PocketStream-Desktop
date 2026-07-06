@@ -906,13 +906,18 @@ impl NetworkManager {
             .clone()
             .ok_or_else(|| AppError::Network("No interface configured".into()))?;
 
+        // Read the IP without untracking yet — only remove from the map
+        // after the netsh delete succeeds, so a failed delete can't leave
+        // the IP on the interface while the map believes it's gone.
         let ip = {
-            let mut map = self.adopted_ips.lock().await;
-            map.remove(subnet)
+            let map = self.adopted_ips.lock().await;
+            *map.get(subnet)
                 .ok_or_else(|| AppError::Network(format!("Subnet {} not adopted", subnet)))?
         };
 
-        auto_adopt::remove_adopted_ip(&iface_name, &ip.to_string()).await
+        auto_adopt::remove_adopted_ip(&iface_name, &ip.to_string()).await?;
+        self.adopted_ips.lock().await.remove(subnet);
+        Ok(())
     }
 
     /// Remove every currently-adopted secondary IP from the OS interface.

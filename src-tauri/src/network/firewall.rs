@@ -40,25 +40,50 @@ fn ensure_allow_rule(port: u16) -> Result<(), AppError> {
         .output()
         .map_err(|e| AppError::Network(format!("Failed to check firewall rule: {}", e)))?;
 
-    let count = String::from_utf8_lossy(&check.stdout).trim().to_string();
-    if count != "0" {
-        // Rule exists — update the port in case it changed
-        let _ = super::cmd("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!(
-                    "Set-NetFirewallRule -DisplayName '{}' -LocalPort {}",
-                    RULE_NAME, port
-                ),
-            ])
-            .output();
-        log::info!(
-            "Firewall rule '{}' already exists (port {})",
-            RULE_NAME,
-            port
-        );
-        return Ok(());
+    // Parse the count as an integer, and only trust it if the query
+    // actually succeeded. The old string compare treated an empty /
+    // failed / noisy stdout as "rule exists" (any non-"0"), which
+    // silently skipped creating the rule and left RTSP blocked.
+    let count = if check.status.success() {
+        String::from_utf8_lossy(&check.stdout)
+            .trim()
+            .parse::<u32>()
+            .ok()
+    } else {
+        None
+    };
+
+    match count {
+        Some(n) if n > 0 => {
+            // Rule exists — update the port in case it changed.
+            let _ = super::cmd("powershell")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    &format!(
+                        "Set-NetFirewallRule -DisplayName '{}' -LocalPort {}",
+                        RULE_NAME, port
+                    ),
+                ])
+                .output();
+            log::info!(
+                "Firewall rule '{}' already exists (port {})",
+                RULE_NAME,
+                port
+            );
+            return Ok(());
+        }
+        None => {
+            // Query failed or unparseable — don't blind-create, because
+            // New-NetFirewallRule duplicates a same-name rule on every
+            // start. The server still works on localhost; a LAN client
+            // may need a manual allow rule.
+            log::warn!(
+                "Could not determine firewall rule state; skipping create to avoid duplicates"
+            );
+            return Ok(());
+        }
+        Some(_) => { /* genuinely 0 — fall through and create */ }
     }
 
     // Create the rule

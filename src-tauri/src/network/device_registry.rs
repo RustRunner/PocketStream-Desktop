@@ -140,7 +140,11 @@ impl DeviceRegistry {
         let mut by_ip: HashMap<String, &CachedDevice> = HashMap::new();
         let mut dropped: Vec<String> = Vec::new();
         for entry in cached {
-            if entry.mac.is_empty() || entry.ip.is_empty() {
+            // Drop rows whose IP isn't a valid IPv4 address (corrupted
+            // cache, a hand-edited hostname): otherwise the string reaches
+            // ping.exe's argv and triggers a DNS lookup / false dot.
+            // APIPA (169.254.x.x) parses fine and is kept.
+            if entry.mac.is_empty() || entry.ip.parse::<std::net::Ipv4Addr>().is_err() {
                 continue;
             }
             match by_ip.get(&entry.ip) {
@@ -531,6 +535,44 @@ mod tests {
     fn snapshot_starts_empty() {
         let r = DeviceRegistry::new();
         assert!(r.snapshot().is_empty());
+    }
+
+    #[test]
+    fn hydrate_from_cache_drops_non_ipv4_rows() {
+        let r = DeviceRegistry::new();
+        let result = r.hydrate_from_cache(&[
+            cached(
+                "AA:BB:CC:DD:EE:01",
+                "192.168.1.10",
+                "192.168.1.0/24",
+                vec![80],
+                "",
+            ),
+            cached(
+                "AA:BB:CC:DD:EE:02",
+                "camera.local",
+                "192.168.1.0/24",
+                vec![80],
+                "",
+            ),
+            cached("", "192.168.1.11", "192.168.1.0/24", vec![], ""),
+            cached(
+                "AA:BB:CC:DD:EE:04",
+                "169.254.5.5",
+                "169.254.0.0/24",
+                vec![],
+                "",
+            ),
+        ]);
+        assert!(result.changed);
+        let snap = r.snapshot();
+        // Only the valid-IPv4, non-empty-MAC rows survive: 192.168.1.10
+        // and the APIPA one. The hostname and empty-MAC rows are dropped.
+        let ips: Vec<&str> = snap.iter().map(|d| d.ip.as_str()).collect();
+        assert!(ips.contains(&"192.168.1.10"));
+        assert!(ips.contains(&"169.254.5.5"));
+        assert!(!ips.contains(&"camera.local"));
+        assert_eq!(snap.len(), 2);
     }
 
     #[test]
