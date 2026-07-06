@@ -3593,6 +3593,7 @@ dependencies = [
  "gstreamer-video",
  "image",
  "ipnetwork",
+ "libloading 0.8.9",
  "log",
  "pcap",
  "pnet",

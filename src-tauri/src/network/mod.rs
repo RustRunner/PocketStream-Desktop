@@ -6,6 +6,14 @@ pub mod firewall;
 pub mod interface;
 pub mod ip_config;
 pub mod ping_dot;
+// The capture surface (probe/load/CaptureSession) is consumed by the
+// arp.rs listener in the next migration step; until that lands the
+// runtime entry points read as dead. The module is cross-platform
+// compilable (libloading + extern "system" types build everywhere; the
+// DLL only resolves at runtime on Windows) so the pure-layout unit
+// tests gate on both CI jobs.
+#[allow(dead_code)]
+pub mod pktmon;
 pub mod scanner;
 pub mod watcher;
 
