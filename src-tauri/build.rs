@@ -49,15 +49,25 @@ fn main() {
         // GStreamer RTSP server
         println!("cargo:rustc-link-arg=/DELAYLOAD:gstrtspserver-1.0-0.dll");
 
-        let manifest =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("pocketstream.exe.manifest");
-        println!("cargo:rerun-if-changed={}", manifest.display());
-
-        let mut res = tauri_build::WindowsAttributes::new();
-        res =
-            res.app_manifest(std::fs::read_to_string(&manifest).expect("failed to read manifest"));
-        tauri_build::try_build(tauri_build::Attributes::new().windows_attributes(res))
-            .expect("failed to run tauri-build");
+        // The requireAdministrator manifest is embedded ONLY for release
+        // builds. dev/test builds inherit it into the test harness too,
+        // and running `cargo test` unelevated then fails with error 740.
+        // The release workflow sets POCKETSTREAM_RELEASE; without it the
+        // build runs asInvoker so tests work in any shell.
+        println!("cargo:rerun-if-env-changed=POCKETSTREAM_RELEASE");
+        let is_release = std::env::var_os("POCKETSTREAM_RELEASE").is_some();
+        if is_release {
+            let manifest =
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("pocketstream.exe.manifest");
+            println!("cargo:rerun-if-changed={}", manifest.display());
+            let mut res = tauri_build::WindowsAttributes::new();
+            res = res
+                .app_manifest(std::fs::read_to_string(&manifest).expect("failed to read manifest"));
+            tauri_build::try_build(tauri_build::Attributes::new().windows_attributes(res))
+                .expect("failed to run tauri-build");
+        } else {
+            tauri_build::build();
+        }
         return;
     }
 
