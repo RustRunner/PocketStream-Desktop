@@ -702,41 +702,63 @@ fn load_from_disk() -> Option<AppSettings> {
         }
     };
 
-    // Decrypt credentials if key exists. A decrypt failure means the
-    // ciphertext is corrupted or the key changed (e.g., user copied
-    // config.toml between machines without .key); log and clear the
-    // field rather than handing the encrypted base64 back to the UI as
-    // if it were the username.
-    if let Ok(key_bytes) = fs::read(key_path()) {
-        if key_bytes.len() == 32 {
-            settings.credentials.username =
-                match decrypt_string(&settings.credentials.username, &key_bytes) {
-                    Some(s) => s,
-                    None if settings.credentials.username.is_empty() => String::new(),
-                    None => {
-                        log::error!(
-                            "config: failed to decrypt stored username — clearing. \
-                             User will need to re-enter credentials."
-                        );
-                        String::new()
-                    }
-                };
-            settings.credentials.password =
-                match decrypt_string(&settings.credentials.password, &key_bytes) {
-                    Some(s) => s,
-                    None if settings.credentials.password.is_empty() => String::new(),
-                    None => {
-                        log::error!(
-                            "config: failed to decrypt stored password — clearing. \
-                             User will need to re-enter credentials."
-                        );
-                        String::new()
-                    }
-                };
-        }
-    }
+    // Resolve the stored (encrypted) credentials against the key. A
+    // usable key decrypts them; an absent or unusable key clears any
+    // non-empty field rather than handing base64 ciphertext to the UI —
+    // which would otherwise be re-encrypted into permanent garbage on
+    // the next save. A transient key-read error (Err) also clears for
+    // this load (we can't decrypt now) but leaves the on-disk key/cipher
+    // untouched, so a later launch recovers.
+    let key: Option<[u8; 32]> = read_key().ok().flatten().map(|(k, _)| k);
+    let (username, password) = resolve_credentials(
+        &settings.credentials.username,
+        &settings.credentials.password,
+        key.as_ref().map(|k| &k[..]),
+    );
+    settings.credentials.username = username;
+    settings.credentials.password = password;
 
     Some(settings)
+}
+
+/// Resolve stored (possibly encrypted) credential fields to plaintext.
+/// `key` is `None` when no usable key is available — in that case a
+/// non-empty (ciphertext) field is cleared, never passed through.
+fn resolve_credentials(username: &str, password: &str, key: Option<&[u8]>) -> (String, String) {
+    match key {
+        Some(k) if k.len() == 32 => (
+            decrypt_field(username, k, "username"),
+            decrypt_field(password, k, "password"),
+        ),
+        _ => {
+            if !username.is_empty() || !password.is_empty() {
+                log::error!(
+                    "config: stored credentials present but the encryption key is \
+                     unavailable — clearing so they aren't re-encrypted as garbage. \
+                     Re-enter them in Settings."
+                );
+            }
+            (String::new(), String::new())
+        }
+    }
+}
+
+/// Decrypt one credential field, applying the clear-on-failure policy:
+/// an empty field stays empty silently; a non-empty field that fails to
+/// decrypt (corruption or wrong key) is logged and cleared.
+fn decrypt_field(field: &str, key: &[u8], label: &str) -> String {
+    match decrypt_string(field, key) {
+        Some(s) => s,
+        None if field.is_empty() => String::new(),
+        None => {
+            log::error!(
+                "config: failed to decrypt stored {} — clearing. \
+                 User will need to re-enter credentials.",
+                label
+            );
+            String::new()
+        }
+    }
 }
 
 fn save_to_disk(settings: &AppSettings) -> Result<(), crate::AppError> {
@@ -756,23 +778,153 @@ fn save_to_disk(settings: &AppSettings) -> Result<(), crate::AppError> {
     Ok(())
 }
 
-fn get_or_create_key() -> Result<Vec<u8>, crate::AppError> {
-    let path = key_path();
-    if let Ok(key) = fs::read(&path) {
-        if key.len() == 32 {
-            return Ok(key);
+/// DPAPI-wrap bytes for the current user (Windows). Returns the opaque
+/// blob to store on disk, or None if the OS call fails.
+#[cfg(windows)]
+fn dpapi_protect(plain: &[u8]) -> Option<Vec<u8>> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Cryptography::{
+        CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    };
+    unsafe {
+        let in_blob = CRYPT_INTEGER_BLOB {
+            cbData: plain.len() as u32,
+            pbData: plain.as_ptr() as *mut u8,
+        };
+        let mut out_blob = CRYPT_INTEGER_BLOB {
+            cbData: 0,
+            pbData: std::ptr::null_mut(),
+        };
+        let ok = CryptProtectData(
+            &in_blob,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut out_blob,
+        );
+        if ok == 0 || out_blob.pbData.is_null() {
+            return None;
+        }
+        let bytes = std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec();
+        LocalFree(out_blob.pbData as _);
+        Some(bytes)
+    }
+}
+
+/// DPAPI-unwrap a blob produced by [`dpapi_protect`] for the current
+/// user (Windows). Returns None if the blob can't be decrypted (wrong
+/// user, corruption).
+#[cfg(windows)]
+fn dpapi_unprotect(blob: &[u8]) -> Option<Vec<u8>> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Cryptography::{
+        CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    };
+    unsafe {
+        let in_blob = CRYPT_INTEGER_BLOB {
+            cbData: blob.len() as u32,
+            pbData: blob.as_ptr() as *mut u8,
+        };
+        let mut out_blob = CRYPT_INTEGER_BLOB {
+            cbData: 0,
+            pbData: std::ptr::null_mut(),
+        };
+        let ok = CryptUnprotectData(
+            &in_blob,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut out_blob,
+        );
+        if ok == 0 || out_blob.pbData.is_null() {
+            return None;
+        }
+        let bytes = std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec();
+        LocalFree(out_blob.pbData as _);
+        Some(bytes)
+    }
+}
+
+/// Read the 32-byte AES key from `path`.
+///
+/// Returns `Ok(Some((key, needs_rewrap)))` for a usable key —
+/// `needs_rewrap` flags a legacy unprotected key that should be upgraded
+/// to DPAPI on the next write. `Ok(None)` means the key is absent
+/// (regenerate is correct) or a DPAPI blob that won't decrypt for this
+/// user (unrecoverable — regenerate). `Err` is reserved for transient
+/// read failures (AV lock, permissions) where the caller must **not**
+/// regenerate, so existing ciphertext isn't orphaned.
+fn read_key_from(path: &Path) -> std::io::Result<Option<([u8; 32], bool)>> {
+    let raw = match fs::read(path) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+
+    // A file of exactly 32 bytes is a legacy raw key (pre-DPAPI). On
+    // Windows it should be re-wrapped; on Unix it's the normal format.
+    if raw.len() == 32 {
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&raw);
+        let needs_rewrap = cfg!(windows);
+        return Ok(Some((key, needs_rewrap)));
+    }
+
+    #[cfg(windows)]
+    {
+        match dpapi_unprotect(&raw) {
+            Some(plain) if plain.len() == 32 => {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&plain);
+                Ok(Some((key, false)))
+            }
+            // Blob present but unusable for this user — treat like absent
+            // so a fresh key is generated (the old ciphertext is already
+            // unrecoverable), never a hard failure.
+            _ => Ok(None),
         }
     }
-    let mut key = vec![0u8; 32];
-    rand::thread_rng().fill_bytes(&mut key);
-    fs::write(&path, &key).map_err(|e| crate::AppError::Config(e.to_string()))?;
+    #[cfg(not(windows))]
+    {
+        // Non-Windows only ever writes 32-byte raw keys; anything else is
+        // unexpected — regenerate rather than fail.
+        Ok(None)
+    }
+}
 
-    // Restrict the key file to the current user. On Windows this is
-    // typically already the case (AppData/Roaming inherits a user-only
-    // ACL), but enforcing it explicitly removes the dependency on that
-    // OS default. On Unix it depends on umask, which can default to
-    // world-readable — set 0600 explicitly so the AES key never leaks
-    // to other local users via a permissive umask.
+fn read_key() -> std::io::Result<Option<([u8; 32], bool)>> {
+    read_key_from(&key_path())
+}
+
+/// Write the 32-byte key, DPAPI-wrapped on Windows, via `atomic_write`
+/// (the previous plain `fs::write` could leave a truncated key on a
+/// mid-write crash).
+fn write_key(key: &[u8; 32]) -> Result<(), crate::AppError> {
+    let path = key_path();
+
+    let on_disk: Vec<u8> = {
+        #[cfg(windows)]
+        {
+            dpapi_protect(key).ok_or_else(|| {
+                crate::AppError::Config("DPAPI protection of the encryption key failed".into())
+            })?
+        }
+        #[cfg(not(windows))]
+        {
+            key.to_vec()
+        }
+    };
+
+    atomic_write(&path, &on_disk).map_err(|e| crate::AppError::Config(e.to_string()))?;
+
+    // Restrict the key file to the current user. On Windows the DPAPI
+    // wrap already binds it to the user account (and AppData inherits a
+    // user-only ACL); on Unix the umask can default world-readable, so
+    // set 0600 explicitly.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -781,7 +933,35 @@ fn get_or_create_key() -> Result<Vec<u8>, crate::AppError> {
         }
     }
 
-    Ok(key)
+    Ok(())
+}
+
+fn get_or_create_key() -> Result<Vec<u8>, crate::AppError> {
+    match read_key() {
+        Ok(Some((key, needs_rewrap))) => {
+            if needs_rewrap {
+                // Upgrade a legacy unprotected key to DPAPI in place. The
+                // key bytes are unchanged, so existing ciphertext stays
+                // valid; a failure is non-fatal (keep using the raw key).
+                if let Err(e) = write_key(&key) {
+                    log::warn!("Failed to upgrade encryption key to DPAPI: {}", e);
+                }
+            }
+            Ok(key.to_vec())
+        }
+        Ok(None) => {
+            let mut key = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut key);
+            write_key(&key)?;
+            Ok(key.to_vec())
+        }
+        // Transient read failure — do NOT regenerate (that would orphan
+        // the existing ciphertext). Fail the save so the caller retries.
+        Err(e) => Err(crate::AppError::Config(format!(
+            "encryption key is present but unreadable: {}",
+            e
+        ))),
+    }
 }
 
 fn encrypt_string(plaintext: &str, key: &[u8]) -> String {
@@ -856,6 +1036,88 @@ mod tests {
         let encrypted = encrypt_string(plaintext, &key);
         let decrypted = decrypt_string(&encrypted, &key).unwrap();
         assert_eq!(decrypted, plaintext);
+    }
+
+    // ── Credential resolution against the key state ─────────────────
+
+    #[test]
+    fn resolve_credentials_decrypts_with_key() {
+        let key = [7u8; 32];
+        let u = encrypt_string("admin", &key);
+        let p = encrypt_string("s3cr3t", &key);
+        let (du, dp) = resolve_credentials(&u, &p, Some(&key));
+        assert_eq!(du, "admin");
+        assert_eq!(dp, "s3cr3t");
+    }
+
+    #[test]
+    fn resolve_credentials_clears_ciphertext_when_key_absent() {
+        // The load-passthrough bug: without a key, non-empty (ciphertext)
+        // fields must be cleared, not handed to the UI as literal creds.
+        let key = [7u8; 32];
+        let u = encrypt_string("admin", &key);
+        let (du, dp) = resolve_credentials(&u, "", None);
+        assert_eq!(du, "");
+        assert_eq!(dp, "");
+    }
+
+    #[test]
+    fn resolve_credentials_clears_on_wrong_key() {
+        let key = [7u8; 32];
+        let wrong = [9u8; 32];
+        let u = encrypt_string("admin", &key);
+        let (du, _) = resolve_credentials(&u, "", Some(&wrong));
+        assert_eq!(du, "");
+    }
+
+    #[test]
+    fn resolve_credentials_empty_stays_empty_without_key() {
+        let (du, dp) = resolve_credentials("", "", None);
+        assert_eq!(du, "");
+        assert_eq!(dp, "");
+    }
+
+    // ── Key file read policy ────────────────────────────────────────
+
+    #[test]
+    fn read_key_absent_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join(".key");
+        assert!(read_key_from(&missing).unwrap().is_none());
+    }
+
+    #[test]
+    fn read_key_legacy_32_bytes_is_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".key");
+        fs::write(&path, [0x5Au8; 32]).unwrap();
+        let (key, needs_rewrap) = read_key_from(&path).unwrap().unwrap();
+        assert_eq!(key, [0x5Au8; 32]);
+        // Legacy raw key is upgrade-worthy on Windows, already-normal on Unix.
+        assert_eq!(needs_rewrap, cfg!(windows));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dpapi_roundtrip() {
+        let key = [0xC3u8; 32];
+        let wrapped = dpapi_protect(&key).expect("DPAPI protect");
+        assert_ne!(wrapped.as_slice(), &key[..]);
+        let unwrapped = dpapi_unprotect(&wrapped).expect("DPAPI unprotect");
+        assert_eq!(unwrapped, key.to_vec());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn read_key_roundtrips_dpapi_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".key");
+        let key = [0x1Fu8; 32];
+        let blob = dpapi_protect(&key).unwrap();
+        fs::write(&path, &blob).unwrap();
+        let (read, needs_rewrap) = read_key_from(&path).unwrap().unwrap();
+        assert_eq!(read, key);
+        assert!(!needs_rewrap); // already DPAPI-wrapped
     }
 
     #[test]
