@@ -36,6 +36,21 @@ fn pick_candidate_ip(device_ip: Ipv4Addr, used_ips: &[Ipv4Addr]) -> Vec<Ipv4Addr
     candidates
 }
 
+/// Pick a scratch last octet on the candidate /24 that isn't the device,
+/// a candidate, or a reserved address. The scratch is bound temporarily
+/// so conflict probes route on-link (see `adopt_subnet`).
+fn pick_scratch(device_ip: Ipv4Addr, candidates: &[Ipv4Addr]) -> Ipv4Addr {
+    let o = device_ip.octets();
+    let device_last = o[3];
+    let taken: Vec<u8> = candidates.iter().map(|c| c.octets()[3]).collect();
+    for &last in &[254u8, 253, 252, 251, 250, 2, 3, 4, 5, 6] {
+        if last != device_last && !taken.contains(&last) {
+            return Ipv4Addr::new(o[0], o[1], o[2], last);
+        }
+    }
+    Ipv4Addr::new(o[0], o[1], o[2], 254)
+}
+
 /// Adopt a foreign subnet by adding a secondary IP to the interface.
 /// Returns the adopted IP if successful, or None if already on that subnet.
 pub async fn adopt_subnet(
@@ -56,13 +71,57 @@ pub async fn adopt_subnet(
     let mut used_ips = super::interface::all_local_ipv4();
     used_ips.extend_from_slice(current_ips);
     let candidates = pick_candidate_ip(device_ip, &used_ips);
+    if candidates.is_empty() {
+        return Err(AppError::Network(format!(
+            "No candidate IPs available on subnet for {}",
+            device_ip
+        )));
+    }
 
-    for candidate in candidates {
-        // ARP probe to check if candidate is in use
+    // Temporarily bind a scratch address on the candidate /24 so the
+    // conflict probes below route on-link. Without an address on this
+    // subnet the probe is structurally blind and reports every candidate
+    // free, risking a duplicate-IP assignment against a real camera-side
+    // device. If the scratch can't be bound, fall back to the (blind)
+    // gateway-routed probe rather than aborting — M6's cooldown and the
+    // adoption-failed signal cover a subsequent conflict.
+    let scratch = pick_scratch(device_ip, &candidates);
+    let scratch_bound =
+        ip_config::add_secondary_ip(interface_name, &scratch.to_string(), "255.255.255.0")
+            .await
+            .is_ok();
+    if !scratch_bound {
+        log::warn!(
+            "Could not bind scratch {} for on-link conflict probe; probes may be blind",
+            scratch
+        );
+    }
+    let source = scratch_bound.then_some(scratch);
+
+    // Probe candidates on-link, then always release the scratch.
+    let mut chosen = None;
+    for candidate in &candidates {
+        // A probe error (couldn't determine conflict) is treated as
+        // in-use — skip it rather than risk a duplicate assignment.
         let in_use =
-            super::arp::send_arp_probe(candidate, std::time::Duration::from_secs(1)).await?;
-
+            super::arp::send_arp_probe(*candidate, source, std::time::Duration::from_secs(1))
+                .await
+                .unwrap_or(true);
         if !in_use {
+            chosen = Some(*candidate);
+            break;
+        }
+        log::info!("Candidate {} is in use, trying next", candidate);
+    }
+
+    if scratch_bound {
+        if let Err(e) = ip_config::remove_secondary_ip(interface_name, &scratch.to_string()).await {
+            log::warn!("Failed to release scratch {}: {}", scratch, e);
+        }
+    }
+
+    match chosen {
+        Some(candidate) => {
             log::info!(
                 "Auto-adopting subnet: adding {} to {}",
                 candidate,
@@ -70,16 +129,13 @@ pub async fn adopt_subnet(
             );
             ip_config::add_secondary_ip(interface_name, &candidate.to_string(), "255.255.255.0")
                 .await?;
-            return Ok(Some(candidate));
+            Ok(Some(candidate))
         }
-
-        log::info!("Candidate {} is in use, trying next", candidate);
+        None => Err(AppError::Network(format!(
+            "Could not find available IP on subnet for {}",
+            device_ip
+        ))),
     }
-
-    Err(AppError::Network(format!(
-        "Could not find available IP on subnet for {}",
-        device_ip
-    )))
 }
 
 /// Remove a previously adopted secondary IP from the interface.
@@ -232,5 +288,25 @@ mod tests {
         let other_subnet_ip = Ipv4Addr::new(10, 0, 0, 100);
         let candidates = pick_candidate_ip(device, &[other_subnet_ip]);
         assert!(candidates.contains(&Ipv4Addr::new(192, 168, 5, 100)));
+    }
+
+    // ── pick_scratch (D3 on-link probe) ─────────────────────────────
+
+    #[test]
+    fn pick_scratch_is_on_the_candidate_subnet() {
+        let device = Ipv4Addr::new(192, 168, 5, 10);
+        let candidates = pick_candidate_ip(device, &[]);
+        let scratch = pick_scratch(device, &candidates);
+        let o = scratch.octets();
+        assert_eq!([o[0], o[1], o[2]], [192, 168, 5]);
+    }
+
+    #[test]
+    fn pick_scratch_avoids_device_and_candidates() {
+        let device = Ipv4Addr::new(10, 0, 0, 50);
+        let candidates = pick_candidate_ip(device, &[]);
+        let scratch = pick_scratch(device, &candidates);
+        assert_ne!(scratch, device);
+        assert!(!candidates.contains(&scratch));
     }
 }

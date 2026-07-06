@@ -549,19 +549,31 @@ pub async fn resolve_mac_for_ip(
         .map(|(_, mac)| mac))
 }
 
-/// Check if `target_ip` is in use by pinging and checking the neighbor
-/// table. (Structurally blind on subnets the host has no address on —
-/// see the pre-adoption on-link probe; this only fixes the locale
-/// dependency.)
+/// Check if `target_ip` is in use by pinging it and checking the
+/// neighbor table.
+///
+/// `source` is the ICMP source address (`ping -S`). Passing a scratch
+/// address already bound on the target's subnet makes the probe
+/// **on-link**: without it, when the host has no address on the target
+/// subnet the OS has no on-link route, so the ping exits via the default
+/// gateway (or fails), no neighbor entry is ever created, and every
+/// candidate reports "free" — the pre-adoption blindness that let
+/// auto-adopt assign a duplicate IP against field gear.
 pub async fn send_arp_probe(
     target_ip: Ipv4Addr,
+    source: Option<Ipv4Addr>,
     timeout: std::time::Duration,
 ) -> Result<bool, AppError> {
     let timeout_ms = timeout.as_millis().to_string();
-    let _ = super::async_cmd("ping")
-        .args(["-n", "1", "-w", &timeout_ms, &target_ip.to_string()])
-        .output()
-        .await;
+    let target_str = target_ip.to_string();
+    let source_str = source.map(|s| s.to_string());
+    let mut ping_args = vec!["-n", "1", "-w", &timeout_ms];
+    if let Some(ref src) = source_str {
+        ping_args.push("-S");
+        ping_args.push(src);
+    }
+    ping_args.push(&target_str);
+    let _ = super::async_cmd("ping").args(&ping_args).output().await;
 
     let script = format!(
         "Get-NetNeighbor -AddressFamily IPv4 -IPAddress '{ip}' -ErrorAction SilentlyContinue \
