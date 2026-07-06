@@ -94,6 +94,20 @@ jobs:
 
       - run: npm ci
 
+      # tauri-build validates the bundle resource globs whenever the crate
+      # compiles — including the clippy in Checks below — so the resource
+      # dirs must exist first. The real "Bundle GStreamer runtime" step
+      # after Checks replaces these placeholders with the actual DLLs.
+      - name: Create resource placeholders
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path src-tauri\resources\gstreamer\bin | Out-Null
+          New-Item -ItemType Directory -Force -Path src-tauri\resources\gstreamer\lib\gstreamer-1.0 | Out-Null
+          New-Item -ItemType Directory -Force -Path src-tauri\resources\prerequisites | Out-Null
+          New-Item -ItemType File -Force -Path src-tauri\resources\gstreamer\bin\.gitkeep | Out-Null
+          New-Item -ItemType File -Force -Path src-tauri\resources\gstreamer\lib\gstreamer-1.0\.gitkeep | Out-Null
+          New-Item -ItemType File -Force -Path src-tauri\resources\prerequisites\.gitkeep | Out-Null
+
       # Same gates as CI, on the release commit.
       - name: Checks (typecheck, fmt, clippy, test, audit)
         shell: pwsh
