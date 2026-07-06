@@ -73,62 +73,24 @@ jobs:
       - name: Configure GStreamer environment
         shell: pwsh
         run: |
-          "GSTREAMER_1_0_ROOT_MSVC_X86_64=C:\gstreamer\1.0\msvc_x86_64\" `
-            | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "PKG_CONFIG_PATH=C:\gstreamer\1.0\msvc_x86_64\lib\pkgconfig" `
-            | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "C:\gstreamer\1.0\msvc_x86_64\bin" `
-            | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-
-      # glib-sys / gstreamer-sys resolve their system deps via pkg-config,
-      # which windows-latest lacks. pkgconfiglite 0.28 (the usual choco
-      # option) mis-parses GStreamer's .pc files, so use the maintained
-      # pkgconf that GStreamer's MSVC devel package bundles in bin/, and
-      # point the pkg-config crate at it via the PKG_CONFIG env var (the
-      # crate looks for an executable literally named "pkg-config", which
-      # is why the bundled pkgconf isn't picked up on its own).
-      - name: Use pkgconf for pkg-config resolution
-        shell: pwsh
-        run: |
-          # Prefer the pkgconf GStreamer bundles; fall back to choco, then
-          # the runner's preinstalled MSYS2. One of the three yields a
-          # maintained pkgconf that parses GStreamer's .pc files.
-          $pkgconf = $null
-          $bundled = "C:\gstreamer\1.0\msvc_x86_64\bin\pkgconf.exe"
-          if (Test-Path $bundled) { $pkgconf = $bundled }
-          if (-not $pkgconf) {
-            choco install pkgconf -y --no-progress
-            $c = Get-Command pkgconf.exe -ErrorAction SilentlyContinue
-            if ($c) { $pkgconf = $c.Source }
-          }
-          if (-not $pkgconf) {
-            & C:\msys64\usr\bin\pacman.exe -S --needed --noconfirm mingw-w64-x86_64-pkgconf
-            $m = "C:\msys64\mingw64\bin\pkgconf.exe"
-            if (Test-Path $m) { $pkgconf = $m }
-          }
-          if (-not $pkgconf) { throw "Could not obtain pkgconf (GStreamer bin, choco, MSYS2 all failed)" }
-          Write-Host "Using pkgconf: $pkgconf"
-          & $pkgconf --version
-          "PKG_CONFIG=$pkgconf" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          # The assumed lib\pkgconfig path did not actually contain
-          # glib-2.0.pc (both pkg-config impls reported it missing), so
-          # locate the real pkgconfig dir under the GStreamer root and set
-          # PKG_CONFIG_PATH to it (forward slashes, accepted everywhere).
-          # Dump the tree and fail loudly if the devel .pc files are absent.
-          $root = "C:\gstreamer"
-          $pc = Get-ChildItem -Path $root -Recurse -Filter "glib-2.0.pc" -File -ErrorAction SilentlyContinue
-          if (-not $pc) {
-            Write-Host "glib-2.0.pc NOT found under $root."
-            Write-Host "=== directory tree under $root ==="
-            Get-ChildItem -Path $root -Recurse -Directory -ErrorAction SilentlyContinue | Select-Object -First 150 -ExpandProperty FullName | ForEach-Object { Write-Host "  $_" }
-            Write-Host "=== all .pc files under $root ==="
-            Get-ChildItem -Path $root -Recurse -Filter "*.pc" -File -ErrorAction SilentlyContinue | Select-Object -First 80 -ExpandProperty FullName | ForEach-Object { Write-Host "  $_" }
-            throw "glib-2.0.pc not present under $root"
-          }
-          $dirs = $pc | ForEach-Object { $_.DirectoryName.Replace('\','/') } | Sort-Object -Unique
-          $pcPath = ($dirs -join ';')
-          "PKG_CONFIG_PATH=$pcPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "glib-2.0.pc found; PKG_CONFIG_PATH=$pcPath"
+          # The MSVC MSIs install to C:\Program Files\gstreamer (NOT
+          # C:\gstreamer) and register GSTREAMER_1_0_ROOT_MSVC_X86_64.
+          # Read that real root (machine then user scope), falling back to
+          # the known default, and derive everything from it. GStreamer
+          # bundles pkg-config.exe in bin/ and it self-locates its own .pc
+          # files, so putting bin/ on PATH is all that's needed - no
+          # separate pkg-config install. The trailing backslash on the
+          # root matters: gstreamer-rs concatenates paths raw in places.
+          $root = [Environment]::GetEnvironmentVariable('GSTREAMER_1_0_ROOT_MSVC_X86_64','Machine')
+          if (-not $root) { $root = [Environment]::GetEnvironmentVariable('GSTREAMER_1_0_ROOT_MSVC_X86_64','User') }
+          if (-not $root) { $root = 'C:\Program Files\gstreamer\1.0\msvc_x86_64\' }
+          $root = $root.TrimEnd('\')
+          $pc = Join-Path $root 'lib\pkgconfig\glib-2.0.pc'
+          if (-not (Test-Path $pc)) { throw "glib-2.0.pc not found at $pc - GStreamer root '$root' is wrong" }
+          Write-Host "GStreamer root: $root"
+          "GSTREAMER_1_0_ROOT_MSVC_X86_64=$root\" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "PKG_CONFIG_PATH=$root\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$root\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
       - run: npm ci
 
