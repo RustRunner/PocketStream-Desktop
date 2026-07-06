@@ -224,20 +224,28 @@ async fn on_arp_seen(
         last_seen: now,
     };
 
-    let mut map = devices.lock().await;
-    let is_new = !map.contains_key(&mac_str);
+    // Update the legacy map under the lock, then release it before any
+    // disk I/O — the cache-file write below must NOT run while the
+    // `devices` mutex is held, or it stalls the listener/merge during an
+    // ARP burst (exactly the window M2's concurrent-write race worries
+    // about). The legacy map is still mutated because the auto-adopt loop
+    // iterates over it; can be retired once auto-adopt uses the registry.
+    let is_new = {
+        let mut map = devices.lock().await;
+        let is_new = !map.contains_key(&mac_str);
+        let entry = map.entry(mac_str.clone()).or_insert(device.clone());
+        entry.last_seen = device.last_seen.clone();
+        entry.ip = device.ip.clone();
+        // Refresh the subnet too: a FLIR that first ARPs from APIPA then
+        // re-ARPs from its real address must not keep the stale subnet
+        // paired with the fresh IP, or adoption is keyed under the wrong
+        // subnet.
+        entry.subnet = device.subnet.clone();
+        is_new
+    };
 
-    let entry = map.entry(mac_str.clone()).or_insert(device.clone());
-    entry.last_seen = device.last_seen.clone();
-    entry.ip = device.ip.clone();
-    // Refresh the subnet too: a FLIR that first ARPs from APIPA then
-    // re-ARPs from its real address must not keep the stale subnet paired
-    // with the fresh IP, or adoption gets stored under the wrong key.
-    entry.subnet = device.subnet.clone();
-
-    // Mirror into the canonical DeviceRegistry. The legacy `devices` map
-    // above is still mutated because the auto-adopt loop iterates over
-    // it; can be retired once auto-adopt switches to the registry too.
+    // Mirror into the canonical DeviceRegistry (its own lock) and evict
+    // same-IP dupe cache rows — all outside the `devices` lock.
     let result = registry.merge_arp(&device);
     if result.changed {
         emitter.poke();
@@ -257,7 +265,7 @@ async fn on_arp_seen(
     }
 
     if is_new {
-        log::info!("ARP: {} ({})", entry.ip, entry.mac);
+        log::info!("ARP: {} ({})", device.ip, device.mac);
         let _ = app_handle.emit("arp-device-discovered", &device);
     }
 }

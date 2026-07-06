@@ -1109,29 +1109,38 @@ async fn merge_arp_table(
     use tauri::{Emitter, Manager};
 
     let entries = arp::read_system_arp_table(interface_ip).await;
-    let mut added = 0u32;
-    let mut registry_changed = false;
-
-    let mut map = devices.lock().await;
     let now = chrono::Utc::now().to_rfc3339();
 
-    for (ip, mac) in entries {
-        if map.contains_key(&mac) {
-            continue;
+    // Insert new entries into the legacy map under the lock, then release
+    // it before the registry merge and any cache-file disk writes below —
+    // holding `devices` across disk I/O stalls the listener during ARP
+    // bursts (L31).
+    let new_devices: Vec<ArpDevice> = {
+        let mut map = devices.lock().await;
+        let mut collected = Vec::new();
+        for (ip, mac) in entries {
+            if map.contains_key(&mac) {
+                continue;
+            }
+            let octets = ip.octets();
+            let device = ArpDevice {
+                mac: mac.clone(),
+                ip: ip.to_string(),
+                subnet: format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]),
+                first_seen: now.clone(),
+                last_seen: now.clone(),
+            };
+            map.insert(mac, device.clone());
+            collected.push(device);
         }
+        collected
+    };
 
-        let octets = ip.octets();
-        let device = ArpDevice {
-            mac: mac.clone(),
-            ip: ip.to_string(),
-            subnet: format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]),
-            first_seen: now.clone(),
-            last_seen: now.clone(),
-        };
-
+    let mut registry_changed = false;
+    for device in &new_devices {
         log::info!("ARP table: {} ({})", device.ip, device.mac);
-        let _ = app_handle.emit("arp-device-discovered", &device);
-        let result = registry.merge_arp(&device);
+        let _ = app_handle.emit("arp-device-discovered", device);
+        let result = registry.merge_arp(device);
         if result.changed {
             registry_changed = true;
         }
@@ -1150,12 +1159,10 @@ async fn merge_arp_table(
                 }
             }
         }
-        map.insert(mac, device);
-        added += 1;
     }
 
-    if added > 0 {
-        log::info!("Merged {} devices from OS ARP table", added);
+    if !new_devices.is_empty() {
+        log::info!("Merged {} devices from OS ARP table", new_devices.len());
     }
     // Coalesce all the new entries into one event. The emitter's 150 ms
     // window absorbs both this batch and any concurrent live-ARP merges.

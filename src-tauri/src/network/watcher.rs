@@ -36,8 +36,8 @@ mod imp {
 
     use windows_sys::Win32::Foundation::{BOOLEAN, HANDLE, NO_ERROR};
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        NotifyIpInterfaceChange, NotifyUnicastIpAddressChange, MIB_IPINTERFACE_ROW,
-        MIB_NOTIFICATION_TYPE, MIB_UNICASTIPADDRESS_ROW,
+        CancelMibChangeNotify2, NotifyIpInterfaceChange, NotifyUnicastIpAddressChange,
+        MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE, MIB_UNICASTIPADDRESS_ROW,
     };
 
     use crate::network::interface;
@@ -45,8 +45,21 @@ mod imp {
     // AF_UNSPEC covers both IPv4 and IPv6 in a single registration.
     const AF_UNSPEC: u16 = 0;
 
-    static SENDER: OnceLock<mpsc::UnboundedSender<()>> = OnceLock::new();
+    // Replaceable slot (not a OnceLock): a failed init attempt sets it,
+    // then a retry must be able to overwrite it — a OnceLock would strand
+    // the first attempt's sender, whose receiver was already dropped, and
+    // every callback wake would then go nowhere.
+    static SENDER: std::sync::RwLock<Option<mpsc::UnboundedSender<()>>> =
+        std::sync::RwLock::new(None);
     static INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+    fn wake() {
+        if let Ok(guard) = SENDER.read() {
+            if let Some(tx) = guard.as_ref() {
+                let _ = tx.send(());
+            }
+        }
+    }
 
     // Keep the notification handles alive for the life of the process.
     // Dropping them would implicitly cancel the subscription, which we
@@ -64,9 +77,7 @@ mod imp {
         _row: *const MIB_IPINTERFACE_ROW,
         _ty: MIB_NOTIFICATION_TYPE,
     ) {
-        if let Some(tx) = SENDER.get() {
-            let _ = tx.send(());
-        }
+        wake();
     }
 
     unsafe extern "system" fn address_cb(
@@ -74,18 +85,26 @@ mod imp {
         _row: *const MIB_UNICASTIPADDRESS_ROW,
         _ty: MIB_NOTIFICATION_TYPE,
     ) {
-        if let Some(tx) = SENDER.get() {
-            let _ = tx.send(());
-        }
+        wake();
     }
 
     pub fn start(handle: AppHandle) -> bool {
-        if INITIALIZED.swap(true, Ordering::SeqCst) {
+        // Claim the init slot. INITIALIZED stays true ONLY on success —
+        // a failed attempt below resets it so a later call can retry.
+        // (The old code latched it before registration, so one failure
+        // permanently disabled the watcher.)
+        if INITIALIZED
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
             return true;
         }
 
         let (tx, rx) = mpsc::unbounded_channel();
-        let _ = SENDER.set(tx);
+        // Overwrite any sender a prior failed attempt left behind.
+        if let Ok(mut guard) = SENDER.write() {
+            *guard = Some(tx);
+        }
 
         let mut iface_handle: HANDLE = std::ptr::null_mut();
         let mut addr_handle: HANDLE = std::ptr::null_mut();
@@ -100,6 +119,7 @@ mod imp {
             );
             if r1 != NO_ERROR {
                 log::warn!("NotifyIpInterfaceChange failed with code {}", r1);
+                INITIALIZED.store(false, Ordering::SeqCst);
                 return false;
             }
 
@@ -112,13 +132,17 @@ mod imp {
             );
             if r2 != NO_ERROR {
                 log::warn!("NotifyUnicastIpAddressChange failed with code {}", r2);
-                // iface handle leaks — acceptable for process lifetime
+                // Free the first registration instead of leaking it, so a
+                // retry starts clean.
+                CancelMibChangeNotify2(iface_handle);
+                INITIALIZED.store(false, Ordering::SeqCst);
                 return false;
             }
             true
         };
 
         if !ok {
+            INITIALIZED.store(false, Ordering::SeqCst);
             return false;
         }
 
