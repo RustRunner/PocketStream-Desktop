@@ -13,10 +13,12 @@ pub fn already_on_subnet(device_ip: Ipv4Addr, current_ips: &[Ipv4Addr]) -> bool 
 }
 
 /// Pick a candidate IP on the same /24 as `device_ip`.
-/// Tries .100, then .101, .99, .102, .98, etc., skipping the device IP itself
-/// and any last-octet values already used by the interface (to keep IPs
-/// distinguishable across subnets).
-fn pick_candidate_ip(device_ip: Ipv4Addr, used_last_octets: &[u8]) -> Vec<Ipv4Addr> {
+/// Tries .100, then .101, .99, .102, .98, etc., skipping the device IP
+/// itself, the reserved .0/.1/.255, and any **full IP** already in
+/// `used_ips`. `used_ips` compares whole addresses (not last octets) so
+/// a .100 on a *different* /24 doesn't needlessly block .100 here, while
+/// a .100 held by any local adapter on *this* /24 does.
+fn pick_candidate_ip(device_ip: Ipv4Addr, used_ips: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
     let octets = device_ip.octets();
     let device_last = octets[3];
     let base = [octets[0], octets[1], octets[2]];
@@ -24,13 +26,11 @@ fn pick_candidate_ip(device_ip: Ipv4Addr, used_last_octets: &[u8]) -> Vec<Ipv4Ad
     let mut candidates = Vec::new();
     let starts: &[u8] = &[100, 101, 99, 102, 98, 103, 97, 104, 96, 105, 95];
     for &last in starts {
-        if last != device_last
-            && last != 0
-            && last != 255
-            && last != 1
-            && !used_last_octets.contains(&last)
-        {
-            candidates.push(Ipv4Addr::new(base[0], base[1], base[2], last));
+        if last != device_last && last != 0 && last != 255 && last != 1 {
+            let candidate = Ipv4Addr::new(base[0], base[1], base[2], last);
+            if !used_ips.contains(&candidate) {
+                candidates.push(candidate);
+            }
         }
     }
     candidates
@@ -48,10 +48,14 @@ pub async fn adopt_subnet(
         return Ok(None);
     }
 
-    // Collect last octets from all existing IPs on the interface so the
-    // candidate picker avoids them (keeps IPs distinguishable across subnets).
-    let used_last_octets: Vec<u8> = current_ips.iter().map(|ip| ip.octets()[3]).collect();
-    let candidates = pick_candidate_ip(device_ip, &used_last_octets);
+    // Exclude every IP held by ANY local interface, not just the target —
+    // the ARP probe below can't detect the host's own addresses, so a
+    // candidate already on e.g. WiFi would look "free" and collide. Union
+    // with the passed-in target IPs in case pnet hasn't yet reflected a
+    // freshly-added one.
+    let mut used_ips = super::interface::all_local_ipv4();
+    used_ips.extend_from_slice(current_ips);
+    let candidates = pick_candidate_ip(device_ip, &used_ips);
 
     for candidate in candidates {
         // ARP probe to check if candidate is in use
@@ -189,23 +193,44 @@ mod tests {
     }
 
     #[test]
-    fn pick_candidate_skips_used_last_octets() {
+    fn pick_candidate_skips_used_ip() {
         let device = Ipv4Addr::new(10, 0, 0, 50);
-        // Interface already has .100 — candidate should skip it
-        let candidates = pick_candidate_ip(device, &[100]);
+        // A local adapter already holds .100 — candidate should skip it.
+        let candidates = pick_candidate_ip(device, &[Ipv4Addr::new(10, 0, 0, 100)]);
         assert!(!candidates.contains(&Ipv4Addr::new(10, 0, 0, 100)));
-        // Should start with .101 instead
+        // Should start with .101 instead.
         assert_eq!(candidates[0], Ipv4Addr::new(10, 0, 0, 101));
     }
 
     #[test]
-    fn pick_candidate_skips_multiple_used_octets() {
+    fn pick_candidate_skips_multiple_used_ips() {
         let device = Ipv4Addr::new(10, 0, 0, 50);
-        // Interface has .100 and .101
-        let candidates = pick_candidate_ip(device, &[100, 101]);
+        let used = [Ipv4Addr::new(10, 0, 0, 100), Ipv4Addr::new(10, 0, 0, 101)];
+        let candidates = pick_candidate_ip(device, &used);
         assert!(!candidates.contains(&Ipv4Addr::new(10, 0, 0, 100)));
         assert!(!candidates.contains(&Ipv4Addr::new(10, 0, 0, 101)));
-        // Should start with .99
+        // Should start with .99.
         assert_eq!(candidates[0], Ipv4Addr::new(10, 0, 0, 99));
+    }
+
+    #[test]
+    fn pick_candidate_excludes_full_ip_on_this_subnet_only() {
+        // M7: a WiFi adapter holds 192.168.5.100 on the SAME /24 we're
+        // adopting — that candidate must be excluded (an ARP probe can't
+        // see the host's own IP).
+        let device = Ipv4Addr::new(192, 168, 5, 10);
+        let wifi_ip = Ipv4Addr::new(192, 168, 5, 100);
+        let candidates = pick_candidate_ip(device, &[wifi_ip]);
+        assert!(!candidates.contains(&wifi_ip));
+    }
+
+    #[test]
+    fn pick_candidate_does_not_block_same_last_octet_on_other_subnet() {
+        // A .100 on a DIFFERENT /24 must not block .100 here — the fix
+        // compares full IPs, not last octets.
+        let device = Ipv4Addr::new(192, 168, 5, 10);
+        let other_subnet_ip = Ipv4Addr::new(10, 0, 0, 100);
+        let candidates = pick_candidate_ip(device, &[other_subnet_ip]);
+        assert!(candidates.contains(&Ipv4Addr::new(192, 168, 5, 100)));
     }
 }

@@ -366,6 +366,22 @@ pub fn quick_status_by_mac(mac: &str) -> Option<(bool, Vec<IpInfo>)> {
     Some((iface.is_up(), ips))
 }
 
+/// Every IPv4 address currently assigned to any local interface, read
+/// from pnet (in-memory, no process spawn). Used by auto-adopt to avoid
+/// picking a candidate IP already held by another adapter — an ARP probe
+/// can't detect the host's own addresses, so e.g. a WiFi IP on the same
+/// /24 as the camera Ethernet would look "free" and collide.
+pub fn all_local_ipv4() -> Vec<std::net::Ipv4Addr> {
+    pnet::datalink::interfaces()
+        .iter()
+        .flat_map(|i| &i.ips)
+        .filter_map(|ipn| match ipn.ip() {
+            std::net::IpAddr::V4(v4) => Some(v4),
+            std::net::IpAddr::V6(_) => None,
+        })
+        .collect()
+}
+
 /// Get info for a specific interface by name.
 pub async fn get_by_name(name: &str) -> Result<InterfaceInfo, AppError> {
     let all = list_all().await?;

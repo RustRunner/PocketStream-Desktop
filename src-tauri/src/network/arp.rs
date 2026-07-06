@@ -230,6 +230,10 @@ async fn on_arp_seen(
     let entry = map.entry(mac_str.clone()).or_insert(device.clone());
     entry.last_seen = device.last_seen.clone();
     entry.ip = device.ip.clone();
+    // Refresh the subnet too: a FLIR that first ARPs from APIPA then
+    // re-ARPs from its real address must not keep the stale subnet paired
+    // with the fresh IP, or adoption gets stored under the wrong key.
+    entry.subnet = device.subnet.clone();
 
     // Mirror into the canonical DeviceRegistry. The legacy `devices` map
     // above is still mutated because the auto-adopt loop iterates over

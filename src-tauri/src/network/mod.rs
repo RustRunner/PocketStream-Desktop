@@ -687,47 +687,54 @@ impl NetworkManager {
                 };
 
                 for device in &device_list {
-                    if known_subnets.contains(&device.subnet) {
-                        continue;
-                    }
-
-                    if adopted.lock().await.contains_key(&device.subnet) {
-                        known_subnets.insert(device.subnet.clone());
-                        continue;
-                    }
-
                     let device_ip: Ipv4Addr = match device.ip.parse() {
                         Ok(ip) => ip,
                         Err(_) => continue,
                     };
 
+                    // Derive the subnet from the live IP rather than trusting
+                    // the stored device.subnet — a device that first ARPed
+                    // from APIPA then re-ARPed from its real address can carry
+                    // a stale subnet, which would key the adoption wrongly.
+                    let o = device_ip.octets();
+                    let device_subnet = format!("{}.{}.{}.0/24", o[0], o[1], o[2]);
+
+                    if known_subnets.contains(&device_subnet) {
+                        continue;
+                    }
+
+                    if adopted.lock().await.contains_key(&device_subnet) {
+                        known_subnets.insert(device_subnet.clone());
+                        continue;
+                    }
+
                     // Refresh current IPs (may have changed since startup)
                     let current_ips = get_interface_ips(&iface_name).await;
 
                     if auto_adopt::already_on_subnet(device_ip, &current_ips) {
-                        known_subnets.insert(device.subnet.clone());
+                        known_subnets.insert(device_subnet.clone());
                         continue;
                     }
 
-                    log::info!("Foreign subnet detected: {}", device.subnet);
+                    log::info!("Foreign subnet detected: {}", device_subnet);
 
                     match auto_adopt::adopt_subnet(&iface_name, device_ip, &current_ips).await {
                         Ok(Some(adopted_ip)) => {
                             adopted
                                 .lock()
                                 .await
-                                .insert(device.subnet.clone(), adopted_ip);
-                            known_subnets.insert(device.subnet.clone());
+                                .insert(device_subnet.clone(), adopted_ip);
+                            known_subnets.insert(device_subnet.clone());
 
                             let _ = app_handle_for_adopt.emit(
                                 "subnet-adopted",
                                 serde_json::json!({
-                                    "subnet": device.subnet,
+                                    "subnet": device_subnet,
                                     "adopted_ip": adopted_ip.to_string(),
                                 }),
                             );
 
-                            log::info!("Auto-adopted {} with IP {}", device.subnet, adopted_ip);
+                            log::info!("Auto-adopted {} with IP {}", device_subnet, adopted_ip);
 
                             // Kick active-discovery passes on the newly-adopted
                             // /24. Without this, only the device that triggered
@@ -792,17 +799,17 @@ impl NetworkManager {
                             if let Err(e) = config.update_adopted_subnets(snapshot) {
                                 log::warn!(
                                     "Failed to persist adopted subnet {} to config: {}",
-                                    device.subnet,
+                                    device_subnet,
                                     e
                                 );
                             }
                         }
                         Ok(None) => {
-                            known_subnets.insert(device.subnet.clone());
+                            known_subnets.insert(device_subnet.clone());
                         }
                         Err(e) => {
-                            log::warn!("Failed to auto-adopt {}: {}", device.subnet, e);
-                            known_subnets.insert(device.subnet.clone());
+                            log::warn!("Failed to auto-adopt {}: {}", device_subnet, e);
+                            known_subnets.insert(device_subnet.clone());
                         }
                     }
                 }
