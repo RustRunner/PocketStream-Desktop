@@ -15,7 +15,9 @@ pub fn save_screenshot_jpg(
     height: u32,
     output_dir: &Path,
 ) -> Result<PathBuf, AppError> {
-    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    // Millisecond precision so two captures in the same second don't
+    // overwrite each other.
+    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S_%3f");
     let filename = format!("PS_Screenshot_{}.jpg", timestamp);
     let path = output_dir.join(&filename);
 
@@ -37,7 +39,9 @@ pub fn recording_path(output_dir: &Path) -> Result<PathBuf, AppError> {
     fs::create_dir_all(output_dir)
         .map_err(|e| AppError::Stream(format!("Failed to create output dir: {}", e)))?;
 
-    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    // Millisecond precision so two recordings started in the same second
+    // don't collide.
+    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S_%3f");
     let filename = format!("PS_Recording_{}.mp4", timestamp);
     Ok(output_dir.join(filename))
 }
@@ -75,11 +79,10 @@ mod tests {
     fn recording_path_unique_per_call() {
         let dir = tempfile::tempdir().unwrap();
         let p1 = recording_path(dir.path()).unwrap();
-        // Sleep briefly so timestamp differs
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // A few ms is enough now that the name carries milliseconds —
+        // no longer the full second the old second-resolution name needed.
+        std::thread::sleep(std::time::Duration::from_millis(5));
         let p2 = recording_path(dir.path()).unwrap();
-        // Paths should differ (different timestamp)
-        // Note: within the same second they'd be equal, hence the sleep
         assert_ne!(p1, p2);
     }
 }

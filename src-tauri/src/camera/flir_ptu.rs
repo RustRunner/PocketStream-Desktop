@@ -52,8 +52,11 @@ fn normalize_ptu_cmd(cmd: &str) -> String {
     }
 }
 
-/// Shared HTTP client — reused across all PTU commands.
-fn client() -> Result<&'static reqwest::Client, AppError> {
+/// Shared HTTP client — reused across all camera HTTP commands (PTU and
+/// the Sony/Nexus CGI handlers) instead of building a fresh client per
+/// call. `pub(crate)` so the CGI commands in `commands::camera` can share
+/// it. A per-request `.timeout()` still applies on top of the client's.
+pub(crate) fn client() -> Result<&'static reqwest::Client, AppError> {
     static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
@@ -64,7 +67,7 @@ fn client() -> Result<&'static reqwest::Client, AppError> {
                 .map_err(|e| format!("Failed to build HTTP client: {}", e))
         })
         .as_ref()
-        .map_err(|e| AppError::Stream(e.clone()))
+        .map_err(|e| AppError::Camera(e.clone()))
 }
 
 /// Send a command to the FLIR PTU and return the JSON response.
@@ -80,10 +83,10 @@ pub async fn send_command(base_url: &str, cmd: &str) -> Result<HashMap<String, S
         .body(cmd.to_string())
         .send()
         .await
-        .map_err(|e| AppError::Stream(format!("PTU request failed: {}", e)))?;
+        .map_err(|e| AppError::Camera(format!("PTU request failed: {}", e)))?;
 
     if !resp.status().is_success() {
-        return Err(AppError::Stream(format!(
+        return Err(AppError::Camera(format!(
             "PTU returned HTTP {}",
             resp.status()
         )));
@@ -92,7 +95,7 @@ pub async fn send_command(base_url: &str, cmd: &str) -> Result<HashMap<String, S
     let json: HashMap<String, String> = resp
         .json()
         .await
-        .map_err(|e| AppError::Stream(format!("PTU JSON parse error: {}", e)))?;
+        .map_err(|e| AppError::Camera(format!("PTU JSON parse error: {}", e)))?;
 
     Ok(json)
 }

@@ -122,7 +122,7 @@ pub async fn sony_cgi_zoom(
 
     log::info!("Sony CGI zoom: speed={} → {}", zoom_speed, url);
 
-    let client = reqwest::Client::new();
+    let client = crate::camera::flir_ptu::client()?;
     let mut req = client.get(&url);
     if !username.is_empty() {
         req = req.basic_auth(&username, Some(&password));
@@ -174,7 +174,7 @@ pub async fn control_cgi_zoom_direct(
     // time to become available again. HTTP error responses (4xx/5xx)
     // aren't retried — those indicate the camera actually answered and
     // rejected us, so retrying would just hammer it.
-    let client = reqwest::Client::new();
+    let client = crate::camera::flir_ptu::client()?;
     let mut last_err: Option<reqwest::Error> = None;
     for attempt in 0..2 {
         if attempt > 0 {
@@ -222,7 +222,7 @@ pub async fn control_cgi_probe_status(
 ) -> Result<String, AppError> {
     let addr = control_target(&ip, &manager).await?;
     let url = format!("http://{}/cgi-bin/control.cgi", addr);
-    let client = reqwest::Client::new();
+    let client = crate::camera::flir_ptu::client()?;
 
     // Small menu of queries the firmware might answer. The first one that
     // returns an integer in the 0..~31500 range is almost certainly the

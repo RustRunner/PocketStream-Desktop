@@ -47,7 +47,11 @@ pub struct RtspRestreamer {
     /// claim isn't observable from the socket table at start.
     udp_ingest_port: Option<u16>,
     bytes_sent: Arc<AtomicU64>,
-    bandwidth_start: std::time::Instant,
+    /// (bytes counted, time) at the previous bandwidth poll, so
+    /// `bandwidth_kbps` reports the rate over the last poll interval
+    /// rather than a lifetime average. Single 1 Hz consumer, so the
+    /// mutex is uncontended.
+    bw_prev: std::sync::Mutex<(u64, std::time::Instant)>,
 }
 
 impl Drop for RtspRestreamer {
@@ -273,7 +277,7 @@ impl RtspRestreamer {
             mount_path: mount_path.into(),
             udp_ingest_port: None,
             bytes_sent,
-            bandwidth_start: std::time::Instant::now(),
+            bw_prev: std::sync::Mutex::new((0, std::time::Instant::now())),
         })
     }
 
@@ -328,7 +332,7 @@ impl RtspRestreamer {
             mount_path: mount_path.into(),
             udp_ingest_port: Some(udp_port),
             bytes_sent,
-            bandwidth_start: std::time::Instant::now(),
+            bw_prev: std::sync::Mutex::new((0, std::time::Instant::now())),
         })
     }
 
@@ -343,13 +347,20 @@ impl RtspRestreamer {
     }
 
     /// Get the current average bandwidth in kbps since server start.
+    /// Current throughput over the interval since the previous call, not
+    /// a lifetime average (which never reflected the live rate).
     pub fn bandwidth_kbps(&self) -> f64 {
-        let elapsed = self.bandwidth_start.elapsed().as_secs_f64();
-        if elapsed < 0.5 {
+        let now = std::time::Instant::now();
+        let bytes = self.bytes_sent.load(Ordering::Relaxed);
+        let mut prev = self.bw_prev.lock().unwrap_or_else(|p| p.into_inner());
+        let (prev_bytes, prev_time) = *prev;
+        let elapsed = now.duration_since(prev_time).as_secs_f64();
+        *prev = (bytes, now);
+        if elapsed < 0.001 {
             return 0.0;
         }
-        let bytes = self.bytes_sent.load(Ordering::Relaxed) as f64;
-        (bytes * 8.0) / elapsed / 1000.0
+        let delta_bits = bytes.saturating_sub(prev_bytes) as f64 * 8.0;
+        delta_bits / elapsed / 1000.0
     }
 
     /// Get the port this server is listening on.

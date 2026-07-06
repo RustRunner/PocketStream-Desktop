@@ -484,13 +484,18 @@ impl StreamManager {
                 .clone()
         };
 
-        let (width, height, rgb_data) = pipeline.pull_snapshot()?;
-
         let output_dir = dirs::picture_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
             .join("PocketStream");
 
-        let path = recorder::save_screenshot_jpg(&rgb_data, width, height, &output_dir)?;
+        // pull_snapshot blocks up to 500ms on try_pull_sample and the
+        // JPEG encode is CPU-bound — run both off the async worker.
+        let path = tokio::task::spawn_blocking(move || {
+            let (width, height, rgb_data) = pipeline.pull_snapshot()?;
+            recorder::save_screenshot_jpg(&rgb_data, width, height, &output_dir)
+        })
+        .await
+        .map_err(|e| AppError::Stream(format!("Screenshot task failed: {}", e)))??;
 
         Ok(path.to_string_lossy().to_string())
     }
