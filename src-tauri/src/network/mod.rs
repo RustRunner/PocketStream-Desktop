@@ -630,6 +630,17 @@ impl NetworkManager {
             let mut cached_dhcp_state: Option<(bool, std::time::Instant)> = None;
             const DHCP_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
+            // Cooldown for subnets whose adoption FAILED (transient netsh
+            // errors, a candidate that turned out to be in use, etc.).
+            // Replaces the old permanent blacklist: subnet -> (next retry
+            // time, current backoff). Backoff doubles from 60s, capped at
+            // 10 min. Successful/already-adopted subnets use known_subnets
+            // (permanent) as before.
+            let mut cooldowns: HashMap<String, (std::time::Instant, std::time::Duration)> =
+                HashMap::new();
+            const COOLDOWN_INITIAL: std::time::Duration = std::time::Duration::from_secs(60);
+            const COOLDOWN_MAX: std::time::Duration = std::time::Duration::from_secs(600);
+
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
@@ -716,10 +727,20 @@ impl NetworkManager {
                         continue;
                     }
 
+                    // Still cooling down from a recent failed attempt? Skip
+                    // until the retry time; a fresh success/failure below
+                    // clears or re-arms it.
+                    if let Some(&(retry_at, _)) = cooldowns.get(&device_subnet) {
+                        if std::time::Instant::now() < retry_at {
+                            continue;
+                        }
+                    }
+
                     log::info!("Foreign subnet detected: {}", device_subnet);
 
                     match auto_adopt::adopt_subnet(&iface_name, device_ip, &current_ips).await {
                         Ok(Some(adopted_ip)) => {
+                            cooldowns.remove(&device_subnet);
                             adopted
                                 .lock()
                                 .await
@@ -805,11 +826,35 @@ impl NetworkManager {
                             }
                         }
                         Ok(None) => {
+                            cooldowns.remove(&device_subnet);
                             known_subnets.insert(device_subnet.clone());
                         }
                         Err(e) => {
-                            log::warn!("Failed to auto-adopt {}: {}", device_subnet, e);
-                            known_subnets.insert(device_subnet.clone());
+                            // Cooldown instead of permanent blacklist so a
+                            // transient failure (or a DHCP adapter that
+                            // couldn't be rescued yet) is retried with
+                            // backoff rather than abandoned forever.
+                            let next_backoff = cooldowns
+                                .get(&device_subnet)
+                                .map(|(_, b)| (*b * 2).min(COOLDOWN_MAX))
+                                .unwrap_or(COOLDOWN_INITIAL);
+                            cooldowns.insert(
+                                device_subnet.clone(),
+                                (std::time::Instant::now() + next_backoff, next_backoff),
+                            );
+                            log::warn!(
+                                "Failed to auto-adopt {} ({}); retrying in {}s",
+                                device_subnet,
+                                e,
+                                next_backoff.as_secs()
+                            );
+                            let _ = app_handle_for_adopt.emit(
+                                "adoption-failed",
+                                serde_json::json!({
+                                    "subnet": device_subnet,
+                                    "error": e.to_string(),
+                                }),
+                            );
                         }
                     }
                 }

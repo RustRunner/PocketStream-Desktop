@@ -208,6 +208,14 @@ export interface DevicePingResultPayload {
   reachable: boolean;
 }
 
+/** Payload for the `subnet-adopted` failure counterpart: an auto-adopt
+ *  attempt failed and was put on a retry cooldown. Diagnostic — the loop
+ *  retries with backoff on its own. */
+export interface AdoptionFailedPayload {
+  subnet: string;
+  error: string;
+}
+
 /** Payload for the `discovery-degraded` event: the capture backend
  *  delivered no ARP payload events within the window after the provoking
  *  ping sweep. Diagnostic only — availability is never flipped on this. */

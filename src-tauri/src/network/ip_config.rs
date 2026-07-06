@@ -167,7 +167,6 @@ fn validate_ip(ip: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 fn mask_to_prefix(mask: &str) -> Result<u8, AppError> {
     let addr: std::net::Ipv4Addr = mask
         .parse()
@@ -177,24 +176,31 @@ fn mask_to_prefix(mask: &str) -> Result<u8, AppError> {
 }
 
 /// Add a secondary IP address to an interface (preserves existing IPs).
+///
+/// Windows uses `New-NetIPAddress`, not `netsh interface ip add address`:
+/// netsh refuses to add an IP on a DHCP-enabled adapter, which is exactly
+/// the APIPA-rescue case (a camera dropped to 169.254/16 because DHCP
+/// failed), so the rescue silently never worked. New-NetIPAddress adds
+/// the address on DHCP and static interfaces alike.
 pub async fn add_secondary_ip(interface: &str, ip: &str, mask: &str) -> Result<(), AppError> {
     super::interface::validate_interface_name(interface).await?;
     validate_ip(ip)?;
     validate_ip(mask)?;
+    let prefix = mask_to_prefix(mask)?;
 
     #[cfg(target_os = "windows")]
     {
-        let name_arg = format!("name={}", interface);
-        run_command(
-            "netsh",
-            &["interface", "ip", "add", "address", &name_arg, ip, mask],
-        )
-        .await?;
+        let escaped = interface.replace('\'', "''");
+        let script = format!(
+            "New-NetIPAddress -InterfaceAlias '{}' -IPAddress '{}' -PrefixLength {} \
+             -ErrorAction Stop | Out-Null",
+            escaped, ip, prefix
+        );
+        run_command("powershell", &["-NoProfile", "-Command", &script]).await?;
     }
 
     #[cfg(target_os = "linux")]
     {
-        let prefix = mask_to_prefix(mask)?;
         let cidr = format!("{}/{}", ip, prefix);
         run_command("ip", &["addr", "add", &cidr, "dev", interface]).await?;
     }

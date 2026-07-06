@@ -31,6 +31,7 @@ import { showModalWithVideo } from "./streaming.js";
 import { selectedDevice } from "./store.ts";
 import { formatError } from "./errors.ts";
 import type {
+  AdoptionFailedPayload,
   ArpDevicePayload,
   DevicePingResultPayload,
   DeviceRecord,
@@ -268,6 +269,12 @@ export function setupArpListeners(): void {
     }
     // Reset the settle timer — netsh needs time to activate the IP
     debounceScan();
+  });
+
+  api.onEvent<AdoptionFailedPayload>("adoption-failed", (data) => {
+    // Diagnostic only — the adopt loop retries with backoff on its own.
+    log(`Auto-adopt failed for ${data.subnet}: ${data.error}`);
+    showToast(`Couldn't join ${data.subnet} — will retry`, true);
   });
 
   // Initial hydration / scan kickoff is orchestrated from main.js
