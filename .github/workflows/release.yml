@@ -94,6 +94,11 @@ jobs:
 
       - run: npm ci
 
+      # The frontend dist/ must exist before any crate compile: tauri's
+      # generate_context! macro (run during the clippy/test in Checks)
+      # validates frontendDist ("../dist") and panics if it's missing.
+      - run: npm run build
+
       # tauri-build validates the bundle resource globs whenever the crate
       # compiles — including the clippy in Checks below — so the resource
       # dirs must exist first. The real "Bundle GStreamer runtime" step
