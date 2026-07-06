@@ -40,6 +40,14 @@ import type {
   SubnetAdoptedPayload,
 } from "./types.ts";
 
+/** Escape a value for use inside a double-quoted CSS attribute selector.
+ *  Only `"` and `\` are special inside the quotes — escaping just those
+ *  (rather than CSS.escape, which mangles `.`/`/` in a subnet) keeps the
+ *  selector matching while preventing a stray quote from breaking it. */
+function cssAttrValue(value: string): string {
+  return value.replace(/["\\]/g, "\\$&");
+}
+
 // ── Local scanning state ────────────────────────────────────────────
 
 let pendingScans = 0;
@@ -262,7 +270,9 @@ export function setupArpListeners(): void {
     // class auto-clears after the CSS animation; the persistent "(auto)"
     // badge stays put. No state to clean up because renderSubnetList
     // rebuilds the row from scratch next render.
-    const row = $(`#subnet-list .subnet-row[data-subnet="${data.subnet}"]`);
+    const row = $(
+      `#subnet-list .subnet-row[data-subnet="${cssAttrValue(data.subnet)}"]`
+    );
     if (row) {
       row.classList.add("subnet-row-just-adopted");
       setTimeout(() => row.classList.remove("subnet-row-just-adopted"), 2500);
@@ -581,16 +591,22 @@ export function renderArpDeviceList(): void {
       // yet (gray); the pinger fills it in within seconds.
       const dot = renderReachabilityDot(r.ip);
 
+      // Escape backend-sourced strings before they hit innerHTML — same
+      // treatment device-cache.ts gives these fields. escapeHtml quotes
+      // are attribute-safe, so the data-* attributes are covered too.
+      const ipEsc = escapeHtml(r.ip);
+      const portsEsc = escapeHtml(ports.join(", "));
+
       html += `
-        <div class="${classes.join(" ")}" data-ip="${r.ip}">
+        <div class="${classes.join(" ")}" data-ip="${ipEsc}">
           <div class="device-name-row">
             ${dot}
             <span class="device-name">${escapeHtml(name)}</span>
-            <button class="edit-alias-btn" data-alias-ip="${r.ip}" title="Rename">${pencilSvg}</button>
+            <button class="edit-alias-btn" data-alias-ip="${ipEsc}" title="Rename">${pencilSvg}</button>
           </div>
           <div class="device-detail-row">
-            <a class="device-ip" href="#" data-browse="${r.ip}" title="Open in browser">${r.ip}</a>
-            <span class="device-ports">${ports.join(", ")}</span>
+            <a class="device-ip" href="#" data-browse="${ipEsc}" title="Open in browser">${ipEsc}</a>
+            <span class="device-ports">${portsEsc}</span>
           </div>
         </div>`;
     }

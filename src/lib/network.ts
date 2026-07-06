@@ -3,7 +3,7 @@
  */
 
 import * as api from "./tauri-api.ts";
-import { $, $$, state, adoptedSubnets, showToast, log } from "./state.ts";
+import { $, $$, state, adoptedSubnets, showToast, log, escapeHtml } from "./state.ts";
 import { resetDiscoveryStatus, hideDiscoveryStatus, renderArpDeviceList } from "./devices.js";
 import { handleHardDisconnect, handleReconnect, showModalWithVideo } from "./streaming.js";
 import { selectedDevice } from "./store.ts";
@@ -322,20 +322,23 @@ export function renderSubnetList(): void {
   let html = sortedIps
     .map((ip) => {
       const isAuto = adoptedIpSet.has(ip.address);
+      // Escape backend-sourced strings interpolated into innerHTML.
+      const subnetEsc = escapeHtml(ip.subnet);
+      const ipEsc = escapeHtml(`${ip.address}/${ip.prefix}`);
       if (isAuto) {
         return `
-        <div class="status-row subnet-row subnet-row-auto" data-subnet="${ip.subnet}">
+        <div class="status-row subnet-row subnet-row-auto" data-subnet="${subnetEsc}">
           <span class="status-label">IP:</span>
           <span class="auto-ip-group">
             <span class="badge-auto">(auto)</span>
-            <span class="status-value">${ip.address}/${ip.prefix}</span>
+            <span class="status-value">${ipEsc}</span>
           </span>
         </div>`;
       }
       return `
-      <div class="status-row subnet-row" data-subnet="${ip.subnet}">
+      <div class="status-row subnet-row" data-subnet="${subnetEsc}">
         <span class="status-label">IP:</span>
-        <span class="status-value">${ip.address}/${ip.prefix}</span>
+        <span class="status-value">${ipEsc}</span>
       </div>`;
     })
     .join("");
@@ -345,11 +348,11 @@ export function renderSubnetList(): void {
   for (const [subnet, adoptedIp] of adoptedSubnets) {
     if (renderedIps.has(adoptedIp)) continue;
     html += `
-      <div class="status-row subnet-row subnet-row-auto" data-subnet="${subnet}">
+      <div class="status-row subnet-row subnet-row-auto" data-subnet="${escapeHtml(subnet)}">
         <span class="status-label">IP:</span>
         <span class="auto-ip-group">
           <span class="badge-auto">(auto)</span>
-          <span class="status-value">${adoptedIp}/24</span>
+          <span class="status-value">${escapeHtml(`${adoptedIp}/24`)}</span>
         </span>
       </div>`;
   }
@@ -434,7 +437,12 @@ export function setupIpConfigDialog(): void {
       select.innerHTML = dialogInterfaces
         .map((i) => {
           const ip = i.ips.length > 0 ? i.ips[0]!.address : "no IP";
-          return `<option value="${i.name}">${i.display_name || i.name} (${ip})</option>`;
+          // Adapter names are backend-sourced and can carry arbitrary
+          // characters (user renames, vendor strings) — escape before
+          // innerHTML, value attribute included.
+          const nameEsc = escapeHtml(i.name);
+          const labelEsc = escapeHtml(`${i.display_name || i.name} (${ip})`);
+          return `<option value="${nameEsc}">${labelEsc}</option>`;
         })
         .join("");
       populateDialogFields();
@@ -622,9 +630,11 @@ function renderSecondaryIps(
     .map((ip) => {
       const isAuto = adoptedIpSet.has(ip.address);
       const badge = isAuto ? '<span class="badge-auto">(auto)</span>' : "";
+      const addrEsc = escapeHtml(ip.address);
+      const cidrEsc = escapeHtml(`${ip.address}/${ip.prefix}`);
       return `<div class="secondary-ip-item">
-        <span>${ip.address}/${ip.prefix} ${badge}</span>
-        <button class="btn-remove-ip" data-remove-sec-ip="${ip.address}" title="Remove">
+        <span>${cidrEsc} ${badge}</span>
+        <button class="btn-remove-ip" data-remove-sec-ip="${addrEsc}" title="Remove">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
         </button>
       </div>`;
