@@ -25,12 +25,16 @@ async fn control_target(
 #[tauri::command]
 pub async fn ptu_send(
     manager: State<'_, NetworkManager>,
+    ptu: State<'_, crate::camera::flir_ptu::PtuController>,
     ip: String,
     cmd: String,
 ) -> Result<std::collections::HashMap<String, String>, AppError> {
     let addr = control_target(&ip, &manager).await?;
     let base_url = format!("http://{}", addr);
-    crate::camera::flir_ptu::send_command(&base_url, &cmd).await
+    // Route through the backend controller: serializes all PTU sends at
+    // the trust boundary (no frontend path can interleave) and enforces
+    // velocity mode on speed commands.
+    ptu.send(&base_url, &cmd).await
 }
 
 // ── ONVIF / generic PTZ (stubs — return Err until implemented) ─────
