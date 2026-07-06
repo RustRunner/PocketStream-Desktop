@@ -19,6 +19,10 @@ jobs:
           cache: npm
 
       - run: npm ci
+      # The IPC contract (types.ts / tauri-api.ts) is hand-maintained;
+      # typecheck is the cheapest drift net against the Rust side. Run
+      # before the build so a contract break fails fast.
+      - run: npm run typecheck
       - run: npm run build
 
   rust:

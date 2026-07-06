@@ -50,11 +50,20 @@ function Step {
     }
 }
 
+# ── Frontend typecheck (mirrors `frontend` job) ────────────────────
+# The IPC contract (types.ts / tauri-api.ts) is hand-maintained, so this
+# is the cheapest drift net. Invoke npm.cmd, not npm: plain `npm`
+# resolves to npm.ps1, which PowerShell execution policy can block.
+Step "npm run typecheck" {
+    Push-Location $repoRoot
+    try { npm.cmd run typecheck } finally { Pop-Location }
+}
+
 # ── Frontend build (mirrors `frontend` job) ────────────────────────
 if (-not $Quick) {
     Step "Frontend build" {
         Push-Location $repoRoot
-        try { npm run build } finally { Pop-Location }
+        try { npm.cmd run build } finally { Pop-Location }
     }
 }
 
