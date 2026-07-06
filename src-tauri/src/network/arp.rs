@@ -401,49 +401,110 @@ fn format_mac(mac: &[u8; 6]) -> String {
 /// (e.g. from a prior browser visit), the ping sweep won't generate a
 /// new ARP request on the wire, so the capture listener never sees it.
 ///
-/// `interface_ip` scopes the query to a single interface via `arp -a -N`,
-/// preventing WiFi entries from leaking in.
+/// `interface_ip` scopes the query to the interface that owns it (by
+/// `InterfaceIndex`), preventing WiFi entries from leaking in.
+///
+/// Uses `Get-NetNeighbor` rather than `arp -a`: the cmdlet's JSON is
+/// locale-invariant (the `State` field is numeric / an invariant enum
+/// name), whereas `arp -a`'s "dynamic"/"static" column is localized —
+/// on a German or French Windows the old parser matched nothing and
+/// silently returned no neighbors.
 pub async fn read_system_arp_table(interface_ip: &str) -> Vec<(Ipv4Addr, String)> {
-    let output = match super::async_cmd("arp")
-        .args(["-a", "-N", interface_ip])
-        .output()
-        .await
-    {
-        Ok(o) => o,
-        Err(e) => {
-            log::warn!("Failed to read ARP table: {}", e);
-            return vec![];
-        }
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    log::debug!(
-        "ARP table for {}: {} entries",
-        interface_ip,
-        stdout.lines().count()
+    let script = format!(
+        "$idx=(Get-NetIPAddress -IPAddress '{ip}' -AddressFamily IPv4 -ErrorAction SilentlyContinue \
+         | Select-Object -First 1).InterfaceIndex; \
+         if ($null -ne $idx) {{ Get-NetNeighbor -AddressFamily IPv4 -InterfaceIndex $idx \
+         -ErrorAction SilentlyContinue | Select-Object IPAddress,LinkLayerAddress,State \
+         | ConvertTo-Json -Compress }}",
+        ip = interface_ip.replace('\'', "''"),
     );
-    parse_arp_table(&stdout)
+    let stdout = match run_powershell(&script).await {
+        Some(s) => s,
+        None => return vec![],
+    };
+    let entries = parse_neighbors_json(&stdout);
+    log::debug!("Neighbors for {}: {} entries", interface_ip, entries.len());
+    entries
 }
 
-/// Parse `arp -a` output into (IP, MAC) pairs.
-/// Only returns dynamic entries with valid IPv4 addresses.
-fn parse_arp_table(output: &str) -> Vec<(Ipv4Addr, String)> {
-    let mut entries = Vec::new();
-    for line in output.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        // Windows `arp -a` format: "  192.168.1.207  aa-bb-cc-dd-ee-ff  dynamic"
-        if parts.len() >= 3 && parts[2].eq_ignore_ascii_case("dynamic") {
-            if let Ok(ip) = parts[0].parse::<Ipv4Addr>() {
-                // Normalize MAC from aa-bb-cc-dd-ee-ff to aa:bb:cc:dd:ee:ff
-                let mac = parts[1].replace('-', ":").to_lowercase();
-                // Skip incomplete entries (ff-ff-ff-ff-ff-ff or 00-00-00-00-00-00)
-                if mac != "ff:ff:ff:ff:ff:ff" && mac != "00:00:00:00:00:00" {
-                    entries.push((ip, mac));
-                }
-            }
+/// Run a PowerShell script, returning stdout on success (exit 0), or
+/// None on spawn failure, non-zero exit, or timeout. Bounded so a hung
+/// PowerShell can't wedge the caller.
+async fn run_powershell(script: &str) -> Option<String> {
+    let fut = super::async_cmd("powershell")
+        .args(["-NoProfile", "-Command", script])
+        .kill_on_drop(true)
+        .output();
+    match tokio::time::timeout(std::time::Duration::from_secs(10), fut).await {
+        Ok(Ok(o)) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).to_string()),
+        Ok(Ok(o)) => {
+            log::warn!("Get-NetNeighbor exited {}", o.status.code().unwrap_or(-1));
+            None
+        }
+        Ok(Err(e)) => {
+            log::warn!("Get-NetNeighbor spawn failed: {}", e);
+            None
+        }
+        Err(_) => {
+            log::warn!("Get-NetNeighbor timed out");
+            None
         }
     }
-    entries
+}
+
+/// Parse `Get-NetNeighbor | ConvertTo-Json` output into dynamic
+/// (IP, MAC) pairs. ConvertTo-Json emits a bare object for one row and
+/// an array for many.
+fn parse_neighbors_json(stdout: &str) -> Vec<(Ipv4Addr, String)> {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return vec![];
+    }
+    let values: Vec<serde_json::Value> = if trimmed.starts_with('[') {
+        serde_json::from_str(trimmed).unwrap_or_default()
+    } else {
+        serde_json::from_str::<serde_json::Value>(trimmed)
+            .map(|v| vec![v])
+            .unwrap_or_default()
+    };
+
+    values
+        .iter()
+        .filter(|v| neighbor_state_is_dynamic(&v["State"]))
+        .filter_map(|v| {
+            let ip = v["IPAddress"].as_str()?.parse::<Ipv4Addr>().ok()?;
+            let mac = normalize_mac(v["LinkLayerAddress"].as_str()?)?;
+            Some((ip, mac))
+        })
+        .collect()
+}
+
+/// True for the `NlNeighborState` values that mean "a resolved neighbor
+/// with a real unicast MAC" — the locale-invariant equivalent of what
+/// `arp -a` labelled "dynamic". Excludes 6=Permanent (static, which
+/// covers multicast/broadcast rows — matching by MAC regex would newly
+/// admit those) and 0=Unreachable / 1=Incomplete (no usable MAC).
+/// Accepts either the numeric serialization or the invariant enum name.
+fn neighbor_state_is_dynamic(state: &serde_json::Value) -> bool {
+    if let Some(n) = state.as_u64() {
+        return (2..=5).contains(&n);
+    }
+    if let Some(s) = state.as_str() {
+        let s = s.to_ascii_lowercase();
+        return matches!(s.as_str(), "probe" | "delay" | "stale" | "reachable");
+    }
+    false
+}
+
+/// Normalize a `Get-NetNeighbor` LinkLayerAddress (e.g. `AA-BB-CC-DD-EE-FF`)
+/// to the codebase's colon-lowercase form, rejecting the empty /
+/// broadcast / zeroed placeholders.
+fn normalize_mac(raw: &str) -> Option<String> {
+    let mac = raw.replace('-', ":").to_lowercase();
+    if mac.is_empty() || mac == "ff:ff:ff:ff:ff:ff" || mac == "00:00:00:00:00:00" {
+        return None;
+    }
+    Some(mac)
 }
 
 /// Resolve the MAC address currently bound to `target_ip` from the
@@ -467,28 +528,27 @@ pub async fn resolve_mac_for_ip(
         .output()
         .await;
 
-    let output = super::async_cmd("arp")
-        .args(["-a"])
-        .output()
+    // Get-NetNeighbor for the single target — locale-invariant, unlike
+    // the old `arp -a` "dynamic" text match.
+    let script = format!(
+        "Get-NetNeighbor -AddressFamily IPv4 -IPAddress '{ip}' -ErrorAction SilentlyContinue \
+         | Select-Object IPAddress,LinkLayerAddress,State | ConvertTo-Json -Compress",
+        ip = target_ip
+    );
+    let stdout = run_powershell(&script)
         .await
-        .map_err(|e| AppError::Network(format!("arp failed: {}", e)))?;
+        .ok_or_else(|| AppError::Network("Get-NetNeighbor failed".into()))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let target_str = target_ip.to_string();
-    for line in stdout.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 3 && parts[0] == target_str && parts[2].eq_ignore_ascii_case("dynamic") {
-            // Normalize MAC: arp -a uses aa-bb-cc-dd-ee-ff; rest of codebase uses colons.
-            let mac = parts[1].replace('-', ":").to_lowercase();
-            if mac != "ff:ff:ff:ff:ff:ff" && mac != "00:00:00:00:00:00" {
-                return Ok(Some(mac));
-            }
-        }
-    }
-    Ok(None)
+    Ok(parse_neighbors_json(&stdout)
+        .into_iter()
+        .find(|(ip, _)| *ip == target_ip)
+        .map(|(_, mac)| mac))
 }
 
-/// Check if `target_ip` is in use by pinging and checking ARP table.
+/// Check if `target_ip` is in use by pinging and checking the neighbor
+/// table. (Structurally blind on subnets the host has no address on —
+/// see the pre-adoption on-link probe; this only fixes the locale
+/// dependency.)
 pub async fn send_arp_probe(
     target_ip: Ipv4Addr,
     timeout: std::time::Duration,
@@ -499,21 +559,16 @@ pub async fn send_arp_probe(
         .output()
         .await;
 
-    let output = super::async_cmd("arp")
-        .args(["-a"])
-        .output()
+    let script = format!(
+        "Get-NetNeighbor -AddressFamily IPv4 -IPAddress '{ip}' -ErrorAction SilentlyContinue \
+         | Select-Object IPAddress,LinkLayerAddress,State | ConvertTo-Json -Compress",
+        ip = target_ip
+    );
+    let stdout = run_powershell(&script)
         .await
-        .map_err(|e| AppError::Network(format!("arp failed: {}", e)))?;
+        .ok_or_else(|| AppError::Network("Get-NetNeighbor failed".into()))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let target_str = target_ip.to_string();
-    for line in stdout.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 3 && parts[0] == target_str && parts[2].to_lowercase() == "dynamic" {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(!parse_neighbors_json(&stdout).is_empty())
 }
 
 #[cfg(test)]
@@ -743,64 +798,76 @@ mod tests {
         assert_eq!(format_mac(&[0xFF; 6]), "ff:ff:ff:ff:ff:ff");
     }
 
-    // ── parse_arp_table ─────────────────────────────────────────────
+    // ── parse_neighbors_json ────────────────────────────────────────
+    // Get-NetNeighbor JSON is locale-invariant, so unlike the old
+    // arp -a parser these fixtures are the same on any Windows language.
 
     #[test]
-    fn parse_arp_table_windows_format() {
-        let output = "\
-Interface: 192.168.1.100 --- 0x6
-  Internet Address      Physical Address      Type
-  192.168.1.1           aa-bb-cc-dd-ee-01     dynamic
-  192.168.1.207         aa-bb-cc-dd-ee-02     dynamic
-  192.168.1.255         ff-ff-ff-ff-ff-ff     static
-";
-        let entries = parse_arp_table(output);
+    fn parse_neighbors_json_array_numeric_state() {
+        // State: 5=Reachable, 4=Stale (both dynamic), 6=Permanent (static).
+        let json = r#"[
+            {"IPAddress":"192.168.1.1","LinkLayerAddress":"AA-BB-CC-DD-EE-01","State":5},
+            {"IPAddress":"192.168.1.207","LinkLayerAddress":"aa-bb-cc-dd-ee-02","State":4},
+            {"IPAddress":"192.168.1.255","LinkLayerAddress":"FF-FF-FF-FF-FF-FF","State":6}
+        ]"#;
+        let entries = parse_neighbors_json(json);
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].0, Ipv4Addr::new(192, 168, 1, 1));
-        assert_eq!(entries[0].1, "aa:bb:cc:dd:ee:01");
-        assert_eq!(entries[1].0, Ipv4Addr::new(192, 168, 1, 207));
-        assert_eq!(entries[1].1, "aa:bb:cc:dd:ee:02");
+        assert_eq!(
+            entries[0],
+            (Ipv4Addr::new(192, 168, 1, 1), "aa:bb:cc:dd:ee:01".into())
+        );
+        assert_eq!(
+            entries[1],
+            (Ipv4Addr::new(192, 168, 1, 207), "aa:bb:cc:dd:ee:02".into())
+        );
     }
 
     #[test]
-    fn parse_arp_table_skips_static_entries() {
-        let output = "  192.168.1.1  aa-bb-cc-dd-ee-ff  static\n";
-        let entries = parse_arp_table(output);
-        assert!(entries.is_empty());
+    fn parse_neighbors_json_single_object() {
+        // ConvertTo-Json emits a bare object for a single row.
+        let json = r#"{"IPAddress":"10.0.0.5","LinkLayerAddress":"11-22-33-44-55-66","State":5}"#;
+        let entries = parse_neighbors_json(json);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, "11:22:33:44:55:66");
     }
 
     #[test]
-    fn parse_arp_table_skips_broadcast() {
-        let output = "  192.168.1.255  ff-ff-ff-ff-ff-ff  dynamic\n";
-        let entries = parse_arp_table(output);
-        assert!(entries.is_empty());
+    fn parse_neighbors_json_accepts_enum_name_state() {
+        // Defensive: if State serializes as the (invariant) enum name
+        // rather than the number, we still classify it correctly.
+        let json = r#"[
+            {"IPAddress":"10.0.0.1","LinkLayerAddress":"AA-BB-CC-DD-EE-FF","State":"Reachable"},
+            {"IPAddress":"10.0.0.2","LinkLayerAddress":"AA-BB-CC-DD-EE-01","State":"Permanent"}
+        ]"#;
+        let entries = parse_neighbors_json(json);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, Ipv4Addr::new(10, 0, 0, 1));
     }
 
     #[test]
-    fn parse_arp_table_skips_zeroed_mac() {
-        let output = "  192.168.1.50  00-00-00-00-00-00  dynamic\n";
-        let entries = parse_arp_table(output);
-        assert!(entries.is_empty());
+    fn parse_neighbors_json_excludes_permanent_and_incomplete() {
+        // 6=Permanent (multicast/broadcast/static), 1=Incomplete (no MAC),
+        // 0=Unreachable — none should appear.
+        let json = r#"[
+            {"IPAddress":"224.0.0.22","LinkLayerAddress":"01-00-5E-00-00-16","State":6},
+            {"IPAddress":"192.168.1.50","LinkLayerAddress":"","State":1},
+            {"IPAddress":"192.168.1.51","LinkLayerAddress":"AA-BB-CC-DD-EE-02","State":0}
+        ]"#;
+        assert!(parse_neighbors_json(json).is_empty());
     }
 
     #[test]
-    fn parse_arp_table_empty_output() {
-        assert!(parse_arp_table("").is_empty());
+    fn parse_neighbors_json_skips_placeholder_macs() {
+        let json = r#"[
+            {"IPAddress":"192.168.1.255","LinkLayerAddress":"FF-FF-FF-FF-FF-FF","State":5},
+            {"IPAddress":"192.168.1.50","LinkLayerAddress":"00-00-00-00-00-00","State":5}
+        ]"#;
+        assert!(parse_neighbors_json(json).is_empty());
     }
 
     #[test]
-    fn parse_arp_table_header_lines_ignored() {
-        let output = "\
-Interface: 192.168.1.100 --- 0x6
-  Internet Address      Physical Address      Type
-";
-        assert!(parse_arp_table(output).is_empty());
-    }
-
-    #[test]
-    fn parse_arp_table_normalizes_mac() {
-        let output = "  10.0.0.1  AA-BB-CC-DD-EE-FF  dynamic\n";
-        let entries = parse_arp_table(output);
-        assert_eq!(entries[0].1, "aa:bb:cc:dd:ee:ff");
+    fn parse_neighbors_json_empty_and_blank() {
+        assert!(parse_neighbors_json("").is_empty());
+        assert!(parse_neighbors_json("   \r\n ").is_empty());
     }
 }
