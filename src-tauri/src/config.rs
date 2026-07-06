@@ -1387,20 +1387,17 @@ password = ""
 
     #[test]
     #[cfg_attr(not(target_os = "windows"), ignore)]
-    fn get_or_create_key_returns_32_bytes() {
-        // Uses the real config dir (%APPDATA%/PocketStream/.key).
-        // Skipped on Linux CI where the dir doesn't exist.
-        let key = get_or_create_key().unwrap();
-        assert_eq!(key.len(), 32);
-    }
-
-    #[test]
-    #[cfg_attr(not(target_os = "windows"), ignore)]
-    fn get_or_create_key_is_stable() {
-        // Uses the real config dir. Skipped on Linux CI.
+    fn get_or_create_key_returns_stable_32_bytes() {
+        // Uses the real config dir (%APPDATA%/PocketStream/.key), so length
+        // and stability are asserted in ONE test: as two separate tests
+        // they ran in parallel and raced to create the shared key file on
+        // a fresh machine, each overwriting the other's freshly-generated
+        // key (locally it passed only because the file already existed).
+        // Skipped on non-Windows where the config dir isn't present.
         let k1 = get_or_create_key().unwrap();
+        assert_eq!(k1.len(), 32, "key should be 32 bytes");
         let k2 = get_or_create_key().unwrap();
-        assert_eq!(k1, k2, "Same key should be returned on subsequent calls");
+        assert_eq!(k1, k2, "same key should be returned on subsequent calls");
     }
 
     // ── User-Settings Merge ─────────────────────────────────────────
