@@ -476,20 +476,24 @@ async function scanDevicePorts(ip: string, attempt = 0): Promise<void> {
       }
     }
     if (!found) {
-      markIpScanned(ip, /* clear */ true);
-      // Retry — the device may be on a subnet that was just adopted
+      // Retry — the device may be on a subnet that was just adopted.
+      // Keep the scanned flag SET across the retry gap so a concurrent
+      // discovery trigger (new ARP event, Nodes refresh) can't start a
+      // duplicate scan chain for this IP; release it only once retries
+      // are exhausted.
       if (attempt < MAX_SCAN_RETRIES) {
         setTimeout(() => scanDevicePorts(ip, attempt + 1), RETRY_DELAY_MS);
         return; // don't decrement pendingScans yet
       }
+      markIpScanned(ip, /* clear */ true);
     }
   } catch (e) {
     log(`Port scan failed for ${ip}: ${formatError(e)}`);
-    markIpScanned(ip, /* clear */ true);
     if (attempt < MAX_SCAN_RETRIES) {
       setTimeout(() => scanDevicePorts(ip, attempt + 1), RETRY_DELAY_MS);
       return;
     }
+    markIpScanned(ip, /* clear */ true);
   }
 
   pendingScans--;
@@ -635,9 +639,12 @@ export function renderArpDeviceList(): void {
       item.classList.add("selected");
       const ip = item.dataset["ip"] ?? null;
       selectedDevice.set(ip);
-      // Persist the CAM pick to config so next launch defaults to
-      // the same target. PTU is alias-driven only — no equivalent
-      // persistence here.
+      // Remember this selection as the in-memory CAM default for the
+      // session (getActiveCamIp falls back to it). It is written to
+      // disk only when a stream actually starts or the device is
+      // explicitly aliased CAM — a node the user merely clicks but
+      // never streams is not persisted across launches. PTU is
+      // alias-driven only, with no click override.
       if (state.config && ip) {
         state.config.stream.camera_ip = ip;
       }
@@ -749,9 +756,15 @@ export function setupAliasDialog(): void {
         const ip = dialog.dataset["ip"];
         if (!ip) return;
         persistAlias(ip, "CAM");
-        // Persist as the default CAM target so getActiveCamIp picks it
-        // up on next session — same intent the old dropdown carried.
-        if (state.config) state.config.stream.camera_ip = ip;
+        // Aliasing CAM is a deliberate designation — persist it to disk
+        // so getActiveCamIp's config fallback picks it up next session.
+        // (The click-to-select path only sets this in memory.)
+        if (state.config) {
+          state.config.stream.camera_ip = ip;
+          api.updateStreamSettings(state.config.stream).catch((e: unknown) => {
+            log(`persist CAM pick failed for ${ip}: ${formatError(e)}`);
+          });
+        }
         // Mirror into selectedDevice so subscribers (zoom restore,
         // Nodes panel highlight) react immediately. Same store the
         // click-to-select path uses.

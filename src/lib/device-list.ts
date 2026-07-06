@@ -93,14 +93,23 @@ export function devicesBySubnet(): Map<string, DeviceRecord[]> {
  *  push updates. Call once during app startup, before any subscriber
  *  expects data to be available. */
 export async function start(): Promise<void> {
+  // If a push update arrives while we await the cold-start fetch below,
+  // it carries the backend's newest snapshot — the initial fetch may
+  // predate it. Track that so we don't overwrite the fresher event.
+  let eventLanded = false;
   api.onEvent<DeviceRecord[]>("device-list-changed", (snapshot) => {
+    eventLanded = true;
     setSnapshot(snapshot);
   });
 
   try {
     const initial = await api.getDeviceList();
-    setSnapshot(initial);
-    log(`device-list: hydrated ${value.length} record(s) from backend`);
+    if (eventLanded) {
+      log("device-list: live event beat initial hydrate; keeping event snapshot");
+    } else {
+      setSnapshot(initial);
+      log(`device-list: hydrated ${value.length} record(s) from backend`);
+    }
   } catch (e) {
     log(`device-list: initial hydrate failed: ${formatError(e)}`);
   }

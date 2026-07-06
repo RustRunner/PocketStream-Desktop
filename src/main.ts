@@ -29,6 +29,7 @@ import {
   startStatusListener,
   handleHardDisconnect,
   syncRtspStartButton,
+  syncVideoVisibility,
 } from "./lib/streaming.ts";
 import { setupPtzControls } from "./lib/ptz.ts";
 import type {
@@ -298,10 +299,10 @@ async function loadConfig(): Promise<void> {
     syncRtspStartButton();
     $<HTMLInputElement>("#rtsp-server-port").value = String(state.config.rtsp_server.port);
     $<HTMLInputElement>("#rtsp-token").value = state.config.rtsp_server.token;
-    if (state.config.rtsp_server.bind_interface) {
-      $<HTMLSelectElement>("#rtsp-bind-interface").value =
-        state.config.rtsp_server.bind_interface;
-    }
+    // The bind-interface <select> is restored in one place only —
+    // populateVpnDropdown, after its options exist. Setting .value here
+    // (before the VPN options are appended) silently resolves to "",
+    // which a later start/save could then persist over the saved value.
 
     // Set active protocol
     const proto = state.config.stream.protocol;
@@ -353,10 +354,15 @@ function setupSettingsSave(): void {
         ? "udp"
         : "rtsp";
 
+    // An empty Custom… input must not clobber the configured path.
+    // Fall back to the currently-saved path, and only to the hard
+    // default when nothing is configured yet.
+    const rtspPath =
+      readRtspPath() || state.config?.stream?.rtsp_path || "/z3-1.sdp";
     const stream: StreamConfig = {
       protocol: activeProto,
       rtsp_port: parseInt($<HTMLInputElement>("#rtsp-port").value) || 554,
-      rtsp_path: readRtspPath() || "/z3-1.sdp",
+      rtsp_path: rtspPath,
       udp_port: parseInt($<HTMLInputElement>("#udp-port").value) || 8600,
       camera_ip: state.config?.stream?.camera_ip || "",
     };
@@ -382,6 +388,11 @@ function setupSettingsSave(): void {
       // Re-pull the canonical settings so state.config reflects whatever
       // the backend currently holds for the fields we don't own.
       state.config = await api.getConfig();
+      // Re-sync the Path UI (and lastAppliedRtspPath) to what was saved,
+      // so a later blur on the custom input doesn't re-fire applyPathChange
+      // and needlessly restart the stream — and so an empty-Custom save
+      // that kept the existing path is reflected back in the dropdown.
+      applyRtspPath(stream.rtsp_path);
       showToast("Settings saved");
     } catch (e) {
       showToast("Failed to save: " + formatError(e), true);
@@ -414,12 +425,15 @@ function setupMenuAndAbout(): void {
 
     // Reposition video after sidebar animation completes
     if (state.isStreaming) {
-      api.setVideoVisible(false);
+      api.setVideoVisible(false).catch(() => {});
       setTimeout(async () => {
         try {
           const bounds = getVideoAreaBounds();
           await api.updateVideoPosition(bounds.x, bounds.y, bounds.width, bounds.height);
-          await api.setVideoVisible(true);
+          // Route through syncVideoVisibility rather than an
+          // unconditional show — during a lost stream or with a modal
+          // open the video must stay hidden.
+          await syncVideoVisibility();
         } catch (_) {}
       }, 250);
     }

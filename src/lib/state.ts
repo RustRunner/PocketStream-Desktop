@@ -88,7 +88,9 @@ export function showToast(message: string, isError = false): void {
   // Write toast messages to the log file for diagnostics
   logToFile(isError ? "error" : "info", `toast: ${message}`);
 
-  const existing = document.querySelector(".toast");
+  // Never evict the update notification — it stays until the user acts on
+  // it. Only clear a prior transient toast.
+  const existing = document.querySelector(".toast:not(.update-toast)");
   if (existing) existing.remove();
 
   const toast = document.createElement("div");

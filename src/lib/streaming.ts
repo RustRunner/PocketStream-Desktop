@@ -135,7 +135,7 @@ export function setupStreamControls(): void {
           }
           if (state.config) {
             state.config.stream.camera_ip = selectedIp;
-            await api.saveConfig(state.config);
+            await api.updateStreamSettings(state.config.stream);
           }
           const bounds = getVideoAreaBounds();
           const handle = await api.createVideoWindow(
@@ -287,7 +287,7 @@ export function setupRtspControls(): void {
       "#rtsp-bind-interface"
     ).value;
     try {
-      await api.saveConfig(state.config);
+      await api.updateRtspSettings(state.config.rtsp_server);
     } catch (e) {
       showToast("Failed to save VPN selection: " + formatError(e), true);
     }
@@ -313,13 +313,11 @@ export function setupRtspControls(): void {
       }
     } else {
       try {
-        // Save bind_interface selection before starting
-        if (state.config) {
-          state.config.rtsp_server.bind_interface = $<HTMLSelectElement>(
-            "#rtsp-bind-interface"
-          ).value;
-          await api.saveConfig(state.config);
-        }
+        // bind_interface is persisted by the dropdown's change handler,
+        // so don't re-copy the <select> value here. During startup the
+        // VPN options are still being populated asynchronously and the
+        // select can briefly read empty; writing that back would wipe
+        // the saved interface.
         const info = await api.startRtspServer();
         state.isRtspRunning = true;
         rtspFullUrl = info.rtsp_url;
