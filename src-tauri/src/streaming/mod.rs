@@ -7,7 +7,7 @@ use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
 
-use crate::config::AppSettings;
+use crate::config::{AppSettings, StreamProtocol};
 use crate::error::AppError;
 
 #[derive(Debug, Clone, Serialize)]
@@ -118,11 +118,15 @@ impl StreamManager {
         url.to_string()
     }
 
-    /// Build the input URL from current settings.
+    /// Build the input URL from current settings. Credentials are NOT
+    /// embedded — they're carried separately and set as `rtspsrc`
+    /// `user-id`/`user-pw` properties by the pipeline builders, which
+    /// keeps a password containing `@`/`:`/`/` from producing a
+    /// malformed URL and keeps credentials out of pipeline-string logs.
     fn build_input_url(settings: &AppSettings) -> Result<String, AppError> {
-        match settings.stream.protocol.as_str() {
-            "udp" => Ok(format!("udp://@:{}", settings.stream.udp_port)),
-            _ => {
+        match settings.stream.protocol {
+            StreamProtocol::Udp => Ok(format!("udp://@:{}", settings.stream.udp_port)),
+            StreamProtocol::Rtsp => {
                 // Validate camera IP before building URL (defense in depth)
                 if !settings.stream.camera_ip.is_empty() {
                     settings
@@ -136,20 +140,9 @@ impl StreamManager {
                             ))
                         })?;
                 }
-                let creds = if !settings.credentials.username.is_empty() {
-                    format!(
-                        "{}:{}@",
-                        settings.credentials.username, settings.credentials.password
-                    )
-                } else {
-                    String::new()
-                };
                 Ok(format!(
-                    "rtsp://{}{}:{}{}",
-                    creds,
-                    settings.stream.camera_ip,
-                    settings.stream.rtsp_port,
-                    settings.stream.rtsp_path
+                    "rtsp://{}:{}{}",
+                    settings.stream.camera_ip, settings.stream.rtsp_port, settings.stream.rtsp_path
                 ))
             }
         }
@@ -177,7 +170,7 @@ impl StreamManager {
             // means one of them silently gets nothing. The restreamer's
             // udpsrc binds lazily on first client connect, which is why
             // this is guarded at start time rather than probed.
-            if settings.stream.protocol == "udp" {
+            if settings.stream.protocol == StreamProtocol::Udp {
                 let conflict = state.rtsp_server.as_ref().and_then(|s| s.udp_ingest_port())
                     == Some(settings.stream.udp_port);
                 if conflict {
@@ -217,12 +210,12 @@ impl StreamManager {
             }
         }
 
-        let pipeline = match settings.stream.protocol.as_str() {
-            "udp" => {
+        let pipeline = match settings.stream.protocol {
+            StreamProtocol::Udp => {
                 log::info!("Starting UDP playback on port {}", settings.stream.udp_port);
                 PlaybackPipeline::new_udp(settings.stream.udp_port, window_handle)?
             }
-            _ => {
+            StreamProtocol::Rtsp => {
                 let url = Self::build_input_url(settings)?;
                 log::info!("Starting RTSP playback from: {}", Self::redact_url(&url));
                 PlaybackPipeline::new_rtsp(
@@ -231,6 +224,8 @@ impl StreamManager {
                     true,
                     window_handle,
                     Some(settings.stream.camera_ip.clone()),
+                    &settings.credentials.username,
+                    &settings.credentials.password,
                 )?
             }
         };
@@ -245,11 +240,11 @@ impl StreamManager {
             let mut state = self.state.lock().await;
             state.playback = Some(Arc::new(pipeline));
             state.start_time = Some(std::time::Instant::now());
-            state.playback_source = Some(match settings.stream.protocol.as_str() {
-                "udp" => SourceMode::Udp {
+            state.playback_source = Some(match settings.stream.protocol {
+                StreamProtocol::Udp => SourceMode::Udp {
                     port: settings.stream.udp_port,
                 },
-                _ => SourceMode::Rtsp,
+                StreamProtocol::Rtsp => SourceMode::Rtsp,
             });
         }
 
@@ -327,7 +322,7 @@ impl StreamManager {
         // Double-bind guard, mirror of the one in start_playback: the
         // restreamer's UDP ingest must not claim the port the running
         // preview is already receiving on.
-        if settings.stream.protocol == "udp" {
+        if settings.stream.protocol == StreamProtocol::Udp {
             if let Some(SourceMode::Udp { port }) = state.playback_source {
                 if port == settings.stream.udp_port {
                     return Err(AppError::Stream(format!(
@@ -361,20 +356,22 @@ impl StreamManager {
             Some(ip)
         };
 
-        let server = match settings.stream.protocol.as_str() {
-            "udp" => RtspRestreamer::start_from_udp(
+        let server = match settings.stream.protocol {
+            StreamProtocol::Udp => RtspRestreamer::start_from_udp(
                 settings.stream.udp_port,
                 port,
                 &mount_path,
                 bind_address.as_deref(),
             )?,
-            _ => {
+            StreamProtocol::Rtsp => {
                 let input_url = Self::build_input_url(settings)?;
                 RtspRestreamer::start_from_rtsp(
                     &input_url,
                     port,
                     &mount_path,
                     bind_address.as_deref(),
+                    &settings.credentials.username,
+                    &settings.credentials.password,
                 )?
             }
         };
@@ -676,14 +673,14 @@ mod tests {
     use crate::config::*;
 
     fn make_settings(
-        protocol: &str,
+        protocol: StreamProtocol,
         camera_ip: &str,
         username: &str,
         password: &str,
     ) -> AppSettings {
         AppSettings {
             stream: StreamConfig {
-                protocol: protocol.into(),
+                protocol,
                 rtsp_port: 554,
                 rtsp_path: "/live".into(),
                 udp_port: 8600,
@@ -751,44 +748,41 @@ mod tests {
     // ── build_input_url ─────────────────────────────────────────────
 
     #[test]
-    fn build_url_rtsp_with_credentials() {
-        let s = make_settings("rtsp", "192.168.1.10", "admin", "pass123");
+    fn build_url_rtsp_omits_credentials() {
+        // Credentials are carried via rtspsrc user-id/user-pw now, never
+        // embedded — so a password with URL-special characters can't
+        // produce a malformed URL, and creds stay out of pipeline logs.
+        let s = make_settings(StreamProtocol::Rtsp, "192.168.1.10", "admin", "p@ss:w/rd");
         let url = StreamManager::build_input_url(&s).unwrap();
-        assert_eq!(url, "rtsp://admin:pass123@192.168.1.10:554/live");
+        assert_eq!(url, "rtsp://192.168.1.10:554/live");
+        assert!(!url.contains("admin"));
+        assert!(!url.contains("p@ss"));
     }
 
     #[test]
     fn build_url_rtsp_without_credentials() {
-        let s = make_settings("rtsp", "192.168.1.10", "", "");
+        let s = make_settings(StreamProtocol::Rtsp, "192.168.1.10", "", "");
         let url = StreamManager::build_input_url(&s).unwrap();
         assert_eq!(url, "rtsp://192.168.1.10:554/live");
     }
 
     #[test]
-    fn build_url_rtsp_empty_password_still_has_creds() {
-        // If username is set but password is empty, creds block is still added
-        let s = make_settings("rtsp", "10.0.0.5", "admin", "");
-        let url = StreamManager::build_input_url(&s).unwrap();
-        assert_eq!(url, "rtsp://admin:@10.0.0.5:554/live");
-    }
-
-    #[test]
     fn build_url_udp() {
-        let s = make_settings("udp", "", "", "");
+        let s = make_settings(StreamProtocol::Udp, "", "", "");
         let url = StreamManager::build_input_url(&s).unwrap();
         assert_eq!(url, "udp://@:8600");
     }
 
     #[test]
     fn build_url_udp_ignores_camera_ip() {
-        let s = make_settings("udp", "192.168.1.1", "admin", "pass");
+        let s = make_settings(StreamProtocol::Udp, "192.168.1.1", "admin", "pass");
         let url = StreamManager::build_input_url(&s).unwrap();
         assert_eq!(url, "udp://@:8600");
     }
 
     #[test]
     fn build_url_custom_port_and_path() {
-        let mut s = make_settings("rtsp", "10.0.0.5", "", "");
+        let mut s = make_settings(StreamProtocol::Rtsp, "10.0.0.5", "", "");
         s.stream.rtsp_port = 8554;
         s.stream.rtsp_path = "/cam1/main".into();
         let url = StreamManager::build_input_url(&s).unwrap();
@@ -797,29 +791,26 @@ mod tests {
 
     #[test]
     fn build_url_custom_udp_port() {
-        let mut s = make_settings("udp", "", "", "");
+        let mut s = make_settings(StreamProtocol::Udp, "", "", "");
         s.stream.udp_port = 9999;
         let url = StreamManager::build_input_url(&s).unwrap();
         assert_eq!(url, "udp://@:9999");
     }
 
     #[test]
-    fn build_url_unknown_protocol_falls_to_rtsp() {
-        // Any non-"udp" protocol defaults to RTSP path
-        let s = make_settings("http", "1.2.3.4", "", "");
-        let url = StreamManager::build_input_url(&s).unwrap();
-        assert!(url.starts_with("rtsp://"));
-    }
-
-    #[test]
     fn build_url_rejects_invalid_camera_ip() {
-        let s = make_settings("rtsp", "not-an-ip", "", "");
+        let s = make_settings(StreamProtocol::Rtsp, "not-an-ip", "", "");
         assert!(StreamManager::build_input_url(&s).is_err());
     }
 
     #[test]
     fn build_url_rejects_pipeline_injection_in_ip() {
-        let s = make_settings("rtsp", "192.168.1.1 ! filesrc location=/etc/passwd", "", "");
+        let s = make_settings(
+            StreamProtocol::Rtsp,
+            "192.168.1.1 ! filesrc location=/etc/passwd",
+            "",
+            "",
+        );
         assert!(StreamManager::build_input_url(&s).is_err());
     }
 

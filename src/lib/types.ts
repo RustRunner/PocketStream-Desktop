@@ -78,9 +78,12 @@ export interface ScanResult {
 
 // ── Config (config.rs) ───────────────────────────────────────────────
 
+/** Camera input protocol. Mirrors the Rust `StreamProtocol` enum, which
+ *  rejects any other value at the IPC boundary. */
+export type StreamProtocol = "rtsp" | "udp";
+
 export interface StreamConfig {
-  /** "rtsp" or "udp" */
-  protocol: string;
+  protocol: StreamProtocol;
   rtsp_port: number;
   rtsp_path: string;
   udp_port: number;

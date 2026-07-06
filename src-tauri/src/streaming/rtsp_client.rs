@@ -79,12 +79,15 @@ pub struct PlaybackPipeline {
 impl PlaybackPipeline {
     /// Create a playback pipeline for an RTSP source.
     /// `window_handle`: if Some, render into that HWND via VideoOverlay.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_rtsp(
         url: &str,
         latency_ms: u32,
         use_tcp: bool,
         window_handle: Option<usize>,
         camera_ip: Option<String>,
+        username: &str,
+        password: &str,
     ) -> Result<Self, AppError> {
         let protocols = if use_tcp { "tcp" } else { "udp+tcp" };
 
@@ -113,16 +116,19 @@ impl PlaybackPipeline {
         // The named element must exist if the pipeline parsed, but a
         // GStreamer plugin-version mismatch could in theory remove it —
         // return an error rather than panicking the streaming task.
-        result
-            .pipeline
-            .by_name("src")
-            .ok_or_else(|| {
-                AppError::Stream(
-                    "rtspsrc 'src' element not found in pipeline (GStreamer version mismatch?)"
-                        .into(),
-                )
-            })?
-            .set_property("location", url);
+        let src = result.pipeline.by_name("src").ok_or_else(|| {
+            AppError::Stream(
+                "rtspsrc 'src' element not found in pipeline (GStreamer version mismatch?)".into(),
+            )
+        })?;
+        src.set_property("location", url);
+        // Credentials as rtspsrc properties, not URL-embedded — handles
+        // passwords with URL-special characters and keeps creds out of
+        // the pipeline string / logs.
+        if !username.is_empty() {
+            src.set_property("user-id", username);
+            src.set_property("user-pw", password);
+        }
 
         Ok(result)
     }

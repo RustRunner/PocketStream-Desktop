@@ -10,10 +10,23 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+/// Camera input protocol. Serializes as the lowercase wire strings
+/// `"rtsp"` / `"udp"` (unchanged from when this was a bare `String`), so
+/// a junk value now fails deserialization at the IPC boundary and, for a
+/// config file, routes to the quarantine path instead of silently
+/// falling through to RTSP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamProtocol {
+    #[default]
+    Rtsp,
+    Udp,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamConfig {
-    /// Input protocol: "rtsp" or "udp"
-    pub protocol: String,
+    /// Input protocol.
+    pub protocol: StreamProtocol,
     /// Camera RTSP port (default 554)
     pub rtsp_port: u16,
     /// Camera RTSP path (default "/z3-1.sdp")
@@ -125,7 +138,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             stream: StreamConfig {
-                protocol: "rtsp".into(),
+                protocol: StreamProtocol::Rtsp,
                 rtsp_port: 554,
                 rtsp_path: "/z3-1.sdp".into(),
                 udp_port: 8600,
@@ -1242,7 +1255,7 @@ mod tests {
     #[test]
     fn default_settings_stream_config() {
         let s = AppSettings::default();
-        assert_eq!(s.stream.protocol, "rtsp");
+        assert_eq!(s.stream.protocol, StreamProtocol::Rtsp);
         assert_eq!(s.stream.rtsp_port, 554);
         assert_eq!(s.stream.rtsp_path, "/z3-1.sdp");
         assert_eq!(s.stream.udp_port, 8600);
@@ -1268,6 +1281,43 @@ mod tests {
     // ── TOML Serialization ──────────────────────────────────────────
 
     #[test]
+    fn junk_protocol_fails_deserialize() {
+        // A typo'd protocol used to silently become RTSP. It now fails to
+        // deserialize, so load_from_disk quarantines the file instead of
+        // streaming the wrong thing.
+        let toml_str = r#"
+[stream]
+protocol = "htsp"
+rtsp_port = 554
+rtsp_path = "/z3-1.sdp"
+udp_port = 8600
+camera_ip = ""
+
+[rtsp_server]
+enabled = false
+port = 8554
+token = "abc"
+
+[credentials]
+username = ""
+password = ""
+"#;
+        assert!(toml::from_str::<AppSettings>(toml_str).is_err());
+    }
+
+    #[test]
+    fn protocol_wire_strings_are_lowercase() {
+        assert_eq!(
+            toml::Value::try_from(StreamProtocol::Rtsp).unwrap(),
+            toml::Value::String("rtsp".into())
+        );
+        assert_eq!(
+            toml::Value::try_from(StreamProtocol::Udp).unwrap(),
+            toml::Value::String("udp".into())
+        );
+    }
+
+    #[test]
     fn settings_toml_roundtrip() {
         let original = AppSettings::default();
         let toml_str = toml::to_string_pretty(&original).unwrap();
@@ -1282,7 +1332,7 @@ mod tests {
     fn settings_toml_with_populated_fields() {
         let settings = AppSettings {
             stream: StreamConfig {
-                protocol: "udp".into(),
+                protocol: StreamProtocol::Udp,
                 rtsp_port: 8554,
                 rtsp_path: "/cam1".into(),
                 udp_port: 9000,
@@ -1305,7 +1355,7 @@ mod tests {
         };
         let toml_str = toml::to_string_pretty(&settings).unwrap();
         let parsed: AppSettings = toml::from_str(&toml_str).unwrap();
-        assert_eq!(parsed.stream.protocol, "udp");
+        assert_eq!(parsed.stream.protocol, StreamProtocol::Udp);
         assert_eq!(parsed.stream.camera_ip, "10.0.0.5");
         assert_eq!(parsed.rtsp_server.bind_interface, "Ethernet 2");
         assert!(parsed.rtsp_server.enabled);
@@ -1507,7 +1557,7 @@ password = ""
     fn merge_user_fields_applies_user_editable_fields() {
         let mut current = AppSettings::default();
         let mut incoming = AppSettings::default();
-        incoming.stream.protocol = "udp".into();
+        incoming.stream.protocol = StreamProtocol::Udp;
         incoming.stream.rtsp_port = 9999;
         incoming.rtsp_server.enabled = true;
         incoming.rtsp_server.port = 7777;
@@ -1516,7 +1566,7 @@ password = ""
 
         current.merge_user_fields(incoming);
 
-        assert_eq!(current.stream.protocol, "udp");
+        assert_eq!(current.stream.protocol, StreamProtocol::Udp);
         assert_eq!(current.stream.rtsp_port, 9999);
         assert!(current.rtsp_server.enabled);
         assert_eq!(current.rtsp_server.port, 7777);

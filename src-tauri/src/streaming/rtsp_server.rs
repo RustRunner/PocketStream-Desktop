@@ -197,6 +197,8 @@ impl RtspRestreamer {
         port: u16,
         mount_path: &str,
         bind_address: Option<&str>,
+        username: &str,
+        password: &str,
     ) -> Result<Self, AppError> {
         let server = gst_rtsp_server::RTSPServer::new();
         server.set_service(&port.to_string());
@@ -218,12 +220,21 @@ impl RtspRestreamer {
 
         // Set the RTSP source URL each time the factory creates a new pipeline
         // (once per connecting client). Fires before media-constructed.
+        // Credentials go on rtspsrc's user-id/user-pw properties, not the
+        // URL, so special characters don't break it and creds stay out of
+        // the launch string.
         let url_for_factory = input_url.to_string();
+        let user_for_factory = username.to_string();
+        let pw_for_factory = password.to_string();
         factory.connect_media_configure(move |_factory, media| {
             let element = media.element();
             if let Ok(bin) = element.downcast::<gst::Bin>() {
                 if let Some(src) = bin.by_name("src") {
                     src.set_property("location", &url_for_factory);
+                    if !user_for_factory.is_empty() {
+                        src.set_property("user-id", &user_for_factory);
+                        src.set_property("user-pw", &pw_for_factory);
+                    }
                 }
             }
         });

@@ -35,6 +35,7 @@ import type {
   Credentials,
   RtspServerConfig,
   StreamConfig,
+  StreamProtocol,
 } from "./lib/types.ts";
 import type { TauriUpdate } from "./lib/tauri-global.d.ts";
 
@@ -345,8 +346,12 @@ function setupSettingsSave(): void {
   });
 
   $<HTMLButtonElement>("#save-settings").addEventListener("click", async () => {
-    const activeProto =
-      $<HTMLElement>("[data-protocol].active")?.dataset["protocol"] || "rtsp";
+    // Narrow to the StreamProtocol union — the backend enum rejects
+    // anything else, and the only two toggle buttons carry these values.
+    const activeProto: StreamProtocol =
+      $<HTMLElement>("[data-protocol].active")?.dataset["protocol"] === "udp"
+        ? "udp"
+        : "rtsp";
 
     const stream: StreamConfig = {
       protocol: activeProto,
