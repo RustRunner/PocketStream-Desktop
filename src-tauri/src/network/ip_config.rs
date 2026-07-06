@@ -1,6 +1,12 @@
+use std::net::Ipv4Addr;
+
 use crate::error::AppError;
 
 /// Assign a static IP address to a network interface.
+///
+/// `preserve_secondaries` are addresses (e.g. adopted rescue IPs) that
+/// must survive the set — the primary set wipes every address on the
+/// adapter, so any of these still present get re-added afterward.
 ///
 /// Platform-specific implementation:
 /// - Windows: uses `netsh interface ip set address`
@@ -10,6 +16,7 @@ pub async fn assign_static_ip(
     ip: &str,
     subnet_mask: &str,
     gateway: Option<&str>,
+    preserve_secondaries: &[Ipv4Addr],
 ) -> Result<(), AppError> {
     super::interface::validate_interface_name(interface).await?;
     validate_ip(ip)?;
@@ -20,16 +27,18 @@ pub async fn assign_static_ip(
 
     #[cfg(target_os = "windows")]
     {
-        assign_windows(interface, ip, subnet_mask, gateway).await
+        assign_windows(interface, ip, subnet_mask, gateway, preserve_secondaries).await
     }
 
     #[cfg(target_os = "linux")]
     {
+        let _ = preserve_secondaries;
         assign_linux(interface, ip, subnet_mask, gateway).await
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
+        let _ = preserve_secondaries;
         Err(AppError::Network("Unsupported platform".into()))
     }
 }
@@ -40,12 +49,31 @@ async fn assign_windows(
     ip: &str,
     subnet_mask: &str,
     gateway: Option<&str>,
+    preserve_secondaries: &[Ipv4Addr],
 ) -> Result<(), AppError> {
-    // Snapshot existing secondary IPs before the set (which replaces all).
-    let secondaries: Vec<super::interface::IpInfo> = super::interface::get_by_name(interface)
-        .await
-        .map(|info| info.ips.into_iter().skip(1).collect())
-        .unwrap_or_default();
+    // Snapshot BEFORE the set. Propagate a snapshot failure instead of
+    // treating it as an empty adapter: the old unwrap_or_default() would
+    // then re-add nothing, silently wiping every secondary (including the
+    // adopted rescue IP) when the set below replaces all addresses.
+    let info = super::interface::get_by_name(interface).await?;
+
+    // Choose which addresses to re-add by explicit membership in the
+    // preserve set — NOT by position. Enumeration order isn't guaranteed
+    // (so `.skip(1)` could re-add the real primary as a secondary), and
+    // PrefixOrigin marks adopted and user statics both Manual, so origin
+    // can't classify them either. The new primary is excluded.
+    let to_restore: Vec<super::interface::IpInfo> = info
+        .ips
+        .into_iter()
+        .filter(|sec| {
+            sec.address != ip
+                && sec
+                    .address
+                    .parse::<Ipv4Addr>()
+                    .map(|a| preserve_secondaries.contains(&a))
+                    .unwrap_or(false)
+        })
+        .collect();
 
     // Set primary static IP (replaces all existing IPs)
     let mut args = vec![
@@ -63,13 +91,10 @@ async fn assign_windows(
     }
     run_command("netsh", &args).await?;
 
-    // Re-add secondary IPs that were wiped by the set command (in parallel).
-    // Skip the new primary if it happened to also be a secondary.
+    // Re-add the preserved secondaries wiped by the set (in parallel).
+    // netsh add works here because the interface is now static.
     let mut tasks = Vec::new();
-    for sec in &secondaries {
-        if sec.address == ip {
-            continue;
-        }
+    for sec in &to_restore {
         let mask = prefix_to_mask(sec.prefix);
         let iface = interface.to_string();
         let addr = sec.address.clone();

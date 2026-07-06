@@ -51,8 +51,22 @@ pub async fn set_static_ip(
     subnet_mask: String,
     gateway: Option<String>,
 ) -> Result<(), AppError> {
-    crate::network::ip_config::assign_static_ip(&name, &ip, &subnet_mask, gateway.as_deref())
-        .await?;
+    // Adopted rescue IPs must survive the primary set — pass them so the
+    // secondary re-add classifies by membership, not by enumeration order.
+    let preserve: Vec<std::net::Ipv4Addr> = manager
+        .get_adopted_ips()
+        .await
+        .into_values()
+        .filter_map(|ip| ip.parse().ok())
+        .collect();
+    crate::network::ip_config::assign_static_ip(
+        &name,
+        &ip,
+        &subnet_mask,
+        gateway.as_deref(),
+        &preserve,
+    )
+    .await?;
     // Manual ownership trumps auto-adopt: drop any registry entry for
     // this IP so the "(auto)" badge stops shadowing a user-set IP, and
     // persist the prune so the state survives a restart.
