@@ -6,13 +6,11 @@ pub mod firewall;
 pub mod interface;
 pub mod ip_config;
 pub mod ping_dot;
-// The capture surface (probe/load/CaptureSession) is consumed by the
-// arp.rs listener in the next migration step; until that lands the
-// runtime entry points read as dead. The module is cross-platform
-// compilable (libloading + extern "system" types build everywhere; the
-// DLL only resolves at runtime on Windows) so the pure-layout unit
-// tests gate on both CI jobs.
-#[allow(dead_code)]
+// Cross-platform compilable (libloading + extern "system" types build
+// everywhere; PktMonApi.dll only resolves at runtime on Windows) so the
+// pure-layout unit tests gate on both CI jobs. The runtime capture path
+// is consumed by the arp.rs listener; the availability probe is called
+// only from the Windows startup block, so it reads as dead on Linux.
 pub mod pktmon;
 pub mod scanner;
 pub mod watcher;
@@ -220,7 +218,7 @@ impl NetworkManager {
             if let Some(emitter) = self.device_emitter.lock().await.clone() {
                 emitter.poke();
             }
-            if crate::is_npcap_available() {
+            if crate::is_discovery_available() {
                 let iface = self.interface_name.lock().await.clone().or_else(|| {
                     interface::list_physical().ok().and_then(|list| {
                         list.into_iter()

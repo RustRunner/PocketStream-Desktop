@@ -83,78 +83,48 @@ pub fn ensure_gstreamer() -> Result<(), AppError> {
     result.clone().map_err(AppError::Stream)
 }
 
-/// Whether Npcap was successfully loaded at startup.
-/// Checked before any pcap operations to avoid delay-load crashes.
-static NPCAP_AVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Whether the OS-native capture backend (PacketMonitor) is usable,
+/// established once at startup by the behavioral probe. There is no
+/// install path — the API is in-box on supported Windows or absent on
+/// builds below its floor.
+static DISCOVERY_AVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
-pub fn is_npcap_available() -> bool {
-    NPCAP_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
+pub fn is_discovery_available() -> bool {
+    DISCOVERY_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// If Npcap is missing and a bundled installer exists, offer to install it.
-/// Uses a Win32 MessageBox (no Tauri window needed — runs before app starts).
-/// Returns true if Npcap was installed successfully.
+/// Windows build number for diagnostics (the field-debug breadcrumb for
+/// the PacketMonitor floor question). Uses `RtlGetVersion` from ntdll —
+/// unlike `GetVersionEx` it isn't shimmed down by the app manifest.
+/// Returns 0 if it can't be read; this is a log value, never a gate.
 #[cfg(windows)]
-fn offer_npcap_install() -> bool {
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
-
-    let exe_dir = match std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-    {
-        Some(d) => d,
-        None => return false,
-    };
-
-    let installer = exe_dir
-        .join("resources")
-        .join("prerequisites")
-        .join("npcap-setup.exe");
-
-    if !installer.exists() {
-        log::info!("No bundled Npcap installer at {}", installer.display());
-        return false;
+fn os_build_number() -> u32 {
+    #[repr(C)]
+    struct OsVersionInfoW {
+        dw_os_version_info_size: u32,
+        dw_major_version: u32,
+        dw_minor_version: u32,
+        dw_build_number: u32,
+        dw_platform_id: u32,
+        sz_csd_version: [u16; 128],
     }
-
-    let title: Vec<u16> = OsStr::new("PocketStream Desktop")
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let msg: Vec<u16> = OsStr::new(
-        "Npcap is required for network device discovery.\n\n\
-         Would you like to install it now?\n\n\
-         (During install, check \"Install Npcap in WinPcap API-compatible Mode\")",
-    )
-    .encode_wide()
-    .chain(std::iter::once(0))
-    .collect();
-
-    // MB_YESNO (4) | MB_ICONQUESTION (0x20)
-    let result = unsafe {
-        windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
-            std::ptr::null_mut(),
-            msg.as_ptr(),
-            title.as_ptr(),
-            0x00000004 | 0x00000020,
-        )
-    };
-
-    if result != 6 {
-        // User chose No
-        return false;
-    }
-
-    log::info!("Launching bundled Npcap installer: {}", installer.display());
-    match std::process::Command::new(&installer).status() {
-        Ok(status) => {
-            log::info!("Npcap installer exited with: {}", status);
-            // Retry loading Npcap DLLs
-            setup_npcap()
-        }
-        Err(e) => {
-            log::warn!("Failed to launch Npcap installer: {}", e);
-            false
+    unsafe {
+        let Ok(ntdll) = libloading::Library::new("ntdll.dll") else {
+            return 0;
+        };
+        let rtl_get_version: libloading::Symbol<
+            unsafe extern "system" fn(*mut OsVersionInfoW) -> i32,
+        > = match ntdll.get(b"RtlGetVersion") {
+            Ok(s) => s,
+            Err(_) => return 0,
+        };
+        let mut info: OsVersionInfoW = std::mem::zeroed();
+        info.dw_os_version_info_size = std::mem::size_of::<OsVersionInfoW>() as u32;
+        if rtl_get_version(&mut info) == 0 {
+            info.dw_build_number
+        } else {
+            0
         }
     }
 }
@@ -246,57 +216,6 @@ fn setup_bundled_gstreamer() -> bool {
     }
 
     true
-}
-
-/// Pre-load Npcap DLLs. Returns true if Npcap was loaded successfully.
-#[cfg(windows)]
-fn setup_npcap() -> bool {
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
-
-    let npcap_dir = r"C:\Windows\System32\Npcap";
-    if !std::path::Path::new(npcap_dir).exists() {
-        log::warn!(
-            "Npcap not found at {}. ARP discovery will be unavailable.",
-            npcap_dir
-        );
-        return false;
-    }
-
-    // Set the DLL search directory so dependencies resolve
-    let dir_wide: Vec<u16> = OsStr::new(npcap_dir)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    unsafe {
-        windows_sys::Win32::System::LibraryLoader::SetDllDirectoryW(dir_wide.as_ptr());
-    }
-
-    let mut all_loaded = true;
-    // Load Packet.dll first (dependency of wpcap.dll)
-    for dll in &["Packet.dll", "wpcap.dll"] {
-        let path = format!(r"{}\{}", npcap_dir, dll);
-        let wide: Vec<u16> = OsStr::new(&path)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let handle =
-            unsafe { windows_sys::Win32::System::LibraryLoader::LoadLibraryW(wide.as_ptr()) };
-        if !handle.is_null() {
-            log::info!("Loaded Npcap {}", dll);
-        } else {
-            let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-            log::warn!("Failed to load Npcap {} (error {})", dll, err);
-            all_loaded = false;
-        }
-    }
-
-    // Reset DLL directory so it doesn't interfere with other DLL loading
-    unsafe {
-        windows_sys::Win32::System::LibraryLoader::SetDllDirectoryW(std::ptr::null());
-    }
-
-    all_loaded
 }
 
 /// Background task that polls the active Ethernet interface every 3 seconds
@@ -417,14 +336,21 @@ pub fn run() {
     // ── Prerequisites ────────────────────────────────────────────────
     #[cfg(windows)]
     {
-        let mut npcap_ok = setup_npcap();
-        if !npcap_ok {
-            // Offer to install from bundled installer (shows a system dialog)
-            npcap_ok = offer_npcap_install();
-        }
-        NPCAP_AVAILABLE.store(npcap_ok, std::sync::atomic::Ordering::Relaxed);
-        if !npcap_ok {
-            log::warn!("Npcap is not installed — network discovery features will be limited");
+        // Behavioral probe of the in-box PacketMonitor capture backend.
+        // No install path — it's present on supported Windows or the
+        // build is below its floor. The build number is logged as a
+        // field-debug breadcrumb for the floor question, never as the
+        // gate (the probe result is the gate).
+        let build = os_build_number();
+        match network::pktmon::probe() {
+            Ok(()) => {
+                DISCOVERY_AVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+                log::info!("Device discovery available (PacketMonitor); Windows build {build}");
+            }
+            Err(reason) => {
+                DISCOVERY_AVAILABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+                log::warn!("Device discovery unavailable on Windows build {build}: {reason}");
+            }
         }
 
         let bundled = setup_bundled_gstreamer();
@@ -571,7 +497,7 @@ pub fn run() {
                             // modes. Static-Manual is intentionally quiet:
                             // no ARP, no auto-adopt, no port scanner.
                             if mode != config::NetworkMode::StaticManual {
-                                if is_npcap_available() {
+                                if is_discovery_available() {
                                     let name = iface.name.clone();
                                     log::info!("Auto-starting ARP discovery on '{}'", name);
 
@@ -581,7 +507,9 @@ pub fn run() {
                                         log::warn!("Failed to auto-start ARP discovery: {}", e);
                                     }
                                 } else {
-                                    log::info!("Skipping ARP discovery (Npcap not installed)");
+                                    log::info!(
+                                        "Skipping ARP discovery (packet capture unavailable)"
+                                    );
                                 }
                             } else {
                                 log::info!(

@@ -246,6 +246,10 @@ fn wide(s: &str) -> Vec<u16> {
 /// HRESULT) for the log line; static facts like the Windows build
 /// number are the caller's to log as diagnostics — they are never the
 /// gate. Requires elevation, which the app always has.
+///
+/// Called only from the Windows startup path; on other targets it is
+/// unreferenced (the module still compiles so the layout tests run).
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn probe() -> Result<(), String> {
     let api = PktMonApi::load()?;
     unsafe {

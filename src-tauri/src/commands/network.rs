@@ -213,8 +213,10 @@ pub async fn start_arp_discovery(
     app: tauri::AppHandle,
     interface: String,
 ) -> Result<(), AppError> {
-    if !crate::is_npcap_available() {
-        return Err(AppError::NpcapMissing);
+    if !crate::is_discovery_available() {
+        return Err(AppError::DiscoveryUnavailable(
+            "Packet capture is not available on this Windows build".into(),
+        ));
     }
     manager.start_arp_discovery(&interface, app).await
 }

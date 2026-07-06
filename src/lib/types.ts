@@ -153,7 +153,7 @@ export interface RtspServerInfo {
 export interface TypedAppError {
   kind:
     | "Network"
-    | "NpcapMissing"
+    | "DiscoveryUnavailable"
     | "Stream"
     | "Config"
     | "Camera"

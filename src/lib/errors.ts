@@ -6,9 +6,9 @@
  * `${e}` would render that as "[object Object]" — every toast/log site
  * must funnel through `formatError(e)` to stay readable.
  *
- * `errorKind(e)` returns the discriminator for branching (e.g., to open
- * the Npcap install dialog when `kind === "NpcapMissing"`). Returns null
- * for legacy string errors or anything without a `kind` field.
+ * `errorKind(e)` returns the discriminator for branching (e.g., to react
+ * to `kind === "DiscoveryUnavailable"`). Returns null for legacy string
+ * errors or anything without a `kind` field.
  */
 
 import type { TypedAppError } from "./types.ts";
@@ -31,8 +31,8 @@ export function formatError(e: Caught): string {
 
 /** Discriminator from a typed AppError, or null if the value isn't one
  *  (legacy string error, native Error, etc.). Use this to branch on
- *  specific failure classes — e.g., open the install dialog when
- *  `errorKind(e) === "NpcapMissing"`. */
+ *  specific failure classes — e.g., react to
+ *  `errorKind(e) === "DiscoveryUnavailable"`. */
 export function errorKind(e: Caught): TypedAppError["kind"] | null {
   if (e && typeof e === "object" && "kind" in e) {
     const kind = (e as { kind: unknown }).kind;

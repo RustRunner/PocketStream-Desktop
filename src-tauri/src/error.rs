@@ -6,14 +6,14 @@ pub enum AppError {
     #[error("Network error: {0}")]
     Network(String),
 
-    /// Npcap is required for raw ARP capture but isn't installed. Carries
-    /// no message — the frontend recognizes the discriminator and surfaces
-    /// the install dialog directly. The Display impl provides a fallback
-    /// for plain logging.
-    #[error(
-        "Npcap is not installed -- ARP discovery requires Npcap (https://npcap.com/#download)"
-    )]
-    NpcapMissing,
+    /// The OS-native packet-capture backend (PacketMonitor) is not
+    /// usable on this machine — either the API is absent (Windows below
+    /// the PacketMonitor floor) or a live capture-start failure. Carries
+    /// the observed reason for logs and plain toast display; the
+    /// frontend branches on the `kind` discriminator. There is no
+    /// install path — the API ships in-box or it doesn't.
+    #[error("Device discovery unavailable: {0}")]
+    DiscoveryUnavailable(String),
 
     #[error("Stream error: {0}")]
     Stream(String),
@@ -37,7 +37,7 @@ impl AppError {
     pub fn kind(&self) -> &'static str {
         match self {
             AppError::Network(_) => "Network",
-            AppError::NpcapMissing => "NpcapMissing",
+            AppError::DiscoveryUnavailable(_) => "DiscoveryUnavailable",
             AppError::Stream(_) => "Stream",
             AppError::Config(_) => "Config",
             AppError::Camera(_) => "Camera",
@@ -49,7 +49,7 @@ impl AppError {
 
 /// Serialize as `{ "kind": "<variant>", "message": "<display>" }` so the
 /// frontend can both display a human-readable message AND branch on the
-/// discriminator (e.g., `if (err.kind === "NpcapMissing") openInstallDialog()`).
+/// discriminator (e.g., `if (err.kind === "DiscoveryUnavailable") ...`).
 /// All frontend toast/log sites should run errors through `formatError(e)`
 /// in `src/lib/errors.js` to survive both this object shape and any legacy
 /// string error that escapes the typed channel.
@@ -103,10 +103,10 @@ mod tests {
     }
 
     #[test]
-    fn display_npcap_missing() {
-        let err = AppError::NpcapMissing;
-        assert!(err.to_string().contains("Npcap"));
-        assert!(err.to_string().contains("npcap.com"));
+    fn display_discovery_unavailable() {
+        let err = AppError::DiscoveryUnavailable("PktMonApi.dll did not load".into());
+        assert!(err.to_string().contains("Device discovery unavailable"));
+        assert!(err.to_string().contains("PktMonApi.dll did not load"));
     }
 
     // ── Discriminator (kind) ────────────────────────────────────────
@@ -114,7 +114,10 @@ mod tests {
     #[test]
     fn kind_returns_stable_discriminators() {
         assert_eq!(AppError::Network("x".into()).kind(), "Network");
-        assert_eq!(AppError::NpcapMissing.kind(), "NpcapMissing");
+        assert_eq!(
+            AppError::DiscoveryUnavailable("x".into()).kind(),
+            "DiscoveryUnavailable"
+        );
         assert_eq!(AppError::Stream("x".into()).kind(), "Stream");
         assert_eq!(AppError::Config("x".into()).kind(), "Config");
         assert_eq!(AppError::Camera("x".into()).kind(), "Camera");
@@ -139,15 +142,15 @@ mod tests {
     }
 
     #[test]
-    fn serialize_npcap_missing_carries_install_url_in_message() {
-        let err = AppError::NpcapMissing;
+    fn serialize_discovery_unavailable_carries_reason_in_message() {
+        let err = AppError::DiscoveryUnavailable("HRESULT 0x80070005".into());
         let json = serde_json::to_value(&err).unwrap();
-        assert_eq!(json["kind"], "NpcapMissing");
+        assert_eq!(json["kind"], "DiscoveryUnavailable");
         // Message must remain useful for plain toast display even when
         // the frontend doesn't branch on the kind.
         let msg = json["message"].as_str().unwrap();
-        assert!(msg.contains("Npcap"));
-        assert!(msg.contains("npcap.com"));
+        assert!(msg.contains("Device discovery unavailable"));
+        assert!(msg.contains("HRESULT 0x80070005"));
     }
 
     #[test]
