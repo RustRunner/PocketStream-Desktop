@@ -1,11 +1,15 @@
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::net::Ipv4Addr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
 use tokio::sync::Mutex;
 
+use super::pktmon;
 use crate::error::AppError;
 use crate::network::device_registry::{DeviceListEmitter, DeviceRegistry};
 
@@ -28,18 +32,213 @@ impl ArpListenerHandle {
     }
 }
 
-/// Start raw pcap ARP listener on the specified Ethernet interface.
-/// Discovers all devices on the wire — both known and foreign subnets.
+/// Content-dedupe window: PktMon reports the same frame once per stack
+/// component it traverses (distinct `PktGroupId` each — the id does not
+/// group appearances), so one wire ARP arrives as several callbacks. The
+/// registry merge is idempotent regardless, so this LRU only saves
+/// spawn/lock traffic; it keys on frame content, never on component or
+/// appearance order.
+const DEDUPE_TTL: Duration = Duration::from_secs(2);
+const DEDUPE_CAP: usize = 256;
+
+struct DedupeLru {
+    seen: HashMap<(u16, [u8; 6], [u8; 4]), Instant>,
+}
+
+impl DedupeLru {
+    fn new() -> Self {
+        Self {
+            seen: HashMap::new(),
+        }
+    }
+
+    /// True if this (op, sender_mac, sender_ip) hasn't been seen within
+    /// the TTL. Records it and evicts expired entries.
+    fn admit(&mut self, op: u16, mac: [u8; 6], ip: [u8; 4], now: Instant) -> bool {
+        self.seen
+            .retain(|_, &mut t| now.duration_since(t) < DEDUPE_TTL);
+        let key = (op, mac, ip);
+        if self.seen.contains_key(&key) {
+            return false;
+        }
+        // ARP volume under the EtherType constraint is tiny; a hard cap
+        // is a runaway backstop, not a working-set limit.
+        if self.seen.len() >= DEDUPE_CAP {
+            self.seen.clear();
+        }
+        self.seen.insert(key, now);
+        true
+    }
+}
+
+/// Everything the C data callback needs. Reached through the stream's
+/// `user_context` pointer; lives (in an `Arc`) on the listener's
+/// spawn_blocking thread for the whole session, so the pointer stays
+/// valid until after `SetSessionActive(FALSE)` — no callback fires
+/// afterward.
+struct CallbackContext {
+    own_mac: Option<[u8; 6]>,
+    dedupe: StdMutex<DedupeLru>,
+    runtime: tokio::runtime::Handle,
+    devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
+    registry: Arc<DeviceRegistry>,
+    emitter: Arc<DeviceListEmitter>,
+    app_handle: tauri::AppHandle,
+    /// One-shot latches so the diagnostics don't spam per packet.
+    missed_logged: AtomicBool,
+    canary_logged: AtomicBool,
+}
+
+/// No-op event callback. The realtime stream signals lifecycle events
+/// here; none need handling, but the spike ran with a non-null callback,
+/// so keep one rather than passing null.
+unsafe extern "system" fn event_cb(_ctx: *mut c_void, _info: *const c_void, _kind: u32) {}
+
+/// Per-packet data callback. Runs on the API's stream thread — kept
+/// minimal (parse + dedupe + marshal); no registry work here. A slow
+/// callback drops packets, surfaced by the missed-packet counters.
+unsafe extern "system" fn data_cb(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor) {
+    if ctx.is_null() || d.is_null() {
+        return;
+    }
+    let ctx = &*(ctx as *const CallbackContext);
+    let desc = *d;
+    if desc.data.is_null() {
+        return;
+    }
+    let blob = std::slice::from_raw_parts(desc.data, desc.data_size as usize);
+
+    if (desc.missed_packet_write_count > 0 || desc.missed_packet_read_count > 0)
+        && !ctx.missed_logged.swap(true, Ordering::Relaxed)
+    {
+        log::warn!(
+            "PktMon ring reported drops (write={}, read={}) — capture callback may be too slow",
+            desc.missed_packet_write_count,
+            desc.missed_packet_read_count
+        );
+    }
+
+    // Metadata is only needed for the PacketType==7 fallback framing and
+    // the layout canary; capture works without it (default to Ethernet II).
+    let meta = pktmon::read_metadata(blob, desc.metadata_offset as usize);
+    if let Some(m) = &meta {
+        if !pktmon::metadata_plausible(m) && !ctx.canary_logged.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "PktMon metadata out of documented range — the pinned layout may have changed on this Windows build"
+            );
+        }
+    }
+    let packet_type = meta.map(|m| m.packet_type).unwrap_or(0);
+
+    let po = desc.packet_offset as usize;
+    let pl = desc.packet_length as usize;
+    if pl == 0 || blob.len() < po + pl {
+        return;
+    }
+    let frame = &blob[po..po + pl];
+
+    let Some((op, mac, ip)) = extract_arp(frame, packet_type) else {
+        return;
+    };
+    if ip == Ipv4Addr::new(0, 0, 0, 0) {
+        return;
+    }
+    // Skip our own gratuitous ARP (emitted when we add a secondary IP);
+    // otherwise it lands as a phantom peer that gets scanned against our
+    // own IP and cached as a ghost node.
+    if let Some(own) = ctx.own_mac {
+        if mac == own {
+            return;
+        }
+    }
+
+    if let Ok(mut lru) = ctx.dedupe.lock() {
+        if !lru.admit(op, mac, ip.octets(), Instant::now()) {
+            return;
+        }
+    }
+
+    // Marshal onto the tokio runtime — the merge/emit tail is async
+    // (tokio Mutex, registry, cache I/O) and must not run here.
+    let devices = ctx.devices.clone();
+    let registry = ctx.registry.clone();
+    let emitter = ctx.emitter.clone();
+    let app_handle = ctx.app_handle.clone();
+    ctx.runtime.spawn(async move {
+        on_arp_seen(ip, mac, devices, registry, emitter, app_handle).await;
+    });
+}
+
+/// Merge one observed (ip, mac) into the legacy map and the canonical
+/// registry, mirror same-IP cache evictions, and emit on first sight.
+/// Extracted from the old listener loop unchanged so swapping the
+/// capture backend doesn't disturb it.
+async fn on_arp_seen(
+    ip: Ipv4Addr,
+    mac: [u8; 6],
+    devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
+    registry: Arc<DeviceRegistry>,
+    emitter: Arc<DeviceListEmitter>,
+    app_handle: tauri::AppHandle,
+) {
+    let ip_str = ip.to_string();
+    let mac_str = format_mac(&mac);
+    let octets = ip.octets();
+    let subnet = format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]);
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let device = ArpDevice {
+        mac: mac_str.clone(),
+        ip: ip_str.clone(),
+        subnet,
+        first_seen: now.clone(),
+        last_seen: now,
+    };
+
+    let mut map = devices.lock().await;
+    let is_new = !map.contains_key(&mac_str);
+
+    let entry = map.entry(mac_str.clone()).or_insert(device.clone());
+    entry.last_seen = device.last_seen.clone();
+    entry.ip = device.ip.clone();
+
+    // Mirror into the canonical DeviceRegistry. The legacy `devices` map
+    // above is still mutated because the auto-adopt loop iterates over
+    // it; can be retired once auto-adopt switches to the registry too.
+    let result = registry.merge_arp(&device);
+    if result.changed {
+        emitter.poke();
+    }
+    if !result.dropped_macs.is_empty() {
+        let cfg: tauri::State<'_, crate::config::AppConfig> = app_handle.state();
+        for dropped in &result.dropped_macs {
+            if let Err(e) = cfg.remove_cached_device(dropped) {
+                log::warn!(
+                    "Failed to evict dupe cache row {} (same IP as {}): {}",
+                    dropped,
+                    device.mac,
+                    e
+                );
+            }
+        }
+    }
+
+    if is_new {
+        log::info!("ARP: {} ({})", entry.ip, entry.mac);
+        let _ = app_handle.emit("arp-device-discovered", &device);
+    }
+}
+
+/// Start the PacketMonitor ARP listener. Signature preserved from the
+/// pcap backend so `mod.rs` callers don't change.
 ///
-/// `ethernet_ips` — IPv4 addresses assigned to the target Ethernet adapter.
-/// Used to match the correct pcap capture device (avoids picking WiFi).
+/// `ethernet_ips` — the target adapter's IPv4 addresses. No longer used
+/// to select a capture device (PacketMonitor captures unscoped, with the
+/// in-driver EtherType constraint doing the filtering), kept for the
+/// startup log and signature stability.
 ///
-/// `own_mac` — the target adapter's own MAC. ARP packets with this as the
-/// sender MAC are skipped, otherwise the gratuitous ARP we emit whenever
-/// we add a secondary IP gets captured and inserted into `devices` as if
-/// it were a peer. That phantom entry then gets port-scanned against our
-/// own IP, hits any local service listening on 0.0.0.0, and ends up in
-/// the persistent device cache as a ghost "node".
+/// `own_mac` — the target adapter's own MAC; ARP frames sent by it are
+/// skipped (see [`on_arp_seen`]'s phantom-peer note).
 pub fn start_listener(
     devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
     registry: Arc<DeviceRegistry>,
@@ -48,174 +247,64 @@ pub fn start_listener(
     ethernet_ips: Vec<Ipv4Addr>,
     own_mac: Option<[u8; 6]>,
 ) -> Result<ArpListenerHandle, AppError> {
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let runtime = tokio::runtime::Handle::current();
 
     log::info!(
-        "Starting pcap ARP listener (target IPs: {:?})",
+        "Starting PacketMonitor ARP listener (adapter IPs: {:?})",
         ethernet_ips
     );
 
     tokio::task::spawn_blocking(move || {
-        let pcap_devices = match pcap::Device::list() {
-            Ok(devs) => devs,
+        let ctx = Arc::new(CallbackContext {
+            own_mac,
+            dedupe: StdMutex::new(DedupeLru::new()),
+            runtime: runtime.clone(),
+            devices,
+            registry,
+            emitter,
+            app_handle,
+            missed_logged: AtomicBool::new(false),
+            canary_logged: AtomicBool::new(false),
+        });
+
+        let config = pktmon::RealtimeStreamConfiguration {
+            user_context: Arc::as_ptr(&ctx) as *mut c_void,
+            event_callback: Some(event_cb),
+            data_callback: Some(data_cb),
+            buffer_size_multiplier: 4,
+            truncation_size: 128,
+        };
+
+        let session = match pktmon::CaptureSession::start("PocketStreamArpCapture", config) {
+            Ok(s) => s,
             Err(e) => {
-                log::warn!("pcap: failed to list devices: {}", e);
+                log::warn!("PacketMonitor: capture start failed: {}", e);
                 return;
             }
         };
+        log::info!("PacketMonitor: ARP capture active");
 
-        log::info!("pcap: found {} capture devices", pcap_devices.len());
-
-        // Log all pcap devices for diagnostics
-        for d in &pcap_devices {
-            let addrs: Vec<String> = d.addresses.iter().map(|a| a.addr.to_string()).collect();
-            log::debug!("pcap: device '{}' addrs={:?}", d.name, addrs);
+        // Block this thread until the shutdown flip. `changed()` is
+        // async; run it on the captured handle (this is a blocking-pool
+        // thread, so block_on is allowed). The ctx Arc stays alive here,
+        // keeping the user_context pointer valid for every callback.
+        if !*shutdown_rx.borrow() {
+            runtime.block_on(async {
+                let _ = shutdown_rx.changed().await;
+            });
         }
-
-        // Match the pcap device that has one of the target Ethernet IPs.
-        // This ensures we capture on the Ethernet adapter, not WiFi.
-        let target_addrs: Vec<std::net::IpAddr> = ethernet_ips
-            .iter()
-            .map(|ip| std::net::IpAddr::V4(*ip))
-            .collect();
-
-        let pcap_dev = pcap_devices
-            .into_iter()
-            .find(|d| d.addresses.iter().any(|a| target_addrs.contains(&a.addr)));
-
-        let pcap_dev = match pcap_dev {
-            Some(d) => {
-                log::info!("pcap: using device '{}'", d.name);
-                d
-            }
-            None => {
-                log::warn!("pcap: no device matched Ethernet IPs {:?}", ethernet_ips);
-                return;
-            }
-        };
-
-        let mut cap = match pcap::Capture::from_device(pcap_dev)
-            .map_err(|e| format!("{}", e))
-            .and_then(|c| {
-                // Non-promiscuous: ARP requests are broadcast (so we
-                // see every host that asks for a MAC), and ARP replies
-                // to our own ping sweep come back unicast to us. We
-                // lose visibility into ARP exchanges between *other*
-                // hosts, which is acceptable — passive devices on the
-                // subnet are still discovered via the ping sweep + OS
-                // ARP cache merge in `mod.rs`. Promiscuous mode is a
-                // known stress vector on USB Ethernet drivers (notably
-                // the ASIX AX88179) and offers no functional benefit
-                // for the BPF-filtered ARP-only capture.
-                c.promisc(false)
-                    .timeout(500)
-                    .snaplen(64)
-                    .open()
-                    .map_err(|e| format!("{}", e))
-            }) {
-            Ok(c) => c,
-            Err(e) => {
-                log::warn!("pcap: failed to open capture: {}", e);
-                return;
-            }
-        };
-
-        if let Err(e) = cap.filter("arp", true) {
-            log::warn!("pcap: failed to set BPF filter: {}", e);
-            return;
-        }
-
-        log::info!("pcap: ARP capture started");
-
-        loop {
-            if *shutdown_rx.borrow() {
-                log::info!("pcap: shutting down");
-                break;
-            }
-
-            match cap.next_packet() {
-                Ok(packet) => {
-                    if let Some((ip, mac)) = parse_arp_packet(packet.data) {
-                        if ip == Ipv4Addr::new(0, 0, 0, 0) {
-                            continue;
-                        }
-                        // Skip our own announcements — see note on `own_mac`.
-                        if let Some(own) = own_mac {
-                            if mac == own {
-                                continue;
-                            }
-                        }
-
-                        let ip_str = ip.to_string();
-                        let mac_str = format_mac(&mac);
-
-                        let devices = devices.clone();
-                        let registry = registry.clone();
-                        let emitter = emitter.clone();
-                        let app_handle = app_handle.clone();
-                        tokio::spawn(async move {
-                            let octets = ip.octets();
-                            let subnet = format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]);
-                            let now = chrono::Utc::now().to_rfc3339();
-
-                            let device = ArpDevice {
-                                mac: mac_str.clone(),
-                                ip: ip_str.clone(),
-                                subnet,
-                                first_seen: now.clone(),
-                                last_seen: now,
-                            };
-
-                            let mut map = devices.lock().await;
-                            let is_new = !map.contains_key(&mac_str);
-
-                            let entry = map.entry(mac_str.clone()).or_insert(device.clone());
-                            entry.last_seen = device.last_seen.clone();
-                            entry.ip = device.ip.clone();
-
-                            // Mirror into the canonical DeviceRegistry. The
-                            // legacy `devices` map above is still mutated
-                            // because the auto-adopt loop iterates over it;
-                            // can be retired once auto-adopt switches to
-                            // the registry too.
-                            let result = registry.merge_arp(&device);
-                            if result.changed {
-                                emitter.poke();
-                            }
-                            if !result.dropped_macs.is_empty() {
-                                let cfg: tauri::State<'_, crate::config::AppConfig> =
-                                    app_handle.state();
-                                for dropped in &result.dropped_macs {
-                                    if let Err(e) = cfg.remove_cached_device(dropped) {
-                                        log::warn!(
-                                            "Failed to evict dupe cache row {} (same IP as {}): {}",
-                                            dropped,
-                                            device.mac,
-                                            e
-                                        );
-                                    }
-                                }
-                            }
-
-                            if is_new {
-                                log::info!("ARP: {} ({})", entry.ip, entry.mac);
-                                let _ = app_handle.emit("arp-device-discovered", &device);
-                            }
-                        });
-                    }
-                }
-                Err(pcap::Error::TimeoutExpired) => continue,
-                Err(e) => {
-                    log::debug!("pcap: read error: {}", e);
-                    continue;
-                }
-            }
-        }
+        log::info!("PacketMonitor: shutting down capture");
+        session.stop();
+        drop(ctx);
     });
 
     Ok(ArpListenerHandle { shutdown_tx })
 }
 
+/// Parse a full Ethernet II frame carrying an ARP payload into
+/// `(sender_ip, sender_mac)`. Byte-level contract unchanged from the
+/// pcap era — the capture backend feeds it the same 42-byte frames.
 fn parse_arp_packet(data: &[u8]) -> Option<(Ipv4Addr, [u8; 6])> {
     if data.len() < 42 {
         return None;
@@ -224,7 +313,17 @@ fn parse_arp_packet(data: &[u8]) -> Option<(Ipv4Addr, [u8; 6])> {
     if ethertype != 0x0806 {
         return None;
     }
-    let arp = &data[14..];
+    let (_, mac, ip) = parse_arp_header(&data[14..])?;
+    Some((ip, mac))
+}
+
+/// Validate a 28-byte ARP header (Ethernet/IPv4 only) and return
+/// `(opcode, sender_mac, sender_ip)`. Shared by the Ethernet II framing
+/// and the PacketType==7 direct-ARP fallback.
+fn parse_arp_header(arp: &[u8]) -> Option<(u16, [u8; 6], Ipv4Addr)> {
+    if arp.len() < 28 {
+        return None;
+    }
     if u16::from_be_bytes([arp[0], arp[1]]) != 1
         || u16::from_be_bytes([arp[2], arp[3]]) != 0x0800
         || arp[4] != 6
@@ -232,13 +331,32 @@ fn parse_arp_packet(data: &[u8]) -> Option<(Ipv4Addr, [u8; 6])> {
     {
         return None;
     }
+    let op = u16::from_be_bytes([arp[6], arp[7]]);
     let mut mac = [0u8; 6];
     mac.copy_from_slice(&arp[8..14]);
     let ip = Ipv4Addr::new(arp[14], arp[15], arp[16], arp[17]);
     if mac == [0xff; 6] {
         return None;
     }
-    Some((ip, mac))
+    Some((op, mac, ip))
+}
+
+/// Extract `(opcode, sender_mac, sender_ip)` from a captured frame.
+/// PacketMonitor delivers Ethernet II framing in practice (the observed
+/// S4 case); the `PacketType == 7` direct-ARP path is defensive — never
+/// observed, but documented as possible.
+fn extract_arp(frame: &[u8], packet_type: u16) -> Option<(u16, [u8; 6], Ipv4Addr)> {
+    if frame.len() >= 42 && frame[12] == 0x08 && frame[13] == 0x06 {
+        // Full validation via the documented Ethernet II parser; the
+        // opcode sits at ARP-header offset 6 (frame offset 20).
+        let (ip, mac) = parse_arp_packet(frame)?;
+        let op = u16::from_be_bytes([frame[20], frame[21]]);
+        return Some((op, mac, ip));
+    }
+    if packet_type == 7 && frame.len() >= 28 {
+        return parse_arp_header(frame);
+    }
+    None
 }
 
 fn format_mac(mac: &[u8; 6]) -> String {
@@ -486,6 +604,94 @@ mod tests {
         pkt.extend_from_slice(&[0u8; 100]); // trailing data (padding)
         let (ip, _) = parse_arp_packet(&pkt).unwrap();
         assert_eq!(ip, Ipv4Addr::new(192, 168, 0, 1));
+    }
+
+    // ── extract_arp / parse_arp_header (capture-backend feed) ───────
+
+    /// Real S4-captured ARP request frame (Ethernet II, 42 bytes):
+    /// gateway 192.168.12.1 asking, laptop AC-45-EF-38-F9-F5 sender.
+    const S4_REQUEST: [u8; 42] = [
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xAC, 0x45, 0xEF, 0x38, 0xF9, 0xF5, 0x08, 0x06, 0x00,
+        0x01, 0x08, 0x00, 0x06, 0x04, 0x00, 0x01, 0xAC, 0x45, 0xEF, 0x38, 0xF9, 0xF5, 0xC0, 0xA8,
+        0x0C, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0xA8, 0x0C, 0x01,
+    ];
+
+    /// Real S4-captured ARP reply frame (Ethernet II, 42 bytes):
+    /// gateway 192.168.12.1 / 64-67-72-20-06-A3 replying.
+    const S4_REPLY: [u8; 42] = [
+        0xAC, 0x45, 0xEF, 0x38, 0xF9, 0xF5, 0x64, 0x67, 0x72, 0x20, 0x06, 0xA3, 0x08, 0x06, 0x00,
+        0x01, 0x08, 0x00, 0x06, 0x04, 0x00, 0x02, 0x64, 0x67, 0x72, 0x20, 0x06, 0xA3, 0xC0, 0xA8,
+        0x0C, 0x01, 0xAC, 0x45, 0xEF, 0x38, 0xF9, 0xF5, 0xC0, 0xA8, 0x0C, 0x40,
+    ];
+
+    #[test]
+    fn extract_arp_from_real_request_frame() {
+        let (op, mac, ip) = extract_arp(&S4_REQUEST, 1).unwrap();
+        assert_eq!(op, 1); // request
+        assert_eq!(mac, [0xAC, 0x45, 0xEF, 0x38, 0xF9, 0xF5]);
+        assert_eq!(ip, Ipv4Addr::new(192, 168, 12, 64));
+    }
+
+    #[test]
+    fn extract_arp_from_real_reply_frame() {
+        let (op, mac, ip) = extract_arp(&S4_REPLY, 1).unwrap();
+        assert_eq!(op, 2); // reply
+        assert_eq!(mac, [0x64, 0x67, 0x72, 0x20, 0x06, 0xA3]);
+        assert_eq!(ip, Ipv4Addr::new(192, 168, 12, 1));
+    }
+
+    #[test]
+    fn extract_arp_accepts_direct_header_when_packet_type_7() {
+        // PacketType==7 payload starts at the ARP header (no Ethernet II
+        // prefix). Defensive path — never observed in S4.
+        let direct = &S4_REQUEST[14..];
+        assert_eq!(direct.len(), 28);
+        let (op, mac, ip) = extract_arp(direct, 7).unwrap();
+        assert_eq!(op, 1);
+        assert_eq!(mac, [0xAC, 0x45, 0xEF, 0x38, 0xF9, 0xF5]);
+        assert_eq!(ip, Ipv4Addr::new(192, 168, 12, 64));
+    }
+
+    #[test]
+    fn extract_arp_rejects_bare_header_without_type_7() {
+        // Same 28-byte header but packet_type=1 (Ethernet II expected):
+        // no 0x0806 at offset 12, so it must not parse.
+        let direct = &S4_REQUEST[14..];
+        assert!(extract_arp(direct, 1).is_none());
+    }
+
+    #[test]
+    fn extract_arp_rejects_non_arp_frame() {
+        let mut frame = S4_REQUEST;
+        frame[12] = 0x08;
+        frame[13] = 0x00; // IPv4, not ARP
+        assert!(extract_arp(&frame, 1).is_none());
+    }
+
+    // ── DedupeLru ───────────────────────────────────────────────────
+
+    #[test]
+    fn dedupe_suppresses_repeat_within_ttl() {
+        let mut lru = DedupeLru::new();
+        let t0 = Instant::now();
+        let mac = [0xAC, 0x45, 0xEF, 0x38, 0xF9, 0xF5];
+        let ip = [192, 168, 12, 64];
+        assert!(lru.admit(1, mac, ip, t0));
+        // Same content again immediately — suppressed.
+        assert!(!lru.admit(1, mac, ip, t0));
+        // Different opcode is a different key.
+        assert!(lru.admit(2, mac, ip, t0));
+    }
+
+    #[test]
+    fn dedupe_readmits_after_ttl() {
+        let mut lru = DedupeLru::new();
+        let t0 = Instant::now();
+        let mac = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+        let ip = [10, 0, 0, 5];
+        assert!(lru.admit(1, mac, ip, t0));
+        let later = t0 + DEDUPE_TTL + Duration::from_millis(1);
+        assert!(lru.admit(1, mac, ip, later));
     }
 
     // ── format_mac ──────────────────────────────────────────────────
