@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -24,6 +24,28 @@ pub struct ArpDevice {
 
 pub struct ArpListenerHandle {
     shutdown_tx: tokio::sync::watch::Sender<bool>,
+}
+
+/// Monotonic count of ARP frames the capture backend has delivered and
+/// parsed (incremented in [`on_arp_seen`], which only the capture
+/// callback reaches — the OS ARP-table merge does not touch it). The
+/// quiet-network watchdog compares this against a per-session baseline
+/// to tell "capture is delivering payload events" from silence.
+static ARP_FRAMES_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// Largest missed-packet count the ring has reported in any callback —
+/// a nonzero value means the callback fell behind at least once. Surfaced
+/// in the degraded-discovery diagnostic; never resets (worst-seen).
+static ARP_MISSED_MAX: AtomicU64 = AtomicU64::new(0);
+
+/// Total ARP frames parsed by the capture backend so far this process.
+pub fn frames_seen() -> u64 {
+    ARP_FRAMES_SEEN.load(Ordering::Relaxed)
+}
+
+/// Worst missed-packet count the capture ring has reported.
+pub fn missed_max() -> u64 {
+    ARP_MISSED_MAX.load(Ordering::Relaxed)
 }
 
 impl ArpListenerHandle {
@@ -108,14 +130,18 @@ unsafe extern "system" fn data_cb(ctx: *mut c_void, d: *const pktmon::StreamData
     }
     let blob = std::slice::from_raw_parts(desc.data, desc.data_size as usize);
 
-    if (desc.missed_packet_write_count > 0 || desc.missed_packet_read_count > 0)
-        && !ctx.missed_logged.swap(true, Ordering::Relaxed)
-    {
-        log::warn!(
-            "PktMon ring reported drops (write={}, read={}) — capture callback may be too slow",
-            desc.missed_packet_write_count,
-            desc.missed_packet_read_count
-        );
+    let missed = desc
+        .missed_packet_write_count
+        .max(desc.missed_packet_read_count);
+    if missed > 0 {
+        ARP_MISSED_MAX.fetch_max(missed as u64, Ordering::Relaxed);
+        if !ctx.missed_logged.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "PktMon ring reported drops (write={}, read={}) — capture callback may be too slow",
+                desc.missed_packet_write_count,
+                desc.missed_packet_read_count
+            );
+        }
     }
 
     // Metadata is only needed for the PacketType==7 fallback framing and
@@ -181,6 +207,9 @@ async fn on_arp_seen(
     emitter: Arc<DeviceListEmitter>,
     app_handle: tauri::AppHandle,
 ) {
+    // Payload-event liveness signal for the quiet-network watchdog.
+    ARP_FRAMES_SEEN.fetch_add(1, Ordering::Relaxed);
+
     let ip_str = ip.to_string();
     let mac_str = format_mac(&mac);
     let octets = ip.octets();

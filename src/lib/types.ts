@@ -204,3 +204,17 @@ export interface DevicePingResultPayload {
   ip: string;
   reachable: boolean;
 }
+
+/** Payload for the `discovery-degraded` event: the capture backend
+ *  delivered no ARP payload events within the window after the provoking
+ *  ping sweep. Diagnostic only — availability is never flipped on this. */
+export interface DiscoveryDegradedPayload {
+  /** Machine-readable cause; currently always "no-payload-events". */
+  reason: string;
+  /** Worst missed-packet count the capture ring reported (0 = none). */
+  missed_packets: number;
+}
+
+/** The `discovery-recovered` event (empty payload) fires once after a
+ *  `discovery-degraded` when the first ARP frame finally parses. */
+export type DiscoveryRecoveredPayload = Record<string, never>;

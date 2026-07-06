@@ -18,7 +18,7 @@
  */
 
 import * as api from "./tauri-api.ts";
-import { $, state, log, escapeHtml, adoptedSubnets } from "./state.ts";
+import { $, state, log, showToast, escapeHtml, adoptedSubnets } from "./state.ts";
 import { renderSubnetList, isInterfaceConnected } from "./network.ts";
 import {
   clearScannedIps,
@@ -34,6 +34,8 @@ import type {
   ArpDevicePayload,
   DevicePingResultPayload,
   DeviceRecord,
+  DiscoveryDegradedPayload,
+  DiscoveryRecoveredPayload,
   SubnetAdoptedPayload,
 } from "./types.ts";
 
@@ -234,6 +236,21 @@ export function setupArpListeners(): void {
     if (prev !== data.reachable) {
       renderArpDeviceList();
     }
+  });
+
+  // Quiet-network watchdog signals. Diagnostic only — the backend never
+  // flips discovery availability on silence, so this is a heads-up that a
+  // provoked ping sweep drew no ARP frames (dead subnet, or capture not
+  // delivering). At most one degraded toast per discovery session.
+  api.onEvent<DiscoveryDegradedPayload>("discovery-degraded", (data) => {
+    const drops =
+      data.missed_packets > 0 ? ` (ring drops: ${data.missed_packets})` : "";
+    log(`Discovery degraded: ${data.reason}${drops}`);
+    showToast("No devices responding to discovery yet", true);
+  });
+
+  api.onEvent<DiscoveryRecoveredPayload>("discovery-recovered", () => {
+    log("Discovery recovered — devices responding again");
   });
 
   api.onEvent<SubnetAdoptedPayload>("subnet-adopted", (data) => {

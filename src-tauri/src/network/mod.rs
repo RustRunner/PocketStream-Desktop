@@ -59,6 +59,10 @@ pub struct NetworkManager {
     arp_listener_handle: Arc<Mutex<Option<arp::ArpListenerHandle>>>,
     auto_adopt_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     auto_adopt_enabled: Arc<Mutex<bool>>,
+    /// Quiet-network watchdog: emits `discovery-degraded` if the capture
+    /// backend delivers no ARP payload events shortly after the provoking
+    /// ping sweep, then `discovery-recovered` on the first frame.
+    discovery_watchdog_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     interface_name: Arc<Mutex<Option<String>>>,
     /// Canonical store of merged device records (ARP + scan + cache +
     /// alias + status). Mutated alongside `arp_devices` during the
@@ -84,6 +88,7 @@ impl NetworkManager {
             arp_listener_handle: Arc::new(Mutex::new(None)),
             auto_adopt_handle: Arc::new(Mutex::new(None)),
             auto_adopt_enabled: Arc::new(Mutex::new(true)),
+            discovery_watchdog_handle: Arc::new(Mutex::new(None)),
             interface_name: Arc::new(Mutex::new(None)),
             device_registry: Arc::new(DeviceRegistry::new()),
             device_emitter: Arc::new(Mutex::new(None)),
@@ -549,6 +554,56 @@ impl NetworkManager {
             }
         });
 
+        // Quiet-network watchdog. The ping sweep above provokes ARP; if
+        // the capture backend delivers no parsed frames within the window
+        // after it, discovery is degraded (e.g. a layout/floor issue where
+        // the session starts but no payload arrives). This is a diagnostic
+        // only — it never flips availability, and emits at most one
+        // degraded per session, cleared by a recovered on the first frame.
+        let watchdog_app = app_handle_for_adopt.clone();
+        let watchdog = tokio::spawn(async move {
+            use tauri::Emitter;
+            // Longer than the 500 ms sweep-start delay plus the sweep
+            // itself, so a healthy backend has time to deliver frames.
+            const INITIAL_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+            const POLL: std::time::Duration = std::time::Duration::from_secs(2);
+            const MAX_WATCH: std::time::Duration = std::time::Duration::from_secs(300);
+
+            let baseline = arp::frames_seen();
+            tokio::time::sleep(INITIAL_WINDOW).await;
+            if arp::frames_seen() > baseline {
+                return; // capture is delivering — healthy, no event
+            }
+
+            let missed = arp::missed_max();
+            log::warn!(
+                "Discovery degraded: no ARP payload events within {}s of the ping sweep (missed_max={})",
+                INITIAL_WINDOW.as_secs(),
+                missed
+            );
+            let _ = watchdog_app.emit(
+                "discovery-degraded",
+                serde_json::json!({
+                    "reason": "no-payload-events",
+                    "missed_packets": missed,
+                }),
+            );
+
+            // Watch for the first frame (bounded — don't linger forever on
+            // a genuinely dead backend; the single degraded warning stands).
+            let mut waited = std::time::Duration::ZERO;
+            while waited < MAX_WATCH {
+                tokio::time::sleep(POLL).await;
+                waited += POLL;
+                if arp::frames_seen() > baseline {
+                    log::info!("Discovery recovered: ARP payload events resumed");
+                    let _ = watchdog_app.emit("discovery-recovered", serde_json::json!({}));
+                    return;
+                }
+            }
+        });
+        *self.discovery_watchdog_handle.lock().await = Some(watchdog);
+
         // Auto-adopt handler for foreign subnets
         let devices_for_adopt = devices.clone();
         let registry_for_adopt = registry.clone();
@@ -755,6 +810,9 @@ impl NetworkManager {
         if let Some(h) = self.auto_adopt_handle.lock().await.take() {
             h.abort();
             log::info!("Auto-adopt task cancelled");
+        }
+        if let Some(h) = self.discovery_watchdog_handle.lock().await.take() {
+            h.abort();
         }
         if let Some(h) = self.arp_listener_handle.lock().await.take() {
             h.stop();
