@@ -17,6 +17,7 @@ pub mod watcher;
 
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -77,6 +78,18 @@ pub struct NetworkManager {
     /// by `start_ping_dot`, stopped on shutdown. Mode-independent: the
     /// pinger watches whatever the registry contains.
     ping_dot_handle: Arc<Mutex<Option<ping_dot::PingDotHandle>>>,
+    /// Serializes the discovery lifecycle (start / stop / mode change /
+    /// startup restore) so concurrent entry can't overwrite — and thereby
+    /// orphan — the auto-adopt task handle. Non-reentrant: internal callers
+    /// use the `*_locked` variants.
+    discovery_op: Arc<Mutex<()>>,
+    /// Advanced on every discovery start. Captured by sweeps and the
+    /// capture listener so stale-session work fences itself out.
+    discovery_generation: Arc<AtomicU64>,
+    /// True while a discovery session is live; cleared by every stop. The
+    /// generation only advances on start, so this flag is what lets a stop
+    /// with no restart (Static Auto → Manual) still drop stragglers.
+    discovery_active: Arc<AtomicBool>,
 }
 
 impl NetworkManager {
@@ -93,6 +106,9 @@ impl NetworkManager {
             device_registry: Arc::new(DeviceRegistry::new()),
             device_emitter: Arc::new(Mutex::new(None)),
             ping_dot_handle: Arc::new(Mutex::new(None)),
+            discovery_op: Arc::new(Mutex::new(())),
+            discovery_generation: Arc::new(AtomicU64::new(0)),
+            discovery_active: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -182,6 +198,10 @@ impl NetworkManager {
         }
         log::info!("Mode change: {:?} → {:?}", old_mode, new_mode);
 
+        // Serialize against start/stop so a mode-change teardown/restart
+        // can't interleave with a concurrent discovery start.
+        let _op = self.discovery_op.lock().await;
+
         if new_mode == NetworkMode::StaticManual {
             // Going INTO Manual: merge everything the Nodes panel is
             // currently showing (real-MAC entries with at least one
@@ -212,7 +232,7 @@ impl NetworkManager {
                     log::warn!("Failed to auto-pin discovered device: {}", e);
                 }
             }
-            self.stop_arp_discovery().await;
+            self.stop_locked().await;
             self.device_registry.clear();
             self.hydrate_manual_nodes(config).await;
         } else if old_mode == NetworkMode::StaticManual {
@@ -234,7 +254,10 @@ impl NetworkManager {
                     }),
                 };
                 if let Some(name) = iface {
-                    if let Err(e) = self.start_arp_discovery(&name, app_handle.clone()).await {
+                    if let Err(e) = self
+                        .start_arp_discovery_locked(&name, app_handle.clone())
+                        .await
+                    {
                         log::warn!("Failed to start ARP after mode change: {}", e);
                     }
                 }
@@ -306,6 +329,11 @@ impl NetworkManager {
         if settings.adopted_subnets.is_empty() {
             return;
         }
+
+        // Serialize against discovery start/stop: a watcher-driven start
+        // must not spawn the auto-adopt loop while we're mid-restore (both
+        // mutate adopted_ips and bind secondary IPs), and vice versa.
+        let _op = self.discovery_op.lock().await;
 
         // Get the active ethernet interface
         let iface = match interface::list_physical().await {
@@ -475,12 +503,37 @@ impl NetworkManager {
 
     /// Start ARP discovery (PacketMonitor capture) on the Ethernet
     /// interface. Also spawns auto-adopt handler for foreign subnets.
+    ///
+    /// Public entry point: serializes the discovery lifecycle on the op
+    /// lock so it cannot interleave with a concurrent stop / mode change /
+    /// startup restore (which would orphan the auto-adopt loop).
     pub async fn start_arp_discovery(
         &self,
         interface_display_name: &str,
         app_handle: tauri::AppHandle,
     ) -> Result<(), AppError> {
-        self.stop_arp_discovery().await;
+        let _op = self.discovery_op.lock().await;
+        self.start_arp_discovery_locked(interface_display_name, app_handle)
+            .await
+    }
+
+    /// Start body, run with the discovery op lock already held. Callers
+    /// that already hold it (`apply_mode_change`) delegate here so the
+    /// non-reentrant lock isn't acquired twice.
+    async fn start_arp_discovery_locked(
+        &self,
+        interface_display_name: &str,
+        app_handle: tauri::AppHandle,
+    ) -> Result<(), AppError> {
+        self.stop_locked().await;
+
+        // New discovery session: advance the generation and mark discovery
+        // active so sweeps and capture frames from a prior session can
+        // fence themselves out (that work captures the generation; the
+        // active flag also covers a stop with no restart).
+        let generation = self.discovery_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        self.discovery_active.store(true, Ordering::Relaxed);
+        log::debug!("Discovery session generation → {}", generation);
 
         *self.interface_name.lock().await = Some(interface_display_name.to_string());
 
@@ -866,12 +919,32 @@ impl NetworkManager {
                 }
             }
         });
-        *self.auto_adopt_handle.lock().await = Some(adopt_handle);
+        {
+            let mut slot = self.auto_adopt_handle.lock().await;
+            if slot.is_some() {
+                log::warn!(
+                    "auto_adopt_handle slot unexpectedly occupied at start — \
+                     the preceding stop should have cleared it"
+                );
+            }
+            *slot = Some(adopt_handle);
+        }
 
         Ok(())
     }
 
     pub async fn stop_arp_discovery(&self) {
+        let _op = self.discovery_op.lock().await;
+        self.stop_locked().await;
+    }
+
+    /// Stop body, run with the discovery op lock already held.
+    async fn stop_locked(&self) {
+        // Mark inactive before tearing down handles so an in-flight sweep
+        // or capture frame fences out. Cleared on every stop — including a
+        // stop with no following start (Static Auto → Manual) — which a
+        // generation counter alone would miss.
+        self.discovery_active.store(false, Ordering::Relaxed);
         if let Some(h) = self.auto_adopt_handle.lock().await.take() {
             h.abort();
             log::info!("Auto-adopt task cancelled");
