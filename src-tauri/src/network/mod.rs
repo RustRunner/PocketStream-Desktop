@@ -75,6 +75,62 @@ const AUTO_ADOPT_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// future is dropped (killing its child) and its pending IPs are reconciled.
 const ADOPT_MAX_TOTAL: std::time::Duration = std::time::Duration::from_secs(45);
 
+/// Settle delay before an adoption is announced finished, covering the NIC
+/// watcher's ~300 ms debounce so the final IP-change up-event is gated too.
+const ADOPTION_SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// RAII gate around a single adoption. On creation it emits
+/// `adoption-started`; on drop — normal completion OR a dropped/aborted
+/// future — it emits `adoption-finished` after a short settle. The frontend
+/// suppresses watcher-driven discovery/stream restarts between the two so
+/// the adoption's own IP churn (scratch bind/release, final add) is not
+/// mistaken for a reconnect. The `adoption_id` lets the frontend ignore a
+/// stale finish from a superseded adoption.
+struct AdoptionGate {
+    app_handle: tauri::AppHandle,
+    adoption_id: u64,
+}
+
+impl AdoptionGate {
+    fn start(app_handle: tauri::AppHandle, adoption_id: u64) -> Self {
+        use tauri::Emitter;
+        let _ = app_handle.emit(
+            "adoption-started",
+            serde_json::json!({ "adoption_id": adoption_id.to_string() }),
+        );
+        Self {
+            app_handle,
+            adoption_id,
+        }
+    }
+}
+
+impl Drop for AdoptionGate {
+    fn drop(&mut self) {
+        let app_handle = self.app_handle.clone();
+        let adoption_id = self.adoption_id;
+        let emit_finished = move || {
+            use tauri::Emitter;
+            let _ = app_handle.emit(
+                "adoption-finished",
+                serde_json::json!({ "adoption_id": adoption_id.to_string() }),
+            );
+        };
+        // Drop can't await the settle, so run it on a short task; fall back
+        // to an immediate emit if there is no runtime handle (e.g. during
+        // shutdown) so the gate is never left stuck closed on the frontend.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    tokio::time::sleep(ADOPTION_SETTLE).await;
+                    emit_finished();
+                });
+            }
+            Err(_) => emit_finished(),
+        }
+    }
+}
+
 pub struct NetworkManager {
     active_scans: Arc<Mutex<HashSet<String>>>,
     arp_devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
@@ -843,6 +899,12 @@ impl NetworkManager {
                     log::info!("Foreign subnet detected: {}", device_subnet);
 
                     let adoption_id = adoption_seq.fetch_add(1, Ordering::Relaxed) + 1;
+                    // Bracket the adoption with started/finished so the
+                    // frontend suppresses restarts from its own IP churn.
+                    // The guard emits `adoption-finished` on drop, so every
+                    // terminal path below (success, timeout, error, break,
+                    // task abort) releases the gate.
+                    let _gate = AdoptionGate::start(app_handle_for_adopt.clone(), adoption_id);
                     let local_ips = interface::all_local_ipv4();
                     let started = std::time::Instant::now();
                     let outcome = tokio::time::timeout(

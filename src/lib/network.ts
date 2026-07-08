@@ -8,7 +8,11 @@ import { resetDiscoveryStatus, hideDiscoveryStatus, renderArpDeviceList } from "
 import { handleHardDisconnect, handleReconnect, showModalWithVideo } from "./streaming.js";
 import { selectedDevice } from "./store.ts";
 import { formatError } from "./errors.ts";
-import type { InterfaceInfo, NetworkMode } from "./types.ts";
+import type {
+  AdoptionLifecyclePayload,
+  InterfaceInfo,
+  NetworkMode,
+} from "./types.ts";
 import * as deviceList from "./device-list.ts";
 
 // Reference $$ once so the import isn't dropped — used elsewhere via the
@@ -191,6 +195,43 @@ export function setupInterfaceWatcher(): void {
 
     applyUpEvent(iface, wasDown);
   });
+
+  // Adoption gate. The backend brackets every auto-adoption with
+  // `adoption-started` / `adoption-finished` (carrying an opaque
+  // adoption_id). Between them, the up-events above are the adoption's own
+  // IP churn, so applyUpEvent suppresses restarts. `adoption-finished`
+  // fires on EVERY terminal path — success, failure, timeout, shutdown —
+  // so the gate can never stick closed.
+  api.onEvent<AdoptionLifecyclePayload>("adoption-started", (data) => {
+    state.activeAdoptionId = data.adoption_id;
+    log(`Adoption ${data.adoption_id} started — restart gate closed`);
+  });
+
+  api.onEvent<AdoptionLifecyclePayload>("adoption-finished", (data) => {
+    // Ignore a stale finish from a superseded adoption: only the active id
+    // reopens the gate / consumes the latch. (A finish can arrive after a
+    // newer adoption already started because of the settle delay.)
+    if (data.adoption_id !== state.activeAdoptionId) {
+      return;
+    }
+    state.activeAdoptionId = null;
+    // Consume the latch unconditionally — even on a failed rescue, where
+    // the interface is still APIPA and the connected-check below fails —
+    // so a leftover latch can't misfire handleReconnect on a later,
+    // unrelated adoption.
+    const wasLatched = state.suppressedReconnect;
+    state.suppressedReconnect = false;
+    log(`Adoption ${data.adoption_id} finished — restart gate reopened`);
+    if (wasLatched && isInterfaceConnected()) {
+      // The APIPA outage tore the stream down and the gate swallowed the
+      // up-event that would have resumed it; resume exactly once now. Do
+      // NOT restart discovery — it never stopped (it drove the adoption),
+      // and restarting would re-enter the loop this gate removes.
+      handleReconnect().catch((e: unknown) =>
+        log(`Post-adoption resume: ${formatError(e)}`)
+      );
+    }
+  });
 }
 
 function applyDownEvent(iface: InterfaceInfo): void {
@@ -238,6 +279,23 @@ function applyUpEvent(iface: InterfaceInfo, wasDown: boolean): void {
   // (load_adopted_from_config completing during cold start triggers
   // this event with the new IP set).
   renderSubnetList();
+
+  // While an auto-adoption is in progress, this up-event is the app's own
+  // IP churn (scratch bind/release, final add) — NOT a reconnect. Do not
+  // restart discovery or the stream. If the interface had been torn down
+  // (an APIPA rescue), latch a one-shot resume for when the adoption
+  // finishes: the gate is swallowing the only up-event that would resume
+  // the stream, and no further watcher event arrives once the IP set is
+  // stable.
+  if (state.activeAdoptionId !== null) {
+    log(`Up-event during adoption ${state.activeAdoptionId} — suppressing restart`);
+    if (wasDown) {
+      renderArpDeviceList();
+      state.suppressedReconnect = true;
+    }
+    return;
+  }
+
   if (wasDown) {
     // If we just came back from disconnected, re-render immediately
     // from the preserved state so the Nodes list snaps back, then

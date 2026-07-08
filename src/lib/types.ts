@@ -194,6 +194,16 @@ export interface AdoptionFailedPayload {
   error: string;
 }
 
+/** Payload for the `adoption-started` / `adoption-finished` events. The
+ *  backend brackets every auto-adoption with these — `adoption-finished`
+ *  fires on success, failure, timeout, and shutdown alike, after a short
+ *  settle covering the NIC watcher's ~300 ms debounce. `adoption_id` is an
+ *  opaque monotonic token so a stale finish from a superseded adoption is
+ *  told apart from the active one. */
+export interface AdoptionLifecyclePayload {
+  adoption_id: string;
+}
+
 /** Payload for the `discovery-degraded` event: the capture backend
  *  delivered no ARP payload events within the window after the provoking
  *  ping sweep. Diagnostic only — availability is never flipped on this. */

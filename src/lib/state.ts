@@ -22,6 +22,17 @@ export interface AppState {
    *  video child window is hidden and the "Stream Lost..." overlay is
    *  shown until the next successful health-check or manual stop. */
   streamLost?: boolean;
+  /** The id of the auto-adoption currently in progress, or null when none.
+   *  Set by the `adoption-started` event and cleared by the matching
+   *  `adoption-finished`. While non-null, watcher up-events are the app's
+   *  own adoption-induced IP churn, so discovery/stream restarts are
+   *  suppressed rather than treated as a reconnect. */
+  activeAdoptionId: string | null;
+  /** Latched when an up-event was suppressed while an adoption was in
+   *  progress AND the interface had been torn down (wasDown). Consumed on
+   *  the next matching `adoption-finished` to resume the stream exactly
+   *  once — the gate otherwise swallows the only up-event that would. */
+  suppressedReconnect: boolean;
 }
 
 export const state: AppState = {
@@ -30,6 +41,8 @@ export const state: AppState = {
   isStreaming: false,
   isRtspRunning: false,
   isRecording: false,
+  activeAdoptionId: null,
+  suppressedReconnect: false,
 };
 // `selectedDevice` previously lived here; it's now in store.ts with a
 // subscribe/notify accessor. New shared mutable state should land in
