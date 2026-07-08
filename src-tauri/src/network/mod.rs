@@ -131,6 +131,35 @@ impl Drop for AdoptionGate {
     }
 }
 
+/// Session fence for sweep and capture work. Holds the discovery
+/// generation captured when the work was scheduled plus handles to the
+/// live generation/active flags, so stale work — a sweep or capture frame
+/// from a prior session, or anything after a stop — drops itself before
+/// merging into the shared registry or emitting. Gating on `active` (not
+/// only the generation) is what catches a stop with no restart, e.g.
+/// Static Auto → Manual, where the generation never advances.
+#[derive(Clone)]
+pub(crate) struct SweepFence {
+    generation: u64,
+    current: Arc<AtomicU64>,
+    active: Arc<AtomicBool>,
+}
+
+impl SweepFence {
+    pub(crate) fn new(generation: u64, current: Arc<AtomicU64>, active: Arc<AtomicBool>) -> Self {
+        Self {
+            generation,
+            current,
+            active,
+        }
+    }
+
+    pub(crate) fn is_stale(&self) -> bool {
+        !self.active.load(Ordering::Relaxed)
+            || self.generation != self.current.load(Ordering::Relaxed)
+    }
+}
+
 pub struct NetworkManager {
     active_scans: Arc<Mutex<HashSet<String>>>,
     arp_devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
@@ -621,6 +650,15 @@ impl NetworkManager {
         self.discovery_active.store(true, Ordering::Relaxed);
         log::debug!("Discovery session generation → {}", generation);
 
+        // Session fence shared by the capture listener and every sweep so
+        // stale-session work (from a prior session, or after a stop) drops
+        // itself before merging or emitting into the shared registry.
+        let fence = SweepFence::new(
+            generation,
+            self.discovery_generation.clone(),
+            self.discovery_active.clone(),
+        );
+
         *self.interface_name.lock().await = Some(interface_display_name.to_string());
 
         let devices = self.arp_devices.clone();
@@ -666,6 +704,7 @@ impl NetworkManager {
             app_handle,
             ethernet_ips,
             own_mac,
+            fence.clone(),
         )?;
         *self.arp_listener_handle.lock().await = Some(handle);
 
@@ -677,9 +716,15 @@ impl NetworkManager {
         let sweep_registry = registry.clone();
         let sweep_emitter = emitter.clone();
         let sweep_app_handle = app_handle_for_adopt.clone();
+        let sweep_fence = fence.clone();
         tokio::spawn(async move {
             // Small delay to let the capture listener start first
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // If discovery already restarted (or stopped) during that delay,
+            // this sweep belongs to a dead session — don't touch the registry.
+            if sweep_fence.is_stale() {
+                return;
+            }
             log::info!("Ping sweeping known subnets to populate ARP");
             ping_sweep_subnets(&sweep_ips).await;
 
@@ -689,6 +734,9 @@ impl NetworkManager {
             // cover it post-adoption, but not the cold-start merge). The
             // map dedup makes the extra queries harmless.
             for sweep_iface_ip in &sweep_ips {
+                if sweep_fence.is_stale() {
+                    break;
+                }
                 if sweep_iface_ip.is_empty() {
                     continue;
                 }
@@ -698,6 +746,7 @@ impl NetworkManager {
                     sweep_emitter.clone(),
                     sweep_app_handle.clone(),
                     sweep_iface_ip,
+                    &sweep_fence,
                 )
                 .await;
             }
@@ -757,6 +806,7 @@ impl NetworkManager {
         let devices_for_adopt = devices.clone();
         let registry_for_adopt = registry.clone();
         let emitter_for_adopt = emitter.clone();
+        let fence_for_loop = fence.clone();
         let adopt_handle = tokio::spawn(async move {
             use tauri::Emitter;
             use tauri::Manager;
@@ -1010,11 +1060,18 @@ impl NetworkManager {
                             let sweep_registry = registry_for_adopt.clone();
                             let sweep_emitter = emitter_for_adopt.clone();
                             let sweep_handle = app_handle_for_adopt.clone();
+                            let sweep_fence = fence_for_loop.clone();
                             tokio::spawn(async move {
                                 let passes: [u64; 3] = [1500, 5000, 12000];
                                 for (i, delay_ms) in passes.iter().enumerate() {
                                     tokio::time::sleep(std::time::Duration::from_millis(*delay_ms))
                                         .await;
+                                    // A restart/stop during the staggered
+                                    // delays means this belongs to a dead
+                                    // session — stop pinging and merging.
+                                    if sweep_fence.is_stale() {
+                                        break;
+                                    }
                                     log::info!(
                                         "Post-adoption sweep pass {}/{} on {}",
                                         i + 1,
@@ -1028,6 +1085,7 @@ impl NetworkManager {
                                         sweep_emitter.clone(),
                                         sweep_handle.clone(),
                                         &sweep_ip,
+                                        &sweep_fence,
                                     )
                                     .await;
                                 }
@@ -1385,8 +1443,16 @@ async fn merge_arp_table(
     emitter: Arc<DeviceListEmitter>,
     app_handle: tauri::AppHandle,
     interface_ip: &str,
+    fence: &SweepFence,
 ) {
     use tauri::{Emitter, Manager};
+
+    // Fence stale-session merges: a sweep from a prior discovery session
+    // (or one still running after a stop) must not merge or emit into the
+    // current session's shared registry.
+    if fence.is_stale() {
+        return;
+    }
 
     let entries = arp::read_system_arp_table(interface_ip).await;
     let now = chrono::Utc::now().to_rfc3339();
@@ -1448,5 +1514,36 @@ async fn merge_arp_table(
     // window absorbs both this batch and any concurrent live-ARP merges.
     if registry_changed {
         emitter.poke();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fence(generation: u64, current: u64, active: bool) -> SweepFence {
+        SweepFence::new(
+            generation,
+            Arc::new(AtomicU64::new(current)),
+            Arc::new(AtomicBool::new(active)),
+        )
+    }
+
+    #[test]
+    fn fence_fresh_session_is_not_stale() {
+        assert!(!fence(1, 1, true).is_stale());
+    }
+
+    #[test]
+    fn fence_superseded_generation_is_stale() {
+        // A newer start advanced the generation past this work's capture.
+        assert!(fence(1, 2, true).is_stale());
+    }
+
+    #[test]
+    fn fence_inactive_discovery_is_stale() {
+        // A stop with no restart clears `active` without moving the
+        // generation (Static Auto -> Manual) — must still read as stale.
+        assert!(fence(1, 1, false).is_stale());
     }
 }

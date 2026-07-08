@@ -106,6 +106,10 @@ struct CallbackContext {
     registry: Arc<DeviceRegistry>,
     emitter: Arc<DeviceListEmitter>,
     app_handle: tauri::AppHandle,
+    /// Session fence: a live capture frame from a prior discovery session
+    /// (or one still firing after a stop) drops itself before merging or
+    /// emitting into the shared registry.
+    fence: super::SweepFence,
     /// One-shot latches so the diagnostics don't spam per packet.
     missed_logged: AtomicBool,
     canary_logged: AtomicBool,
@@ -182,6 +186,14 @@ unsafe extern "system" fn data_cb(ctx: *mut c_void, d: *const pktmon::StreamData
         if !lru.admit(op, mac, ip.octets(), Instant::now()) {
             return;
         }
+    }
+
+    // Fence stale-session frames: a callback from a prior listener (or one
+    // still firing after a stop) must not merge or emit into the current
+    // session's shared registry. Checked here, before the spawn, so a stale
+    // frame costs nothing.
+    if ctx.fence.is_stale() {
+        return;
     }
 
     // Marshal onto the tokio runtime — the merge/emit tail is async
@@ -280,13 +292,14 @@ async fn on_arp_seen(
 ///
 /// `own_mac` — the target adapter's own MAC; ARP frames sent by it are
 /// skipped (see [`on_arp_seen`]'s phantom-peer note).
-pub fn start_listener(
+pub(crate) fn start_listener(
     devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
     registry: Arc<DeviceRegistry>,
     emitter: Arc<DeviceListEmitter>,
     app_handle: tauri::AppHandle,
     ethernet_ips: Vec<Ipv4Addr>,
     own_mac: Option<[u8; 6]>,
+    fence: super::SweepFence,
 ) -> Result<ArpListenerHandle, AppError> {
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let runtime = tokio::runtime::Handle::current();
@@ -305,6 +318,7 @@ pub fn start_listener(
             registry,
             emitter,
             app_handle,
+            fence,
             missed_logged: AtomicBool::new(false),
             canary_logged: AtomicBool::new(false),
         });
