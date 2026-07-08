@@ -160,8 +160,25 @@ impl SweepFence {
     }
 }
 
+/// RAII guard that removes a subnet from the active-scan set on drop, so a
+/// cancelled `scan_subnet` future can't leave the subnet permanently marked
+/// "scan in progress" (which would reject every later scan of it for the
+/// process lifetime). Uses the std mutex so `Drop` can remove synchronously.
+struct ScanGuard {
+    active: Arc<std::sync::Mutex<HashSet<String>>>,
+    subnet: String,
+}
+
+impl Drop for ScanGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.active.lock() {
+            set.remove(&self.subnet);
+        }
+    }
+}
+
 pub struct NetworkManager {
-    active_scans: Arc<Mutex<HashSet<String>>>,
+    active_scans: Arc<std::sync::Mutex<HashSet<String>>>,
     arp_devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
     adopted_ips: Arc<Mutex<HashMap<String, Ipv4Addr>>>,
     arp_listener_handle: Arc<Mutex<Option<arp::ArpListenerHandle>>>,
@@ -214,7 +231,7 @@ pub struct NetworkManager {
 impl NetworkManager {
     pub fn new() -> Self {
         Self {
-            active_scans: Arc::new(Mutex::new(HashSet::new())),
+            active_scans: Arc::new(std::sync::Mutex::new(HashSet::new())),
             arp_devices: Arc::new(Mutex::new(HashMap::new())),
             adopted_ips: Arc::new(Mutex::new(HashMap::new())),
             arp_listener_handle: Arc::new(Mutex::new(None)),
@@ -396,17 +413,26 @@ impl NetworkManager {
     /// (Static-Manual). Safe to call multiple times; replaces any
     /// previously-running pinger.
     pub async fn start_ping_dot(&self, app_handle: tauri::AppHandle) {
-        let mut slot = self.ping_dot_handle.lock().await;
-        if let Some(prev) = slot.take() {
+        // Take the previous handle out and release the lock BEFORE awaiting
+        // its stop — holding the guard across stop().await needlessly
+        // serializes start/stop and would self-deadlock if the pinger were
+        // ever changed to call back into this handle.
+        let prev = self.ping_dot_handle.lock().await.take();
+        if let Some(prev) = prev {
             prev.stop().await;
         }
-        *slot = Some(ping_dot::start(app_handle, self.device_registry.clone()));
+        let handle = ping_dot::start(app_handle, self.device_registry.clone());
+        *self.ping_dot_handle.lock().await = Some(handle);
         log::info!("Started ICMP ping-dot loop");
     }
 
     /// Stop the pinger task and drain. No-op if not running.
     pub async fn stop_ping_dot(&self) {
-        if let Some(handle) = self.ping_dot_handle.lock().await.take() {
+        // Take the handle out and drop the lock guard before awaiting stop
+        // (the edition-2021 `if let` would otherwise keep the guard alive
+        // across the await).
+        let handle = self.ping_dot_handle.lock().await.take();
+        if let Some(handle) = handle {
             handle.stop().await;
             log::info!("Stopped ICMP ping-dot loop");
         }
@@ -622,18 +648,27 @@ impl NetworkManager {
     }
 
     pub async fn scan_subnet(&self, subnet: &str) -> Result<Vec<ScanResult>, AppError> {
-        {
-            let mut active = self.active_scans.lock().await;
+        // RAII guard: the subnet is removed from the active set on drop —
+        // normal return OR a cancelled future — so a cancellation at the
+        // scan await below can't wedge the subnet as "scan in progress"
+        // forever. Insert + guard creation happen under one lock.
+        let _guard = {
+            let mut active = self
+                .active_scans
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             if !active.insert(subnet.to_string()) {
                 return Err(AppError::Network(format!(
                     "Scan already in progress for {}",
                     subnet
                 )));
             }
-        }
-        let result = scanner::scan(subnet).await;
-        self.active_scans.lock().await.remove(subnet);
-        result
+            ScanGuard {
+                active: self.active_scans.clone(),
+                subnet: subnet.to_string(),
+            }
+        };
+        scanner::scan(subnet).await
     }
 
     /// Start ARP discovery (PacketMonitor capture) on the Ethernet
@@ -707,11 +742,22 @@ impl NetworkManager {
 
         let registry = self.device_registry.clone();
 
-        // Late-bind the emitter now that we have an AppHandle. Replace
-        // any previous emitter (e.g. from a prior interface switch) so
-        // events fire under the current handle.
-        let emitter = DeviceListEmitter::new(app_handle.clone(), registry.clone());
-        *self.device_emitter.lock().await = Some(emitter.clone());
+        // Late-bind the emitter now that we have an AppHandle. Reuse the
+        // existing one if `init_emitter` already wired it at startup — two
+        // live emitters poking the same registry would double every
+        // device-list-changed event. Only create + store when the slot is
+        // empty (the app handle is the same across interface switches).
+        let emitter = {
+            let mut slot = self.device_emitter.lock().await;
+            match slot.as_ref() {
+                Some(existing) => existing.clone(),
+                None => {
+                    let e = DeviceListEmitter::new(app_handle.clone(), registry.clone());
+                    *slot = Some(e.clone());
+                    e
+                }
+            }
+        };
         // Emit the initial snapshot so any frontend that's already
         // subscribed sees cache-hydrated devices without having to
         // separately call get_device_list.
@@ -1643,5 +1689,22 @@ mod tests {
         let out = merge_adopted_config(&live, &pending);
         assert_eq!(out.get("10.0.0.0/24").map(String::as_str), Some("10.0.0.100"));
         assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn scan_guard_removes_subnet_on_drop() {
+        // A cancelled scan_subnet future drops its ScanGuard, which must
+        // clear the active-scan flag so later scans of that subnet aren't
+        // permanently rejected.
+        let active = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        active.lock().unwrap().insert("10.0.0.0/24".to_string());
+        {
+            let _g = ScanGuard {
+                active: active.clone(),
+                subnet: "10.0.0.0/24".to_string(),
+            };
+            assert!(active.lock().unwrap().contains("10.0.0.0/24"));
+        }
+        assert!(!active.lock().unwrap().contains("10.0.0.0/24"));
     }
 }
