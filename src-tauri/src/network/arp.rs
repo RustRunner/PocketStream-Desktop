@@ -38,6 +38,10 @@ static ARP_FRAMES_SEEN: AtomicU64 = AtomicU64::new(0);
 /// in the degraded-discovery diagnostic; never resets (worst-seen).
 static ARP_MISSED_MAX: AtomicU64 = AtomicU64::new(0);
 
+/// One-shot latch so a caught data-callback panic logs once per session
+/// rather than once per packet.
+static DATA_CB_PANIC_LOGGED: AtomicBool = AtomicBool::new(false);
+
 /// Total ARP frames parsed by the capture backend so far this process.
 pub fn frames_seen() -> u64 {
     ARP_FRAMES_SEEN.load(Ordering::Relaxed)
@@ -120,16 +124,79 @@ struct CallbackContext {
 /// so keep one rather than passing null.
 unsafe extern "system" fn event_cb(_ctx: *mut c_void, _info: *const c_void, _kind: u32) {}
 
-/// Per-packet data callback. Runs on the API's stream thread — kept
-/// minimal (parse + dedupe + marshal); no registry work here. A slow
-/// callback drops packets, surfaced by the missed-packet counters.
+/// Maximum plausible frame-buffer size from a single PacketMonitor
+/// descriptor. Real Ethernet frames are ~1.5 KB (jumbo ~9 KB); 64 KiB is a
+/// generous ceiling that rejects an implausibly large `data_size` before it
+/// reaches `from_raw_parts`. This bounds blast radius — it cannot prove the
+/// pointer is valid for a below-cap length.
+const MAX_DESCRIPTOR_BYTES: u32 = 64 * 1024;
+
+/// True if a descriptor's `data_size` is plausible: non-zero and within the
+/// blast-radius cap.
+fn data_size_ok(data_size: u32) -> bool {
+    data_size != 0 && data_size <= MAX_DESCRIPTOR_BYTES
+}
+
+/// Validate a packet's (offset, length) against the buffer length,
+/// overflow-safe. Returns the in-bounds `[start, end)` range, or None if the
+/// length is zero, offset+length overflows, or the end runs past the buffer.
+/// The overflow guard is only load-bearing on a 32-bit build (unreachable on
+/// the shipped 64-bit target, where the u32 fields widen well within usize);
+/// it stays as cheap defense.
+fn checked_packet_range(
+    blob_len: usize,
+    packet_offset: usize,
+    packet_length: usize,
+) -> Option<(usize, usize)> {
+    if packet_length == 0 {
+        return None;
+    }
+    let end = packet_offset.checked_add(packet_length)?;
+    if end > blob_len {
+        return None;
+    }
+    Some((packet_offset, end))
+}
+
+/// Per-packet data callback (the extern "C" boundary). Wraps the real work
+/// in `catch_unwind`: a panic unwinding across `extern "system"` aborts the
+/// process, so catch it, log once per session, and return. `AssertUnwindSafe`
+/// is sound here — the only shared state a mid-parse panic can leave
+/// inconsistent is the dedupe `StdMutex`, which poisons and then self-
+/// disables for the rest of the session (the `if let Ok(lru)` below skips a
+/// poisoned lock). `catch_unwind` guards against panics introduced by future
+/// edits; it cannot intercept a segfault from a malformed descriptor pointer
+/// (that is not an unwind) — the `data_size` cap only bounds that blast
+/// radius.
 unsafe extern "system" fn data_cb(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor) {
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        data_cb_inner(ctx, d);
+    }));
+    if caught.is_err() && !DATA_CB_PANIC_LOGGED.swap(true, Ordering::Relaxed) {
+        log::error!(
+            "PacketMonitor data callback panicked — suppressed to avoid an \
+             FFI-boundary process abort; capture continues"
+        );
+    }
+}
+
+/// The real per-packet parse. Runs on the API's stream thread — kept minimal
+/// (parse + dedupe + marshal); no registry work here. A slow callback drops
+/// packets, surfaced by the missed-packet counters.
+unsafe fn data_cb_inner(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor) {
     if ctx.is_null() || d.is_null() {
         return;
     }
     let ctx = &*(ctx as *const CallbackContext);
     let desc = *d;
     if desc.data.is_null() {
+        return;
+    }
+    // Descriptor sanity before from_raw_parts: reject a zero or implausibly
+    // large data_size. This bounds the blast radius of a malformed
+    // descriptor but does NOT prove the pointer is valid for a below-cap
+    // length — residual trust in the OS descriptor contract remains.
+    if !data_size_ok(desc.data_size) {
         return;
     }
     let blob = std::slice::from_raw_parts(desc.data, desc.data_size as usize);
@@ -162,10 +229,10 @@ unsafe extern "system" fn data_cb(ctx: *mut c_void, d: *const pktmon::StreamData
 
     let po = desc.packet_offset as usize;
     let pl = desc.packet_length as usize;
-    if pl == 0 || blob.len() < po + pl {
+    let Some((frame_start, frame_end)) = checked_packet_range(blob.len(), po, pl) else {
         return;
-    }
-    let frame = &blob[po..po + pl];
+    };
+    let frame = &blob[frame_start..frame_end];
 
     let Some((op, mac, ip)) = extract_arp(frame, packet_type) else {
         return;
@@ -613,6 +680,34 @@ pub async fn send_arp_probe(
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn checked_range_rejects_zero_length() {
+        assert_eq!(checked_packet_range(100, 0, 0), None);
+    }
+
+    #[test]
+    fn checked_range_rejects_overflow() {
+        assert_eq!(checked_packet_range(100, usize::MAX, 1), None);
+    }
+
+    #[test]
+    fn checked_range_rejects_end_past_buffer() {
+        assert_eq!(checked_packet_range(100, 50, 60), None);
+    }
+
+    #[test]
+    fn checked_range_accepts_valid() {
+        assert_eq!(checked_packet_range(100, 14, 42), Some((14, 56)));
+    }
+
+    #[test]
+    fn data_size_cap_rejects_zero_and_oversized() {
+        assert!(!data_size_ok(0));
+        assert!(!data_size_ok(MAX_DESCRIPTOR_BYTES + 1));
+        assert!(data_size_ok(1500));
+        assert!(data_size_ok(MAX_DESCRIPTOR_BYTES));
+    }
 
     /// Build a minimal valid ARP packet (42 bytes: 14 Ethernet + 28 ARP).
     fn make_arp_packet(sender_mac: [u8; 6], sender_ip: [u8; 4]) -> Vec<u8> {
