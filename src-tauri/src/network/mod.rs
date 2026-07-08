@@ -841,9 +841,10 @@ impl NetworkManager {
 
             let missed = arp::missed_max();
             log::warn!(
-                "Discovery degraded: no ARP payload events within {}s of the ping sweep (missed_max={})",
+                "Discovery degraded: no ARP payload events within {}s of the ping sweep (missed_max={}, tasks_dropped={})",
                 INITIAL_WINDOW.as_secs(),
-                missed
+                missed,
+                arp::tasks_dropped()
             );
             let _ = watchdog_app.emit(
                 "discovery-degraded",
