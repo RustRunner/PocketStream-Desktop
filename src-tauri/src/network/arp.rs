@@ -42,6 +42,16 @@ static ARP_MISSED_MAX: AtomicU64 = AtomicU64::new(0);
 /// rather than once per packet.
 static DATA_CB_PANIC_LOGGED: AtomicBool = AtomicBool::new(false);
 
+/// Count of ARP frames dropped because the in-flight on_arp_seen task bound
+/// was saturated (a distinct-tuple flood or a slow registry). Never resets.
+static ARP_TASKS_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Total ARP frames dropped due to the callback-task bound this session.
+/// A diagnostic companion to [`frames_seen`] / [`missed_max`].
+pub fn tasks_dropped() -> u64 {
+    ARP_TASKS_DROPPED.load(Ordering::Relaxed)
+}
+
 /// Total ARP frames parsed by the capture backend so far this process.
 pub fn frames_seen() -> u64 {
     ARP_FRAMES_SEEN.load(Ordering::Relaxed)
@@ -114,9 +124,14 @@ struct CallbackContext {
     /// (or one still firing after a stop) drops itself before merging or
     /// emitting into the shared registry.
     fence: super::SweepFence,
+    /// Bounds concurrent on_arp_seen tasks so a distinct-tuple ARP flood
+    /// can't spawn unbounded workers that starve discovery.
+    arp_task_sem: Arc<tokio::sync::Semaphore>,
     /// One-shot latches so the diagnostics don't spam per packet.
     missed_logged: AtomicBool,
     canary_logged: AtomicBool,
+    /// One-shot latch for the task-bound-reached (flood) warning.
+    flood_logged: AtomicBool,
 }
 
 /// No-op event callback. The realtime stream signals lifecycle events
@@ -156,6 +171,21 @@ fn checked_packet_range(
         return None;
     }
     Some((packet_offset, end))
+}
+
+/// Max concurrent `on_arp_seen` tasks. Mirrors the ping-sweep semaphore
+/// (32): a distinct-tuple ARP flood bypasses the identical-tuple dedupe, and
+/// each task blocking-locks the registry across an O(n log n) snapshot, so an
+/// unbounded spawn would starve discovery under a storm.
+const MAX_INFLIGHT_ARP_TASKS: usize = 32;
+
+/// Reserve a slot for an on_arp_seen task without blocking (the FFI callback
+/// thread must never block). `Some(permit)` to hold for the task's lifetime,
+/// or `None` when the bound is already saturated.
+fn try_admit_arp_task(
+    sem: &Arc<tokio::sync::Semaphore>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    sem.clone().try_acquire_owned().ok()
 }
 
 /// Per-packet data callback (the extern "C" boundary). Wraps the real work
@@ -263,6 +293,26 @@ unsafe fn data_cb_inner(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor
         return;
     }
 
+    // Bound in-flight on_arp_seen tasks: a distinct-tuple ARP flood bypasses
+    // the identical-tuple dedupe, and each task blocking-locks the registry
+    // across an O(n log n) snapshot. Reserve a slot without blocking (this is
+    // the FFI thread); if the bound is saturated, drop the frame — ARP is
+    // best-effort and the OS ARP-table sweep backfills — and count it so a
+    // storm is visible in diagnostics.
+    let permit = match try_admit_arp_task(&ctx.arp_task_sem) {
+        Some(p) => p,
+        None => {
+            ARP_TASKS_DROPPED.fetch_add(1, Ordering::Relaxed);
+            if !ctx.flood_logged.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    "ARP callback task bound ({}) reached — dropping frames (flood or slow registry); the OS ARP-table sweep backfills",
+                    MAX_INFLIGHT_ARP_TASKS
+                );
+            }
+            return;
+        }
+    };
+
     // Marshal onto the tokio runtime — the merge/emit tail is async
     // (tokio Mutex, registry, cache I/O) and must not run here.
     let devices = ctx.devices.clone();
@@ -270,6 +320,9 @@ unsafe fn data_cb_inner(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor
     let emitter = ctx.emitter.clone();
     let app_handle = ctx.app_handle.clone();
     ctx.runtime.spawn(async move {
+        // Hold the permit for the task's lifetime; dropping it on completion
+        // frees the slot for the next admitted frame.
+        let _permit = permit;
         on_arp_seen(ip, mac, devices, registry, emitter, app_handle).await;
     });
 }
@@ -386,8 +439,10 @@ pub(crate) fn start_listener(
             emitter,
             app_handle,
             fence,
+            arp_task_sem: Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_ARP_TASKS)),
             missed_logged: AtomicBool::new(false),
             canary_logged: AtomicBool::new(false),
+            flood_logged: AtomicBool::new(false),
         });
 
         let config = pktmon::RealtimeStreamConfiguration {
@@ -707,6 +762,20 @@ mod tests {
         assert!(!data_size_ok(MAX_DESCRIPTOR_BYTES + 1));
         assert!(data_size_ok(1500));
         assert!(data_size_ok(MAX_DESCRIPTOR_BYTES));
+    }
+
+    #[test]
+    fn arp_task_admission_respects_bound() {
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        let p1 = try_admit_arp_task(&sem);
+        let p2 = try_admit_arp_task(&sem);
+        assert!(p1.is_some() && p2.is_some());
+        // Bound reached — the next frame is refused (dropped) rather than
+        // spawning an unbounded worker.
+        assert!(try_admit_arp_task(&sem).is_none());
+        // Releasing a permit frees a slot for the next admitted frame.
+        drop(p1);
+        assert!(try_admit_arp_task(&sem).is_some());
     }
 
     /// Build a minimal valid ARP packet (42 bytes: 14 Ethernet + 28 ARP).
