@@ -53,13 +53,42 @@ pub(crate) fn async_cmd(program: &str) -> tokio::process::Command {
     tokio::process::Command::from(std_cmd)
 }
 
+/// Cooperative-shutdown handle for the auto-adopt loop: a `watch` signal
+/// plus the task's join handle. A bare `JoinHandle` could only be aborted;
+/// this lets `stop` ask the loop to exit at a `select!` point (so an
+/// in-flight adoption cleans up), join with a bound, and fall back to abort
+/// only if that times out.
+struct AutoAdoptHandle {
+    shutdown: tokio::sync::watch::Sender<bool>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+/// How long a cooperative auto-adopt stop waits for the loop to exit before
+/// aborting it. Abort is safe because the add/remove children are
+/// kill-on-drop, so the dropped future takes any in-flight child with it.
+const AUTO_ADOPT_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Hard ceiling on a single adoption attempt. A probe can take ~11 s (1 s
+/// ping + up to a 10 s neighbor lookup) across up to 11 candidates, so the
+/// natural worst case is tens of seconds; 45 s bounds a pathological run
+/// without thrashing the cooldown on a merely slow box. On timeout the adopt
+/// future is dropped (killing its child) and its pending IPs are reconciled.
+const ADOPT_MAX_TOTAL: std::time::Duration = std::time::Duration::from_secs(45);
+
 pub struct NetworkManager {
     active_scans: Arc<Mutex<HashSet<String>>>,
     arp_devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
     adopted_ips: Arc<Mutex<HashMap<String, Ipv4Addr>>>,
     arp_listener_handle: Arc<Mutex<Option<arp::ArpListenerHandle>>>,
-    auto_adopt_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
-    auto_adopt_enabled: Arc<Mutex<bool>>,
+    auto_adopt_handle: Arc<Mutex<Option<AutoAdoptHandle>>>,
+    /// Secondary IPs the auto-adopt loop has bound but not yet handed over
+    /// to `adopted_ips` (scratch probes and unrecorded final adds), tagged
+    /// with the owning adoption id. Reconciled on stop so a cancelled or
+    /// timed-out adoption never leaks an untracked IP.
+    pending_ips: auto_adopt::PendingIps,
+    /// Monotonic source of adoption ids: each adoption pass takes the next
+    /// value to tag its `pending_ips` entries.
+    adoption_seq: Arc<AtomicU64>,
     /// Quiet-network watchdog: emits `discovery-degraded` if the capture
     /// backend delivers no ARP payload events shortly after the provoking
     /// ping sweep, then `discovery-recovered` on the first frame.
@@ -100,7 +129,8 @@ impl NetworkManager {
             adopted_ips: Arc::new(Mutex::new(HashMap::new())),
             arp_listener_handle: Arc::new(Mutex::new(None)),
             auto_adopt_handle: Arc::new(Mutex::new(None)),
-            auto_adopt_enabled: Arc::new(Mutex::new(true)),
+            pending_ips: Arc::new(Mutex::new(Vec::new())),
+            adoption_seq: Arc::new(AtomicU64::new(0)),
             discovery_watchdog_handle: Arc::new(Mutex::new(None)),
             interface_name: Arc::new(Mutex::new(None)),
             device_registry: Arc::new(DeviceRegistry::new()),
@@ -539,7 +569,9 @@ impl NetworkManager {
 
         let devices = self.arp_devices.clone();
         let adopted = self.adopted_ips.clone();
-        let auto_adopt = self.auto_adopt_enabled.clone();
+        let pending_ips = self.pending_ips.clone();
+        let adoption_seq = self.adoption_seq.clone();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let iface_name = interface_display_name.to_string();
         let app_handle_for_adopt = app_handle.clone();
 
@@ -672,6 +704,8 @@ impl NetworkManager {
         let adopt_handle = tokio::spawn(async move {
             use tauri::Emitter;
             use tauri::Manager;
+            let mut shutdown_rx = shutdown_rx;
+            let ops = auto_adopt::RealAdoptOps;
             let mut known_subnets: HashSet<String> = HashSet::new();
 
             // Mark subnets we already have IPs on as known
@@ -701,10 +735,18 @@ impl NetworkManager {
             const COOLDOWN_MAX: std::time::Duration = std::time::Duration::from_secs(600);
 
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
-                if !*auto_adopt.lock().await {
-                    continue;
+                // Shutdown-aware idle: wake on the 2 s tick or the moment a
+                // stop is signalled, and exit promptly either way.
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                    res = shutdown_rx.changed() => {
+                        if res.is_err() {
+                            break;
+                        }
+                    }
+                }
+                if *shutdown_rx.borrow() {
+                    break;
                 }
 
                 // Gate the adoption pass on host mode: while the adapter
@@ -757,6 +799,9 @@ impl NetworkManager {
                 };
 
                 for device in &device_list {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
                     let device_ip: Ipv4Addr = match device.ip.parse() {
                         Ok(ip) => ip,
                         Err(_) => continue,
@@ -797,13 +842,77 @@ impl NetworkManager {
 
                     log::info!("Foreign subnet detected: {}", device_subnet);
 
-                    match auto_adopt::adopt_subnet(&iface_name, device_ip, &current_ips).await {
-                        Ok(Some(adopted_ip)) => {
+                    let adoption_id = adoption_seq.fetch_add(1, Ordering::Relaxed) + 1;
+                    let local_ips = interface::all_local_ipv4();
+                    let started = std::time::Instant::now();
+                    let outcome = tokio::time::timeout(
+                        ADOPT_MAX_TOTAL,
+                        auto_adopt::adopt_subnet(
+                            &ops,
+                            &iface_name,
+                            device_ip,
+                            &current_ips,
+                            &local_ips,
+                            &pending_ips,
+                            adoption_id,
+                            &shutdown_rx,
+                        ),
+                    )
+                    .await;
+
+                    match outcome {
+                        Err(_elapsed) => {
+                            // ADOPT_MAX_TOTAL hit: the adopt future is dropped
+                            // now, so kill-on-drop took any in-flight child.
+                            // Reconcile whatever it bound and re-arm the
+                            // cooldown. Logged distinctly so the bound can be
+                            // retuned from field data.
+                            log::warn!(
+                                "Adoption of {} exceeded the {}s bound (elapsed {}s) — dropped and reconciling",
+                                device_subnet,
+                                ADOPT_MAX_TOTAL.as_secs(),
+                                started.elapsed().as_secs()
+                            );
+                            auto_adopt::reconcile_pending(&ops, &pending_ips, Some(adoption_id))
+                                .await;
+                            let next_backoff = cooldowns
+                                .get(&device_subnet)
+                                .map(|(_, b)| (*b * 2).min(COOLDOWN_MAX))
+                                .unwrap_or(COOLDOWN_INITIAL);
+                            cooldowns.insert(
+                                device_subnet.clone(),
+                                (std::time::Instant::now() + next_backoff, next_backoff),
+                            );
+                        }
+                        Ok(Ok(Some(adopted_ip))) => {
+                            // A stop may have raced the successful final bind.
+                            // If so, roll the IP back and do NOT record —
+                            // recording an IP the stop path won't clean is
+                            // worse than re-adopting on the next start.
+                            if *shutdown_rx.borrow() {
+                                log::info!(
+                                    "Shutdown raced adoption of {} — rolling back {}",
+                                    device_subnet,
+                                    adopted_ip
+                                );
+                                auto_adopt::reconcile_pending(&ops, &pending_ips, Some(adoption_id))
+                                    .await;
+                                break;
+                            }
                             cooldowns.remove(&device_subnet);
                             adopted
                                 .lock()
                                 .await
                                 .insert(device_subnet.clone(), adopted_ip);
+                            // Handover: the IP is recorded and owned now, so
+                            // drop its pending breadcrumb (adapter untouched).
+                            auto_adopt::pending_handover(
+                                &pending_ips,
+                                &iface_name,
+                                adopted_ip,
+                                adoption_id,
+                            )
+                            .await;
                             known_subnets.insert(device_subnet.clone());
 
                             let _ = app_handle_for_adopt.emit(
@@ -884,15 +993,22 @@ impl NetworkManager {
                                 );
                             }
                         }
-                        Ok(None) => {
+                        Ok(Ok(None)) => {
+                            // Already on subnet, or a clean shutdown-before-
+                            // bind. Nothing was left bound.
                             cooldowns.remove(&device_subnet);
                             known_subnets.insert(device_subnet.clone());
+                            if *shutdown_rx.borrow() {
+                                break;
+                            }
                         }
-                        Err(e) => {
-                            // Cooldown instead of permanent blacklist so a
-                            // transient failure (or a DHCP adapter that
-                            // couldn't be rescued yet) is retried with
-                            // backoff rather than abandoned forever.
+                        Ok(Err(e)) => {
+                            // adopt_subnet cleaned its own breadcrumbs except a
+                            // scratch whose release failed; reconcile this id
+                            // to catch that. Cooldown instead of a permanent
+                            // blacklist so a transient failure is retried.
+                            auto_adopt::reconcile_pending(&ops, &pending_ips, Some(adoption_id))
+                                .await;
                             let next_backoff = cooldowns
                                 .get(&device_subnet)
                                 .map(|(_, b)| (*b * 2).min(COOLDOWN_MAX))
@@ -918,6 +1034,7 @@ impl NetworkManager {
                     }
                 }
             }
+            log::info!("Auto-adopt loop exited");
         });
         {
             let mut slot = self.auto_adopt_handle.lock().await;
@@ -927,7 +1044,10 @@ impl NetworkManager {
                      the preceding stop should have cleared it"
                 );
             }
-            *slot = Some(adopt_handle);
+            *slot = Some(AutoAdoptHandle {
+                shutdown: shutdown_tx,
+                join: adopt_handle,
+            });
         }
 
         Ok(())
@@ -946,8 +1066,23 @@ impl NetworkManager {
         // generation counter alone would miss.
         self.discovery_active.store(false, Ordering::Relaxed);
         if let Some(h) = self.auto_adopt_handle.lock().await.take() {
-            h.abort();
-            log::info!("Auto-adopt task cancelled");
+            // Cooperative stop: ask the loop to exit at a select! point so an
+            // in-flight adoption rolls back cleanly, then join with a bound.
+            // Abort only if it doesn't exit in time — safe because the
+            // add/remove children are kill-on-drop, so dropping the future
+            // takes any in-flight child with it.
+            let _ = h.shutdown.send(true);
+            let abort = h.join.abort_handle();
+            match tokio::time::timeout(AUTO_ADOPT_STOP_TIMEOUT, h.join).await {
+                Ok(_) => log::info!("Auto-adopt task stopped cooperatively"),
+                Err(_) => {
+                    log::warn!(
+                        "Auto-adopt task did not stop within {}s — aborting",
+                        AUTO_ADOPT_STOP_TIMEOUT.as_secs()
+                    );
+                    abort.abort();
+                }
+            }
         }
         if let Some(h) = self.discovery_watchdog_handle.lock().await.take() {
             h.abort();
@@ -956,6 +1091,10 @@ impl NetworkManager {
             h.stop();
             log::info!("ARP discovery stopped");
         }
+        // Reconcile any secondary IP the (now-stopped) adoption left bound
+        // but unrecorded — scratch probes and final adds that never reached
+        // adopted_ips. Best-effort; failures are logged and retried next stop.
+        auto_adopt::reconcile_pending(&auto_adopt::RealAdoptOps, &self.pending_ips, None).await;
     }
 
     pub async fn get_adopted_ips(&self) -> HashMap<String, String> {
