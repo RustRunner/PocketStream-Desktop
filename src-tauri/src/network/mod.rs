@@ -174,6 +174,11 @@ pub struct NetworkManager {
     /// Monotonic source of adoption ids: each adoption pass takes the next
     /// value to tag its `pending_ips` entries.
     adoption_seq: Arc<AtomicU64>,
+    /// Config entries whose startup re-add failed transiently (subnet -> ip).
+    /// Kept OUT of the live `adopted_ips` map (so the UI never badges an
+    /// unbound IP) but unioned into every persisted config snapshot so a
+    /// later in-session save doesn't delete them — they retry next startup.
+    pending_restore: Arc<Mutex<HashMap<String, Ipv4Addr>>>,
     /// Quiet-network watchdog: emits `discovery-degraded` if the capture
     /// backend delivers no ARP payload events shortly after the provoking
     /// ping sweep, then `discovery-recovered` on the first frame.
@@ -216,6 +221,7 @@ impl NetworkManager {
             auto_adopt_handle: Arc::new(Mutex::new(None)),
             pending_ips: Arc::new(Mutex::new(Vec::new())),
             adoption_seq: Arc::new(AtomicU64::new(0)),
+            pending_restore: Arc::new(Mutex::new(HashMap::new())),
             discovery_watchdog_handle: Arc::new(Mutex::new(None)),
             interface_name: Arc::new(Mutex::new(None)),
             device_registry: Arc::new(DeviceRegistry::new()),
@@ -487,77 +493,60 @@ impl NetworkManager {
 
         let current_ips: HashSet<String> = iface.ips.iter().map(|ip| ip.address.clone()).collect();
 
-        // ── Phase 1: classify + insert under the lock (no awaits) ──
-        // Each entry produces (subnet, ip_str, needs_netsh_add). Pruned
-        // entries are dropped from both the in-memory map and the on-disk
-        // config.
-        let (work_items, save_snapshot) = {
-            let mut map = self.adopted_ips.lock().await;
-            let mut work: Vec<(String, String, bool)> = Vec::new();
-            let mut pruned = false;
-
-            for (subnet, ip_str) in &settings.adopted_subnets {
-                if native_subnets.contains(subnet) {
-                    log::info!(
-                        "Pruning adopted subnet {} ({}) — adapter already covers it natively",
-                        subnet,
-                        ip_str,
-                    );
-                    pruned = true;
-                    continue;
-                }
-
-                if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
-                    map.insert(subnet.clone(), ip);
-                    work.push((
-                        subnet.clone(),
-                        ip_str.clone(),
-                        !current_ips.contains(ip_str),
-                    ));
-                }
+        // ── Phase 1: classify (no live insert) ──
+        // Each surviving entry produces (subnet, ip_str, needs_netsh_add).
+        // Nothing is inserted into the live `adopted_ips` map here — an
+        // entry becomes live only once Phase 2 confirms it is bound, so the
+        // UI never badges an IP that isn't actually on the adapter.
+        let mut work_items: Vec<(String, String, bool)> = Vec::new();
+        let mut kept: HashMap<String, String> = HashMap::new();
+        let mut pruned = false;
+        for (subnet, ip_str) in &settings.adopted_subnets {
+            if native_subnets.contains(subnet) {
+                log::info!(
+                    "Pruning adopted subnet {} ({}) — adapter already covers it natively",
+                    subnet,
+                    ip_str,
+                );
+                pruned = true;
+                continue;
             }
-
-            let snapshot: Option<HashMap<String, String>> = if pruned {
-                Some(
-                    map.iter()
-                        .map(|(k, v)| (k.clone(), v.to_string()))
-                        .collect(),
-                )
+            if ip_str.parse::<Ipv4Addr>().is_ok() {
+                kept.insert(subnet.clone(), ip_str.clone());
+                work_items.push((subnet.clone(), ip_str.clone(), !current_ips.contains(ip_str)));
             } else {
-                None
-            };
-            (work, snapshot)
-        }; // lock dropped here
+                // Unparseable IP — proven invalid, drop it from config.
+                log::warn!("Dropping adopted subnet {} — invalid IP {}", subnet, ip_str);
+                pruned = true;
+            }
+        }
 
-        // Persist the cleaned-up map so pruned entries don't come back.
-        // Outside the lock — config.update writes to disk and shouldn't
-        // block other readers of adopted_ips.
-        if let Some(adopted) = save_snapshot {
-            match config.update_adopted_subnets(adopted) {
+        // Persist the pruned config (original − natively-covered − invalid),
+        // computed independently of which re-adds later succeed: a transient
+        // re-add failure must keep its config entry for a retry. Only write
+        // when something was actually dropped.
+        if pruned {
+            match config.update_adopted_subnets(kept) {
                 Ok(()) => log::info!("Saved pruned adopted subnets to config"),
                 Err(e) => log::warn!("Failed to persist pruned adopted subnets: {}", e),
             }
         }
 
         // ── Phase 2: netsh re-add in parallel, outside the lock ────
-        // After each entry is confirmed on the adapter (either already
-        // present from a hard-crash recovery or freshly netsh-added),
-        // emit `subnet-adopted` so the frontend's existing handler can
-        // populate `adoptedSubnets` and re-render with the (auto) badge.
-        // Failed adds skip the emission — the frontend shouldn't badge
-        // an IP that isn't actually on the interface.
-        use tauri::Emitter;
-        let mut tasks = tokio::task::JoinSet::new();
+        // Each task reports whether its IP is confirmed bound. Recording is
+        // done back here (not in the task) so the live map / pending_restore
+        // mutations and the success-only `subnet-adopted` emit happen in one
+        // place with `&self` in scope.
+        let mut tasks: tokio::task::JoinSet<(String, String, bool)> = tokio::task::JoinSet::new();
         for (subnet, ip_str, needs_add) in work_items {
             let iface_name = iface.name.clone();
-            let handle = app_handle.clone();
             tasks.spawn(async move {
                 let added_ok = if needs_add {
                     log::info!("Re-adding missing adopted IP {} to {}", ip_str, iface_name);
                     match ip_config::add_secondary_ip(&iface_name, &ip_str, "255.255.255.0").await {
                         Ok(()) => true,
                         Err(e) => {
-                            log::warn!("Failed to re-add adopted IP {}: {}", ip_str, e);
+                            log::warn!("Failed to re-add adopted IP {} ({}): {}", ip_str, subnet, e);
                             false
                         }
                     }
@@ -565,29 +554,60 @@ impl NetworkManager {
                     log::info!("Adopted IP {} already on adapter", ip_str);
                     true
                 };
-
-                if added_ok {
-                    let _ = handle.emit(
-                        "subnet-adopted",
-                        serde_json::json!({
-                            "subnet": subnet,
-                            "adopted_ip": ip_str,
-                        }),
-                    );
-                }
+                (subnet, ip_str, added_ok)
             });
         }
-        while tasks.join_next().await.is_some() {}
+
+        // Confirmed-bound entries go live and emit `subnet-adopted`; a
+        // transiently-failed re-add is held in `pending_restore` — not shown
+        // as a live route, but retried next startup and never dropped from
+        // config by an in-session save.
+        use tauri::Emitter;
+        while let Some(res) = tasks.join_next().await {
+            let (subnet, ip_str, added_ok) = match res {
+                Ok(t) => t,
+                Err(e) => {
+                    log::warn!("Adopted-restore task failed to join: {}", e);
+                    continue;
+                }
+            };
+            let ip: Ipv4Addr = match ip_str.parse() {
+                Ok(ip) => ip,
+                Err(_) => continue,
+            };
+            if added_ok {
+                self.adopted_ips.lock().await.insert(subnet.clone(), ip);
+                self.pending_restore.lock().await.remove(&subnet);
+                let _ = app_handle.emit(
+                    "subnet-adopted",
+                    serde_json::json!({
+                        "subnet": subnet,
+                        "adopted_ip": ip_str,
+                    }),
+                );
+            } else {
+                self.pending_restore.lock().await.insert(subnet.clone(), ip);
+                log::warn!(
+                    "Adopted restore held for retry: {} ({}) — re-add failed",
+                    subnet,
+                    ip_str
+                );
+            }
+        }
+    }
+
+    /// The config snapshot to persist: the live adopted map unioned with the
+    /// pending-restore holds (live wins on conflict). Persisting only the
+    /// live map would silently drop a transiently-failed restore.
+    async fn adopted_config_snapshot(&self) -> HashMap<String, String> {
+        let live = self.adopted_ips.lock().await.clone();
+        let pending = self.pending_restore.lock().await.clone();
+        merge_adopted_config(&live, &pending)
     }
 
     /// Save current adopted subnets to config.
     pub async fn save_adopted_to_config(&self, config: &crate::config::AppConfig) {
-        let adopted: HashMap<String, String> = {
-            let map = self.adopted_ips.lock().await;
-            map.iter()
-                .map(|(k, v)| (k.clone(), v.to_string()))
-                .collect()
-        };
+        let adopted = self.adopted_config_snapshot().await;
         if let Err(e) = config.update_adopted_subnets(adopted) {
             log::warn!("Failed to save adopted subnets: {}", e);
         }
@@ -807,6 +827,7 @@ impl NetworkManager {
         let registry_for_adopt = registry.clone();
         let emitter_for_adopt = emitter.clone();
         let fence_for_loop = fence.clone();
+        let pending_restore = self.pending_restore.clone();
         let adopt_handle = tokio::spawn(async move {
             use tauri::Emitter;
             use tauri::Manager;
@@ -1099,12 +1120,13 @@ impl NetworkManager {
                             // after restart with no breadcrumb.
                             let config: tauri::State<'_, crate::config::AppConfig> =
                                 app_handle_for_adopt.state();
-                            let adopted_map = adopted.lock().await;
-                            let snapshot: HashMap<String, String> = adopted_map
-                                .iter()
-                                .map(|(k, v)| (k.clone(), v.to_string()))
-                                .collect();
-                            drop(adopted_map);
+                            // This subnet is now live; drop any held-over
+                            // restore for it so the persisted snapshot below
+                            // reflects the live binding, not the stale hold.
+                            pending_restore.lock().await.remove(&device_subnet);
+                            let live = adopted.lock().await.clone();
+                            let pend = pending_restore.lock().await.clone();
+                            let snapshot = merge_adopted_config(&live, &pend);
                             if let Err(e) = config.update_adopted_subnets(snapshot) {
                                 log::warn!(
                                     "Failed to persist adopted subnet {} to config: {}",
@@ -1255,6 +1277,9 @@ impl NetworkManager {
 
         auto_adopt::remove_adopted_ip(&iface_name, &ip.to_string()).await?;
         self.adopted_ips.lock().await.remove(subnet);
+        // A user removal also drops any held-over restore for this subnet so
+        // it isn't resurrected into config by the next save.
+        self.pending_restore.lock().await.remove(subnet);
         Ok(())
     }
 
@@ -1517,6 +1542,25 @@ async fn merge_arp_table(
     }
 }
 
+/// Merge the live adopted map with the pending-restore map for persistence.
+/// Live wins on a key conflict (a subnet that re-bound this session
+/// supersedes its held-over restore). Pending-restore entries — transient
+/// startup re-add failures — are retained so a wholesale config write does
+/// not delete them, letting the next startup retry.
+fn merge_adopted_config(
+    live: &HashMap<String, Ipv4Addr>,
+    pending: &HashMap<String, Ipv4Addr>,
+) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = pending
+        .iter()
+        .map(|(k, v)| (k.clone(), v.to_string()))
+        .collect();
+    for (k, v) in live {
+        out.insert(k.clone(), v.to_string());
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1545,5 +1589,32 @@ mod tests {
         // A stop with no restart clears `active` without moving the
         // generation (Static Auto -> Manual) — must still read as stale.
         assert!(fence(1, 1, false).is_stale());
+    }
+
+    #[test]
+    fn merge_keeps_pending_restore_entries() {
+        // The core Fix 4 invariant: a transiently-failed restore held in
+        // pending_restore survives a persist derived from the live map.
+        let mut live = HashMap::new();
+        live.insert("10.0.0.0/24".to_string(), Ipv4Addr::new(10, 0, 0, 100));
+        let mut pending = HashMap::new();
+        pending.insert("10.9.0.0/24".to_string(), Ipv4Addr::new(10, 9, 0, 100));
+        let out = merge_adopted_config(&live, &pending);
+        assert_eq!(out.get("10.0.0.0/24").map(String::as_str), Some("10.0.0.100"));
+        assert_eq!(out.get("10.9.0.0/24").map(String::as_str), Some("10.9.0.100"));
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn merge_live_wins_on_conflict() {
+        // If a subnet is both live and pending (shouldn't normally persist,
+        // but be safe), the confirmed live binding wins.
+        let mut live = HashMap::new();
+        live.insert("10.0.0.0/24".to_string(), Ipv4Addr::new(10, 0, 0, 100));
+        let mut pending = HashMap::new();
+        pending.insert("10.0.0.0/24".to_string(), Ipv4Addr::new(10, 0, 0, 200));
+        let out = merge_adopted_config(&live, &pending);
+        assert_eq!(out.get("10.0.0.0/24").map(String::as_str), Some("10.0.0.100"));
+        assert_eq!(out.len(), 1);
     }
 }
