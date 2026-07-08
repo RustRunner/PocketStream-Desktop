@@ -50,6 +50,12 @@ pub struct StreamManager {
     state: Arc<Mutex<StreamState>>,
     video_hwnd: Arc<std::sync::atomic::AtomicIsize>,
     status_tx: Arc<watch::Sender<StreamStatus>>,
+    /// Bumped on every `stop_rtsp_server` (even when no server is stored).
+    /// `start_rtsp_server` captures it before its slow interface enumeration
+    /// and, under the storage lock, refuses to store if it changed — so a
+    /// stop that races a start wins instead of leaving a zombie server the
+    /// user asked not to run.
+    rtsp_epoch: std::sync::atomic::AtomicU64,
 }
 
 /// What a running consumer is ingesting, captured at start time. The
@@ -91,6 +97,7 @@ impl StreamManager {
             })),
             video_hwnd: Arc::new(std::sync::atomic::AtomicIsize::new(0)),
             status_tx: Arc::new(status_tx),
+            rtsp_epoch: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -294,6 +301,7 @@ impl StreamManager {
     pub async fn start_rtsp_server(
         &self,
         settings: &AppSettings,
+        adopted: &std::collections::HashSet<String>,
     ) -> Result<RtspServerInfo, AppError> {
         crate::ensure_gstreamer()?;
 
@@ -305,10 +313,15 @@ impl StreamManager {
             log::warn!("Firewall setup: {}", e);
         }
 
-        // Replace path: tear any existing server down fully (outside
-        // the lock) before binding the new one — dropping it in place
-        // left the port claimed by a socket whose loop was still
-        // running, so quick restarts hit "port in use".
+        // Capture the stop epoch before any slow work. stop_rtsp_server bumps
+        // it unconditionally, so if it changes before we store the new server
+        // a stop raced us and must win (see the storage step below).
+        let start_epoch = self.rtsp_epoch.load(std::sync::atomic::Ordering::Acquire);
+
+        // Replace path: tear any existing server down fully (outside the
+        // lock) before binding the new one — dropping it in place left the
+        // port claimed by a socket whose loop was still running, so quick
+        // restarts hit "port in use".
         let old_server = {
             let mut state = self.state.lock().await;
             state.rtsp_server.take()
@@ -317,45 +330,64 @@ impl StreamManager {
             old.shutdown().await;
         }
 
-        let mut state = self.state.lock().await;
-
-        // Double-bind guard, mirror of the one in start_playback: the
-        // restreamer's UDP ingest must not claim the port the running
-        // preview is already receiving on.
-        if settings.stream.protocol == StreamProtocol::Udp {
-            if let Some(SourceMode::Udp { port }) = state.playback_source {
-                if port == settings.stream.udp_port {
-                    return Err(AppError::Stream(format!(
-                        "UDP port {} is already claimed by the running preview — \
-                         only one consumer can receive a UDP stream. Stop the \
-                         stream first, or switch the input to RTSP.",
-                        port
-                    )));
-                }
-            }
-        }
-
         let mount_path = format!("/stream-{}", settings.rtsp_server.token);
 
-        // Resolve bind interface to an IP address
+        // Resolve the bind address and the advertised IP BEFORE taking the
+        // storage lock — both are full interface enumerations (PowerShell)
+        // and must not run under self.state, which the 1 Hz status ticker and
+        // every stop/refresh also lock (holding it across them stalls status).
         let bind_address = if settings.rtsp_server.bind_interface.is_empty() {
             None
         } else {
             let iface =
                 crate::network::interface::get_by_name(&settings.rtsp_server.bind_interface)
                     .await?;
-            let ip = iface
-                .ips
-                .first()
-                .map(|ip| ip.address.clone())
-                .ok_or_else(|| {
-                    AppError::Stream(format!(
-                        "Interface '{}' has no IPv4 address",
-                        settings.rtsp_server.bind_interface
-                    ))
-                })?;
+            // Never bind the socket to an adopted camera-network secondary or
+            // an APIPA address — either puts the server on the wrong network.
+            // Error clearly instead of silently binding wrong.
+            let ip = first_usable_ip(&iface.ips, adopted).ok_or_else(|| {
+                AppError::Stream(format!(
+                    "Interface '{}' has no usable (non-adopted, non-APIPA) IPv4 address to bind",
+                    settings.rtsp_server.bind_interface
+                ))
+            })?;
             Some(ip)
         };
+
+        // Advertised URL: for an explicit bind, advertise that IP; otherwise
+        // pick the best client-facing address (WiFi/VPN, non-adopted,
+        // non-APIPA), falling back to any usable address so an Ethernet-only
+        // host still advertises its native client IP, not the camera
+        // secondary.
+        let local_ip = match &bind_address {
+            Some(ip) => ip.clone(),
+            None => get_display_ip(adopted)
+                .await
+                .unwrap_or_else(|| "0.0.0.0".into()),
+        };
+        log::info!(
+            "RTSP bind selection: bind={:?} advertise={}",
+            bind_address,
+            local_ip
+        );
+
+        // Double-bind guard, mirror of the one in start_playback: the
+        // restreamer's UDP ingest must not claim the port the running preview
+        // is already receiving on. Checked under a short lock, then released
+        // before the synchronous server build.
+        if settings.stream.protocol == StreamProtocol::Udp {
+            let state = self.state.lock().await;
+            if let Some(SourceMode::Udp { port: pb_port }) = state.playback_source {
+                if pb_port == settings.stream.udp_port {
+                    return Err(AppError::Stream(format!(
+                        "UDP port {} is already claimed by the running preview — \
+                         only one consumer can receive a UDP stream. Stop the \
+                         stream first, or switch the input to RTSP.",
+                        pb_port
+                    )));
+                }
+            }
+        }
 
         let server = match settings.stream.protocol {
             StreamProtocol::Udp => RtspRestreamer::start_from_udp(
@@ -377,26 +409,41 @@ impl StreamManager {
             }
         };
 
-        // Use bind address for client URL if set, otherwise detect local IP
-        let local_ip = match bind_address {
-            Some(ip) => ip,
-            None => get_local_ip().await.unwrap_or_else(|| "0.0.0.0".into()),
-        };
+        // Store under the lock — but only if no stop raced us since
+        // `start_epoch` (a concurrent stop bumps the epoch even during the
+        // take-old window above, when no server is stored). If it changed the
+        // user asked for no server: free the one we just built and report the
+        // supersession rather than leaving a zombie.
+        let mut state = self.state.lock().await;
+        if self.rtsp_epoch.load(std::sync::atomic::Ordering::Acquire) != start_epoch {
+            drop(state);
+            log::info!("RTSP start superseded by a concurrent stop — discarding built server");
+            server.shutdown().await;
+            return Err(AppError::Stream(
+                "RTSP server start was superseded by a stop".into(),
+            ));
+        }
         let info = RtspServerInfo {
             rtsp_url: server.client_url(&local_ip),
             display_url: server.display_url(&local_ip),
         };
-
         state.rtsp_server = Some(server);
         state.rtsp_start_time = Some(std::time::Instant::now());
         state.rtsp_local_ip = Some(local_ip);
-
         drop(state);
+
         self.refresh_status().await;
         Ok(info)
     }
 
     pub async fn stop_rtsp_server(&self) -> Result<(), AppError> {
+        // Record stop intent unconditionally, even when no server is stored:
+        // start_rtsp_server takes the old server out before its slow
+        // enumeration, so during that window rtsp_server is None and a stop
+        // here would otherwise be invisible to the late start — which would
+        // then store a zombie. Bumping the epoch makes the start observe it.
+        self.rtsp_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let server = {
             let mut state = self.state.lock().await;
             let server = state.rtsp_server.take();
@@ -647,31 +694,52 @@ async fn compute_status(state: &Arc<Mutex<StreamState>>) -> StreamStatus {
     }
 }
 
-/// Get the local WiFi IPv4 address (preferred), falling back to any non-VPN interface.
-///
-/// The camera occupies the Ethernet port, so the RTSP server should bind to
-/// WiFi or a VPN-over-WiFi interface for local network streaming.
-async fn get_local_ip() -> Option<String> {
+/// True if `addr` is an APIPA (169.254.0.0/16) address — a DHCP-failure
+/// fallback that can't carry usable client traffic.
+fn is_apipa(addr: &str) -> bool {
+    addr.starts_with("169.254.")
+}
+
+/// First IPv4 on `ips` that is neither an adopted camera-network secondary
+/// nor APIPA. `None` if the interface carries only such addresses — the
+/// caller turns that into a clear error rather than binding the RTSP socket
+/// to the camera network.
+fn first_usable_ip(
+    ips: &[crate::network::interface::IpInfo],
+    adopted: &std::collections::HashSet<String>,
+) -> Option<String> {
+    ips.iter()
+        .map(|ip| ip.address.clone())
+        .find(|addr| !adopted.contains(addr) && !is_apipa(addr))
+}
+
+/// Best client-facing IPv4 to advertise when no explicit bind interface is
+/// set: prefer a WiFi or VPN address (the camera occupies Ethernet), else
+/// any up interface, always skipping adopted secondaries and APIPA. Returns
+/// `None` only if nothing usable exists (caller advertises 0.0.0.0).
+async fn get_display_ip(adopted: &std::collections::HashSet<String>) -> Option<String> {
     let interfaces = crate::network::interface::list_all().await.ok()?;
 
-    // Prefer WiFi interfaces first
-    let wifi_ip = interfaces
+    // Prefer WiFi / VPN — a client-facing URL should advertise the WiFi or
+    // VPN address when there is one, not the Ethernet camera network.
+    let preferred = interfaces
         .iter()
-        .filter(|i| i.is_up && i.is_wifi && !i.is_vpn)
+        .filter(|i| i.is_up && (i.is_wifi || i.is_vpn))
         .flat_map(|i| &i.ips)
-        .next()
+        .find(|ip| !adopted.contains(&ip.address) && !is_apipa(&ip.address))
         .map(|ip| ip.address.clone());
-
-    if wifi_ip.is_some() {
-        return wifi_ip;
+    if preferred.is_some() {
+        return preferred;
     }
 
-    // Fallback: any non-VPN interface with an IP
+    // Fallback: any up interface's first usable address — covers an
+    // Ethernet-only host, where the native client IP sits alongside the
+    // adopted camera secondary and we must advertise the native one.
     interfaces
         .iter()
-        .filter(|i| i.is_up && !i.is_vpn)
+        .filter(|i| i.is_up)
         .flat_map(|i| &i.ips)
-        .next()
+        .find(|ip| !adopted.contains(&ip.address) && !is_apipa(&ip.address))
         .map(|ip| ip.address.clone())
 }
 
@@ -679,6 +747,53 @@ async fn get_local_ip() -> Option<String> {
 mod tests {
     use super::*;
     use crate::config::*;
+
+    fn ip(addr: &str) -> crate::network::interface::IpInfo {
+        crate::network::interface::IpInfo {
+            address: addr.into(),
+            prefix: 24,
+            subnet: "0.0.0.0/24".into(),
+        }
+    }
+
+    fn adopted_set(addrs: &[&str]) -> std::collections::HashSet<String> {
+        addrs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn bind_ip_prefers_native_over_adopted() {
+        // Interface carries a native client IP and an adopted camera
+        // secondary — the native must be chosen for the socket bind.
+        let ips = vec![ip("192.168.1.50"), ip("10.20.30.100")];
+        let adopted = adopted_set(&["10.20.30.100"]);
+        assert_eq!(
+            first_usable_ip(&ips, &adopted).as_deref(),
+            Some("192.168.1.50")
+        );
+    }
+
+    #[test]
+    fn bind_ip_none_when_only_adopted() {
+        // Only an adopted secondary — no usable bind IP, so the caller errors
+        // instead of binding to the camera network.
+        let ips = vec![ip("10.20.30.100")];
+        let adopted = adopted_set(&["10.20.30.100"]);
+        assert!(first_usable_ip(&ips, &adopted).is_none());
+    }
+
+    #[test]
+    fn bind_ip_skips_apipa_but_takes_real_ip() {
+        let adopted = adopted_set(&[]);
+        // APIPA is never selected when a real, non-adopted IP exists...
+        let mixed = vec![ip("169.254.5.5"), ip("192.168.1.50")];
+        assert_eq!(
+            first_usable_ip(&mixed, &adopted).as_deref(),
+            Some("192.168.1.50")
+        );
+        // ...and an APIPA-only interface yields nothing usable.
+        let apipa_only = vec![ip("169.254.5.5")];
+        assert!(first_usable_ip(&apipa_only, &adopted).is_none());
+    }
 
     fn make_settings(
         protocol: StreamProtocol,

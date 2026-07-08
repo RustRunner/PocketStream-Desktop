@@ -58,9 +58,16 @@ pub async fn stop_stream(
 pub async fn start_rtsp_server(
     stream: State<'_, StreamManager>,
     config: State<'_, AppConfig>,
+    network: State<'_, crate::network::NetworkManager>,
 ) -> Result<RtspServerInfo, AppError> {
     let settings = config.get();
-    stream.start_rtsp_server(&settings).await
+    // Adopted camera-network secondaries must never be chosen as the RTSP
+    // bind or advertise IP — pass them so selection can skip them. Tauri
+    // injects the managed NetworkManager, so the JS invoke signature is
+    // unchanged.
+    let adopted: std::collections::HashSet<String> =
+        network.get_adopted_ips().await.into_values().collect();
+    stream.start_rtsp_server(&settings, &adopted).await
 }
 
 #[tauri::command]
