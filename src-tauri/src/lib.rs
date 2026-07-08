@@ -327,7 +327,60 @@ fn setup_logging() {
     }
 
     let _ = dispatch.apply();
+
+    // Global panic hook. Without this a panic at the PacketMonitor FFI
+    // boundary or inside any spawned task tears the process down with no
+    // located breadcrumb. Route the payload, source location, and a
+    // captured backtrace through the same fern sink as normal logging so
+    // the next field crash is attributable to capture / adoption / restore
+    // / streaming rather than "it just disappeared".
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        let payload = panic_payload_str(info.payload());
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        log::error!("PANIC at {}: {}\n{}", location, payload, backtrace);
+    }));
+
     let _ = LOG_DIR.set(log_dir);
+}
+
+/// Best-effort human string from a panic payload. `panic!` / `assert!`
+/// carry either a `&str` (string literals) or a `String` (formatted
+/// messages); anything else is a payload type we can only acknowledge.
+fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+#[cfg(test)]
+mod panic_hook_tests {
+    use super::panic_payload_str;
+
+    #[test]
+    fn extracts_str_literal_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("boom");
+        assert_eq!(panic_payload_str(&*payload), "boom");
+    }
+
+    #[test]
+    fn extracts_string_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(String::from("boom 42"));
+        assert_eq!(panic_payload_str(&*payload), "boom 42");
+    }
+
+    #[test]
+    fn falls_back_for_non_string_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(42i32);
+        assert_eq!(panic_payload_str(&*payload), "<non-string panic payload>");
+    }
 }
 
 pub fn run() {
