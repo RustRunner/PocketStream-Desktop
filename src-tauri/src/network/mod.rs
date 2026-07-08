@@ -1118,8 +1118,6 @@ impl NetworkManager {
                             // but we want a log entry — silent loss leaves
                             // users debugging "where did my camera go?"
                             // after restart with no breadcrumb.
-                            let config: tauri::State<'_, crate::config::AppConfig> =
-                                app_handle_for_adopt.state();
                             // This subnet is now live; drop any held-over
                             // restore for it so the persisted snapshot below
                             // reflects the live binding, not the stale hold.
@@ -1127,12 +1125,31 @@ impl NetworkManager {
                             let live = adopted.lock().await.clone();
                             let pend = pending_restore.lock().await.clone();
                             let snapshot = merge_adopted_config(&live, &pend);
-                            if let Err(e) = config.update_adopted_subnets(snapshot) {
-                                log::warn!(
+                            // Persist off the executor: update_adopted_subnets
+                            // does a synchronous atomic_write + fsync (plus
+                            // DPAPI on the credentials path) under a std lock,
+                            // which would block a tokio worker across disk
+                            // latency. Re-fetch the managed config inside so no
+                            // borrow crosses the thread boundary.
+                            let persist_handle = app_handle_for_adopt.clone();
+                            let persisted = tokio::task::spawn_blocking(move || {
+                                let config: tauri::State<'_, crate::config::AppConfig> =
+                                    persist_handle.state();
+                                config.update_adopted_subnets(snapshot)
+                            })
+                            .await;
+                            match persisted {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => log::warn!(
                                     "Failed to persist adopted subnet {} to config: {}",
                                     device_subnet,
                                     e
-                                );
+                                ),
+                                Err(e) => log::warn!(
+                                    "Persist task for adopted subnet {} failed to join: {}",
+                                    device_subnet,
+                                    e
+                                ),
                             }
                         }
                         Ok(Ok(None)) => {
@@ -1518,17 +1535,27 @@ async fn merge_arp_table(
         // Mirror same-IP dedup to the on-disk cache so reloads don't
         // resurrect the orphan rows.
         if !result.dropped_macs.is_empty() {
-            let config: tauri::State<'_, crate::config::AppConfig> = app_handle.state();
-            for dropped in &result.dropped_macs {
-                if let Err(e) = config.remove_cached_device(dropped) {
-                    log::warn!(
-                        "Failed to evict dupe cache row {} (same IP as {}): {}",
-                        dropped,
-                        device.mac,
-                        e
-                    );
+            // Off the executor: remove_cached_device does a synchronous
+            // fsync'd cache rewrite under a std lock; on a slow disk during an
+            // ARP burst that would stall this worker. Move the eviction to a
+            // blocking thread with owned copies of the keys.
+            let dropped = result.dropped_macs.clone();
+            let survivor = device.mac.clone();
+            let cache_handle = app_handle.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let config: tauri::State<'_, crate::config::AppConfig> = cache_handle.state();
+                for mac in &dropped {
+                    if let Err(e) = config.remove_cached_device(mac) {
+                        log::warn!(
+                            "Failed to evict dupe cache row {} (same IP as {}): {}",
+                            mac,
+                            survivor,
+                            e
+                        );
+                    }
                 }
-            }
+            })
+            .await;
         }
     }
 
