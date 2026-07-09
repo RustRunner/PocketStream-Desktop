@@ -360,29 +360,6 @@ fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-#[cfg(test)]
-mod panic_hook_tests {
-    use super::panic_payload_str;
-
-    #[test]
-    fn extracts_str_literal_payload() {
-        let payload: Box<dyn std::any::Any + Send> = Box::new("boom");
-        assert_eq!(panic_payload_str(&*payload), "boom");
-    }
-
-    #[test]
-    fn extracts_string_payload() {
-        let payload: Box<dyn std::any::Any + Send> = Box::new(String::from("boom 42"));
-        assert_eq!(panic_payload_str(&*payload), "boom 42");
-    }
-
-    #[test]
-    fn falls_back_for_non_string_payload() {
-        let payload: Box<dyn std::any::Any + Send> = Box::new(42i32);
-        assert_eq!(panic_payload_str(&*payload), "<non-string panic payload>");
-    }
-}
-
 pub fn run() {
     setup_logging();
 
@@ -633,4 +610,27 @@ pub fn run() {
                 });
             }
         });
+}
+
+#[cfg(test)]
+mod panic_hook_tests {
+    use super::panic_payload_str;
+
+    #[test]
+    fn extracts_str_literal_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("boom");
+        assert_eq!(panic_payload_str(&*payload), "boom");
+    }
+
+    #[test]
+    fn extracts_string_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(String::from("boom 42"));
+        assert_eq!(panic_payload_str(&*payload), "boom 42");
+    }
+
+    #[test]
+    fn falls_back_for_non_string_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(42i32);
+        assert_eq!(panic_payload_str(&*payload), "<non-string panic payload>");
+    }
 }

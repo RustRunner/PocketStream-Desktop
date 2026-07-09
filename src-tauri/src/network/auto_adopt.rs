@@ -136,7 +136,7 @@ pub async fn reconcile_pending<O: AdoptOps>(ops: &O, pending: &PendingIps, filte
         let guard = pending.lock().await;
         guard
             .iter()
-            .filter(|e| filter.map_or(true, |id| e.adoption_id == id))
+            .filter(|e| filter.is_none_or(|id| e.adoption_id == id))
             .cloned()
             .collect()
     };
@@ -626,7 +626,10 @@ mod tests {
         assert_eq!(got, Some(CANDIDATE));
         // Both the un-released scratch and the final are still bound...
         let bound = ops.bound_ips();
-        assert!(bound.contains(&SCRATCH), "scratch left bound after failed release");
+        assert!(
+            bound.contains(&SCRATCH),
+            "scratch left bound after failed release"
+        );
         assert!(bound.contains(&CANDIDATE));
         // ...and both carry pending breadcrumbs under id 9.
         let ips: Vec<Ipv4Addr> = pending.lock().await.iter().map(|e| e.ip).collect();

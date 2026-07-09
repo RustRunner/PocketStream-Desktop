@@ -247,16 +247,17 @@ pub(crate) async fn run_command_killable(
     let output = tokio::time::timeout(timeout, fut)
         .await
         .map_err(|_| {
-            AppError::Network(format!("{} timed out after {}s", program, timeout.as_secs()))
+            AppError::Network(format!(
+                "{} timed out after {}s",
+                program,
+                timeout.as_secs()
+            ))
         })?
         .map_err(|e| AppError::Network(format!("Failed to run {}: {}", program, e)))?;
     process_command_output(program, output)
 }
 
-fn process_command_output(
-    program: &str,
-    output: std::process::Output,
-) -> Result<String, AppError> {
+fn process_command_output(program: &str, output: std::process::Output) -> Result<String, AppError> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -310,15 +311,23 @@ pub async fn add_secondary_ip(interface: &str, ip: &str, mask: &str) -> Result<(
              -ErrorAction Stop | Out-Null",
             escaped, ip, prefix
         );
-        run_command_killable("powershell", &["-NoProfile", "-Command", &script], IP_CMD_TIMEOUT)
-            .await?;
+        run_command_killable(
+            "powershell",
+            &["-NoProfile", "-Command", &script],
+            IP_CMD_TIMEOUT,
+        )
+        .await?;
     }
 
     #[cfg(target_os = "linux")]
     {
         let cidr = format!("{}/{}", ip, prefix);
-        run_command_killable("ip", &["addr", "add", &cidr, "dev", interface], IP_CMD_TIMEOUT)
-            .await?;
+        run_command_killable(
+            "ip",
+            &["addr", "add", &cidr, "dev", interface],
+            IP_CMD_TIMEOUT,
+        )
+        .await?;
     }
 
     Ok(())
@@ -481,8 +490,12 @@ pub async fn remove_secondary_ip(interface: &str, ip: &str) -> Result<(), AppErr
     {
         // Find the prefix for this IP — default to /24
         let cidr = format!("{}/24", ip);
-        run_command_killable("ip", &["addr", "del", &cidr, "dev", interface], IP_CMD_TIMEOUT)
-            .await?;
+        run_command_killable(
+            "ip",
+            &["addr", "del", &cidr, "dev", interface],
+            IP_CMD_TIMEOUT,
+        )
+        .await?;
     }
 
     Ok(())

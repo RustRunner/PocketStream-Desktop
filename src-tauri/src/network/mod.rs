@@ -539,7 +539,11 @@ impl NetworkManager {
             }
             if ip_str.parse::<Ipv4Addr>().is_ok() {
                 kept.insert(subnet.clone(), ip_str.clone());
-                work_items.push((subnet.clone(), ip_str.clone(), !current_ips.contains(ip_str)));
+                work_items.push((
+                    subnet.clone(),
+                    ip_str.clone(),
+                    !current_ips.contains(ip_str),
+                ));
             } else {
                 // Unparseable IP — proven invalid, drop it from config.
                 log::warn!("Dropping adopted subnet {} — invalid IP {}", subnet, ip_str);
@@ -572,7 +576,12 @@ impl NetworkManager {
                     match ip_config::add_secondary_ip(&iface_name, &ip_str, "255.255.255.0").await {
                         Ok(()) => true,
                         Err(e) => {
-                            log::warn!("Failed to re-add adopted IP {} ({}): {}", ip_str, subnet, e);
+                            log::warn!(
+                                "Failed to re-add adopted IP {} ({}): {}",
+                                ip_str,
+                                subnet,
+                                e
+                            );
                             false
                         }
                     }
@@ -653,10 +662,7 @@ impl NetworkManager {
         // scan await below can't wedge the subnet as "scan in progress"
         // forever. Insert + guard creation happen under one lock.
         let _guard = {
-            let mut active = self
-                .active_scans
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let mut active = self.active_scans.lock().unwrap_or_else(|p| p.into_inner());
             if !active.insert(subnet.to_string()) {
                 return Err(AppError::Network(format!(
                     "Scan already in progress for {}",
@@ -1076,8 +1082,12 @@ impl NetworkManager {
                                     device_subnet,
                                     adopted_ip
                                 );
-                                auto_adopt::reconcile_pending(&ops, &pending_ips, Some(adoption_id))
-                                    .await;
+                                auto_adopt::reconcile_pending(
+                                    &ops,
+                                    &pending_ips,
+                                    Some(adoption_id),
+                                )
+                                .await;
                                 break;
                             }
                             cooldowns.remove(&device_subnet);
@@ -1675,8 +1685,14 @@ mod tests {
         let mut pending = HashMap::new();
         pending.insert("10.9.0.0/24".to_string(), Ipv4Addr::new(10, 9, 0, 100));
         let out = merge_adopted_config(&live, &pending);
-        assert_eq!(out.get("10.0.0.0/24").map(String::as_str), Some("10.0.0.100"));
-        assert_eq!(out.get("10.9.0.0/24").map(String::as_str), Some("10.9.0.100"));
+        assert_eq!(
+            out.get("10.0.0.0/24").map(String::as_str),
+            Some("10.0.0.100")
+        );
+        assert_eq!(
+            out.get("10.9.0.0/24").map(String::as_str),
+            Some("10.9.0.100")
+        );
         assert_eq!(out.len(), 2);
     }
 
@@ -1689,7 +1705,10 @@ mod tests {
         let mut pending = HashMap::new();
         pending.insert("10.0.0.0/24".to_string(), Ipv4Addr::new(10, 0, 0, 200));
         let out = merge_adopted_config(&live, &pending);
-        assert_eq!(out.get("10.0.0.0/24").map(String::as_str), Some("10.0.0.100"));
+        assert_eq!(
+            out.get("10.0.0.0/24").map(String::as_str),
+            Some("10.0.0.100")
+        );
         assert_eq!(out.len(), 1);
     }
 
