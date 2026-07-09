@@ -406,9 +406,137 @@ fn list_all_pnet() -> Result<Vec<InterfaceInfo>, AppError> {
     Ok(result)
 }
 
+/// A local adapter's MAC, up-state, and IPv4 addresses as read from the IP
+/// Helper API. Backs [`quick_status_by_mac`] and [`all_local_ipv4`] on
+/// Windows without touching pnet.
+#[cfg(target_os = "windows")]
+struct WinAdapter {
+    /// Colon-separated, matching the format `parse_adapter` produces, so
+    /// callers can compare MACs regardless of which enumeration path built
+    /// the value they hold.
+    mac: String,
+    is_up: bool,
+    ips: Vec<IpInfo>,
+}
+
+/// Enumerate every local adapter's MAC, up-state, and IPv4 addresses via the
+/// IP Helper `GetAdaptersAddresses`. In-memory, no process spawn.
+///
+/// This exists so the Windows status/collision helpers never call
+/// `pnet::datalink::interfaces()`, whose Windows backend imports
+/// `PacketGetAdapterNames` from Packet.dll. That DLL is delay-loaded and
+/// intentionally never shipped (ARP capture runs on the in-box PacketMonitor
+/// API), so the first pnet interface call would abort the process with the
+/// delay-load "module not found" exception (0xC06D007E) — which is exactly
+/// what happened on the first subnet adoption of a run. IP Helper carries no
+/// such import. Failures return an empty list (fail-open).
+#[cfg(target_os = "windows")]
+fn local_adapters_iphelper() -> Vec<WinAdapter> {
+    use windows_sys::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
+        GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH,
+    };
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKADDR_IN};
+
+    // IF_OPER_STATUS value IfOperStatusUp — the adapter is operational.
+    const IF_OPER_STATUS_UP: i32 = 1;
+
+    let family = AF_INET as u32;
+    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+
+    // Start at the 15 KB Microsoft recommends and grow on overflow. Back the
+    // buffer with u64 so it meets the 8-byte alignment the adapter structs
+    // need — a Vec<u8> would only be 1-byte aligned.
+    let mut size: u32 = 15 * 1024;
+    let mut buf: Vec<u64> = Vec::new();
+    let mut ret = ERROR_BUFFER_OVERFLOW;
+    for _ in 0..4 {
+        buf.clear();
+        buf.resize((size as usize).div_ceil(8), 0);
+        ret = unsafe {
+            GetAdaptersAddresses(
+                family,
+                flags,
+                std::ptr::null(),
+                buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
+                &mut size,
+            )
+        };
+        if ret != ERROR_BUFFER_OVERFLOW {
+            break;
+        }
+    }
+    if ret != 0 {
+        log::debug!("GetAdaptersAddresses failed with code {}", ret);
+        return Vec::new();
+    }
+
+    let mut adapters = Vec::new();
+    let mut cur = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+    while !cur.is_null() {
+        let ad = unsafe { &*cur };
+
+        let mac = if ad.PhysicalAddressLength >= 6 {
+            let p = &ad.PhysicalAddress;
+            format!(
+                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                p[0], p[1], p[2], p[3], p[4], p[5]
+            )
+        } else {
+            String::new()
+        };
+
+        let is_up = ad.OperStatus == IF_OPER_STATUS_UP;
+
+        let mut ips = Vec::new();
+        let mut ua = ad.FirstUnicastAddress;
+        while !ua.is_null() {
+            let u = unsafe { &*ua };
+            let sa = u.Address.lpSockaddr;
+            if !sa.is_null() && unsafe { (*sa).sa_family } == AF_INET {
+                let sin = sa as *const SOCKADDR_IN;
+                let o = unsafe { (*sin).sin_addr.S_un.S_un_b };
+                let addr = std::net::Ipv4Addr::new(o.s_b1, o.s_b2, o.s_b3, o.s_b4);
+                let prefix = u.OnLinkPrefixLength;
+                let subnet = ipnetwork::Ipv4Network::new(addr, prefix)
+                    .map(|n| format!("{}/{}", n.network(), n.prefix()))
+                    .unwrap_or_else(|_| format!("{}/{}", addr, prefix));
+                ips.push(IpInfo {
+                    address: addr.to_string(),
+                    prefix,
+                    subnet,
+                });
+            }
+            ua = u.Next;
+        }
+
+        adapters.push(WinAdapter { mac, is_up, ips });
+        cur = ad.Next;
+    }
+    adapters
+}
+
+/// Lightweight interface status check by MAC (no process spawning, no
+/// network traffic). Matches by MAC address and returns (is_up,
+/// current_ipv4_ips). Cheap enough to poll every few seconds.
+///
+/// On Windows this reads adapter state through the IP Helper API rather than
+/// `pnet::datalink::interfaces()` — see [`local_adapters_iphelper`] for why
+/// the pnet path must never run on Windows.
+#[cfg(target_os = "windows")]
+pub fn quick_status_by_mac(mac: &str) -> Option<(bool, Vec<IpInfo>)> {
+    let target = mac.to_lowercase();
+    local_adapters_iphelper()
+        .into_iter()
+        .find(|a| a.mac.to_lowercase() == target)
+        .map(|a| (a.is_up, a.ips))
+}
+
 /// Lightweight interface status check via pnet (no process spawning).
 /// Matches by MAC address and returns (is_up, current_ipv4_ips).
 /// This is cheap enough to poll every few seconds.
+#[cfg(not(target_os = "windows"))]
 pub fn quick_status_by_mac(mac: &str) -> Option<(bool, Vec<IpInfo>)> {
     let target = mac.to_lowercase();
     let interfaces = pnet::datalink::interfaces();
@@ -433,11 +561,26 @@ pub fn quick_status_by_mac(mac: &str) -> Option<(bool, Vec<IpInfo>)> {
     Some((iface.is_up(), ips))
 }
 
+/// Every IPv4 address currently assigned to any local interface (in-memory,
+/// no process spawn). Used by auto-adopt to avoid picking a candidate IP
+/// already held by another adapter — an ARP probe can't detect the host's
+/// own addresses, so e.g. a WiFi IP on the same /24 as the camera Ethernet
+/// would look "free" and collide.
+///
+/// On Windows this reads through the IP Helper API for the same reason
+/// [`quick_status_by_mac`] does; other platforms use pnet.
+#[cfg(target_os = "windows")]
+pub fn all_local_ipv4() -> Vec<std::net::Ipv4Addr> {
+    local_adapters_iphelper()
+        .iter()
+        .flat_map(|a| &a.ips)
+        .filter_map(|ip| ip.address.parse::<std::net::Ipv4Addr>().ok())
+        .collect()
+}
+
 /// Every IPv4 address currently assigned to any local interface, read
-/// from pnet (in-memory, no process spawn). Used by auto-adopt to avoid
-/// picking a candidate IP already held by another adapter — an ARP probe
-/// can't detect the host's own addresses, so e.g. a WiFi IP on the same
-/// /24 as the camera Ethernet would look "free" and collide.
+/// from pnet (in-memory, no process spawn). See the Windows variant above.
+#[cfg(not(target_os = "windows"))]
 pub fn all_local_ipv4() -> Vec<std::net::Ipv4Addr> {
     pnet::datalink::interfaces()
         .iter()
