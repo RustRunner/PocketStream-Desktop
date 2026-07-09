@@ -20,6 +20,7 @@ use std::net::Ipv4Addr;
 use ipnetwork::Ipv4Network;
 
 use super::interface::{self, InterfaceInfo, IpInfo};
+use crate::config::CachedDevice;
 
 /// Canonical (network-address) `Ipv4Network` for an interface IP, or
 /// `None` for an unparseable / non-IPv4 address. Keeps the real prefix
@@ -127,6 +128,25 @@ pub fn classify_adoption(
     } else {
         AdoptionClass::Keep
     }
+}
+
+/// Split cached device rows into `(allowed, rejected)`. A row is rejected
+/// only when its IP parses *and* falls inside a structural-ghost network,
+/// so a WiFi/VPN/virtual row is evicted while a foreign camera subnet
+/// (CAM/PTU, owned by no local interface) is always allowed. Rows with an
+/// unparseable IP stay in `allowed` — `hydrate_from_cache` drops those on
+/// its own. Rejection keys on ghost overlap only, never on offline status,
+/// so an offline-but-legitimate camera is never evicted here.
+pub fn partition_cached(
+    cached: Vec<CachedDevice>,
+    ghosts: &[Ipv4Network],
+) -> (Vec<CachedDevice>, Vec<CachedDevice>) {
+    cached
+        .into_iter()
+        .partition(|d| match d.ip.parse::<Ipv4Addr>() {
+            Ok(ip) => !is_structural_ghost_ip(ip, ghosts),
+            Err(_) => true,
+        })
 }
 
 #[cfg(test)]
@@ -388,5 +408,55 @@ mod tests {
             classify_adoption("172.28.5.0/24", "172.28.5.42", &native(&[]), &ghosts),
             AdoptionClass::PruneGhost
         );
+    }
+
+    // ── partition_cached ────────────────────────────────────────────
+
+    fn cached(mac: &str, ip: &str) -> CachedDevice {
+        CachedDevice {
+            mac: mac.into(),
+            ip: ip.into(),
+            subnet: String::new(),
+            open_ports: vec![],
+            alias: String::new(),
+            last_seen: String::new(),
+        }
+    }
+
+    #[test]
+    fn partition_rejects_ghost_keeps_foreign_and_unparseable() {
+        let ghosts = vec![net("192.168.12.0/24")];
+        let rows = vec![
+            cached("aa", "192.168.12.50"), // ghost → rejected
+            cached("bb", "10.13.248.84"),  // foreign camera → allowed
+            cached("cc", "not-an-ip"),     // unparseable → allowed
+        ];
+        let (allowed, rejected) = partition_cached(rows, &ghosts);
+        let allowed_macs: Vec<&str> = allowed.iter().map(|d| d.mac.as_str()).collect();
+        let rejected_macs: Vec<&str> = rejected.iter().map(|d| d.mac.as_str()).collect();
+        assert_eq!(rejected_macs, vec!["aa"]);
+        assert!(allowed_macs.contains(&"bb"));
+        assert!(allowed_macs.contains(&"cc"));
+        assert_eq!(allowed.len(), 2);
+    }
+
+    #[test]
+    fn partition_rejects_row_in_wide_ghost_prefix() {
+        // A /16 ghost containing a /24-keyed row is rejected by IP
+        // containment.
+        let ghosts = vec![net("172.28.0.0/16")];
+        let (allowed, rejected) = partition_cached(vec![cached("dd", "172.28.5.9")], &ghosts);
+        assert!(allowed.is_empty());
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].mac, "dd");
+    }
+
+    #[test]
+    fn partition_empty_ghosts_keeps_all() {
+        // Fail-open: no ghosts enumerated → nothing evicted.
+        let rows = vec![cached("ee", "192.168.12.50"), cached("ff", "10.0.0.1")];
+        let (allowed, rejected) = partition_cached(rows, &[]);
+        assert_eq!(allowed.len(), 2);
+        assert!(rejected.is_empty());
     }
 }

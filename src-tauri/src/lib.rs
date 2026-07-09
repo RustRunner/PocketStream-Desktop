@@ -515,7 +515,7 @@ pub fn run() {
                 if mode == config::NetworkMode::StaticManual {
                     manager.hydrate_manual_nodes(&config).await;
                 } else {
-                    manager.hydrate_device_registry(&config);
+                    manager.hydrate_device_registry(&config).await;
                 }
                 manager.load_adopted_from_config(&config, &handle).await;
 

@@ -255,13 +255,37 @@ impl NetworkManager {
     /// (the registry's own one-shot guard prevents re-hydration), but
     /// expected to be called once at startup before ARP discovery so
     /// the initial snapshot reflects last-known state.
-    pub fn hydrate_device_registry(&self, config: &crate::config::AppConfig) {
+    ///
+    /// Cached rows on a subnet owned by an up non-wired local interface
+    /// (WiFi/VPN/virtual) are filtered out before hydration and evicted
+    /// from the on-disk cache, so ghost devices don't reappear as nodes or
+    /// persist across restarts. Rejection keys on ghost overlap only — never
+    /// on offline status — so a foreign/offline camera (CAM/PTU) is kept.
+    pub async fn hydrate_device_registry(&self, config: &crate::config::AppConfig) {
         let cached = config.get_cache();
-        let count = cached.len();
-        let result = self.device_registry.hydrate_from_cache(&cached);
-        if !result.changed {
-            return;
+
+        // Fail-open: an empty ghost set (enumeration failure) rejects
+        // nothing, so a transient adapter-query hiccup can't wipe the cache.
+        let ghosts = ghost::non_wired_interface_networks().await;
+        let (allowed, rejected) = ghost::partition_cached(cached, &ghosts);
+
+        let result = self.device_registry.hydrate_from_cache(&allowed);
+
+        // Evict ghost rows from the on-disk cache (best-effort) so they don't
+        // resurrect on next startup. Runs independently of `result.changed`
+        // — if every cached row was a ghost, nothing hydrated but the cache
+        // still needs cleaning.
+        for device in &rejected {
+            log::info!(
+                "Evicting cached device {} ({}) — on a non-wired subnet",
+                device.ip,
+                device.mac
+            );
+            if let Err(e) = config.remove_cached_device(&device.mac) {
+                log::warn!("Failed to evict ghost cache row {}: {}", device.mac, e);
+            }
         }
+
         // Mirror same-IP dedup decisions onto the on-disk cache so the
         // orphans don't reappear on next startup. Cache file mutations
         // are best-effort: a failure logs but doesn't block boot.
@@ -270,10 +294,15 @@ impl NetworkManager {
                 log::warn!("Failed to evict dupe cache row {}: {}", mac, e);
             }
         }
+
+        if !result.changed && rejected.is_empty() {
+            return;
+        }
         log::info!(
-            "DeviceRegistry: hydrated {} cached device(s) (dropped {} dupe(s))",
-            count - result.dropped_macs.len(),
-            result.dropped_macs.len()
+            "DeviceRegistry: hydrated {} cached device(s) (dropped {} dupe(s), evicted {} ghost(s))",
+            allowed.len() - result.dropped_macs.len(),
+            result.dropped_macs.len(),
+            rejected.len()
         );
     }
 
@@ -378,7 +407,7 @@ impl NetworkManager {
             // Leaving Manual: drop manual hydrations, restore the
             // cache, restart ARP discovery if an interface is known.
             self.device_registry.clear();
-            self.hydrate_device_registry(config);
+            self.hydrate_device_registry(config).await;
             if let Some(emitter) = self.device_emitter.lock().await.clone() {
                 emitter.poke();
             }
