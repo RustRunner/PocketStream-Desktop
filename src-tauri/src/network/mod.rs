@@ -746,6 +746,21 @@ impl NetworkManager {
             iface_info.mac
         );
 
+        // Scope discovery to the wired Ethernet port. The capture backend
+        // is unscoped, so enumerate the subnets owned exclusively by
+        // non-Ethernet interfaces (WiFi/VPN) and drop ARP for any peer on
+        // them. Cameras on the Ethernet subnet, or on a foreign/APIPA
+        // subnet awaiting adoption, are untouched.
+        let excluded_subnets = non_ethernet_subnets().await;
+        if excluded_subnets.is_empty() {
+            log::info!("Discovery: no non-Ethernet subnets to exclude");
+        } else {
+            log::info!(
+                "Discovery excluding non-Ethernet (WiFi/VPN) subnets: {:?}",
+                excluded_subnets
+            );
+        }
+
         let registry = self.device_registry.clone();
 
         // Late-bind the emitter now that we have an AppHandle. Reuse the
@@ -777,6 +792,7 @@ impl NetworkManager {
             ethernet_ips,
             own_mac,
             fence.clone(),
+            excluded_subnets.clone(),
         )?;
         *self.arp_listener_handle.lock().await = Some(handle);
 
@@ -789,6 +805,7 @@ impl NetworkManager {
         let sweep_emitter = emitter.clone();
         let sweep_app_handle = app_handle_for_adopt.clone();
         let sweep_fence = fence.clone();
+        let sweep_excluded = excluded_subnets;
         tokio::spawn(async move {
             // Small delay to let the capture listener start first
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -818,6 +835,7 @@ impl NetworkManager {
                     sweep_emitter.clone(),
                     sweep_app_handle.clone(),
                     sweep_iface_ip,
+                    &sweep_excluded,
                     &sweep_fence,
                 )
                 .await;
@@ -847,11 +865,11 @@ impl NetworkManager {
 
             let missed = arp::missed_max();
             log::warn!(
-                "Discovery degraded: no ARP payload events within {}s of the ping sweep (missed_max={}, tasks_dropped={}, wifi_dropped={})",
+                "Discovery degraded: no ARP payload events within {}s of the ping sweep (missed_max={}, tasks_dropped={}, noneth_dropped={})",
                 INITIAL_WINDOW.as_secs(),
                 missed,
                 arp::tasks_dropped(),
-                arp::wifi_dropped()
+                arp::noneth_dropped()
             );
             let _ = watchdog_app.emit(
                 "discovery-degraded",
@@ -1158,12 +1176,16 @@ impl NetworkManager {
                                         sweep_ip
                                     );
                                     ping_sweep_subnets(std::slice::from_ref(&sweep_ip)).await;
+                                    // The adopted subnet is on the Ethernet
+                                    // interface, so no non-Ethernet exclusion
+                                    // applies to this post-adoption merge.
                                     merge_arp_table(
                                         sweep_devices.clone(),
                                         sweep_registry.clone(),
                                         sweep_emitter.clone(),
                                         sweep_handle.clone(),
                                         &sweep_ip,
+                                        &[],
                                         &sweep_fence,
                                     )
                                     .await;
@@ -1537,12 +1559,57 @@ async fn ping_sweep_subnets(interface_ips: &[String]) {
 /// This catches hosts whose ARP entries were already cached in the OS
 /// (e.g. from a prior browser visit), since the ping sweep won't generate
 /// new ARP packets on the wire for those hosts.
+/// Subnets owned exclusively by non-Ethernet interfaces (WiFi/VPN) that
+/// are currently up. Discovery drops ARP whose sender IP falls in one of
+/// these, so only the wired Ethernet port's peers become nodes. A subnet
+/// that is ALSO present on an Ethernet interface is deliberately left out
+/// of the result, so a camera sharing the Ethernet subnet is never
+/// dropped; a camera on a foreign/APIPA subnet awaiting adoption is
+/// untouched because that subnet belongs to no interface here. On
+/// enumeration failure the list is empty — fail open (scan everything)
+/// rather than blind discovery.
+async fn non_ethernet_subnets() -> Vec<ipnetwork::Ipv4Network> {
+    let ifaces = match interface::list_all().await {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!(
+                "Could not enumerate interfaces to scope discovery to Ethernet: {}",
+                e
+            );
+            return Vec::new();
+        }
+    };
+    let ethernet: Vec<ipnetwork::Ipv4Network> = ifaces
+        .iter()
+        .filter(|i| i.is_up && i.is_ethernet)
+        .flat_map(|i| i.ips.iter().filter_map(ip_to_network))
+        .collect();
+    let mut excluded: Vec<ipnetwork::Ipv4Network> = Vec::new();
+    for iface in ifaces.iter().filter(|i| i.is_up && !i.is_ethernet) {
+        for net in iface.ips.iter().filter_map(ip_to_network) {
+            if !ethernet.contains(&net) && !excluded.contains(&net) {
+                excluded.push(net);
+            }
+        }
+    }
+    excluded
+}
+
+/// Canonical (network-address) `Ipv4Network` for an interface IP, or
+/// `None` for an unparseable / non-IPv4 address.
+fn ip_to_network(ip: &interface::IpInfo) -> Option<ipnetwork::Ipv4Network> {
+    let addr: std::net::Ipv4Addr = ip.address.parse().ok()?;
+    let net = ipnetwork::Ipv4Network::new(addr, ip.prefix).ok()?;
+    ipnetwork::Ipv4Network::new(net.network(), ip.prefix).ok()
+}
+
 async fn merge_arp_table(
     devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
     registry: Arc<DeviceRegistry>,
     emitter: Arc<DeviceListEmitter>,
     app_handle: tauri::AppHandle,
     interface_ip: &str,
+    excluded: &[ipnetwork::Ipv4Network],
     fence: &SweepFence,
 ) {
     use tauri::{Emitter, Manager};
@@ -1565,6 +1632,13 @@ async fn merge_arp_table(
         let mut map = devices.lock().await;
         let mut collected = Vec::new();
         for (ip, mac) in entries {
+            if excluded.iter().any(|net| net.contains(ip)) {
+                // Sender on a non-Ethernet (WiFi/VPN) subnet — not a wired
+                // peer. The OS neighbor read is InterfaceIndex-scoped, so
+                // this usually has nothing to drop; it is a safety net for a
+                // shared-subnet or bridged layout.
+                continue;
+            }
             if map.contains_key(&mac) {
                 continue;
             }

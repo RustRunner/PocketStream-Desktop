@@ -46,12 +46,12 @@ static DATA_CB_PANIC_LOGGED: AtomicBool = AtomicBool::new(false);
 /// was saturated (a distinct-tuple flood or a slow registry). Never resets.
 static ARP_TASKS_DROPPED: AtomicU64 = AtomicU64::new(0);
 
-/// Count of ARP frames dropped because they were captured on a Wi-Fi
-/// adapter rather than the wired Ethernet port. The capture backend is
-/// unscoped, so wireless ARP (the WiFi gateway and other wireless hosts)
-/// reaches the callback; discovery is Ethernet-only, so these are
+/// Count of ARP frames dropped because the sender IP is on a subnet owned
+/// exclusively by a non-Ethernet interface (WiFi/VPN). The capture backend
+/// is unscoped, so wireless ARP (the WiFi gateway and other wireless hosts)
+/// reaches the callback; discovery is wired-Ethernet only, so these are
 /// filtered before they can become nodes. Never resets.
-static ARP_WIFI_DROPPED: AtomicU64 = AtomicU64::new(0);
+static ARP_NONETH_DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Total ARP frames dropped due to the callback-task bound this session.
 /// A diagnostic companion to [`frames_seen`] / [`missed_max`].
@@ -59,10 +59,10 @@ pub fn tasks_dropped() -> u64 {
     ARP_TASKS_DROPPED.load(Ordering::Relaxed)
 }
 
-/// Total ARP frames dropped because they arrived on a Wi-Fi adapter —
-/// wireless peers filtered out to keep discovery wired-Ethernet only.
-pub fn wifi_dropped() -> u64 {
-    ARP_WIFI_DROPPED.load(Ordering::Relaxed)
+/// Total ARP frames dropped because the sender IP is on a non-Ethernet
+/// (WiFi/VPN) subnet — filtered out to keep discovery wired-Ethernet only.
+pub fn noneth_dropped() -> u64 {
+    ARP_NONETH_DROPPED.load(Ordering::Relaxed)
 }
 
 /// Total ARP frames parsed by the capture backend so far this process.
@@ -145,8 +145,13 @@ struct CallbackContext {
     canary_logged: AtomicBool,
     /// One-shot latch for the task-bound-reached (flood) warning.
     flood_logged: AtomicBool,
-    /// One-shot latch for the "filtering WiFi ARP" notice.
-    wifi_logged: AtomicBool,
+    /// One-shot latch for the "filtering non-Ethernet subnet" notice.
+    noneth_logged: AtomicBool,
+    /// Subnets owned exclusively by non-Ethernet interfaces (WiFi/VPN). An
+    /// ARP whose sender IP falls in one of these is dropped, so only the
+    /// wired Ethernet port's peers become nodes. Empty ⇒ no filtering
+    /// (interface enumeration failed, or there were no such subnets).
+    excluded_subnets: Vec<ipnetwork::Ipv4Network>,
 }
 
 /// No-op event callback. The realtime stream signals lifecycle events
@@ -272,22 +277,6 @@ unsafe fn data_cb_inner(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor
     }
     let packet_type = meta.map(|m| m.packet_type).unwrap_or(0);
 
-    // Gate discovery to the wired Ethernet port. The capture backend is
-    // unscoped (only the in-driver EtherType=ARP constraint applies), so
-    // ARP from the WiFi side — the WiFi gateway and other wireless hosts —
-    // arrives here too, normalized to Ethernet II framing, and would land
-    // as phantom nodes. The metadata tags the source medium; drop frames
-    // captured on Wi-Fi. Only an explicit WiFi tag is dropped — a
-    // missing or otherwise-tagged frame is left to pass, so a wired
-    // camera whose medium tag we can't read is never filtered out.
-    if packet_type == pktmon::PACKET_TYPE_WIFI {
-        ARP_WIFI_DROPPED.fetch_add(1, Ordering::Relaxed);
-        if !ctx.wifi_logged.swap(true, Ordering::Relaxed) {
-            log::info!("Filtering WiFi ARP out of discovery — wired-Ethernet peers only");
-        }
-        return;
-    }
-
     let po = desc.packet_offset as usize;
     let pl = desc.packet_length as usize;
     let Some((frame_start, frame_end)) = checked_packet_range(blob.len(), po, pl) else {
@@ -299,6 +288,25 @@ unsafe fn data_cb_inner(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor
         return;
     };
     if ip == Ipv4Addr::new(0, 0, 0, 0) {
+        return;
+    }
+    // Gate discovery to the wired Ethernet port. The capture backend is
+    // unscoped (only the in-driver EtherType=ARP constraint applies), so
+    // ARP from the WiFi side — the WiFi gateway and other wireless hosts —
+    // reaches this callback and would otherwise become phantom nodes. Drop
+    // any sender whose IP is on a subnet owned exclusively by a non-Ethernet
+    // interface. This never touches the Ethernet port's own subnet or a
+    // foreign subnet, so a wired camera — including one still on its
+    // factory/APIPA subnet awaiting adoption — is never filtered out.
+    if ctx.excluded_subnets.iter().any(|net| net.contains(ip)) {
+        ARP_NONETH_DROPPED.fetch_add(1, Ordering::Relaxed);
+        if !ctx.noneth_logged.swap(true, Ordering::Relaxed) {
+            log::info!(
+                "Filtering ARP {} on a non-Ethernet subnet out of discovery (packet_type={})",
+                ip,
+                packet_type
+            );
+        }
         return;
     }
     // Skip our own gratuitous ARP (emitted when we add a secondary IP);
@@ -443,6 +451,10 @@ async fn on_arp_seen(
 ///
 /// `own_mac` — the target adapter's own MAC; ARP frames sent by it are
 /// skipped (see [`on_arp_seen`]'s phantom-peer note).
+///
+/// `excluded_subnets` — subnets owned exclusively by non-Ethernet
+/// interfaces; a captured ARP whose sender IP is in one is dropped.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn start_listener(
     devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
     registry: Arc<DeviceRegistry>,
@@ -451,6 +463,7 @@ pub(crate) fn start_listener(
     ethernet_ips: Vec<Ipv4Addr>,
     own_mac: Option<[u8; 6]>,
     fence: super::SweepFence,
+    excluded_subnets: Vec<ipnetwork::Ipv4Network>,
 ) -> Result<ArpListenerHandle, AppError> {
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let runtime = tokio::runtime::Handle::current();
@@ -474,7 +487,8 @@ pub(crate) fn start_listener(
             missed_logged: AtomicBool::new(false),
             canary_logged: AtomicBool::new(false),
             flood_logged: AtomicBool::new(false),
-            wifi_logged: AtomicBool::new(false),
+            noneth_logged: AtomicBool::new(false),
+            excluded_subnets,
         });
 
         let config = pktmon::RealtimeStreamConfiguration {
