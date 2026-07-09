@@ -183,10 +183,17 @@ mod imp {
             // Prefer an ethernet adapter that has at least one IPv4 address.
             // Fall back to the first ethernet adapter so "disconnected but
             // still known" surfaces in the UI as per the relaxed-filter plan.
+            // Exclude VPN and virtual adapters from both arms so a
+            // VPN-as-Ethernet or virtual switch never drives the camera-port
+            // banner; the relaxed up-state (no is_up check) is kept on
+            // purpose so a disconnected wired port still shows the banner.
             let pick = list
                 .iter()
-                .find(|i| i.is_ethernet && !i.ips.is_empty())
-                .or_else(|| list.iter().find(|i| i.is_ethernet))
+                .find(|i| i.is_ethernet && !i.is_vpn && !i.is_virtual && !i.ips.is_empty())
+                .or_else(|| {
+                    list.iter()
+                        .find(|i| i.is_ethernet && !i.is_vpn && !i.is_virtual)
+                })
                 .cloned();
 
             if let Some(iface) = pick {

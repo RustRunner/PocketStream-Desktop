@@ -3,6 +3,7 @@ pub mod arp;
 pub mod auto_adopt;
 pub mod device_registry;
 pub mod firewall;
+pub mod ghost;
 pub mod interface;
 pub mod ip_config;
 pub mod ping_dot;
@@ -387,7 +388,7 @@ impl NetworkManager {
                     Some(n) => Some(n),
                     None => interface::list_physical().await.ok().and_then(|list| {
                         list.into_iter()
-                            .find(|i| i.is_up && i.is_ethernet && !i.ips.is_empty())
+                            .find(|i| interface::is_wired_ethernet(i) && !i.ips.is_empty())
                             .map(|i| i.name)
                     }),
                 };
@@ -486,7 +487,7 @@ impl NetworkManager {
         let iface = match interface::list_physical().await {
             Ok(interfaces) => interfaces
                 .into_iter()
-                .find(|i| i.is_up && i.is_ethernet && !i.ips.is_empty()),
+                .find(|i| interface::is_wired_ethernet(i) && !i.ips.is_empty()),
             Err(_) => None,
         };
 
@@ -748,15 +749,15 @@ impl NetworkManager {
 
         // Scope discovery to the wired Ethernet port. The capture backend
         // is unscoped, so enumerate the subnets owned exclusively by
-        // non-Ethernet interfaces (WiFi/VPN) and drop ARP for any peer on
-        // them. Cameras on the Ethernet subnet, or on a foreign/APIPA
+        // non-wired interfaces (WiFi/VPN/virtual) and drop ARP for any peer
+        // on them. Cameras on the Ethernet subnet, or on a foreign/APIPA
         // subnet awaiting adoption, are untouched.
-        let excluded_subnets = non_ethernet_subnets().await;
+        let excluded_subnets = ghost::non_wired_interface_networks().await;
         if excluded_subnets.is_empty() {
-            log::info!("Discovery: no non-Ethernet subnets to exclude");
+            log::info!("Discovery: no non-wired subnets to exclude");
         } else {
             log::info!(
-                "Discovery excluding non-Ethernet (WiFi/VPN) subnets: {:?}",
+                "Discovery excluding non-wired (WiFi/VPN/virtual) subnets: {:?}",
                 excluded_subnets
             );
         }
@@ -1559,50 +1560,6 @@ async fn ping_sweep_subnets(interface_ips: &[String]) {
 /// This catches hosts whose ARP entries were already cached in the OS
 /// (e.g. from a prior browser visit), since the ping sweep won't generate
 /// new ARP packets on the wire for those hosts.
-/// Subnets owned exclusively by non-Ethernet interfaces (WiFi/VPN) that
-/// are currently up. Discovery drops ARP whose sender IP falls in one of
-/// these, so only the wired Ethernet port's peers become nodes. A subnet
-/// that is ALSO present on an Ethernet interface is deliberately left out
-/// of the result, so a camera sharing the Ethernet subnet is never
-/// dropped; a camera on a foreign/APIPA subnet awaiting adoption is
-/// untouched because that subnet belongs to no interface here. On
-/// enumeration failure the list is empty — fail open (scan everything)
-/// rather than blind discovery.
-async fn non_ethernet_subnets() -> Vec<ipnetwork::Ipv4Network> {
-    let ifaces = match interface::list_all().await {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!(
-                "Could not enumerate interfaces to scope discovery to Ethernet: {}",
-                e
-            );
-            return Vec::new();
-        }
-    };
-    let ethernet: Vec<ipnetwork::Ipv4Network> = ifaces
-        .iter()
-        .filter(|i| i.is_up && i.is_ethernet)
-        .flat_map(|i| i.ips.iter().filter_map(ip_to_network))
-        .collect();
-    let mut excluded: Vec<ipnetwork::Ipv4Network> = Vec::new();
-    for iface in ifaces.iter().filter(|i| i.is_up && !i.is_ethernet) {
-        for net in iface.ips.iter().filter_map(ip_to_network) {
-            if !ethernet.contains(&net) && !excluded.contains(&net) {
-                excluded.push(net);
-            }
-        }
-    }
-    excluded
-}
-
-/// Canonical (network-address) `Ipv4Network` for an interface IP, or
-/// `None` for an unparseable / non-IPv4 address.
-fn ip_to_network(ip: &interface::IpInfo) -> Option<ipnetwork::Ipv4Network> {
-    let addr: std::net::Ipv4Addr = ip.address.parse().ok()?;
-    let net = ipnetwork::Ipv4Network::new(addr, ip.prefix).ok()?;
-    ipnetwork::Ipv4Network::new(net.network(), ip.prefix).ok()
-}
-
 async fn merge_arp_table(
     devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
     registry: Arc<DeviceRegistry>,

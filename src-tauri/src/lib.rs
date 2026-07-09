@@ -521,9 +521,9 @@ pub fn run() {
 
                 match network::interface::list_physical().await {
                     Ok(interfaces) => {
-                        let eth = interfaces
-                            .iter()
-                            .find(|i| i.is_up && i.is_ethernet && !i.ips.is_empty());
+                        let eth = interfaces.iter().find(|i| {
+                            network::interface::is_wired_ethernet(i) && !i.ips.is_empty()
+                        });
 
                         if let Some(iface) = eth {
                             // ARP discovery (and the auto-adopt loop it

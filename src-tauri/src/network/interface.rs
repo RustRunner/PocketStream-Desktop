@@ -83,6 +83,16 @@ pub struct InterfaceInfo {
     pub is_virtual: bool,
 }
 
+/// The shared "is this a wired camera port?" predicate. A camera-capable
+/// adapter is up, Ethernet media, and neither a VPN nor an OS-virtual
+/// adapter. Every adapter-selection site funnels through this so a
+/// VPN-as-Ethernet or virtual-switch adapter can never be picked as the
+/// camera port. Lives here (not in `ghost`) so selection sites can use it
+/// without pulling in the ghost-subnet module.
+pub fn is_wired_ethernet(i: &InterfaceInfo) -> bool {
+    i.is_up && i.is_ethernet && !i.is_vpn && !i.is_virtual
+}
+
 /// List physical (non-VPN) network interfaces.
 pub async fn list_physical() -> Result<Vec<InterfaceInfo>, AppError> {
     #[cfg(target_os = "windows")]
@@ -132,9 +142,6 @@ pub async fn list_all() -> Result<Vec<InterfaceInfo>, AppError> {
 /// Deliberately separate from [`list_all`]: `list_all` backs the VPN IPC
 /// command and the streaming display-IP fallback, neither of which should
 /// widen to advertise a virtual-switch NAT address.
-// Not yet called from non-test code — the discovery ghost-subnet filter is
-// its in-crate consumer.
-#[allow(dead_code)]
 pub async fn list_all_adapters() -> Result<Vec<InterfaceInfo>, AppError> {
     #[cfg(target_os = "windows")]
     {
@@ -340,7 +347,6 @@ async fn list_vpn_windows() -> Result<Vec<InterfaceInfo>, AppError> {
 }
 
 #[cfg(target_os = "windows")]
-#[allow(dead_code)]
 async fn list_all_adapters_windows() -> Result<Vec<InterfaceInfo>, AppError> {
     // `$true` splices into the shared filter as `(...) -and $true`, i.e. no
     // adapter-level filtering beyond the Up/Disconnected status gate — every
