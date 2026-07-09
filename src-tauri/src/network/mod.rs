@@ -499,6 +499,12 @@ impl NetworkManager {
             }
         };
 
+        // Structural-ghost networks owned by up, non-wired local interfaces
+        // (WiFi/VPN/virtual). Fails open to empty on an enumeration error, so
+        // a transient adapter-query failure just skips ghost pruning this
+        // boot rather than dropping legitimate adoptions.
+        let ghosts = ghost::non_wired_interface_networks().await;
+
         // Build the set of /24 subnets the adapter already covers natively.
         // "Native" means: an IP on the adapter that is NOT the result of a
         // previous adoption. Without this filter, Windows' registry-backed
@@ -529,26 +535,38 @@ impl NetworkManager {
         let mut kept: HashMap<String, String> = HashMap::new();
         let mut pruned = false;
         for (subnet, ip_str) in &settings.adopted_subnets {
-            if native_subnets.contains(subnet) {
-                log::info!(
-                    "Pruning adopted subnet {} ({}) — adapter already covers it natively",
-                    subnet,
-                    ip_str,
-                );
-                pruned = true;
-                continue;
-            }
-            if ip_str.parse::<Ipv4Addr>().is_ok() {
-                kept.insert(subnet.clone(), ip_str.clone());
-                work_items.push((
-                    subnet.clone(),
-                    ip_str.clone(),
-                    !current_ips.contains(ip_str),
-                ));
-            } else {
-                // Unparseable IP — proven invalid, drop it from config.
-                log::warn!("Dropping adopted subnet {} — invalid IP {}", subnet, ip_str);
-                pruned = true;
+            match ghost::classify_adoption(subnet, ip_str, &native_subnets, &ghosts) {
+                ghost::AdoptionClass::PruneNative => {
+                    log::info!(
+                        "Pruning adopted subnet {} ({}) — adapter already covers it natively",
+                        subnet,
+                        ip_str,
+                    );
+                    pruned = true;
+                }
+                ghost::AdoptionClass::PruneGhost => {
+                    // Auto-heal a persisted WiFi/VPN/virtual-switch adoption:
+                    // drop it from config and never re-bind it.
+                    log::info!(
+                        "Pruning adopted subnet {} ({}) — owned by a non-wired local interface (WiFi/VPN/virtual)",
+                        subnet,
+                        ip_str,
+                    );
+                    pruned = true;
+                }
+                ghost::AdoptionClass::PruneInvalid => {
+                    // Unparseable IP — proven invalid, drop it from config.
+                    log::warn!("Dropping adopted subnet {} — invalid IP {}", subnet, ip_str);
+                    pruned = true;
+                }
+                ghost::AdoptionClass::Keep => {
+                    kept.insert(subnet.clone(), ip_str.clone());
+                    work_items.push((
+                        subnet.clone(),
+                        ip_str.clone(),
+                        !current_ips.contains(ip_str),
+                    ));
+                }
             }
         }
 

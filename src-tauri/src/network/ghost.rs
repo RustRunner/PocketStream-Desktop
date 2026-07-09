@@ -14,6 +14,7 @@
 //! cannot be constructed in lib tests, so the `mod.rs` callers are thin
 //! wiring over these functions.
 
+use std::collections::HashSet;
 use std::net::Ipv4Addr;
 
 use ipnetwork::Ipv4Network;
@@ -85,8 +86,6 @@ pub fn is_structural_ghost_ip(ip: Ipv4Addr, networks: &[Ipv4Network]) -> bool {
 /// a /24 adoption key contained in a wider WiFi/VPN /16. A key that fails
 /// to parse is treated as **not** a ghost — fail open, never prune an
 /// adoption we cannot classify.
-// Wired into the restore-time prune.
-#[allow(dead_code)]
 pub fn is_structural_ghost_adoption(subnet_key: &str, networks: &[Ipv4Network]) -> bool {
     let key_net: Ipv4Network = match subnet_key.parse() {
         Ok(n) => n,
@@ -95,6 +94,41 @@ pub fn is_structural_ghost_adoption(subnet_key: &str, networks: &[Ipv4Network]) 
     networks
         .iter()
         .any(|net| net.contains(key_net.network()) || key_net.contains(net.network()))
+}
+
+/// How a persisted adoption entry should be handled on restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdoptionClass {
+    /// Re-bind and keep.
+    Keep,
+    /// The wired adapter already covers this subnet natively — drop it.
+    PruneNative,
+    /// Owned by a non-wired local interface (WiFi/VPN/virtual) — drop it.
+    PruneGhost,
+    /// The saved IP does not parse — drop it.
+    PruneInvalid,
+}
+
+/// Pure restore-time decision for one `adopted_subnets` entry. Precedence:
+/// native coverage first (the adapter owns it outright), then structural
+/// ghost (a non-wired interface owns it), then an unparseable IP; anything
+/// else is kept and re-bound. A foreign camera subnet owned by no local
+/// interface (e.g. CAM) is neither native nor ghost, so it is kept.
+pub fn classify_adoption(
+    subnet_key: &str,
+    ip_str: &str,
+    native_subnets: &HashSet<String>,
+    ghosts: &[Ipv4Network],
+) -> AdoptionClass {
+    if native_subnets.contains(subnet_key) {
+        AdoptionClass::PruneNative
+    } else if is_structural_ghost_adoption(subnet_key, ghosts) {
+        AdoptionClass::PruneGhost
+    } else if ip_str.parse::<Ipv4Addr>().is_err() {
+        AdoptionClass::PruneInvalid
+    } else {
+        AdoptionClass::Keep
+    }
 }
 
 #[cfg(test)]
@@ -298,5 +332,63 @@ mod tests {
         let ghosts = vec![net("192.168.12.0/24")];
         assert!(!is_structural_ghost_adoption("not-a-subnet", &ghosts));
         assert!(!is_structural_ghost_adoption("", &ghosts));
+    }
+
+    // ── classify_adoption ───────────────────────────────────────────
+
+    fn native(subnets: &[&str]) -> HashSet<String> {
+        subnets.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn classify_native_subnet_prunes_native() {
+        let n = native(&["192.168.1.0/24"]);
+        assert_eq!(
+            classify_adoption("192.168.1.0/24", "192.168.1.50", &n, &[]),
+            AdoptionClass::PruneNative
+        );
+    }
+
+    #[test]
+    fn classify_ghost_subnet_prunes_ghost() {
+        let ghosts = vec![net("192.168.12.0/24")];
+        assert_eq!(
+            classify_adoption("192.168.12.0/24", "192.168.12.103", &native(&[]), &ghosts),
+            AdoptionClass::PruneGhost
+        );
+    }
+
+    #[test]
+    fn classify_invalid_ip_prunes_invalid() {
+        assert_eq!(
+            classify_adoption("10.5.0.0/24", "not-an-ip", &native(&[]), &[]),
+            AdoptionClass::PruneInvalid
+        );
+    }
+
+    #[test]
+    fn classify_foreign_camera_subnet_is_kept() {
+        // CAM: a foreign subnet owned by no local interface — neither
+        // native nor ghost — must be re-bound.
+        let ghosts = vec![net("192.168.12.0/24")];
+        assert_eq!(
+            classify_adoption(
+                "10.13.248.0/24",
+                "10.13.248.102",
+                &native(&["192.168.1.0/24"]),
+                &ghosts
+            ),
+            AdoptionClass::Keep
+        );
+    }
+
+    #[test]
+    fn classify_ghost_takes_precedence_over_valid_ip() {
+        // A ghost subnet with a perfectly valid bound IP is still pruned.
+        let ghosts = vec![net("172.28.0.0/16")];
+        assert_eq!(
+            classify_adoption("172.28.5.0/24", "172.28.5.42", &native(&[]), &ghosts),
+            AdoptionClass::PruneGhost
+        );
     }
 }
