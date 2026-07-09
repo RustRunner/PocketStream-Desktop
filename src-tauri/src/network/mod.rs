@@ -1004,6 +1004,20 @@ impl NetworkManager {
             const COOLDOWN_INITIAL: std::time::Duration = std::time::Duration::from_secs(60);
             const COOLDOWN_MAX: std::time::Duration = std::time::Duration::from_secs(600);
 
+            // Structural-ghost guard state. `ghost_until` is a short-lived
+            // per-subnet ignore set: a ghost row can sit in `arp_devices`
+            // forever (entries never expire), so re-check it at most once per
+            // GHOST_SUBNET_RECHECK instead of every 2 s tick. Being TTL'd —
+            // unlike the permanent `known_subnets` — a subnet becomes
+            // adoptable again within one recheck once its WiFi/VPN/virtual
+            // owner goes away. `cached_ghosts` memoizes the enumerated
+            // non-wired network list so a surviving candidate doesn't spawn a
+            // PowerShell adapter query every pass.
+            let mut ghost_until: HashMap<String, std::time::Instant> = HashMap::new();
+            let mut cached_ghosts: Option<(Vec<ipnetwork::Ipv4Network>, std::time::Instant)> = None;
+            const GHOST_SUBNET_RECHECK: std::time::Duration = std::time::Duration::from_secs(300);
+            const GHOST_NETS_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
             loop {
                 // Shutdown-aware idle: wake on the 2 s tick or the moment a
                 // stop is signalled, and exit promptly either way.
@@ -1108,6 +1122,46 @@ impl NetworkManager {
                         if std::time::Instant::now() < retry_at {
                             continue;
                         }
+                    }
+
+                    // Structural-ghost guard: never adopt a subnet owned by an
+                    // up non-wired local interface (WiFi/VPN/virtual), even if
+                    // its ARP reached the unscoped capture. Only candidates
+                    // that already cleared known/adopted/native/cooldown get
+                    // here — i.e. rarely — so the enumeration cost is bounded
+                    // by the two TTLs.
+                    if let Some(until) = ghost_until.get(&device_subnet) {
+                        if std::time::Instant::now() < *until {
+                            continue;
+                        }
+                    }
+                    let ghosts_fresh = cached_ghosts
+                        .as_ref()
+                        .map(|(_, t)| t.elapsed() < GHOST_NETS_TTL)
+                        .unwrap_or(false);
+                    if !ghosts_fresh {
+                        let nets = ghost::non_wired_interface_networks().await;
+                        cached_ghosts = Some((nets, std::time::Instant::now()));
+                    }
+                    let ghost_nets: &[ipnetwork::Ipv4Network] = cached_ghosts
+                        .as_ref()
+                        .map(|(n, _)| n.as_slice())
+                        .unwrap_or(&[]);
+                    if ghost::is_structural_ghost_ip(device_ip, ghost_nets)
+                        || ghost::is_structural_ghost_adoption(&device_subnet, ghost_nets)
+                    {
+                        log::info!(
+                            "Skipping ghost subnet {} (owned by non-wired local interface)",
+                            device_subnet
+                        );
+                        // TTL only — never poison the permanent `known_subnets`
+                        // set, so the subnet is adoptable again after one
+                        // recheck once WiFi/VPN/virtual goes down.
+                        ghost_until.insert(
+                            device_subnet.clone(),
+                            std::time::Instant::now() + GHOST_SUBNET_RECHECK,
+                        );
+                        continue;
                     }
 
                     log::info!("Foreign subnet detected: {}", device_subnet);

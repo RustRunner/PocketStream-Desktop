@@ -74,8 +74,6 @@ pub async fn non_wired_interface_networks() -> Vec<Ipv4Network> {
 }
 
 /// True if `ip` falls inside any structural-ghost network.
-// Wired into the adoption-time guard.
-#[allow(dead_code)]
 pub fn is_structural_ghost_ip(ip: Ipv4Addr, networks: &[Ipv4Network]) -> bool {
     networks.iter().any(|net| net.contains(ip))
 }
