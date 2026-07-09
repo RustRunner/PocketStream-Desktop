@@ -534,6 +534,10 @@ impl NetworkManager {
         let mut work_items: Vec<(String, String, bool)> = Vec::new();
         let mut kept: HashMap<String, String> = HashMap::new();
         let mut pruned = false;
+        // Ghost adoptions whose secondary IP is still bound on the adapter (a
+        // previous run crashed before shutdown cleanup) — unbound after the
+        // config persist below.
+        let mut ghost_bound: Vec<(String, String)> = Vec::new();
         for (subnet, ip_str) in &settings.adopted_subnets {
             match ghost::classify_adoption(subnet, ip_str, &native_subnets, &ghosts) {
                 ghost::AdoptionClass::PruneNative => {
@@ -553,6 +557,11 @@ impl NetworkManager {
                         ip_str,
                     );
                     pruned = true;
+                    // If the IP is still bound (a crash left it behind), queue
+                    // it for an explicit unbind after the config persist.
+                    if current_ips.contains(ip_str) {
+                        ghost_bound.push((subnet.clone(), ip_str.clone()));
+                    }
                 }
                 ghost::AdoptionClass::PruneInvalid => {
                     // Unparseable IP — proven invalid, drop it from config.
@@ -578,6 +587,49 @@ impl NetworkManager {
             match config.update_adopted_subnets(kept) {
                 Ok(()) => log::info!("Saved pruned adopted subnets to config"),
                 Err(e) => log::warn!("Failed to persist pruned adopted subnets: {}", e),
+            }
+        }
+
+        // Crash-leftover cleanup: a ghost adoption whose secondary IP is
+        // still bound on the wired port (a prior run exited without cleanup)
+        // is unbound here so the port isn't left holding a WiFi/VPN address.
+        // Runs after the config persist so a failed unbind can't block the
+        // prune. Guards mirror shutdown cleanup: never strip the adapter's
+        // last IPv4 or its primary native address.
+        if !ghost_bound.is_empty() {
+            let primary_native: Option<&String> = iface
+                .ips
+                .iter()
+                .map(|ip| &ip.address)
+                .find(|addr| !adopted_ip_strs.contains(addr));
+            for (subnet, ip_str) in &ghost_bound {
+                if iface.ips.len() < 2 {
+                    log::warn!(
+                        "Skipping ghost unbind of {} ({}): would leave the adapter with no other IPv4 address",
+                        ip_str,
+                        subnet
+                    );
+                    continue;
+                }
+                if primary_native == Some(ip_str) {
+                    log::warn!(
+                        "Skipping ghost unbind of {} ({}): is the adapter's primary IP",
+                        ip_str,
+                        subnet
+                    );
+                    continue;
+                }
+                match auto_adopt::remove_adopted_ip(&iface.name, ip_str).await {
+                    Ok(()) => {
+                        log::info!("Unbound crash-leftover ghost IP {} ({})", ip_str, subnet)
+                    }
+                    Err(e) => log::warn!(
+                        "Failed to unbind crash-leftover ghost IP {} ({}): {}",
+                        ip_str,
+                        subnet,
+                        e
+                    ),
+                }
             }
         }
 
