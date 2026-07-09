@@ -74,6 +74,13 @@ pub struct InterfaceInfo {
     pub is_ethernet: bool,
     pub is_wifi: bool,
     pub is_vpn: bool,
+    /// True for adapters the OS reports as virtual: Hyper-V/WSL virtual
+    /// switches, VMware/VirtualBox host adapters, and most VPN tunnels.
+    /// Distinct from `is_vpn` because a keyword-missed virtual adapter is
+    /// still a structural non-wired interface that must be excluded from
+    /// camera-port discovery. On Windows this is the `Virtual` property
+    /// from `Get-NetAdapter`; on pnet it is inferred from the name.
+    pub is_virtual: bool,
 }
 
 /// List physical (non-VPN) network interfaces.
@@ -107,6 +114,31 @@ pub async fn list_all() -> Result<Vec<InterfaceInfo>, AppError> {
         let mut result = list_physical_windows().await?;
         result.extend(list_vpn_windows().await?);
         Ok(result)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        list_all_pnet()
+    }
+}
+
+/// List every Up/Disconnected adapter — physical *and* virtual — in a
+/// single unfiltered enumeration. Unlike [`list_all`], this does not drop
+/// virtual adapters whose description misses the VPN keyword list
+/// (Hyper-V/WSL `vEthernet`, VMware/VirtualBox host adapters, some
+/// enterprise VPN clients), so the ghost-subnet machinery can see the
+/// networks they own. `is_vpn` is derived from the description keywords;
+/// `is_virtual` from the OS `Virtual` flag.
+///
+/// Deliberately separate from [`list_all`]: `list_all` backs the VPN IPC
+/// command and the streaming display-IP fallback, neither of which should
+/// widen to advertise a virtual-switch NAT address.
+// Not yet called from non-test code — the discovery ghost-subnet filter is
+// its in-crate consumer.
+#[allow(dead_code)]
+pub async fn list_all_adapters() -> Result<Vec<InterfaceInfo>, AppError> {
+    #[cfg(target_os = "windows")]
+    {
+        list_all_adapters_windows().await
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -154,12 +186,22 @@ fn parse_adapter_json(stdout: &str) -> Result<Vec<serde_json::Value>, AppError> 
     }
 }
 
+/// Parse one `Get-NetAdapter` JSON object into an [`InterfaceInfo`].
+///
+/// `force_vpn` short-circuits the VPN classification to `true` (used by
+/// `list_vpn_windows`, which has already keyword-filtered its input). When
+/// `false`, VPN status is decided by the adapter description so a VPN
+/// driver that registers as a physical (`Virtual = false`) adapter is
+/// still flagged — a physical Ethernet/WiFi description never matches a
+/// VPN keyword, so this does not reclassify real hardware.
 #[cfg(target_os = "windows")]
-fn parse_adapter(a: &serde_json::Value, is_vpn: bool) -> InterfaceInfo {
+fn parse_adapter(a: &serde_json::Value, force_vpn: bool) -> InterfaceInfo {
     let name = a["Name"].as_str().unwrap_or("").to_string();
+    let description = a["Description"].as_str().unwrap_or("");
     let mac = a["MacAddress"].as_str().unwrap_or("").replace('-', ":");
     let media = a["MediaType"].as_str().unwrap_or("");
     let status = a["Status"].as_str().unwrap_or("");
+    let is_virtual = a["Virtual"].as_bool().unwrap_or(false);
 
     let ip_entries = if a["IPs"].is_array() {
         a["IPs"].as_array().unwrap().clone()
@@ -190,6 +232,7 @@ fn parse_adapter(a: &serde_json::Value, is_vpn: bool) -> InterfaceInfo {
     // (Disconnected, Disabled, NotPresent) is treated as down so the UI
     // can surface a reset action without hiding the adapter entirely.
     let is_up = status.eq_ignore_ascii_case("Up");
+    let is_vpn = force_vpn || is_vpn_adapter(description);
 
     InterfaceInfo {
         display_name: name.clone(),
@@ -200,6 +243,7 @@ fn parse_adapter(a: &serde_json::Value, is_vpn: bool) -> InterfaceInfo {
         is_ethernet,
         is_wifi,
         is_vpn,
+        is_virtual,
     }
 }
 
@@ -295,6 +339,18 @@ async fn list_vpn_windows() -> Result<Vec<InterfaceInfo>, AppError> {
         .collect())
 }
 
+#[cfg(target_os = "windows")]
+#[allow(dead_code)]
+async fn list_all_adapters_windows() -> Result<Vec<InterfaceInfo>, AppError> {
+    // `$true` splices into the shared filter as `(...) -and $true`, i.e. no
+    // adapter-level filtering beyond the Up/Disconnected status gate — every
+    // adapter, physical or virtual. `parse_adapter(a, false)` then lets the
+    // description decide VPN status and reads `is_virtual` from `Virtual`.
+    let stdout = run_adapter_query("$true").await?;
+    let adapters = parse_adapter_json(&stdout)?;
+    Ok(adapters.iter().map(|a| parse_adapter(a, false)).collect())
+}
+
 #[cfg(not(target_os = "windows"))]
 fn list_all_pnet() -> Result<Vec<InterfaceInfo>, AppError> {
     use pnet::datalink;
@@ -320,6 +376,13 @@ fn list_all_pnet() -> Result<Vec<InterfaceInfo>, AppError> {
                 .collect();
 
             let lower = iface.name.to_lowercase();
+            // tun/tap/wg/tailscale are software tunnels — both VPN and
+            // virtual. pnet exposes no OS virtual flag, so the name is the
+            // only signal; anything else defaults to non-virtual.
+            let is_tunnel = lower.starts_with("tun")
+                || lower.starts_with("tap")
+                || lower.starts_with("wg")
+                || lower.contains("tailscale");
             InterfaceInfo {
                 name: iface.name.clone(),
                 display_name: iface.name.clone(),
@@ -328,10 +391,8 @@ fn list_all_pnet() -> Result<Vec<InterfaceInfo>, AppError> {
                 is_up: iface.is_up(),
                 is_ethernet: lower.starts_with("eth") || lower.starts_with("en"),
                 is_wifi: lower.starts_with("wl") || lower.starts_with("wlan"),
-                is_vpn: lower.starts_with("tun")
-                    || lower.starts_with("tap")
-                    || lower.starts_with("wg")
-                    || lower.contains("tailscale"),
+                is_vpn: is_tunnel,
+                is_virtual: is_tunnel,
             }
         })
         .collect();
@@ -423,11 +484,13 @@ mod tests {
             is_ethernet: true,
             is_wifi: false,
             is_vpn: false,
+            is_virtual: false,
         };
         let json = serde_json::to_string(&iface).unwrap();
         assert!(json.contains("\"name\":\"eth0\""));
         assert!(json.contains("\"is_up\":true"));
         assert!(json.contains("\"is_vpn\":false"));
+        assert!(json.contains("\"is_virtual\":false"));
     }
 
     // ── Windows-specific parse functions ─────────────────────────────
@@ -637,6 +700,76 @@ mod tests {
             );
             assert!(iface.is_wifi, "WiFi (802.11) must be marked as wifi");
         }
+
+        #[test]
+        fn parse_adapter_reads_virtual_flag() {
+            // A virtual adapter whose description misses the VPN keyword
+            // list (e.g. a Hyper-V/WSL vEthernet switch) must still be
+            // marked is_virtual so the ghost machinery can see its subnet.
+            let json: serde_json::Value = serde_json::from_str(
+                r#"{
+                "Name": "vEthernet (WSL)",
+                "Description": "Hyper-V Virtual Ethernet Adapter",
+                "MacAddress": "00-15-5D-00-00-01",
+                "MediaType": "802.3",
+                "Status": "Up",
+                "Virtual": true,
+                "IPs": [{"Address": "172.28.0.1", "PrefixLength": 20}]
+            }"#,
+            )
+            .unwrap();
+            let iface = parse_adapter(&json, false);
+            assert!(iface.is_virtual, "Virtual=true must set is_virtual");
+            assert!(
+                !iface.is_vpn,
+                "non-keyword description must not be classified VPN"
+            );
+        }
+
+        #[test]
+        fn parse_adapter_virtual_defaults_false() {
+            // A real physical adapter reports Virtual=false (or omits it).
+            let json: serde_json::Value = serde_json::from_str(
+                r#"{
+                "Name": "Ethernet",
+                "Description": "Intel(R) I210 Gigabit Ethernet",
+                "MacAddress": "AA-BB-CC-DD-EE-FF",
+                "MediaType": "802.3",
+                "Status": "Up",
+                "Virtual": false,
+                "IPs": []
+            }"#,
+            )
+            .unwrap();
+            let iface = parse_adapter(&json, false);
+            assert!(!iface.is_virtual);
+            assert!(!iface.is_vpn);
+        }
+
+        #[test]
+        fn parse_adapter_vpn_from_description_when_physical() {
+            // Defensive branch: a VPN driver that registers as physical
+            // (Virtual=false) is still flagged is_vpn from its description,
+            // even though list_physical passes force_vpn=false.
+            let json: serde_json::Value = serde_json::from_str(
+                r#"{
+                "Name": "Ethernet 3",
+                "Description": "Fortinet SSL VPN Virtual Ethernet Adapter",
+                "MacAddress": "",
+                "MediaType": "802.3",
+                "Status": "Up",
+                "Virtual": false,
+                "IPs": []
+            }"#,
+            )
+            .unwrap();
+            let iface = parse_adapter(&json, false);
+            assert!(
+                iface.is_vpn,
+                "VPN keyword in description must set is_vpn even when Virtual=false"
+            );
+            assert!(!iface.is_virtual);
+        }
     }
 
     // ── Platform-independent tests ──────────────────────────────────
@@ -651,6 +784,14 @@ mod tests {
     #[tokio::test]
     async fn list_all_returns_ok() {
         let result = list_all().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn list_all_adapters_returns_ok() {
+        // Full enumeration (physical + virtual) must succeed on any
+        // platform; may be empty in CI.
+        let result = list_all_adapters().await;
         assert!(result.is_ok());
     }
 

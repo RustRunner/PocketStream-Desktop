@@ -66,6 +66,10 @@ export interface InterfaceInfo {
   is_ethernet: boolean;
   is_wifi: boolean;
   is_vpn: boolean;
+  /** OS-reported virtual adapter (Hyper-V/WSL vEthernet, VMware/VirtualBox
+   *  host adapters, most VPN tunnels). Distinct from is_vpn: a keyword-missed
+   *  virtual adapter is still excluded from wired camera-port discovery. */
+  is_virtual: boolean;
 }
 
 // ── Network scanner (network/scanner.rs) ─────────────────────────────

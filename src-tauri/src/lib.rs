@@ -263,6 +263,7 @@ async fn watch_interface(mac: String, display_name: String, handle: tauri::AppHa
             is_ethernet: true,
             is_wifi: false,
             is_vpn: false,
+            is_virtual: false,
         };
 
         let _ = handle.emit("interface-status-changed", &info);

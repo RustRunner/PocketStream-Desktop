@@ -208,6 +208,7 @@ mod imp {
                     is_ethernet: true,
                     is_wifi: false,
                     is_vpn: false,
+                    is_virtual: false,
                 };
                 let _ = handle.emit("interface-status-changed", &sentinel);
             }
