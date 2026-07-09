@@ -46,10 +46,23 @@ static DATA_CB_PANIC_LOGGED: AtomicBool = AtomicBool::new(false);
 /// was saturated (a distinct-tuple flood or a slow registry). Never resets.
 static ARP_TASKS_DROPPED: AtomicU64 = AtomicU64::new(0);
 
+/// Count of ARP frames dropped because they were captured on a Wi-Fi
+/// adapter rather than the wired Ethernet port. The capture backend is
+/// unscoped, so wireless ARP (the WiFi gateway and other wireless hosts)
+/// reaches the callback; discovery is Ethernet-only, so these are
+/// filtered before they can become nodes. Never resets.
+static ARP_WIFI_DROPPED: AtomicU64 = AtomicU64::new(0);
+
 /// Total ARP frames dropped due to the callback-task bound this session.
 /// A diagnostic companion to [`frames_seen`] / [`missed_max`].
 pub fn tasks_dropped() -> u64 {
     ARP_TASKS_DROPPED.load(Ordering::Relaxed)
+}
+
+/// Total ARP frames dropped because they arrived on a Wi-Fi adapter —
+/// wireless peers filtered out to keep discovery wired-Ethernet only.
+pub fn wifi_dropped() -> u64 {
+    ARP_WIFI_DROPPED.load(Ordering::Relaxed)
 }
 
 /// Total ARP frames parsed by the capture backend so far this process.
@@ -132,6 +145,8 @@ struct CallbackContext {
     canary_logged: AtomicBool,
     /// One-shot latch for the task-bound-reached (flood) warning.
     flood_logged: AtomicBool,
+    /// One-shot latch for the "filtering WiFi ARP" notice.
+    wifi_logged: AtomicBool,
 }
 
 /// No-op event callback. The realtime stream signals lifecycle events
@@ -256,6 +271,22 @@ unsafe fn data_cb_inner(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor
         }
     }
     let packet_type = meta.map(|m| m.packet_type).unwrap_or(0);
+
+    // Gate discovery to the wired Ethernet port. The capture backend is
+    // unscoped (only the in-driver EtherType=ARP constraint applies), so
+    // ARP from the WiFi side — the WiFi gateway and other wireless hosts —
+    // arrives here too, normalized to Ethernet II framing, and would land
+    // as phantom nodes. The metadata tags the source medium; drop frames
+    // captured on Wi-Fi. Only an explicit WiFi tag is dropped — a
+    // missing or otherwise-tagged frame is left to pass, so a wired
+    // camera whose medium tag we can't read is never filtered out.
+    if packet_type == pktmon::PACKET_TYPE_WIFI {
+        ARP_WIFI_DROPPED.fetch_add(1, Ordering::Relaxed);
+        if !ctx.wifi_logged.swap(true, Ordering::Relaxed) {
+            log::info!("Filtering WiFi ARP out of discovery — wired-Ethernet peers only");
+        }
+        return;
+    }
 
     let po = desc.packet_offset as usize;
     let pl = desc.packet_length as usize;
@@ -443,6 +474,7 @@ pub(crate) fn start_listener(
             missed_logged: AtomicBool::new(false),
             canary_logged: AtomicBool::new(false),
             flood_logged: AtomicBool::new(false),
+            wifi_logged: AtomicBool::new(false),
         });
 
         let config = pktmon::RealtimeStreamConfiguration {

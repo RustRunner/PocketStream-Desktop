@@ -76,6 +76,13 @@ pub struct StreamMetadata {
     pub timestamp: i64,        // @32 FILETIME; total size 40
 }
 
+/// `packet_type` value for a frame captured on a Wi-Fi adapter. The
+/// capture runs unscoped (all NICs), so ARP from the wireless side —
+/// the WiFi gateway and other wireless hosts — is delivered here too,
+/// normalized to Ethernet II framing; discovery drops these so only the
+/// wired Ethernet port's peers become nodes.
+pub const PACKET_TYPE_WIFI: u16 = 2;
+
 /// `PACKETMONITOR_REALTIME_STREAM_CONFIGURATION`.
 ///
 /// `buffer_size_multiplier` scales the shared ring buffer (4 ⇒ 1 MB —
