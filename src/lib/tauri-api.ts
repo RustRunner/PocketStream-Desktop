@@ -179,6 +179,13 @@ export async function getAdoptedSubnets(): Promise<Record<string, string>> {
   return await invoke<Record<string, string>>("get_adopted_subnets");
 }
 
+/** Remove an auto-adopted subnet: unbinds its secondary IP from the wired
+ *  port and drops it from persisted config. Rejects (with a backend message)
+ *  if the subnet isn't adopted or no interface is configured. */
+export async function removeAdoptedSubnet(subnet: string): Promise<void> {
+  return await invoke("remove_adopted_subnet", { subnet });
+}
+
 /** Listen for a Tauri event. Returns a Promise that resolves to the
  *  unlisten function (call to stop receiving). When running outside
  *  the Tauri shell (e.g. plain `vite dev`), returns a no-op unlisten. */

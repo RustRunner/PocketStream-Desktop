@@ -360,12 +360,51 @@ export function renderModeBadge(): void {
   });
 }
 
+// Wired once — `#subnet-list` is a stable container whose innerHTML is
+// rebuilt on every renderSubnetList call, so a single delegated click
+// listener survives re-renders without stacking duplicates.
+let subnetRemoveWired = false;
+
+/** Remove an auto-adopted subnet from the host card. Optimistic: on success
+ *  drop it from the local map and re-render immediately; the NIC watcher
+ *  refreshes the interface IP list shortly after the unbind, and the backend
+ *  drops any held-over restore so the row can't resurrect on the next save. */
+async function handleRemoveAdopted(subnet: string, btn: HTMLButtonElement): Promise<void> {
+  btn.disabled = true;
+  try {
+    await api.removeAdoptedSubnet(subnet);
+    adoptedSubnets.delete(subnet);
+    renderSubnetList();
+    showToast(`Removed adopted subnet ${subnet}`);
+  } catch (e) {
+    btn.disabled = false;
+    showToast("Failed: " + formatError(e), true);
+  }
+}
+
 export function renderSubnetList(): void {
   const subnetList = $("#subnet-list");
+  if (!subnetRemoveWired) {
+    subnetRemoveWired = true;
+    subnetList.addEventListener("click", (e) => {
+      const btn = (e.target as HTMLElement).closest<HTMLButtonElement>(
+        "[data-remove-adopted]"
+      );
+      if (!btn) return;
+      const subnet = btn.dataset["removeAdopted"];
+      if (subnet) void handleRemoveAdopted(subnet, btn);
+    });
+  }
   renderModeBadge();
   if (!state.activeInterface) return;
 
   const adoptedIpSet = new Set(adoptedSubnets.values());
+  // Trash-icon control shared by both auto-row shapes below. `subnetEsc`
+  // must already be HTML-escaped; it doubles as the removal key.
+  const removeBtn = (subnetEsc: string) =>
+    `<button class="btn-remove-ip" data-remove-adopted="${subnetEsc}" title="Remove adopted subnet">` +
+    `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>` +
+    `</button>`;
   // Hide APIPA addresses — Windows leaves them as a secondary after
   // any brief DHCP failure and they can't carry usable traffic, so
   // showing them as if they were a selectable subnet just confuses
@@ -391,6 +430,7 @@ export function renderSubnetList(): void {
             <span class="badge-auto">(auto)</span>
             <span class="status-value">${ipEsc}</span>
           </span>
+          ${removeBtn(subnetEsc)}
         </div>`;
       }
       return `
@@ -412,14 +452,13 @@ export function renderSubnetList(): void {
           <span class="badge-auto">(auto)</span>
           <span class="status-value">${escapeHtml(`${adoptedIp}/24`)}</span>
         </span>
+        ${removeBtn(escapeHtml(subnet))}
       </div>`;
   }
 
-  // The auto-adopted rows are informational only — there's no per-row
-  // remove control here (adopted subnets are dropped from the IP Config
-  // dialog's secondary-IP list, or auto-released by the manager). An
-  // earlier build wired a `.btn-remove-ip` handler here for a button
-  // that no longer renders; it matched nothing and has been removed.
+  // Auto-adopted rows carry a per-row remove control. Clicks are handled by
+  // the delegated listener wired above (keyed on data-remove-adopted), which
+  // unbinds the secondary IP and drops the adoption from config.
   subnetList.innerHTML = html;
 }
 
