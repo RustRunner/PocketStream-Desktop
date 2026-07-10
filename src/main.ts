@@ -31,6 +31,7 @@ import {
   syncRtspStartButton,
   syncVideoVisibility,
   showModalWithVideo,
+  createVideoWindowSynced,
 } from "./lib/streaming.ts";
 import { setupPtzControls } from "./lib/ptz.ts";
 import type {
@@ -269,12 +270,7 @@ async function applyPathChange(): Promise<void> {
   try {
     await api.stopStream();
     const bounds = getVideoAreaBounds();
-    const handle = await api.createVideoWindow(
-      bounds.x,
-      bounds.y,
-      bounds.width,
-      bounds.height
-    );
+    const handle = await createVideoWindowSynced(bounds);
     await api.startStream(handle);
     showToast("Switched to " + newPath);
   } catch (e) {

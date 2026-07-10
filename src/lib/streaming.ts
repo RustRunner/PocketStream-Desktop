@@ -61,6 +61,34 @@ export function syncVideoVisibility(): Promise<void> {
 }
 
 /**
+ * Create the native video child window and immediately reconcile its
+ * visibility against `syncVideoVisibility`. The child is born WS_VISIBLE
+ * and z-orders above the WebView, so without this reconciliation it
+ * covers any open modal — briefly on paths that sync later, permanently
+ * on paths that never do. Routing every creation through here keeps the
+ * born-visible child from covering a dialog on ANY path (manual start,
+ * reconnect, stall recovery, or a future caller), and honours the
+ * lost-stream invariant (`streamLost` ⇒ hidden) until a status event
+ * flips it back. Callers still sync again after they set the streaming
+ * flags, which reveals the video once nothing is obstructing it.
+ */
+export async function createVideoWindowSynced(bounds: {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}): Promise<string> {
+  const handle = await api.createVideoWindow(
+    bounds.x,
+    bounds.y,
+    bounds.width,
+    bounds.height
+  );
+  await syncVideoVisibility();
+  return handle;
+}
+
+/**
  * Open `dialog` as a modal with the video correctly hidden underneath.
  * Awaiting the returned promise guarantees the video child window is
  * gone before the modal paints (no race where the dialog appears
@@ -138,16 +166,10 @@ export function setupStreamControls(): void {
             await api.updateStreamSettings(state.config.stream);
           }
           const bounds = getVideoAreaBounds();
-          const handle = await api.createVideoWindow(
-            bounds.x,
-            bounds.y,
-            bounds.width,
-            bounds.height
-          );
-          // Newly-created child window is born visible (WS_VISIBLE). If a
-          // dialog happens to be open right now, sync immediately so the
-          // child doesn't briefly cover it before startStream returns.
-          syncVideoVisibility();
+          // createVideoWindowSynced hides the born-visible child if a
+          // dialog is open, so it can't cover one before startStream
+          // returns. A second sync after the flags flip reveals it.
+          const handle = await createVideoWindowSynced(bounds);
           await api.startStream(handle);
           state.isStreaming = true;
           updateStreamUI();
@@ -586,12 +608,7 @@ export async function handleReconnect(): Promise<void> {
 
   try {
     const bounds = getVideoAreaBounds();
-    const handle = await api.createVideoWindow(
-      bounds.x,
-      bounds.y,
-      bounds.width,
-      bounds.height
-    );
+    const handle = await createVideoWindowSynced(bounds);
     await api.startStream(handle);
     state.isStreaming = true;
     state.streamLost = false;
@@ -726,12 +743,7 @@ async function attemptStallRecovery(): Promise<void> {
     // ambiguously if a stale pipeline still owns the HWND.
     await api.stopStream().catch(() => {});
     const bounds = getVideoAreaBounds();
-    const handle = await api.createVideoWindow(
-      bounds.x,
-      bounds.y,
-      bounds.width,
-      bounds.height
-    );
+    const handle = await createVideoWindowSynced(bounds);
     await api.startStream(handle);
     log("Stall recovery: stream restart submitted");
     // Bring the RTSP server back if it was running at the moment of
