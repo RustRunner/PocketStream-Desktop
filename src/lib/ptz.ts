@@ -381,23 +381,26 @@ function getCameraIp(): string | null {
 
 let zoomErrorToasted = false;
 
-async function sendZoomPosition(percent: number): Promise<void> {
+/** `quiet` marks a background push (saved-position restore): failures
+ *  log but never toast — a toast about an action the user didn't take
+ *  is noise. User-initiated sends (drag, preset recall) keep toasting. */
+async function sendZoomPosition(percent: number, quiet: boolean): Promise<void> {
   const ip = getCameraIp();
   if (!ip) {
-    if (!zoomErrorToasted) {
+    if (!quiet && !zoomErrorToasted) {
       showToast("Select a CAM IP to use zoom", true);
       zoomErrorToasted = true;
     }
     return;
   }
   const position = Math.round((percent / 100) * ZOOM_MAX);
-  log(`Zoom: ${percent}% (${position}) ip=${ip}`);
+  log(`Zoom: ${percent}% (${position}) ip=${ip}${quiet ? " (restore)" : ""}`);
   try {
     await api.controlCgiZoomDirect(ip, position);
     zoomErrorToasted = false;
   } catch (e) {
     log(`Zoom failed: ${formatError(e)}`);
-    if (!zoomErrorToasted) {
+    if (!quiet && !zoomErrorToasted) {
       showToast(`Zoom failed: ${formatError(e)}`, true);
       zoomErrorToasted = true;
     }
@@ -424,25 +427,28 @@ function setupZoomSlider(): void {
   // transients.
   const MIN_GAP_MS = 100;
   let inFlight = false;
-  let queuedPercent: number | null = null;
+  let queued: { percent: number; quiet: boolean } | null = null;
   let lastSentPercent: number | null = null;
 
   async function drain(): Promise<void> {
-    while (queuedPercent !== null) {
-      const target = queuedPercent;
-      queuedPercent = null;
-      if (target === lastSentPercent) continue;
-      lastSentPercent = target;
-      await sendZoomPosition(target);
-      if (queuedPercent !== null) {
+    while (queued !== null) {
+      const target = queued;
+      queued = null;
+      if (target.percent === lastSentPercent) continue;
+      lastSentPercent = target.percent;
+      await sendZoomPosition(target.percent, target.quiet);
+      if (queued !== null) {
         await new Promise((r) => setTimeout(r, MIN_GAP_MS));
       }
     }
     inFlight = false;
   }
 
-  function request(percent: number): void {
-    queuedPercent = percent;
+  // Coalescing keeps only the newest entry, so a loud user drag
+  // supersedes a queued quiet restore — the failure toast then belongs
+  // to the value the user actually asked for.
+  function request(percent: number, quiet = false): void {
+    queued = { percent, quiet };
     if (inFlight) return;
     inFlight = true;
     drain();
@@ -492,16 +498,47 @@ function setupZoomSlider(): void {
   // set the slider AND push the value to the camera so the slider
   // becomes the source of truth if they've drifted apart. Skips when
   // no IP is selected or no saved position exists.
+  //
+  // The push is gated on the CAM's registry status: at cold start the
+  // node resolves from cache seconds after launch, long before subnet
+  // adoption binds a route to it, and pushing then just burns an HTTP
+  // timeout. While the record reports anything other than live, hold
+  // the push and let the deviceList subscription below fire it the
+  // moment the CAM flips live (also covers a camera that boots later).
+  let pendingRestoreIp: string | null = null;
+
   function applySavedZoom(): void {
     const ip = getCameraIp();
     if (!ip) return;
     const saved = state.config?.zoom_positions?.[ip];
     if (typeof saved !== "number") return;
     slider.value = String(saved);
+    const record = deviceList.deviceByIp(ip);
+    if (record && record.status !== "live") {
+      pendingRestoreIp = ip;
+      return;
+    }
+    // Live, or unknown to the registry (e.g. a manually-entered IP) —
+    // push optimistically as before.
+    pendingRestoreIp = null;
     // Don't pre-set lastSentPercent — we want request() below to fire
-    // so the camera catches up to the slider.
-    request(saved);
+    // so the camera catches up to the slider. Quiet: this is a
+    // background restore, not a user action.
+    request(saved, true);
   }
+
+  deviceList.subscribe(() => {
+    if (!pendingRestoreIp) return;
+    const record = deviceList.deviceByIp(pendingRestoreIp);
+    if (record?.status !== "live") return;
+    // Re-check the selection — the user may have moved on while the
+    // restore was pending; applySavedZoom re-derives everything.
+    if (getCameraIp() !== pendingRestoreIp) {
+      pendingRestoreIp = null;
+      return;
+    }
+    applySavedZoom();
+  });
 
   // Fires when the user clicks a different node (selectedDevice
   // moves) — the equivalent of the old dropdown change event.
