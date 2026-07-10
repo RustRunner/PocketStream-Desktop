@@ -6,7 +6,7 @@ import * as api from "./tauri-api.ts";
 import { $, $$, state, adoptedSubnets, showToast, log, escapeHtml } from "./state.ts";
 import { resetDiscoveryStatus, hideDiscoveryStatus, renderArpDeviceList } from "./devices.js";
 import { handleHardDisconnect, handleReconnect, showModalWithVideo } from "./streaming.js";
-import { selectedDevice } from "./store.ts";
+import { sessionCamIp } from "./store.ts";
 import { formatError } from "./errors.ts";
 import type {
   AdoptionLifecyclePayload,
@@ -479,17 +479,21 @@ function findDeviceIpByAlias(alias: string): string | undefined {
 }
 
 /** The IP to use as the camera target right now. Tries (in order):
- *    1. The user's current click selection in the Nodes panel
- *    2. The IP persisted to StreamConfig from the last successful pick
- *    3. The device currently aliased CAM in the Naming dialog
+ *    1. The session pick — node click, CAM aliasing, or reconnect
+ *       resume; the user's most recent explicit intent
+ *    2. The device currently aliased CAM — resolved from the live
+ *       device list, so it tracks the camera even if its IP shifted
+ *       since camera_ip was last persisted
+ *    3. The IP persisted in StreamConfig by the last stream start —
+ *       the cold-start fallback
  *  Returns null if none of these resolve — Start Stream surfaces a
  *  "select a CAM" toast in that case. */
 export function getActiveCamIp(): string | null {
-  const selected = selectedDevice.get();
-  if (selected) return selected;
-  const fromConfig = state.config?.stream.camera_ip;
-  if (fromConfig) return fromConfig;
-  return findDeviceIpByAlias("CAM") ?? null;
+  const session = sessionCamIp.get();
+  if (session) return session;
+  const aliased = findDeviceIpByAlias("CAM");
+  if (aliased) return aliased;
+  return state.config?.stream.camera_ip || null;
 }
 
 /** The IP to use as the PTU target right now. PTU is alias-driven

@@ -29,7 +29,7 @@ import {
 } from "./device-state.ts";
 import * as deviceList from "./device-list.ts";
 import { showModalWithVideo } from "./streaming.js";
-import { selectedDevice } from "./store.ts";
+import { selectedDevice, sessionCamIp } from "./store.ts";
 import { formatError } from "./errors.ts";
 import type {
   AdoptionFailedPayload,
@@ -611,14 +611,16 @@ export function renderArpDeviceList(): void {
       item.classList.add("selected");
       const ip = item.dataset["ip"] ?? null;
       selectedDevice.set(ip);
-      // Remember this selection as the in-memory CAM default for the
-      // session (getActiveCamIp falls back to it). It is written to
-      // disk only when a stream actually starts or the device is
-      // explicitly aliased CAM — a node the user merely clicks but
-      // never streams is not persisted across launches. PTU is
-      // alias-driven only, with no click override.
-      if (state.config && ip) {
-        state.config.stream.camera_ip = ip;
+      // Remember this pick as the session's CAM target (getActiveCamIp
+      // reads it first). Deliberately kept out of state.config: Save
+      // Settings builds its payload from there, so a click would leak
+      // to disk on the next unrelated save. Persistence happens only
+      // when a stream actually starts or the device is explicitly
+      // aliased CAM — a node the user merely clicks but never streams
+      // is not persisted across launches. PTU is alias-driven only,
+      // with no click override.
+      if (ip) {
+        sessionCamIp.set(ip);
       }
     });
   });
@@ -738,9 +740,11 @@ export function setupAliasDialog(): void {
           });
         }
         // Mirror into selectedDevice so subscribers (zoom restore,
-        // Nodes panel highlight) react immediately. Same store the
-        // click-to-select path uses.
+        // Nodes panel highlight) react immediately, and into the
+        // session CAM target so this newest designation outranks any
+        // earlier node click.
         selectedDevice.set(ip);
+        sessionCamIp.set(ip);
         dialog.close();
       } else if (role === "ptu") {
         const ip = dialog.dataset["ip"];

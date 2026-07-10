@@ -5,6 +5,7 @@
 import QRCode from "qrcode";
 import * as api from "./tauri-api.ts";
 import { $, state, log, showToast, formatUptime } from "./state.ts";
+import { sessionCamIp } from "./store.ts";
 import { formatError } from "./errors.ts";
 import { getActiveCamIp, getActivePtuIp } from "./network.ts";
 import type { StreamStatus } from "./types.ts";
@@ -622,12 +623,14 @@ export async function handleReconnect(): Promise<void> {
   // decision (same guard attemptStallRecovery uses).
   if (!state.isStreaming || !state.streamLost) return;
 
-  // Restore dropdown selections (dropdown may have been repopulated
-  // during reconnect; set the persisted CAM so getActiveCamIp picks
-  // it up. PTU is alias-driven, which survives across the disconnect
-  // since aliases live in the registry/cache.
-  if (snap.cameraIp && state.config) {
-    state.config.stream.camera_ip = snap.cameraIp;
+  // Restore the session CAM target so getActiveCamIp resolves the same
+  // camera that was streaming before the disconnect. Session state, not
+  // state.config — a resume is not a persistence event, and writing
+  // config here would leak into the next Save Settings. PTU is
+  // alias-driven, which survives across the disconnect since aliases
+  // live in the registry/cache.
+  if (snap.cameraIp) {
+    sessionCamIp.set(snap.cameraIp);
   }
 
   if (!snap.cameraIp) return;
