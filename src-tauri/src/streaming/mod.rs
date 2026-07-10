@@ -309,7 +309,7 @@ impl StreamManager {
 
         // Ensure firewall allows inbound TCP on the RTSP port.
         // Non-fatal — server still works on localhost if this fails.
-        if let Err(e) = crate::network::firewall::ensure_rtsp_allowed(port) {
+        if let Err(e) = crate::network::firewall::ensure_rtsp_allowed(port).await {
             log::warn!("Firewall setup: {}", e);
         }
 
