@@ -19,7 +19,7 @@ pub mod watcher;
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 
 pub use arp::ArpDevice;
@@ -836,9 +836,17 @@ impl NetworkManager {
         // filter our own gratuitous ARP.)
         let iface_info = interface::get_by_name(interface_display_name).await?;
         let known_ips: Vec<String> = iface_info.ips.iter().map(|ip| ip.address.clone()).collect();
-        let ethernet_ips: Vec<Ipv4Addr> =
-            known_ips.iter().filter_map(|ip| ip.parse().ok()).collect();
         let own_mac = parse_mac_bytes(&iface_info.mac);
+
+        // Every IPv4 currently assigned to any local adapter — not just the
+        // camera port. The capture listener drops ARP sent from any of
+        // these so the host never lists itself as a node (its own WiFi
+        // traffic on a subnet shared with the wired port passes every other
+        // filter). The adopt loop refreshes the set each pass because
+        // addresses move under us (DHCP renew, WiFi roam).
+        let local_ips: Arc<StdMutex<HashSet<Ipv4Addr>>> = Arc::new(StdMutex::new(
+            interface::all_local_ipv4().into_iter().collect(),
+        ));
         log::info!(
             "Starting ARP discovery on '{}' (IPs: {:?}, mac: {})",
             interface_display_name,
@@ -889,7 +897,7 @@ impl NetworkManager {
             registry.clone(),
             emitter.clone(),
             app_handle,
-            ethernet_ips,
+            local_ips.clone(),
             own_mac,
             fence.clone(),
             excluded_subnets.clone(),
@@ -906,6 +914,7 @@ impl NetworkManager {
         let sweep_app_handle = app_handle_for_adopt.clone();
         let sweep_fence = fence.clone();
         let sweep_excluded = excluded_subnets;
+        let sweep_local = local_ips.clone();
         tokio::spawn(async move {
             // Small delay to let the capture listener start first
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -916,6 +925,12 @@ impl NetworkManager {
             }
             log::info!("Ping sweeping known subnets to populate ARP");
             ping_sweep_subnets(&sweep_ips).await;
+
+            // One brief-lock snapshot for the whole merge pass (never lock
+            // per entry); a poisoned lock degrades to an empty set, which
+            // filters nothing — fail-open.
+            let local_snapshot: HashSet<Ipv4Addr> =
+                sweep_local.lock().map(|s| s.clone()).unwrap_or_default();
 
             // Merge the OS neighbor table for EVERY local/adopted IP, not
             // just the first — a neighbor learned via an adopted secondary
@@ -936,6 +951,7 @@ impl NetworkManager {
                     sweep_app_handle.clone(),
                     sweep_iface_ip,
                     &sweep_excluded,
+                    &local_snapshot,
                     &sweep_fence,
                 )
                 .await;
@@ -965,11 +981,12 @@ impl NetworkManager {
 
             let missed = arp::missed_max();
             log::warn!(
-                "Discovery degraded: no ARP payload events within {}s of the ping sweep (missed_max={}, tasks_dropped={}, noneth_dropped={})",
+                "Discovery degraded: no ARP payload events within {}s of the ping sweep (missed_max={}, tasks_dropped={}, noneth_dropped={}, self_ip_dropped={})",
                 INITIAL_WINDOW.as_secs(),
                 missed,
                 arp::tasks_dropped(),
-                arp::noneth_dropped()
+                arp::noneth_dropped(),
+                arp::self_ip_dropped()
             );
             let _ = watchdog_app.emit(
                 "discovery-degraded",
@@ -1060,6 +1077,21 @@ impl NetworkManager {
                 }
                 if *shutdown_rx.borrow() {
                     break;
+                }
+
+                // Refresh the local-IP set the capture listener filters
+                // against: addresses move under us (DHCP renew, WiFi roam)
+                // and a stale set would re-admit the host as a peer. Runs
+                // before the DHCP gate below so the set stays fresh even
+                // while adoption is paused. In-memory IP Helper read — no
+                // process spawn, so no TTL cache is needed. An empty read
+                // (transient enumeration failure) keeps the previous set
+                // rather than blanking the filter mid-session.
+                let fresh: HashSet<Ipv4Addr> = interface::all_local_ipv4().into_iter().collect();
+                if !fresh.is_empty() {
+                    if let Ok(mut set) = local_ips.lock() {
+                        *set = fresh;
+                    }
                 }
 
                 // Gate the adoption pass on host mode: while the adapter
@@ -1202,7 +1234,12 @@ impl NetworkManager {
                     // terminal path below (success, timeout, error, break,
                     // task abort) releases the gate.
                     let _gate = AdoptionGate::start(app_handle_for_adopt.clone(), adoption_id);
-                    let local_ips = interface::all_local_ipv4();
+                    // Fresh read at adoption time (not the shared filter
+                    // set): candidate-collision checking wants the newest
+                    // possible view of our own addresses, and the name must
+                    // not shadow the shared `local_ips` the post-adoption
+                    // sweep clones below.
+                    let host_ips_now = interface::all_local_ipv4();
                     let started = std::time::Instant::now();
                     let outcome = tokio::time::timeout(
                         ADOPT_MAX_TOTAL,
@@ -1211,7 +1248,7 @@ impl NetworkManager {
                             &iface_name,
                             device_ip,
                             &current_ips,
-                            &local_ips,
+                            &host_ips_now,
                             &pending_ips,
                             adoption_id,
                             &shutdown_rx,
@@ -1312,6 +1349,7 @@ impl NetworkManager {
                             let sweep_emitter = emitter_for_adopt.clone();
                             let sweep_handle = app_handle_for_adopt.clone();
                             let sweep_fence = fence_for_loop.clone();
+                            let sweep_local = local_ips.clone();
                             tokio::spawn(async move {
                                 let passes: [u64; 3] = [1500, 5000, 12000];
                                 for (i, delay_ms) in passes.iter().enumerate() {
@@ -1332,7 +1370,11 @@ impl NetworkManager {
                                     ping_sweep_subnets(std::slice::from_ref(&sweep_ip)).await;
                                     // The adopted subnet is on the Ethernet
                                     // interface, so no non-Ethernet exclusion
-                                    // applies to this post-adoption merge.
+                                    // applies to this post-adoption merge. The
+                                    // self-IP filter still does — snapshot per
+                                    // pass (the passes span ~12 s).
+                                    let local_snapshot: HashSet<Ipv4Addr> =
+                                        sweep_local.lock().map(|s| s.clone()).unwrap_or_default();
                                     merge_arp_table(
                                         sweep_devices.clone(),
                                         sweep_registry.clone(),
@@ -1340,6 +1382,7 @@ impl NetworkManager {
                                         sweep_handle.clone(),
                                         &sweep_ip,
                                         &[],
+                                        &local_snapshot,
                                         &sweep_fence,
                                     )
                                     .await;
@@ -1713,6 +1756,7 @@ async fn ping_sweep_subnets(interface_ips: &[String]) {
 /// This catches hosts whose ARP entries were already cached in the OS
 /// (e.g. from a prior browser visit), since the ping sweep won't generate
 /// new ARP packets on the wire for those hosts.
+#[allow(clippy::too_many_arguments)]
 async fn merge_arp_table(
     devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
     registry: Arc<DeviceRegistry>,
@@ -1720,6 +1764,7 @@ async fn merge_arp_table(
     app_handle: tauri::AppHandle,
     interface_ip: &str,
     excluded: &[ipnetwork::Ipv4Network],
+    local_ips: &HashSet<Ipv4Addr>,
     fence: &SweepFence,
 ) {
     use tauri::{Emitter, Manager};
@@ -1747,6 +1792,14 @@ async fn merge_arp_table(
                 // peer. The OS neighbor read is InterfaceIndex-scoped, so
                 // this usually has nothing to drop; it is a safety net for a
                 // shared-subnet or bridged layout.
+                continue;
+            }
+            if local_ips.contains(&ip) {
+                // Our own address (any adapter) — the host never lists
+                // itself. Normally unreachable: the neighbor table holds
+                // resolved peers, not local addresses; defense in depth
+                // beside the subnet safety net above.
+                log::debug!("ARP table: skipping our own IP {}", ip);
                 continue;
             }
             if map.contains_key(&mac) {

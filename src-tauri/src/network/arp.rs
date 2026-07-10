@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -53,6 +53,14 @@ static ARP_TASKS_DROPPED: AtomicU64 = AtomicU64::new(0);
 /// filtered before they can become nodes. Never resets.
 static ARP_NONETH_DROPPED: AtomicU64 = AtomicU64::new(0);
 
+/// Count of ARP frames dropped because the sender IP is one of the host's
+/// own addresses. The unscoped capture sees this host's own ARP traffic
+/// from every adapter — e.g. the WiFi NIC refreshing its gateway entry —
+/// and when a non-wired adapter shares the wired port's subnet, the
+/// subnet filter above cannot catch it. The host never lists itself as a
+/// node. Never resets.
+static ARP_SELF_IP_DROPPED: AtomicU64 = AtomicU64::new(0);
+
 /// Total ARP frames dropped due to the callback-task bound this session.
 /// A diagnostic companion to [`frames_seen`] / [`missed_max`].
 pub fn tasks_dropped() -> u64 {
@@ -63,6 +71,12 @@ pub fn tasks_dropped() -> u64 {
 /// (WiFi/VPN) subnet — filtered out to keep discovery wired-Ethernet only.
 pub fn noneth_dropped() -> u64 {
     ARP_NONETH_DROPPED.load(Ordering::Relaxed)
+}
+
+/// Total ARP frames dropped because the sender IP belongs to this host —
+/// the host never appears in its own node list.
+pub fn self_ip_dropped() -> u64 {
+    ARP_SELF_IP_DROPPED.load(Ordering::Relaxed)
 }
 
 /// Total ARP frames parsed by the capture backend so far this process.
@@ -120,6 +134,50 @@ impl DedupeLru {
     }
 }
 
+/// Verdict for a captured ARP sender: admit it as a peer, or drop it.
+/// When several drop conditions apply at once the precedence is
+/// non-wired subnet, then self IP, then own MAC — all three drop the
+/// frame, so the order only decides which counter and log fire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SenderVerdict {
+    Accept,
+    /// Sender is on a subnet owned exclusively by a non-wired local
+    /// interface (WiFi/VPN/virtual) — not a wired peer.
+    DropNonWiredSubnet,
+    /// Sender IP is currently assigned to this host (any adapter). The
+    /// host never lists itself; this catches our own traffic on a subnet
+    /// the wired port shares with a non-wired adapter, where the subnet
+    /// filter is structurally blind.
+    DropSelfIp,
+    /// Sender MAC is the wired adapter's own — our gratuitous ARP.
+    DropOwnMac,
+}
+
+/// Pure sender gate for the capture callback: scope discovery to the
+/// wired port's peers and reject the host's own traffic. An empty
+/// `local_ips` or `excluded` disables that check (fail-open). A wired
+/// camera — on the Ethernet port's subnet or a foreign/APIPA subnet —
+/// matches none of the drop conditions. Module-level and pure so it is
+/// unit-testable without constructing any capture state.
+fn classify_sender(
+    ip: Ipv4Addr,
+    mac: [u8; 6],
+    own_mac: Option<[u8; 6]>,
+    local_ips: &HashSet<Ipv4Addr>,
+    excluded: &[ipnetwork::Ipv4Network],
+) -> SenderVerdict {
+    if excluded.iter().any(|net| net.contains(ip)) {
+        return SenderVerdict::DropNonWiredSubnet;
+    }
+    if local_ips.contains(&ip) {
+        return SenderVerdict::DropSelfIp;
+    }
+    if own_mac == Some(mac) {
+        return SenderVerdict::DropOwnMac;
+    }
+    SenderVerdict::Accept
+}
+
 /// Everything the C data callback needs. Reached through the stream's
 /// `user_context` pointer; lives (in an `Arc`) on the listener's
 /// spawn_blocking thread for the whole session, so the pointer stays
@@ -127,6 +185,12 @@ impl DedupeLru {
 /// afterward.
 struct CallbackContext {
     own_mac: Option<[u8; 6]>,
+    /// Every IPv4 address currently assigned to any local adapter, shared
+    /// with the discovery loop that refreshes it as addresses change
+    /// (DHCP renew, WiFi roam). A frame sent from one of these is the
+    /// host itself, never a peer. Locked briefly on the capture thread —
+    /// same discipline as `dedupe`; lock failure fails open.
+    local_ips: Arc<StdMutex<HashSet<Ipv4Addr>>>,
     dedupe: StdMutex<DedupeLru>,
     runtime: tokio::runtime::Handle,
     devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
@@ -147,6 +211,8 @@ struct CallbackContext {
     flood_logged: AtomicBool,
     /// One-shot latch for the "filtering non-Ethernet subnet" notice.
     noneth_logged: AtomicBool,
+    /// One-shot latch for the "filtering our own IP" notice.
+    selfip_logged: AtomicBool,
     /// Subnets owned exclusively by non-Ethernet interfaces (WiFi/VPN). An
     /// ARP whose sender IP falls in one of these is dropped, so only the
     /// wired Ethernet port's peers become nodes. Empty ⇒ no filtering
@@ -290,32 +356,45 @@ unsafe fn data_cb_inner(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor
     if ip == Ipv4Addr::new(0, 0, 0, 0) {
         return;
     }
-    // Gate discovery to the wired Ethernet port. The capture backend is
-    // unscoped (only the in-driver EtherType=ARP constraint applies), so
-    // ARP from the WiFi side — the WiFi gateway and other wireless hosts —
-    // reaches this callback and would otherwise become phantom nodes. Drop
-    // any sender whose IP is on a subnet owned exclusively by a non-Ethernet
-    // interface. This never touches the Ethernet port's own subnet or a
-    // foreign subnet, so a wired camera — including one still on its
-    // factory/APIPA subnet awaiting adoption — is never filtered out.
-    if ctx.excluded_subnets.iter().any(|net| net.contains(ip)) {
-        ARP_NONETH_DROPPED.fetch_add(1, Ordering::Relaxed);
-        if !ctx.noneth_logged.swap(true, Ordering::Relaxed) {
-            log::info!(
-                "Filtering ARP {} on a non-Ethernet subnet out of discovery (packet_type={})",
-                ip,
-                packet_type
-            );
-        }
-        return;
-    }
-    // Skip our own gratuitous ARP (emitted when we add a secondary IP);
-    // otherwise it lands as a phantom peer that gets scanned against our
-    // own IP and cached as a ghost node.
-    if let Some(own) = ctx.own_mac {
-        if mac == own {
+    // Gate discovery to the wired Ethernet port's peers. The capture
+    // backend is unscoped (only the in-driver EtherType=ARP constraint
+    // applies), so ARP from the WiFi side — the gateway, other wireless
+    // hosts, and this host's own WiFi NIC — reaches this callback and
+    // would otherwise become phantom nodes. A wired camera, including one
+    // still on its factory/APIPA subnet awaiting adoption, matches none
+    // of the drop conditions. A poisoned local-IP lock fails open (frame
+    // admitted) — same tolerance as the dedupe lock below.
+    let verdict = match ctx.local_ips.lock() {
+        Ok(local) => classify_sender(ip, mac, ctx.own_mac, &local, &ctx.excluded_subnets),
+        Err(_) => classify_sender(ip, mac, ctx.own_mac, &HashSet::new(), &ctx.excluded_subnets),
+    };
+    match verdict {
+        SenderVerdict::Accept => {}
+        SenderVerdict::DropNonWiredSubnet => {
+            ARP_NONETH_DROPPED.fetch_add(1, Ordering::Relaxed);
+            if !ctx.noneth_logged.swap(true, Ordering::Relaxed) {
+                log::info!(
+                    "Filtering ARP {} on a non-Ethernet subnet out of discovery (packet_type={})",
+                    ip,
+                    packet_type
+                );
+            }
             return;
         }
+        SenderVerdict::DropSelfIp => {
+            ARP_SELF_IP_DROPPED.fetch_add(1, Ordering::Relaxed);
+            if !ctx.selfip_logged.swap(true, Ordering::Relaxed) {
+                log::info!(
+                    "Filtering ARP from our own IP {} out of discovery — the host never lists itself",
+                    ip
+                );
+            }
+            return;
+        }
+        // Our own gratuitous ARP (emitted when we add a secondary IP);
+        // it would otherwise land as a phantom peer that gets scanned
+        // against our own IP and cached as a ghost node.
+        SenderVerdict::DropOwnMac => return,
     }
 
     if let Ok(mut lru) = ctx.dedupe.lock() {
@@ -441,13 +520,14 @@ async fn on_arp_seen(
     }
 }
 
-/// Start the PacketMonitor ARP listener. Signature preserved from the
-/// pcap backend so `mod.rs` callers don't change.
+/// Start the PacketMonitor ARP listener. PacketMonitor captures unscoped
+/// (the in-driver EtherType constraint is the only capture-side filter);
+/// scoping to the wired port's peers happens per frame in the callback.
 ///
-/// `ethernet_ips` — the target adapter's IPv4 addresses. No longer used
-/// to select a capture device (PacketMonitor captures unscoped, with the
-/// in-driver EtherType constraint doing the filtering), kept for the
-/// startup log and signature stability.
+/// `local_ips` — every IPv4 address currently assigned to any local
+/// adapter, shared with the discovery loop that refreshes it as addresses
+/// change. A captured ARP sent from one of these is the host itself and
+/// is dropped — the host never lists itself as a peer.
 ///
 /// `own_mac` — the target adapter's own MAC; ARP frames sent by it are
 /// skipped (see [`on_arp_seen`]'s phantom-peer note).
@@ -460,7 +540,7 @@ pub(crate) fn start_listener(
     registry: Arc<DeviceRegistry>,
     emitter: Arc<DeviceListEmitter>,
     app_handle: tauri::AppHandle,
-    ethernet_ips: Vec<Ipv4Addr>,
+    local_ips: Arc<StdMutex<HashSet<Ipv4Addr>>>,
     own_mac: Option<[u8; 6]>,
     fence: super::SweepFence,
     excluded_subnets: Vec<ipnetwork::Ipv4Network>,
@@ -468,14 +548,21 @@ pub(crate) fn start_listener(
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let runtime = tokio::runtime::Handle::current();
 
-    log::info!(
-        "Starting PacketMonitor ARP listener (adapter IPs: {:?})",
-        ethernet_ips
-    );
+    {
+        let snapshot: Vec<Ipv4Addr> = local_ips
+            .lock()
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default();
+        log::info!(
+            "Starting PacketMonitor ARP listener (self-filtering local IPs: {:?})",
+            snapshot
+        );
+    }
 
     tokio::task::spawn_blocking(move || {
         let ctx = Arc::new(CallbackContext {
             own_mac,
+            local_ips,
             dedupe: StdMutex::new(DedupeLru::new()),
             runtime: runtime.clone(),
             devices,
@@ -488,6 +575,7 @@ pub(crate) fn start_listener(
             canary_logged: AtomicBool::new(false),
             flood_logged: AtomicBool::new(false),
             noneth_logged: AtomicBool::new(false),
+            selfip_logged: AtomicBool::new(false),
             excluded_subnets,
         });
 
@@ -822,6 +910,131 @@ mod tests {
         // Releasing a permit frees a slot for the next admitted frame.
         drop(p1);
         assert!(try_admit_arp_task(&sem).is_some());
+    }
+
+    // ── classify_sender ─────────────────────────────────────────────
+    //
+    // Reference topology: the wired port holds a static 192.168.1.101/24
+    // (to reach a fixed-IP device at 192.168.1.202) while WiFi holds DHCP
+    // 192.168.1.204/24 — both adapters own 192.168.1.0/24, so the shared
+    // subnet is deliberately absent from the excluded set and only the
+    // self-IP / own-MAC checks can reject the host's own WiFi traffic.
+
+    fn ipv4(s: &str) -> Ipv4Addr {
+        s.parse().unwrap()
+    }
+
+    fn local_set(ips: &[&str]) -> HashSet<Ipv4Addr> {
+        ips.iter().map(|s| ipv4(s)).collect()
+    }
+
+    const WIRED_MAC: [u8; 6] = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+    const OTHER_MAC: [u8; 6] = [0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb];
+
+    #[test]
+    fn sender_own_wifi_ip_on_shared_subnet_dropped_as_self() {
+        // Our own WiFi NIC ARPing on the shared subnet: wrong MAC for the
+        // own-MAC check, subnet not excludable — the self-IP check is the
+        // only thing standing between this frame and a phantom node.
+        let local = local_set(&["192.168.1.101", "192.168.1.204"]);
+        assert_eq!(
+            classify_sender(
+                ipv4("192.168.1.204"),
+                OTHER_MAC,
+                Some(WIRED_MAC),
+                &local,
+                &[]
+            ),
+            SenderVerdict::DropSelfIp
+        );
+    }
+
+    #[test]
+    fn sender_own_mac_dropped() {
+        // Our gratuitous ARP for a just-bound secondary IP: the IP may not
+        // be in the local set yet (set refresh races the bind), so the MAC
+        // check must catch it on its own.
+        let local = local_set(&["192.168.1.101"]);
+        assert_eq!(
+            classify_sender(
+                ipv4("10.13.248.102"),
+                WIRED_MAC,
+                Some(WIRED_MAC),
+                &local,
+                &[]
+            ),
+            SenderVerdict::DropOwnMac
+        );
+    }
+
+    #[test]
+    fn sender_on_excluded_subnet_dropped() {
+        let excluded = vec!["192.168.12.0/24".parse().unwrap()];
+        assert_eq!(
+            classify_sender(
+                ipv4("192.168.12.1"),
+                OTHER_MAC,
+                Some(WIRED_MAC),
+                &local_set(&["192.168.1.101"]),
+                &excluded
+            ),
+            SenderVerdict::DropNonWiredSubnet
+        );
+    }
+
+    #[test]
+    fn wired_peers_accepted_beside_local_ips_on_same_subnet() {
+        // A fixed-IP wired device sharing the /24 with two of our own
+        // addresses must never be rejected, and neither may a camera on a
+        // foreign adopted subnet.
+        let local = local_set(&["192.168.1.101", "192.168.1.204"]);
+        assert_eq!(
+            classify_sender(
+                ipv4("192.168.1.202"),
+                OTHER_MAC,
+                Some(WIRED_MAC),
+                &local,
+                &[]
+            ),
+            SenderVerdict::Accept
+        );
+        assert_eq!(
+            classify_sender(
+                ipv4("10.194.200.24"),
+                OTHER_MAC,
+                Some(WIRED_MAC),
+                &local,
+                &[]
+            ),
+            SenderVerdict::Accept
+        );
+    }
+
+    #[test]
+    fn empty_sets_fail_open() {
+        // Enumeration failure yields empty sets; the filter must admit
+        // everything rather than blind discovery.
+        assert_eq!(
+            classify_sender(ipv4("192.168.1.204"), OTHER_MAC, None, &HashSet::new(), &[]),
+            SenderVerdict::Accept
+        );
+    }
+
+    #[test]
+    fn excluded_subnet_takes_precedence_over_self_ip() {
+        // An IP that is both ours and on an excluded subnet counts as a
+        // non-wired drop — pins which counter/log fires.
+        let excluded = vec!["192.168.12.0/24".parse().unwrap()];
+        assert_eq!(
+            classify_sender(
+                ipv4("192.168.12.103"),
+                OTHER_MAC,
+                Some(WIRED_MAC),
+                &local_set(&["192.168.12.103"]),
+                &excluded
+            ),
+            SenderVerdict::DropNonWiredSubnet
+        );
     }
 
     /// Build a minimal valid ARP packet (42 bytes: 14 Ethernet + 28 ARP).
