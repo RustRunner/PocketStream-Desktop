@@ -55,6 +55,12 @@ export async function getConfig(): Promise<AppSettings> {
   return await invoke<AppSettings>("get_config");
 }
 
+/** Salvage actions taken while loading config files (quarantines,
+ *  resets) — fetched once at init and surfaced as error toasts. */
+export async function getStartupNotices(): Promise<string[]> {
+  return await invoke<string[]>("get_startup_notices");
+}
+
 export async function updateStreamSettings(stream: StreamConfig): Promise<void> {
   return await invoke("update_stream_settings", { stream });
 }

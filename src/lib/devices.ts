@@ -323,7 +323,7 @@ export async function loadExistingArpState(): Promise<void> {
       setDiscoveryPhase("discovering");
     }
   } catch (e) {
-    console.error("Failed to load ARP state:", e);
+    log(`Failed to load ARP state: ${formatError(e)}`);
   }
 }
 

@@ -78,7 +78,7 @@ export async function refreshInterfaces(): Promise<void> {
       warnNoEthernet();
     }
   } catch (e) {
-    console.error("Failed to list interfaces:", e);
+    log(`Failed to list interfaces: ${formatError(e)}`);
     $("#iface-name").textContent = "Error";
     warnNoEthernet();
   }

@@ -3,7 +3,7 @@
  */
 
 import * as api from "./lib/tauri-api.ts";
-import { $, $$, state, showToast, adoptedSubnets } from "./lib/state.ts";
+import { $, $$, state, showToast, log, adoptedSubnets } from "./lib/state.ts";
 import { formatError } from "./lib/errors.ts";
 import {
   refreshInterfaces,
@@ -42,6 +42,22 @@ import type {
 } from "./lib/types.ts";
 import type { TauriUpdate } from "./lib/tauri-global.d.ts";
 
+// ── Global error capture ────────────────────────────────────────────
+// Registered before any wiring runs: uncaught errors and rejections
+// otherwise only reach DevTools and are invisible in pocketstream.log
+// when a field unit misbehaves.
+
+window.addEventListener("error", (e) => {
+  api.logToFile(
+    "error",
+    `Uncaught error: ${e.message} (${e.filename || "?"}:${e.lineno ?? "?"})`,
+  );
+});
+
+window.addEventListener("unhandledrejection", (e) => {
+  api.logToFile("error", `Unhandled rejection: ${formatError(e.reason)}`);
+});
+
 // ── Init ────────────────────────────────────────────────────────────
 
 document.addEventListener("DOMContentLoaded", async () => {
@@ -61,6 +77,16 @@ document.addEventListener("DOMContentLoaded", async () => {
   startStatusListener();
 
   await loadConfig();
+
+  // Surface backend load-time salvage events (e.g. a corrupted config
+  // quarantined and reset to defaults) — without this the reset is
+  // silent and the operator only notices when settings look wrong.
+  try {
+    for (const notice of await api.getStartupNotices()) {
+      showToast(notice, true);
+    }
+  } catch (_) {}
+
   // Paint the mode badge as soon as config is loaded, well before the
   // slower listInterfaces enumeration in refreshInterfaces lands. The
   // mode is a user-set preference that doesn't depend on adapter
@@ -101,7 +127,12 @@ document.addEventListener("DOMContentLoaded", async () => {
 
 async function checkForUpdates(): Promise<void> {
   const updater = window.__TAURI__?.updater;
-  if (!updater) return;
+  if (!updater) {
+    // A plugin rename, withGlobalTauri regression, or capability change
+    // would otherwise disable update checks fleet-wide with no trace.
+    api.logToFile("warn", "Updater API unavailable — update checks disabled");
+    return;
+  }
 
   try {
     const update = await updater.check();
@@ -308,7 +339,7 @@ async function loadConfig(): Promise<void> {
     });
     updateProtocolVisibility(proto);
   } catch (e) {
-    console.error("Failed to load config:", e);
+    log(`Failed to load config: ${formatError(e)}`);
   }
 }
 

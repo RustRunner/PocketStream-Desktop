@@ -432,7 +432,7 @@ function setupQrDialog(): void {
         color: { dark: "#000000", light: "#ffffff" },
       });
     } catch (e) {
-      console.error("QR code generation failed:", e);
+      log(`QR code generation failed: ${formatError(e)}`);
       showToast("Failed to generate QR code", true);
     }
   });

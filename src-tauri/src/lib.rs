@@ -364,6 +364,14 @@ fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> String {
 pub fn run() {
     setup_logging();
 
+    // Version banner — first line of every session so a log file (which
+    // survives across launches and silent auto-updates) can always be
+    // attributed to a build. Doubles as the session-boundary marker.
+    log::info!(
+        "PocketStream Desktop v{} starting",
+        env!("CARGO_PKG_VERSION")
+    );
+
     // ── Prerequisites ────────────────────────────────────────────────
     #[cfg(windows)]
     {
@@ -418,6 +426,7 @@ pub fn run() {
             // Config
             commands::get_config,
             commands::save_config,
+            commands::get_startup_notices,
             commands::update_stream_settings,
             commands::update_rtsp_settings,
             commands::update_credentials,

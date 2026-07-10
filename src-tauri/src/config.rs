@@ -196,18 +196,24 @@ pub struct AppConfig {
     /// only via `upsert_cached_device` / `remove_cached_device` (called
     /// from the DeviceRegistry-backed IPC handlers in commands::network).
     cache: Mutex<Vec<CachedDevice>>,
+    /// User-facing messages about salvage actions taken during load —
+    /// e.g. a corrupted file quarantined and defaults applied. The
+    /// frontend fetches these once at init and surfaces them as error
+    /// toasts; without this, a settings reset is invisible to the user.
+    startup_notices: Mutex<Vec<String>>,
 }
 
 impl AppConfig {
     pub fn load_or_default() -> Self {
-        let settings = load_from_disk().unwrap_or_default();
+        let mut notices = Vec::new();
+        let settings = load_from_disk(&mut notices).unwrap_or_default();
 
         // Cache loading: prefer the dedicated file. If it doesn't exist,
         // try to migrate the legacy `device_cache` field that lived in
         // `config.toml` before this split (one-time read, then we never
         // look there again — the next config.toml save naturally drops
         // the field since AppSettings doesn't contain it anymore).
-        let cache = match load_cache_from_disk() {
+        let cache = match load_cache_from_disk(&mut notices) {
             Some(c) => c,
             None => {
                 let migrated = std::fs::read_to_string(config_path())
@@ -231,6 +237,16 @@ impl AppConfig {
         Self {
             settings: Mutex::new(settings),
             cache: Mutex::new(cache),
+            startup_notices: Mutex::new(notices),
+        }
+    }
+
+    /// Messages about salvage actions taken during load, for the
+    /// frontend to surface once at startup.
+    pub fn startup_notices(&self) -> Vec<String> {
+        match self.startup_notices.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
         }
     }
 
@@ -549,7 +565,7 @@ fn key_path() -> PathBuf {
     config_dir().join(".key")
 }
 
-fn load_cache_from_disk() -> Option<Vec<CachedDevice>> {
+fn load_cache_from_disk(notices: &mut Vec<String>) -> Option<Vec<CachedDevice>> {
     let path = cache_path();
     let content = match fs::read_to_string(&path) {
         Ok(c) => c,
@@ -559,7 +575,14 @@ fn load_cache_from_disk() -> Option<Vec<CachedDevice>> {
             return None;
         }
     };
-    match toml::from_str::<CacheFile>(&content) {
+    parse_cache(&content, &path, notices)
+}
+
+/// Parse the device-cache TOML; on failure quarantine the file and
+/// record a user-facing startup notice. Split from `load_cache_from_disk`
+/// so the salvage behavior is testable without touching the real path.
+fn parse_cache(content: &str, path: &Path, notices: &mut Vec<String>) -> Option<Vec<CachedDevice>> {
+    match toml::from_str::<CacheFile>(content) {
         Ok(parsed) => Some(parsed.devices),
         Err(e) => {
             log::error!(
@@ -567,9 +590,14 @@ fn load_cache_from_disk() -> Option<Vec<CachedDevice>> {
                  so the next save can write a clean file; cached devices will be \
                  rebuilt from the next ARP sweep.",
                 e,
-                quarantine_path(&path).display()
+                quarantine_path(path).display()
             );
-            quarantine(&path);
+            quarantine(path);
+            notices.push(format!(
+                "The saved device cache could not be read; it was preserved as {} \
+                 and devices will be rediscovered on the next network sweep.",
+                quarantine_file_name(path)
+            ));
             None
         }
     }
@@ -663,6 +691,15 @@ fn quarantine_path(path: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(name))
 }
 
+/// File name (not full path) of the quarantine target, for user-facing
+/// notices where the full path would be noise.
+fn quarantine_file_name(path: &Path) -> String {
+    quarantine_path(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "parse-error".into())
+}
+
 /// Move a corrupted config file aside. Best-effort — if the rename
 /// fails (e.g., quarantine target also exists from a prior failure)
 /// the original stays put and the next save will overwrite it via
@@ -689,7 +726,36 @@ fn extract_legacy_device_cache(toml_content: &str) -> Option<Vec<CachedDevice>> 
     cache_value.try_into().ok()
 }
 
-fn load_from_disk() -> Option<AppSettings> {
+/// Parse the settings TOML; on failure quarantine the file and record a
+/// user-facing startup notice. Split from `load_from_disk` so the
+/// salvage behavior is testable without touching the real config path.
+/// The notice mentions the token because falling back to defaults
+/// regenerates the RTSP access token, which invalidates saved client
+/// URLs.
+fn parse_settings(content: &str, path: &Path, notices: &mut Vec<String>) -> Option<AppSettings> {
+    match toml::from_str(content) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            log::error!(
+                "config: config.toml parse failed ({}). Moving aside to {} and \
+                 launching with defaults; the corrupted file is preserved for \
+                 inspection.",
+                e,
+                quarantine_path(path).display()
+            );
+            quarantine(path);
+            notices.push(format!(
+                "Settings could not be read and were reset to defaults. The old \
+                 file was preserved as {}, and the RTSP access token was \
+                 regenerated.",
+                quarantine_file_name(path)
+            ));
+            None
+        }
+    }
+}
+
+fn load_from_disk(notices: &mut Vec<String>) -> Option<AppSettings> {
     let path = config_path();
     let content = match fs::read_to_string(&path) {
         Ok(c) => c,
@@ -700,20 +766,7 @@ fn load_from_disk() -> Option<AppSettings> {
         }
     };
 
-    let mut settings: AppSettings = match toml::from_str(&content) {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!(
-                "config: config.toml parse failed ({}). Moving aside to {} and \
-                 launching with defaults; the corrupted file is preserved for \
-                 inspection.",
-                e,
-                quarantine_path(&path).display()
-            );
-            quarantine(&path);
-            return None;
-        }
-    };
+    let mut settings = parse_settings(&content, &path, notices)?;
 
     // Resolve the stored (encrypted) credentials against the key. A
     // usable key decrypts them; an absent or unusable key clears any
@@ -1845,6 +1898,47 @@ password = ""
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("does-not-exist.toml");
         quarantine(&path);
+    }
+
+    #[test]
+    fn corrupt_settings_toml_quarantines_and_records_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "not [valid toml").unwrap();
+        let mut notices = Vec::new();
+        let parsed = parse_settings("not [valid toml", &path, &mut notices);
+        assert!(parsed.is_none());
+        assert!(!path.exists(), "corrupted file should be moved aside");
+        assert!(dir.path().join("config.toml.parse-error").exists());
+        assert_eq!(notices.len(), 1);
+        // The notice must name the preserved file and the token reset —
+        // it's the only user-visible record of the salvage.
+        assert!(notices[0].contains("config.toml.parse-error"));
+        assert!(notices[0].contains("token"));
+    }
+
+    #[test]
+    fn clean_settings_toml_records_no_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let content = toml::to_string(&AppSettings::default()).unwrap();
+        let mut notices = Vec::new();
+        let parsed = parse_settings(&content, &path, &mut notices);
+        assert!(parsed.is_some());
+        assert!(notices.is_empty());
+    }
+
+    #[test]
+    fn corrupt_cache_toml_quarantines_and_records_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device_cache.toml");
+        fs::write(&path, "devices = not-a-list").unwrap();
+        let mut notices = Vec::new();
+        let parsed = parse_cache("devices = not-a-list", &path, &mut notices);
+        assert!(parsed.is_none());
+        assert!(dir.path().join("device_cache.toml.parse-error").exists());
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("device_cache.toml.parse-error"));
     }
 
     #[test]

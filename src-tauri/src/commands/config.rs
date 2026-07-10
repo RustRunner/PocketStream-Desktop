@@ -54,3 +54,11 @@ pub async fn update_credentials(
 ) -> Result<(), AppError> {
     config.update_credentials(credentials)
 }
+
+/// Salvage actions taken while loading config files (quarantines,
+/// resets). The frontend fetches this once at init and shows each entry
+/// as an error toast.
+#[tauri::command]
+pub async fn get_startup_notices(config: State<'_, AppConfig>) -> Result<Vec<String>, AppError> {
+    Ok(config.startup_notices())
+}

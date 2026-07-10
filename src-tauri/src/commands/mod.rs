@@ -22,6 +22,17 @@ use crate::error::AppError;
 
 #[tauri::command]
 pub fn log_frontend(level: String, message: String) {
+    // Cap the mirrored line so a hot frontend error loop can't bloat the
+    // log file. Char-based, not byte-based — a byte slice can land
+    // mid-UTF-8 and panic.
+    const MAX_CHARS: usize = 2000;
+    let message = if message.chars().count() > MAX_CHARS {
+        let mut m: String = message.chars().take(MAX_CHARS).collect();
+        m.push_str("… [truncated]");
+        m
+    } else {
+        message
+    };
     match level.as_str() {
         "error" => log::error!("[frontend] {}", message),
         "warn" => log::warn!("[frontend] {}", message),
