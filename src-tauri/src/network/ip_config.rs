@@ -212,19 +212,18 @@ async fn assign_linux(
     Ok(())
 }
 
-/// Bounded timeout for the auto-adopt IP-mutation commands.
+/// Bounded timeout for the IP-configuration commands.
 /// `New-NetIPAddress` and `netsh delete address` normally return in well
 /// under a second; 30 s is a generous ceiling that turns a genuine hang
 /// into an error instead of a wedged adoption.
 const IP_CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Run a command with the default `IP_CMD_TIMEOUT` bound. Delegates to
+/// `run_command_killable` so every caller inherits kill-on-drop and the
+/// timeout — a hung child surfaces as an error instead of wedging the
+/// caller and leaking the process.
 pub(crate) async fn run_command(program: &str, args: &[&str]) -> Result<String, AppError> {
-    let output = super::async_cmd(program)
-        .args(args)
-        .output()
-        .await
-        .map_err(|e| AppError::Network(format!("Failed to run {}: {}", program, e)))?;
-    process_command_output(program, output)
+    run_command_killable(program, args, IP_CMD_TIMEOUT).await
 }
 
 /// Like `run_command` but sets `kill_on_drop(true)` and bounds the call
@@ -441,10 +440,17 @@ pub async fn get_dhcp_state(interface: &str) -> Result<bool, AppError> {
             "(Get-NetIPInterface -InterfaceAlias '{}' -AddressFamily IPv4).Dhcp",
             escaped
         );
-        let output = super::async_cmd("powershell")
+        // This also runs inside the auto-adopt loop, so an unbounded
+        // PowerShell hang would stall adoption indefinitely and leak the
+        // child when the loop is torn down. kill_on_drop plus a 10s bound
+        // turn a hang into an ordinary error instead.
+        let fut = super::async_cmd("powershell")
             .args(["-NoProfile", "-Command", &script])
-            .output()
+            .kill_on_drop(true)
+            .output();
+        let output = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
             .await
+            .map_err(|_| AppError::Network("Get-NetIPInterface timed out after 10s".into()))?
             .map_err(|e| AppError::Network(format!("Failed to read DHCP state: {}", e)))?;
 
         if !output.status.success() {
