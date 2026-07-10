@@ -121,9 +121,9 @@ jobs:
           try {
             cargo fmt --check
             if ($LASTEXITCODE -ne 0) { throw "fmt failed" }
-            cargo clippy --all-targets --no-deps -- -D warnings
+            cargo clippy --all-targets --no-deps --locked -- -D warnings
             if ($LASTEXITCODE -ne 0) { throw "clippy failed" }
-            cargo test --lib
+            cargo test --lib --locked
             if ($LASTEXITCODE -ne 0) { throw "tests failed" }
             cargo install cargo-audit --locked --quiet
             # Advisory ignores are passed explicitly: cargo-audit does not
@@ -160,3 +160,6 @@ jobs:
           releaseName: "PocketStream Desktop ${{ github.ref_name }}"
           releaseDraft: true
           prerelease: false
+          # Trailing args after -- reach cargo: fail on a drifted
+          # Cargo.lock instead of silently re-resolving at release time.
+          args: -- --locked

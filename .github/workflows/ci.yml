@@ -2,7 +2,11 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # Every branch: work-in-progress branches carry release-blocking
+    # fixes for days before a PR exists, and unexercised CI is how the
+    # Windows job silently rotted last time. A branch that is also in a
+    # PR runs twice; that redundancy is accepted for the simplicity.
+    branches: ['**']
   pull_request:
     branches: [main]
 
@@ -69,9 +73,12 @@ jobs:
         with:
           workspaces: src-tauri
 
+      # --locked on every build-graph command: a Cargo.toml edited
+      # without refreshing Cargo.lock must fail here, not re-resolve
+      # silently to whatever the registry serves that day.
       - name: cargo test
         working-directory: src-tauri
-        run: cargo test --lib
+        run: cargo test --lib --locked
 
       - name: cargo fmt
         working-directory: src-tauri
@@ -79,7 +86,7 @@ jobs:
 
       - name: cargo clippy
         working-directory: src-tauri
-        run: cargo clippy --all-targets --no-deps -- -D warnings
+        run: cargo clippy --all-targets --no-deps --locked -- -D warnings
 
   windows:
     name: Rust Compile (Windows)
@@ -180,11 +187,11 @@ jobs:
       # environment it needs, so the knowledge lives with the test.
       - name: cargo build (lib + tests)
         working-directory: src-tauri
-        run: cargo build --lib --tests
+        run: cargo build --lib --tests --locked
 
       - name: cargo test
         working-directory: src-tauri
-        run: cargo test --lib
+        run: cargo test --lib --locked
 
   audit:
     name: Security Audit
@@ -194,7 +201,7 @@ jobs:
       - name: cargo audit
         working-directory: src-tauri
         run: |
-          cargo install cargo-audit --quiet
+          cargo install cargo-audit --locked --quiet
           # Advisory ignores are passed explicitly rather than via
           # audit.toml: cargo-audit does not read a project-local
           # audit.toml (only a global ~/.cargo/audit.toml), so the file's
