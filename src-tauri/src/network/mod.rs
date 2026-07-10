@@ -257,32 +257,43 @@ impl NetworkManager {
     /// the initial snapshot reflects last-known state.
     ///
     /// Cached rows on a subnet owned by an up non-wired local interface
-    /// (WiFi/VPN/virtual) are filtered out before hydration and evicted
-    /// from the on-disk cache, so ghost devices don't reappear as nodes or
-    /// persist across restarts. Rejection keys on ghost overlap only — never
-    /// on offline status — so a foreign/offline camera (CAM/PTU) is kept.
+    /// (WiFi/VPN/virtual), or sitting at an IP this host currently owns,
+    /// are filtered out before hydration and evicted from the on-disk
+    /// cache, so ghost devices and stale self-rows don't reappear as nodes
+    /// or persist across restarts. Rejection keys on ghost overlap or
+    /// host-owned IP only — never on offline status — so a foreign/offline
+    /// camera (CAM/PTU) is kept.
     pub async fn hydrate_device_registry(&self, config: &crate::config::AppConfig) {
         let cached = config.get_cache();
 
         // Fail-open: an empty ghost set (enumeration failure) rejects
         // nothing, so a transient adapter-query hiccup can't wipe the cache.
         let ghosts = ghost::non_wired_interface_networks().await;
-        let (allowed, rejected) = ghost::partition_cached(cached, &ghosts);
+        // Host-owned IPs: a cached row at one of our own current addresses
+        // is the host itself, not a device (e.g. a self-row captured before
+        // live discovery filtered our own traffic). Same fail-open contract.
+        let local_ips: HashSet<Ipv4Addr> = interface::all_local_ipv4().into_iter().collect();
+        let (allowed, rejected) = ghost::partition_cached(cached, &ghosts, &local_ips);
 
         let result = self.device_registry.hydrate_from_cache(&allowed);
 
-        // Evict ghost rows from the on-disk cache (best-effort) so they don't
-        // resurrect on next startup. Runs independently of `result.changed`
-        // — if every cached row was a ghost, nothing hydrated but the cache
-        // still needs cleaning.
-        for device in &rejected {
+        // Evict rejected rows from the on-disk cache (best-effort) so they
+        // don't resurrect on next startup. Runs independently of
+        // `result.changed` — if every cached row was rejected, nothing
+        // hydrated but the cache still needs cleaning.
+        for (device, reason) in &rejected {
+            let why = match reason {
+                ghost::CacheReject::NonWiredSubnet => "on a non-wired subnet",
+                ghost::CacheReject::HostOwnedIp => "at a host-owned IP",
+            };
             log::info!(
-                "Evicting cached device {} ({}) — on a non-wired subnet",
+                "Evicting cached device {} ({}) — {}",
                 device.ip,
-                device.mac
+                device.mac,
+                why
             );
             if let Err(e) = config.remove_cached_device(&device.mac) {
-                log::warn!("Failed to evict ghost cache row {}: {}", device.mac, e);
+                log::warn!("Failed to evict cache row {}: {}", device.mac, e);
             }
         }
 
@@ -299,7 +310,7 @@ impl NetworkManager {
             return;
         }
         log::info!(
-            "DeviceRegistry: hydrated {} cached device(s) (dropped {} dupe(s), evicted {} ghost(s))",
+            "DeviceRegistry: hydrated {} cached device(s) (dropped {} dupe(s), evicted {} rejected row(s))",
             allowed.len() - result.dropped_macs.len(),
             result.dropped_macs.len(),
             rejected.len()
