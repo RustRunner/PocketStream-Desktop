@@ -502,9 +502,9 @@ function setupZoomSlider(): void {
   // The push is gated on the CAM's registry status: at cold start the
   // node resolves from cache seconds after launch, long before subnet
   // adoption binds a route to it, and pushing then just burns an HTTP
-  // timeout. While the record reports anything other than live, hold
-  // the push and let the deviceList subscription below fire it the
-  // moment the CAM flips live (also covers a camera that boots later).
+  // timeout. Until the record exists AND reports live, hold the push
+  // and let the deviceList subscription below fire it the moment the
+  // CAM flips live (also covers a camera that boots after the app).
   let pendingRestoreIp: string | null = null;
 
   function applySavedZoom(): void {
@@ -513,13 +513,16 @@ function setupZoomSlider(): void {
     const saved = state.config?.zoom_positions?.[ip];
     if (typeof saved !== "number") return;
     slider.value = String(saved);
+    // A missing record is held exactly like a non-live one: the restore
+    // can run before the registry has hydrated its cache at all, which
+    // is precisely the no-route window. Nothing legitimate is lost by
+    // holding — manually-entered IPs hydrate as Live records, so the
+    // only record-less state is "not discovered yet".
     const record = deviceList.deviceByIp(ip);
-    if (record && record.status !== "live") {
+    if (!record || record.status !== "live") {
       pendingRestoreIp = ip;
       return;
     }
-    // Live, or unknown to the registry (e.g. a manually-entered IP) —
-    // push optimistically as before.
     pendingRestoreIp = null;
     // Don't pre-set lastSentPercent — we want request() below to fire
     // so the camera catches up to the slider. Quiet: this is a
