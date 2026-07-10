@@ -589,10 +589,39 @@ impl StreamManager {
 
     pub async fn start_recording(&self) -> Result<(), AppError> {
         // Path computation involves filesystem I/O — keep it outside
-        // the lock.
+        // the lock. When the Videos folder is unavailable, fall back to
+        // the per-user local-data dir — NOT the process CWD, which on an
+        // installed build is Program Files and unwritable.
         let output_dir = dirs::video_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .unwrap_or_else(|| {
+                let fallback = dirs::data_local_dir().unwrap_or_else(std::env::temp_dir);
+                log::warn!(
+                    "Videos directory unavailable; recording under {}",
+                    fallback.display()
+                );
+                fallback
+            })
             .join("PocketStream");
+
+        // Pre-flight the recording volume: a disk that fills mid-write
+        // surfaces as an opaque GStreamer bus error that reads like a
+        // network failure, so refuse to start below a floor instead. A
+        // failed probe fails open — it must not block recording.
+        if let Some(free) = recorder::free_space_bytes(&output_dir) {
+            if !recorder::recording_space_ok(free) {
+                return Err(AppError::Stream(format!(
+                    "Not enough disk space to record — {} MB free, {} MB required",
+                    free / (1024 * 1024),
+                    recorder::RECORDING_MIN_FREE_BYTES / (1024 * 1024)
+                )));
+            }
+        } else {
+            log::warn!(
+                "Could not determine free space for {}; starting recording anyway",
+                output_dir.display()
+            );
+        }
+
         let path = recorder::recording_path(&output_dir)?;
         let path_str = path.to_string_lossy().to_string();
 

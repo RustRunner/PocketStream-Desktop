@@ -34,6 +34,56 @@ pub fn save_screenshot_jpg(
     Ok(path)
 }
 
+/// Minimum free space required to start a recording. Fragmented MP4 at
+/// the pipeline's 4 Mbps is roughly 30 MB/min; 512 MB gives the
+/// operator meaningful runway while leaving headroom for the rest of
+/// the system. No automatic deletion ever — field footage may be
+/// evidence; when space runs out the answer is a clear error, not a
+/// reaper.
+pub const RECORDING_MIN_FREE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// True when a recording may start with `free` bytes available on the
+/// recording volume.
+pub fn recording_space_ok(free: u64) -> bool {
+    free >= RECORDING_MIN_FREE_BYTES
+}
+
+/// Free bytes available to the current user on the volume containing
+/// `path`. Walks up to the deepest existing ancestor first — the
+/// recording directory itself may not exist yet. `None` when the probe
+/// fails; callers should fail open (a broken probe must not block
+/// recording).
+#[cfg(windows)]
+pub fn free_space_bytes(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    let mut probe = path;
+    while !probe.exists() {
+        probe = probe.parent()?;
+    }
+    let wide: Vec<u16> = probe
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut free_to_caller: u64 = 0;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_to_caller,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(free_to_caller)
+}
+
+#[cfg(not(windows))]
+pub fn free_space_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
 /// Generate a recording file path (doesn't create the file).
 pub fn recording_path(output_dir: &Path) -> Result<PathBuf, AppError> {
     fs::create_dir_all(output_dir)
@@ -61,6 +111,30 @@ mod tests {
         assert!(path.exists());
         assert!(path.to_string_lossy().contains("PS_Screenshot_"));
         assert_eq!(path.extension().unwrap(), "jpg");
+    }
+
+    // ── free-space pre-flight ───────────────────────────────────────
+
+    #[test]
+    fn space_floor_boundaries() {
+        assert!(!recording_space_ok(0));
+        assert!(!recording_space_ok(RECORDING_MIN_FREE_BYTES - 1));
+        assert!(recording_space_ok(RECORDING_MIN_FREE_BYTES));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn free_space_probe_returns_some_for_temp_dir() {
+        assert!(free_space_bytes(&std::env::temp_dir()).is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn free_space_probe_walks_up_to_existing_ancestor() {
+        let p = std::env::temp_dir()
+            .join("ps-does-not-exist")
+            .join("nested");
+        assert!(free_space_bytes(&p).is_some());
     }
 
     // ── recording_path ──────────────────────────────────────────────

@@ -670,6 +670,18 @@ impl Drop for PlaybackPipeline {
 fn friendly_rtsp_error(error: &str, debug: &str) -> String {
     let combined = format!("{} {}", error, debug).to_lowercase();
 
+    // Disk exhaustion during recording — checked before the network
+    // patterns because filesink failures ride the same "internal data
+    // stream error" wording those patterns match, and "network
+    // connection lost" would send the operator debugging the wrong
+    // thing entirely.
+    if combined.contains("no space left")
+        || combined.contains("not enough space")
+        || combined.contains("disk full")
+    {
+        return "Recording stopped: disk full. Free space on the recording drive.".into();
+    }
+
     // Network-loss / mid-stream disconnect — checked first because
     // GStreamer's debug payload often replays the last RTSP exchange,
     // which can include cached 401/404 responses from earlier auth
@@ -739,6 +751,27 @@ mod tests {
     // Each pinned message is what the user sees in a toast — changing the
     // contract requires deliberately updating the expectation, not silently
     // editing the function.
+
+    #[test]
+    fn disk_full_beats_generic_stream_error() {
+        // filesink exhaustion rides "internal data stream error", which
+        // the network patterns also match — the disk branch must win or
+        // the operator gets sent to check ethernet cables.
+        let msg = friendly_rtsp_error(
+            "Internal data stream error",
+            "gstfilesink.c: Error while writing to file: No space left on device",
+        );
+        assert!(msg.to_lowercase().contains("disk full"));
+    }
+
+    #[test]
+    fn disk_full_via_windows_phrase() {
+        let msg = friendly_rtsp_error(
+            "Error while writing",
+            "There is not enough space on the disk",
+        );
+        assert!(msg.to_lowercase().contains("disk full"));
+    }
 
     #[test]
     fn rtsp_503_recognized() {
