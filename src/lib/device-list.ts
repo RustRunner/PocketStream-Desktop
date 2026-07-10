@@ -96,8 +96,12 @@ export async function start(): Promise<void> {
   // If a push update arrives while we await the cold-start fetch below,
   // it carries the backend's newest snapshot — the initial fetch may
   // predate it. Track that so we don't overwrite the fresher event.
+  // Registration itself is awaited: Tauri's listen() is async, and a
+  // snapshot emitted before it completes would be dropped entirely,
+  // leaving the UI stale until the next backend emit. Awaiting closes
+  // that pre-registration window before the fetch begins.
   let eventLanded = false;
-  api.onEvent<DeviceRecord[]>("device-list-changed", (snapshot) => {
+  await api.onEvent<DeviceRecord[]>("device-list-changed", (snapshot) => {
     eventLanded = true;
     setSnapshot(snapshot);
   });
