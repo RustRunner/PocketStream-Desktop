@@ -30,6 +30,7 @@ import {
   handleHardDisconnect,
   syncRtspStartButton,
   syncVideoVisibility,
+  showModalWithVideo,
 } from "./lib/streaming.ts";
 import { setupPtzControls } from "./lib/ptz.ts";
 import type {
@@ -575,7 +576,7 @@ function setupResetAdapterButton(): void {
   const titleEl = $<HTMLElement>("#host-title");
   const dialog = $<HTMLDialogElement>("#reset-adapter-dialog");
 
-  titleEl.addEventListener("click", () => {
+  titleEl.addEventListener("click", async () => {
     const iface = state.activeInterface;
     if (!iface || !iface.name) {
       showToast(
@@ -586,7 +587,10 @@ function setupResetAdapterButton(): void {
     }
     $<HTMLElement>("#reset-adapter-name").textContent =
       iface.display_name || iface.name;
-    dialog.showModal();
+    // Through showModalWithVideo, not showModal: the native video child
+    // z-orders above the WebView, so a bare showModal leaves the dialog
+    // buried under (and unclickable through) a running stream.
+    await showModalWithVideo(dialog);
   });
 
   $<HTMLButtonElement>("#reset-adapter-cancel").addEventListener("click", () => {
