@@ -172,15 +172,19 @@ jobs:
           workspaces: src-tauri
           key: windows
 
-      # Compile the entire crate, including the #[cfg(windows)] halves
-      # that the Linux job can't see. Tests aren't *run* — many depend on
-      # local resources (GStreamer plugin registry, real network adapters)
-      # and CI runners aren't a faithful production environment for them.
-      # `cargo build --tests` still type-checks every test, which is the
-      # actual gap we're closing here.
+      # Compile AND run the crate's tests, including the #[cfg(windows)]
+      # halves the Linux job can't see — DPAPI credential-key handling
+      # and the other Windows-only paths execute nowhere else. Tests
+      # that genuinely need resources a runner can't provide are marked
+      # #[ignore] in code, each with a reason string describing the
+      # environment it needs, so the knowledge lives with the test.
       - name: cargo build (lib + tests)
         working-directory: src-tauri
         run: cargo build --lib --tests
+
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test --lib
 
   audit:
     name: Security Audit
