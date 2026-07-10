@@ -6,7 +6,7 @@ use tauri::State;
 use crate::config::AppConfig;
 use crate::error::AppError;
 use crate::network::NetworkManager;
-use crate::validation::parse_known_camera_ip;
+use crate::validation::{parse_camera_url_host, parse_known_camera_ip};
 
 /// Resolve and validate a camera-control target. Camera-control commands
 /// use the known-device validator so a FLIR that fell back to APIPA stays
@@ -22,11 +22,12 @@ async fn control_target(
 
 /// Open a discovered device's web UI in the system browser.
 ///
-/// Replaces a frontend `plugin:shell|open` invoke: the elevated webview
-/// no longer holds the shell-open capability at all, so it can't be
-/// coerced into opening an arbitrary URL or path. The IP is validated
-/// against the known-device set (same guard as camera control), and the
-/// only thing that can be opened is `http://<validated-ipv4>`.
+/// Runs on the backend so the webview needs no shell-open capability —
+/// the shell plugin isn't installed at all, so the webview process
+/// can't be coerced into opening an arbitrary URL or path. The IP is
+/// validated against the known-device set (same guard as camera
+/// control), and the only thing that can be opened is
+/// `http://<validated-ipv4>`.
 #[tauri::command]
 pub async fn open_device_browser(
     manager: State<'_, NetworkManager>,
@@ -67,31 +68,49 @@ pub async fn ptu_send(
 }
 
 // ── ONVIF / generic PTZ (stubs — return Err until implemented) ─────
+//
+// Every handler validates its target before dispatching, even though
+// the implementations currently return "not yet implemented": these
+// commands are registered and IPC-reachable, so an unvalidated
+// URL/subnet surface would be one implementation away from an SSRF
+// pivot. When ONVIF lands, tighten the URL-host check to the
+// known-device validation camera control uses (control_target), so
+// APIPA-rescue devices stay controllable.
 
 #[tauri::command]
 pub async fn discover_onvif(
     subnet: Option<String>,
 ) -> Result<Vec<crate::camera::OnvifDevice>, AppError> {
+    if let Some(s) = subnet.as_deref() {
+        // Same boundary checks as scan_network: malformed CIDR and
+        // too-wide subnets rejected before anything spins up.
+        let (_, prefix) = crate::validation::parse_cidr(s)?;
+        crate::network::scanner::check_scan_size(prefix)?;
+    }
     crate::camera::onvif::discover(subnet.as_deref()).await
 }
 
 #[tauri::command]
 pub async fn ptz_move(camera_url: String, pan: f64, tilt: f64, zoom: f64) -> Result<(), AppError> {
+    parse_camera_url_host(&camera_url)?;
     crate::camera::ptz::continuous_move(&camera_url, pan, tilt, zoom).await
 }
 
 #[tauri::command]
 pub async fn ptz_stop(camera_url: String) -> Result<(), AppError> {
+    parse_camera_url_host(&camera_url)?;
     crate::camera::ptz::stop(&camera_url).await
 }
 
 #[tauri::command]
 pub async fn ptz_goto_preset(camera_url: String, preset: u32) -> Result<(), AppError> {
+    parse_camera_url_host(&camera_url)?;
     crate::camera::ptz::goto_preset(&camera_url, preset).await
 }
 
 #[tauri::command]
 pub async fn ptz_set_preset(camera_url: String, preset: u32, name: String) -> Result<(), AppError> {
+    parse_camera_url_host(&camera_url)?;
     crate::camera::ptz::set_preset(&camera_url, preset, &name).await
 }
 

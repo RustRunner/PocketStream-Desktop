@@ -75,6 +75,37 @@ pub fn parse_known_camera_ip(
     )))
 }
 
+/// Extract and validate the host of a camera-control URL. PTZ/ONVIF
+/// commands accept a full `camera_url` from the webview; before any
+/// dispatch the host must be a literal IPv4 address that passes the
+/// same reserved-range guard as every other camera target. Hostnames
+/// are rejected (no DNS pivot), as is any URL carrying userinfo
+/// (`http://user@host` smuggling) or a non-HTTP scheme. When ONVIF is
+/// actually implemented, tighten this to the known-device validation
+/// used by camera control so APIPA-rescue devices stay controllable.
+pub fn parse_camera_url_host(url: &str) -> Result<Ipv4Addr, AppError> {
+    let (scheme, rest) = url.split_once("://").ok_or_else(|| {
+        AppError::Network(format!(
+            "Invalid camera URL (expected scheme://host): {}",
+            url
+        ))
+    })?;
+    if scheme != "http" && scheme != "https" {
+        return Err(AppError::Network(format!(
+            "Camera URL scheme not allowed: {}",
+            scheme
+        )));
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.contains('@') {
+        return Err(AppError::Network(
+            "Camera URL must not contain credentials".into(),
+        ));
+    }
+    let host = authority.split(':').next().unwrap_or("");
+    parse_camera_ip(host)
+}
+
 /// True when `addr` falls inside the CIDR block `cidr` ("a.b.c.0/24").
 /// Malformed CIDR strings are treated as non-matching rather than
 /// erroring — adopted-subnet keys are backend-generated, so a bad one
@@ -255,6 +286,50 @@ mod tests {
     fn known_variant_accepts_routable_without_registry() {
         let registry = DeviceRegistry::new();
         assert!(parse_known_camera_ip("192.168.1.50", &registry, &[]).is_ok());
+    }
+
+    // ── parse_camera_url_host ──────────────────────────────────────
+
+    #[test]
+    fn url_host_accepts_plain_ipv4_url() {
+        let addr = parse_camera_url_host("http://192.168.1.50/onvif/device_service").unwrap();
+        assert_eq!(addr.octets(), [192, 168, 1, 50]);
+    }
+
+    #[test]
+    fn url_host_accepts_port_and_https() {
+        assert!(parse_camera_url_host("https://192.168.1.50:8080/onvif").is_ok());
+        assert!(parse_camera_url_host("http://10.0.0.2:80").is_ok());
+    }
+
+    #[test]
+    fn url_host_rejects_hostnames() {
+        // Only literal IPv4 — a resolvable name would let DNS pick the
+        // real target after validation.
+        assert!(parse_camera_url_host("http://camera.local/onvif").is_err());
+        assert!(parse_camera_url_host("http://example.com").is_err());
+    }
+
+    #[test]
+    fn url_host_rejects_reserved_ranges() {
+        assert!(parse_camera_url_host("http://127.0.0.1/onvif").is_err());
+        // Strict guard for the stubbed surface: link-local needs the
+        // known-device context that camera control has and this doesn't.
+        assert!(parse_camera_url_host("http://169.254.1.1/onvif").is_err());
+        assert!(parse_camera_url_host("http://0.0.0.0/").is_err());
+    }
+
+    #[test]
+    fn url_host_rejects_userinfo() {
+        assert!(parse_camera_url_host("http://admin@192.168.1.50/onvif").is_err());
+        assert!(parse_camera_url_host("http://a:b@192.168.1.50").is_err());
+    }
+
+    #[test]
+    fn url_host_rejects_missing_or_odd_scheme() {
+        assert!(parse_camera_url_host("192.168.1.50/onvif").is_err());
+        assert!(parse_camera_url_host("file://192.168.1.50/etc").is_err());
+        assert!(parse_camera_url_host("gopher://192.168.1.50").is_err());
     }
 
     // ── cidr_contains ──────────────────────────────────────────────
