@@ -56,6 +56,11 @@ pub struct StreamManager {
     /// stop that races a start wins instead of leaving a zombie server the
     /// user asked not to run.
     rtsp_epoch: std::sync::atomic::AtomicU64,
+    /// Same stop-beats-start protocol as `rtsp_epoch`, for the playback
+    /// pipeline: bumped on every `stop_playback` (even when no pipeline is
+    /// stored), captured by `start_playback` before its slow pipeline
+    /// build, and re-checked under the storage lock.
+    playback_epoch: std::sync::atomic::AtomicU64,
 }
 
 /// What a running consumer is ingesting, captured at start time. The
@@ -98,6 +103,7 @@ impl StreamManager {
             video_hwnd: Arc::new(std::sync::atomic::AtomicIsize::new(0)),
             status_tx: Arc::new(status_tx),
             rtsp_epoch: std::sync::atomic::AtomicU64::new(0),
+            playback_epoch: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -163,6 +169,13 @@ impl StreamManager {
         // GStreamer init runs in a background thread at startup; block here
         // until it's ready (usually instant, only slow on first cold launch).
         crate::ensure_gstreamer()?;
+
+        // Capture the stop epoch before any slow work. stop_playback bumps
+        // it unconditionally, so if it changes before we store the new
+        // pipeline a stop raced us and must win (see the storage step below).
+        let start_epoch = self
+            .playback_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
 
         // Take the old pipeline (and any recording state) out under the
         // lock; do the slow GStreamer teardown outside it — same
@@ -239,12 +252,31 @@ impl StreamManager {
 
         pipeline.play()?;
 
-        // Second lock acquisition (take-old above, store-new here). The
-        // window between them is harmless today — the frontend
-        // serializes stream starts — but concurrent starts would race
-        // to store their pipeline; revisit if that assumption changes.
+        // Second lock acquisition (take-old above, store-new here). A stop
+        // landing in the window between them "succeeds" against an empty
+        // state, so store only if no stop raced us since `start_epoch` (a
+        // concurrent stop bumps the epoch even during the take-old window
+        // above, when no pipeline is stored). If it changed the user asked
+        // for no playback: stop the pipeline we just built and report the
+        // supersession rather than leaving a zombie preview.
         {
             let mut state = self.state.lock().await;
+            if self
+                .playback_epoch
+                .load(std::sync::atomic::Ordering::Acquire)
+                != start_epoch
+            {
+                drop(state);
+                log::info!(
+                    "Playback start superseded by a concurrent stop — discarding built pipeline"
+                );
+                if let Err(e) = pipeline.stop() {
+                    log::warn!("Stopping superseded playback pipeline failed: {}", e);
+                }
+                return Err(AppError::Stream(
+                    "Playback start was superseded by a stop".into(),
+                ));
+            }
             state.playback = Some(Arc::new(pipeline));
             state.start_time = Some(std::time::Instant::now());
             state.playback_source = Some(match settings.stream.protocol {
@@ -260,6 +292,14 @@ impl StreamManager {
     }
 
     pub async fn stop_playback(&self) -> Result<(), AppError> {
+        // Record stop intent unconditionally, even when no pipeline is
+        // stored: start_playback takes the old pipeline out before its slow
+        // build, so during that window playback is None and a stop here
+        // would otherwise be invisible to the late start — which would then
+        // store a playing pipeline the user asked to stop. Bumping the
+        // epoch makes the start observe it.
+        self.playback_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         // Take everything out of state under the lock, then do the slow
         // GStreamer transitions outside it. The pipeline is owned (not
         // borrowed) by the time we await, so the lock can drop cleanly.
