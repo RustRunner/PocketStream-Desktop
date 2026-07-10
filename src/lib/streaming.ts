@@ -237,7 +237,7 @@ export function setupStreamControls(): void {
 
 // ── Stream UI updates ───────────────────────────────────────────────
 
-function updateStreamUI(): void {
+export function updateStreamUI(): void {
   const btn = $<HTMLButtonElement>("#btn-toggle-stream");
   btn.textContent = state.isStreaming ? "Stop Stream" : "Start Stream";
   btn.className = state.isStreaming ? "outlined-btn active-btn" : "filled-btn";
@@ -474,6 +474,28 @@ function setupQrDialog(): void {
 const DROP_THRESHOLD_EVENTS = 3;
 let notPlayingStreak = 0;
 
+// Latched across a deliberate stop→start pipeline switch (path change):
+// the status events emitted while the new pipeline spins up legitimately
+// report playing=false, and on a camera with slow RTSP setup they would
+// accumulate past DROP_THRESHOLD_EVENTS and tear down the just-started
+// pipeline AND the RTSP relay via showStreamLost. Only the drop-detection
+// block honors the latch — RTSP-UI sync and uptime rendering must keep
+// running, since the RTSP server stays live during a playback switch.
+let pipelineSwitchInProgress = false;
+
+/** Suppress the drop detector for the duration of a deliberate
+ *  stop→start pipeline switch. Pair with endPipelineSwitch() in a
+ *  finally block so a failed switch can't leave the detector off. */
+export function beginPipelineSwitch(): void {
+  pipelineSwitchInProgress = true;
+  notPlayingStreak = 0;
+}
+
+export function endPipelineSwitch(): void {
+  pipelineSwitchInProgress = false;
+  notPlayingStreak = 0;
+}
+
 // ── Stall auto-recovery ─────────────────────────────────────────────
 //
 // When health_check reports "Stream stalled — no frames for Ns" the
@@ -533,18 +555,22 @@ function handleStatus(status: StreamStatus | null): void {
     }
   }
 
-  // Detect stream drop — backend says not playing but we think we're streaming
-  if (state.isStreaming && !status.playing) {
-    notPlayingStreak++;
-    if (notPlayingStreak >= DROP_THRESHOLD_EVENTS) {
-      showStreamLost(status.error);
+  // Detect stream drop — backend says not playing but we think we're
+  // streaming. Skipped while a deliberate pipeline switch is in
+  // progress; those events are the switch itself, not a drop.
+  if (!pipelineSwitchInProgress) {
+    if (state.isStreaming && !status.playing) {
+      notPlayingStreak++;
+      if (notPlayingStreak >= DROP_THRESHOLD_EVENTS) {
+        showStreamLost(status.error);
+      }
+    } else if (state.isStreaming && status.playing) {
+      if (notPlayingStreak > 0) {
+        log(`Stream recovered after ${notPlayingStreak} bad event(s)`);
+      }
+      notPlayingStreak = 0;
+      hideStreamLost();
     }
-  } else if (state.isStreaming && status.playing) {
-    if (notPlayingStreak > 0) {
-      log(`Stream recovered after ${notPlayingStreak} bad event(s)`);
-    }
-    notPlayingStreak = 0;
-    hideStreamLost();
   }
 }
 

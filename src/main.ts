@@ -32,6 +32,9 @@ import {
   syncVideoVisibility,
   showModalWithVideo,
   createVideoWindowSynced,
+  beginPipelineSwitch,
+  endPipelineSwitch,
+  updateStreamUI,
 } from "./lib/streaming.ts";
 import { setupPtzControls } from "./lib/ptz.ts";
 import type {
@@ -298,6 +301,11 @@ async function applyPathChange(): Promise<void> {
   // Start Stream click via state.config.stream.rtsp_path.
   if (!state.isStreaming || state.streamLost) return;
 
+  // Suppress the drop detector across the deliberate stop→start: on a
+  // camera with slow RTSP setup the switch spans several status ticks
+  // whose playing=false would otherwise trip the stream-lost teardown
+  // against the pipeline this very switch just started.
+  beginPipelineSwitch();
   try {
     await api.stopStream();
     const bounds = getVideoAreaBounds();
@@ -305,7 +313,14 @@ async function applyPathChange(): Promise<void> {
     await api.startStream(handle);
     showToast("Switched to " + newPath);
   } catch (e) {
+    // The old pipeline is gone and the new one failed to start —
+    // reflect the stopped reality instead of leaving the UI claiming a
+    // live stream that no longer exists.
+    state.isStreaming = false;
+    updateStreamUI();
     showToast("Failed to switch path: " + formatError(e), true);
+  } finally {
+    endPipelineSwitch();
   }
 }
 
