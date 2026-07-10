@@ -41,8 +41,7 @@
     ],
     "resources": [
       "resources/gstreamer/bin/*",
-      "resources/gstreamer/lib/gstreamer-1.0/*",
-      "resources/prerequisites/*"
+      "resources/gstreamer/lib/gstreamer-1.0/*"
     ],
     "windows": {
       "nsis": {

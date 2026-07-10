@@ -62,10 +62,8 @@ jobs:
         run: |
           mkdir -p src-tauri/resources/gstreamer/bin
           mkdir -p src-tauri/resources/gstreamer/lib/gstreamer-1.0
-          mkdir -p src-tauri/resources/prerequisites
           touch src-tauri/resources/gstreamer/bin/.gitkeep
           touch src-tauri/resources/gstreamer/lib/gstreamer-1.0/.gitkeep
-          touch src-tauri/resources/prerequisites/.gitkeep
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -166,10 +164,8 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path src-tauri\resources\gstreamer\bin | Out-Null
           New-Item -ItemType Directory -Force -Path src-tauri\resources\gstreamer\lib\gstreamer-1.0 | Out-Null
-          New-Item -ItemType Directory -Force -Path src-tauri\resources\prerequisites | Out-Null
           New-Item -ItemType File -Force -Path src-tauri\resources\gstreamer\bin\.gitkeep | Out-Null
           New-Item -ItemType File -Force -Path src-tauri\resources\gstreamer\lib\gstreamer-1.0\.gitkeep | Out-Null
-          New-Item -ItemType File -Force -Path src-tauri\resources\prerequisites\.gitkeep | Out-Null
 
       - uses: Swatinem/rust-cache@v2
         with:

@@ -108,10 +108,8 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path src-tauri\resources\gstreamer\bin | Out-Null
           New-Item -ItemType Directory -Force -Path src-tauri\resources\gstreamer\lib\gstreamer-1.0 | Out-Null
-          New-Item -ItemType Directory -Force -Path src-tauri\resources\prerequisites | Out-Null
           New-Item -ItemType File -Force -Path src-tauri\resources\gstreamer\bin\.gitkeep | Out-Null
           New-Item -ItemType File -Force -Path src-tauri\resources\gstreamer\lib\gstreamer-1.0\.gitkeep | Out-Null
-          New-Item -ItemType File -Force -Path src-tauri\resources\prerequisites\.gitkeep | Out-Null
 
       # Same gates as CI, on the release commit.
       - name: Checks (typecheck, fmt, clippy, test, audit)
@@ -144,17 +142,6 @@ jobs:
       - name: Bundle GStreamer runtime
         shell: pwsh
         run: pwsh -File scripts/bundle-gstreamer.ps1
-
-      # The bundle resource glob includes resources/prerequisites/*; keep
-      # a placeholder so the glob resolves. (Npcap bundling is gone — the
-      # capture backend is the in-box PacketMonitor API.)
-      - name: Create prerequisite placeholder
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path src-tauri\resources\prerequisites | Out-Null
-          if (-not (Test-Path src-tauri\resources\prerequisites\.gitkeep)) {
-            New-Item -ItemType File -Path src-tauri\resources\prerequisites\.gitkeep | Out-Null
-          }
 
       # Build + sign + assemble latest.json + publish as a DRAFT release.
       # POCKETSTREAM_RELEASE embeds the requireAdministrator manifest.
