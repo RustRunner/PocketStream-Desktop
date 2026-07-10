@@ -480,9 +480,18 @@ impl PlaybackPipeline {
         let rec_bin = gst::parse::bin_from_description(rec_bin_str, true)
             .map_err(|e| AppError::Stream(format!("Recording bin parse error: {}", e)))?;
 
+        // The named element must exist if the bin parsed, but a GStreamer
+        // plugin-version mismatch could in theory remove it — return an
+        // error rather than panicking the streaming task. This runs before
+        // the bin joins the pipeline, so the early return needs no unwind.
         rec_bin
             .by_name("rec_sink")
-            .expect("filesink 'rec_sink' not found in recording bin")
+            .ok_or_else(|| {
+                AppError::Stream(
+                    "filesink 'rec_sink' not found in recording bin (GStreamer version mismatch?)"
+                        .into(),
+                )
+            })?
             .set_property("location", file_path);
         rec_bin.set_property("name", bin_name);
 
