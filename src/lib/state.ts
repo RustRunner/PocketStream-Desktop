@@ -63,14 +63,28 @@ export const adoptedSubnets: Map<string, string> = new Map();
  *  for the common case; pass a more specific type when you need
  *  `.value` / `.checked` / etc. — e.g., `$<HTMLInputElement>("#x")`.
  *
- *  Returns the cast as non-null for ergonomics: every consumer in this
- *  codebase queries by an ID that is statically present in index.html,
- *  so a null return would just push a check to every site without
- *  catching real bugs. If a selector starts producing null at runtime,
- *  the resulting `Cannot read properties of null` is the real signal
- *  and the right fix is at that call site, not here. */
-export const $ = <E extends Element = HTMLElement>(sel: string): E =>
-  document.querySelector(sel) as E;
+ *  Throws when the selector matches nothing. Every consumer queries an
+ *  element the app can't function without (IDs statically present in
+ *  index.html), so a miss means the markup and the wiring drifted —
+ *  e.g. an ID renamed on one side only. That compiles clean, so the
+ *  runtime check is the only tripwire; failing here, named, at wiring
+ *  time beats dying later at arbitrary depth as a bare "Cannot read
+ *  properties of null" — possibly inside a swallowed catch. All wiring
+ *  runs at DOMContentLoaded and the global error handlers mirror the
+ *  throw into pocketstream.log, so a missed rename is loud on the very
+ *  next launch, before any user interaction. Use $opt for selectors
+ *  that may legitimately match nothing. */
+export const $ = <E extends Element = HTMLElement>(sel: string): E => {
+  const el = document.querySelector<E>(sel);
+  if (!el) throw new Error(`Missing DOM element: ${sel}`);
+  return el;
+};
+
+/** querySelector for elements that may legitimately be absent —
+ *  state-dependent matches (e.g. "[data-protocol].active") or nodes
+ *  created after load. The null is part of the contract; handle it. */
+export const $opt = <E extends Element = HTMLElement>(sel: string): E | null =>
+  document.querySelector<E>(sel);
 
 export const $$ = <E extends Element = HTMLElement>(sel: string): NodeListOf<E> =>
   document.querySelectorAll(sel) as NodeListOf<E>;

@@ -3,7 +3,7 @@
  */
 
 import * as api from "./lib/tauri-api.ts";
-import { $, $$, state, showToast, log, adoptedSubnets } from "./lib/state.ts";
+import { $, $$, $opt, state, showToast, log, adoptedSubnets } from "./lib/state.ts";
 import { formatError } from "./lib/errors.ts";
 import {
   refreshInterfaces,
@@ -393,7 +393,7 @@ function setupSettingsSave(): void {
     // Narrow to the StreamProtocol union — the backend enum rejects
     // anything else, and the only two toggle buttons carry these values.
     const activeProto: StreamProtocol =
-      $<HTMLElement>("[data-protocol].active")?.dataset["protocol"] === "udp"
+      $opt<HTMLElement>("[data-protocol].active")?.dataset["protocol"] === "udp"
         ? "udp"
         : "rtsp";
 
