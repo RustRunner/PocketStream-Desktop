@@ -404,6 +404,19 @@ impl DeviceRegistry {
         changed
     }
 
+    /// The parsed IP of every user-pinned record (see `is_user_pinned`).
+    /// Lets removal paths ask "does a pinned device sit inside this
+    /// subnet" without exposing the key map — the `manual:` key prefix
+    /// only exists on the map keys, not in the records a `snapshot()`
+    /// returns.
+    pub fn user_pinned_ips(&self, configured_pins: &HashSet<String>) -> Vec<std::net::Ipv4Addr> {
+        let map = self.lock();
+        map.iter()
+            .filter(|(key, r)| is_user_pinned(key, &r.alias, &r.ip, configured_pins))
+            .filter_map(|(_, r)| r.ip.parse().ok())
+            .collect()
+    }
+
     /// Evict a phantom cached device: a non-`Live` record at `ip` whose
     /// targeted verify found no open ports and which the user hasn't
     /// pinned (see `is_user_pinned`: aliased entries like the labelled
@@ -681,6 +694,40 @@ mod tests {
         // An unset stream target must not pin the empty string.
         settings.stream.camera_ip = String::new();
         assert!(!configured_pins(&settings).contains(""));
+    }
+
+    #[test]
+    fn user_pinned_ips_returns_pinned_records_only() {
+        let r = DeviceRegistry::new();
+        r.hydrate_from_cache(&[
+            cached(
+                "AA:BB:CC:DD:EE:01",
+                "192.168.4.65",
+                "192.168.4.0/24",
+                vec![80],
+                "CAM",
+            ),
+            cached(
+                "AA:BB:CC:DD:EE:02",
+                "192.168.4.90",
+                "192.168.4.0/24",
+                vec![80],
+                "",
+            ),
+            cached("AA:BB:CC:DD:EE:03", "10.0.0.5", "10.0.0.0/24", vec![], ""),
+        ]);
+        let pins: HashSet<String> = ["10.0.0.5".to_string()].into_iter().collect();
+        let mut ips = r.user_pinned_ips(&pins);
+        ips.sort();
+        // The aliased CAM and the configured pin qualify; the anonymous
+        // row does not.
+        assert_eq!(
+            ips,
+            vec![
+                "10.0.0.5".parse::<std::net::Ipv4Addr>().unwrap(),
+                "192.168.4.65".parse().unwrap(),
+            ]
+        );
     }
 
     #[test]

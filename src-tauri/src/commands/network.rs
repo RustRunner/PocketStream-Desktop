@@ -419,9 +419,21 @@ pub async fn get_adopted_subnets(
 pub async fn remove_adopted_subnet(
     manager: State<'_, NetworkManager>,
     config: State<'_, AppConfig>,
+    app: tauri::AppHandle,
     subnet: String,
 ) -> Result<(), AppError> {
-    manager.remove_adopted_subnet(&subnet).await?;
+    let ip = manager.remove_adopted_subnet(&subnet).await?;
     manager.save_adopted_to_config(&config).await;
+    // Same event the lifecycle reaper emits, so every UI surface follows
+    // backend state through one listener whichever path removed the row.
+    use tauri::Emitter;
+    let _ = app.emit(
+        "subnet-removed",
+        serde_json::json!({
+            "subnet": subnet,
+            "adopted_ip": ip.to_string(),
+            "reason": "manual",
+        }),
+    );
     Ok(())
 }

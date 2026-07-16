@@ -13,6 +13,7 @@ pub mod ping_dot;
 // is consumed by the arp.rs listener; the availability probe is called
 // only from the Windows startup block, so it reads as dead on Linux.
 pub mod pktmon;
+pub mod reaper;
 pub mod scanner;
 pub mod watcher;
 
@@ -293,6 +294,38 @@ fn record_positive_liveness(
     liveness.insert(subnet.clone(), now);
     meta.entry(subnet).or_default().last_device_seen = Some(wall_rfc3339.to_string());
     true
+}
+
+/// True when the wired adapter has no native IPv4 address — nothing
+/// that isn't APIPA, an adopted secondary, or a still-pending adoption
+/// bind. In that state APIPA bindings are the host's only connectivity
+/// (the adoption rescue path), so the lifecycle check must not remove
+/// any of them. An older adopted non-APIPA secondary deliberately does
+/// not count as native: it must not make a DHCP-less host look
+/// connected.
+fn host_in_apipa_rescue(
+    current_ips: &[Ipv4Addr],
+    adopted_ips: &HashSet<Ipv4Addr>,
+    pending_ips: &HashSet<Ipv4Addr>,
+) -> bool {
+    !current_ips
+        .iter()
+        .any(|ip| !ip.is_link_local() && !adopted_ips.contains(ip) && !pending_ips.contains(ip))
+}
+
+/// Adapter guards for an automatic unbind, mirroring shutdown cleanup:
+/// never strip the adapter's primary address, and never leave it with
+/// zero IPv4 addresses (Windows often disables such an adapter — far
+/// worse than a stray secondary surviving another cycle). Returns the
+/// reason the unbind is blocked, or `None` when it may proceed.
+fn unbind_guard_blocks(ip: &str, adapter_ips: &[String]) -> Option<&'static str> {
+    if adapter_ips.first().map(String::as_str) == Some(ip) {
+        return Some("is the adapter's primary IP");
+    }
+    if adapter_ips.len() <= 1 && adapter_ips.iter().any(|a| a == ip) {
+        return Some("would leave the adapter with no other IPv4 address");
+    }
+    None
 }
 
 impl NetworkManager {
@@ -1220,6 +1253,9 @@ impl NetworkManager {
         let liveness_for_adopt = self.adoption_liveness.clone();
         let meta_for_adopt = self.adopted_meta.clone();
         let adopt_handle = tokio::spawn(async move {
+            // AdoptOps in scope: the reap pass calls the unbind through
+            // the same seam the adoption rollback paths use.
+            use auto_adopt::AdoptOps;
             use tauri::Emitter;
             use tauri::Manager;
             let mut shutdown_rx = shutdown_rx;
@@ -1230,6 +1266,19 @@ impl NetworkManager {
             // a single spurious frame (which sits in the persistent
             // device map forever) can no longer bind a secondary IP.
             let mut dwell = auto_adopt::DwellTracker::new();
+            // Lifecycle clocks for the reap pass below. The session
+            // start anchors the startup grace for adoptions with no
+            // positive sighting; it restarts with discovery itself, so
+            // an interface bounce re-arms the grace.
+            let loop_started = std::time::Instant::now();
+            // Failed or guard-blocked reaps back off here (60 s doubling
+            // to 10 min, like adoption failures) instead of retrying —
+            // and re-logging — every 2 s tick.
+            let mut reap_cooldowns: HashMap<String, (std::time::Instant, std::time::Duration)> =
+                HashMap::new();
+            // Unparseable adoption keys are warned about once, then left
+            // to the existing restore/manual-removal behavior.
+            let mut invalid_warned: HashSet<String> = HashSet::new();
 
             // Mark subnets we already have IPs on as known
             for ip_str in &known_ips {
@@ -1298,6 +1347,189 @@ impl NetworkManager {
                 if !fresh.is_empty() {
                     if let Ok(mut set) = local_ips.lock() {
                         *set = fresh;
+                    }
+                }
+
+                // ── Adoption lifecycle pass ─────────────────────────────
+                // Runs every tick BEFORE the DHCP gate below: reaping is
+                // maintenance of existing bindings and must keep running
+                // while new adoption is paused — that is the common state
+                // in which a stale APIPA binding should disappear. The
+                // cheap no-veto verdict screens first; only a would-reap
+                // entry pays for the config/registry/interface reads.
+                let adopted_snapshot: HashMap<String, Ipv4Addr> = adopted.lock().await.clone();
+                for (reap_subnet, reap_ip) in &adopted_snapshot {
+                    let parsed = reaper::parse_subnet_key(reap_subnet);
+                    if parsed.is_none() {
+                        if invalid_warned.insert(reap_subnet.clone()) {
+                            log::warn!(
+                                "Adopted subnet key {} does not parse — never auto-removed, remove manually if stale",
+                                reap_subnet
+                            );
+                        }
+                        continue;
+                    }
+                    let last_positive_elapsed = liveness_for_adopt
+                        .lock()
+                        .ok()
+                        .and_then(|l| l.get(reap_subnet).map(|t| t.elapsed()));
+                    let base_input = reaper::LifecycleInput {
+                        subnet: parsed,
+                        last_positive_elapsed,
+                        session_elapsed: loop_started.elapsed(),
+                        pinned: false,
+                        host_rescued: false,
+                        badge_age: None,
+                    };
+                    if reaper::lifecycle_verdict(&base_input) != reaper::ReapVerdict::Reap {
+                        continue;
+                    }
+                    if let Some(&(retry_at, _)) = reap_cooldowns.get(reap_subnet) {
+                        if std::time::Instant::now() < retry_at {
+                            continue;
+                        }
+                    }
+
+                    // TTL crossed and not cooling down — gather the veto
+                    // inputs. Pinned: any user-pinned device (alias,
+                    // manual node, configured stream target) inside the
+                    // subnet, whether or not it has a registry record.
+                    let pins = {
+                        let config: tauri::State<'_, crate::config::AppConfig> =
+                            app_handle_for_adopt.state();
+                        device_registry::configured_pins(&config.get())
+                    };
+                    let mut pinned_ips = registry_for_adopt.user_pinned_ips(&pins);
+                    pinned_ips.extend(pins.iter().filter_map(|p| p.parse::<Ipv4Addr>().ok()));
+                    let pinned = pinned_ips
+                        .iter()
+                        .any(|ip| &subnet_key_for(*ip) == reap_subnet);
+
+                    let current_ips = get_interface_ips(&iface_name).await;
+                    let adopted_vals: HashSet<Ipv4Addr> =
+                        adopted_snapshot.values().copied().collect();
+                    let pending_vals: HashSet<Ipv4Addr> =
+                        pending_ips.lock().await.iter().map(|p| p.ip).collect();
+                    let host_rescued =
+                        host_in_apipa_rescue(&current_ips, &adopted_vals, &pending_vals);
+
+                    let verdict = reaper::lifecycle_verdict(&reaper::LifecycleInput {
+                        pinned,
+                        host_rescued,
+                        ..base_input
+                    });
+                    if verdict != reaper::ReapVerdict::Reap {
+                        // Vetoed: stale-but-held. The UI badges it from
+                        // the adoption snapshot; nothing to do here.
+                        continue;
+                    }
+
+                    // Adapter guards, mirroring shutdown cleanup. A
+                    // blocked reap arms the cooldown so the warning
+                    // doesn't repeat every 2 s.
+                    let adapter_ip_strs: Vec<String> = interface::get_by_name(&iface_name)
+                        .await
+                        .map(|i| i.ips.iter().map(|ip| ip.address.clone()).collect())
+                        .unwrap_or_default();
+                    if let Some(reason) =
+                        unbind_guard_blocks(&reap_ip.to_string(), &adapter_ip_strs)
+                    {
+                        log::warn!(
+                            "Holding reap of stale adoption {} ({}): {} — re-checking in {}s",
+                            reap_subnet,
+                            reap_ip,
+                            reason,
+                            COOLDOWN_INITIAL.as_secs()
+                        );
+                        reap_cooldowns.insert(
+                            reap_subnet.clone(),
+                            (
+                                std::time::Instant::now() + COOLDOWN_INITIAL,
+                                COOLDOWN_INITIAL,
+                            ),
+                        );
+                        continue;
+                    }
+
+                    // Unbind first; only a successful OS removal may drop
+                    // live state, so a failure can't strand a bound IP
+                    // the maps no longer know about.
+                    match ops.remove(&iface_name, *reap_ip).await {
+                        Ok(()) => {
+                            adopted.lock().await.remove(reap_subnet);
+                            pending_restore.lock().await.remove(reap_subnet);
+                            // Clear the loop-local traces too: a reaped
+                            // subnet must be able to re-adopt in this
+                            // session once a device really returns (the
+                            // dwell gate demands two fresh observations,
+                            // which is thrash protection enough).
+                            known_subnets.remove(reap_subnet);
+                            dwell.prune_subnet(reap_subnet);
+                            reap_cooldowns.remove(reap_subnet);
+                            if let Ok(mut liveness) = liveness_for_adopt.lock() {
+                                liveness.remove(reap_subnet);
+                            }
+                            if let Ok(mut meta) = meta_for_adopt.lock() {
+                                meta.remove(reap_subnet);
+                            }
+
+                            let live = adopted.lock().await.clone();
+                            let pend = pending_restore.lock().await.clone();
+                            let snapshot = merge_adopted_config(&live, &pend);
+                            let meta_snapshot =
+                                meta_for_adopt.lock().map(|m| m.clone()).unwrap_or_default();
+                            let persist_handle = app_handle_for_adopt.clone();
+                            let persisted = tokio::task::spawn_blocking(move || {
+                                let config: tauri::State<'_, crate::config::AppConfig> =
+                                    persist_handle.state();
+                                config.update_adoption_state(snapshot, meta_snapshot)
+                            })
+                            .await;
+                            match persisted {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => log::warn!(
+                                    "Failed to persist reap of {} to config: {}",
+                                    reap_subnet,
+                                    e
+                                ),
+                                Err(e) => log::warn!(
+                                    "Reap persist task for {} failed to join: {}",
+                                    reap_subnet,
+                                    e
+                                ),
+                            }
+
+                            let _ = app_handle_for_adopt.emit(
+                                "subnet-removed",
+                                serde_json::json!({
+                                    "subnet": reap_subnet,
+                                    "adopted_ip": reap_ip.to_string(),
+                                    "reason": "stale_apipa",
+                                }),
+                            );
+                            log::info!(
+                                "Reaped stale APIPA adoption {} ({}): no positive device evidence within the lifecycle window",
+                                reap_subnet,
+                                reap_ip
+                            );
+                        }
+                        Err(e) => {
+                            let next_backoff = reap_cooldowns
+                                .get(reap_subnet)
+                                .map(|(_, b)| (*b * 2).min(COOLDOWN_MAX))
+                                .unwrap_or(COOLDOWN_INITIAL);
+                            reap_cooldowns.insert(
+                                reap_subnet.clone(),
+                                (std::time::Instant::now() + next_backoff, next_backoff),
+                            );
+                            log::warn!(
+                                "Failed to unbind stale adoption {} ({}): {} — retrying in {}s",
+                                reap_subnet,
+                                reap_ip,
+                                e,
+                                next_backoff.as_secs()
+                            );
+                        }
                     }
                 }
 
@@ -1841,7 +2073,8 @@ impl NetworkManager {
         !removed.is_empty()
     }
 
-    pub async fn remove_adopted_subnet(&self, subnet: &str) -> Result<(), AppError> {
+    /// Returns the unbound IP so the caller can emit the removal event.
+    pub async fn remove_adopted_subnet(&self, subnet: &str) -> Result<Ipv4Addr, AppError> {
         let iface_name = self
             .interface_name
             .lock()
@@ -1864,7 +2097,7 @@ impl NetworkManager {
         // it isn't resurrected into config by the next save.
         self.pending_restore.lock().await.remove(subnet);
         self.forget_adoption_tracking(std::slice::from_ref(&subnet.to_string()));
-        Ok(())
+        Ok(ip)
     }
 
     /// Remove every currently-adopted secondary IP from the OS interface.
@@ -2420,6 +2653,53 @@ mod tests {
             t0 + std::time::Duration::from_secs(301)
         ));
         assert!(state.dirty);
+    }
+
+    #[test]
+    fn rescue_state_ignores_apipa_adopted_and_pending_addresses() {
+        let apipa_native = Ipv4Addr::new(169, 254, 7, 20);
+        let adopted_foreign = Ipv4Addr::new(172, 31, 169, 102);
+        let pending_scratch = Ipv4Addr::new(10, 0, 0, 254);
+        let real_lease = Ipv4Addr::new(192, 168, 12, 64);
+        let adopted: HashSet<Ipv4Addr> = [adopted_foreign].into_iter().collect();
+        let pending: HashSet<Ipv4Addr> = [pending_scratch].into_iter().collect();
+
+        // Only APIPA + adopted + pending addresses on the adapter: the
+        // host is rescued. The adopted non-APIPA secondary deliberately
+        // does not count as native connectivity.
+        assert!(host_in_apipa_rescue(
+            &[apipa_native, adopted_foreign, pending_scratch],
+            &adopted,
+            &pending,
+        ));
+
+        // A real (native, non-APIPA) address ends the rescue state.
+        assert!(!host_in_apipa_rescue(
+            &[apipa_native, adopted_foreign, real_lease],
+            &adopted,
+            &pending,
+        ));
+
+        // No addresses at all is rescue too — nothing native to rely on.
+        assert!(host_in_apipa_rescue(&[], &adopted, &pending));
+    }
+
+    #[test]
+    fn unbind_guards_block_primary_and_last_address_only() {
+        let ips = vec![
+            "192.168.12.64".to_string(),
+            "169.254.168.102".to_string(),
+            "172.31.169.102".to_string(),
+        ];
+        // A secondary among several: no block.
+        assert_eq!(unbind_guard_blocks("169.254.168.102", &ips), None);
+        // The primary (first) address is always blocked.
+        assert!(unbind_guard_blocks("192.168.12.64", &ips).is_some());
+        // The adapter's only address is blocked.
+        let sole = vec!["169.254.168.102".to_string()];
+        assert!(unbind_guard_blocks("169.254.168.102", &sole).is_some());
+        // An address the adapter no longer holds: nothing to guard.
+        assert_eq!(unbind_guard_blocks("169.254.43.102", &ips), None);
     }
 
     #[test]
