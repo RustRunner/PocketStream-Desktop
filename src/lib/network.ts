@@ -44,10 +44,20 @@ async function refreshHostMode(): Promise<void> {
 
 // ── Interface discovery ─────────────────────────────────────────────
 
+/**
+ * Mirrors the backend's wired-camera-port authority, minus is_up:
+ * Disconnected adapters stay listed so the Reset affordance keeps
+ * working. A VPN or OS-virtual adapter that claims Ethernet media is
+ * never offered for selection — the backend rejects it anyway.
+ */
+function isWiredCandidate(i: InterfaceInfo): boolean {
+  return i.is_ethernet && !i.is_vpn && !i.is_virtual;
+}
+
 export async function refreshInterfaces(): Promise<void> {
   try {
     const interfaces = await api.listInterfaces();
-    const ethList = (interfaces || []).filter((i) => i.is_ethernet);
+    const ethList = (interfaces || []).filter(isWiredCandidate);
     // Pick the first truly-connected adapter. "Connected" means link up AND
     // at least one real IPv4 — APIPA (169.254.x.x) addresses don't count,
     // since Windows assigns them when no real network is reachable.
@@ -520,7 +530,7 @@ export function setupIpConfigDialog(): void {
     await showModalWithVideo(dialog);
 
     try {
-      dialogInterfaces = ((await api.listInterfaces()) || []).filter((i) => i.is_ethernet);
+      dialogInterfaces = ((await api.listInterfaces()) || []).filter(isWiredCandidate);
       select.innerHTML = dialogInterfaces
         .map((i) => {
           const ip = i.ips.length > 0 ? i.ips[0]!.address : "no IP";
@@ -764,7 +774,7 @@ function renderSecondaryIps(
 /** Reload interfaces and refresh dialog fields without closing. */
 async function reloadDialogInterfaces(): Promise<void> {
   try {
-    dialogInterfaces = ((await api.listInterfaces()) || []).filter((i) => i.is_ethernet);
+    dialogInterfaces = ((await api.listInterfaces()) || []).filter(isWiredCandidate);
     populateDialogFields();
     // Also refresh the host card
     await refreshInterfaces();

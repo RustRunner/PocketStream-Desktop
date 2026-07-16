@@ -846,6 +846,16 @@ impl NetworkManager {
         // needed — but the listener still uses the adapter's own MAC to
         // filter our own gratuitous ARP.)
         let iface_info = interface::get_by_name(interface_display_name).await?;
+        // Backend authority: discovery only ever runs on an up, wired
+        // Ethernet adapter, no matter what name a caller supplied. The
+        // frontend mirrors this in its selection filters, but the backend
+        // is the enforcement point.
+        if !interface::is_wired_ethernet(&iface_info) {
+            return Err(AppError::Network(format!(
+                "'{}' is not an up, wired Ethernet adapter — ARP discovery only runs on the wired camera port",
+                interface_display_name
+            )));
+        }
         let known_ips: Vec<String> = iface_info.ips.iter().map(|ip| ip.address.clone()).collect();
         let own_mac = parse_mac_bytes(&iface_info.mac);
 
