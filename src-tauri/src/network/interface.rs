@@ -193,6 +193,36 @@ fn parse_adapter_json(stdout: &str) -> Result<Vec<serde_json::Value>, AppError> 
     }
 }
 
+/// `NDIS_PHYSICAL_MEDIUM` values whose physical transport is wireless:
+/// 1 WirelessLan, 8 WirelessWan, 9 Native802_11, 10 Bluetooth, 12 WiMax,
+/// 13 UWB, 20 Native802_15_4.
+#[cfg(target_os = "windows")]
+const WIRELESS_NDIS_PHYSICAL_MEDIUMS: [u64; 7] = [1, 8, 9, 10, 12, 13, 20];
+
+/// Whether the adapter's *physical* transport is wireless, overriding its
+/// logical media type. Some NDIS drivers (emulated-802.3 WiFi dongles,
+/// wireless WAN modems) report a logical `MediaType` of `802.3` while the
+/// radio underneath is anything but wired — trusting the logical value
+/// alone would let them be selected as the camera port.
+///
+/// Precedence: a non-zero `NdisPhysicalMedium` decides outright — it is a
+/// raw numeric on the adapter CIM instance, locale-proof by construction
+/// (14 = physical 802.3 and other wired media are conclusively not
+/// wireless). Zero (`Unspecified`) or absent falls back to the
+/// `PhysicalMediaType` display string — the same trust class as the
+/// `MediaType` string we already rely on. Neither present ⇒ not wireless,
+/// leaving the logical media type as the decider (previous behavior).
+#[cfg(target_os = "windows")]
+fn physical_medium_is_wireless(ndis: Option<u64>, physical_media_type: &str) -> bool {
+    match ndis {
+        Some(n) if n != 0 => WIRELESS_NDIS_PHYSICAL_MEDIUMS.contains(&n),
+        _ => {
+            let s = physical_media_type.to_ascii_lowercase();
+            s.contains("802.11") || s.contains("wireless")
+        }
+    }
+}
+
 /// Parse one `Get-NetAdapter` JSON object into an [`InterfaceInfo`].
 ///
 /// `force_vpn` short-circuits the VPN classification to `true` (used by
@@ -233,8 +263,15 @@ fn parse_adapter(a: &serde_json::Value, force_vpn: bool) -> InterfaceInfo {
         })
         .collect();
 
-    let is_ethernet = media.contains("802.3");
-    let is_wifi = media.contains("802.11") || media.contains("Native 802.11");
+    // A wireless physical medium overrides a logical 802.3 claim so an
+    // emulated-Ethernet wireless adapter can never classify as the wired
+    // camera port.
+    let physical_wireless = physical_medium_is_wireless(
+        a["NdisPhysicalMedium"].as_u64(),
+        a["PhysicalMediaType"].as_str().unwrap_or(""),
+    );
+    let is_ethernet = media.contains("802.3") && !physical_wireless;
+    let is_wifi = media.contains("802.11") || media.contains("Native 802.11") || physical_wireless;
     // Windows reports 'Up' for fully operational adapters. Anything else
     // (Disconnected, Disabled, NotPresent) is treated as down so the UI
     // can surface a reset action without hiding the adapter entirely.
@@ -270,6 +307,8 @@ async fn run_adapter_query(filter: &str) -> Result<String, AppError> {
                 Description = $adapter.InterfaceDescription
                 MacAddress = $adapter.MacAddress
                 MediaType = $adapter.MediaType
+                PhysicalMediaType = [string]$adapter.PhysicalMediaType
+                NdisPhysicalMedium = $adapter.NdisPhysicalMedium
                 Status = $adapter.Status
                 Virtual = $adapter.Virtual
                 IPs = @($ips | ForEach-Object {{
@@ -672,6 +711,123 @@ mod tests {
             assert!(!is_vpn_adapter("Intel(R) Ethernet Connection I219-V"));
             assert!(!is_vpn_adapter("Realtek PCIe GBE Family Controller"));
             assert!(!is_vpn_adapter("Microsoft Wi-Fi Direct Virtual Adapter"));
+        }
+
+        // ── physical-medium classification ────────────────────────────
+
+        #[test]
+        fn physical_medium_numeric_wireless_set() {
+            for n in [1u64, 8, 9, 10, 12, 13, 20] {
+                assert!(
+                    physical_medium_is_wireless(Some(n), ""),
+                    "NdisPhysicalMedium {n} must classify wireless"
+                );
+            }
+            // 14 = physical 802.3; 2 = CableModem — wired media stay wired.
+            assert!(!physical_medium_is_wireless(Some(14), ""));
+            assert!(!physical_medium_is_wireless(Some(2), ""));
+        }
+
+        #[test]
+        fn physical_medium_numeric_beats_string() {
+            // A conclusive wired numeric wins even against a wireless string.
+            assert!(!physical_medium_is_wireless(Some(14), "Native 802.11"));
+        }
+
+        #[test]
+        fn physical_medium_string_fallback_variants() {
+            assert!(physical_medium_is_wireless(None, "Native 802.11"));
+            assert!(physical_medium_is_wireless(Some(0), "Wireless LAN"));
+            assert!(physical_medium_is_wireless(None, "wireless wan"));
+            assert!(physical_medium_is_wireless(None, "802.11"));
+        }
+
+        #[test]
+        fn physical_medium_unspecified_falls_back_to_not_wireless() {
+            assert!(!physical_medium_is_wireless(None, ""));
+            assert!(!physical_medium_is_wireless(Some(0), "Unspecified"));
+            assert!(!physical_medium_is_wireless(Some(0), ""));
+        }
+
+        #[test]
+        fn parse_adapter_emulated_802_3_wireless_dongle_not_ethernet() {
+            let json: serde_json::Value = serde_json::from_str(
+                r#"{
+                "Name": "Wi-Fi Dongle",
+                "Description": "Generic USB Wireless Adapter",
+                "MacAddress": "AA-BB-CC-00-11-22",
+                "MediaType": "802.3",
+                "NdisPhysicalMedium": 9,
+                "Status": "Up",
+                "IPs": []
+            }"#,
+            )
+            .unwrap();
+            let iface = parse_adapter(&json, false);
+            assert!(
+                !iface.is_ethernet,
+                "wireless physical medium must override logical 802.3"
+            );
+            assert!(iface.is_wifi);
+        }
+
+        #[test]
+        fn parse_adapter_physical_802_3_stays_ethernet() {
+            let json: serde_json::Value = serde_json::from_str(
+                r#"{
+                "Name": "Ethernet",
+                "Description": "Intel(R) Ethernet Connection I219-V",
+                "MacAddress": "AA-BB-CC-DD-EE-FF",
+                "MediaType": "802.3",
+                "PhysicalMediaType": "802.3",
+                "NdisPhysicalMedium": 14,
+                "Status": "Up",
+                "IPs": []
+            }"#,
+            )
+            .unwrap();
+            let iface = parse_adapter(&json, false);
+            assert!(iface.is_ethernet);
+            assert!(!iface.is_wifi);
+        }
+
+        #[test]
+        fn parse_adapter_wireless_string_overrides_logical_802_3() {
+            let json: serde_json::Value = serde_json::from_str(
+                r#"{
+                "Name": "Mobile Broadband",
+                "Description": "WWAN Modem",
+                "MacAddress": "AA-BB-CC-33-44-55",
+                "MediaType": "802.3",
+                "PhysicalMediaType": "Wireless WAN",
+                "Status": "Up",
+                "IPs": []
+            }"#,
+            )
+            .unwrap();
+            let iface = parse_adapter(&json, false);
+            assert!(!iface.is_ethernet);
+            assert!(iface.is_wifi);
+        }
+
+        #[test]
+        fn parse_adapter_missing_physical_fields_keeps_today_behavior() {
+            // Legacy JSON without either physical-medium field parses
+            // exactly as before the physical-medium override existed.
+            let json: serde_json::Value = serde_json::from_str(
+                r#"{
+                "Name": "Ethernet",
+                "Description": "Realtek PCIe GbE",
+                "MacAddress": "11-22-33-44-55-66",
+                "MediaType": "802.3",
+                "Status": "Up",
+                "IPs": []
+            }"#,
+            )
+            .unwrap();
+            let iface = parse_adapter(&json, false);
+            assert!(iface.is_ethernet);
+            assert!(!iface.is_wifi);
         }
 
         #[test]
