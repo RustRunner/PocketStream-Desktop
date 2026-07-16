@@ -5,6 +5,7 @@
 //! 2. Optionally recorded to MP4
 //! 3. Snapshot-captured via an appsink
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -75,6 +76,15 @@ pub struct PlaybackPipeline {
     /// tick degrades to a generic "stalled"/not-playing verdict.
     /// Cleared on `play()` so a restarted pipeline reports fresh state.
     first_error: Arc<Mutex<Option<String>>>,
+    /// True once the audio playback branch is linked and state-synced.
+    /// Written by the pad-added handler on rtspsrc's streaming thread,
+    /// read by the status snapshot. Dies with the pipeline instance,
+    /// so stop/camera-switch resets are structural.
+    audio_present: Arc<AtomicBool>,
+    /// Last recognized audio codec the camera offered — set on SETUP
+    /// accept and on a recognized-but-unsupported skip, so status can
+    /// name a codec that exists but is not playing.
+    audio_codec: Arc<Mutex<Option<audio::AudioCodec>>>,
 }
 
 impl PlaybackPipeline {
@@ -149,8 +159,14 @@ impl PlaybackPipeline {
             )
         })?;
         let selection = Arc::new(audio::SelectionState::default());
-        install_stream_selection(&src, selection.clone());
-        install_pad_routing(&result.pipeline, &src, &dec, selection);
+        install_stream_selection(&src, selection.clone(), result.audio_codec.clone());
+        install_pad_routing(
+            &result.pipeline,
+            &src,
+            &dec,
+            selection,
+            result.audio_present.clone(),
+        );
 
         Ok(result)
     }
@@ -265,7 +281,23 @@ impl PlaybackPipeline {
             camera_ip,
             stall_diag_sent,
             first_error: Arc::new(Mutex::new(None)),
+            audio_present: Arc::new(AtomicBool::new(false)),
+            audio_codec: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Audio state for the status snapshot: whether the audio branch
+    /// is linked, and the last recognized codec name. A recognized but
+    /// skipped codec reports `(false, Some(name))`; UDP playback never
+    /// sets either and reports `(false, None)` forever.
+    pub fn audio_status(&self) -> (bool, Option<String>) {
+        let present = self.audio_present.load(Ordering::Acquire);
+        let codec = self
+            .audio_codec
+            .lock()
+            .ok()
+            .and_then(|g| g.map(|c| c.name().to_string()));
+        (present, codec)
     }
 
     /// Start playback.
@@ -697,7 +729,11 @@ impl Drop for PlaybackPipeline {
 /// `None` panics in the closure return marshal at runtime. Runs on an
 /// rtspsrc streaming thread; registry lookups are in-memory and
 /// non-blocking.
-fn install_stream_selection(src: &gst::Element, selection: Arc<audio::SelectionState>) {
+fn install_stream_selection(
+    src: &gst::Element,
+    selection: Arc<audio::SelectionState>,
+    codec_cell: Arc<Mutex<Option<audio::AudioCodec>>>,
+) {
     src.connect("select-stream", false, move |values| {
         // Signal signature: (rtspsrc, stream number, caps).
         let caps = values.get(2).and_then(|v| v.get::<gst::Caps>().ok());
@@ -711,21 +747,34 @@ fn install_stream_selection(src: &gst::Element, selection: Arc<audio::SelectionS
             })
             .unwrap_or(false);
         let accept = selection.select_playback(kind, codec, supported);
-        if !accept && kind == audio::MediaKind::Audio {
-            if supported {
-                log::info!("Additional audio track declined (one audio stream max)");
-            } else {
-                match codec {
-                    Some(c) => log::warn!(
-                        "Audio track skipped: decoder chain for {} incomplete in GStreamer registry",
-                        c.name()
-                    ),
-                    None => log::warn!(
-                        "Audio track skipped: no decoder for {}",
-                        caps.as_ref()
-                            .map(|c| c.to_string())
-                            .unwrap_or_else(|| "unknown codec (no caps)".into())
-                    ),
+        if kind == audio::MediaKind::Audio {
+            if let Some(c) = codec {
+                // Record the recognized codec for status reporting. An
+                // accepted codec always wins; a skipped one only fills
+                // an empty cell — a declined duplicate must not
+                // overwrite what is actually playing.
+                if let Ok(mut g) = codec_cell.lock() {
+                    if accept || g.is_none() {
+                        *g = Some(c);
+                    }
+                }
+            }
+            if !accept {
+                if supported {
+                    log::info!("Additional audio track declined (one audio stream max)");
+                } else {
+                    match codec {
+                        Some(c) => log::warn!(
+                            "Audio track skipped: decoder chain for {} incomplete in GStreamer registry",
+                            c.name()
+                        ),
+                        None => log::warn!(
+                            "Audio track skipped: no decoder for {}",
+                            caps.as_ref()
+                                .map(|c| c.to_string())
+                                .unwrap_or_else(|| "unknown codec (no caps)".into())
+                        ),
+                    }
                 }
             }
         }
@@ -749,6 +798,7 @@ fn install_pad_routing(
     src: &gst::Element,
     dec: &gst::Element,
     selection: Arc<audio::SelectionState>,
+    audio_present: Arc<AtomicBool>,
 ) {
     let pipeline_weak = pipeline.downgrade();
     let dec_weak = dec.downgrade();
@@ -757,8 +807,8 @@ fn install_pad_routing(
             return; // pipeline is tearing down
         };
         let caps = pad.current_caps().unwrap_or_else(|| pad.query_caps(None));
-        let (kind, _codec) = audio::classify_rtp_caps(&caps);
-        match selection.route_pad(kind) {
+        let (kind, codec) = audio::classify_rtp_caps(&caps);
+        match selection.route_pad(kind, codec) {
             audio::PadRoute::VideoDecoder => {
                 let Some(dec_sink) = dec.static_pad("sink") else {
                     attach_fakesink(&pipeline, pad, "decodebin sink pad missing");
@@ -775,9 +825,67 @@ fn install_pad_routing(
                 }
                 log::info!("RTSP video pad linked to decoder");
             }
+            audio::PadRoute::AudioBranch(codec) => {
+                match attach_audio_branch(&pipeline, pad, codec) {
+                    Ok(()) => audio_present.store(true, Ordering::Release),
+                    Err(e) => {
+                        // Video must survive a failed audio branch: park
+                        // the pad and report audio as unavailable.
+                        log::warn!("Audio branch for {} failed: {}", codec.name(), e);
+                        attach_fakesink(&pipeline, pad, "audio branch could not be built");
+                    }
+                }
+            }
             audio::PadRoute::Fakesink(reason) => attach_fakesink(&pipeline, pad, reason),
         }
     });
+}
+
+/// Build the codec-specific audio playback branch and link the RTSP pad
+/// into it. Same discipline as `attach_recording`: once the bin is IN
+/// the pipeline, every failure unwinds it (Null + remove) — there is no
+/// tee request pad here, the rtspsrc pad links the bin's ghost sink
+/// directly. On Err the caller terminates the pad in a fakesink and
+/// video continues.
+fn attach_audio_branch(
+    pipeline: &gst::Pipeline,
+    pad: &gst::Pad,
+    codec: audio::AudioCodec,
+) -> Result<(), AppError> {
+    let bin = gst::parse::bin_from_description(&codec.branch_launch(), true)
+        .map_err(|e| AppError::Stream(format!("Audio branch parse error: {}", e)))?;
+    bin.set_property("name", "audio_bin");
+
+    pipeline
+        .add(&bin)
+        .map_err(|e| AppError::Stream(format!("Failed to add audio branch: {}", e)))?;
+
+    let unwind = || {
+        let _ = bin.set_state(gst::State::Null);
+        let _ = pipeline.remove(&bin);
+    };
+
+    let Some(bin_sink) = bin.static_pad("sink") else {
+        unwind();
+        return Err(AppError::Stream("Audio branch has no sink pad".into()));
+    };
+    if let Err(e) = pad.link(&bin_sink) {
+        unwind();
+        return Err(AppError::Stream(format!(
+            "Failed to link audio pad to branch: {}",
+            e
+        )));
+    }
+    if let Err(e) = bin.sync_state_with_parent() {
+        let _ = pad.unlink(&bin_sink);
+        unwind();
+        return Err(AppError::Stream(format!(
+            "Failed to sync audio branch: {}",
+            e
+        )));
+    }
+    log::info!("Audio branch attached ({})", codec.name());
+    Ok(())
 }
 
 /// Terminate a pad in its own fakesink — the structural guarantee that

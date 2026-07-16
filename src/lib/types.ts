@@ -134,6 +134,11 @@ export interface StreamStatus {
   bandwidth_kbps: number;
   /** Friendly error string if the pipeline reported a problem */
   error: string | null;
+  /** True while the playback pipeline has a linked audio branch */
+  audio_present: boolean;
+  /** Last recognized audio codec; may be set with audio_present=false
+   *  when the codec was recognized but skipped (no decoder) */
+  audio_codec: string | null;
 }
 
 export interface RtspServerInfo {

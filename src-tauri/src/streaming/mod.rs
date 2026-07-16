@@ -30,6 +30,12 @@ pub struct StreamStatus {
     pub uptime_secs: u64,
     pub bandwidth_kbps: f64,
     pub error: Option<String>,
+    /// True while the playback pipeline has a linked audio branch.
+    pub audio_present: bool,
+    /// Last recognized audio codec the camera offered. May be `Some`
+    /// with `audio_present == false` when the codec was recognized but
+    /// skipped (decoder chain unavailable).
+    pub audio_codec: Option<String>,
 }
 
 impl StreamStatus {
@@ -43,6 +49,8 @@ impl StreamStatus {
             uptime_secs: 0,
             bandwidth_kbps: 0.0,
             error: None,
+            audio_present: false,
+            audio_codec: None,
         }
     }
 }
@@ -752,6 +760,15 @@ async fn compute_status(state: &Arc<Mutex<StreamState>>) -> StreamStatus {
         None => (false, None),
     };
 
+    // Idle/stopped playback reports no audio; the cells live on the
+    // pipeline instance, so stop and camera-switch resets are
+    // structural rather than an explicit clear.
+    let (audio_present, audio_codec) = state
+        .playback
+        .as_ref()
+        .map(|p| p.audio_status())
+        .unwrap_or((false, None));
+
     StreamStatus {
         playing,
         rtsp_server_running: state.rtsp_server.is_some(),
@@ -761,6 +778,8 @@ async fn compute_status(state: &Arc<Mutex<StreamState>>) -> StreamStatus {
         uptime_secs: uptime,
         bandwidth_kbps: bandwidth,
         error,
+        audio_present,
+        audio_codec,
     }
 }
 
@@ -1020,28 +1039,26 @@ mod tests {
             uptime_secs: 120,
             bandwidth_kbps: 0.0,
             error: None,
+            audio_present: true,
+            audio_codec: Some("PCMU".into()),
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("\"playing\":true"));
         assert!(json.contains("\"uptime_secs\":120"));
         assert!(json.contains("\"display_url\":"));
+        assert!(json.contains("\"audio_present\":true"));
+        assert!(json.contains("\"audio_codec\":\"PCMU\""));
     }
 
     #[test]
     fn stream_status_default_values() {
-        let status = StreamStatus {
-            playing: false,
-            rtsp_server_running: false,
-            rtsp_url: None,
-            display_url: None,
-            recording: false,
-            uptime_secs: 0,
-            bandwidth_kbps: 0.0,
-            error: None,
-        };
+        let status = StreamStatus::idle();
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("\"rtsp_url\":null"));
         assert!(json.contains("\"display_url\":null"));
+        // Idle/stopped/video-only playback: no audio, no codec.
+        assert!(json.contains("\"audio_present\":false"));
+        assert!(json.contains("\"audio_codec\":null"));
     }
 
     // ── StreamManager ───────────────────────────────────────────────

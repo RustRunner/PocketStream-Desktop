@@ -68,6 +68,19 @@ impl AudioCodec {
             "autoaudiosink",
         ]
     }
+
+    /// Launch description for the codec's playback branch, parsed with
+    /// ghost pads into a bin. `volume` is named so mute control can
+    /// find it; `sync=false` matches the video sink's low-latency
+    /// policy — RTP delivery stays paced by rtspsrc's jitter buffer.
+    pub fn branch_launch(self) -> String {
+        format!(
+            "{depay} ! {decoder} ! audioconvert ! audioresample \
+             ! volume name=vol ! autoaudiosink sync=false",
+            depay = self.depay(),
+            decoder = self.decoder(),
+        )
+    }
 }
 
 /// Coarse classification of an RTP stream's `media` caps field.
@@ -124,6 +137,10 @@ pub fn audio_codec_supported(codec: AudioCodec, has_element: impl Fn(&str) -> bo
 pub enum PadRoute {
     /// The selected video pad: link to the decodebin sink.
     VideoDecoder,
+    /// The selected audio pad: build the codec's playback branch and
+    /// link into it. If the branch cannot be constructed, the caller
+    /// falls back to a fakesink.
+    AudioBranch(AudioCodec),
     /// Terminate the pad in its own fakesink; the payload is the
     /// reason for the log line.
     Fakesink(&'static str),
@@ -184,12 +201,11 @@ impl SelectionState {
     }
 
     /// Pad-time routing verdict. The first video pad goes to the
-    /// decoder; every other pad — duplicates, audio, surprises —
-    /// terminates in a fakesink. Audio termination is the safety net
-    /// for pads that appear despite `select_playback` (or, currently,
-    /// for accepted audio: the audible playback branch does not exist
-    /// yet, so accepted audio parks here).
-    pub fn route_pad(&self, kind: MediaKind) -> PadRoute {
+    /// decoder; the first recognized audio pad gets its playback
+    /// branch; every other pad — duplicates, unrecognized audio,
+    /// surprises — terminates in a fakesink. The fakesink path is the
+    /// safety net for pads that appear despite `select_playback`.
+    pub fn route_pad(&self, kind: MediaKind, codec: Option<AudioCodec>) -> PadRoute {
         match kind {
             MediaKind::Video => {
                 if self
@@ -203,12 +219,15 @@ impl SelectionState {
                 }
             }
             MediaKind::Audio => {
+                let Some(codec) = codec else {
+                    return PadRoute::Fakesink("unrecognized audio codec");
+                };
                 if self
                     .audio_routed
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
                 {
-                    PadRoute::Fakesink("audio playback branch unavailable")
+                    PadRoute::AudioBranch(codec)
                 } else {
                     PadRoute::Fakesink("duplicate audio pad")
                 }
@@ -401,63 +420,101 @@ mod tests {
     #[test]
     fn first_video_pad_routes_to_decoder() {
         let s = SelectionState::default();
-        assert_eq!(s.route_pad(MediaKind::Video), PadRoute::VideoDecoder);
+        assert_eq!(s.route_pad(MediaKind::Video, None), PadRoute::VideoDecoder);
     }
 
     #[test]
     fn duplicate_video_pad_routes_to_fakesink() {
         let s = SelectionState::default();
-        assert_eq!(s.route_pad(MediaKind::Video), PadRoute::VideoDecoder);
+        assert_eq!(s.route_pad(MediaKind::Video, None), PadRoute::VideoDecoder);
         assert!(matches!(
-            s.route_pad(MediaKind::Video),
+            s.route_pad(MediaKind::Video, None),
             PadRoute::Fakesink(_)
         ));
     }
 
     #[test]
-    fn audio_pads_route_to_fakesink() {
-        // No audible branch exists yet: accepted audio parks in a
-        // fakesink, and so does a duplicate.
+    fn first_recognized_audio_pad_gets_its_branch() {
+        let s = SelectionState::default();
+        assert_eq!(
+            s.route_pad(MediaKind::Audio, Some(AudioCodec::Pcmu)),
+            PadRoute::AudioBranch(AudioCodec::Pcmu)
+        );
+    }
+
+    #[test]
+    fn duplicate_audio_pad_routes_to_fakesink() {
+        let s = SelectionState::default();
+        assert_eq!(
+            s.route_pad(MediaKind::Audio, Some(AudioCodec::Pcmu)),
+            PadRoute::AudioBranch(AudioCodec::Pcmu)
+        );
+        assert!(matches!(
+            s.route_pad(MediaKind::Audio, Some(AudioCodec::Pcma)),
+            PadRoute::Fakesink(_)
+        ));
+    }
+
+    #[test]
+    fn unrecognized_audio_pad_routes_to_fakesink_without_claiming_slot() {
         let s = SelectionState::default();
         assert!(matches!(
-            s.route_pad(MediaKind::Audio),
+            s.route_pad(MediaKind::Audio, None),
             PadRoute::Fakesink(_)
         ));
-        assert!(matches!(
-            s.route_pad(MediaKind::Audio),
-            PadRoute::Fakesink(_)
-        ));
+        // The unrecognized pad must not consume the audio slot.
+        assert_eq!(
+            s.route_pad(MediaKind::Audio, Some(AudioCodec::Pcma)),
+            PadRoute::AudioBranch(AudioCodec::Pcma)
+        );
     }
 
     #[test]
     fn other_pads_route_to_fakesink() {
         let s = SelectionState::default();
         assert!(matches!(
-            s.route_pad(MediaKind::Other),
+            s.route_pad(MediaKind::Other, None),
             PadRoute::Fakesink(_)
         ));
     }
 
     #[test]
-    fn every_non_video_outcome_is_the_fakesink_path() {
+    fn no_outcome_leaves_a_pad_unlinked() {
         // The structural guarantee: route_pad has no outcome that
-        // leaves a pad unlinked. Exactly one VideoDecoder verdict
-        // exists per pipeline; everything else is a Fakesink.
+        // leaves a pad unlinked. Exactly one VideoDecoder and one
+        // AudioBranch verdict exist per pipeline; everything else is
+        // a Fakesink.
         let s = SelectionState::default();
         let verdicts = [
-            s.route_pad(MediaKind::Video),
-            s.route_pad(MediaKind::Video),
-            s.route_pad(MediaKind::Audio),
-            s.route_pad(MediaKind::Audio),
-            s.route_pad(MediaKind::Other),
+            s.route_pad(MediaKind::Video, None),
+            s.route_pad(MediaKind::Video, None),
+            s.route_pad(MediaKind::Audio, Some(AudioCodec::Pcmu)),
+            s.route_pad(MediaKind::Audio, Some(AudioCodec::Pcmu)),
+            s.route_pad(MediaKind::Audio, None),
+            s.route_pad(MediaKind::Other, None),
         ];
-        let decoders = verdicts
-            .iter()
-            .filter(|v| **v == PadRoute::VideoDecoder)
-            .count();
-        assert_eq!(decoders, 1);
-        assert!(verdicts[1..]
-            .iter()
-            .all(|v| matches!(v, PadRoute::Fakesink(_))));
+        assert_eq!(verdicts[0], PadRoute::VideoDecoder);
+        assert_eq!(verdicts[2], PadRoute::AudioBranch(AudioCodec::Pcmu));
+        for v in [&verdicts[1], &verdicts[3], &verdicts[4], &verdicts[5]] {
+            assert!(matches!(v, PadRoute::Fakesink(_)));
+        }
+    }
+
+    // ── branch_launch ───────────────────────────────────────────────
+
+    #[test]
+    fn branch_launch_builds_the_full_codec_chain() {
+        let pcmu = AudioCodec::Pcmu.branch_launch();
+        assert!(pcmu.starts_with("rtppcmudepay ! mulawdec"));
+        let pcma = AudioCodec::Pcma.branch_launch();
+        assert!(pcma.starts_with("rtppcmadepay ! alawdec"));
+        for launch in [pcmu, pcma] {
+            assert!(launch.contains("audioconvert"));
+            assert!(launch.contains("audioresample"));
+            // Mute control finds the element by this name.
+            assert!(launch.contains("volume name=vol"));
+            // Low-latency sink policy, matching the video sink.
+            assert!(launch.contains("autoaudiosink sync=false"));
+        }
     }
 }
