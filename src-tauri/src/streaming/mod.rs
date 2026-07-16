@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod recorder;
 pub mod rtsp_client;
 pub mod rtsp_server;

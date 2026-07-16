@@ -14,6 +14,7 @@ use gstreamer_app as gst_app;
 
 use gstreamer_video::prelude::VideoOverlayExtManual;
 
+use super::audio;
 use crate::error::AppError;
 
 /// How long the pipeline can sit in `Playing` state with no buffers
@@ -94,10 +95,17 @@ impl PlaybackPipeline {
         // User-controlled values (URL) are set as element properties below,
         // never interpolated into the pipeline description string, to prevent
         // GStreamer pipeline injection via crafted RTSP paths or credentials.
+        //
+        // rtspsrc and decodebin are deliberately NOT linked here. A camera
+        // with an audio track gives rtspsrc one pad per stream, and a single
+        // parse-launch link goes to whichever pad appears first — leaving
+        // the other selected stream unlinked, whose GST_FLOW_NOT_LINKED
+        // kills the whole pipeline. Pads are routed explicitly in the
+        // pad-added handler installed below instead.
         let pipeline_str = format!(
             concat!(
                 "rtspsrc name=src latency={latency} protocols={proto} ",
-                "! decodebin name=dec ",
+                "decodebin name=dec ",
                 "dec. ! videoconvert ! tee name=t ",
                 "t. ! queue leaky=downstream max-size-buffers=2 ! autovideosink name=videosink sync=false ",
                 "t. ! queue leaky=downstream max-size-buffers=1 ",
@@ -129,6 +137,20 @@ impl PlaybackPipeline {
             src.set_property("user-id", username);
             src.set_property("user-pw", password);
         }
+
+        // Explicit stream selection + pad routing, replacing the old
+        // single parse-launch link to decodebin. Both handlers must be
+        // installed before play() — rtspsrc emits select-stream and
+        // pad-added during its Paused transition.
+        let dec = result.pipeline.by_name("dec").ok_or_else(|| {
+            AppError::Stream(
+                "decodebin 'dec' element not found in pipeline (GStreamer version mismatch?)"
+                    .into(),
+            )
+        })?;
+        let selection = Arc::new(audio::SelectionState::default());
+        install_stream_selection(&src, selection.clone());
+        install_pad_routing(&result.pipeline, &src, &dec, selection);
 
         Ok(result)
     }
@@ -663,6 +685,145 @@ impl Drop for PlaybackPipeline {
         // right after construction, or an error path drops it — doesn't
         // leak the GStreamer pipeline and its elements.
         let _ = self.pipeline.set_state(gst::State::Null);
+    }
+}
+
+/// Connect rtspsrc's `select-stream` so unwanted tracks are declined
+/// before SETUP. This is the primary filter; the fakesink route in
+/// `install_pad_routing` is the backstop for pads that appear anyway.
+///
+/// Dynamic signal — rtspsrc is a plugin element with no static Rust
+/// binding — and the handler MUST return a gboolean `Value`: returning
+/// `None` panics in the closure return marshal at runtime. Runs on an
+/// rtspsrc streaming thread; registry lookups are in-memory and
+/// non-blocking.
+fn install_stream_selection(src: &gst::Element, selection: Arc<audio::SelectionState>) {
+    src.connect("select-stream", false, move |values| {
+        // Signal signature: (rtspsrc, stream number, caps).
+        let caps = values.get(2).and_then(|v| v.get::<gst::Caps>().ok());
+        let (kind, codec) = caps
+            .as_ref()
+            .map(|c| audio::classify_rtp_caps(c))
+            .unwrap_or((audio::MediaKind::Other, None));
+        let supported = codec
+            .map(|c| {
+                audio::audio_codec_supported(c, |name| gst::ElementFactory::find(name).is_some())
+            })
+            .unwrap_or(false);
+        let accept = selection.select_playback(kind, codec, supported);
+        if !accept && kind == audio::MediaKind::Audio {
+            if supported {
+                log::info!("Additional audio track declined (one audio stream max)");
+            } else {
+                match codec {
+                    Some(c) => log::warn!(
+                        "Audio track skipped: decoder chain for {} incomplete in GStreamer registry",
+                        c.name()
+                    ),
+                    None => log::warn!(
+                        "Audio track skipped: no decoder for {}",
+                        caps.as_ref()
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "unknown codec (no caps)".into())
+                    ),
+                }
+            }
+        }
+        Some(accept.to_value())
+    });
+}
+
+/// Connect rtspsrc's `pad-added` and route every new pad: the selected
+/// video pad links to decodebin, everything else terminates in its own
+/// fakesink so no selected pad is ever left unlinked (an unlinked pad's
+/// GST_FLOW_NOT_LINKED is fatal to the stream loop).
+///
+/// Runs on rtspsrc's streaming thread: pad linking, in-memory checks,
+/// and state-syncing lazily-added elements only — no blocking waits, no
+/// I/O (same discipline as the tee buffer probe). Pipeline and decodebin
+/// are captured weakly: a strong ref inside a closure owned by an
+/// element of that same pipeline is a cycle that would keep the whole
+/// pipeline alive past PlaybackPipeline::drop.
+fn install_pad_routing(
+    pipeline: &gst::Pipeline,
+    src: &gst::Element,
+    dec: &gst::Element,
+    selection: Arc<audio::SelectionState>,
+) {
+    let pipeline_weak = pipeline.downgrade();
+    let dec_weak = dec.downgrade();
+    src.connect_pad_added(move |_, pad| {
+        let (Some(pipeline), Some(dec)) = (pipeline_weak.upgrade(), dec_weak.upgrade()) else {
+            return; // pipeline is tearing down
+        };
+        let caps = pad.current_caps().unwrap_or_else(|| pad.query_caps(None));
+        let (kind, _codec) = audio::classify_rtp_caps(&caps);
+        match selection.route_pad(kind) {
+            audio::PadRoute::VideoDecoder => {
+                let Some(dec_sink) = dec.static_pad("sink") else {
+                    attach_fakesink(&pipeline, pad, "decodebin sink pad missing");
+                    return;
+                };
+                if dec_sink.is_linked() {
+                    attach_fakesink(&pipeline, pad, "decoder already linked");
+                    return;
+                }
+                if let Err(e) = pad.link(&dec_sink) {
+                    log::warn!("Video pad failed to link to decoder: {}", e);
+                    attach_fakesink(&pipeline, pad, "video pad could not link to decoder");
+                    return;
+                }
+                log::info!("RTSP video pad linked to decoder");
+            }
+            audio::PadRoute::Fakesink(reason) => attach_fakesink(&pipeline, pad, reason),
+        }
+    });
+}
+
+/// Terminate a pad in its own fakesink — the structural guarantee that
+/// a selected-but-unroutable pad swallows buffers instead of killing
+/// the stream loop.
+///
+/// `sync=false async=false`: a lazily-added sink with async left true
+/// would join preroll and could stall a pipeline sitting in Paused —
+/// re-creating the very hang this path exists to prevent.
+fn attach_fakesink(pipeline: &gst::Pipeline, pad: &gst::Pad, reason: &str) {
+    log::warn!(
+        "Terminating RTSP pad '{}' in a fakesink: {}",
+        pad.name(),
+        reason
+    );
+    let sink = match gst::ElementFactory::make("fakesink")
+        .property("sync", false)
+        .property("async", false)
+        .build()
+    {
+        Ok(s) => s,
+        Err(e) => {
+            // Nothing further possible — but a missing core element is
+            // a broken GStreamer install, not a stream condition.
+            log::error!("fakesink unavailable, pad left unlinked: {}", e);
+            return;
+        }
+    };
+    if let Err(e) = pipeline.add(&sink) {
+        log::error!("Failed to add fakesink to pipeline: {}", e);
+        return;
+    }
+    // From here the sink is IN the pipeline; failures must remove it
+    // again so teardown doesn't trip over a dangling element.
+    let Some(sink_pad) = sink.static_pad("sink") else {
+        log::error!("fakesink has no sink pad");
+        let _ = pipeline.remove(&sink);
+        return;
+    };
+    if let Err(e) = pad.link(&sink_pad) {
+        log::error!("Failed to link pad to fakesink: {}", e);
+        let _ = pipeline.remove(&sink);
+        return;
+    }
+    if let Err(e) = sink.sync_state_with_parent() {
+        log::error!("Failed to sync fakesink with pipeline state: {}", e);
     }
 }
 
