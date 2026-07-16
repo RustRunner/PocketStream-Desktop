@@ -1,10 +1,115 @@
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{watch, Mutex};
 
 use crate::error::AppError;
 use crate::network::ip_config;
+
+/// Minimum age of a subnet's first qualifying observation before a repeat
+/// observation may trigger adoption. Adds ~one loop pass to a real
+/// device's adoption; a device that never re-ARPs never adopts.
+const DWELL_MIN: Duration = Duration::from_secs(2);
+
+/// Candidates not re-encountered within this window are dropped. A live
+/// candidate is re-checked every adopt-loop pass, so only devices whose
+/// subnet stopped clearing the adoption gates (adopted via another
+/// device, native IP added, cooldown) go quiet and age out. Purely a
+/// growth bound — an expired device restarts its dwell from scratch.
+const DWELL_CANDIDATE_TTL: Duration = Duration::from_secs(600);
+
+/// Outcome of one dwell check for an adoption candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DwellVerdict {
+    /// First qualifying observation — start waiting for a repeat.
+    Started,
+    /// Still waiting: no new frame yet, or the repeat came too soon.
+    Waiting,
+    /// A distinct later frame arrived and the dwell has elapsed — adopt.
+    Mature,
+}
+
+struct DwellCandidate {
+    /// The device's `last_seen` string at the first qualifying
+    /// observation. The ARP map rewrites `last_seen` on every accepted
+    /// frame, so any difference proves a second frame — whereas the map
+    /// entry itself is persistent and would look identical across
+    /// arbitrarily many loop passes.
+    token: String,
+    first_qualifying: Instant,
+    last_checked: Instant,
+}
+
+/// Gate that requires a device to produce two distinct accepted ARP
+/// frames before its subnet is adopted, so one spurious frame from the
+/// session-persistent device map can no longer bind an IP.
+///
+/// Candidates are keyed per (subnet, MAC): a second device appearing on
+/// the same subnet opens its own candidacy and neither matures nor
+/// resets another device's wait. The tracker is loop-local state, pure
+/// over injected `Instant`s.
+pub struct DwellTracker {
+    candidates: HashMap<(String, String), DwellCandidate>,
+}
+
+impl DwellTracker {
+    pub fn new() -> Self {
+        Self {
+            candidates: HashMap::new(),
+        }
+    }
+
+    /// Check one gate-clearing device against its dwell candidacy.
+    /// `token` is the device's current `last_seen` observation string.
+    pub fn check(&mut self, subnet: &str, mac: &str, token: &str, now: Instant) -> DwellVerdict {
+        self.candidates
+            .retain(|_, c| now.saturating_duration_since(c.last_checked) < DWELL_CANDIDATE_TTL);
+        // A device observed on a new subnet abandons its old candidacy —
+        // the old (subnet, MAC) pairing no longer describes the device.
+        self.candidates
+            .retain(|(s, m), _| !(m == mac && s != subnet));
+
+        let key = (subnet.to_string(), mac.to_string());
+        match self.candidates.get_mut(&key) {
+            None => {
+                self.candidates.insert(
+                    key,
+                    DwellCandidate {
+                        token: token.to_string(),
+                        first_qualifying: now,
+                        last_checked: now,
+                    },
+                );
+                DwellVerdict::Started
+            }
+            Some(c) => {
+                c.last_checked = now;
+                if c.token != token
+                    && now.saturating_duration_since(c.first_qualifying) >= DWELL_MIN
+                {
+                    DwellVerdict::Mature
+                } else {
+                    DwellVerdict::Waiting
+                }
+            }
+        }
+    }
+
+    /// Drop every candidate on `subnet`. Called once an adoption attempt
+    /// for the subnet finishes (success or failure) or the subnet is
+    /// removed, so the next approach restarts the two-observation gate.
+    pub fn prune_subnet(&mut self, subnet: &str) {
+        self.candidates.retain(|(s, _), _| s != subnet);
+    }
+}
+
+impl Default for DwellTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Check if any of the given IPs are already on the same /24 subnet as the device.
 pub fn already_on_subnet(device_ip: Ipv4Addr, current_ips: &[Ipv4Addr]) -> bool {
@@ -306,6 +411,165 @@ pub async fn remove_adopted_ip(interface_name: &str, ip: &str) -> Result<(), App
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    // ── DwellTracker (two-observation adoption gate) ─────────────────
+
+    const SUBNET_A: &str = "169.254.168.0/24";
+    const SUBNET_B: &str = "169.254.43.0/24";
+    const MAC_1: &str = "AA:BB:CC:DD:EE:01";
+    const MAC_2: &str = "AA:BB:CC:DD:EE:02";
+
+    #[test]
+    fn dwell_first_observation_starts_and_waits() {
+        let mut d = DwellTracker::new();
+        let t0 = Instant::now();
+        assert_eq!(d.check(SUBNET_A, MAC_1, "t0", t0), DwellVerdict::Started);
+    }
+
+    #[test]
+    fn dwell_unchanged_token_never_matures() {
+        // The ARP map is persistent: one frame re-appears in every later
+        // snapshot. However many passes elapse, the same token must wait.
+        let mut d = DwellTracker::new();
+        let t0 = Instant::now();
+        d.check(SUBNET_A, MAC_1, "t0", t0);
+        for secs in [2u64, 10, 60, 300] {
+            assert_eq!(
+                d.check(SUBNET_A, MAC_1, "t0", t0 + Duration::from_secs(secs)),
+                DwellVerdict::Waiting,
+                "same token at +{}s must not mature",
+                secs
+            );
+        }
+    }
+
+    #[test]
+    fn dwell_advanced_token_before_min_waits() {
+        let mut d = DwellTracker::new();
+        let t0 = Instant::now();
+        d.check(SUBNET_A, MAC_1, "t0", t0);
+        assert_eq!(
+            d.check(SUBNET_A, MAC_1, "t1", t0 + Duration::from_secs(1)),
+            DwellVerdict::Waiting
+        );
+    }
+
+    #[test]
+    fn dwell_advanced_token_after_min_matures() {
+        let mut d = DwellTracker::new();
+        let t0 = Instant::now();
+        d.check(SUBNET_A, MAC_1, "t0", t0);
+        assert_eq!(
+            d.check(SUBNET_A, MAC_1, "t1", t0 + Duration::from_secs(2)),
+            DwellVerdict::Mature
+        );
+    }
+
+    #[test]
+    fn dwell_early_second_frame_matures_on_a_later_pass() {
+        // The second frame lands quickly (a boot-time ARP burst); the
+        // token difference is durable, so the candidate matures on the
+        // first pass at or after the dwell minimum.
+        let mut d = DwellTracker::new();
+        let t0 = Instant::now();
+        d.check(SUBNET_A, MAC_1, "t0", t0);
+        assert_eq!(
+            d.check(SUBNET_A, MAC_1, "t1", t0 + Duration::from_millis(500)),
+            DwellVerdict::Waiting
+        );
+        assert_eq!(
+            d.check(SUBNET_A, MAC_1, "t1", t0 + Duration::from_secs(2)),
+            DwellVerdict::Mature
+        );
+    }
+
+    #[test]
+    fn dwell_mac_moving_subnets_restarts() {
+        let mut d = DwellTracker::new();
+        let t0 = Instant::now();
+        d.check(SUBNET_A, MAC_1, "t0", t0);
+        // Same device re-ARPs from a different subnet: old candidacy is
+        // abandoned, the new one starts fresh.
+        assert_eq!(
+            d.check(SUBNET_B, MAC_1, "t1", t0 + Duration::from_secs(3)),
+            DwellVerdict::Started
+        );
+        // Returning to the original subnet also starts fresh — the old
+        // candidate is gone, an advanced token alone must not mature.
+        assert_eq!(
+            d.check(SUBNET_A, MAC_1, "t2", t0 + Duration::from_secs(6)),
+            DwellVerdict::Started
+        );
+    }
+
+    #[test]
+    fn dwell_two_devices_on_one_subnet_are_independent() {
+        // Two devices alternating single frames must not reset each
+        // other (a subnet-keyed candidate overwritten by each new MAC
+        // would loop forever) and must not mature each other.
+        let mut d = DwellTracker::new();
+        let t0 = Instant::now();
+        assert_eq!(d.check(SUBNET_A, MAC_1, "a0", t0), DwellVerdict::Started);
+        assert_eq!(
+            d.check(SUBNET_A, MAC_2, "b0", t0 + Duration::from_secs(1)),
+            DwellVerdict::Started
+        );
+        // Device 1 unchanged: still waiting, unaffected by device 2.
+        assert_eq!(
+            d.check(SUBNET_A, MAC_1, "a0", t0 + Duration::from_secs(3)),
+            DwellVerdict::Waiting
+        );
+        // Device 1's own repeat matures only its own candidacy…
+        assert_eq!(
+            d.check(SUBNET_A, MAC_1, "a1", t0 + Duration::from_secs(5)),
+            DwellVerdict::Mature
+        );
+        // …device 2 with its original token keeps waiting.
+        assert_eq!(
+            d.check(SUBNET_A, MAC_2, "b0", t0 + Duration::from_secs(5)),
+            DwellVerdict::Waiting
+        );
+    }
+
+    #[test]
+    fn dwell_prune_subnet_clears_only_that_subnet() {
+        let mac_3 = "AA:BB:CC:DD:EE:03";
+        let mut d = DwellTracker::new();
+        let t0 = Instant::now();
+        d.check(SUBNET_A, MAC_1, "a0", t0);
+        d.check(SUBNET_A, MAC_2, "b0", t0);
+        d.check(SUBNET_B, mac_3, "c0", t0);
+        d.prune_subnet(SUBNET_A);
+        // Both subnet-A candidates restart from scratch.
+        assert_eq!(
+            d.check(SUBNET_A, MAC_1, "a1", t0 + Duration::from_secs(9)),
+            DwellVerdict::Started
+        );
+        assert_eq!(
+            d.check(SUBNET_A, MAC_2, "b1", t0 + Duration::from_secs(9)),
+            DwellVerdict::Started
+        );
+        // The untouched subnet-B candidate survived: its own repeat
+        // observation matures normally.
+        assert_eq!(
+            d.check(SUBNET_B, mac_3, "c1", t0 + Duration::from_secs(9)),
+            DwellVerdict::Mature
+        );
+    }
+
+    #[test]
+    fn dwell_stale_candidate_expires_and_restarts() {
+        // A candidate that stopped being re-checked (its subnet no
+        // longer clears the gates) ages out; when it qualifies again an
+        // advanced token alone must not mature — the dwell restarts.
+        let mut d = DwellTracker::new();
+        let t0 = Instant::now();
+        d.check(SUBNET_A, MAC_1, "t0", t0);
+        assert_eq!(
+            d.check(SUBNET_A, MAC_1, "t1", t0 + Duration::from_secs(601)),
+            DwellVerdict::Started
+        );
+    }
 
     // ── already_on_subnet ───────────────────────────────────────────
 

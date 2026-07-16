@@ -1054,6 +1054,11 @@ impl NetworkManager {
             let mut shutdown_rx = shutdown_rx;
             let ops = auto_adopt::RealAdoptOps;
             let mut known_subnets: HashSet<String> = HashSet::new();
+            // Two-observation gate: a subnet is adopted only after its
+            // triggering device produces a second accepted ARP frame, so
+            // a single spurious frame (which sits in the persistent
+            // device map forever) can no longer bind a secondary IP.
+            let mut dwell = auto_adopt::DwellTracker::new();
 
             // Mark subnets we already have IPs on as known
             for ip_str in &known_ips {
@@ -1256,7 +1261,33 @@ impl NetworkManager {
                         continue;
                     }
 
-                    log::info!("Foreign subnet detected: {}", device_subnet);
+                    // All structural gates cleared — now require a second
+                    // accepted frame from this device before binding.
+                    // `last_seen` is rewritten on every accepted frame,
+                    // so it serves as the observation token.
+                    match dwell.check(
+                        &device_subnet,
+                        &device.mac,
+                        &device.last_seen,
+                        std::time::Instant::now(),
+                    ) {
+                        auto_adopt::DwellVerdict::Started => {
+                            log::info!(
+                                "Foreign subnet detected: {} — holding adoption until {} is observed again",
+                                device_subnet,
+                                device.mac
+                            );
+                            continue;
+                        }
+                        auto_adopt::DwellVerdict::Waiting => continue,
+                        auto_adopt::DwellVerdict::Mature => {}
+                    }
+
+                    log::info!(
+                        "Foreign subnet {} confirmed by a repeat observation from {} — adopting",
+                        device_subnet,
+                        device.mac
+                    );
 
                     let adoption_id = adoption_seq.fetch_add(1, Ordering::Relaxed) + 1;
                     // Bracket the adoption with started/finished so the
@@ -1499,6 +1530,12 @@ impl NetworkManager {
                             );
                         }
                     }
+
+                    // Whatever the attempt's outcome, this subnet's dwell
+                    // candidacy is spent — a later approach (post-cooldown
+                    // retry, removal then re-appearance) restarts the
+                    // two-observation gate.
+                    dwell.prune_subnet(&device_subnet);
                 }
             }
             log::info!("Auto-adopt loop exited");
