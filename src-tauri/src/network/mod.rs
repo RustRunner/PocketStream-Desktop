@@ -1571,6 +1571,23 @@ impl NetworkManager {
             .collect()
     }
 
+    /// Resolve the wired source IP for reaching `target`, for
+    /// wired-bound cache verification. `None` (discovery never started,
+    /// or no adopted/native wired subnet contains the target) means the
+    /// verification must fail rather than probe unbound. The adapter
+    /// re-read costs one PowerShell query per call — acceptable because
+    /// this only runs after a TCP scan already succeeded; cache the
+    /// selected adapter's IPs in memory if verify latency ever matters.
+    pub async fn wired_source_for(&self, target: Ipv4Addr) -> Option<Ipv4Addr> {
+        let adopted = self.adopted_ips.lock().await.clone();
+        let iface = self.interface_name.lock().await.clone()?;
+        let iface_ips = match interface::get_by_name(&iface).await {
+            Ok(info) => info.ips,
+            Err(_) => Vec::new(),
+        };
+        select_wired_source(target, &adopted, &iface_ips)
+    }
+
     /// Forget that `ip` was auto-adopted. Used when the user manually
     /// claims an IP via Apply / Add Secondary — once they've taken
     /// ownership, the registry shouldn't keep tagging it as ours,
@@ -1705,6 +1722,38 @@ impl NetworkManager {
         }
         while tasks.join_next().await.is_some() {}
     }
+}
+
+/// Pick the wired-bound source IP for reaching `target`: the adopted
+/// secondary IP whose subnet contains it wins (that binding was created
+/// specifically to reach devices there), then the selected wired
+/// interface's own IP on a containing network. `None` means no wired
+/// route identity exists for this target — the caller must treat MAC
+/// verification as failed, never probe unbound: an unbound ping routes
+/// via the default gateway (possibly WiFi), the exact path wired-bound
+/// verification exists to close. Malformed adopted keys are skipped.
+fn select_wired_source(
+    target: Ipv4Addr,
+    adopted: &HashMap<String, Ipv4Addr>,
+    iface_ips: &[interface::IpInfo],
+) -> Option<Ipv4Addr> {
+    for (subnet, ip) in adopted {
+        if let Ok(net) = subnet.parse::<ipnetwork::Ipv4Network>() {
+            if net.contains(target) {
+                return Some(*ip);
+            }
+        }
+    }
+    for info in iface_ips {
+        if let Ok(addr) = info.address.parse::<Ipv4Addr>() {
+            if let Ok(net) = ipnetwork::Ipv4Network::new(addr, info.prefix) {
+                if net.contains(target) {
+                    return Some(addr);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Parse a "AA:BB:CC:DD:EE:FF" or "AA-BB-..." MAC string into 6 bytes.
@@ -1924,6 +1973,92 @@ mod tests {
             Arc::new(AtomicU64::new(current)),
             Arc::new(AtomicBool::new(active)),
         )
+    }
+
+    // ── wired source selection for MAC verification ───────────────
+
+    fn ip(s: &str) -> Ipv4Addr {
+        s.parse().unwrap()
+    }
+
+    fn ip_info(address: &str, prefix: u8) -> interface::IpInfo {
+        let net = ipnetwork::Ipv4Network::new(address.parse().unwrap(), prefix).unwrap();
+        interface::IpInfo {
+            address: address.to_string(),
+            prefix,
+            subnet: format!("{}/{}", net.network(), net.prefix()),
+        }
+    }
+
+    fn adopted(entries: &[(&str, &str)]) -> HashMap<String, Ipv4Addr> {
+        entries
+            .iter()
+            .map(|(subnet, addr)| (subnet.to_string(), ip(addr)))
+            .collect()
+    }
+
+    #[test]
+    fn wired_source_prefers_adopted_ip_for_its_subnet() {
+        let adopted = adopted(&[("172.31.169.0/24", "172.31.169.102")]);
+        let native = [ip_info("192.168.1.101", 24)];
+        assert_eq!(
+            select_wired_source(ip("172.31.169.50"), &adopted, &native),
+            Some(ip("172.31.169.102"))
+        );
+    }
+
+    #[test]
+    fn wired_source_adopted_beats_native_on_same_subnet() {
+        // Both the adopted binding and a native IP contain the target —
+        // the adopted binding wins (it was created to reach devices
+        // there).
+        let adopted = adopted(&[("192.168.1.0/24", "192.168.1.55")]);
+        let native = [ip_info("192.168.1.101", 24)];
+        assert_eq!(
+            select_wired_source(ip("192.168.1.202"), &adopted, &native),
+            Some(ip("192.168.1.55"))
+        );
+    }
+
+    #[test]
+    fn wired_source_uses_native_iface_ip() {
+        let native = [ip_info("192.168.1.101", 24)];
+        assert_eq!(
+            select_wired_source(ip("192.168.1.202"), &HashMap::new(), &native),
+            Some(ip("192.168.1.101"))
+        );
+    }
+
+    #[test]
+    fn wired_source_none_when_no_subnet_matches() {
+        // A foreign-subnet target with no wired identity: verification
+        // must fail rather than fall back to an unbound probe.
+        let adopted = adopted(&[("172.31.169.0/24", "172.31.169.102")]);
+        let native = [ip_info("192.168.1.101", 24)];
+        assert_eq!(select_wired_source(ip("10.0.0.7"), &adopted, &native), None);
+    }
+
+    #[test]
+    fn wired_source_skips_malformed_adopted_keys() {
+        let adopted = adopted(&[("not-a-subnet", "172.31.169.102")]);
+        let native = [ip_info("192.168.1.101", 24)];
+        assert_eq!(
+            select_wired_source(ip("192.168.1.202"), &adopted, &native),
+            Some(ip("192.168.1.101"))
+        );
+    }
+
+    #[test]
+    fn wired_source_respects_non_24_prefixes() {
+        let native = [ip_info("10.10.0.5", 16)];
+        assert_eq!(
+            select_wired_source(ip("10.10.200.9"), &HashMap::new(), &native),
+            Some(ip("10.10.0.5"))
+        );
+        assert_eq!(
+            select_wired_source(ip("10.11.0.9"), &HashMap::new(), &native),
+            None
+        );
     }
 
     #[test]

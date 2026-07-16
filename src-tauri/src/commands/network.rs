@@ -194,16 +194,24 @@ pub async fn clear_manual_nodes(
     Ok(())
 }
 
-/// Look up the MAC at `ip` from the live ARP cache. Used by the
+/// Look up the MAC at `ip`, bound to the wired path. Used by the
 /// cache-verify path to confirm a cached record at an IP is still the
 /// same physical device, not just *something else* with the same
-/// address today. Returns null if the IP doesn't respond.
+/// address today. The probe and neighbor lookup are scoped to the
+/// wired source the backend resolves for the target's subnet, so a
+/// WiFi responder on a shared subnet can never verify a wired record.
+/// Returns null if no wired source exists, the IP doesn't respond over
+/// the wired path, or no ARP entry forms there.
 #[tauri::command]
-pub async fn resolve_mac(ip: String) -> Result<Option<String>, AppError> {
+pub async fn resolve_mac(
+    manager: State<'_, NetworkManager>,
+    ip: String,
+) -> Result<Option<String>, AppError> {
     let parsed: std::net::Ipv4Addr = ip
         .parse()
         .map_err(|_| AppError::Network(format!("Invalid IP: {}", ip)))?;
-    crate::network::arp::resolve_mac_for_ip(parsed, std::time::Duration::from_secs(1)).await
+    let source = manager.wired_source_for(parsed).await;
+    crate::network::arp::resolve_mac_for_ip(parsed, source, std::time::Duration::from_secs(1)).await
 }
 
 #[tauri::command]
