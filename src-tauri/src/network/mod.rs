@@ -842,9 +842,10 @@ impl NetworkManager {
         let app_handle_for_adopt = app_handle.clone();
 
         // Get current IPs so auto-adopt knows which subnets are "known".
-        // (PacketMonitor captures unscoped — no capture-device matching
-        // needed — but the listener still uses the adapter's own MAC to
-        // filter our own gratuitous ARP.)
+        // The adapter's MAC serves double duty: the capture session is
+        // attach-time scoped to the data source carrying this MAC, and
+        // the listener drops ARP frames the adapter itself sent (our own
+        // gratuitous ARP).
         let iface_info = interface::get_by_name(interface_display_name).await?;
         // Backend authority: discovery only ever runs on an up, wired
         // Ethernet adapter, no matter what name a caller supplied. The
@@ -858,6 +859,14 @@ impl NetworkManager {
         }
         let known_ips: Vec<String> = iface_info.ips.iter().map(|ip| ip.address.clone()).collect();
         let own_mac = parse_mac_bytes(&iface_info.mac);
+        // Capture identity for attach-time scoping: the same MAC that
+        // feeds the own-frame filter, plus the display name for logs. A
+        // None MAC (unparseable) makes the join fail and the capture
+        // fall back to an unscoped session rather than guessing.
+        let capture_scope = pktmon::CaptureScope {
+            mac: own_mac,
+            display_name: interface_display_name.to_string(),
+        };
 
         // Every IPv4 currently assigned to any local adapter — not just the
         // camera port. The capture listener drops ARP sent from any of
@@ -922,6 +931,7 @@ impl NetworkManager {
             own_mac,
             fence.clone(),
             excluded_subnets.clone(),
+            capture_scope,
         )?;
         *self.arp_listener_handle.lock().await = Some(handle);
 

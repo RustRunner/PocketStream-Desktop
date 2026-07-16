@@ -520,9 +520,12 @@ async fn on_arp_seen(
     }
 }
 
-/// Start the PacketMonitor ARP listener. PacketMonitor captures unscoped
-/// (the in-driver EtherType constraint is the only capture-side filter);
-/// scoping to the wired port's peers happens per frame in the callback.
+/// Start the PacketMonitor ARP listener. The capture session is scoped
+/// at attach time to the selected wired adapter's data source (with an
+/// unscoped fresh session as the fail-open fallback), and the in-driver
+/// EtherType constraint keeps it ARP-only. The per-frame filters below
+/// stay active in both modes as defense-in-depth — they are the only
+/// scoping when the fallback is in effect.
 ///
 /// `local_ips` — every IPv4 address currently assigned to any local
 /// adapter, shared with the discovery loop that refreshes it as addresses
@@ -534,6 +537,8 @@ async fn on_arp_seen(
 ///
 /// `excluded_subnets` — subnets owned exclusively by non-Ethernet
 /// interfaces; a captured ARP whose sender IP is in one is dropped.
+///
+/// `scope` — the selected wired adapter's capture identity.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start_listener(
     devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
@@ -544,6 +549,7 @@ pub(crate) fn start_listener(
     own_mac: Option<[u8; 6]>,
     fence: super::SweepFence,
     excluded_subnets: Vec<ipnetwork::Ipv4Network>,
+    scope: pktmon::CaptureScope,
 ) -> Result<ArpListenerHandle, AppError> {
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let runtime = tokio::runtime::Handle::current();
@@ -587,14 +593,28 @@ pub(crate) fn start_listener(
             truncation_size: 128,
         };
 
-        let session = match pktmon::CaptureSession::start("PocketStreamArpCapture", config) {
-            Ok(s) => s,
+        let session = match pktmon::CaptureSession::start("PocketStreamArpCapture", config, &scope)
+        {
+            Ok((s, pktmon::ScopeOutcome::SelectedInterface)) => {
+                log::info!(
+                    "PacketMonitor: ARP capture active (scope=selected-interface, adapter='{}')",
+                    scope.display_name
+                );
+                s
+            }
+            Ok((s, pktmon::ScopeOutcome::UnscopedFallback { reason })) => {
+                log::warn!(
+                    "PacketMonitor: ARP capture active (scope=unscoped-fallback, adapter='{}'): {}",
+                    scope.display_name,
+                    reason
+                );
+                s
+            }
             Err(e) => {
                 log::warn!("PacketMonitor: capture start failed: {}", e);
                 return;
             }
         };
-        log::info!("PacketMonitor: ARP capture active");
 
         // Block this thread until the shutdown flip. `changed()` is
         // async; run it on the captured handle (this is a blocking-pool
