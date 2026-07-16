@@ -13,6 +13,7 @@
  */
 
 import type {
+  AdoptionSnapshot,
   AppSettings,
   Credentials,
   DeviceRecord,
@@ -184,6 +185,13 @@ export async function forgetDevice(mac: string): Promise<void> {
  *  if a device was actually removed. */
 export async function evictPhantomDevice(ip: string): Promise<boolean> {
   return await invoke<boolean>("evict_phantom_device", { ip });
+}
+
+/** Atomic adoption snapshot: routing map + per-subnet lifecycle
+ *  metadata with backend-derived staleness. Supersedes
+ *  `getAdoptedSubnets` for every consumer that also renders badges. */
+export async function getAdoptionState(): Promise<AdoptionSnapshot> {
+  return await invoke<AdoptionSnapshot>("get_adoption_state");
 }
 
 export async function getAdoptedSubnets(): Promise<Record<string, string>> {

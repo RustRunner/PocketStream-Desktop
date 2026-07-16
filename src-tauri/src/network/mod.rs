@@ -239,6 +239,75 @@ pub struct NetworkManager {
     adopted_meta: Arc<std::sync::Mutex<HashMap<String, crate::config::AdoptedMeta>>>,
     /// Flush cadence for metadata-only config writes.
     meta_flush: Arc<std::sync::Mutex<MetaFlush>>,
+    /// Instant the current discovery session started; `None` while
+    /// stopped. Anchors the startup-grace math when the adoption
+    /// snapshot derives staleness (the reap pass carries its own copy
+    /// into the loop task).
+    discovery_started: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+}
+
+/// One adopted subnet's lifecycle metadata as the UI consumes it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AdoptedMetaView {
+    /// RFC3339; `None` for entries recorded before metadata existed.
+    pub adopted_at: Option<String>,
+    /// RFC3339; `None` until positive evidence arrives.
+    pub last_device_seen: Option<String>,
+    /// Stale by the applicable evidence threshold (APIPA session
+    /// TTL/startup grace, non-APIPA 24 h wall badge). Derived without
+    /// the pin/rescue vetoes: an unprotected stale APIPA entry reaps
+    /// within a tick of crossing its threshold, so a row that stays
+    /// visible with this flag set is exactly the held/manual-only case.
+    pub stale: bool,
+}
+
+/// Atomic snapshot of the adoption state for the frontend — the
+/// routing map and the per-subnet metadata views taken together so the
+/// two can never disagree.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AdoptionSnapshot {
+    pub adopted_subnets: HashMap<String, String>,
+    pub meta: HashMap<String, AdoptedMetaView>,
+}
+
+/// Wall-clock age of the last recorded sighting (or of the adoption
+/// itself when no device was ever seen), for the informational badge.
+/// `None` when there is nothing to measure, the stamp is unparseable,
+/// or it sits in the future — skew may mislabel a row, never more.
+fn badge_age(
+    meta: Option<&crate::config::AdoptedMeta>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<std::time::Duration> {
+    let stamp = meta.and_then(|m| m.last_device_seen.as_ref().or(m.adopted_at.as_ref()))?;
+    let parsed = chrono::DateTime::parse_from_rfc3339(stamp).ok()?;
+    now.signed_duration_since(parsed.with_timezone(&chrono::Utc))
+        .to_std()
+        .ok()
+}
+
+/// Build the UI view of one adoption from the same verdict function
+/// the reap pass uses, so the badge and the removal policy cannot
+/// drift apart.
+fn adoption_meta_view(
+    subnet: &str,
+    meta: Option<&crate::config::AdoptedMeta>,
+    last_positive_elapsed: Option<std::time::Duration>,
+    session_elapsed: std::time::Duration,
+    badge_age: Option<std::time::Duration>,
+) -> AdoptedMetaView {
+    let stale = reaper::lifecycle_verdict(&reaper::LifecycleInput {
+        subnet: reaper::parse_subnet_key(subnet),
+        last_positive_elapsed,
+        session_elapsed,
+        pinned: false,
+        host_rescued: false,
+        badge_age,
+    }) != reaper::ReapVerdict::Keep;
+    AdoptedMetaView {
+        adopted_at: meta.and_then(|m| m.adopted_at.clone()),
+        last_device_seen: meta.and_then(|m| m.last_device_seen.clone()),
+        stale,
+    }
 }
 
 /// Metadata-only config writes (liveness stamps) are coalesced: stamps
@@ -353,6 +422,58 @@ impl NetworkManager {
                 dirty: false,
                 last_flush: std::time::Instant::now(),
             })),
+            discovery_started: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Atomic adoption snapshot for the frontend: the live adopted map
+    /// plus per-subnet metadata views with staleness derived at call
+    /// time from the same clocks the reap pass reads.
+    pub async fn adoption_snapshot(&self) -> AdoptionSnapshot {
+        let adopted: HashMap<String, String> = self
+            .adopted_ips
+            .lock()
+            .await
+            .iter()
+            .map(|(k, v)| (k.clone(), v.to_string()))
+            .collect();
+        let meta_map = self
+            .adopted_meta
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
+        let liveness = self
+            .adoption_liveness
+            .lock()
+            .map(|l| l.clone())
+            .unwrap_or_default();
+        let session_elapsed = self
+            .discovery_started
+            .lock()
+            .ok()
+            .and_then(|s| *s)
+            .map(|t| t.elapsed())
+            .unwrap_or_default();
+        let wall_now = chrono::Utc::now();
+        let meta = adopted
+            .keys()
+            .map(|subnet| {
+                let m = meta_map.get(subnet);
+                (
+                    subnet.clone(),
+                    adoption_meta_view(
+                        subnet,
+                        m,
+                        liveness.get(subnet).map(|t| t.elapsed()),
+                        session_elapsed,
+                        badge_age(m, wall_now),
+                    ),
+                )
+            })
+            .collect();
+        AdoptionSnapshot {
+            adopted_subnets: adopted,
+            meta,
         }
     }
 
@@ -920,11 +1041,24 @@ impl NetworkManager {
             if added_ok {
                 self.adopted_ips.lock().await.insert(subnet.clone(), ip);
                 self.pending_restore.lock().await.remove(&subnet);
+                // A just-restored entry is never stale: its startup
+                // grace begins with the discovery session, and the
+                // badge is re-derived from the adoption snapshot
+                // whenever the UI re-pulls it.
+                let restored_meta = self
+                    .adopted_meta
+                    .lock()
+                    .ok()
+                    .and_then(|m| m.get(&subnet).cloned())
+                    .unwrap_or_default();
                 let _ = app_handle.emit(
                     "subnet-adopted",
                     serde_json::json!({
                         "subnet": subnet,
                         "adopted_ip": ip_str,
+                        "adopted_at": restored_meta.adopted_at,
+                        "last_device_seen": restored_meta.last_device_seen,
+                        "stale": false,
                     }),
                 );
             } else {
@@ -1252,6 +1386,14 @@ impl NetworkManager {
         let pending_restore = self.pending_restore.clone();
         let liveness_for_adopt = self.adoption_liveness.clone();
         let meta_for_adopt = self.adopted_meta.clone();
+        // One session-start instant shared by the loop's reap pass and
+        // the adoption snapshot's staleness derivation. Anchors the
+        // startup grace; restarts with discovery, so an interface
+        // bounce re-arms it.
+        let session_started = std::time::Instant::now();
+        if let Ok(mut started) = self.discovery_started.lock() {
+            *started = Some(session_started);
+        }
         let adopt_handle = tokio::spawn(async move {
             // AdoptOps in scope: the reap pass calls the unbind through
             // the same seam the adoption rollback paths use.
@@ -1266,11 +1408,6 @@ impl NetworkManager {
             // a single spurious frame (which sits in the persistent
             // device map forever) can no longer bind a secondary IP.
             let mut dwell = auto_adopt::DwellTracker::new();
-            // Lifecycle clocks for the reap pass below. The session
-            // start anchors the startup grace for adoptions with no
-            // positive sighting; it restarts with discovery itself, so
-            // an interface bounce re-arms the grace.
-            let loop_started = std::time::Instant::now();
             // Failed or guard-blocked reaps back off here (60 s doubling
             // to 10 min, like adoption failures) instead of retrying —
             // and re-logging — every 2 s tick.
@@ -1376,7 +1513,7 @@ impl NetworkManager {
                     let base_input = reaper::LifecycleInput {
                         subnet: parsed,
                         last_positive_elapsed,
-                        session_elapsed: loop_started.elapsed(),
+                        session_elapsed: session_started.elapsed(),
                         pinned: false,
                         host_rescued: false,
                         badge_age: None,
@@ -1773,21 +1910,18 @@ impl NetworkManager {
                             // observed moments ago (twice, per the dwell
                             // gate), so seed the session liveness clock
                             // and the persisted metadata together.
-                            {
-                                let wall = chrono::Utc::now().to_rfc3339();
-                                if let Ok(mut liveness) = liveness_for_adopt.lock() {
-                                    liveness
-                                        .insert(device_subnet.clone(), std::time::Instant::now());
-                                }
-                                if let Ok(mut meta) = meta_for_adopt.lock() {
-                                    meta.insert(
-                                        device_subnet.clone(),
-                                        crate::config::AdoptedMeta {
-                                            adopted_at: Some(wall.clone()),
-                                            last_device_seen: Some(wall),
-                                        },
-                                    );
-                                }
+                            let adoption_wall = chrono::Utc::now().to_rfc3339();
+                            if let Ok(mut liveness) = liveness_for_adopt.lock() {
+                                liveness.insert(device_subnet.clone(), std::time::Instant::now());
+                            }
+                            if let Ok(mut meta) = meta_for_adopt.lock() {
+                                meta.insert(
+                                    device_subnet.clone(),
+                                    crate::config::AdoptedMeta {
+                                        adopted_at: Some(adoption_wall.clone()),
+                                        last_device_seen: Some(adoption_wall.clone()),
+                                    },
+                                );
                             }
                             // Handover: the IP is recorded and owned now, so
                             // drop its pending breadcrumb (adapter untouched).
@@ -1805,6 +1939,11 @@ impl NetworkManager {
                                 serde_json::json!({
                                     "subnet": device_subnet,
                                     "adopted_ip": adopted_ip.to_string(),
+                                    "adopted_at": adoption_wall,
+                                    "last_device_seen": adoption_wall,
+                                    // Freshly adopted is never stale — the
+                                    // liveness clock was seeded moments ago.
+                                    "stale": false,
                                 }),
                             );
 
@@ -1994,6 +2133,12 @@ impl NetworkManager {
         // stop with no following start (Static Auto → Manual) — which a
         // generation counter alone would miss.
         self.discovery_active.store(false, Ordering::Relaxed);
+        // No session, no session clock: the adoption snapshot's grace
+        // math treats a stopped discovery as elapsed-zero (never badges
+        // an APIPA entry stale on session evidence it cannot gather).
+        if let Ok(mut started) = self.discovery_started.lock() {
+            *started = None;
+        }
         if let Some(h) = self.auto_adopt_handle.lock().await.take() {
             // Cooperative stop: ask the loop to exit at a select! point so an
             // in-flight adoption rolls back cleanly, then join with a bound.
@@ -2653,6 +2798,79 @@ mod tests {
             t0 + std::time::Duration::from_secs(301)
         ));
         assert!(state.dirty);
+    }
+
+    #[test]
+    fn badge_age_prefers_last_seen_and_tolerates_bad_stamps() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-16T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let seen = crate::config::AdoptedMeta {
+            adopted_at: Some("2026-07-10T12:00:00+00:00".into()),
+            last_device_seen: Some("2026-07-16T11:00:00+00:00".into()),
+        };
+        assert_eq!(
+            badge_age(Some(&seen), now),
+            Some(std::time::Duration::from_secs(3600))
+        );
+
+        // Never seen: the adoption time itself anchors the badge.
+        let never = crate::config::AdoptedMeta {
+            adopted_at: Some("2026-07-16T10:00:00+00:00".into()),
+            last_device_seen: None,
+        };
+        assert_eq!(
+            badge_age(Some(&never), now),
+            Some(std::time::Duration::from_secs(7200))
+        );
+
+        // Nothing recorded, unparseable, or future stamps: no age —
+        // skew and corruption may only mislabel toward "not stale".
+        assert_eq!(badge_age(None, now), None);
+        let garbage = crate::config::AdoptedMeta {
+            adopted_at: Some("yesterday-ish".into()),
+            last_device_seen: None,
+        };
+        assert_eq!(badge_age(Some(&garbage), now), None);
+        let future = crate::config::AdoptedMeta {
+            adopted_at: Some("2026-07-17T00:00:00+00:00".into()),
+            last_device_seen: None,
+        };
+        assert_eq!(badge_age(Some(&future), now), None);
+    }
+
+    #[test]
+    fn meta_view_staleness_follows_the_lifecycle_policy() {
+        let min = |m: u64| std::time::Duration::from_secs(m * 60);
+        let hour = |h: u64| std::time::Duration::from_secs(h * 3600);
+
+        // APIPA, never sighted: stale only past the startup grace.
+        let v = adoption_meta_view("169.254.168.0/24", None, None, min(11), None);
+        assert!(v.stale);
+        let v = adoption_meta_view("169.254.168.0/24", None, None, min(9), None);
+        assert!(!v.stale);
+
+        // APIPA sighted recently is healthy however old the session.
+        let v = adoption_meta_view("169.254.168.0/24", None, Some(min(1)), hour(10), None);
+        assert!(!v.stale);
+
+        // Non-APIPA badges on the 24 h wall age only.
+        let v = adoption_meta_view("172.31.169.0/24", None, None, hour(10), Some(hour(25)));
+        assert!(v.stale);
+        let v = adoption_meta_view("172.31.169.0/24", None, None, hour(10), Some(hour(23)));
+        assert!(!v.stale);
+
+        // The stored stamps ride through to the view unchanged.
+        let meta = crate::config::AdoptedMeta {
+            adopted_at: Some("2026-07-01T00:00:00+00:00".into()),
+            last_device_seen: Some("2026-07-15T00:00:00+00:00".into()),
+        };
+        let v = adoption_meta_view("172.31.169.0/24", Some(&meta), None, min(1), None);
+        assert_eq!(v.adopted_at.as_deref(), Some("2026-07-01T00:00:00+00:00"));
+        assert_eq!(
+            v.last_device_seen.as_deref(),
+            Some("2026-07-15T00:00:00+00:00")
+        );
     }
 
     #[test]

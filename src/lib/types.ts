@@ -183,13 +183,46 @@ export interface ArpDevicePayload {
   last_seen: string;
 }
 
+/** Lifecycle metadata for one adopted subnet as the backend derives it
+ *  (see Rust `AdoptedMetaView`). `stale` is computed backend-side from
+ *  the same policy the removal pass uses; the frontend only renders. */
+export interface AdoptedMetaView {
+  /** RFC3339; null for entries recorded before metadata existed. */
+  adopted_at: string | null;
+  /** RFC3339; null until positive device evidence arrives. */
+  last_device_seen: string | null;
+  stale: boolean;
+}
+
+/** Atomic adoption snapshot (Rust `AdoptionSnapshot`): the routing map
+ *  and per-subnet metadata taken together so they can't disagree. */
+export interface AdoptionSnapshot {
+  adopted_subnets: Record<string, string>;
+  meta: Record<string, AdoptedMetaView>;
+}
+
 /** Payload for the `subnet-adopted` event emitted by the network
- *  manager when a foreign-subnet auto-adoption completes. The wire
- *  field is `adopted_ip` (not `ip`) — matches the JSON the backend
- *  builds via `serde_json::json!`. */
+ *  manager when a foreign-subnet auto-adoption completes or a
+ *  persisted adoption is restored at startup. The wire field is
+ *  `adopted_ip` (not `ip`) — matches the JSON the backend builds via
+ *  `serde_json::json!`. Carries the metadata view inline so listeners
+ *  don't need a follow-up snapshot pull. */
 export interface SubnetAdoptedPayload {
   subnet: string;
   adopted_ip: string;
+  adopted_at: string | null;
+  last_device_seen: string | null;
+  stale: boolean;
+}
+
+/** Payload for the `subnet-removed` event: an adoption left backend
+ *  state, either reaped by the lifecycle check (`stale_apipa`) or
+ *  removed by the user (`manual`). One listener serves both so every
+ *  surface follows backend state through the same path. */
+export interface SubnetRemovedPayload {
+  subnet: string;
+  adopted_ip: string;
+  reason: "stale_apipa" | "manual";
 }
 
 /** Payload for the `device-ping-result` event emitted by the ICMP

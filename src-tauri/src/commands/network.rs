@@ -408,6 +408,16 @@ fn persist_record_for_ip(
     })
 }
 
+/// Atomic adoption snapshot: the routing map plus per-subnet lifecycle
+/// metadata, with staleness derived backend-side so the UI badge and
+/// the removal policy share one implementation.
+#[tauri::command]
+pub async fn get_adoption_state(
+    manager: State<'_, NetworkManager>,
+) -> Result<crate::network::AdoptionSnapshot, AppError> {
+    Ok(manager.adoption_snapshot().await)
+}
+
 #[tauri::command]
 pub async fn get_adopted_subnets(
     manager: State<'_, NetworkManager>,
