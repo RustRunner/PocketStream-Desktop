@@ -188,14 +188,11 @@ export async function evictPhantomDevice(ip: string): Promise<boolean> {
 }
 
 /** Atomic adoption snapshot: routing map + per-subnet lifecycle
- *  metadata with backend-derived staleness. Supersedes
- *  `getAdoptedSubnets` for every consumer that also renders badges. */
+ *  metadata with backend-derived staleness. Replaced the plain
+ *  subnet-to-IP getter — every consumer renders badges from the same
+ *  pull now, so the two can't drift. */
 export async function getAdoptionState(): Promise<AdoptionSnapshot> {
   return await invoke<AdoptionSnapshot>("get_adoption_state");
-}
-
-export async function getAdoptedSubnets(): Promise<Record<string, string>> {
-  return await invoke<Record<string, string>>("get_adopted_subnets");
 }
 
 /** Remove an auto-adopted subnet: unbinds its secondary IP from the wired

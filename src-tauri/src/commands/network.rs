@@ -419,13 +419,6 @@ pub async fn get_adoption_state(
 }
 
 #[tauri::command]
-pub async fn get_adopted_subnets(
-    manager: State<'_, NetworkManager>,
-) -> Result<std::collections::HashMap<String, String>, AppError> {
-    Ok(manager.get_adopted_ips().await)
-}
-
-#[tauri::command]
 pub async fn remove_adopted_subnet(
     manager: State<'_, NetworkManager>,
     config: State<'_, AppConfig>,

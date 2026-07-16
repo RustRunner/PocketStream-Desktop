@@ -2,7 +2,7 @@
  * PocketStream Desktop — Shared state & utilities
  */
 
-import type { AppSettings, InterfaceInfo } from "./types.ts";
+import type { AdoptedMetaView, AppSettings, InterfaceInfo } from "./types.ts";
 import { logToFile } from "./tauri-api.ts";
 
 // ── Shared mutable state ────────────────────────────────────────────
@@ -56,6 +56,12 @@ export const state: AppState = {
  *  `subnet-adopted` events; used by the routing helper and the subnet
  *  list renderer. */
 export const adoptedSubnets: Map<string, string> = new Map();
+
+/** Subnet -> lifecycle metadata view (stale badge + tooltip data).
+ *  Mirrored from the same backend snapshot and events as
+ *  `adoptedSubnets` — the backend derives `stale`; this map only
+ *  renders it. */
+export const adoptionMeta: Map<string, AdoptedMetaView> = new Map();
 
 // ── DOM helpers ─────────────────────────────────────────────────────
 

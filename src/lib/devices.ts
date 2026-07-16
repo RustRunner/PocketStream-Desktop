@@ -18,8 +18,20 @@
  */
 
 import * as api from "./tauri-api.ts";
-import { $, state, log, showToast, escapeHtml, adoptedSubnets } from "./state.ts";
-import { renderSubnetList, isInterfaceConnected } from "./network.ts";
+import {
+  $,
+  state,
+  log,
+  showToast,
+  escapeHtml,
+  adoptedSubnets,
+  adoptionMeta,
+} from "./state.ts";
+import {
+  renderSubnetList,
+  isInterfaceConnected,
+  refreshIpDialogIfOpen,
+} from "./network.ts";
 import {
   clearScannedIps,
   hasRouteToSubnet,
@@ -39,6 +51,7 @@ import type {
   DiscoveryDegradedPayload,
   DiscoveryRecoveredPayload,
   SubnetAdoptedPayload,
+  SubnetRemovedPayload,
 } from "./types.ts";
 
 /** Escape a value for use inside a double-quoted CSS attribute selector.
@@ -266,6 +279,11 @@ export function setupArpListeners(): void {
   api.onEvent<SubnetAdoptedPayload>("subnet-adopted", (data) => {
     log(`Subnet adopted: ${data.subnet} -> ${data.adopted_ip}`);
     adoptedSubnets.set(data.subnet, data.adopted_ip);
+    adoptionMeta.set(data.subnet, {
+      adopted_at: data.adopted_at,
+      last_device_seen: data.last_device_seen,
+      stale: data.stale,
+    });
     renderSubnetList();
     // Briefly flash the row so the user notices a live adoption. The
     // class auto-clears after the CSS animation; the persistent "(auto)"
@@ -288,6 +306,24 @@ export function setupArpListeners(): void {
     showToast(`Couldn't join ${data.subnet} — will retry`, true);
   });
 
+  // One removal path for every surface: whether the backend reaped a
+  // stale adoption or the user removed one from either panel, this
+  // event is what clears the frontend maps and re-renders — the
+  // optimistic local deletes in the click handlers are just immediate
+  // feedback, this is authoritative.
+  api.onEvent<SubnetRemovedPayload>("subnet-removed", (data) => {
+    log(`Subnet removed (${data.reason}): ${data.subnet} (${data.adopted_ip})`);
+    adoptedSubnets.delete(data.subnet);
+    adoptionMeta.delete(data.subnet);
+    renderSubnetList();
+    void refreshIpDialogIfOpen();
+    // Manual removals already toast from their click handler; only a
+    // background reap needs to tell the user something happened.
+    if (data.reason === "stale_apipa") {
+      showToast(`Removed stale adoption ${data.subnet} — no device seen there`);
+    }
+  });
+
   // Initial hydration / scan kickoff is orchestrated from main.js
   // (deviceList.start() then loadExistingArpState) so the order is
   // explicit at the call site.
@@ -303,13 +339,15 @@ export async function loadExistingArpState(): Promise<void> {
   }
 
   try {
-    const subnets = await api.getAdoptedSubnets();
-    if (subnets) {
-      for (const [subnet, ip] of Object.entries(subnets)) {
-        adoptedSubnets.set(subnet, ip);
-      }
-      if (Object.keys(subnets).length > 0) renderSubnetList();
+    const snapshot = await api.getAdoptionState();
+    const entries = Object.entries(snapshot.adopted_subnets);
+    for (const [subnet, ip] of entries) {
+      adoptedSubnets.set(subnet, ip);
     }
+    for (const [subnet, meta] of Object.entries(snapshot.meta)) {
+      adoptionMeta.set(subnet, meta);
+    }
+    if (entries.length > 0) renderSubnetList();
 
     // Kick verification + scanning for whatever's already in the
     // registry. Cached-only records on routable subnets get a fast

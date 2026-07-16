@@ -3,7 +3,16 @@
  */
 
 import * as api from "./lib/tauri-api.ts";
-import { $, $$, $opt, state, showToast, log, adoptedSubnets } from "./lib/state.ts";
+import {
+  $,
+  $$,
+  $opt,
+  state,
+  showToast,
+  log,
+  adoptedSubnets,
+  adoptionMeta,
+} from "./lib/state.ts";
 import { formatError } from "./lib/errors.ts";
 import {
   refreshInterfaces,
@@ -107,11 +116,12 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Without this, the first frame shows every IP as primary, and the
   // badges only appear after loadExistingArpState() runs below.
   try {
-    const subnets = await api.getAdoptedSubnets();
-    if (subnets) {
-      for (const [subnet, ip] of Object.entries(subnets)) {
-        adoptedSubnets.set(subnet, ip);
-      }
+    const snapshot = await api.getAdoptionState();
+    for (const [subnet, ip] of Object.entries(snapshot.adopted_subnets)) {
+      adoptedSubnets.set(subnet, ip);
+    }
+    for (const [subnet, meta] of Object.entries(snapshot.meta)) {
+      adoptionMeta.set(subnet, meta);
     }
   } catch (_) {}
 

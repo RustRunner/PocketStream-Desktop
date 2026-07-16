@@ -1249,6 +1249,21 @@
   vertical-align: middle;
 }
 
+/* Adopted subnet with no positive device evidence within its lifecycle
+   threshold (backend-derived). Amber, not red: informational — the row
+   still works, it just looks abandoned. */
+.badge-stale {
+  display: inline-block;
+  background: rgba(255, 179, 0, 0.18);
+  color: #ffb300;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 10px;
+  margin-left: 4px;
+  vertical-align: middle;
+}
+
 .btn-remove-ip {
   background: none;
   border: none;

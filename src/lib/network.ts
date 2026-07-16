@@ -3,7 +3,16 @@
  */
 
 import * as api from "./tauri-api.ts";
-import { $, $$, state, adoptedSubnets, showToast, log, escapeHtml } from "./state.ts";
+import {
+  $,
+  $$,
+  state,
+  adoptedSubnets,
+  adoptionMeta,
+  showToast,
+  log,
+  escapeHtml,
+} from "./state.ts";
 import { resetDiscoveryStatus, hideDiscoveryStatus, renderArpDeviceList } from "./devices.js";
 import { handleHardDisconnect, handleReconnect, showModalWithVideo } from "./streaming.js";
 import { sessionCamIp } from "./store.ts";
@@ -731,14 +740,36 @@ function renderSecondaryIps(
   // user-set static IP on the same /24 is a different value and must
   // not get tagged "auto" just because the subnet is in the map.
   const adoptedIpSet = new Set(adoptedSubnets.values());
+  // Reverse map for the lifecycle metadata lookup: adopted IP → subnet
+  // (the metadata mirror is keyed by subnet, rows render by IP).
+  const ipToSubnet = new Map(
+    [...adoptedSubnets].map(([subnet, ip]) => [ip, subnet])
+  );
   list.innerHTML = secondaries
     .map((ip) => {
       const isAuto = adoptedIpSet.has(ip.address);
-      const badge = isAuto ? '<span class="badge-auto">(auto)</span>' : "";
+      let badge = isAuto ? '<span class="badge-auto">(auto)</span>' : "";
+      let tooltip = "";
+      if (isAuto) {
+        // Stale flag and tooltip come from the backend's adoption
+        // snapshot — the same policy that decides removal, so the
+        // badge can't disagree with what the reaper would do.
+        const subnet = ipToSubnet.get(ip.address);
+        const meta = subnet ? adoptionMeta.get(subnet) : undefined;
+        if (meta) {
+          tooltip = meta.last_device_seen
+            ? `last device seen: ${new Date(meta.last_device_seen).toLocaleString()}`
+            : "no device seen this session";
+          if (meta.stale) {
+            badge += ' <span class="badge-stale">stale</span>';
+          }
+        }
+      }
       const addrEsc = escapeHtml(ip.address);
       const cidrEsc = escapeHtml(`${ip.address}/${ip.prefix}`);
+      const titleAttr = tooltip ? ` title="${escapeHtml(tooltip)}"` : "";
       return `<div class="secondary-ip-item">
-        <span>${cidrEsc} ${badge}</span>
+        <span${titleAttr}>${cidrEsc} ${badge}</span>
         <button class="btn-remove-ip" data-remove-sec-ip="${addrEsc}" title="Remove">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
         </button>
@@ -786,6 +817,15 @@ function renderSecondaryIps(
         spinner.style.display = "none";
       });
     });
+}
+
+/** Re-pull interfaces into the IP-config dialog when it's open. Used
+ *  by event listeners that change adoption state underneath it (the
+ *  lifecycle reaper, a removal from the other panel) — a closed dialog
+ *  re-reads everything on open anyway. */
+export async function refreshIpDialogIfOpen(): Promise<void> {
+  const dialog = $<HTMLDialogElement>("#ip-config-dialog");
+  if (dialog.open) await reloadDialogInterfaces();
 }
 
 /** Reload interfaces and refresh dialog fields without closing. */
