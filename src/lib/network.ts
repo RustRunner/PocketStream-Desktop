@@ -418,9 +418,13 @@ export function renderSubnetList(): void {
   // Hide APIPA addresses — Windows leaves them as a secondary after
   // any brief DHCP failure and they can't carry usable traffic, so
   // showing them as if they were a selectable subnet just confuses
-  // users (seen on multiple Getac installs in the field).
+  // users (seen on multiple Getac installs in the field). Adopted
+  // APIPA secondaries are exempt: those are addresses we bound on
+  // purpose to reach a camera in APIPA fallback, and hiding them left
+  // this card disagreeing with the Configure list (which shows every
+  // secondary) with no way to see or remove the adoption from here.
   const sortedIps = [...state.activeInterface.ips]
-    .filter((ip) => !isApipa(ip.address))
+    .filter((ip) => !isApipa(ip.address) || adoptedIpSet.has(ip.address))
     .sort((a, b) => {
       const aAuto = adoptedIpSet.has(a.address) ? 1 : 0;
       const bAuto = adoptedIpSet.has(b.address) ? 1 : 0;
