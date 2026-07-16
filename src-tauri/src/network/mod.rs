@@ -227,6 +227,72 @@ pub struct NetworkManager {
     /// generation only advances on start, so this flag is what lets a stop
     /// with no restart (Static Auto → Manual) still drop stragglers.
     discovery_active: Arc<AtomicBool>,
+    /// Session-only positive-liveness clock per adopted subnet: the
+    /// monotonic instant of the last accepted ARP frame, successful
+    /// targeted scan, or successful ping from a device on the subnet.
+    /// Never persisted — wall clock is display-only by design.
+    adoption_liveness: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
+    /// In-memory working copy of the persisted adoption metadata
+    /// (config's `adopted_meta`), stamped through the same choke point
+    /// as `adoption_liveness` and flushed coarsely (see `MetaFlush`).
+    adopted_meta: Arc<std::sync::Mutex<HashMap<String, crate::config::AdoptedMeta>>>,
+    /// Flush cadence for metadata-only config writes.
+    meta_flush: Arc<std::sync::Mutex<MetaFlush>>,
+}
+
+/// Metadata-only config writes (liveness stamps) are coalesced: stamps
+/// mark the state dirty and it flushes at most once per interval.
+/// Adoption and removal writes persist immediately through their own
+/// saves — this cadence exists so ARP frames and pings never translate
+/// into per-event fsyncs.
+const META_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+struct MetaFlush {
+    dirty: bool,
+    last_flush: std::time::Instant,
+}
+
+/// Mark the metadata dirty and decide whether a coarse flush is due.
+/// Consumes the dirty state (and restarts the cadence) when it says
+/// yes; otherwise the dirt persists for a later stamp or lifecycle
+/// save to pick up.
+fn meta_dirty_flush_due(state: &mut MetaFlush, now: std::time::Instant) -> bool {
+    state.dirty = true;
+    if now.saturating_duration_since(state.last_flush) >= META_FLUSH_INTERVAL {
+        state.dirty = false;
+        state.last_flush = now;
+        true
+    } else {
+        false
+    }
+}
+
+/// The `/24` adoption key `ip` falls under — the same derivation every
+/// adoption path uses, so containment is exact key equality.
+fn subnet_key_for(ip: Ipv4Addr) -> String {
+    let o = ip.octets();
+    format!("{}.{}.{}.0/24", o[0], o[1], o[2])
+}
+
+/// Record positive device evidence for `ip` against the adoption maps.
+/// Refreshes the session liveness clock and stamps the display
+/// metadata. Returns whether the evidence landed on an adopted subnet
+/// (the common case is no — the maps are untouched then).
+fn record_positive_liveness(
+    ip: Ipv4Addr,
+    adopted: &HashMap<String, Ipv4Addr>,
+    liveness: &mut HashMap<String, std::time::Instant>,
+    meta: &mut HashMap<String, crate::config::AdoptedMeta>,
+    now: std::time::Instant,
+    wall_rfc3339: &str,
+) -> bool {
+    let subnet = subnet_key_for(ip);
+    if !adopted.contains_key(&subnet) {
+        return false;
+    }
+    liveness.insert(subnet.clone(), now);
+    meta.entry(subnet).or_default().last_device_seen = Some(wall_rfc3339.to_string());
+    true
 }
 
 impl NetworkManager {
@@ -248,6 +314,87 @@ impl NetworkManager {
             discovery_op: Arc::new(Mutex::new(())),
             discovery_generation: Arc::new(AtomicU64::new(0)),
             discovery_active: Arc::new(AtomicBool::new(false)),
+            adoption_liveness: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            adopted_meta: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            meta_flush: Arc::new(std::sync::Mutex::new(MetaFlush {
+                dirty: false,
+                last_flush: std::time::Instant::now(),
+            })),
+        }
+    }
+
+    /// Record positive evidence (accepted ARP frame, successful targeted
+    /// scan, successful ping) that a device exists on `ip`'s subnet.
+    /// Cheap no-op unless that subnet is adopted. Metadata reaches disk
+    /// at most once per `META_FLUSH_INTERVAL` from here; adoption and
+    /// removal writes flush immediately through their own saves.
+    pub async fn note_positive_liveness(&self, app_handle: &tauri::AppHandle, ip: Ipv4Addr) {
+        let now = std::time::Instant::now();
+        let wall = chrono::Utc::now().to_rfc3339();
+        let landed = {
+            let adopted = self.adopted_ips.lock().await;
+            match (self.adoption_liveness.lock(), self.adopted_meta.lock()) {
+                (Ok(mut liveness), Ok(mut meta)) => {
+                    record_positive_liveness(ip, &adopted, &mut liveness, &mut meta, now, &wall)
+                }
+                _ => false,
+            }
+        };
+        if !landed {
+            return;
+        }
+        let flush = self
+            .meta_flush
+            .lock()
+            .map(|mut f| meta_dirty_flush_due(&mut f, now))
+            .unwrap_or(false);
+        if flush {
+            self.flush_adoption_state(app_handle).await;
+        }
+    }
+
+    /// Persist the adoption pair (subnets ∪ pending restores, metadata)
+    /// through the atomic config writer, off the executor (the save is
+    /// an fsync under a std lock). Best-effort: a failure is logged and
+    /// the in-memory state stays authoritative for the next flush or
+    /// lifecycle save.
+    pub async fn flush_adoption_state(&self, app_handle: &tauri::AppHandle) {
+        let adopted = self.adopted_config_snapshot().await;
+        let meta = self
+            .adopted_meta
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
+        let handle = app_handle.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            use tauri::Manager;
+            let config: tauri::State<'_, crate::config::AppConfig> = handle.state();
+            config.update_adoption_state(adopted, meta)
+        })
+        .await;
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => log::warn!("Failed to persist adoption metadata: {}", e),
+            Err(e) => log::warn!("Adoption metadata persist task failed to join: {}", e),
+        }
+    }
+
+    /// Drop session liveness and in-memory metadata for subnets that
+    /// are no longer adopted. The next config save (aligned inside the
+    /// writer) drops their persisted metadata too.
+    fn forget_adoption_tracking(&self, subnets: &[String]) {
+        if subnets.is_empty() {
+            return;
+        }
+        if let Ok(mut liveness) = self.adoption_liveness.lock() {
+            for s in subnets {
+                liveness.remove(s);
+            }
+        }
+        if let Ok(mut meta) = self.adopted_meta.lock() {
+            for s in subnets {
+                meta.remove(s);
+            }
         }
     }
 
@@ -619,6 +766,19 @@ impl NetworkManager {
             }
         }
 
+        // Seed the in-memory metadata working copy for the surviving
+        // entries. Config load already backfilled legacy gaps, so every
+        // kept subnet has an entry; pruned subnets are dropped here and
+        // from the persisted map below.
+        if let Ok(mut meta) = self.adopted_meta.lock() {
+            *meta = settings
+                .adopted_meta
+                .iter()
+                .filter(|(subnet, _)| kept.contains_key(*subnet))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+        }
+
         // Persist the pruned config (original − natively-covered − invalid),
         // computed independently of which re-adds later succeed: a transient
         // re-add failure must keep its config entry for a retry. Only write
@@ -754,10 +914,16 @@ impl NetworkManager {
         merge_adopted_config(&live, &pending)
     }
 
-    /// Save current adopted subnets to config.
+    /// Save current adopted subnets and their lifecycle metadata to
+    /// config in one atomic write.
     pub async fn save_adopted_to_config(&self, config: &crate::config::AppConfig) {
         let adopted = self.adopted_config_snapshot().await;
-        if let Err(e) = config.update_adopted_subnets(adopted) {
+        let meta = self
+            .adopted_meta
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
+        if let Err(e) = config.update_adoption_state(adopted, meta) {
             log::warn!("Failed to save adopted subnets: {}", e);
         }
     }
@@ -1051,6 +1217,8 @@ impl NetworkManager {
         let emitter_for_adopt = emitter.clone();
         let fence_for_loop = fence.clone();
         let pending_restore = self.pending_restore.clone();
+        let liveness_for_adopt = self.adoption_liveness.clone();
+        let meta_for_adopt = self.adopted_meta.clone();
         let adopt_handle = tokio::spawn(async move {
             use tauri::Emitter;
             use tauri::Manager;
@@ -1369,6 +1537,26 @@ impl NetworkManager {
                                 .lock()
                                 .await
                                 .insert(device_subnet.clone(), adopted_ip);
+                            // Fresh adoption: the triggering device was
+                            // observed moments ago (twice, per the dwell
+                            // gate), so seed the session liveness clock
+                            // and the persisted metadata together.
+                            {
+                                let wall = chrono::Utc::now().to_rfc3339();
+                                if let Ok(mut liveness) = liveness_for_adopt.lock() {
+                                    liveness
+                                        .insert(device_subnet.clone(), std::time::Instant::now());
+                                }
+                                if let Ok(mut meta) = meta_for_adopt.lock() {
+                                    meta.insert(
+                                        device_subnet.clone(),
+                                        crate::config::AdoptedMeta {
+                                            adopted_at: Some(wall.clone()),
+                                            last_device_seen: Some(wall),
+                                        },
+                                    );
+                                }
+                            }
                             // Handover: the IP is recorded and owned now, so
                             // drop its pending breadcrumb (adapter untouched).
                             auto_adopt::pending_handover(
@@ -1467,7 +1655,9 @@ impl NetworkManager {
                             let live = adopted.lock().await.clone();
                             let pend = pending_restore.lock().await.clone();
                             let snapshot = merge_adopted_config(&live, &pend);
-                            // Persist off the executor: update_adopted_subnets
+                            let meta_snapshot =
+                                meta_for_adopt.lock().map(|m| m.clone()).unwrap_or_default();
+                            // Persist off the executor: update_adoption_state
                             // does a synchronous atomic_write + fsync (plus
                             // DPAPI on the credentials path) under a std lock,
                             // which would block a tokio worker across disk
@@ -1477,7 +1667,7 @@ impl NetworkManager {
                             let persisted = tokio::task::spawn_blocking(move || {
                                 let config: tauri::State<'_, crate::config::AppConfig> =
                                     persist_handle.state();
-                                config.update_adopted_subnets(snapshot)
+                                config.update_adoption_state(snapshot, meta_snapshot)
                             })
                             .await;
                             match persisted {
@@ -1634,10 +1824,21 @@ impl NetworkManager {
     /// otherwise the "(auto)" badge stays on a user-set IP forever.
     /// Returns true if any entry was removed.
     pub async fn untrack_adopted_ip(&self, ip: &str) -> bool {
-        let mut map = self.adopted_ips.lock().await;
-        let before = map.len();
-        map.retain(|_, v| v.to_string() != ip);
-        before != map.len()
+        let removed: Vec<String> = {
+            let mut map = self.adopted_ips.lock().await;
+            let mut removed = Vec::new();
+            map.retain(|subnet, v| {
+                if v.to_string() == ip {
+                    removed.push(subnet.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            removed
+        };
+        self.forget_adoption_tracking(&removed);
+        !removed.is_empty()
     }
 
     pub async fn remove_adopted_subnet(&self, subnet: &str) -> Result<(), AppError> {
@@ -1662,6 +1863,7 @@ impl NetworkManager {
         // A user removal also drops any held-over restore for this subnet so
         // it isn't resurrected into config by the next save.
         self.pending_restore.lock().await.remove(subnet);
+        self.forget_adoption_tracking(std::slice::from_ref(&subnet.to_string()));
         Ok(())
     }
 
@@ -1943,6 +2145,13 @@ async fn merge_arp_table(
     for device in &new_devices {
         log::info!("ARP table: {} ({})", device.ip, device.mac);
         let _ = app_handle.emit("arp-device-discovered", device);
+        // Positive-liveness stamp for the adoption lifecycle — a
+        // neighbor-table row accepted here is device evidence just like
+        // a captured frame.
+        if let Ok(device_ip) = device.ip.parse::<Ipv4Addr>() {
+            let manager: tauri::State<'_, NetworkManager> = app_handle.state();
+            manager.note_positive_liveness(&app_handle, device_ip).await;
+        }
         let result = registry.merge_arp(device);
         if result.changed {
             registry_changed = true;
@@ -2117,6 +2326,100 @@ mod tests {
         // A stop with no restart clears `active` without moving the
         // generation (Static Auto -> Manual) — must still read as stale.
         assert!(fence(1, 1, false).is_stale());
+    }
+
+    #[test]
+    fn subnet_key_matches_adoption_key_derivation() {
+        assert_eq!(
+            subnet_key_for(Ipv4Addr::new(169, 254, 168, 7)),
+            "169.254.168.0/24"
+        );
+        assert_eq!(subnet_key_for(Ipv4Addr::new(10, 0, 0, 255)), "10.0.0.0/24");
+    }
+
+    #[test]
+    fn positive_liveness_refreshes_only_adopted_subnets() {
+        let mut adopted = HashMap::new();
+        adopted.insert(
+            "169.254.168.0/24".to_string(),
+            Ipv4Addr::new(169, 254, 168, 102),
+        );
+        let mut liveness = HashMap::new();
+        let mut meta = HashMap::new();
+        let t0 = std::time::Instant::now();
+
+        // Evidence from a device on the adopted subnet lands: session
+        // clock refreshed, display metadata stamped.
+        assert!(record_positive_liveness(
+            Ipv4Addr::new(169, 254, 168, 7),
+            &adopted,
+            &mut liveness,
+            &mut meta,
+            t0,
+            "2026-07-16T12:00:00+00:00",
+        ));
+        assert_eq!(liveness.get("169.254.168.0/24"), Some(&t0));
+        assert_eq!(
+            meta["169.254.168.0/24"].last_device_seen.as_deref(),
+            Some("2026-07-16T12:00:00+00:00")
+        );
+
+        // Evidence from a non-adopted subnet touches nothing.
+        assert!(!record_positive_liveness(
+            Ipv4Addr::new(192, 168, 1, 50),
+            &adopted,
+            &mut liveness,
+            &mut meta,
+            t0,
+            "2026-07-16T12:00:01+00:00",
+        ));
+        assert_eq!(liveness.len(), 1);
+        assert_eq!(meta.len(), 1);
+
+        // A later sighting advances both stamps.
+        let t1 = t0 + std::time::Duration::from_secs(60);
+        record_positive_liveness(
+            Ipv4Addr::new(169, 254, 168, 9),
+            &adopted,
+            &mut liveness,
+            &mut meta,
+            t1,
+            "2026-07-16T12:01:00+00:00",
+        );
+        assert_eq!(liveness.get("169.254.168.0/24"), Some(&t1));
+        assert_eq!(
+            meta["169.254.168.0/24"].last_device_seen.as_deref(),
+            Some("2026-07-16T12:01:00+00:00")
+        );
+    }
+
+    #[test]
+    fn meta_flush_cadence_coalesces_writes() {
+        let t0 = std::time::Instant::now();
+        let mut state = MetaFlush {
+            dirty: false,
+            last_flush: t0,
+        };
+        // Stamps inside the interval mark dirty but never flush.
+        assert!(!meta_dirty_flush_due(&mut state, t0));
+        assert!(!meta_dirty_flush_due(
+            &mut state,
+            t0 + std::time::Duration::from_secs(299)
+        ));
+        assert!(state.dirty);
+        // The first stamp past the interval flushes and resets both the
+        // dirt and the cadence.
+        assert!(meta_dirty_flush_due(
+            &mut state,
+            t0 + std::time::Duration::from_secs(300)
+        ));
+        assert!(!state.dirty);
+        // …so the next stamp starts a fresh interval.
+        assert!(!meta_dirty_flush_due(
+            &mut state,
+            t0 + std::time::Duration::from_secs(301)
+        ));
+        assert!(state.dirty);
     }
 
     #[test]

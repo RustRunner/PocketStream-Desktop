@@ -384,34 +384,16 @@ impl AppConfig {
         self.save()
     }
 
-    /// Replace just the adopted-subnets map and persist. Field-scoped so
-    /// the background adopt/prune tasks can't revert a concurrent user
-    /// save of unrelated sections — the previous whole-struct
-    /// get→mutate→update cycle raced user settings saves in both
-    /// directions (user edit reverted, or a still-bound adopted subnet
-    /// dropped).
-    pub fn update_adopted_subnets(
-        &self,
-        adopted: HashMap<String, String>,
-    ) -> Result<(), crate::AppError> {
-        match self.settings.lock() {
-            Ok(mut guard) => guard.adopted_subnets = adopted,
-            Err(poisoned) => {
-                log::error!("Config mutex poisoned during update_adopted_subnets, recovering");
-                poisoned.into_inner().adopted_subnets = adopted;
-            }
-        }
-        self.save()
-    }
-
     /// Replace the adopted-subnets map together with its lifecycle
     /// metadata — one locked update, one save — so a crash can never
-    /// persist half a lifecycle transition. Field-scoped like
-    /// `update_adopted_subnets`, which it supersedes for lifecycle
-    /// writers. The two maps are aligned before the write (stray
-    /// metadata dropped, missing metadata backfilled), so the persisted
-    /// pair always describes the same subnets regardless of caller
-    /// bookkeeping.
+    /// persist half a lifecycle transition. Field-scoped so the
+    /// background adopt/prune tasks can't revert a concurrent user save
+    /// of unrelated sections — a whole-struct get→mutate→update cycle
+    /// would race user settings saves in both directions (user edit
+    /// reverted, or a still-bound adopted subnet dropped). The two maps
+    /// are aligned before the write (stray metadata dropped, missing
+    /// metadata backfilled), so the persisted pair always describes the
+    /// same subnets regardless of caller bookkeeping.
     pub fn update_adoption_state(
         &self,
         adopted: HashMap<String, String>,
@@ -434,7 +416,7 @@ impl AppConfig {
     }
 
     /// Persist one zoom-slider position (clamped to 0–100). Field-scoped
-    /// for the same reason as `update_adopted_subnets`.
+    /// for the same reason as `update_adoption_state`.
     pub fn update_zoom_position(
         &self,
         camera_ip: String,

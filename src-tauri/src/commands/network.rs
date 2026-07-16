@@ -273,9 +273,19 @@ pub async fn get_device_list(
 pub async fn report_scan_result(
     manager: State<'_, NetworkManager>,
     config: State<'_, AppConfig>,
+    app: tauri::AppHandle,
     ip: String,
     open_ports: Vec<u16>,
 ) -> Result<(), AppError> {
+    // A successful scan (any open port) is positive device evidence for
+    // the adoption lifecycle — even when the port set is unchanged and
+    // the registry merge below turns out to be a no-op. Stamp before
+    // the early return. A zero-port result is not evidence.
+    if !open_ports.is_empty() {
+        if let Ok(parsed) = ip.parse::<std::net::Ipv4Addr>() {
+            manager.note_positive_liveness(&app, parsed).await;
+        }
+    }
     let registry = manager.registry();
     if !registry.merge_scan_result(&ip, &open_ports) {
         return Ok(());

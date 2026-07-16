@@ -88,6 +88,19 @@ pub fn start(app_handle: AppHandle, registry: Arc<DeviceRegistry>) -> PingDotHan
                 let target = ip.clone();
                 tokio::spawn(async move {
                     let reachable = probe(&target).await;
+                    // A real echo reply is positive device evidence for
+                    // the adoption lifecycle: a quiet-but-reachable
+                    // camera may never ARP on its own, but these
+                    // periodic probes keep proving it exists. Timeouts
+                    // and unreachable verdicts stamp nothing.
+                    if reachable {
+                        if let Ok(parsed) = target.parse::<std::net::Ipv4Addr>() {
+                            use tauri::Manager;
+                            let manager: tauri::State<'_, crate::network::NetworkManager> =
+                                ah.state();
+                            manager.note_positive_liveness(&ah, parsed).await;
+                        }
+                    }
                     let _ = ah.emit(
                         "device-ping-result",
                         serde_json::json!({

@@ -494,6 +494,14 @@ async fn on_arp_seen(
         is_new
     };
 
+    // Positive-liveness stamp for the adoption lifecycle: an accepted
+    // frame is proof a device exists on the sender's subnet. Cheap
+    // no-op unless that subnet is adopted.
+    {
+        let manager: tauri::State<'_, crate::network::NetworkManager> = app_handle.state();
+        manager.note_positive_liveness(&app_handle, ip).await;
+    }
+
     // Mirror into the canonical DeviceRegistry (its own lock) and evict
     // same-IP dupe cache rows — all outside the `devices` lock.
     let result = registry.merge_arp(&device);
