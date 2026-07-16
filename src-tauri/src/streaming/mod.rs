@@ -926,6 +926,7 @@ mod tests {
                 password: password.into(),
             },
             adopted_subnets: std::collections::HashMap::new(),
+            adopted_meta: std::collections::HashMap::new(),
             zoom_positions: std::collections::HashMap::new(),
             network_mode: NetworkMode::default(),
             manual_nodes: Vec::new(),

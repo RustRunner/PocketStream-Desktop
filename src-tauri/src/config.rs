@@ -114,6 +114,47 @@ pub struct CachedDevice {
     pub last_seen: String,
 }
 
+/// Lifecycle metadata for one adopted subnet. Persisted as a map
+/// parallel to `adopted_subnets` (never a value-type change to that
+/// map, so configs written by older builds keep loading untouched).
+/// Display and history data only: nothing here is trusted for removal
+/// decisions — the APIPA boundary is re-derived from the subnet key on
+/// every decision so a stored flag can't drift from the subnet it
+/// describes, and wall time is never used to remove anything.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdoptedMeta {
+    /// RFC3339 wall time the subnet was adopted. For adoptions
+    /// persisted by builds that predate this metadata, backfilled with
+    /// the load time of the first build that records it.
+    #[serde(default)]
+    pub adopted_at: Option<String>,
+    /// RFC3339 wall time of the last positive evidence from a device
+    /// on the subnet (accepted ARP, successful targeted scan or ping).
+    /// `None` until evidence arrives.
+    #[serde(default)]
+    pub last_device_seen: Option<String>,
+}
+
+/// Align lifecycle metadata with the adopted map being persisted:
+/// drop metadata for subnets no longer present, backfill metadata for
+/// subnets that lack any (legacy configs, writers that recorded none)
+/// using `now_rfc3339` as the adoption time. Keeps the invariant that
+/// the two maps always describe the same subnets, whatever the caller
+/// passed.
+pub fn align_adopted_meta(
+    adopted: &HashMap<String, String>,
+    meta: &mut HashMap<String, AdoptedMeta>,
+    now_rfc3339: &str,
+) {
+    meta.retain(|subnet, _| adopted.contains_key(subnet));
+    for subnet in adopted.keys() {
+        meta.entry(subnet.clone()).or_insert_with(|| AdoptedMeta {
+            adopted_at: Some(now_rfc3339.to_string()),
+            last_device_seen: None,
+        });
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub stream: StreamConfig,
@@ -122,6 +163,11 @@ pub struct AppSettings {
     /// Auto-adopted subnet IPs: subnet string -> adopted IP address
     #[serde(default)]
     pub adopted_subnets: HashMap<String, String>,
+    /// Lifecycle metadata per adopted subnet, keyed like
+    /// `adopted_subnets`. See `AdoptedMeta` for what is (and is
+    /// deliberately not) stored.
+    #[serde(default)]
+    pub adopted_meta: HashMap<String, AdoptedMeta>,
     /// Last zoom slider position (0–100 %) per camera IP.
     /// Restored on launch so the slider doesn't reset to Wide when the
     /// camera is still pointed at the last-set zoom. Stored as percent
@@ -161,6 +207,7 @@ impl Default for AppSettings {
                 password: String::new(),
             },
             adopted_subnets: HashMap::new(),
+            adopted_meta: HashMap::new(),
             zoom_positions: HashMap::new(),
             network_mode: NetworkMode::default(),
             manual_nodes: Vec::new(),
@@ -171,7 +218,8 @@ impl Default for AppSettings {
 impl AppSettings {
     /// Apply only the user-editable sections (`stream`, `rtsp_server`,
     /// `credentials`) from `incoming`, leaving backend-owned fields
-    /// (`adopted_subnets`, `zoom_positions`) untouched. The device cache
+    /// (`adopted_subnets`, `adopted_meta`, `zoom_positions`) untouched.
+    /// The device cache
     /// is no longer part of `AppSettings` at all (lives in its own
     /// file — see `cache_path`), so `save_config` is structurally
     /// incapable of wiping it now; this merge still guards the other
@@ -212,7 +260,18 @@ pub struct AppConfig {
 impl AppConfig {
     pub fn load_or_default() -> Self {
         let mut notices = Vec::new();
-        let settings = load_from_disk(&mut notices).unwrap_or_default();
+        let mut settings = load_from_disk(&mut notices).unwrap_or_default();
+
+        // Adoptions persisted by builds that predate lifecycle metadata
+        // arrive with no `adopted_meta` entry. Backfill in memory (load
+        // time as the adoption time, no device seen yet) rather than
+        // writing back immediately — the next lifecycle save persists
+        // it, and re-deriving on every load is idempotent.
+        align_adopted_meta(
+            &settings.adopted_subnets,
+            &mut settings.adopted_meta,
+            &chrono::Utc::now().to_rfc3339(),
+        );
 
         // Cache loading: prefer the dedicated file. If it doesn't exist,
         // try to migrate the legacy `device_cache` field that lived in
@@ -340,6 +399,35 @@ impl AppConfig {
             Err(poisoned) => {
                 log::error!("Config mutex poisoned during update_adopted_subnets, recovering");
                 poisoned.into_inner().adopted_subnets = adopted;
+            }
+        }
+        self.save()
+    }
+
+    /// Replace the adopted-subnets map together with its lifecycle
+    /// metadata — one locked update, one save — so a crash can never
+    /// persist half a lifecycle transition. Field-scoped like
+    /// `update_adopted_subnets`, which it supersedes for lifecycle
+    /// writers. The two maps are aligned before the write (stray
+    /// metadata dropped, missing metadata backfilled), so the persisted
+    /// pair always describes the same subnets regardless of caller
+    /// bookkeeping.
+    pub fn update_adoption_state(
+        &self,
+        adopted: HashMap<String, String>,
+        mut meta: HashMap<String, AdoptedMeta>,
+    ) -> Result<(), crate::AppError> {
+        align_adopted_meta(&adopted, &mut meta, &chrono::Utc::now().to_rfc3339());
+        match self.settings.lock() {
+            Ok(mut guard) => {
+                guard.adopted_subnets = adopted;
+                guard.adopted_meta = meta;
+            }
+            Err(poisoned) => {
+                log::error!("Config mutex poisoned during update_adoption_state, recovering");
+                let mut guard = poisoned.into_inner();
+                guard.adopted_subnets = adopted;
+                guard.adopted_meta = meta;
             }
         }
         self.save()
@@ -1423,6 +1511,7 @@ password = ""
                 password: "secret".into(),
             },
             adopted_subnets: std::collections::HashMap::new(),
+            adopted_meta: std::collections::HashMap::new(),
             zoom_positions: std::collections::HashMap::new(),
             network_mode: NetworkMode::default(),
             manual_nodes: Vec::new(),
@@ -1651,6 +1740,110 @@ password = ""
         let parsed: AppSettings = toml::from_str(legacy).unwrap();
         assert_eq!(parsed.network_mode, NetworkMode::StaticAuto);
         assert!(parsed.manual_nodes.is_empty());
+    }
+
+    #[test]
+    fn adopted_meta_toml_roundtrip() {
+        let mut settings = AppSettings::default();
+        settings
+            .adopted_subnets
+            .insert("169.254.168.0/24".into(), "169.254.168.102".into());
+        settings.adopted_meta.insert(
+            "169.254.168.0/24".into(),
+            AdoptedMeta {
+                adopted_at: Some("2026-07-16T10:29:13+00:00".into()),
+                last_device_seen: None,
+            },
+        );
+        let toml_str = toml::to_string_pretty(&settings).unwrap();
+        let parsed: AppSettings = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.adopted_meta.len(), 1);
+        let meta = &parsed.adopted_meta["169.254.168.0/24"];
+        assert_eq!(
+            meta.adopted_at.as_deref(),
+            Some("2026-07-16T10:29:13+00:00")
+        );
+        assert_eq!(meta.last_device_seen, None);
+    }
+
+    #[test]
+    fn config_with_adoptions_but_no_meta_loads_with_empty_map() {
+        // Configs written before lifecycle metadata carry adopted
+        // subnets with no adopted_meta table; serde defaults must fill
+        // the map so the upgrade loads (backfill happens separately).
+        let legacy = r#"
+[stream]
+protocol = "rtsp"
+rtsp_port = 554
+rtsp_path = "/z3-1.sdp"
+udp_port = 8600
+camera_ip = ""
+
+[rtsp_server]
+enabled = false
+port = 8554
+token = "abc"
+
+[credentials]
+username = ""
+password = ""
+
+[adopted_subnets]
+"169.254.168.0/24" = "169.254.168.102"
+"#;
+        let parsed: AppSettings = toml::from_str(legacy).unwrap();
+        assert_eq!(parsed.adopted_subnets.len(), 1);
+        assert!(parsed.adopted_meta.is_empty());
+    }
+
+    #[test]
+    fn align_adopted_meta_backfills_and_prunes() {
+        let mut adopted = HashMap::new();
+        adopted.insert(
+            "169.254.168.0/24".to_string(),
+            "169.254.168.102".to_string(),
+        );
+        let mut meta: HashMap<String, AdoptedMeta> = HashMap::new();
+        // Stray metadata for a subnet not being persisted…
+        meta.insert("10.0.0.0/24".into(), AdoptedMeta::default());
+        align_adopted_meta(&adopted, &mut meta, "2026-07-16T00:00:00+00:00");
+        // …is dropped, and the subnet lacking metadata is backfilled
+        // with the supplied time and no device sighting.
+        assert_eq!(meta.len(), 1);
+        let m = &meta["169.254.168.0/24"];
+        assert_eq!(m.adopted_at.as_deref(), Some("2026-07-16T00:00:00+00:00"));
+        assert_eq!(m.last_device_seen, None);
+    }
+
+    #[test]
+    fn align_adopted_meta_preserves_existing_entries() {
+        let mut adopted = HashMap::new();
+        adopted.insert("172.31.169.0/24".to_string(), "172.31.169.102".to_string());
+        let mut meta = HashMap::new();
+        meta.insert(
+            "172.31.169.0/24".to_string(),
+            AdoptedMeta {
+                adopted_at: Some("2026-07-01T00:00:00+00:00".into()),
+                last_device_seen: Some("2026-07-15T00:00:00+00:00".into()),
+            },
+        );
+        align_adopted_meta(&adopted, &mut meta, "2026-07-16T00:00:00+00:00");
+        let m = &meta["172.31.169.0/24"];
+        assert_eq!(m.adopted_at.as_deref(), Some("2026-07-01T00:00:00+00:00"));
+        assert_eq!(
+            m.last_device_seen.as_deref(),
+            Some("2026-07-15T00:00:00+00:00")
+        );
+    }
+
+    #[test]
+    fn merge_user_fields_preserves_adopted_meta() {
+        let mut current = AppSettings::default();
+        current
+            .adopted_meta
+            .insert("169.254.168.0/24".into(), AdoptedMeta::default());
+        current.merge_user_fields(AppSettings::default());
+        assert_eq!(current.adopted_meta.len(), 1);
     }
 
     #[test]

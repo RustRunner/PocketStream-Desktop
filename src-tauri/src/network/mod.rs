@@ -622,9 +622,12 @@ impl NetworkManager {
         // Persist the pruned config (original − natively-covered − invalid),
         // computed independently of which re-adds later succeed: a transient
         // re-add failure must keep its config entry for a retry. Only write
-        // when something was actually dropped.
+        // when something was actually dropped. Lifecycle metadata rides the
+        // same write: alignment inside the updater drops the pruned
+        // subnets' metadata and backfills legacy entries that never had
+        // any.
         if pruned {
-            match config.update_adopted_subnets(kept) {
+            match config.update_adoption_state(kept, settings.adopted_meta.clone()) {
                 Ok(()) => log::info!("Saved pruned adopted subnets to config"),
                 Err(e) => log::warn!("Failed to persist pruned adopted subnets: {}", e),
             }
