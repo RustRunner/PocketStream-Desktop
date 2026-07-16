@@ -757,13 +757,26 @@ function renderSecondaryIps(
         const spinner = $<HTMLElement>("#ip-config-spinner");
         spinner.style.display = "";
         try {
-          await api.removeSecondaryIp(ifaceName, ip);
-          // Also remove from adopted map if it was auto-adopted
+          // An auto-adopted address must go through the adoption
+          // removal path: the generic secondary-IP delete only unbinds
+          // the OS address, leaving the backend adoption and its config
+          // entry intact — the row silently returned on the next
+          // launch's restore. Generic removal stays for user-owned
+          // secondaries, which have no backend registration.
+          let adoptedSubnet: string | null = null;
           for (const [subnet, adoptedIp] of adoptedSubnets) {
             if (adoptedIp === ip) {
-              adoptedSubnets.delete(subnet);
+              adoptedSubnet = subnet;
               break;
             }
+          }
+          if (adoptedSubnet) {
+            await api.removeAdoptedSubnet(adoptedSubnet);
+            adoptedSubnets.delete(adoptedSubnet);
+            // The host card renders adopted rows too — keep it in step.
+            renderSubnetList();
+          } else {
+            await api.removeSecondaryIp(ifaceName, ip);
           }
           showToast(`Removed ${ip}`);
           await reloadDialogInterfaces();
