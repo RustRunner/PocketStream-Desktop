@@ -11,14 +11,14 @@
 //! not emit events on its own; emission is the responsibility of the
 //! caller (NetworkManager) so it can debounce / batch.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{CachedDevice, ManualNode};
+use crate::config::{AppSettings, CachedDevice, ManualNode};
 use crate::network::ArpDevice;
 
 /// User-visible reachability status of a device record.
@@ -58,6 +58,29 @@ pub struct DeviceRecord {
 /// emitting redundant `device-list-changed` events for no-op writes.
 pub struct DeviceRegistry {
     devices: Mutex<HashMap<String, DeviceRecord>>,
+}
+
+/// The set of user-configured pinned IPs: every manual node plus the
+/// persisted stream target. The stream target participates because the
+/// CAM can be selected for streaming without ever receiving an alias —
+/// that config entry is just as much a statement of user intent as a
+/// label.
+pub fn configured_pins(settings: &AppSettings) -> HashSet<String> {
+    let mut pins: HashSet<String> = settings.manual_nodes.iter().map(|n| n.ip.clone()).collect();
+    if !settings.stream.camera_ip.is_empty() {
+        pins.insert(settings.stream.camera_ip.clone());
+    }
+    pins
+}
+
+/// One reusable definition of "the user meant to keep this device":
+/// a pinned registry entry (`manual:` key), any non-empty alias, or an
+/// IP in the configured pin set. Every automatic-removal path shares
+/// this so protection can't drift between them. Deliberately excludes
+/// transient reachability (`Live` and friends) — a status guard
+/// belongs to the individual removal path, not to identity.
+pub fn is_user_pinned(key: &str, alias: &str, ip: &str, configured_pins: &HashSet<String>) -> bool {
+    key.starts_with("manual:") || !alias.is_empty() || configured_pins.contains(ip)
 }
 
 /// Result of a mutation that may also drop stale records (e.g. merge_arp
@@ -383,18 +406,19 @@ impl DeviceRegistry {
 
     /// Evict a phantom cached device: a non-`Live` record at `ip` whose
     /// targeted verify found no open ports and which the user hasn't
-    /// pinned. Aliased entries (the CAM/PTU the user labelled and treats
-    /// as fixed), manual nodes, and `Live` records (ARP-confirmed this
-    /// session) are never evicted. Returns the dropped MAC so the caller
-    /// can remove the cache row.
-    pub fn evict_phantom(&self, ip: &str) -> Option<String> {
+    /// pinned (see `is_user_pinned`: aliased entries like the labelled
+    /// CAM/PTU, `manual:` nodes, and configured pins — the persisted
+    /// stream target counts even without an alias). `Live` records
+    /// (ARP-confirmed this session) are additionally never evicted —
+    /// an eviction-specific liveness guard on top of identity. Returns
+    /// the dropped MAC so the caller can remove the cache row.
+    pub fn evict_phantom(&self, ip: &str, configured_pins: &HashSet<String>) -> Option<String> {
         let mut map = self.lock();
         let mac = map
             .iter()
             .find(|(key, r)| {
                 r.ip == ip
-                    && r.alias.is_empty()
-                    && !key.starts_with("manual:")
+                    && !is_user_pinned(key, &r.alias, &r.ip, configured_pins)
                     && matches!(
                         r.status,
                         DeviceStatus::CachedOnly | DeviceStatus::Offline | DeviceStatus::Verifying
@@ -595,7 +619,7 @@ mod tests {
             "",
         )]);
         assert_eq!(
-            r.evict_phantom("192.168.1.10").as_deref(),
+            r.evict_phantom("192.168.1.10", &HashSet::new()).as_deref(),
             Some("AA:BB:CC:DD:EE:01")
         );
         assert!(r.snapshot().is_empty());
@@ -612,14 +636,81 @@ mod tests {
             vec![],
             "CAM",
         )]);
-        assert!(r.evict_phantom("192.168.1.10").is_none());
+        assert!(r.evict_phantom("192.168.1.10", &HashSet::new()).is_none());
         assert_eq!(r.snapshot().len(), 1);
 
         // A Live (ARP-confirmed) device is never evicted either.
         let r2 = DeviceRegistry::new();
         r2.merge_arp(&arp("AA:BB:CC:DD:EE:02", "192.168.1.11", "192.168.1.0/24"));
-        assert!(r2.evict_phantom("192.168.1.11").is_none());
+        assert!(r2.evict_phantom("192.168.1.11", &HashSet::new()).is_none());
         assert_eq!(r2.snapshot().len(), 1);
+    }
+
+    #[test]
+    fn evict_phantom_exempts_configured_pins() {
+        // A record with no alias whose IP is user-configured (the
+        // persisted stream target here) is user intent — never evicted
+        // even though nothing on the registry row itself marks it.
+        let r = DeviceRegistry::new();
+        r.hydrate_from_cache(&[cached(
+            "AA:BB:CC:DD:EE:01",
+            "172.31.169.65",
+            "172.31.169.0/24",
+            vec![],
+            "",
+        )]);
+        let mut settings = AppSettings::default();
+        settings.stream.camera_ip = "172.31.169.65".into();
+        let pins = configured_pins(&settings);
+        assert!(r.evict_phantom("172.31.169.65", &pins).is_none());
+        assert_eq!(r.snapshot().len(), 1);
+    }
+
+    #[test]
+    fn configured_pins_collects_manual_nodes_and_stream_target() {
+        let mut settings = AppSettings::default();
+        settings.manual_nodes.push(ManualNode {
+            ip: "192.168.4.202".into(),
+            alias: "PTU".into(),
+        });
+        settings.stream.camera_ip = "172.31.169.65".into();
+        let pins = configured_pins(&settings);
+        assert!(pins.contains("192.168.4.202"));
+        assert!(pins.contains("172.31.169.65"));
+
+        // An unset stream target must not pin the empty string.
+        settings.stream.camera_ip = String::new();
+        assert!(!configured_pins(&settings).contains(""));
+    }
+
+    #[test]
+    fn is_user_pinned_covers_every_intent_signal_and_nothing_else() {
+        let pins: HashSet<String> = ["10.0.0.5".to_string()].into_iter().collect();
+        // Pinned registry entry, regardless of alias.
+        assert!(is_user_pinned("manual:10.0.0.9", "", "10.0.0.9", &pins));
+        // Any non-empty alias — CAM, PTU, or a custom name.
+        assert!(is_user_pinned(
+            "AA:BB:CC:DD:EE:01",
+            "CAM",
+            "10.0.0.1",
+            &pins
+        ));
+        assert!(is_user_pinned(
+            "AA:BB:CC:DD:EE:02",
+            "PTU",
+            "10.0.0.2",
+            &pins
+        ));
+        assert!(is_user_pinned(
+            "AA:BB:CC:DD:EE:03",
+            "warehouse-cam",
+            "10.0.0.3",
+            &pins
+        ));
+        // Configured pin (manual node or stream target).
+        assert!(is_user_pinned("AA:BB:CC:DD:EE:04", "", "10.0.0.5", &pins));
+        // Unaliased, unconfigured, ordinary MAC key — not pinned.
+        assert!(!is_user_pinned("AA:BB:CC:DD:EE:05", "", "10.0.0.6", &pins));
     }
 
     #[test]

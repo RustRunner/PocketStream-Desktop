@@ -328,10 +328,11 @@ pub async fn set_device_status(
 }
 
 /// Evict a phantom cached device whose targeted verify found no open
-/// ports. The backend enforces the exemptions: aliased CAM/PTU entries,
-/// manual nodes, and Live (ARP-confirmed) devices are never removed, so
-/// the frontend can call this unconditionally on a failed verify and a
-/// pinned device is left to keep re-verifying.
+/// ports. The backend enforces the exemptions: user-pinned entries
+/// (any alias, manual nodes, the persisted stream target) and Live
+/// (ARP-confirmed) devices are never removed, so the frontend can call
+/// this unconditionally on a failed verify and a pinned device is left
+/// to keep re-verifying.
 /// Returns true if a device was evicted, false if `ip` was exempt (kept)
 /// or not tracked — the frontend keeps re-verifying only the kept ones.
 #[tauri::command]
@@ -340,7 +341,8 @@ pub async fn evict_phantom_device(
     config: State<'_, AppConfig>,
     ip: String,
 ) -> Result<bool, AppError> {
-    match manager.registry().evict_phantom(&ip) {
+    let pins = crate::network::device_registry::configured_pins(&config.get());
+    match manager.registry().evict_phantom(&ip, &pins) {
         Some(mac) => {
             config.remove_cached_device(&mac)?;
             if let Some(emitter) = manager.emitter().await {
