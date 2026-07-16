@@ -169,6 +169,20 @@ impl SelectionState {
         }
     }
 
+    /// SETUP-time policy for the RTSP re-stream server: accept only
+    /// the first video stream; decline audio and every other media
+    /// type. The re-stream launch chain can only consume H.264 video —
+    /// audio pass-through is a separate future feature.
+    pub fn select_video_only(&self, kind: MediaKind) -> bool {
+        match kind {
+            MediaKind::Video => self
+                .video_selected
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            MediaKind::Audio | MediaKind::Other => false,
+        }
+    }
+
     /// Pad-time routing verdict. The first video pad goes to the
     /// decoder; every other pad — duplicates, audio, surprises —
     /// terminates in a fakesink. Audio termination is the safety net
@@ -362,6 +376,24 @@ mod tests {
         let s = SelectionState::default();
         assert!(s.select_playback(MediaKind::Audio, Some(AudioCodec::Pcmu), true));
         assert!(s.select_playback(MediaKind::Video, None, false));
+    }
+
+    // ── select_video_only ───────────────────────────────────────────
+
+    #[test]
+    fn video_only_accepts_first_video_declines_later() {
+        let s = SelectionState::default();
+        assert!(s.select_video_only(MediaKind::Video));
+        assert!(!s.select_video_only(MediaKind::Video));
+    }
+
+    #[test]
+    fn video_only_declines_audio_and_other() {
+        let s = SelectionState::default();
+        assert!(!s.select_video_only(MediaKind::Audio));
+        assert!(!s.select_video_only(MediaKind::Other));
+        // Declines must not claim the video slot.
+        assert!(s.select_video_only(MediaKind::Video));
     }
 
     // ── route_pad ───────────────────────────────────────────────────

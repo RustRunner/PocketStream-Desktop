@@ -16,6 +16,7 @@ use gstreamer_rtsp_server::prelude::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use super::audio;
 use crate::error::AppError;
 
 /// Redact the RTSP access token embedded in a mount path for logging.
@@ -239,6 +240,30 @@ impl RtspRestreamer {
                         src.set_property("user-id", &user_for_factory);
                         src.set_property("user-pw", &pw_for_factory);
                     }
+                    // Accept only the first video stream at SETUP. The
+                    // launch chain can only consume H.264 video; an
+                    // audio pad would have no consumer and its
+                    // GST_FLOW_NOT_LINKED would kill the re-stream
+                    // pipeline the same way it killed playback. Fresh
+                    // state per media — the factory is shared, and each
+                    // media construction negotiates its own streams.
+                    // media-configure fires before SDP/SETUP, so the
+                    // handler lands in time.
+                    let selection = audio::SelectionState::default();
+                    src.connect("select-stream", false, move |values| {
+                        let caps = values.get(2).and_then(|v| v.get::<gst::Caps>().ok());
+                        let kind = caps
+                            .as_ref()
+                            .map(|c| audio::classify_rtp_caps(c).0)
+                            .unwrap_or(audio::MediaKind::Other);
+                        let accept = selection.select_video_only(kind);
+                        if !accept {
+                            log::info!("Re-stream: declining non-video stream at SETUP");
+                        }
+                        // A select-stream handler must return a gboolean
+                        // Value — None panics in the closure marshal.
+                        Some(accept.to_value())
+                    });
                 }
             }
         });
