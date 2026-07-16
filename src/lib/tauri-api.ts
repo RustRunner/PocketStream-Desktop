@@ -73,6 +73,11 @@ export async function updateCredentials(credentials: Credentials): Promise<void>
   return await invoke("update_credentials", { credentials });
 }
 
+/** Persist the audio mute preference and apply it to live playback. */
+export async function setAudioMuted(muted: boolean): Promise<void> {
+  return await invoke("set_audio_muted", { muted });
+}
+
 // ── Network ─────────────────────────────────────────────────────────
 
 export async function scanNetwork(subnet: string): Promise<ScanResult[]> {

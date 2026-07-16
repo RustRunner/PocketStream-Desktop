@@ -92,6 +92,11 @@ export interface StreamConfig {
   rtsp_path: string;
   udp_port: number;
   camera_ip: string;
+  /** Audio mute preference; false = audio plays when a stream carries
+   *  a supported track. Required so every StreamConfig literal carries
+   *  it — an omitted field would deserialize to false backend-side and
+   *  silently unmute. */
+  audio_muted: boolean;
 }
 
 export interface RtspServerConfig {

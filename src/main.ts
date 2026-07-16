@@ -408,6 +408,10 @@ function setupSettingsSave(): void {
       rtsp_path: rtspPath,
       udp_port: parseInt($<HTMLInputElement>("#udp-port").value) || 8600,
       camera_ip: state.config?.stream?.camera_ip || "",
+      // Not a Settings field — preserve the live preference so an
+      // unrelated save can't unmute/reset it (the mute toggle keeps
+      // state.config in sync when it flips this).
+      audio_muted: state.config?.stream?.audio_muted ?? false,
     };
     const rtspServer: RtspServerConfig = {
       enabled: $<HTMLInputElement>("#rtsp-server-enable").checked,

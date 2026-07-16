@@ -35,6 +35,11 @@ pub struct StreamConfig {
     pub udp_port: u16,
     /// Camera IP address (discovered or manual)
     pub camera_ip: String,
+    /// Whether audio playback is muted. `false` by default — audio
+    /// plays when a stream carries a supported track. `serde(default)`
+    /// migrates config files that predate the field.
+    #[serde(default)]
+    pub audio_muted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,6 +148,7 @@ impl Default for AppSettings {
                 rtsp_path: "/z3-1.sdp".into(),
                 udp_port: 8600,
                 camera_ip: String::new(),
+                audio_muted: false,
             },
             rtsp_server: RtspServerConfig {
                 enabled: false,
@@ -392,6 +398,18 @@ impl AppConfig {
             Err(poisoned) => {
                 log::error!("Config mutex poisoned during set_network_mode, recovering");
                 poisoned.into_inner().network_mode = mode;
+            }
+        }
+        self.save()
+    }
+
+    /// Replace just the audio mute preference and persist.
+    pub fn set_audio_muted(&self, muted: bool) -> Result<(), crate::AppError> {
+        match self.settings.lock() {
+            Ok(mut guard) => guard.stream.audio_muted = muted,
+            Err(poisoned) => {
+                log::error!("Config mutex poisoned during set_audio_muted, recovering");
+                poisoned.into_inner().stream.audio_muted = muted;
             }
         }
         self.save()
@@ -1313,6 +1331,8 @@ mod tests {
         assert_eq!(s.stream.rtsp_path, "/z3-1.sdp");
         assert_eq!(s.stream.udp_port, 8600);
         assert!(s.stream.camera_ip.is_empty());
+        // Audio is on by default; the mute button is the opt-out.
+        assert!(!s.stream.audio_muted);
     }
 
     #[test]
@@ -1390,6 +1410,7 @@ password = ""
                 rtsp_path: "/cam1".into(),
                 udp_port: 9000,
                 camera_ip: "10.0.0.5".into(),
+                audio_muted: true,
             },
             rtsp_server: RtspServerConfig {
                 enabled: true,
@@ -1413,6 +1434,35 @@ password = ""
         assert_eq!(parsed.rtsp_server.bind_interface, "Ethernet 2");
         assert!(parsed.rtsp_server.enabled);
         assert_eq!(parsed.credentials.username, "admin");
+        assert!(parsed.stream.audio_muted);
+    }
+
+    #[test]
+    fn stream_config_missing_audio_muted_defaults_false() {
+        // A config file written before the field existed must load
+        // with audio on — the migration default.
+        let toml_str = r#"
+            [stream]
+            protocol = "rtsp"
+            rtsp_port = 554
+            rtsp_path = "/live"
+            udp_port = 8600
+            camera_ip = "192.168.1.10"
+
+            [rtsp_server]
+            enabled = false
+            port = 8554
+            token = "tok"
+
+            [credentials]
+            username = ""
+            password = ""
+        "#;
+        let parsed: AppSettings = toml::from_str(toml_str).unwrap();
+        assert!(!parsed.stream.audio_muted);
+        // The rest of the stream section must survive the migration.
+        assert_eq!(parsed.stream.camera_ip, "192.168.1.10");
+        assert_eq!(parsed.stream.rtsp_path, "/live");
     }
 
     // ── Config Paths ────────────────────────────────────────────────

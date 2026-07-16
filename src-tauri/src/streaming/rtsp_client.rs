@@ -85,6 +85,11 @@ pub struct PlaybackPipeline {
     /// accept and on a recognized-but-unsupported skip, so status can
     /// name a codec that exists but is not playing.
     audio_codec: Arc<Mutex<Option<audio::AudioCodec>>>,
+    /// Desired mute state, held pipeline-side so a mute command that
+    /// arrives before the lazily built audio branch exists is not
+    /// lost: the branch builder reads this value and re-applies it
+    /// after state sync. Seeded from config at construction.
+    desired_mute: Arc<AtomicBool>,
 }
 
 impl PlaybackPipeline {
@@ -99,6 +104,7 @@ impl PlaybackPipeline {
         camera_ip: Option<String>,
         username: &str,
         password: &str,
+        audio_muted: bool,
     ) -> Result<Self, AppError> {
         let protocols = if use_tcp { "tcp" } else { "udp+tcp" };
 
@@ -158,6 +164,10 @@ impl PlaybackPipeline {
                     .into(),
             )
         })?;
+        // Seed the mute preference before the handlers can build the
+        // audio branch, so the branch is born with the persisted state.
+        result.desired_mute.store(audio_muted, Ordering::Release);
+
         let selection = Arc::new(audio::SelectionState::default());
         install_stream_selection(&src, selection.clone(), result.audio_codec.clone());
         install_pad_routing(
@@ -166,6 +176,7 @@ impl PlaybackPipeline {
             &dec,
             selection,
             result.audio_present.clone(),
+            result.desired_mute.clone(),
         );
 
         Ok(result)
@@ -283,7 +294,21 @@ impl PlaybackPipeline {
             first_error: Arc::new(Mutex::new(None)),
             audio_present: Arc::new(AtomicBool::new(false)),
             audio_codec: Arc::new(Mutex::new(None)),
+            desired_mute: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Record the desired mute state and apply it to the live volume
+    /// element when the audio branch exists. Safe to call before the
+    /// branch is built — the branch builder reads the stored value and
+    /// re-applies it after state sync, so a command landing in that
+    /// window is never lost. `by_name` recurses into child bins and
+    /// finds "vol" inside the audio bin.
+    pub fn set_audio_muted(&self, muted: bool) {
+        self.desired_mute.store(muted, Ordering::Release);
+        if let Some(vol) = self.pipeline.by_name("vol") {
+            vol.set_property("mute", muted);
+        }
     }
 
     /// Audio state for the status snapshot: whether the audio branch
@@ -799,6 +824,7 @@ fn install_pad_routing(
     dec: &gst::Element,
     selection: Arc<audio::SelectionState>,
     audio_present: Arc<AtomicBool>,
+    desired_mute: Arc<AtomicBool>,
 ) {
     let pipeline_weak = pipeline.downgrade();
     let dec_weak = dec.downgrade();
@@ -826,7 +852,7 @@ fn install_pad_routing(
                 log::info!("RTSP video pad linked to decoder");
             }
             audio::PadRoute::AudioBranch(codec) => {
-                match attach_audio_branch(&pipeline, pad, codec) {
+                match attach_audio_branch(&pipeline, pad, codec, &desired_mute) {
                     Ok(()) => audio_present.store(true, Ordering::Release),
                     Err(e) => {
                         // Video must survive a failed audio branch: park
@@ -851,10 +877,18 @@ fn attach_audio_branch(
     pipeline: &gst::Pipeline,
     pad: &gst::Pad,
     codec: audio::AudioCodec,
+    desired_mute: &AtomicBool,
 ) -> Result<(), AppError> {
     let bin = gst::parse::bin_from_description(&codec.branch_launch(), true)
         .map_err(|e| AppError::Stream(format!("Audio branch parse error: {}", e)))?;
     bin.set_property("name", "audio_bin");
+
+    // The named element must exist if the bin parsed; a missing "vol"
+    // is a broken branch, refused before it joins the pipeline.
+    let vol = bin
+        .by_name("vol")
+        .ok_or_else(|| AppError::Stream("volume 'vol' not found in audio branch".into()))?;
+    vol.set_property("mute", desired_mute.load(Ordering::Acquire));
 
     pipeline
         .add(&bin)
@@ -884,6 +918,11 @@ fn attach_audio_branch(
             e
         )));
     }
+    // Re-apply after the branch is live: a set_audio_muted command
+    // landing between the read above and the branch becoming findable
+    // via by_name stores the new value but has no element to poke —
+    // without this re-read that command would be silently lost.
+    vol.set_property("mute", desired_mute.load(Ordering::Acquire));
     log::info!("Audio branch attached ({})", codec.name());
     Ok(())
 }

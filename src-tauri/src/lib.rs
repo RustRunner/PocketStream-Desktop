@@ -445,6 +445,7 @@ pub fn run() {
             // Streaming
             commands::start_stream,
             commands::stop_stream,
+            commands::set_audio_muted,
             commands::start_rtsp_server,
             commands::stop_rtsp_server,
             commands::take_screenshot,

@@ -55,6 +55,20 @@ pub async fn stop_stream(
 }
 
 #[tauri::command]
+pub async fn set_audio_muted(
+    stream: State<'_, StreamManager>,
+    config: State<'_, AppConfig>,
+    muted: bool,
+) -> Result<(), AppError> {
+    // Persist first: a failed save errors out before the live pipeline
+    // changes, so the stored preference and what the user hears cannot
+    // disagree.
+    config.set_audio_muted(muted)?;
+    stream.set_audio_muted(muted).await;
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn start_rtsp_server(
     stream: State<'_, StreamManager>,
     config: State<'_, AppConfig>,

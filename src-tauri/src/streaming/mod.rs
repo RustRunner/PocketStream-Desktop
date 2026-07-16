@@ -255,6 +255,7 @@ impl StreamManager {
                     Some(settings.stream.camera_ip.clone()),
                     &settings.credentials.username,
                     &settings.credentials.password,
+                    settings.stream.audio_muted,
                 )?
             }
         };
@@ -714,6 +715,21 @@ impl StreamManager {
         Ok(path)
     }
 
+    /// Apply the mute preference to live playback, if any. Persistence
+    /// happens in the command layer; with no pipeline this is a no-op —
+    /// the next start seeds the preference from config. Clone the
+    /// pipeline Arc out under the lock, poke GStreamer outside it (the
+    /// one lock discipline for StreamManager).
+    pub async fn set_audio_muted(&self, muted: bool) {
+        let pipeline = {
+            let state = self.state.lock().await;
+            state.playback.clone()
+        };
+        if let Some(p) = pipeline {
+            p.set_audio_muted(muted);
+        }
+    }
+
     #[allow(dead_code)] // called from commands.rs behind #[cfg(windows)]
     pub fn set_video_child_hwnd(&self, hwnd: isize) {
         self.video_hwnd
@@ -897,6 +913,7 @@ mod tests {
                 rtsp_path: "/live".into(),
                 udp_port: 8600,
                 camera_ip: camera_ip.into(),
+                audio_muted: false,
             },
             rtsp_server: RtspServerConfig {
                 enabled: false,
