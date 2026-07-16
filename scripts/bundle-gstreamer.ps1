@@ -196,6 +196,22 @@ $Plugins = @(
 
     # Additional codecs decodebin may need
     "gstcodecalpha.dll"
+
+    # G.711 audio decoders: mulawdec, alawdec
+    "gstmulaw.dll"
+    "gstalaw.dll"
+
+    # Audio branch plumbing: audioconvert, audioresample
+    "gstaudioconvert.dll"
+    "gstaudioresample.dll"
+
+    # Audio mute control: volume
+    "gstvolume.dll"
+
+    # Windows audio sinks for autoaudiosink: wasapi2sink (primary),
+    # directsoundsink (fallback on older images)
+    "gstwasapi2.dll"
+    "gstdirectsound.dll"
 )
 
 # ── Copy files ────────────────────────────────────────────────────────

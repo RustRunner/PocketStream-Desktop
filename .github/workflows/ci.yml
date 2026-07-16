@@ -174,6 +174,70 @@ jobs:
           New-Item -ItemType File -Force -Path src-tauri\resources\gstreamer\bin\.gitkeep | Out-Null
           New-Item -ItemType File -Force -Path src-tauri\resources\gstreamer\lib\gstreamer-1.0\.gitkeep | Out-Null
 
+      # Build the shipping GStreamer bundle and prove it is self-sufficient.
+      # The bundle script fails on any missing source DLL; the smoke check
+      # then verifies the generated bundle actually provides the audio-path
+      # elements with the system plugin directory masked, so the complete
+      # SDK install on this runner cannot hide a bundle omission.
+      - name: Bundle GStreamer runtime
+        shell: pwsh
+        run: pwsh -ExecutionPolicy Bypass -File scripts/bundle-gstreamer.ps1
+
+      - name: Bundle smoke check (isolated plugin path)
+        shell: pwsh
+        run: |
+          $bundle = Join-Path $pwd 'src-tauri\resources\gstreamer\lib\gstreamer-1.0'
+          # Windows deletes an env var assigned an empty string, and an
+          # unset GST_PLUGIN_SYSTEM_PATH_1_0 falls back to the default
+          # system plugin dir — so isolation needs a real, empty directory.
+          $emptyDir = Join-Path $env:RUNNER_TEMP 'no-system-plugins'
+          New-Item -ItemType Directory -Force -Path $emptyDir | Out-Null
+          $env:GST_PLUGIN_PATH_1_0        = $bundle
+          $env:GST_PLUGIN_SYSTEM_PATH_1_0 = $emptyDir
+          $env:GST_REGISTRY_1_0 = Join-Path $env:RUNNER_TEMP 'bundle-smoke-registry.bin'
+
+          # Negative control: opusdec ships in the complete SDK install but
+          # is deliberately not bundled. If it resolves, the isolation above
+          # is broken and every positive check below is meaningless.
+          gst-inspect-1.0.exe --exists opusdec
+          if ($LASTEXITCODE -eq 0) { throw 'Smoke-check isolation broken: system plugins are visible' }
+
+          $elements = @('rtppcmudepay','rtppcmadepay','mulawdec','alawdec',
+                        'audioconvert','audioresample','volume','autoaudiosink',
+                        'wasapi2sink','directsoundsink')
+          $missing = foreach ($e in $elements) {
+            gst-inspect-1.0.exe --exists $e
+            if ($LASTEXITCODE -ne 0) { $e }
+          }
+          if ($missing) { throw "Bundle missing elements: $($missing -join ', ')" }
+          Write-Host "All $($elements.Count) audio-path elements present in the bundle."
+
+      # Guard the import surface of the audio plugins: every non-system DLL
+      # they import must ship in the bundle's bin directory, or the installed
+      # app fails to load them while CI (whose PATH holds the complete SDK)
+      # stays green. First-level imports of exactly these seven DLLs —
+      # deliberately not a general dependency walker.
+      - name: Audit audio plugin imports against the bundle
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = & $vswhere -latest -find '**\Hostx64\x64\dumpbin.exe' | Select-Object -First 1
+          if (-not $dumpbin) { throw 'dumpbin.exe not found on the runner' }
+          $bundleBin = Join-Path $pwd 'src-tauri\resources\gstreamer\bin'
+          $plugins = @('gstmulaw.dll','gstalaw.dll','gstaudioconvert.dll',
+                       'gstaudioresample.dll','gstvolume.dll','gstwasapi2.dll','gstdirectsound.dll')
+          # OS-inbox and VC-runtime imports the app already relies on.
+          $systemOk = '^(KERNEL32|USER32|ole32|DSOUND|MMDevAPI|AVRT|VCRUNTIME140(_1)?|MSVCP140|api-ms-win-.*)\.dll$'
+          $gaps = foreach ($p in $plugins) {
+            $file = Join-Path $pwd "src-tauri\resources\gstreamer\lib\gstreamer-1.0\$p"
+            $deps = (& $dumpbin /dependents $file | Select-String -Pattern '^\s{4}\S+\.dll').Line.Trim()
+            foreach ($d in $deps) {
+              if ($d -notmatch $systemOk -and -not (Test-Path (Join-Path $bundleBin $d))) { "$p -> $d" }
+            }
+          }
+          if ($gaps) { throw "Plugin imports missing from the bundle: $($gaps -join '; ')" }
+          Write-Host 'All audio plugin imports resolve inside the bundle (or the OS/VC runtime).'
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
