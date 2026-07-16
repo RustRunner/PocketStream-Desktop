@@ -752,6 +752,20 @@
   color: var(--md-error);
 }
 
+/* The mute button carries both speaker glyphs; the `muted` class picks
+   which one shows. */
+#btn-mute .icon-audio-off {
+  display: none;
+}
+
+#btn-mute.muted .icon-audio-on {
+  display: none;
+}
+
+#btn-mute.muted .icon-audio-off {
+  display: block;
+}
+
 /* ── Device List ────────────────────────────────────────────────────── */
 
 .subnet-list {

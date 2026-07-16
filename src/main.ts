@@ -35,6 +35,7 @@ import {
   beginPipelineSwitch,
   endPipelineSwitch,
   updateStreamUI,
+  updateMuteButton,
 } from "./lib/streaming.ts";
 import { setupPtzControls } from "./lib/ptz.ts";
 import type {
@@ -80,6 +81,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   startStatusListener();
 
   await loadConfig();
+
+  // Paint the mute button's persisted visual state now that config is
+  // loaded; it stays disabled until a stream carries audio.
+  updateMuteButton();
 
   // Surface backend load-time salvage events (e.g. a corrupted config
   // quarantined and reset to defaults) — without this the reset is

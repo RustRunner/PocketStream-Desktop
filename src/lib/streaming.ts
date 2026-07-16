@@ -132,6 +132,17 @@ let lastRecordToggleAt = 0;
 // through the same handler before the first await resolved.
 let streamToggleBusy = false;
 
+/** Busy latch for the mute toggle (see streamToggleBusy): a double-tap
+ *  would compute `next` twice from the same pre-toggle config value and
+ *  apply the same state twice instead of toggling back. */
+let muteToggleBusy = false;
+
+/** Audio availability from the last stream-status event. Module-local
+ *  rather than AppState: nothing outside this file consumes them — the
+ *  persisted mute preference itself lives in state.config.stream. */
+let audioPresent = false;
+let audioCodec: string | null = null;
+
 export function setupStreamControls(): void {
   $<HTMLButtonElement>("#btn-toggle-stream").addEventListener("click", async () => {
     if (streamToggleBusy) return;
@@ -196,6 +207,26 @@ export function setupStreamControls(): void {
     }
   });
 
+  $<HTMLButtonElement>("#btn-mute").addEventListener("click", async () => {
+    if (muteToggleBusy) return;
+    muteToggleBusy = true;
+    const next = !(state.config?.stream.audio_muted ?? false);
+    try {
+      await api.setAudioMuted(next);
+      // Keep the shared config in sync so a later Settings save or
+      // path switch (both send state.config.stream wholesale) can't
+      // revert the preference the backend just persisted.
+      if (state.config) {
+        state.config.stream.audio_muted = next;
+      }
+      updateMuteButton();
+    } catch (e) {
+      showToast(`Failed to ${next ? "mute" : "unmute"} audio: ` + formatError(e), true);
+    } finally {
+      muteToggleBusy = false;
+    }
+  });
+
   $<HTMLButtonElement>("#btn-record").addEventListener("click", async () => {
     const now = Date.now();
     const sinceLast = now - lastRecordToggleAt;
@@ -248,6 +279,7 @@ export function updateStreamUI(): void {
   const canInteract = state.isStreaming && !state.streamLost;
   $<HTMLButtonElement>("#btn-screenshot").disabled = !canInteract;
   $<HTMLButtonElement>("#btn-record").disabled = !canInteract;
+  updateMuteButton();
 
   const area = $("#video-area");
   const placeholder = area.querySelector<HTMLElement>(".placeholder-text");
@@ -258,6 +290,19 @@ export function updateStreamUI(): void {
     placeholder.style.display = "";
     placeholder.textContent = "Select a camera and start stream";
   }
+}
+
+/** Single renderer for the mute button: enabled only while a healthy
+ *  stream is carrying audio; muted visual from the persisted
+ *  preference; codec named in the tooltip when known. Exported so init
+ *  can paint the persisted state as soon as config loads. */
+export function updateMuteButton(): void {
+  const btn = $<HTMLButtonElement>("#btn-mute");
+  btn.disabled = !(state.isStreaming && !state.streamLost && audioPresent);
+  const muted = state.config?.stream.audio_muted ?? false;
+  btn.classList.toggle("muted", muted);
+  const action = muted ? "Unmute audio" : "Mute audio";
+  btn.title = audioCodec ? `${action} (${audioCodec})` : action;
 }
 
 // ── RTSP server controls ────────────────────────────────────────────
@@ -554,6 +599,14 @@ function handleStatus(status: StreamStatus | null): void {
     if (!rtspFullUrl && status.rtsp_url) {
       rtspFullUrl = status.rtsp_url;
     }
+  }
+
+  // Audio availability drives the mute button. Change-detected so the
+  // 1 Hz ticker doesn't re-render the button every second.
+  if (status.audio_present !== audioPresent || status.audio_codec !== audioCodec) {
+    audioPresent = status.audio_present;
+    audioCodec = status.audio_codec;
+    updateMuteButton();
   }
 
   // Detect stream drop — backend says not playing but we think we're
