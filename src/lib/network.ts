@@ -838,8 +838,23 @@ function renderSecondaryIps(
               break;
             }
           }
+          if (!adoptedSubnet) {
+            // The live map can be empty while the row's IP is still a
+            // persisted adoption: a disconnected cold start restores
+            // nothing, yet an unclean shutdown leaves the address bound.
+            // Those rows must also route through the adoption-aware
+            // removal, or the config entry survives and the adoption
+            // resurrects on the next connected launch.
+            const configured = await api.getConfiguredAdoptions();
+            for (const [subnet, adoptedIp] of Object.entries(configured)) {
+              if (adoptedIp === ip) {
+                adoptedSubnet = subnet;
+                break;
+              }
+            }
+          }
           if (adoptedSubnet) {
-            await api.removeAdoptedSubnet(adoptedSubnet);
+            await api.removeAdoptedSubnet(adoptedSubnet, ifaceName);
             adoptedSubnets.delete(adoptedSubnet);
             // The host card renders adopted rows too — keep it in step.
             renderSubnetList();

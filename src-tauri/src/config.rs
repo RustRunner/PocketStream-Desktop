@@ -155,6 +155,19 @@ pub fn align_adopted_meta(
     }
 }
 
+/// Remove exactly one subnet — and its metadata row — from an adoption
+/// map pair, leaving every other entry and its metadata untouched.
+/// Returns whether the subnet entry existed. Pure so the surgical
+/// contract is unit-testable.
+fn remove_adoption_entry(
+    adopted: &mut HashMap<String, String>,
+    meta: &mut HashMap<String, AdoptedMeta>,
+    subnet: &str,
+) -> bool {
+    meta.remove(subnet);
+    adopted.remove(subnet).is_some()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub stream: StreamConfig,
@@ -413,6 +426,31 @@ impl AppConfig {
             }
         }
         self.save()
+    }
+
+    /// Field-scoped like [`Self::update_adoption_state`], but surgical:
+    /// removes exactly `subnet` (and its metadata row) from the persisted
+    /// adoption state, preserving every other entry. For callers with no
+    /// live adoption state — rebuilding the persisted map from live
+    /// state would wipe the entries that never restored this session.
+    /// Saves only when the entry existed; returns whether it did.
+    pub fn remove_adopted_subnet_entry(&self, subnet: &str) -> Result<bool, crate::AppError> {
+        let removed = match self.settings.lock() {
+            Ok(mut guard) => {
+                let s = &mut *guard;
+                remove_adoption_entry(&mut s.adopted_subnets, &mut s.adopted_meta, subnet)
+            }
+            Err(poisoned) => {
+                log::error!("Config mutex poisoned during remove_adopted_subnet_entry, recovering");
+                let mut guard = poisoned.into_inner();
+                let s = &mut *guard;
+                remove_adoption_entry(&mut s.adopted_subnets, &mut s.adopted_meta, subnet)
+            }
+        };
+        if removed {
+            self.save()?;
+        }
+        Ok(removed)
     }
 
     /// Persist one zoom-slider position (clamped to 0–100). Field-scoped
@@ -1628,6 +1666,55 @@ password = ""
              the cache lives in device_cache.toml. Found:\n{}",
             toml_str
         );
+    }
+
+    #[test]
+    fn remove_adoption_entry_is_surgical() {
+        let mut adopted = HashMap::new();
+        adopted.insert("172.31.169.0/24".to_string(), "172.31.169.100".to_string());
+        adopted.insert("169.254.73.0/24".to_string(), "169.254.73.99".to_string());
+        let mut meta = HashMap::new();
+        meta.insert(
+            "172.31.169.0/24".to_string(),
+            AdoptedMeta {
+                adopted_at: Some("2026-07-16T00:20:37Z".into()),
+                last_device_seen: Some("2026-07-17T01:10:18Z".into()),
+            },
+        );
+        meta.insert(
+            "169.254.73.0/24".to_string(),
+            AdoptedMeta {
+                adopted_at: Some("2026-07-16T00:20:37Z".into()),
+                last_device_seen: None,
+            },
+        );
+
+        assert!(remove_adoption_entry(
+            &mut adopted,
+            &mut meta,
+            "172.31.169.0/24"
+        ));
+        // The other entry AND its metadata survive untouched — removing
+        // one adoption must never rebuild (and thereby wipe) the rest.
+        assert_eq!(adopted.len(), 1);
+        assert_eq!(
+            adopted.get("169.254.73.0/24"),
+            Some(&"169.254.73.99".to_string())
+        );
+        assert_eq!(meta.len(), 1);
+        assert_eq!(
+            meta.get("169.254.73.0/24").unwrap().adopted_at.as_deref(),
+            Some("2026-07-16T00:20:37Z")
+        );
+
+        // Absent subnet: a reported no-op, nothing else disturbed.
+        assert!(!remove_adoption_entry(
+            &mut adopted,
+            &mut meta,
+            "10.0.0.0/24"
+        ));
+        assert_eq!(adopted.len(), 1);
+        assert_eq!(meta.len(), 1);
     }
 
     #[test]

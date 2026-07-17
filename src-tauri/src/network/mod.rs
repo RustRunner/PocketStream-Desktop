@@ -519,6 +519,95 @@ async fn park_capture_handle(
     }
 }
 
+/// Which path a user-initiated adoption removal takes. Pure — the
+/// (live, pending-restore, config) membership triple fully determines
+/// the route, so the decision is unit-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemovalRoute {
+    /// Live adoption state exists — the standard unbind + snapshot-save.
+    Live,
+    /// No live entry, but the subnet is persisted (directly, or held as
+    /// a pending restore): unbind wherever the IP is actually bound and
+    /// purge exactly that config entry.
+    ConfigOnly,
+    /// Held nowhere — the removal is an error.
+    Unknown,
+}
+
+fn classify_removal(in_live: bool, in_pending_restore: bool, in_config: bool) -> RemovalRoute {
+    if in_live {
+        RemovalRoute::Live
+    } else if in_pending_restore || in_config {
+        // A pending-restore entry is not live-bound, but every persisted
+        // snapshot unions it back in — the purge must drop both.
+        RemovalRoute::ConfigOnly
+    } else {
+        RemovalRoute::Unknown
+    }
+}
+
+/// Names of the adapters currently binding `ip`. The caller's interface
+/// hint only orders the result (checked first) — a stale dialog
+/// selection must never decide where an unbind runs.
+fn adapters_binding_ip<'a>(
+    adapters: &'a [interface::InterfaceInfo],
+    ip: &str,
+    hint: Option<&str>,
+) -> Vec<&'a str> {
+    let mut owners: Vec<&str> = adapters
+        .iter()
+        .filter(|a| a.ips.iter().any(|i| i.address == ip))
+        .map(|a| a.name.as_str())
+        .collect();
+    if let Some(h) = hint {
+        if let Some(pos) = owners.iter().position(|n| *n == h) {
+            owners.swap(0, pos);
+        }
+    }
+    owners
+}
+
+/// Outcome of an owner-resolving unbind.
+#[derive(Debug, PartialEq, Eq)]
+enum UnbindOutcome {
+    /// The IP was bound and netsh removed it (from `adapter`, plus any
+    /// other adapter that also bound it).
+    Unbound { adapter: String },
+    /// The IP is bound on no enumerated adapter. Structured absence IS
+    /// success for a removal — never inferred from netsh output, which
+    /// is localized.
+    NotBound,
+}
+
+/// Unbind `ip` from whichever adapter(s) actually bind it, resolved by
+/// structured enumeration — a disconnected adapter still enumerates and
+/// can still be unbound. Any netsh failure propagates so the caller
+/// leaves persisted state intact for a retry.
+async fn unbind_ip_resolving_owner(
+    ip: Ipv4Addr,
+    hint: Option<&str>,
+) -> Result<UnbindOutcome, AppError> {
+    let adapters = interface::list_all_adapters().await?;
+    let ip_str = ip.to_string();
+    let owners = adapters_binding_ip(&adapters, &ip_str, hint);
+    if owners.len() > 1 {
+        log::warn!(
+            "Secondary IP {} is bound on {} adapters — removing it from all of them",
+            ip_str,
+            owners.len()
+        );
+    }
+    let mut removed_from: Option<String> = None;
+    for owner in owners {
+        ip_config::remove_secondary_ip(owner, &ip_str).await?;
+        removed_from.get_or_insert_with(|| owner.to_string());
+    }
+    Ok(match removed_from {
+        Some(adapter) => UnbindOutcome::Unbound { adapter },
+        None => UnbindOutcome::NotBound,
+    })
+}
+
 /// Capture-health watchdog with a bounded self-heal ladder.
 ///
 /// After each session activation, the provoking sweep plus a checkpoint
@@ -2515,31 +2604,92 @@ impl NetworkManager {
         !removed.is_empty()
     }
 
-    /// Returns the unbound IP so the caller can emit the removal event.
-    pub async fn remove_adopted_subnet(&self, subnet: &str) -> Result<Ipv4Addr, AppError> {
-        let iface_name = self
-            .interface_name
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| AppError::Network("No interface configured".into()))?;
+    /// Remove an adopted subnet however it is held: live adoption state,
+    /// or config-only — a disconnected cold start restores nothing, yet
+    /// after an unclean shutdown Windows keeps the secondary bound and
+    /// the config entry persists, so the row must still be removable
+    /// without resurrecting on the next connected launch.
+    ///
+    /// Serialized under `discovery_op` so an in-flight startup restore
+    /// cannot re-bind the address after the purge. Returns the unbound
+    /// IP so the caller can emit the removal event.
+    pub async fn remove_adopted_subnet(
+        &self,
+        config: &crate::config::AppConfig,
+        subnet: &str,
+        iface_hint: Option<&str>,
+    ) -> Result<Ipv4Addr, AppError> {
+        let _op = self.discovery_op.lock().await;
 
-        // Read the IP without untracking yet — only remove from the map
-        // after the netsh delete succeeds, so a failed delete can't leave
-        // the IP on the interface while the map believes it's gone.
-        let ip = {
-            let map = self.adopted_ips.lock().await;
-            *map.get(subnet)
-                .ok_or_else(|| AppError::Network(format!("Subnet {} not adopted", subnet)))?
-        };
+        let live_ip = { self.adopted_ips.lock().await.get(subnet).copied() };
+        let pending_ip = { self.pending_restore.lock().await.get(subnet).copied() };
+        // An unparseable persisted IP reads as absent here; the startup
+        // restore's classification prunes such entries itself.
+        let config_ip = config
+            .get()
+            .adopted_subnets
+            .get(subnet)
+            .and_then(|s| s.parse::<Ipv4Addr>().ok());
 
-        auto_adopt::remove_adopted_ip(&iface_name, &ip.to_string()).await?;
-        self.adopted_ips.lock().await.remove(subnet);
-        // A user removal also drops any held-over restore for this subnet so
-        // it isn't resurrected into config by the next save.
-        self.pending_restore.lock().await.remove(subnet);
-        self.forget_adoption_tracking(std::slice::from_ref(&subnet.to_string()));
-        Ok(ip)
+        match classify_removal(live_ip.is_some(), pending_ip.is_some(), config_ip.is_some()) {
+            RemovalRoute::Live => {
+                let iface_name = self
+                    .interface_name
+                    .lock()
+                    .await
+                    .clone()
+                    .ok_or_else(|| AppError::Network("No interface configured".into()))?;
+                let ip = live_ip.expect("live route implies a live entry");
+                // netsh delete first — a failed delete must not leave the
+                // IP on the interface while the map believes it's gone.
+                auto_adopt::remove_adopted_ip(&iface_name, &ip.to_string()).await?;
+                self.adopted_ips.lock().await.remove(subnet);
+                // A user removal also drops any held-over restore for
+                // this subnet so it isn't resurrected into config by the
+                // next save.
+                self.pending_restore.lock().await.remove(subnet);
+                self.forget_adoption_tracking(std::slice::from_ref(&subnet.to_string()));
+                // Snapshot-save under the same lifecycle lock, so a
+                // concurrent restore can't interleave between the map
+                // update and the persist.
+                self.save_adopted_to_config(config).await;
+                Ok(ip)
+            }
+            RemovalRoute::ConfigOnly => {
+                let ip = config_ip
+                    .or(pending_ip)
+                    .expect("config route implies a persisted entry");
+                match unbind_ip_resolving_owner(ip, iface_hint).await? {
+                    UnbindOutcome::Unbound { adapter } => {
+                        log::info!(
+                            "Removed config-only adopted IP {} from '{}' (subnet {})",
+                            ip,
+                            adapter,
+                            subnet
+                        );
+                    }
+                    UnbindOutcome::NotBound => {
+                        log::info!(
+                            "Config-only adopted IP {} is bound nowhere — purging the entry (subnet {})",
+                            ip,
+                            subnet
+                        );
+                    }
+                }
+                self.pending_restore.lock().await.remove(subnet);
+                self.forget_adoption_tracking(std::slice::from_ref(&subnet.to_string()));
+                // Surgical purge only. The snapshot-save would rebuild
+                // config from live ∪ pending-restore — both empty on a
+                // disconnected cold start — erasing every other adoption
+                // while removing this one.
+                config.remove_adopted_subnet_entry(subnet)?;
+                Ok(ip)
+            }
+            RemovalRoute::Unknown => Err(AppError::Network(format!(
+                "Subnet {} is not adopted (live or configured)",
+                subnet
+            ))),
+        }
     }
 
     /// Remove every currently-adopted secondary IP from the OS interface.
@@ -2897,6 +3047,82 @@ mod tests {
             Arc::new(AtomicU64::new(current)),
             Arc::new(AtomicBool::new(active)),
         )
+    }
+
+    // ── adoption-removal routing ──────────────────────────────────
+
+    #[test]
+    fn removal_route_classification() {
+        // Live wins whether or not the entry is also persisted.
+        assert_eq!(classify_removal(true, false, true), RemovalRoute::Live);
+        assert_eq!(classify_removal(true, true, true), RemovalRoute::Live);
+        assert_eq!(classify_removal(true, false, false), RemovalRoute::Live);
+        // Persisted-only — including a pending restore that never bound —
+        // routes to the config-aware path.
+        assert_eq!(
+            classify_removal(false, false, true),
+            RemovalRoute::ConfigOnly
+        );
+        assert_eq!(
+            classify_removal(false, true, false),
+            RemovalRoute::ConfigOnly
+        );
+        assert_eq!(
+            classify_removal(false, true, true),
+            RemovalRoute::ConfigOnly
+        );
+        // Held nowhere is an error, not a silent success.
+        assert_eq!(classify_removal(false, false, false), RemovalRoute::Unknown);
+    }
+
+    fn adapter(name: &str, ips: &[&str]) -> interface::InterfaceInfo {
+        interface::InterfaceInfo {
+            name: name.into(),
+            display_name: name.into(),
+            ips: ips
+                .iter()
+                .map(|addr| interface::IpInfo {
+                    address: (*addr).into(),
+                    prefix: 24,
+                    subnet: String::new(),
+                })
+                .collect(),
+            mac: String::new(),
+            is_up: true,
+            is_ethernet: true,
+            is_wifi: false,
+            is_vpn: false,
+            is_virtual: false,
+        }
+    }
+
+    #[test]
+    fn adapters_binding_ip_resolves_true_owner_over_hint() {
+        // A stale dialog selection must not decide where the unbind runs.
+        let adapters = vec![
+            adapter("Ethernet", &["192.168.1.20"]),
+            adapter("Ethernet 2", &["172.31.169.253"]),
+        ];
+        let owners = adapters_binding_ip(&adapters, "172.31.169.253", Some("Ethernet"));
+        assert_eq!(owners, vec!["Ethernet 2"]);
+    }
+
+    #[test]
+    fn adapters_binding_ip_bound_nowhere_is_empty() {
+        // Structured absence — the caller treats this as success without
+        // ever parsing netsh output.
+        let adapters = vec![adapter("Ethernet", &["192.168.1.20"])];
+        assert!(adapters_binding_ip(&adapters, "172.31.169.253", Some("Ethernet")).is_empty());
+    }
+
+    #[test]
+    fn adapters_binding_ip_hint_orders_multiple_owners() {
+        let adapters = vec![
+            adapter("Ethernet", &["172.31.169.253"]),
+            adapter("Ethernet 2", &["172.31.169.253"]),
+        ];
+        let owners = adapters_binding_ip(&adapters, "172.31.169.253", Some("Ethernet 2"));
+        assert_eq!(owners, vec!["Ethernet 2", "Ethernet"]);
     }
 
     // ── wired source selection for MAC verification ───────────────

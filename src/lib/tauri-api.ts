@@ -202,11 +202,22 @@ export async function getAdoptionState(): Promise<AdoptionSnapshot> {
   return await invoke<AdoptionSnapshot>("get_adoption_state");
 }
 
-/** Remove an auto-adopted subnet: unbinds its secondary IP from the wired
- *  port and drops it from persisted config. Rejects (with a backend message)
- *  if the subnet isn't adopted or no interface is configured. */
-export async function removeAdoptedSubnet(subnet: string): Promise<void> {
-  return await invoke("remove_adopted_subnet", { subnet });
+/** Persisted adoption entries (subnet -> IP) straight from config. A
+ *  routing aid for the Configure dialog's removal path only: an entry here
+ *  is not necessarily bound this session (disconnected cold start), so it
+ *  must never feed `adoptedSubnets` or anything else that treats that map
+ *  as live on-link routes. */
+export async function getConfiguredAdoptions(): Promise<Record<string, string>> {
+  return await invoke<Record<string, string>>("get_configured_adoptions");
+}
+
+/** Remove an auto-adopted subnet: unbinds its secondary IP (resolving the
+ *  real owning adapter — `ifaceHint` is ordering only) and drops it from
+ *  persisted config, even when no live adoption state exists this session.
+ *  Rejects (with a backend message) if the subnet is neither adopted nor
+ *  configured. */
+export async function removeAdoptedSubnet(subnet: string, ifaceHint?: string): Promise<void> {
+  return await invoke("remove_adopted_subnet", { subnet, ifaceHint });
 }
 
 /** Listen for a Tauri event. Returns a Promise that resolves to the

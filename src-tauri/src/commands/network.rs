@@ -437,9 +437,15 @@ pub async fn remove_adopted_subnet(
     config: State<'_, AppConfig>,
     app: tauri::AppHandle,
     subnet: String,
+    iface_hint: Option<String>,
 ) -> Result<(), AppError> {
-    let ip = manager.remove_adopted_subnet(&subnet).await?;
-    manager.save_adopted_to_config(&config).await;
+    // The manager owns persistence for both routes: a snapshot-save for a
+    // live adoption, a surgical single-entry purge for a config-only one
+    // (a snapshot here would rebuild from empty live state and wipe every
+    // other adoption).
+    let ip = manager
+        .remove_adopted_subnet(&config, &subnet, iface_hint.as_deref())
+        .await?;
     // Same event the lifecycle reaper emits, so every UI surface follows
     // backend state through one listener whichever path removed the row.
     use tauri::Emitter;
@@ -452,4 +458,16 @@ pub async fn remove_adopted_subnet(
         }),
     );
     Ok(())
+}
+
+/// Persisted adoption entries (subnet -> IP) straight from config, for
+/// the Configure dialog's removal routing only. A config-only adoption
+/// (nothing restored this session) must still route through the
+/// adoption-aware removal — but an entry here is not necessarily bound,
+/// so this must never feed the frontend's live routing map.
+#[tauri::command]
+pub async fn get_configured_adoptions(
+    config: State<'_, AppConfig>,
+) -> Result<std::collections::HashMap<String, String>, AppError> {
+    Ok(config.get().adopted_subnets)
 }
