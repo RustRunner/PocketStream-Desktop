@@ -275,3 +275,17 @@ jobs:
             --ignore RUSTSEC-2024-0413 \
             --ignore RUSTSEC-2026-0194 \
             --ignore RUSTSEC-2026-0195
+
+  compliance:
+    name: Third-Party Notices
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The notices/manifest/texts consistency check needs no GStreamer
+      # install and no build — it cross-checks committed files only, so
+      # a DLL added to the bundle manifest without a notices entry (or a
+      # new npm dependency without one) fails here on every push.
+      - name: Check third-party notices coverage
+        shell: pwsh
+        run: ./scripts/check-third-party.ps1

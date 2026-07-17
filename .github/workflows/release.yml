@@ -112,11 +112,13 @@ jobs:
           New-Item -ItemType File -Force -Path src-tauri\resources\gstreamer\lib\gstreamer-1.0\.gitkeep | Out-Null
 
       # Same gates as CI, on the release commit.
-      - name: Checks (typecheck, fmt, clippy, test, audit)
+      - name: Checks (typecheck, notices, fmt, clippy, test, audit)
         shell: pwsh
         run: |
           npm run typecheck
           if ($LASTEXITCODE -ne 0) { throw "typecheck failed" }
+          ./scripts/check-third-party.ps1
+          if ($LASTEXITCODE -ne 0) { throw "third-party notices check failed" }
           Push-Location src-tauri
           try {
             cargo fmt --check

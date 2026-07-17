@@ -42,7 +42,9 @@
     ],
     "resources": [
       "resources/gstreamer/bin/*",
-      "resources/gstreamer/lib/gstreamer-1.0/*"
+      "resources/gstreamer/lib/gstreamer-1.0/*",
+      "resources/licenses/THIRD-PARTY-NOTICES.md",
+      "resources/licenses/texts/*"
     ],
     "windows": {
       "nsis": {
