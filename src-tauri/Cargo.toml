@@ -45,6 +45,10 @@ tauri-build = { version = "2", features = [] }
 
 [dev-dependencies]
 tempfile = "3"
+# test-util enables tokio's paused-clock tests (start_paused), so budget
+# logic can be exercised without real waits. Feature-only: pulls no new
+# crates, so the lockfile is unchanged.
+tokio = { version = "1", features = ["test-util"] }
 
 [features]
 default = ["custom-protocol"]

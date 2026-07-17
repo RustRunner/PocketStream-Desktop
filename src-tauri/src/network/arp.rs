@@ -982,6 +982,87 @@ fn format_mac(mac: &[u8; 6]) -> String {
     )
 }
 
+/// Force a fresh on-wire ARP resolution of `target`, pinned to the
+/// adapter that owns `scratch` (the caller's temporary probe address).
+///
+/// Two steps, neither of which parses localized OS text:
+/// 1. Flush the target's neighbor entry, scoped to the adapter — so a
+///    Stale/Delay/Probe leftover cannot masquerade as a fresh answer.
+///    Flush failure fails closed.
+/// 2. `SendARP` (IP Helper) with the scratch as the source: it transmits
+///    a real ARP request and returns the responder's MAC directly.
+///    Because step 1 emptied the cache entry, any MAC returned is fresh
+///    on-wire evidence by construction — and being pure ARP, devices
+///    that drop ICMP still answer. Runs on the blocking pool relying on
+///    the call's own internal retry bound (a few seconds);
+///    `spawn_blocking` cannot be aborted, so no abort wrapper is
+///    layered on top — the caller budgets for the duration instead.
+///
+/// `Ok(Some(mac))` — colon-lowercase MAC of the fresh responder;
+/// `Ok(None)` — no response; `Err` — the resolution could not be
+/// attempted (flush failed, task lost).
+pub(crate) async fn fresh_resolve_mac(
+    target: Ipv4Addr,
+    scratch: Ipv4Addr,
+) -> Result<Option<String>, AppError> {
+    flush_neighbor(target, scratch).await?;
+
+    #[cfg(target_os = "windows")]
+    {
+        tokio::task::spawn_blocking(move || send_arp_blocking(target, scratch))
+            .await
+            .map_err(|e| AppError::Network(format!("SendARP task failed to join: {}", e)))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err(AppError::Network(
+            "fresh ARP resolution is Windows-only".into(),
+        ))
+    }
+}
+
+/// Remove the target's neighbor-cache entry on the adapter owning
+/// `scratch`. Success is signalled by our own sentinel on stdout, never
+/// by parsing cmdlet output (which is localized). A missing sentinel —
+/// no adapter owns the scratch, cmdlet failure, timeout — is an error:
+/// the caller must fail closed rather than trust a possibly-stale cache.
+async fn flush_neighbor(target: Ipv4Addr, scratch: Ipv4Addr) -> Result<(), AppError> {
+    let script = format!(
+        "$idx=(Get-NetIPAddress -IPAddress '{scratch}' -AddressFamily IPv4 -ErrorAction SilentlyContinue \
+         | Select-Object -First 1).InterfaceIndex; \
+         if ($null -ne $idx) {{ Remove-NetNeighbor -InterfaceIndex $idx -IPAddress '{target}' \
+         -Confirm:$false -ErrorAction SilentlyContinue; Write-Output 'flushed' }}"
+    );
+    match run_powershell(&script).await {
+        Some(out) if out.contains("flushed") => Ok(()),
+        _ => Err(AppError::Network(format!(
+            "could not flush the neighbor entry for {} on the adapter owning {}",
+            target, scratch
+        ))),
+    }
+}
+
+/// Blocking `SendARP` call (IP Helper — kernel-provided FFI, no
+/// Packet.dll involvement). `IPAddr` is a u32 holding the address bytes
+/// in network order in memory; reinterpreting the octets native-endian
+/// produces exactly that layout on either endianness.
+#[cfg(target_os = "windows")]
+fn send_arp_blocking(target: Ipv4Addr, scratch: Ipv4Addr) -> Option<String> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::SendARP;
+    let dest = u32::from_ne_bytes(target.octets());
+    let src = u32::from_ne_bytes(scratch.octets());
+    let mut mac = [0u8; 8];
+    let mut len: u32 = mac.len() as u32;
+    let rc = unsafe { SendARP(dest, src, mac.as_mut_ptr() as *mut _, &mut len) };
+    if rc == 0 && len == 6 {
+        Some(format_mac(&[
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+        ]))
+    } else {
+        None
+    }
+}
+
 /// Read the OS ARP table for a specific interface and return dynamic entries.
 ///
 /// Supplements live capture: if a host is already in the OS ARP cache
@@ -1086,7 +1167,7 @@ fn neighbor_state_is_dynamic(state: &serde_json::Value) -> bool {
 /// Normalize a `Get-NetNeighbor` LinkLayerAddress (e.g. `AA-BB-CC-DD-EE-FF`)
 /// to the codebase's colon-lowercase form, rejecting the empty /
 /// broadcast / zeroed placeholders.
-fn normalize_mac(raw: &str) -> Option<String> {
+pub(crate) fn normalize_mac(raw: &str) -> Option<String> {
     let mac = raw.replace('-', ":").to_lowercase();
     if mac.is_empty() || mac == "ff:ff:ff:ff:ff:ff" || mac == "00:00:00:00:00:00" {
         return None;

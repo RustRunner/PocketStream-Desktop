@@ -146,8 +146,9 @@ fn pick_candidate_ip(device_ip: Ipv4Addr, used_ips: &[Ipv4Addr]) -> Vec<Ipv4Addr
 
 /// Pick a scratch last octet on the candidate /24 that isn't the device,
 /// a candidate, or a reserved address. The scratch is bound temporarily
-/// so conflict probes route on-link (see `adopt_subnet`).
-fn pick_scratch(device_ip: Ipv4Addr, candidates: &[Ipv4Addr]) -> Ipv4Addr {
+/// so conflict probes route on-link (see `adopt_subnet`); the cache
+/// probe uses the same picker for its identity scratch.
+pub(crate) fn pick_scratch(device_ip: Ipv4Addr, candidates: &[Ipv4Addr]) -> Ipv4Addr {
     let o = device_ip.octets();
     let device_last = o[3];
     let taken: Vec<u8> = candidates.iter().map(|c| c.octets()[3]).collect();
@@ -229,6 +230,50 @@ async fn pending_remove(pending: &PendingIps, iface: &str, ip: Ipv4Addr, adoptio
 /// failed release under the same id is left for reconciliation.
 pub async fn pending_handover(pending: &PendingIps, iface: &str, ip: Ipv4Addr, adoption_id: u64) {
     pending_remove(pending, iface, ip, adoption_id).await;
+}
+
+/// Bind a standalone scratch address with the breadcrumb-first
+/// discipline `adopt_subnet` uses internally: the pending entry is
+/// registered before the bind, so a dropped future can never leave an
+/// untracked address. A failed bind removes its breadcrumb and reports
+/// the error.
+pub async fn bind_scratch<O: AdoptOps>(
+    ops: &O,
+    pending: &PendingIps,
+    iface: &str,
+    scratch: Ipv4Addr,
+    adoption_id: u64,
+) -> Result<(), AppError> {
+    pending_insert(pending, iface, scratch, adoption_id).await;
+    match ops.add(iface, scratch, "255.255.255.0").await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            pending_remove(pending, iface, scratch, adoption_id).await;
+            Err(e)
+        }
+    }
+}
+
+/// Release a scratch bound by [`bind_scratch`]. A successful remove
+/// drops the breadcrumb; a failed remove keeps it so `reconcile_pending`
+/// retries later — the scratch is never silently orphaned.
+pub async fn release_scratch<O: AdoptOps>(
+    ops: &O,
+    pending: &PendingIps,
+    iface: &str,
+    scratch: Ipv4Addr,
+    adoption_id: u64,
+) {
+    match ops.remove(iface, scratch).await {
+        Ok(()) => pending_remove(pending, iface, scratch, adoption_id).await,
+        Err(e) => log::warn!(
+            "Failed to release probe scratch {} on {} (adoption {}): {} — breadcrumb kept for reconcile",
+            scratch,
+            iface,
+            adoption_id,
+            e
+        ),
+    }
 }
 
 /// Roll back leftover pending IPs with a best-effort OS remove. `filter =
@@ -778,6 +823,59 @@ mod tests {
         async fn probe(&self, target: Ipv4Addr, _source: Option<Ipv4Addr>) -> bool {
             self.in_use.contains(&target)
         }
+    }
+
+    #[tokio::test]
+    async fn bind_scratch_registers_breadcrumb_before_bind() {
+        let ops = FakeOps::new();
+        let pending = new_pending();
+        bind_scratch(&ops, &pending, "eth0", SCRATCH, 7)
+            .await
+            .unwrap();
+        assert_eq!(ops.bound_ips(), vec![SCRATCH]);
+        // The breadcrumb survives until an explicit release/handover, so a
+        // dropped future still leaves reconcile something to find.
+        assert_eq!(pending.lock().await.len(), 1);
+        assert_eq!(pending.lock().await[0].adoption_id, 7);
+    }
+
+    #[tokio::test]
+    async fn bind_scratch_failure_drops_breadcrumb_and_errors() {
+        let mut ops = FakeOps::new();
+        ops.fail_add.push(SCRATCH);
+        let pending = new_pending();
+        assert!(bind_scratch(&ops, &pending, "eth0", SCRATCH, 7)
+            .await
+            .is_err());
+        assert!(ops.bound_ips().is_empty());
+        assert!(pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn release_scratch_success_clears_breadcrumb() {
+        let ops = FakeOps::new();
+        let pending = new_pending();
+        bind_scratch(&ops, &pending, "eth0", SCRATCH, 7)
+            .await
+            .unwrap();
+        release_scratch(&ops, &pending, "eth0", SCRATCH, 7).await;
+        assert!(ops.bound_ips().is_empty());
+        assert!(pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn release_scratch_failure_keeps_breadcrumb_for_reconcile() {
+        let mut ops = FakeOps::new();
+        ops.fail_remove.push(SCRATCH);
+        let pending = new_pending();
+        bind_scratch(&ops, &pending, "eth0", SCRATCH, 7)
+            .await
+            .unwrap();
+        release_scratch(&ops, &pending, "eth0", SCRATCH, 7).await;
+        // Remove failed: the address is still bound and the breadcrumb is
+        // kept so reconcile_pending retries — never silently orphaned.
+        assert_eq!(ops.bound_ips(), vec![SCRATCH]);
+        assert_eq!(pending.lock().await.len(), 1);
     }
 
     fn new_pending() -> PendingIps {

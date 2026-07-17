@@ -1,6 +1,7 @@
 pub mod adapter_refresh;
 pub mod arp;
 pub mod auto_adopt;
+mod cache_probe;
 pub mod device_registry;
 pub mod firewall;
 pub mod ghost;
@@ -131,6 +132,14 @@ const ADOPT_MAX_TOTAL: std::time::Duration = std::time::Duration::from_secs(45);
 /// Settle delay before an adoption is announced finished, covering the NIC
 /// watcher's ~300 ms debounce so the final IP-change up-event is gated too.
 const ADOPTION_SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Cooldown for subnets whose adoption FAILED (transient netsh errors, a
+/// candidate that turned out to be in use, etc.). Replaces the old
+/// permanent blacklist: subnet -> (next retry time, current backoff),
+/// backoff doubling from 60 s, capped at 10 min. Shared by the adoption
+/// tail and the reap pass's failure backoff.
+const COOLDOWN_INITIAL: std::time::Duration = std::time::Duration::from_secs(60);
+const COOLDOWN_MAX: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// RAII gate around a single adoption. On creation it emits
 /// `adoption-started`; on drop — normal completion OR a dropped/aborted
@@ -606,6 +615,430 @@ async fn unbind_ip_resolving_owner(
         Some(adapter) => UnbindOutcome::Unbound { adapter },
         None => UnbindOutcome::NotBound,
     })
+}
+
+/// Long-lived clones the shared adoption tail needs, built once at
+/// adopt-task start from the clones the task already owns. Lets the
+/// broadcast dwell path and the cache probe drive one tail without a
+/// dozen-argument signature.
+struct AdoptionCtx {
+    iface_name: String,
+    ops: auto_adopt::RealAdoptOps,
+    app_handle: tauri::AppHandle,
+    adopted: Arc<Mutex<HashMap<String, Ipv4Addr>>>,
+    pending_ips: auto_adopt::PendingIps,
+    pending_restore: Arc<Mutex<HashMap<String, Ipv4Addr>>>,
+    adoption_seq: Arc<AtomicU64>,
+    liveness: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
+    meta: Arc<std::sync::Mutex<HashMap<String, crate::config::AdoptedMeta>>>,
+    devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
+    registry: Arc<DeviceRegistry>,
+    emitter: Arc<DeviceListEmitter>,
+    fence: SweepFence,
+    local_ips: Arc<std::sync::Mutex<HashSet<Ipv4Addr>>>,
+}
+
+/// Why an adoption attempt is justified. Logged only — `adopted_meta`
+/// keeps its two-field schema; provenance has no consumer.
+enum AdoptionEvidence {
+    /// The dwell gate matured: two accepted broadcast frames.
+    DwellMature { mac: String },
+    /// The cache probe got a solicited, freshly MAC-verified reply from
+    /// a device we have history with — strictly stronger evidence than
+    /// two spontaneous frames, which is what justifies bypassing dwell.
+    CachedMacMatch { cached_ip: Ipv4Addr, mac: String },
+}
+
+impl std::fmt::Display for AdoptionEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AdoptionEvidence::DwellMature { mac } => {
+                write!(f, "confirmed by a repeat observation from {}", mac)
+            }
+            AdoptionEvidence::CachedMacMatch { cached_ip, mac } => {
+                write!(f, "cached device {} freshly verified at {}", mac, cached_ip)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdoptionAttemptOutcome {
+    Adopted,
+    NoOp,
+    Failed,
+    /// A stop raced the attempt — the caller must exit its loop.
+    ShutdownRace,
+}
+
+/// The shared adoption tail: gate, bounded `adopt_subnet`, and every
+/// success/failure consequence (liveness seed, metadata, events, pending
+/// handover, post-adoption sweeps, config persist, cooldown handling).
+/// Driven by the broadcast dwell path and the cache probe; the evidence
+/// says which. Deliberately has no access to the dwell tracker — the
+/// probe path must never touch it, so it stays at the broadcast site.
+#[allow(clippy::too_many_arguments)]
+async fn attempt_adoption(
+    ctx: &AdoptionCtx,
+    device_ip: Ipv4Addr,
+    device_subnet: &str,
+    evidence: AdoptionEvidence,
+    current_ips: &[Ipv4Addr],
+    cooldowns: &mut HashMap<String, (std::time::Instant, std::time::Duration)>,
+    known_subnets: &mut HashSet<String>,
+    shutdown_rx: &tokio::sync::watch::Receiver<bool>,
+) -> AdoptionAttemptOutcome {
+    use tauri::Emitter;
+    use tauri::Manager;
+
+    log::info!("Foreign subnet {} — adopting ({})", device_subnet, evidence);
+
+    let adoption_id = ctx.adoption_seq.fetch_add(1, Ordering::Relaxed) + 1;
+    // Bracket the adoption with started/finished so the frontend
+    // suppresses restarts from its own IP churn. The guard emits
+    // `adoption-finished` on drop, so every terminal path below
+    // (success, timeout, error, shutdown race, task abort) releases the
+    // gate.
+    let _gate = AdoptionGate::start(ctx.app_handle.clone(), adoption_id);
+    // Fresh read at adoption time (not the shared filter set):
+    // candidate-collision checking wants the newest possible view of our
+    // own addresses, and the name must not shadow the shared `local_ips`
+    // the post-adoption sweep clones below.
+    let host_ips_now = interface::all_local_ipv4();
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(
+        ADOPT_MAX_TOTAL,
+        auto_adopt::adopt_subnet(
+            &ctx.ops,
+            &ctx.iface_name,
+            device_ip,
+            current_ips,
+            &host_ips_now,
+            &ctx.pending_ips,
+            adoption_id,
+            shutdown_rx,
+        ),
+    )
+    .await;
+
+    match outcome {
+        Err(_elapsed) => {
+            // ADOPT_MAX_TOTAL hit: the adopt future is dropped now, so
+            // kill-on-drop took any in-flight child. Reconcile whatever
+            // it bound and re-arm the cooldown. Logged distinctly so the
+            // bound can be retuned from field data.
+            log::warn!(
+                "Adoption of {} exceeded the {}s bound (elapsed {}s) — dropped and reconciling",
+                device_subnet,
+                ADOPT_MAX_TOTAL.as_secs(),
+                started.elapsed().as_secs()
+            );
+            auto_adopt::reconcile_pending(&ctx.ops, &ctx.pending_ips, Some(adoption_id)).await;
+            let next_backoff = cooldowns
+                .get(device_subnet)
+                .map(|(_, b)| (*b * 2).min(COOLDOWN_MAX))
+                .unwrap_or(COOLDOWN_INITIAL);
+            cooldowns.insert(
+                device_subnet.to_string(),
+                (std::time::Instant::now() + next_backoff, next_backoff),
+            );
+            AdoptionAttemptOutcome::Failed
+        }
+        Ok(Ok(Some(adopted_ip))) => {
+            // A stop may have raced the successful final bind. If so,
+            // roll the IP back and do NOT record — recording an IP the
+            // stop path won't clean is worse than re-adopting on the
+            // next start.
+            if *shutdown_rx.borrow() {
+                log::info!(
+                    "Shutdown raced adoption of {} — rolling back {}",
+                    device_subnet,
+                    adopted_ip
+                );
+                auto_adopt::reconcile_pending(&ctx.ops, &ctx.pending_ips, Some(adoption_id)).await;
+                return AdoptionAttemptOutcome::ShutdownRace;
+            }
+            cooldowns.remove(device_subnet);
+            ctx.adopted
+                .lock()
+                .await
+                .insert(device_subnet.to_string(), adopted_ip);
+            // Fresh adoption: the triggering device was observed moments
+            // ago, so seed the session liveness clock and the persisted
+            // metadata together.
+            let adoption_wall = chrono::Utc::now().to_rfc3339();
+            if let Ok(mut liveness) = ctx.liveness.lock() {
+                liveness.insert(device_subnet.to_string(), std::time::Instant::now());
+            }
+            if let Ok(mut meta) = ctx.meta.lock() {
+                meta.insert(
+                    device_subnet.to_string(),
+                    crate::config::AdoptedMeta {
+                        adopted_at: Some(adoption_wall.clone()),
+                        last_device_seen: Some(adoption_wall.clone()),
+                    },
+                );
+            }
+            // Handover: the IP is recorded and owned now, so drop its
+            // pending breadcrumb (adapter untouched).
+            auto_adopt::pending_handover(
+                &ctx.pending_ips,
+                &ctx.iface_name,
+                adopted_ip,
+                adoption_id,
+            )
+            .await;
+            known_subnets.insert(device_subnet.to_string());
+
+            let _ = ctx.app_handle.emit(
+                "subnet-adopted",
+                serde_json::json!({
+                    "subnet": device_subnet,
+                    "adopted_ip": adopted_ip.to_string(),
+                    "adopted_at": adoption_wall,
+                    "last_device_seen": adoption_wall,
+                    // Freshly adopted is never stale — the liveness
+                    // clock was seeded moments ago.
+                    "stale": false,
+                }),
+            );
+
+            log::info!("Auto-adopted {} with IP {}", device_subnet, adopted_ip);
+
+            // Kick active-discovery passes on the newly-adopted /24.
+            // Without this, only the device that triggered the adoption
+            // is in arpDevices — passive hosts on the same subnet
+            // (cameras idle on their control port, etc.) never ARP on
+            // their own and stay invisible until the user manually
+            // refreshes.
+            //
+            // Multiple staggered passes cover three issues that
+            // routinely break a single-shot sweep on Windows:
+            //   1. The newly-bound secondary IP isn't fully usable for
+            //      ~1–3s after netsh returns — the first ping via
+            //      `-S adopted_ip` can silently fail during that window.
+            //   2. If the /24 also overlaps WiFi, the route metric may
+            //      settle unpredictably and later passes catch what an
+            //      early pass missed.
+            //   3. Devices behind a slow switch / PoE injector sometimes
+            //      drop the first ARP broadcast.
+            let sweep_ip = adopted_ip.to_string();
+            let sweep_devices = ctx.devices.clone();
+            let sweep_registry = ctx.registry.clone();
+            let sweep_emitter = ctx.emitter.clone();
+            let sweep_handle = ctx.app_handle.clone();
+            let sweep_fence = ctx.fence.clone();
+            let sweep_local = ctx.local_ips.clone();
+            tokio::spawn(async move {
+                let passes: [u64; 3] = [1500, 5000, 12000];
+                for (i, delay_ms) in passes.iter().enumerate() {
+                    tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
+                    // A restart/stop during the staggered delays means
+                    // this belongs to a dead session — stop pinging and
+                    // merging.
+                    if sweep_fence.is_stale() {
+                        break;
+                    }
+                    log::info!(
+                        "Post-adoption sweep pass {}/{} on {}",
+                        i + 1,
+                        passes.len(),
+                        sweep_ip
+                    );
+                    ping_sweep_subnets(std::slice::from_ref(&sweep_ip)).await;
+                    // The adopted subnet is on the Ethernet interface, so
+                    // no non-Ethernet exclusion applies to this
+                    // post-adoption merge. The self-IP filter still does
+                    // — snapshot per pass (the passes span ~12 s).
+                    let local_snapshot: HashSet<Ipv4Addr> =
+                        sweep_local.lock().map(|s| s.clone()).unwrap_or_default();
+                    merge_arp_table(
+                        sweep_devices.clone(),
+                        sweep_registry.clone(),
+                        sweep_emitter.clone(),
+                        sweep_handle.clone(),
+                        &sweep_ip,
+                        &[],
+                        &local_snapshot,
+                        &sweep_fence,
+                    )
+                    .await;
+                }
+            });
+
+            // Persist to config so the adoption survives a restart.
+            // Failure here is non-fatal (the IP is still bound to the
+            // interface for this session) but we want a log entry —
+            // silent loss leaves users debugging "where did my camera
+            // go?" after restart with no breadcrumb.
+            // This subnet is now live; drop any held-over restore for it
+            // so the persisted snapshot below reflects the live binding,
+            // not the stale hold.
+            ctx.pending_restore.lock().await.remove(device_subnet);
+            let live = ctx.adopted.lock().await.clone();
+            let pend = ctx.pending_restore.lock().await.clone();
+            let snapshot = merge_adopted_config(&live, &pend);
+            let meta_snapshot = ctx.meta.lock().map(|m| m.clone()).unwrap_or_default();
+            // Persist off the executor: update_adoption_state does a
+            // synchronous atomic_write + fsync (plus DPAPI on the
+            // credentials path) under a std lock, which would block a
+            // tokio worker across disk latency. Re-fetch the managed
+            // config inside so no borrow crosses the thread boundary.
+            let persist_handle = ctx.app_handle.clone();
+            let persisted = tokio::task::spawn_blocking(move || {
+                let config: tauri::State<'_, crate::config::AppConfig> = persist_handle.state();
+                config.update_adoption_state(snapshot, meta_snapshot)
+            })
+            .await;
+            match persisted {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => log::warn!(
+                    "Failed to persist adopted subnet {} to config: {}",
+                    device_subnet,
+                    e
+                ),
+                Err(e) => log::warn!(
+                    "Persist task for adopted subnet {} failed to join: {}",
+                    device_subnet,
+                    e
+                ),
+            }
+            AdoptionAttemptOutcome::Adopted
+        }
+        Ok(Ok(None)) => {
+            // Already on subnet, or a clean shutdown-before-bind.
+            // Nothing was left bound.
+            cooldowns.remove(device_subnet);
+            known_subnets.insert(device_subnet.to_string());
+            if *shutdown_rx.borrow() {
+                AdoptionAttemptOutcome::ShutdownRace
+            } else {
+                AdoptionAttemptOutcome::NoOp
+            }
+        }
+        Ok(Err(e)) => {
+            // adopt_subnet cleaned its own breadcrumbs except a scratch
+            // whose release failed; reconcile this id to catch that.
+            // Cooldown instead of a permanent blacklist so a transient
+            // failure is retried.
+            auto_adopt::reconcile_pending(&ctx.ops, &ctx.pending_ips, Some(adoption_id)).await;
+            let next_backoff = cooldowns
+                .get(device_subnet)
+                .map(|(_, b)| (*b * 2).min(COOLDOWN_MAX))
+                .unwrap_or(COOLDOWN_INITIAL);
+            cooldowns.insert(
+                device_subnet.to_string(),
+                (std::time::Instant::now() + next_backoff, next_backoff),
+            );
+            log::warn!(
+                "Failed to auto-adopt {} ({}); retrying in {}s",
+                device_subnet,
+                e,
+                next_backoff.as_secs()
+            );
+            let _ = ctx.app_handle.emit(
+                "adoption-failed",
+                serde_json::json!({
+                    "subnet": device_subnet,
+                    "error": e.to_string(),
+                }),
+            );
+            AdoptionAttemptOutcome::Failed
+        }
+    }
+}
+
+/// Production `ProbeIo`: scratch discipline via the auto-adopt
+/// breadcrumb helpers, fresh resolution via flush + `SendARP`, and the
+/// shared adoption tail for hand-offs.
+struct RealProbeIo<'a> {
+    ctx: &'a AdoptionCtx,
+    cooldowns: &'a mut HashMap<String, (std::time::Instant, std::time::Duration)>,
+    known_subnets: &'a mut HashSet<String>,
+    shutdown_rx: &'a tokio::sync::watch::Receiver<bool>,
+    /// Adoption id minted for the currently-bound identity scratch.
+    scratch_id: Option<u64>,
+    /// Set when a hand-off observed a shutdown race; the adopt loop
+    /// must break after the pass returns.
+    stop: bool,
+}
+
+impl cache_probe::ProbeIo for RealProbeIo<'_> {
+    async fn bind_scratch(&mut self, subnet: &str, scratch: Ipv4Addr) -> bool {
+        let id = self.ctx.adoption_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        match auto_adopt::bind_scratch(
+            &self.ctx.ops,
+            &self.ctx.pending_ips,
+            &self.ctx.iface_name,
+            scratch,
+            id,
+        )
+        .await
+        {
+            Ok(()) => {
+                log::info!("Cache probe: bound scratch {} for {}", scratch, subnet);
+                self.scratch_id = Some(id);
+                true
+            }
+            Err(e) => {
+                log::info!("Cache probe: scratch bind failed for {}: {}", subnet, e);
+                false
+            }
+        }
+    }
+
+    async fn release_scratch(&mut self, _subnet: &str, scratch: Ipv4Addr) {
+        if let Some(id) = self.scratch_id.take() {
+            auto_adopt::release_scratch(
+                &self.ctx.ops,
+                &self.ctx.pending_ips,
+                &self.ctx.iface_name,
+                scratch,
+                id,
+            )
+            .await;
+        }
+    }
+
+    async fn resolve(&mut self, target: Ipv4Addr, scratch: Ipv4Addr) -> Result<Option<String>, ()> {
+        arp::fresh_resolve_mac(target, scratch).await.map_err(|e| {
+            log::debug!(
+                "Cache probe: fresh resolve of {} failed closed: {}",
+                target,
+                e
+            );
+        })
+    }
+
+    async fn adopt(&mut self, subnet: &str, ip: Ipv4Addr, mac: &str) -> bool {
+        // Fresh read after the identity scratch was released, so the
+        // adoption's own `already_on_subnet` check cannot see it and
+        // silently no-op.
+        let current_ips = get_interface_ips(&self.ctx.iface_name).await;
+        let outcome = attempt_adoption(
+            self.ctx,
+            ip,
+            subnet,
+            AdoptionEvidence::CachedMacMatch {
+                cached_ip: ip,
+                mac: mac.to_string(),
+            },
+            &current_ips,
+            self.cooldowns,
+            self.known_subnets,
+            self.shutdown_rx,
+        )
+        .await;
+        if outcome == AdoptionAttemptOutcome::ShutdownRace {
+            self.stop = true;
+            return false;
+        }
+        true
+    }
+
+    fn shutdown(&self) -> bool {
+        *self.shutdown_rx.borrow()
+    }
 }
 
 /// Capture-health watchdog with a bounded self-heal ladder.
@@ -1766,6 +2199,31 @@ impl NetworkManager {
             use tauri::Manager;
             let mut shutdown_rx = shutdown_rx;
             let ops = auto_adopt::RealAdoptOps;
+            // The shared adoption tail's context — one bundle of the
+            // clones this task already owns, used by both the broadcast
+            // path below and the cache probe.
+            let ctx = AdoptionCtx {
+                iface_name: iface_name.clone(),
+                ops: auto_adopt::RealAdoptOps,
+                app_handle: app_handle_for_adopt.clone(),
+                adopted: adopted.clone(),
+                pending_ips: pending_ips.clone(),
+                pending_restore: pending_restore.clone(),
+                adoption_seq: adoption_seq.clone(),
+                liveness: liveness_for_adopt.clone(),
+                meta: meta_for_adopt.clone(),
+                devices: devices_for_adopt.clone(),
+                registry: registry_for_adopt.clone(),
+                emitter: emitter_for_adopt.clone(),
+                fence: fence_for_loop.clone(),
+                local_ips: local_ips.clone(),
+            };
+            // Cached-device probe: at most one pass per discovery
+            // session, deferred (not consumed) while the DHCP gate is
+            // closed. Identity misses land in the attempted set, never
+            // in the shared cooldowns.
+            let mut cache_probe_done = false;
+            let mut cache_probe_attempted: HashSet<String> = HashSet::new();
             let mut known_subnets: HashSet<String> = HashSet::new();
             // Two-observation gate: a subnet is adopted only after its
             // triggering device produces a second accepted ARP frame, so
@@ -1796,16 +2254,11 @@ impl NetworkManager {
             let mut cached_dhcp_state: Option<(bool, std::time::Instant)> = None;
             const DHCP_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
-            // Cooldown for subnets whose adoption FAILED (transient netsh
-            // errors, a candidate that turned out to be in use, etc.).
-            // Replaces the old permanent blacklist: subnet -> (next retry
-            // time, current backoff). Backoff doubles from 60s, capped at
-            // 10 min. Successful/already-adopted subnets use known_subnets
+            // Failed-adoption backoff (module-level COOLDOWN_* constants).
+            // Successful/already-adopted subnets use known_subnets
             // (permanent) as before.
             let mut cooldowns: HashMap<String, (std::time::Instant, std::time::Duration)> =
                 HashMap::new();
-            const COOLDOWN_INITIAL: std::time::Duration = std::time::Duration::from_secs(60);
-            const COOLDOWN_MAX: std::time::Duration = std::time::Duration::from_secs(600);
 
             // Structural-ghost guard state. `ghost_until` is a short-lived
             // per-subnet ignore set: a ghost row can sit in `arp_devices`
@@ -2078,6 +2531,78 @@ impl NetworkManager {
                     // APIPA-only DHCP: fall through and adopt as rescue.
                 }
 
+                // Cached-device on-link probe: runs on the first tick the
+                // DHCP gate allows adoption at all (the `continue` above
+                // keeps it pending, so a DHCP→Static transition still
+                // gets its pass). Rediscovers quiet known devices in
+                // seconds instead of waiting for their spontaneous
+                // broadcast ARP — the FLIR in APIPA fallback and the
+                // Annke's minutes-apart gateway ARP are the field cases.
+                if !cache_probe_done {
+                    cache_probe_done = true;
+                    let cached_records = {
+                        let config: tauri::State<'_, crate::config::AppConfig> =
+                            app_handle_for_adopt.state();
+                        config.get_cache()
+                    };
+                    if !cached_records.is_empty() {
+                        let native_subnets: HashSet<String> = get_interface_ips(&iface_name)
+                            .await
+                            .iter()
+                            .map(|ip| {
+                                let o = ip.octets();
+                                format!("{}.{}.{}.0/24", o[0], o[1], o[2])
+                            })
+                            .collect();
+                        let adopted_keys: HashSet<String> =
+                            adopted.lock().await.keys().cloned().collect();
+                        let pending_keys: HashSet<String> =
+                            pending_restore.lock().await.keys().cloned().collect();
+                        let ghost_nets = ghost::non_wired_interface_networks().await;
+                        cached_ghosts = Some((ghost_nets.clone(), std::time::Instant::now()));
+                        let candidates = cache_probe::derive_candidates(
+                            &cached_records,
+                            &native_subnets,
+                            &adopted_keys,
+                            &pending_keys,
+                            &ghost_nets,
+                            &cache_probe_attempted,
+                        );
+                        if !candidates.is_empty() {
+                            log::info!(
+                                "Cache probe: verifying {} candidate subnet(s) from the device cache",
+                                candidates.len()
+                            );
+                            let mut io = RealProbeIo {
+                                ctx: &ctx,
+                                cooldowns: &mut cooldowns,
+                                known_subnets: &mut known_subnets,
+                                shutdown_rx: &shutdown_rx,
+                                scratch_id: None,
+                                stop: false,
+                            };
+                            let report = cache_probe::run_pass(
+                                &mut io,
+                                candidates,
+                                cache_probe::CACHE_PROBE_PASS_BUDGET,
+                            )
+                            .await;
+                            let stop = io.stop;
+                            cache_probe_attempted.extend(report.attempted);
+                            if !report.skipped_at_budget.is_empty() {
+                                log::warn!(
+                                    "Cache probe hit its {}s budget — skipped subnets (their broadcast path still applies): {:?}",
+                                    cache_probe::CACHE_PROBE_PASS_BUDGET.as_secs(),
+                                    report.skipped_at_budget
+                                );
+                            }
+                            if stop {
+                                break;
+                            }
+                        }
+                    }
+                }
+
                 let device_list: Vec<ArpDevice> = {
                     let map = devices.lock().await;
                     map.values().cloned().collect()
@@ -2187,283 +2712,29 @@ impl NetworkManager {
                         auto_adopt::DwellVerdict::Mature => {}
                     }
 
-                    log::info!(
-                        "Foreign subnet {} confirmed by a repeat observation from {} — adopting",
-                        device_subnet,
-                        device.mac
-                    );
-
-                    let adoption_id = adoption_seq.fetch_add(1, Ordering::Relaxed) + 1;
-                    // Bracket the adoption with started/finished so the
-                    // frontend suppresses restarts from its own IP churn.
-                    // The guard emits `adoption-finished` on drop, so every
-                    // terminal path below (success, timeout, error, break,
-                    // task abort) releases the gate.
-                    let _gate = AdoptionGate::start(app_handle_for_adopt.clone(), adoption_id);
-                    // Fresh read at adoption time (not the shared filter
-                    // set): candidate-collision checking wants the newest
-                    // possible view of our own addresses, and the name must
-                    // not shadow the shared `local_ips` the post-adoption
-                    // sweep clones below.
-                    let host_ips_now = interface::all_local_ipv4();
-                    let started = std::time::Instant::now();
-                    let outcome = tokio::time::timeout(
-                        ADOPT_MAX_TOTAL,
-                        auto_adopt::adopt_subnet(
-                            &ops,
-                            &iface_name,
-                            device_ip,
-                            &current_ips,
-                            &host_ips_now,
-                            &pending_ips,
-                            adoption_id,
-                            &shutdown_rx,
-                        ),
+                    let outcome = attempt_adoption(
+                        &ctx,
+                        device_ip,
+                        &device_subnet,
+                        AdoptionEvidence::DwellMature {
+                            mac: device.mac.clone(),
+                        },
+                        &current_ips,
+                        &mut cooldowns,
+                        &mut known_subnets,
+                        &shutdown_rx,
                     )
                     .await;
-
-                    match outcome {
-                        Err(_elapsed) => {
-                            // ADOPT_MAX_TOTAL hit: the adopt future is dropped
-                            // now, so kill-on-drop took any in-flight child.
-                            // Reconcile whatever it bound and re-arm the
-                            // cooldown. Logged distinctly so the bound can be
-                            // retuned from field data.
-                            log::warn!(
-                                "Adoption of {} exceeded the {}s bound (elapsed {}s) — dropped and reconciling",
-                                device_subnet,
-                                ADOPT_MAX_TOTAL.as_secs(),
-                                started.elapsed().as_secs()
-                            );
-                            auto_adopt::reconcile_pending(&ops, &pending_ips, Some(adoption_id))
-                                .await;
-                            let next_backoff = cooldowns
-                                .get(&device_subnet)
-                                .map(|(_, b)| (*b * 2).min(COOLDOWN_MAX))
-                                .unwrap_or(COOLDOWN_INITIAL);
-                            cooldowns.insert(
-                                device_subnet.clone(),
-                                (std::time::Instant::now() + next_backoff, next_backoff),
-                            );
-                        }
-                        Ok(Ok(Some(adopted_ip))) => {
-                            // A stop may have raced the successful final bind.
-                            // If so, roll the IP back and do NOT record —
-                            // recording an IP the stop path won't clean is
-                            // worse than re-adopting on the next start.
-                            if *shutdown_rx.borrow() {
-                                log::info!(
-                                    "Shutdown raced adoption of {} — rolling back {}",
-                                    device_subnet,
-                                    adopted_ip
-                                );
-                                auto_adopt::reconcile_pending(
-                                    &ops,
-                                    &pending_ips,
-                                    Some(adoption_id),
-                                )
-                                .await;
-                                break;
-                            }
-                            cooldowns.remove(&device_subnet);
-                            adopted
-                                .lock()
-                                .await
-                                .insert(device_subnet.clone(), adopted_ip);
-                            // Fresh adoption: the triggering device was
-                            // observed moments ago (twice, per the dwell
-                            // gate), so seed the session liveness clock
-                            // and the persisted metadata together.
-                            let adoption_wall = chrono::Utc::now().to_rfc3339();
-                            if let Ok(mut liveness) = liveness_for_adopt.lock() {
-                                liveness.insert(device_subnet.clone(), std::time::Instant::now());
-                            }
-                            if let Ok(mut meta) = meta_for_adopt.lock() {
-                                meta.insert(
-                                    device_subnet.clone(),
-                                    crate::config::AdoptedMeta {
-                                        adopted_at: Some(adoption_wall.clone()),
-                                        last_device_seen: Some(adoption_wall.clone()),
-                                    },
-                                );
-                            }
-                            // Handover: the IP is recorded and owned now, so
-                            // drop its pending breadcrumb (adapter untouched).
-                            auto_adopt::pending_handover(
-                                &pending_ips,
-                                &iface_name,
-                                adopted_ip,
-                                adoption_id,
-                            )
-                            .await;
-                            known_subnets.insert(device_subnet.clone());
-
-                            let _ = app_handle_for_adopt.emit(
-                                "subnet-adopted",
-                                serde_json::json!({
-                                    "subnet": device_subnet,
-                                    "adopted_ip": adopted_ip.to_string(),
-                                    "adopted_at": adoption_wall,
-                                    "last_device_seen": adoption_wall,
-                                    // Freshly adopted is never stale — the
-                                    // liveness clock was seeded moments ago.
-                                    "stale": false,
-                                }),
-                            );
-
-                            log::info!("Auto-adopted {} with IP {}", device_subnet, adopted_ip);
-
-                            // Kick active-discovery passes on the newly-adopted
-                            // /24. Without this, only the device that triggered
-                            // the adoption is in arpDevices — passive hosts on
-                            // the same subnet (cameras idle on their control
-                            // port, etc.) never ARP on their own and stay
-                            // invisible until the user manually refreshes.
-                            //
-                            // Multiple staggered passes cover three issues that
-                            // routinely break a single-shot sweep on Windows:
-                            //   1. The newly-bound secondary IP isn't fully
-                            //      usable for ~1–3s after netsh returns — the
-                            //      first ping via `-S adopted_ip` can silently
-                            //      fail during that window.
-                            //   2. If the /24 also overlaps WiFi, the route
-                            //      metric may settle unpredictably and later
-                            //      passes catch what an early pass missed.
-                            //   3. Devices behind a slow switch / PoE injector
-                            //      sometimes drop the first ARP broadcast.
-                            let sweep_ip = adopted_ip.to_string();
-                            let sweep_devices = devices_for_adopt.clone();
-                            let sweep_registry = registry_for_adopt.clone();
-                            let sweep_emitter = emitter_for_adopt.clone();
-                            let sweep_handle = app_handle_for_adopt.clone();
-                            let sweep_fence = fence_for_loop.clone();
-                            let sweep_local = local_ips.clone();
-                            tokio::spawn(async move {
-                                let passes: [u64; 3] = [1500, 5000, 12000];
-                                for (i, delay_ms) in passes.iter().enumerate() {
-                                    tokio::time::sleep(std::time::Duration::from_millis(*delay_ms))
-                                        .await;
-                                    // A restart/stop during the staggered
-                                    // delays means this belongs to a dead
-                                    // session — stop pinging and merging.
-                                    if sweep_fence.is_stale() {
-                                        break;
-                                    }
-                                    log::info!(
-                                        "Post-adoption sweep pass {}/{} on {}",
-                                        i + 1,
-                                        passes.len(),
-                                        sweep_ip
-                                    );
-                                    ping_sweep_subnets(std::slice::from_ref(&sweep_ip)).await;
-                                    // The adopted subnet is on the Ethernet
-                                    // interface, so no non-Ethernet exclusion
-                                    // applies to this post-adoption merge. The
-                                    // self-IP filter still does — snapshot per
-                                    // pass (the passes span ~12 s).
-                                    let local_snapshot: HashSet<Ipv4Addr> =
-                                        sweep_local.lock().map(|s| s.clone()).unwrap_or_default();
-                                    merge_arp_table(
-                                        sweep_devices.clone(),
-                                        sweep_registry.clone(),
-                                        sweep_emitter.clone(),
-                                        sweep_handle.clone(),
-                                        &sweep_ip,
-                                        &[],
-                                        &local_snapshot,
-                                        &sweep_fence,
-                                    )
-                                    .await;
-                                }
-                            });
-
-                            // Persist to config so the adoption survives a
-                            // restart. Failure here is non-fatal (the IP is
-                            // still bound to the interface for this session)
-                            // but we want a log entry — silent loss leaves
-                            // users debugging "where did my camera go?"
-                            // after restart with no breadcrumb.
-                            // This subnet is now live; drop any held-over
-                            // restore for it so the persisted snapshot below
-                            // reflects the live binding, not the stale hold.
-                            pending_restore.lock().await.remove(&device_subnet);
-                            let live = adopted.lock().await.clone();
-                            let pend = pending_restore.lock().await.clone();
-                            let snapshot = merge_adopted_config(&live, &pend);
-                            let meta_snapshot =
-                                meta_for_adopt.lock().map(|m| m.clone()).unwrap_or_default();
-                            // Persist off the executor: update_adoption_state
-                            // does a synchronous atomic_write + fsync (plus
-                            // DPAPI on the credentials path) under a std lock,
-                            // which would block a tokio worker across disk
-                            // latency. Re-fetch the managed config inside so no
-                            // borrow crosses the thread boundary.
-                            let persist_handle = app_handle_for_adopt.clone();
-                            let persisted = tokio::task::spawn_blocking(move || {
-                                let config: tauri::State<'_, crate::config::AppConfig> =
-                                    persist_handle.state();
-                                config.update_adoption_state(snapshot, meta_snapshot)
-                            })
-                            .await;
-                            match persisted {
-                                Ok(Ok(())) => {}
-                                Ok(Err(e)) => log::warn!(
-                                    "Failed to persist adopted subnet {} to config: {}",
-                                    device_subnet,
-                                    e
-                                ),
-                                Err(e) => log::warn!(
-                                    "Persist task for adopted subnet {} failed to join: {}",
-                                    device_subnet,
-                                    e
-                                ),
-                            }
-                        }
-                        Ok(Ok(None)) => {
-                            // Already on subnet, or a clean shutdown-before-
-                            // bind. Nothing was left bound.
-                            cooldowns.remove(&device_subnet);
-                            known_subnets.insert(device_subnet.clone());
-                            if *shutdown_rx.borrow() {
-                                break;
-                            }
-                        }
-                        Ok(Err(e)) => {
-                            // adopt_subnet cleaned its own breadcrumbs except a
-                            // scratch whose release failed; reconcile this id
-                            // to catch that. Cooldown instead of a permanent
-                            // blacklist so a transient failure is retried.
-                            auto_adopt::reconcile_pending(&ops, &pending_ips, Some(adoption_id))
-                                .await;
-                            let next_backoff = cooldowns
-                                .get(&device_subnet)
-                                .map(|(_, b)| (*b * 2).min(COOLDOWN_MAX))
-                                .unwrap_or(COOLDOWN_INITIAL);
-                            cooldowns.insert(
-                                device_subnet.clone(),
-                                (std::time::Instant::now() + next_backoff, next_backoff),
-                            );
-                            log::warn!(
-                                "Failed to auto-adopt {} ({}); retrying in {}s",
-                                device_subnet,
-                                e,
-                                next_backoff.as_secs()
-                            );
-                            let _ = app_handle_for_adopt.emit(
-                                "adoption-failed",
-                                serde_json::json!({
-                                    "subnet": device_subnet,
-                                    "error": e.to_string(),
-                                }),
-                            );
-                        }
-                    }
 
                     // Whatever the attempt's outcome, this subnet's dwell
                     // candidacy is spent — a later approach (post-cooldown
                     // retry, removal then re-appearance) restarts the
-                    // two-observation gate.
+                    // two-observation gate. Dwell stays at this call site:
+                    // the probe path must never touch the tracker.
                     dwell.prune_subnet(&device_subnet);
+                    if outcome == AdoptionAttemptOutcome::ShutdownRace {
+                        break;
+                    }
                 }
             }
             log::info!("Auto-adopt loop exited");
