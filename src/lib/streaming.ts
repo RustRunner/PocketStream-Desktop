@@ -143,6 +143,47 @@ let muteToggleBusy = false;
 let audioPresent = false;
 let audioCodec: string | null = null;
 
+/** IP of the pipeline the user currently intends to be streaming.
+ *  Set before the start awaits begin at every start site (manual
+ *  start, auto-resume, stall recovery), so it covers the window where
+ *  `isStreaming` is still false during startup, and it persists
+ *  through the stream-lost overlay — the intent survives a drop.
+ *  Cleared on stop and on a failed manual start.
+ *
+ *  This — not the persisted `camera_ip`, which is also rewritten by
+ *  CAM designation while an unrelated stream keeps playing — is the
+ *  identity that teardown logic must compare against. */
+let activePlaybackIp: string | null = null;
+
+export function getActivePlaybackIp(): string | null {
+  return activePlaybackIp;
+}
+
+/** Stop the stream and reset every piece of frontend stream state.
+ *  Flags flip before the async stop so an in-flight status event
+ *  can't race a false "Stream Lost"; the resume snapshot drops so a
+ *  stopped stream never auto-resumes on a later reconnect; and the
+ *  recording indicator resets — the backend finalizes an in-progress
+ *  recording (EOS flush) inside the stop itself. Idempotent: safe
+ *  when nothing is streaming, and safe mid-start (the backend
+ *  playback epoch makes a late start observe the stop). */
+export async function stopStreamNow(message = "Stream stopped"): Promise<void> {
+  state.isStreaming = false;
+  state.streamLost = false;
+  resumeSnapshot = null;
+  activePlaybackIp = null;
+  hideStreamLost();
+  state.isRecording = false;
+  $("#btn-record").classList.remove("recording");
+  try {
+    await api.stopStream();
+    updateStreamUI();
+    showToast(message);
+  } catch (e) {
+    showToast("Failed to stop: " + formatError(e), true);
+  }
+}
+
 export function setupStreamControls(): void {
   $<HTMLButtonElement>("#btn-toggle-stream").addEventListener("click", async () => {
     if (streamToggleBusy) return;
@@ -151,21 +192,7 @@ export function setupStreamControls(): void {
     toggleBtn.disabled = true;
     try {
       if (state.isStreaming) {
-        try {
-          // Set flags BEFORE the async stop so an in-flight status event
-          // doesn't race and trigger a false "Stream Lost".
-          state.isStreaming = false;
-          state.streamLost = false;
-          // User asked to stop — don't auto-resume on a later reconnect.
-          resumeSnapshot = null;
-          // Clear any stuck overlay from an earlier drop in this session.
-          hideStreamLost();
-          await api.stopStream();
-          updateStreamUI();
-          showToast("Stream stopped");
-        } catch (e) {
-          showToast("Failed to stop: " + formatError(e), true);
-        }
+        await stopStreamNow();
       } else {
         try {
           const selectedIp = getActiveCamIp();
@@ -173,6 +200,10 @@ export function setupStreamControls(): void {
             showToast("Pick a node first (click it in the Nodes panel)", true);
             return;
           }
+          // Claim the playback identity before the slow awaits so a
+          // concurrent teardown (role change) can observe and cancel
+          // this start.
+          activePlaybackIp = selectedIp;
           if (state.config) {
             state.config.stream.camera_ip = selectedIp;
             await api.updateStreamSettings(state.config.stream);
@@ -183,12 +214,22 @@ export function setupStreamControls(): void {
           // returns. A second sync after the flags flip reveals it.
           const handle = await createVideoWindowSynced(bounds);
           await api.startStream(handle);
+          if (activePlaybackIp !== selectedIp) {
+            // A teardown landed while the start was in flight (the
+            // backend playback epoch already observed its stop) —
+            // make sure this just-started pipeline and its video
+            // child are gone rather than resurrecting the UI state.
+            await api.stopStream().catch(() => {});
+            updateStreamUI();
+            return;
+          }
           state.isStreaming = true;
           updateStreamUI();
           syncVideoVisibility();
           notPlayingStreak = 0;
           showToast("Stream started");
         } catch (e) {
+          activePlaybackIp = null;
           showToast("Stream failed: " + formatError(e), true);
         }
       }
@@ -648,7 +689,10 @@ let resumeSnapshot: ResumeSnapshot | null = null;
 export function handleHardDisconnect(reason: string): void {
   if (state.isStreaming && !state.streamLost) {
     resumeSnapshot = {
-      cameraIp: getActiveCamIp(),
+      // The playback identity, not getActiveCamIp(): the CAM
+      // designation can have moved to another node since this stream
+      // started, and a resume must bring back what was playing.
+      cameraIp: activePlaybackIp ?? getActiveCamIp(),
       ptuIp: getActivePtuIp(),
       wasRtspRunning: !!state.isRtspRunning,
     };
@@ -687,6 +731,10 @@ export async function handleReconnect(): Promise<void> {
   }
 
   if (!snap.cameraIp) return;
+
+  // Re-claim the playback identity before the start awaits — a role
+  // change during the resume window compares against this.
+  activePlaybackIp = snap.cameraIp;
 
   try {
     const bounds = getVideoAreaBounds();
@@ -817,6 +865,7 @@ async function attemptStallRecovery(): Promise<void> {
     log("Stall recovery: no camera IP available, aborting");
     return;
   }
+  activePlaybackIp = cameraIp;
 
   log("Stall recovery: restarting pipeline");
   try {
