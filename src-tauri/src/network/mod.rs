@@ -108,6 +108,19 @@ struct AutoAdoptHandle {
 /// kill-on-drop, so the dropped future takes any in-flight child with it.
 const AUTO_ADOPT_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Handle to the capture-health watchdog. Like [`AutoAdoptHandle`], the
+/// watchdog is asked to stop cooperatively — it may be mid-restart of the
+/// capture session, and a cooperative exit lets it park or install the
+/// in-flight session cleanly — with abort as the bounded fallback (safe:
+/// an orphaned capture session tears itself down when its handle drops).
+struct WatchdogHandle {
+    shutdown: tokio::sync::watch::Sender<bool>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+/// How long a cooperative watchdog stop waits before aborting.
+const WATCHDOG_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Hard ceiling on a single adoption attempt. A probe can take ~11 s (1 s
 /// ping + up to a 10 s neighbor lookup) across up to 11 candidates, so the
 /// natural worst case is tens of seconds; 45 s bounds a pathological run
@@ -240,10 +253,11 @@ pub struct NetworkManager {
     /// unbound IP) but unioned into every persisted config snapshot so a
     /// later in-session save doesn't delete them — they retry next startup.
     pending_restore: Arc<Mutex<HashMap<String, Ipv4Addr>>>,
-    /// Quiet-network watchdog: emits `discovery-degraded` if the capture
-    /// backend delivers no ARP payload events shortly after the provoking
-    /// ping sweep, then `discovery-recovered` on the first frame.
-    discovery_watchdog_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Capture-health watchdog: restarts a provably deaf capture session
+    /// (scoped retry, then forced-unscoped), and only when that ladder is
+    /// exhausted emits `discovery-degraded`, then `discovery-recovered`
+    /// on the first frame — the pre-ladder event contract, unchanged.
+    discovery_watchdog_handle: Arc<Mutex<Option<WatchdogHandle>>>,
     interface_name: Arc<Mutex<Option<String>>>,
     /// Canonical store of merged device records (ARP + scan + cache +
     /// alias + status). Mutated alongside `arp_devices` during the
@@ -437,6 +451,267 @@ fn unbind_guard_blocks(ip: &str, adapter_ips: &[String]) -> Option<&'static str>
         return Some("would leave the adapter with no other IPv4 address");
     }
     None
+}
+
+/// Provoke ARP on the known subnets, then merge the OS neighbor table.
+/// Fence-checked throughout. Shared by discovery start (spawned after a
+/// short delay so the capture attach lands first) and the capture-restart
+/// ladder, which re-provokes so a fresh session has traffic to prove
+/// itself against.
+async fn provoke_sweep(params: &arp::ListenerParams, sweep_ips: &[String]) {
+    if params.fence.is_stale() {
+        return;
+    }
+    log::info!("Ping sweeping known subnets to populate ARP");
+    ping_sweep_subnets(sweep_ips).await;
+
+    // One brief-lock snapshot for the whole merge pass (never lock per
+    // entry); a poisoned lock degrades to an empty set, which filters
+    // nothing — fail-open.
+    let local_snapshot: HashSet<Ipv4Addr> = params
+        .local_ips
+        .lock()
+        .map(|s| s.clone())
+        .unwrap_or_default();
+
+    // Merge the OS neighbor table for EVERY local/adopted IP, not just
+    // the first — a neighbor learned via an adopted secondary subnet
+    // would otherwise be missed at boot (in-session sweeps cover it
+    // post-adoption, but not the cold-start merge). The map dedup makes
+    // the extra queries harmless.
+    for sweep_iface_ip in sweep_ips {
+        if params.fence.is_stale() {
+            break;
+        }
+        if sweep_iface_ip.is_empty() {
+            continue;
+        }
+        merge_arp_table(
+            params.devices.clone(),
+            params.registry.clone(),
+            params.emitter.clone(),
+            params.app_handle.clone(),
+            sweep_iface_ip,
+            &params.excluded_subnets,
+            &local_snapshot,
+            &params.fence,
+        )
+        .await;
+    }
+}
+
+/// The current capture session's counters, if a session is installed.
+async fn current_session_counters(
+    slot: &Arc<Mutex<Option<arp::ArpListenerHandle>>>,
+) -> Option<Arc<arp::SessionCounters>> {
+    slot.lock().await.as_ref().map(|h| h.counters())
+}
+
+/// Take the installed capture handle, signal it to stop, and park its
+/// join in the prior-capture guard — ownership is retained; the next
+/// capture start bounded-joins it there.
+async fn park_capture_handle(
+    slot: &Arc<Mutex<Option<arp::ArpListenerHandle>>>,
+    prior: &arp::PriorCaptureJoins,
+) {
+    if let Some(h) = slot.lock().await.take() {
+        prior.lock().await.push(h.stop_into_join());
+    }
+}
+
+/// Capture-health watchdog with a bounded self-heal ladder.
+///
+/// After each session activation, the provoking sweep plus a checkpoint
+/// window prove the session delivers. A deaf-but-alive (or fully dead)
+/// session is restarted: once scoped, covering transient attach races,
+/// then forced-unscoped. If the escalation is also deaf — or any start
+/// fails, an activation times out, or a teardown join times out — the
+/// ladder exhausts into the pre-existing degraded event and bounded
+/// recovery poll. Transparent retries and recoveries log only;
+/// `discovery-degraded` fires at most once, on exhaustion, so the
+/// degraded/recovered event contract is unchanged.
+///
+/// Runs below the discovery lifecycle mutex; a concurrent stop wins.
+/// Every wait point also watches `shutdown_rx`, the fence is re-checked
+/// under the handle-slot lock before a restarted session is installed,
+/// and health is sampled through the installed handle's own counters
+/// only — late callbacks from a torn-down session cannot satisfy a
+/// checkpoint.
+async fn watchdog_ladder(
+    params: arp::ListenerParams,
+    sweep_ips: Vec<String>,
+    listener_slot: Arc<Mutex<Option<arp::ArpListenerHandle>>>,
+    prior_joins: arp::PriorCaptureJoins,
+    mut activation_rx: arp::ActivationRx,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    use tauri::Emitter;
+    // Longer than the 500 ms sweep-start delay plus the sweep itself, so
+    // a healthy backend has time to deliver frames.
+    const INITIAL_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+    const POLL: std::time::Duration = std::time::Duration::from_secs(2);
+    const MAX_WATCH: std::time::Duration = std::time::Duration::from_secs(300);
+
+    let mut restarts_used: u32 = 0;
+    let mut last_self_delta: u64 = 0;
+    'session: loop {
+        let activation = tokio::select! {
+            _ = shutdown_rx.changed() => None,
+            outcome = tokio::time::timeout(arp::CAPTURE_ACTIVATION_TIMEOUT, activation_rx) => {
+                Some(outcome)
+            }
+        };
+        let mut event = match activation {
+            None => arp::AttemptEvent::ShutdownSignalled,
+            Some(Ok(Ok(Ok(_scope)))) => {
+                // Activated. Re-provoke on restarts — the initial
+                // session's sweep was already spawned by the start path —
+                // so the fresh session has traffic to prove itself.
+                if restarts_used > 0 {
+                    provoke_sweep(&params, &sweep_ips).await;
+                }
+                match current_session_counters(&listener_slot).await {
+                    None => arp::AttemptEvent::ShutdownSignalled, // stop already took the handle
+                    Some(counters) => {
+                        let baseline = counters.snapshot();
+                        let window = tokio::select! {
+                            _ = shutdown_rx.changed() => None,
+                            _ = tokio::time::sleep(INITIAL_WINDOW) => Some(()),
+                        };
+                        match window {
+                            None => arp::AttemptEvent::ShutdownSignalled,
+                            Some(()) => {
+                                let now = counters.snapshot();
+                                let payload_delta =
+                                    now.frames_seen.saturating_sub(baseline.frames_seen);
+                                last_self_delta =
+                                    now.self_ip_dropped.saturating_sub(baseline.self_ip_dropped);
+                                arp::AttemptEvent::Verdict(arp::capture_health(
+                                    payload_delta,
+                                    last_self_delta,
+                                ))
+                            }
+                        }
+                    }
+                }
+            }
+            // The capture thread already logged the start failure.
+            Some(Ok(Ok(Err(_start_error)))) => arp::AttemptEvent::StartFailed,
+            Some(Ok(Err(_channel_closed))) => arp::AttemptEvent::ActivationChannelClosed,
+            Some(Err(_elapsed)) => {
+                // The blocking thread may still complete the fixed-name
+                // start later — retain ownership: park the unconfirmed
+                // session so no future start can overlap it.
+                park_capture_handle(&listener_slot, &prior_joins).await;
+                arp::AttemptEvent::ActivationTimedOut
+            }
+        };
+
+        // Act on decisions until this attempt resolves. The inner loop
+        // runs at most twice: a Restart that faults feeds the fault back
+        // through the decision function, which always exhausts.
+        loop {
+            match arp::next_ladder_step(event, restarts_used) {
+                arp::LadderAction::Done => {
+                    if restarts_used > 0 {
+                        log::info!(
+                            "Capture recovered: ARP payload events after restart (attempt {})",
+                            restarts_used
+                        );
+                    }
+                    return;
+                }
+                arp::LadderAction::Abort => return,
+                arp::LadderAction::Exhaust => break 'session,
+                arp::LadderAction::Restart(mode) => {
+                    log::warn!(
+                        "Capture Rx-dead (payload=0, self={}) — restarting capture (attempt {}, scope={:?})",
+                        last_self_delta,
+                        restarts_used + 1,
+                        mode
+                    );
+                    // Tear down the deaf session; a stop that already
+                    // took the handle wins.
+                    let Some(old_handle) = listener_slot.lock().await.take() else {
+                        return;
+                    };
+                    let mut old_join = old_handle.stop_into_join();
+                    if tokio::time::timeout(arp::CAPTURE_JOIN_TIMEOUT, &mut old_join)
+                        .await
+                        .is_err()
+                    {
+                        // Wedged capture thread: park it so no future
+                        // start can overlap it, and stop laddering.
+                        prior_joins.lock().await.push(old_join);
+                        event = arp::AttemptEvent::JoinTimedOut;
+                        continue;
+                    }
+                    match arp::start_listener(params.clone(), mode, &prior_joins).await {
+                        Err(e) => {
+                            log::warn!("Capture restart failed: {}", e);
+                            event = arp::AttemptEvent::StartFailed;
+                            continue;
+                        }
+                        Ok((new_handle, new_rx)) => {
+                            let mut slot = listener_slot.lock().await;
+                            if params.fence.is_stale() {
+                                // Discovery stopped or restarted while we
+                                // were attaching — the new session belongs
+                                // to nobody; tear it straight back down.
+                                drop(slot);
+                                prior_joins.lock().await.push(new_handle.stop_into_join());
+                                return;
+                            }
+                            *slot = Some(new_handle);
+                            drop(slot);
+                            restarts_used += 1;
+                            activation_rx = new_rx;
+                            continue 'session;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Ladder exhausted — degrade exactly as the pre-ladder watchdog did,
+    // then poll (bounded) for late recovery on the live session, if any.
+    let missed = arp::missed_max();
+    log::warn!(
+        "Discovery degraded: no ARP payload events and the capture self-heal is exhausted (payload_total={}, missed_max={}, tasks_dropped={}, noneth_dropped={}, self_ip_dropped={})",
+        arp::frames_seen(),
+        missed,
+        arp::tasks_dropped(),
+        arp::noneth_dropped(),
+        arp::self_ip_dropped()
+    );
+    let _ = params.app_handle.emit(
+        "discovery-degraded",
+        serde_json::json!({
+            "reason": "no-payload-events",
+            "missed_packets": missed,
+        }),
+    );
+
+    let Some(counters) = current_session_counters(&listener_slot).await else {
+        return; // no live session left to watch
+    };
+    let baseline = counters.snapshot().frames_seen;
+    let mut waited = std::time::Duration::ZERO;
+    while waited < MAX_WATCH {
+        tokio::select! {
+            _ = shutdown_rx.changed() => return,
+            _ = tokio::time::sleep(POLL) => {}
+        }
+        waited += POLL;
+        if counters.snapshot().frames_seen > baseline {
+            log::info!("Discovery recovered: ARP payload events resumed");
+            let _ = params
+                .app_handle
+                .emit("discovery-recovered", serde_json::json!({}));
+            return;
+        }
+    }
 }
 
 impl NetworkManager {
@@ -1337,132 +1612,46 @@ impl NetworkManager {
             local_ips: local_ips.clone(),
             own_mac,
             fence: fence.clone(),
-            excluded_subnets: excluded_subnets.clone(),
+            excluded_subnets,
             scope: capture_scope,
         };
-        // The activation signal is unconsumed for now — the session start
-        // result is still surfaced by the capture thread's own logging.
-        let (handle, _activation_rx) =
-            arp::start_listener(listener_params, &self.prior_capture_joins).await?;
-        let session_counters = handle.counters();
+        let (handle, activation_rx) = arp::start_listener(
+            listener_params.clone(),
+            pktmon::CaptureMode::PreferScoped,
+            &self.prior_capture_joins,
+        )
+        .await?;
         *self.arp_listener_handle.lock().await = Some(handle);
 
         // Ping sweep known subnets to provoke ARP traffic so the capture
         // listener sees all devices, then read the OS ARP table to catch
         // cached entries that didn't generate new ARP packets on the wire.
+        let sweep_params = listener_params.clone();
         let sweep_ips = known_ips.clone();
-        let sweep_devices = self.arp_devices.clone();
-        let sweep_registry = registry.clone();
-        let sweep_emitter = emitter.clone();
-        let sweep_app_handle = app_handle_for_adopt.clone();
-        let sweep_fence = fence.clone();
-        let sweep_excluded = excluded_subnets;
-        let sweep_local = local_ips.clone();
         tokio::spawn(async move {
             // Small delay to let the capture listener start first
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            // If discovery already restarted (or stopped) during that delay,
-            // this sweep belongs to a dead session — don't touch the registry.
-            if sweep_fence.is_stale() {
-                return;
-            }
-            log::info!("Ping sweeping known subnets to populate ARP");
-            ping_sweep_subnets(&sweep_ips).await;
-
-            // One brief-lock snapshot for the whole merge pass (never lock
-            // per entry); a poisoned lock degrades to an empty set, which
-            // filters nothing — fail-open.
-            let local_snapshot: HashSet<Ipv4Addr> =
-                sweep_local.lock().map(|s| s.clone()).unwrap_or_default();
-
-            // Merge the OS neighbor table for EVERY local/adopted IP, not
-            // just the first — a neighbor learned via an adopted secondary
-            // subnet would otherwise be missed at boot (in-session sweeps
-            // cover it post-adoption, but not the cold-start merge). The
-            // map dedup makes the extra queries harmless.
-            for sweep_iface_ip in &sweep_ips {
-                if sweep_fence.is_stale() {
-                    break;
-                }
-                if sweep_iface_ip.is_empty() {
-                    continue;
-                }
-                merge_arp_table(
-                    sweep_devices.clone(),
-                    sweep_registry.clone(),
-                    sweep_emitter.clone(),
-                    sweep_app_handle.clone(),
-                    sweep_iface_ip,
-                    &sweep_excluded,
-                    &local_snapshot,
-                    &sweep_fence,
-                )
-                .await;
-            }
+            provoke_sweep(&sweep_params, &sweep_ips).await;
         });
 
-        // Quiet-network watchdog. The ping sweep above provokes ARP; if
-        // the capture backend delivers no parsed frames within the window
-        // after it, discovery is degraded (e.g. a layout/floor issue where
-        // the session starts but no payload arrives). This is a diagnostic
-        // only — it never flips availability, and emits at most one
-        // degraded per session, cleared by a recovered on the first frame.
-        let watchdog_app = app_handle_for_adopt.clone();
-        let watchdog_counters = session_counters;
-        let watchdog = tokio::spawn(async move {
-            use tauri::Emitter;
-            // Longer than the 500 ms sweep-start delay plus the sweep
-            // itself, so a healthy backend has time to deliver frames.
-            const INITIAL_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
-            const POLL: std::time::Duration = std::time::Duration::from_secs(2);
-            const MAX_WATCH: std::time::Duration = std::time::Duration::from_secs(300);
-
-            // Sample through this session's own counters — the globals
-            // keep counting late callbacks from prior sessions, which
-            // could mask a deaf replacement session.
-            let baseline = watchdog_counters.snapshot();
-            tokio::time::sleep(INITIAL_WINDOW).await;
-            let now = watchdog_counters.snapshot();
-            let payload_delta = now.frames_seen.saturating_sub(baseline.frames_seen);
-            let self_delta = now.self_ip_dropped.saturating_sub(baseline.self_ip_dropped);
-            let verdict = arp::capture_health(payload_delta, self_delta);
-            if verdict == arp::CaptureHealth::Healthy {
-                return; // capture is delivering — healthy, no event
-            }
-
-            let missed = arp::missed_max();
-            log::warn!(
-                "Discovery degraded ({:?}): no ARP payload events within {}s of the ping sweep (payload_total={}, missed_max={}, tasks_dropped={}, noneth_dropped={}, self_ip_dropped={})",
-                verdict,
-                INITIAL_WINDOW.as_secs(),
-                arp::frames_seen(),
-                missed,
-                arp::tasks_dropped(),
-                arp::noneth_dropped(),
-                arp::self_ip_dropped()
-            );
-            let _ = watchdog_app.emit(
-                "discovery-degraded",
-                serde_json::json!({
-                    "reason": "no-payload-events",
-                    "missed_packets": missed,
-                }),
-            );
-
-            // Watch for the first frame (bounded — don't linger forever on
-            // a genuinely dead backend; the single degraded warning stands).
-            let mut waited = std::time::Duration::ZERO;
-            while waited < MAX_WATCH {
-                tokio::time::sleep(POLL).await;
-                waited += POLL;
-                if watchdog_counters.snapshot().frames_seen > baseline.frames_seen {
-                    log::info!("Discovery recovered: ARP payload events resumed");
-                    let _ = watchdog_app.emit("discovery-recovered", serde_json::json!({}));
-                    return;
-                }
-            }
+        // Capture-health watchdog. The ping sweep above provokes ARP; if
+        // the session delivers no payload within the window, the watchdog
+        // restarts the capture (bounded ladder) before degrading loudly.
+        // It never flips availability, and emits at most one degraded per
+        // session, cleared by a recovered on the first frame.
+        let (watchdog_shutdown, watchdog_shutdown_rx) = tokio::sync::watch::channel(false);
+        let watchdog = tokio::spawn(watchdog_ladder(
+            listener_params.clone(),
+            known_ips.clone(),
+            self.arp_listener_handle.clone(),
+            self.prior_capture_joins.clone(),
+            activation_rx,
+            watchdog_shutdown_rx,
+        ));
+        *self.discovery_watchdog_handle.lock().await = Some(WatchdogHandle {
+            shutdown: watchdog_shutdown,
+            join: watchdog,
         });
-        *self.discovery_watchdog_handle.lock().await = Some(watchdog);
 
         // Auto-adopt handler for foreign subnets
         let devices_for_adopt = devices.clone();
@@ -2245,7 +2434,23 @@ impl NetworkManager {
             }
         }
         if let Some(h) = self.discovery_watchdog_handle.lock().await.take() {
-            h.abort();
+            // Cooperative stop first: the watchdog may be mid-restart of
+            // the capture session, and a cooperative exit parks or
+            // installs the in-flight session cleanly. Abort is the
+            // bounded fallback — safe, because an orphaned session tears
+            // itself down when its handle drops.
+            let _ = h.shutdown.send(true);
+            let abort = h.join.abort_handle();
+            if tokio::time::timeout(WATCHDOG_STOP_TIMEOUT, h.join)
+                .await
+                .is_err()
+            {
+                log::warn!(
+                    "Discovery watchdog did not stop within {}s — aborting",
+                    WATCHDOG_STOP_TIMEOUT.as_secs()
+                );
+                abort.abort();
+            }
         }
         if let Some(h) = self.arp_listener_handle.lock().await.take() {
             // Signal shutdown and park the capture thread's join in the

@@ -354,6 +354,17 @@ pub struct CaptureScope {
     pub display_name: String,
 }
 
+/// How the caller wants the session scoped. `PreferScoped` preserves the
+/// long-standing behavior — scoped attach with the automatic unscoped
+/// fallback on scope-join failure; the mode split does not remove that
+/// fallback. `ForcedUnscoped` demands unscoped from the outset, for a
+/// caller escalating past a scoped session that proved deaf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureMode {
+    PreferScoped,
+    ForcedUnscoped,
+}
+
 /// How the session ended up scoped — logged exactly once per start.
 pub enum ScopeOutcome {
     SelectedInterface,
@@ -484,13 +495,29 @@ impl CaptureSession {
     /// join, or attach — the partial session is fully unwound and a
     /// fresh unscoped session (per-frame filters still active) is built
     /// from scratch. The returned [`ScopeOutcome`] says which happened;
-    /// the caller logs it exactly once per start.
+    /// the caller logs it exactly once per start. `ForcedUnscoped` skips
+    /// the scoped attempt entirely.
     pub fn start(
         session_name: &str,
         config: RealtimeStreamConfiguration,
         scope: &CaptureScope,
+        mode: CaptureMode,
     ) -> Result<(Self, ScopeOutcome), String> {
         let api = PktMonApi::load()?;
+        if mode == CaptureMode::ForcedUnscoped {
+            let (handle, session, stream) = Self::try_start(&api, session_name, &config, None)?;
+            return Ok((
+                Self {
+                    api,
+                    handle,
+                    session,
+                    stream,
+                },
+                ScopeOutcome::UnscopedFallback {
+                    reason: "unscoped demanded by the capture-restart ladder".into(),
+                },
+            ));
+        }
         match Self::try_start(&api, session_name, &config, Some(scope)) {
             Ok((handle, session, stream)) => Ok((
                 Self {

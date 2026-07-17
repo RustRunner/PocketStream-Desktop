@@ -177,10 +177,78 @@ fn record_accepted_frame(counters: &SessionCounters) {
     ARP_FRAMES_SEEN.fetch_add(1, Ordering::Relaxed);
 }
 
+/// One observation the capture-restart ladder reacts to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttemptEvent {
+    /// Checkpoint verdict for a session that confirmed activation.
+    Verdict(CaptureHealth),
+    /// The session never confirmed activation within the bound; its
+    /// still-live thread has been parked in the prior-capture guard.
+    ActivationTimedOut,
+    /// The capture thread died without reporting (panic before the send).
+    ActivationChannelClosed,
+    /// The session start reported failure, or a restart's listener start
+    /// failed outright.
+    StartFailed,
+    /// A torn-down session's thread did not exit within the join bound.
+    JoinTimedOut,
+    /// Discovery is stopping; the ladder must yield immediately.
+    ShutdownSignalled,
+}
+
+/// What the ladder does next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LadderAction {
+    /// Healthy — the ladder ends without emitting anything.
+    Done,
+    /// Tear down the current session and restart at the given scope mode.
+    Restart(pktmon::CaptureMode),
+    /// Give up loudly: degraded event, then the bounded recovery poll.
+    Exhaust,
+    /// A stop won; end silently.
+    Abort,
+}
+
+/// Restarts one discovery session's ladder may spend: a scoped retry,
+/// then a forced-unscoped escalation. Re-armed only by a discovery
+/// restart, so a genuinely dead backend cannot flap capture forever.
+pub(crate) const LADDER_MAX_RESTARTS: u32 = 2;
+
+/// The ladder's single decision point — every observation routes through
+/// here. Pure so sequencing, the per-session cap, fault handling, and
+/// shutdown priority are unit-testable without any capture state.
+pub(crate) fn next_ladder_step(event: AttemptEvent, restarts_used: u32) -> LadderAction {
+    match event {
+        AttemptEvent::ShutdownSignalled => LadderAction::Abort,
+        AttemptEvent::Verdict(CaptureHealth::Healthy) => LadderAction::Done,
+        AttemptEvent::Verdict(_) => {
+            if restarts_used == 0 {
+                LadderAction::Restart(pktmon::CaptureMode::PreferScoped)
+            } else if restarts_used < LADDER_MAX_RESTARTS {
+                LadderAction::Restart(pktmon::CaptureMode::ForcedUnscoped)
+            } else {
+                LadderAction::Exhaust
+            }
+        }
+        // Lifecycle faults never retry: a failed start, an unconfirmed
+        // start, or an unjoinable teardown mean the backend is not
+        // behaving predictably — degrade loudly instead of flapping.
+        AttemptEvent::ActivationTimedOut
+        | AttemptEvent::ActivationChannelClosed
+        | AttemptEvent::StartFailed
+        | AttemptEvent::JoinTimedOut => LadderAction::Exhaust,
+    }
+}
+
 /// Resolves once the blocking capture thread has run session start: the
 /// achieved scope on success, or the start error. A receiver that drops
 /// without listening loses nothing — the send is fire-and-forget.
 pub(crate) type ActivationRx = tokio::sync::oneshot::Receiver<Result<pktmon::ScopeOutcome, String>>;
+
+/// Bound on waiting for a session to confirm activation. Generous —
+/// activation is normally near-instant; a session that cannot confirm
+/// within this is treated as wedged and its thread stays parked.
+pub(crate) const CAPTURE_ACTIVATION_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Bound on joining a prior capture thread before starting a new session.
 pub(crate) const CAPTURE_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -209,29 +277,33 @@ async fn drain_prior_capture_within(
     slot: &PriorCaptureJoins,
     bound: Duration,
 ) -> Result<(), AppError> {
-    let parked: Vec<tokio::task::JoinHandle<()>> = std::mem::take(&mut *slot.lock().await);
-    if parked.is_empty() {
+    // Join in place, holding the guard's lock: if this future is dropped
+    // mid-drain (a watchdog stop's abort fallback can do that), every
+    // unfinished handle is still parked in the guard — nothing detaches.
+    let mut guard = slot.lock().await;
+    if guard.is_empty() {
         return Ok(());
     }
     let deadline = tokio::time::Instant::now() + bound;
-    let mut survivors = Vec::new();
-    for mut handle in parked {
+    let mut i = 0;
+    while i < guard.len() {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        // `&mut JoinHandle` is pollable, so a timeout does not consume the
-        // handle — the unfinished thread re-parks instead of being lost.
-        match tokio::time::timeout(remaining, &mut handle).await {
-            Ok(_) => {} // exited (a panic also counts — the thread is gone)
-            Err(_) => survivors.push(handle),
+        // `&mut JoinHandle` is pollable, so a timeout does not consume
+        // the handle — an unfinished thread stays parked, never lost.
+        let exited = tokio::time::timeout(remaining, &mut guard[i]).await.is_ok();
+        if exited {
+            // A panic also counts — either way the thread is gone.
+            guard.remove(i);
+        } else {
+            i += 1;
         }
     }
-    if survivors.is_empty() {
+    if guard.is_empty() {
         Ok(())
     } else {
-        let n = survivors.len();
-        slot.lock().await.extend(survivors);
         Err(AppError::Network(format!(
             "{} previous capture thread(s) have not exited — refusing to start a second fixed-name capture session",
-            n
+            guard.len()
         )))
     }
 }
@@ -727,6 +799,7 @@ pub(crate) struct ListenerParams {
 /// blocking thread has actually run the session start.
 pub(crate) async fn start_listener(
     params: ListenerParams,
+    mode: pktmon::CaptureMode,
     prior: &PriorCaptureJoins,
 ) -> Result<(ArpListenerHandle, ActivationRx), AppError> {
     drain_prior_capture(prior).await?;
@@ -789,8 +862,12 @@ pub(crate) async fn start_listener(
             truncation_size: 128,
         };
 
-        let session = match pktmon::CaptureSession::start("PocketStreamArpCapture", config, &scope)
-        {
+        let session = match pktmon::CaptureSession::start(
+            "PocketStreamArpCapture",
+            config,
+            &scope,
+            mode,
+        ) {
             Ok((s, outcome)) => {
                 match &outcome {
                     pktmon::ScopeOutcome::SelectedInterface => {
@@ -1144,6 +1221,70 @@ mod tests {
         assert_eq!(capture_health(0, 1), RxDead);
         // Nothing delivered at all — session entirely dead.
         assert_eq!(capture_health(0, 0), FullyDead);
+    }
+
+    #[test]
+    fn ladder_sequences_scoped_then_unscoped_then_exhausts() {
+        use AttemptEvent::Verdict;
+        assert_eq!(
+            next_ladder_step(Verdict(CaptureHealth::RxDead), 0),
+            LadderAction::Restart(pktmon::CaptureMode::PreferScoped)
+        );
+        assert_eq!(
+            next_ladder_step(Verdict(CaptureHealth::RxDead), 1),
+            LadderAction::Restart(pktmon::CaptureMode::ForcedUnscoped)
+        );
+        assert_eq!(
+            next_ladder_step(Verdict(CaptureHealth::RxDead), 2),
+            LadderAction::Exhaust
+        );
+        // A fully-dead session climbs the same ladder.
+        assert_eq!(
+            next_ladder_step(Verdict(CaptureHealth::FullyDead), 0),
+            LadderAction::Restart(pktmon::CaptureMode::PreferScoped)
+        );
+        assert_eq!(
+            next_ladder_step(Verdict(CaptureHealth::FullyDead), 1),
+            LadderAction::Restart(pktmon::CaptureMode::ForcedUnscoped)
+        );
+    }
+
+    #[test]
+    fn ladder_healthy_is_done_at_any_depth() {
+        for used in 0..=LADDER_MAX_RESTARTS {
+            assert_eq!(
+                next_ladder_step(AttemptEvent::Verdict(CaptureHealth::Healthy), used),
+                LadderAction::Done
+            );
+        }
+    }
+
+    #[test]
+    fn ladder_faults_exhaust_at_any_depth_without_restarting() {
+        // Every lifecycle fault ends the ladder — no overlap between a
+        // fault and a fresh restart attempt is ever possible.
+        for event in [
+            AttemptEvent::ActivationTimedOut,
+            AttemptEvent::ActivationChannelClosed,
+            AttemptEvent::StartFailed,
+            AttemptEvent::JoinTimedOut,
+        ] {
+            for used in 0..=LADDER_MAX_RESTARTS {
+                assert_eq!(next_ladder_step(event, used), LadderAction::Exhaust);
+            }
+        }
+    }
+
+    #[test]
+    fn ladder_shutdown_wins_at_any_depth() {
+        // A stop beats even a would-be restart or exhaustion: the ladder
+        // yields silently, emitting nothing.
+        for used in 0..=LADDER_MAX_RESTARTS {
+            assert_eq!(
+                next_ladder_step(AttemptEvent::ShutdownSignalled, used),
+                LadderAction::Abort
+            );
+        }
     }
 
     #[test]
