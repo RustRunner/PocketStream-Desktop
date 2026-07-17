@@ -298,8 +298,12 @@ pub async fn report_scan_result(
 }
 
 /// Set or clear the user-assigned alias for the device with this IP.
-/// Empty string clears. Persists to cache (if the device has open
-/// ports — cache rows without ports aren't useful) and emits.
+/// Empty string clears. Assigning CAM or PTU demotes any previous
+/// holder (single-holder invariant), so more than one record can
+/// change. Every changed record is written through to the cache and
+/// manual-nodes stores (best-effort — the registry is authoritative,
+/// so the event still emits when a disk write fails and the UI
+/// converges on registry state).
 #[tauri::command]
 pub async fn set_device_alias(
     manager: State<'_, NetworkManager>,
@@ -308,10 +312,11 @@ pub async fn set_device_alias(
     alias: String,
 ) -> Result<(), AppError> {
     let registry = manager.registry();
-    if !registry.set_alias(&ip, &alias) {
+    let changed = registry.set_alias(&ip, &alias);
+    if changed.is_empty() {
         return Ok(());
     }
-    persist_record_for_ip(&registry, &config, &ip)?;
+    crate::network::persist_alias_writethrough(&registry, &config, &changed);
     if let Some(emitter) = manager.emitter().await {
         emitter.poke();
     }

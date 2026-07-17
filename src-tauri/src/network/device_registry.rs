@@ -443,17 +443,62 @@ impl DeviceRegistry {
     }
 
     /// Set or clear an alias for the device with this IP. Empty string
-    /// clears. No-op if the IP isn't tracked.
-    pub fn set_alias(&self, ip: &str, alias: &str) -> bool {
+    /// clears. Returns the IPs whose records changed: the target, plus
+    /// any other holder demoted because the new alias is a role — CAM
+    /// and PTU may only ever have one holder each, so assigning a role
+    /// anywhere strips it from every other record (this also repairs a
+    /// legacy duplicate when the target already held the role).
+    ///
+    /// Returns empty when the IP isn't tracked: an unknown target must
+    /// never strip the current holder.
+    pub fn set_alias(&self, ip: &str, alias: &str) -> Vec<String> {
         let mut map = self.lock();
-        let mut changed = false;
+        if !map.values().any(|r| r.ip == ip) {
+            return Vec::new();
+        }
+        let mut changed: Vec<String> = Vec::new();
         for record in map.values_mut() {
-            if record.ip == ip && record.alias != alias {
-                record.alias = alias.to_string();
-                changed = true;
+            if record.ip == ip {
+                if record.alias != alias {
+                    record.alias = alias.to_string();
+                    changed.push(record.ip.clone());
+                }
+            } else if is_role_alias(alias) && record.alias == alias {
+                record.alias.clear();
+                changed.push(record.ip.clone());
             }
         }
+        changed.sort();
+        changed.dedup();
         changed
+    }
+
+    /// Repair the single-holder invariant after hydration: when legacy
+    /// cache rows or manual-node config entries put a role (CAM/PTU) on
+    /// more than one record, keep one winner per role and clear the
+    /// rest. Returns the demoted IPs so the caller can write the change
+    /// through to the on-disk stores. `camera_ip` biases the CAM winner
+    /// toward the configured stream target.
+    pub fn normalize_role_duplicates(&self, camera_ip: Option<&str>) -> Vec<String> {
+        let camera_ip = camera_ip.filter(|s| !s.is_empty());
+        let mut map = self.lock();
+        let mut demoted: Vec<String> = Vec::new();
+        for role in ROLE_ALIASES {
+            let holders: Vec<DeviceRecord> =
+                map.values().filter(|r| r.alias == role).cloned().collect();
+            if holders.len() < 2 {
+                continue;
+            }
+            let preferred = if role == "CAM" { camera_ip } else { None };
+            let winner = select_role_winner(&holders, preferred);
+            for record in map.values_mut() {
+                if record.alias == role && record.mac != winner {
+                    record.alias.clear();
+                    demoted.push(record.ip.clone());
+                }
+            }
+        }
+        demoted
     }
 
     /// Set the status for the device with this MAC.
@@ -489,6 +534,44 @@ impl Default for DeviceRegistry {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Aliases with reserved role semantics: at most one record may hold
+/// each at any time.
+const ROLE_ALIASES: [&str; 2] = ["CAM", "PTU"];
+
+fn is_role_alias(alias: &str) -> bool {
+    ROLE_ALIASES.contains(&alias)
+}
+
+/// Pick which of several records keeps a contested role. Preference:
+/// the record at `preferred_ip` (callers pass the configured stream
+/// camera IP for CAM), then the most recently seen, then the
+/// numerically lowest IP. The registry never holds two records at one
+/// IP, so this is a total order over the candidates and the outcome is
+/// independent of map iteration order. Returns the winner's MAC key.
+fn select_role_winner(candidates: &[DeviceRecord], preferred_ip: Option<&str>) -> String {
+    candidates
+        .iter()
+        .max_by(|a, b| {
+            let a_pref = Some(a.ip.as_str()) == preferred_ip;
+            let b_pref = Some(b.ip.as_str()) == preferred_ip;
+            a_pref
+                .cmp(&b_pref)
+                .then_with(|| parse_last_seen(a).cmp(&parse_last_seen(b)))
+                .then_with(|| compare_ips(&b.ip, &a.ip))
+        })
+        .map(|r| r.mac.clone())
+        .unwrap_or_default()
+}
+
+/// Parse a record's `last_seen` for chronological comparison. The
+/// registry holds a mix of `Z`-suffixed and `+00:00`-suffixed RFC3339
+/// strings (cache rows vs `chrono::to_rfc3339`), so lexicographic
+/// comparison is not reliably chronological — parse instead. An
+/// unparseable timestamp sorts oldest (`None < Some`).
+fn parse_last_seen(record: &DeviceRecord) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    chrono::DateTime::parse_from_rfc3339(&record.last_seen).ok()
 }
 
 /// Compare two dotted-quad IP strings numerically. Falls back to
@@ -871,14 +954,273 @@ mod tests {
     fn set_alias_updates_existing_record() {
         let r = DeviceRegistry::new();
         r.merge_arp(&arp("AA:BB:CC:DD:EE:01", "192.168.1.10", "192.168.1.0/24"));
-        assert!(r.set_alias("192.168.1.10", "CAM"));
+        assert_eq!(
+            r.set_alias("192.168.1.10", "CAM"),
+            vec!["192.168.1.10".to_string()]
+        );
         assert_eq!(r.snapshot()[0].alias, "CAM");
         assert!(
-            !r.set_alias("192.168.1.10", "CAM"),
+            r.set_alias("192.168.1.10", "CAM").is_empty(),
             "identical write is a no-op"
         );
-        assert!(r.set_alias("192.168.1.10", ""), "empty string clears");
+        assert_eq!(
+            r.set_alias("192.168.1.10", ""),
+            vec!["192.168.1.10".to_string()],
+            "empty string clears"
+        );
         assert_eq!(r.snapshot()[0].alias, "");
+    }
+
+    // ── role exclusivity (single-holder invariant) ──────────────────
+
+    /// Count of records currently holding `role`.
+    fn holders(r: &DeviceRegistry, role: &str) -> usize {
+        r.snapshot().iter().filter(|d| d.alias == role).count()
+    }
+
+    fn alias_of(r: &DeviceRegistry, ip: &str) -> String {
+        r.snapshot()
+            .iter()
+            .find(|d| d.ip == ip)
+            .map(|d| d.alias.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn set_alias_unknown_ip_is_noop_and_keeps_holder() {
+        let r = DeviceRegistry::new();
+        r.merge_arp(&arp("MAC:A", "192.168.1.10", "192.168.1.0/24"));
+        r.set_alias("192.168.1.10", "CAM");
+        assert!(
+            r.set_alias("10.9.9.9", "CAM").is_empty(),
+            "unknown target must change nothing"
+        );
+        assert_eq!(alias_of(&r, "192.168.1.10"), "CAM");
+    }
+
+    #[test]
+    fn set_alias_role_steal_demotes_previous_holder() {
+        let r = DeviceRegistry::new();
+        r.merge_arp(&arp("MAC:A", "192.168.1.10", "192.168.1.0/24"));
+        r.merge_arp(&arp("MAC:B", "192.168.1.20", "192.168.1.0/24"));
+        r.set_alias("192.168.1.10", "CAM");
+
+        let changed = r.set_alias("192.168.1.20", "CAM");
+        assert_eq!(
+            changed,
+            vec!["192.168.1.10".to_string(), "192.168.1.20".to_string()]
+        );
+        assert_eq!(alias_of(&r, "192.168.1.10"), "", "previous holder reverts");
+        assert_eq!(alias_of(&r, "192.168.1.20"), "CAM");
+        assert_eq!(holders(&r, "CAM"), 1);
+    }
+
+    #[test]
+    fn set_alias_cam_and_ptu_coexist_on_different_nodes() {
+        let r = DeviceRegistry::new();
+        r.merge_arp(&arp("MAC:A", "192.168.1.10", "192.168.1.0/24"));
+        r.merge_arp(&arp("MAC:B", "192.168.1.20", "192.168.1.0/24"));
+        r.set_alias("192.168.1.10", "CAM");
+        let changed = r.set_alias("192.168.1.20", "PTU");
+        assert_eq!(changed, vec!["192.168.1.20".to_string()]);
+        assert_eq!(alias_of(&r, "192.168.1.10"), "CAM");
+        assert_eq!(alias_of(&r, "192.168.1.20"), "PTU");
+    }
+
+    #[test]
+    fn set_alias_cross_role_overwrite_leaves_single_holders() {
+        // Assigning CAM onto the node that holds PTU: the node's PTU is
+        // overwritten and the previous CAM holder is demoted — exactly
+        // one CAM and zero PTUs remain.
+        let r = DeviceRegistry::new();
+        r.merge_arp(&arp("MAC:A", "192.168.1.10", "192.168.1.0/24"));
+        r.merge_arp(&arp("MAC:B", "192.168.1.20", "192.168.1.0/24"));
+        r.set_alias("192.168.1.10", "CAM");
+        r.set_alias("192.168.1.20", "PTU");
+
+        let changed = r.set_alias("192.168.1.20", "CAM");
+        assert_eq!(
+            changed,
+            vec!["192.168.1.10".to_string(), "192.168.1.20".to_string()]
+        );
+        assert_eq!(alias_of(&r, "192.168.1.20"), "CAM");
+        assert_eq!(alias_of(&r, "192.168.1.10"), "");
+        assert_eq!(holders(&r, "CAM"), 1);
+        assert_eq!(holders(&r, "PTU"), 0);
+    }
+
+    #[test]
+    fn set_alias_custom_name_never_demotes_roles() {
+        let r = DeviceRegistry::new();
+        r.merge_arp(&arp("MAC:A", "192.168.1.10", "192.168.1.0/24"));
+        r.merge_arp(&arp("MAC:B", "192.168.1.20", "192.168.1.0/24"));
+        r.set_alias("192.168.1.10", "CAM");
+        let changed = r.set_alias("192.168.1.20", "Bench unit");
+        assert_eq!(changed, vec!["192.168.1.20".to_string()]);
+        assert_eq!(alias_of(&r, "192.168.1.10"), "CAM");
+    }
+
+    #[test]
+    fn set_alias_repairs_duplicate_even_when_target_already_holds_role() {
+        // Legacy cache state can hold two CAMs. Re-assigning CAM to one
+        // of them is a no-op on the target but must still demote the
+        // other holder.
+        let r = DeviceRegistry::new();
+        r.hydrate_from_cache(&[
+            cached("MAC:A", "192.168.1.10", "192.168.1.0/24", vec![80], "CAM"),
+            cached("MAC:B", "192.168.1.20", "192.168.1.0/24", vec![80], "CAM"),
+        ]);
+        assert_eq!(holders(&r, "CAM"), 2, "legacy duplicate precondition");
+
+        let changed = r.set_alias("192.168.1.10", "CAM");
+        assert_eq!(changed, vec!["192.168.1.20".to_string()]);
+        assert_eq!(alias_of(&r, "192.168.1.10"), "CAM");
+        assert_eq!(holders(&r, "CAM"), 1);
+    }
+
+    // ── normalize_role_duplicates ───────────────────────────────────
+
+    fn cached_at(mac: &str, ip: &str, alias: &str, last_seen: &str) -> CachedDevice {
+        CachedDevice {
+            mac: mac.into(),
+            ip: ip.into(),
+            subnet: "192.168.1.0/24".into(),
+            open_ports: vec![80],
+            alias: alias.into(),
+            last_seen: last_seen.into(),
+        }
+    }
+
+    #[test]
+    fn normalize_is_noop_without_duplicates() {
+        let r = DeviceRegistry::new();
+        r.hydrate_from_cache(&[
+            cached_at("MAC:A", "192.168.1.10", "CAM", "2026-07-01T00:00:00Z"),
+            cached_at("MAC:B", "192.168.1.20", "PTU", "2026-07-01T00:00:00Z"),
+        ]);
+        assert!(r.normalize_role_duplicates(None).is_empty());
+        assert_eq!(alias_of(&r, "192.168.1.10"), "CAM");
+        assert_eq!(alias_of(&r, "192.168.1.20"), "PTU");
+    }
+
+    #[test]
+    fn normalize_prefers_configured_camera_ip() {
+        let r = DeviceRegistry::new();
+        r.hydrate_from_cache(&[
+            cached_at("MAC:A", "192.168.1.10", "CAM", "2026-07-01T00:00:00Z"),
+            // Newer, but not the configured stream target.
+            cached_at("MAC:B", "192.168.1.20", "CAM", "2026-07-10T00:00:00Z"),
+        ]);
+        let demoted = r.normalize_role_duplicates(Some("192.168.1.10"));
+        assert_eq!(demoted, vec!["192.168.1.20".to_string()]);
+        assert_eq!(alias_of(&r, "192.168.1.10"), "CAM");
+        assert_eq!(holders(&r, "CAM"), 1);
+    }
+
+    #[test]
+    fn normalize_falls_back_to_newest_last_seen() {
+        let r = DeviceRegistry::new();
+        r.hydrate_from_cache(&[
+            cached_at("MAC:A", "192.168.1.10", "PTU", "2026-07-01T00:00:00Z"),
+            // Mixed RFC3339 suffix styles must still compare
+            // chronologically (parsed, not lexicographic).
+            cached_at("MAC:B", "192.168.1.20", "PTU", "2026-07-10T00:00:00+00:00"),
+        ]);
+        let demoted = r.normalize_role_duplicates(None);
+        assert_eq!(demoted, vec!["192.168.1.10".to_string()]);
+        assert_eq!(alias_of(&r, "192.168.1.20"), "PTU");
+    }
+
+    #[test]
+    fn normalize_tiebreaks_on_lowest_ip() {
+        let r = DeviceRegistry::new();
+        r.hydrate_from_cache(&[
+            cached_at("MAC:B", "192.168.1.20", "CAM", "2026-07-01T00:00:00Z"),
+            cached_at("MAC:A", "192.168.1.10", "CAM", "2026-07-01T00:00:00Z"),
+        ]);
+        let demoted = r.normalize_role_duplicates(None);
+        assert_eq!(demoted, vec!["192.168.1.20".to_string()]);
+        assert_eq!(alias_of(&r, "192.168.1.10"), "CAM");
+    }
+
+    #[test]
+    fn normalize_ignores_camera_ip_for_ptu() {
+        let r = DeviceRegistry::new();
+        r.hydrate_from_cache(&[
+            cached_at("MAC:A", "192.168.1.10", "PTU", "2026-07-01T00:00:00Z"),
+            cached_at("MAC:B", "192.168.1.20", "PTU", "2026-07-10T00:00:00Z"),
+        ]);
+        // camera_ip points at the older PTU holder; PTU selection must
+        // not be biased by it — newest wins.
+        let demoted = r.normalize_role_duplicates(Some("192.168.1.10"));
+        assert_eq!(demoted, vec!["192.168.1.10".to_string()]);
+        assert_eq!(alias_of(&r, "192.168.1.20"), "PTU");
+    }
+
+    #[test]
+    fn normalize_is_deterministic_across_insertion_orders() {
+        let rows = [
+            cached_at("MAC:A", "192.168.1.10", "CAM", "2026-07-01T00:00:00Z"),
+            cached_at("MAC:B", "192.168.1.20", "CAM", "2026-07-01T00:00:00Z"),
+            cached_at("MAC:C", "192.168.1.30", "CAM", "2026-07-01T00:00:00Z"),
+        ];
+        let forward = DeviceRegistry::new();
+        forward.hydrate_from_cache(&rows);
+        forward.normalize_role_duplicates(None);
+
+        let mut reversed_rows = rows.to_vec();
+        reversed_rows.reverse();
+        let reversed = DeviceRegistry::new();
+        reversed.hydrate_from_cache(&reversed_rows);
+        reversed.normalize_role_duplicates(None);
+
+        assert_eq!(alias_of(&forward, "192.168.1.10"), "CAM");
+        assert_eq!(alias_of(&reversed, "192.168.1.10"), "CAM");
+        assert_eq!(holders(&forward, "CAM"), 1);
+        assert_eq!(holders(&reversed, "CAM"), 1);
+    }
+
+    #[test]
+    fn normalize_is_idempotent() {
+        let r = DeviceRegistry::new();
+        r.hydrate_from_cache(&[
+            cached_at("MAC:A", "192.168.1.10", "CAM", "2026-07-01T00:00:00Z"),
+            cached_at("MAC:B", "192.168.1.20", "CAM", "2026-07-10T00:00:00Z"),
+        ]);
+        assert!(!r.normalize_role_duplicates(None).is_empty());
+        assert!(r.normalize_role_duplicates(None).is_empty());
+    }
+
+    // ── merge paths move roles, never copy them ─────────────────────
+
+    #[test]
+    fn merge_arp_alias_inheritance_moves_role_never_copies() {
+        // One CAM before the MAC change at its IP → one CAM after.
+        let r = DeviceRegistry::new();
+        r.hydrate_from_cache(&[cached(
+            "OLD:MAC",
+            "192.168.1.10",
+            "192.168.1.0/24",
+            vec![80],
+            "CAM",
+        )]);
+        r.merge_arp(&arp("NEW:MAC", "192.168.1.10", "192.168.1.0/24"));
+        assert_eq!(holders(&r, "CAM"), 1);
+        assert_eq!(r.snapshot()[0].mac, "NEW:MAC");
+    }
+
+    #[test]
+    fn hydrate_dedup_alias_inheritance_moves_role_never_copies() {
+        // One CAM among the same-IP duplicates → one CAM after hydration.
+        let r = DeviceRegistry::new();
+        r.hydrate_from_cache(&[
+            cached_at("OLD:MAC", "192.168.1.10", "CAM", "2026-06-01T00:00:00Z"),
+            cached_at("NEW:MAC", "192.168.1.10", "", "2026-07-01T00:00:00Z"),
+        ]);
+        assert_eq!(holders(&r, "CAM"), 1);
+        let snap = r.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].mac, "NEW:MAC", "survivor inherits the role");
     }
 
     #[test]

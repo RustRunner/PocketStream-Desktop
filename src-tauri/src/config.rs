@@ -515,6 +515,37 @@ impl AppConfig {
         self.save()
     }
 
+    /// Update the alias of an existing manual node in place. Returns
+    /// Ok(true) when a pinned entry existed and actually changed (and
+    /// was saved); Ok(false) when the IP isn't pinned or the alias
+    /// already matches. Used by the role single-holder enforcement to
+    /// write demotions through to config — a registry-only demotion
+    /// would resurrect on the next manual-node hydration.
+    pub fn update_manual_node_alias(&self, ip: &str, alias: &str) -> Result<bool, crate::AppError> {
+        let changed = {
+            let mut guard = match self.settings.lock() {
+                Ok(g) => g,
+                Err(poisoned) => {
+                    log::error!(
+                        "Config mutex poisoned during update_manual_node_alias, recovering"
+                    );
+                    poisoned.into_inner()
+                }
+            };
+            match guard.manual_nodes.iter_mut().find(|n| n.ip == ip) {
+                Some(node) if node.alias != alias => {
+                    node.alias = alias.to_string();
+                    true
+                }
+                _ => false,
+            }
+        };
+        if changed {
+            self.save()?;
+        }
+        Ok(changed)
+    }
+
     /// Remove a manual node by IP. No-op if the IP isn't pinned.
     pub fn remove_manual_node(&self, ip: &str) -> Result<(), crate::AppError> {
         let removed = match self.settings.lock() {

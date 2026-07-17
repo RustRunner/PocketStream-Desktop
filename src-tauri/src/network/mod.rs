@@ -55,6 +55,44 @@ pub(crate) fn async_cmd(program: &str) -> tokio::process::Command {
     tokio::process::Command::from(std_cmd)
 }
 
+/// Write alias changes through to every on-disk alias store so a
+/// demoted CAM/PTU can't resurrect from a stale row: the device cache
+/// (only rows with open ports live there — same gate as scan-result
+/// persistence) and the manual-nodes config list. Best-effort: a
+/// failed write logs and the registry stays authoritative — the next
+/// successful persist of the record self-heals the store.
+pub(crate) fn persist_alias_writethrough(
+    registry: &DeviceRegistry,
+    config: &crate::config::AppConfig,
+    ips: &[String],
+) {
+    let snapshot = registry.snapshot();
+    for ip in ips {
+        let Some(record) = snapshot.iter().find(|r| r.ip == *ip) else {
+            continue;
+        };
+        if !record.open_ports.is_empty() {
+            if let Err(e) = config.upsert_cached_device(crate::config::CachedDevice {
+                mac: record.mac.clone(),
+                ip: record.ip.clone(),
+                subnet: record.subnet.clone(),
+                open_ports: record.open_ports.clone(),
+                alias: record.alias.clone(),
+                last_seen: record.last_seen.clone(),
+            }) {
+                log::warn!("Failed to persist alias change for {} to cache: {}", ip, e);
+            }
+        }
+        if let Err(e) = config.update_manual_node_alias(ip, &record.alias) {
+            log::warn!(
+                "Failed to write alias change for {} to manual nodes: {}",
+                ip,
+                e
+            );
+        }
+    }
+}
+
 /// Cooperative-shutdown handle for the auto-adopt loop: a `watch` signal
 /// plus the task's join handle. A bare `JoinHandle` could only be aborted;
 /// this lets `stop` ask the loop to exit at a `select!` point (so an
@@ -607,6 +645,18 @@ impl NetworkManager {
             }
         }
 
+        // Legacy cache files can hold CAM/PTU on more than one row.
+        // Repair to a single holder per role now that all rows are in,
+        // and write the demotions back so they don't return next launch.
+        let camera_ip = config.get().stream.camera_ip;
+        let demoted = self
+            .device_registry
+            .normalize_role_duplicates(Some(&camera_ip));
+        if !demoted.is_empty() {
+            log::info!("Demoted duplicate role alias on {}", demoted.join(", "));
+            persist_alias_writethrough(&self.device_registry, config, &demoted);
+        }
+
         if !result.changed && rejected.is_empty() {
             return;
         }
@@ -648,8 +698,24 @@ impl NetworkManager {
             return;
         }
         let count = nodes.len();
-        if self.device_registry.hydrate_manual_nodes(&nodes) {
+        let hydrated = self.device_registry.hydrate_manual_nodes(&nodes);
+        if hydrated {
             log::info!("DeviceRegistry: hydrated {} manual node(s)", count);
+        }
+
+        // Manual-node config rows can carry a legacy CAM/PTU alias that
+        // collides with a discovered holder. Enforce the single-holder
+        // invariant and write demotions back (registry + config), so a
+        // mode toggle can't resurrect a duplicate.
+        let camera_ip = config.get().stream.camera_ip;
+        let demoted = self
+            .device_registry
+            .normalize_role_duplicates(Some(&camera_ip));
+        if !demoted.is_empty() {
+            persist_alias_writethrough(&self.device_registry, config, &demoted);
+        }
+
+        if hydrated || !demoted.is_empty() {
             if let Some(emitter) = self.device_emitter.lock().await.clone() {
                 emitter.poke();
             }
