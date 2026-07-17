@@ -487,7 +487,13 @@ pub fn run() {
             // non-Windows platforms — fall back to the legacy per-MAC pnet
             // poller below. Successful registration makes the polling watcher
             // redundant and we skip spawning it to avoid duplicate events.
-            let event_watcher_ok = network::watcher::start(handle.clone());
+            // The pending-IP registry lets the watcher strip transient
+            // scratch binds from its emissions.
+            let watcher_pending = {
+                let manager: tauri::State<'_, network::NetworkManager> = handle.state();
+                manager.pending_ips_handle()
+            };
+            let event_watcher_ok = network::watcher::start(handle.clone(), watcher_pending);
 
             // Load adopted subnets from config, then start discovery
             // subsystems gated on the user's chosen network mode.

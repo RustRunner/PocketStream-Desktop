@@ -555,6 +555,26 @@ fn classify_removal(in_live: bool, in_pending_restore: bool, in_config: bool) ->
     }
 }
 
+/// Drop pending (scratch / not-yet-handed-over) addresses from an
+/// enumerated adapter list. Those are transient adoption machinery, not
+/// host addresses: rendering one as a host row, or letting its
+/// bind/release read as an IP change, misleads every consumer. Pure so
+/// the filter is unit-testable; adapters are kept even when the filter
+/// empties their address list (a port whose only address is a scratch
+/// presents as disconnected, which is what it effectively is).
+pub(crate) fn strip_pending_ips(
+    mut list: Vec<interface::InterfaceInfo>,
+    pending: &HashSet<String>,
+) -> Vec<interface::InterfaceInfo> {
+    if pending.is_empty() {
+        return list;
+    }
+    for iface in &mut list {
+        iface.ips.retain(|ip| !pending.contains(&ip.address));
+    }
+    list
+}
+
 /// Names of the adapters currently binding `ip`. The caller's interface
 /// hint only orders the result (checked first) — a stale dialog
 /// selection must never decide where an unbind runs.
@@ -948,6 +968,11 @@ async fn attempt_adoption(
     }
 }
 
+/// Settle wait after binding an identity scratch, covering Windows
+/// duplicate-address detection (~1 s per DAD transmit, three transmits
+/// by default) so `SendARP` sourced from the scratch actually transmits.
+const SCRATCH_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Production `ProbeIo`: scratch discipline via the auto-adopt
 /// breadcrumb helpers, fresh resolution via flush + `SendARP`, and the
 /// shared adoption tail for hand-offs.
@@ -978,6 +1003,14 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
             Ok(()) => {
                 log::info!("Cache probe: bound scratch {} for {}", scratch, subnet);
                 self.scratch_id = Some(id);
+                // A freshly bound address sits in duplicate-address
+                // detection (tentative) for ~1–3 s and is not usable as
+                // an ARP source until that clears — the same window the
+                // post-adoption sweep documents for its first pass. The
+                // conflict-probe path absorbs it across its multi-
+                // candidate loop; the identity probe gets one explicit
+                // settle, counted against the pass budget.
+                tokio::time::sleep(SCRATCH_SETTLE).await;
                 true
             }
             Err(e) => {
@@ -1001,13 +1034,26 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
     }
 
     async fn resolve(&mut self, target: Ipv4Addr, scratch: Ipv4Addr) -> Result<Option<String>, ()> {
-        arp::fresh_resolve_mac(target, scratch).await.map_err(|e| {
-            log::debug!(
-                "Cache probe: fresh resolve of {} failed closed: {}",
-                target,
-                e
-            );
-        })
+        // Logged at info per outcome — a silent miss here cost a field
+        // session; the pass touches at most a handful of pairs.
+        match arp::fresh_resolve_mac(target, scratch).await {
+            Ok(Some(mac)) => {
+                log::info!("Cache probe: {} answered with {}", target, mac);
+                Ok(Some(mac))
+            }
+            Ok(None) => {
+                log::info!("Cache probe: {} did not answer a fresh ARP", target);
+                Ok(None)
+            }
+            Err(e) => {
+                log::info!(
+                    "Cache probe: fresh resolve of {} failed closed: {}",
+                    target,
+                    e
+                );
+                Err(())
+            }
+        }
     }
 
     async fn adopt(&mut self, subnet: &str, ip: Ipv4Addr, mac: &str) -> bool {
@@ -1964,7 +2010,28 @@ impl NetworkManager {
     }
 
     pub async fn list_interfaces(&self) -> Result<Vec<InterfaceInfo>, AppError> {
-        interface::list_physical().await
+        let list = interface::list_physical().await?;
+        // Scratch/pending addresses are transient probe state, not host
+        // addresses — the UI must never render them as host rows, and
+        // their bind/release must not read as an IP change.
+        Ok(strip_pending_ips(list, &self.pending_ip_strings().await))
+    }
+
+    /// String forms of every pending (scratch or not-yet-handed-over)
+    /// address, for filtering UI-facing interface enumerations.
+    pub(crate) async fn pending_ip_strings(&self) -> HashSet<String> {
+        self.pending_ips
+            .lock()
+            .await
+            .iter()
+            .map(|e| e.ip.to_string())
+            .collect()
+    }
+
+    /// Clone of the pending-IP registry for collaborators spawned outside
+    /// the manager (the NIC watcher filters its emissions with it).
+    pub fn pending_ips_handle(&self) -> auto_adopt::PendingIps {
+        self.pending_ips.clone()
     }
 
     pub async fn get_interface(&self, name: &str) -> Result<InterfaceInfo, AppError> {
@@ -2588,6 +2655,11 @@ impl NetworkManager {
                             )
                             .await;
                             let stop = io.stop;
+                            log::info!(
+                                "Cache probe pass finished: attempted={:?}, adopted={:?}",
+                                report.attempted,
+                                report.handed_off
+                            );
                             cache_probe_attempted.extend(report.attempted);
                             if !report.skipped_at_budget.is_empty() {
                                 log::warn!(
@@ -3384,6 +3456,27 @@ mod tests {
         // ever parsing netsh output.
         let adapters = vec![adapter("Ethernet", &["192.168.1.20"])];
         assert!(adapters_binding_ip(&adapters, "172.31.169.253", Some("Ethernet")).is_empty());
+    }
+
+    #[test]
+    fn strip_pending_ips_hides_scratch_addresses_only() {
+        let pending: HashSet<String> = ["172.31.169.254".to_string()].into_iter().collect();
+
+        let list = vec![adapter("Ethernet", &["192.168.1.101", "172.31.169.254"])];
+        let out = strip_pending_ips(list, &pending);
+        let ips: Vec<&str> = out[0].ips.iter().map(|i| i.address.as_str()).collect();
+        assert_eq!(ips, vec!["192.168.1.101"]);
+
+        // Empty pending set: untouched.
+        let list = vec![adapter("Ethernet", &["192.168.1.101"])];
+        assert_eq!(strip_pending_ips(list, &HashSet::new())[0].ips.len(), 1);
+
+        // An adapter whose only address is a scratch stays listed — it
+        // reads as disconnected, it is not dropped from the list.
+        let list = vec![adapter("Ethernet 2", &["172.31.169.254"])];
+        let out = strip_pending_ips(list, &pending);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].ips.is_empty());
     }
 
     #[test]

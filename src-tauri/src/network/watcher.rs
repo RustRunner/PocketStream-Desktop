@@ -14,13 +14,19 @@
 
 use tauri::AppHandle;
 
+use super::auto_adopt::PendingIps;
+
+/// `pending` is the manager's pending-IP registry: scratch and
+/// not-yet-handed-over addresses are stripped from every emission so
+/// transient probe binds neither render as host rows nor read as IP
+/// changes to the frontend.
 #[cfg(target_os = "windows")]
-pub fn start(handle: AppHandle) -> bool {
-    imp::start(handle)
+pub fn start(handle: AppHandle, pending: PendingIps) -> bool {
+    imp::start(handle, pending)
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn start(_handle: AppHandle) -> bool {
+pub fn start(_handle: AppHandle, _pending: PendingIps) -> bool {
     false
 }
 
@@ -40,6 +46,7 @@ mod imp {
         MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE, MIB_UNICASTIPADDRESS_ROW,
     };
 
+    use crate::network::auto_adopt::PendingIps;
     use crate::network::interface;
 
     // AF_UNSPEC covers both IPv4 and IPv6 in a single registration.
@@ -88,7 +95,7 @@ mod imp {
         wake();
     }
 
-    pub fn start(handle: AppHandle) -> bool {
+    pub fn start(handle: AppHandle, pending: PendingIps) -> bool {
         // Claim the init slot. INITIALIZED stays true ONLY on success —
         // a failed attempt below resets it so a later call can retry.
         // (The old code latched it before registration, so one failure
@@ -157,11 +164,15 @@ mod imp {
         // which runs outside any tokio runtime context — a bare tokio::spawn
         // panics with "there is no reactor running", killing the process
         // silently on a Windows GUI app (no stderr to see the panic).
-        tauri::async_runtime::spawn(debounce_loop(rx, handle));
+        tauri::async_runtime::spawn(debounce_loop(rx, handle, pending));
         true
     }
 
-    async fn debounce_loop(mut rx: mpsc::UnboundedReceiver<()>, handle: AppHandle) {
+    async fn debounce_loop(
+        mut rx: mpsc::UnboundedReceiver<()>,
+        handle: AppHandle,
+        pending: PendingIps,
+    ) {
         loop {
             if rx.recv().await.is_none() {
                 return;
@@ -179,6 +190,16 @@ mod imp {
                     continue;
                 }
             };
+            // Strip transient scratch/pending addresses before the pick:
+            // a probe's bind/release must not surface as a host IP or
+            // masquerade as an IP change.
+            let pending_now: std::collections::HashSet<String> = pending
+                .lock()
+                .await
+                .iter()
+                .map(|e| e.ip.to_string())
+                .collect();
+            let list = crate::network::strip_pending_ips(list, &pending_now);
 
             // Prefer an ethernet adapter that has at least one IPv4 address.
             // Fall back to the first ethernet adapter so "disconnected but
