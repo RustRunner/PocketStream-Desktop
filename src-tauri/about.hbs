@@ -1,0 +1,20 @@
+# Third-Party Rust Crate Notices
+
+The application executable statically links the Rust crates listed
+below. This file is generated at build time by cargo-about from the
+locked dependency graph; each section is one license, followed by the
+crates distributed under it and the license text.
+
+{{#each licenses}}
+## {{{name}}} ({{id}})
+
+Used by:
+{{#each used_by}}
+- {{crate.name}} {{crate.version}}{{#if crate.repository}} — <{{{crate.repository}}}>{{/if}}
+{{/each}}
+
+~~~
+{{{text}}}
+~~~
+
+{{/each}}

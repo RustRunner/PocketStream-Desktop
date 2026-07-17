@@ -1,0 +1,27 @@
+﻿# cargo-about configuration: the license gate + notices generator for
+# the Rust crates compiled into the application executable.
+#
+# `accepted` is a hard allowlist of GPL-3.0-compatible licenses: a new
+# dependency whose license expression isn't satisfiable from this list
+# fails `cargo about generate` (run in CI and in the release workflow),
+# so an incompatible license can never ship silently.
+
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "MPL-2.0",
+    "GPL-3.0-only",
+]
+
+# Only the graph that actually links into the shipped Windows binary;
+# Linux-only deps (GTK stack pulled by tauri on unix) drop out.
+targets = ["x86_64-pc-windows-msvc"]

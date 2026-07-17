@@ -138,6 +138,20 @@ jobs:
             Pop-Location
           }
 
+      # Generate the Rust crate license notices the installer ships
+      # (resources/licenses/generated/). Doubles as the license gate:
+      # generation fails on a crate license missing from the about.toml
+      # accept list. cargo-about's binary lives behind the `cli`
+      # feature — installing without it "succeeds" with no binary.
+      - name: Generate Rust crate notices
+        shell: pwsh
+        working-directory: src-tauri
+        run: |
+          cargo install cargo-about --locked --quiet --features cli
+          if ($LASTEXITCODE -ne 0) { throw "cargo-about install failed" }
+          cargo about generate about.hbs -o resources/licenses/generated/THIRD-PARTY-RUST.md
+          if ($LASTEXITCODE -ne 0) { throw "cargo about generate failed" }
+
       # Stage the GStreamer runtime into resources/. The hardened script
       # fails on a version mismatch or any missing DLL, so a drifted SDK
       # can't ship a broken installer.
