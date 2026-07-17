@@ -112,12 +112,25 @@ export interface Credentials {
   password: string;
 }
 
+/** Backend-owned adoption lifecycle metadata, keyed like
+ *  `adopted_subnets`. The frontend never writes it — the backend
+ *  preserves it across saves and the UI reads adoption state via
+ *  `get_adoption_state` instead. */
+export interface AdoptedMeta {
+  /** RFC3339 wall time the subnet was adopted. */
+  adopted_at: string | null;
+  /** RFC3339 wall time of the last positive device evidence, or null. */
+  last_device_seen: string | null;
+}
+
 export interface AppSettings {
   stream: StreamConfig;
   rtsp_server: RtspServerConfig;
   credentials: Credentials;
   /** subnet (e.g. "192.168.1.0/24") -> adopted secondary IP */
   adopted_subnets: Record<string, string>;
+  /** subnet -> lifecycle metadata; backend-owned, see AdoptedMeta */
+  adopted_meta: Record<string, AdoptedMeta>;
   /** camera IP -> last zoom slider position (0..100) */
   zoom_positions: Record<string, number>;
   /** User's chosen network mode. Drives ARP/auto-adopt subsystem
