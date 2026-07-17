@@ -3,7 +3,7 @@ name = "pocketstream-desktop"
 version = "0.6.1"
 edition = "2021"
 description = "PocketStream for Desktop — IP Camera Monitoring & Relay Station"
-license = "GPL-3.0"
+license = "GPL-3.0-only"
 
 [dependencies]
 tauri = { version = "2", features = [] }
