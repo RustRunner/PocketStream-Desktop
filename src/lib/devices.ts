@@ -270,7 +270,19 @@ export function setupArpListeners(): void {
     const drops =
       data.missed_packets > 0 ? ` (ring drops: ${data.missed_packets})` : "";
     log(`Discovery degraded: ${data.reason}${drops}`);
-    showToast("No devices responding to discovery yet", true);
+    // The watchdog sees only the ARP capture channel — not ICMP, and
+    // not the OS ARP-table merge that backstops it at sweep end. When
+    // the panel already shows a reachable node (cached device with a
+    // green ping dot, or a Live record), a "no devices" toast
+    // contradicts what the user is looking at. Keep the log line for
+    // diagnosing real capture regressions; toast only when the panel
+    // is as empty as the capture channel.
+    const anyReachable =
+      [...pingResults.values()].some(Boolean) ||
+      deviceList.getDevices().some((r) => r.status === "live");
+    if (!anyReachable) {
+      showToast("No devices responding to discovery yet", true);
+    }
   });
 
   api.onEvent<DiscoveryRecoveredPayload>("discovery-recovered", () => {
