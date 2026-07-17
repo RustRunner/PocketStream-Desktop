@@ -16,7 +16,6 @@ import {
 import { resetDiscoveryStatus, hideDiscoveryStatus, renderArpDeviceList } from "./devices.js";
 import { handleHardDisconnect, handleReconnect, showModalWithVideo } from "./streaming.js";
 import { sessionCamIp } from "./store.ts";
-import { visibleDevices } from "./device-state.ts";
 import { formatError } from "./errors.ts";
 import type {
   AdoptionLifecyclePayload,
@@ -175,12 +174,6 @@ function isDownEvent(iface: InterfaceInfo): boolean {
 }
 
 export function setupInterfaceWatcher(): void {
-  // Adopted rows on the Host card are gated on Nodes-panel membership,
-  // so the card must repaint when the device list moves, not only on
-  // interface/adoption events — a node appearing (or a phantom row
-  // dropping out) shows/hides its adoption's row.
-  deviceList.subscribe(() => renderSubnetList());
-
   api.onEvent<InterfaceInfo>("interface-status-changed", (iface) => {
     // Capture the prior connection state BEFORE any state mutation so
     // applyUpEvent can decide whether this is a true reconnect.
@@ -425,24 +418,12 @@ export function renderSubnetList(): void {
   if (!state.activeInterface) return;
 
   const adoptedIpSet = new Set(adoptedSubnets.values());
-  // An adopted row renders only while the Nodes panel shows a device
-  // inside that adoption — same panel-strict filter, so the two cards
-  // can never disagree. An adoption is plumbing for reaching nodes; a
-  // binding with nothing behind it (a stale leftover waiting out the
-  // reaper, a subnet whose device hasn't reappeared yet) reads as
-  // mystery IPs on the Host card. The Configure dialog still lists
-  // every secondary, so hidden adoptions stay inspectable/removable
-  // there while the reaper retires the APIPA ones on its own.
-  const subnetsWithNodes = new Set(
-    visibleDevices(deviceList.getDevices(), /* panelStrict */ true).map(
-      (r) => r.subnet
-    )
-  );
-  const shownAdoptedIps = new Set(
-    [...adoptedSubnets]
-      .filter(([subnet]) => subnetsWithNodes.has(subnet))
-      .map(([, ip]) => ip)
-  );
+  // An adopted row stays on the Host card until the adoption is
+  // explicitly removed — the per-row trash control, the Configure
+  // dialog, or the APIPA reaper (all of which emit subnet-removed and
+  // clear the map). It is NOT tied to Nodes-panel contents: clearing or
+  // losing the nodes behind an adoption must not make the binding look
+  // deleted while the secondary IP is still live on the adapter.
   // Trash-icon control shared by both auto-row shapes below. `subnetEsc`
   // must already be HTML-escaped; it doubles as the removal key.
   const removeBtn = (subnetEsc: string) =>
@@ -453,13 +434,9 @@ export function renderSubnetList(): void {
   // secondary after any brief DHCP failure and they can't carry usable
   // traffic, so showing them as if they were a selectable subnet just
   // confuses users (seen on multiple Getac installs in the field).
-  // Adopted rows: gated on Nodes-panel membership (see above).
+  // Adopted rows always render (see above).
   const sortedIps = [...state.activeInterface.ips]
-    .filter((ip) =>
-      adoptedIpSet.has(ip.address)
-        ? shownAdoptedIps.has(ip.address)
-        : !isApipa(ip.address)
-    )
+    .filter((ip) => adoptedIpSet.has(ip.address) || !isApipa(ip.address))
     .sort((a, b) => {
       const aAuto = adoptedIpSet.has(a.address) ? 1 : 0;
       const bAuto = adoptedIpSet.has(b.address) ? 1 : 0;
@@ -491,11 +468,10 @@ export function renderSubnetList(): void {
     .join("");
 
   // Add auto-adopted subnets not yet bound as interface IPs (skip if
-  // already shown), under the same Nodes-panel gate as the bound rows.
+  // already shown).
   const renderedIps = new Set(state.activeInterface.ips.map((ip) => ip.address));
   for (const [subnet, adoptedIp] of adoptedSubnets) {
     if (renderedIps.has(adoptedIp)) continue;
-    if (!subnetsWithNodes.has(subnet)) continue;
     html += `
       <div class="status-row subnet-row subnet-row-auto" data-subnet="${escapeHtml(subnet)}">
         <span class="status-label">IP:</span>
