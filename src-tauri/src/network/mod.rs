@@ -1407,14 +1407,19 @@ impl NetworkManager {
             const MAX_WATCH: std::time::Duration = std::time::Duration::from_secs(300);
 
             let baseline = arp::frames_seen();
+            let self_baseline = arp::self_ip_dropped();
             tokio::time::sleep(INITIAL_WINDOW).await;
-            if arp::frames_seen() > baseline {
+            let payload_delta = arp::frames_seen().saturating_sub(baseline);
+            let self_delta = arp::self_ip_dropped().saturating_sub(self_baseline);
+            let verdict = arp::capture_health(payload_delta, self_delta);
+            if verdict == arp::CaptureHealth::Healthy {
                 return; // capture is delivering — healthy, no event
             }
 
             let missed = arp::missed_max();
             log::warn!(
-                "Discovery degraded: no ARP payload events within {}s of the ping sweep (missed_max={}, tasks_dropped={}, noneth_dropped={}, self_ip_dropped={})",
+                "Discovery degraded ({:?}): no ARP payload events within {}s of the ping sweep (missed_max={}, tasks_dropped={}, noneth_dropped={}, self_ip_dropped={})",
+                verdict,
                 INITIAL_WINDOW.as_secs(),
                 missed,
                 arp::tasks_dropped(),

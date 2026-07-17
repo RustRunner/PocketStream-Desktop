@@ -89,6 +89,34 @@ pub fn missed_max() -> u64 {
     ARP_MISSED_MAX.load(Ordering::Relaxed)
 }
 
+/// Verdict over one watchdog checkpoint window, derived from counter
+/// deltas sampled at the window edges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CaptureHealth {
+    /// Payload frames arrived — the inbound path is delivering.
+    Healthy,
+    /// No payload, but the host's own frames were delivered: the session
+    /// is alive yet deaf to inbound traffic.
+    RxDead,
+    /// Nothing was delivered at all. The provoking sweep always generates
+    /// the host's own ARP, so a flat self counter means the session is
+    /// entirely dead (a truly silent wire is indistinguishable, and
+    /// treating it as dead is harmless).
+    FullyDead,
+}
+
+/// Classify a checkpoint window. Pure so the decision is unit-testable
+/// without constructing any capture state.
+pub(crate) fn capture_health(payload_delta: u64, self_delta: u64) -> CaptureHealth {
+    if payload_delta > 0 {
+        CaptureHealth::Healthy
+    } else if self_delta > 0 {
+        CaptureHealth::RxDead
+    } else {
+        CaptureHealth::FullyDead
+    }
+}
+
 impl ArpListenerHandle {
     pub fn stop(&self) {
         let _ = self.shutdown_tx.send(true);
@@ -931,6 +959,20 @@ pub async fn send_arp_probe(
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn capture_health_verdict_table() {
+        use CaptureHealth::*;
+        // Payload delivered — healthy regardless of self noise.
+        assert_eq!(capture_health(5, 100), Healthy);
+        // A single frame landing exactly at the window edge still counts.
+        assert_eq!(capture_health(1, 0), Healthy);
+        // Alive (own sweep frames delivered) but deaf to inbound.
+        assert_eq!(capture_health(0, 7447), RxDead);
+        assert_eq!(capture_health(0, 1), RxDead);
+        // Nothing delivered at all — session entirely dead.
+        assert_eq!(capture_health(0, 0), FullyDead);
+    }
 
     #[test]
     fn checked_range_rejects_zero_length() {
