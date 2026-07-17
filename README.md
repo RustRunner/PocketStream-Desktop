@@ -92,4 +92,8 @@ The installer will be generated in `src-tauri/target/release/bundle/nsis/`.
 
 Licensed under the [GNU General Public License v3.0 only](https://www.gnu.org/licenses/gpl-3.0.html) (SPDX: `GPL-3.0-only`) — see [LICENSE](LICENSE).
 
-Third-party libraries used under Apache 2.0, MIT, and LGPL-2.1+ licenses.
+Third-party components:
+
+- The Windows installer bundles the GStreamer MSVC runtime (LGPL-2.1+, plus the GPL-2.0+ x264 encoder) and supporting libraries. Complete notices and license texts ship with every install under `resources\licenses\` and are viewable in-app (About → Licenses & Notices).
+- Corresponding source for all LGPL/GPL components — including the build recipes used to produce the binaries — is published at the [gst-src-1.26.11 release](https://github.com/RustRunner/PocketStream-Desktop/releases/tag/gst-src-1.26.11) and mirrored for each pinned GStreamer version.
+- Notices for the Rust crates compiled into the executable are generated at release time and installed as `resources\licenses\generated\THIRD-PARTY-RUST.md`.

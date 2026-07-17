@@ -1,3 +1,8 @@
+# Publishing checklist (drafts are published by hand): before publishing
+# a draft, confirm the corresponding-source prerelease for the pinned
+# GStreamer version exists (tag gst-src-<version>, staged by
+# scripts/mirror-gstreamer-src.ps1 — see its header for the publish
+# command) and link it from the release notes.
 name: Release
 
 on:
