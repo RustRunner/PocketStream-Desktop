@@ -9,6 +9,13 @@
 
 $ErrorActionPreference = "Stop"
 
+# ── Load the bundle manifest ──────────────────────────────────────────
+# The pinned version and DLL lists live in gstreamer-manifest.psd1 so the
+# third-party notices check validates the same data this script ships.
+
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Manifest  = Import-PowerShellDataFile (Join-Path $ScriptDir "gstreamer-manifest.psd1")
+
 # ── Locate GStreamer ──────────────────────────────────────────────────
 
 $GstRoot = $env:GSTREAMER_1_0_ROOT_MSVC_X86_64
@@ -31,7 +38,7 @@ Write-Host "GStreamer root: $GstRoot" -ForegroundColor Cyan
 # pinned MSI in .github/workflows/ci.yml). A drifted local SDK would ship
 # a bundle whose DLLs don't match the import libs the exe was linked with.
 
-$ExpectedVersion = "1.26.11"
+$ExpectedVersion = $Manifest.PinnedVersion
 $GstInspect = Join-Path $GstBin "gst-inspect-1.0.exe"
 if (-not (Test-Path $GstInspect)) {
     Write-Error "gst-inspect-1.0.exe not found in $GstBin -- cannot verify the SDK version."
@@ -56,7 +63,6 @@ Write-Host "GStreamer version: $InstalledVersion (matches expected)" -Foreground
 
 # ── Output directories ────────────────────────────────────────────────
 
-$ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectDir = Split-Path -Parent $ScriptDir
 $OutBin     = Join-Path $ProjectDir "src-tauri\resources\gstreamer\bin"
 $OutPlugins = Join-Path $ProjectDir "src-tauri\resources\gstreamer\lib\gstreamer-1.0"
@@ -68,151 +74,12 @@ if (Test-Path (Join-Path $ProjectDir "src-tauri\resources\gstreamer")) {
 New-Item -ItemType Directory -Force -Path $OutBin     | Out-Null
 New-Item -ItemType Directory -Force -Path $OutPlugins  | Out-Null
 
-# ── Core runtime DLLs (from bin/) ────────────────────────────────────
-# These are the GStreamer + GLib shared libraries needed at runtime.
+# ── DLL lists (from the manifest) ────────────────────────────────────
+# Core DLLs come from <root>/bin, plugins from <root>/lib/gstreamer-1.0.
+# The per-DLL rationale comments live in gstreamer-manifest.psd1.
 
-$CoreDlls = @(
-    # GStreamer core
-    "gstreamer-1.0-0.dll"
-    "gstbase-1.0-0.dll"
-    "gstapp-1.0-0.dll"
-    "gstvideo-1.0-0.dll"
-    "gstaudio-1.0-0.dll"
-    "gstpbutils-1.0-0.dll"
-    "gstnet-1.0-0.dll"
-    "gsttag-1.0-0.dll"
-    "gstrtp-1.0-0.dll"
-    "gstrtsp-1.0-0.dll"
-    "gstsdp-1.0-0.dll"
-    "gstcodecparsers-1.0-0.dll"
-    "gstgl-1.0-0.dll"
-    "gstallocators-1.0-0.dll"
-    "gstmpegts-1.0-0.dll"
-
-    # D3D11 GPU decoding/rendering dependencies
-    "gstd3d11-1.0-0.dll"
-    "gstcodecs-1.0-0.dll"
-    "gstd3dshader-1.0-0.dll"
-    "gstdxva-1.0-0.dll"
-    "gstcontroller-1.0-0.dll"
-    "gstriff-1.0-0.dll"
-
-    # OpenGL fallback + image format support
-    "graphene-1.0-0.dll"
-    "jpeg8.dll"
-    "png16.dll"
-
-    # RTSP server library
-    "gstrtspserver-1.0-0.dll"
-
-    # GLib / GObject / GIO
-    "glib-2.0-0.dll"
-    "gobject-2.0-0.dll"
-    "gmodule-2.0-0.dll"
-    "gio-2.0-0.dll"
-    "intl-8.dll"
-    "ffi-8.dll"
-    "pcre2-8-0.dll"
-    "z-1.dll"
-    "orc-0.4-0.dll"
-
-    # (No gnutls/nettle TLS stack: the MSVC runtime doesn't ship it and
-    # the app streams over plain RTP/RTSP, not SRTP/TLS — a complete
-    # install has none of these DLLs and the app runs fine without them.)
-
-    # FFmpeg / libav (for avdec_h264)
-    "avcodec-61.dll"
-    "avutil-59.dll"
-    "avfilter-10.dll"
-    "avformat-61.dll"
-    "bz2.dll"
-    "swresample-5.dll"
-    "swscale-8.dll"
-
-    # x264 encoder
-    "x264-164.dll"
-)
-
-# ── GStreamer plugins (from lib/gstreamer-1.0/) ──────────────────────
-# Only the plugins actually used by PocketStream pipelines.
-
-$Plugins = @(
-    # Core elements: tee, queue, filesrc, filesink, identity
-    "gstcoreelements.dll"
-
-    # App elements: appsink, appsrc
-    "gstapp.dll"
-
-    # Auto-detect sinks: autovideosink, autoaudiosink
-    "gstautodetect.dll"
-
-    # Video convert + scale: videoconvert, videoscale
-    "gstvideoconvertscale.dll"
-
-    # Playback: decodebin, playbin, uridecodebin
-    "gstplayback.dll"
-
-    # Type-finding (required by decodebin)
-    "gsttypefindfunctions.dll"
-
-    # RTP: rtph264depay, rtph264pay
-    "gstrtp.dll"
-
-    # RTSP source: rtspsrc
-    "gstrtsp.dll"
-
-    # RTP session management (required by rtspsrc)
-    "gstrtpmanager.dll"
-
-    # UDP elements: udpsrc, udpsink
-    "gstudp.dll"
-
-    # TCP elements (used by RTSP interleaved transport)
-    "gsttcp.dll"
-
-    # MPEG-TS demuxer: tsdemux
-    "gstmpegtsdemux.dll"
-
-    # H.264 parser: h264parse
-    "gstvideoparsersbad.dll"
-
-    # FFmpeg/libav decoders: avdec_h264
-    "gstlibav.dll"
-
-    # x264 encoder: x264enc
-    "gstx264.dll"
-
-    # ISO MP4 muxer: mp4mux, qtmux
-    "gstisomp4.dll"
-
-    # Direct3D 11 video sink + decoder (Windows GPU-accelerated)
-    "gstd3d11.dll"
-
-    # OpenGL (fallback video rendering)
-    "gstopengl.dll"
-
-    # Raw video/audio capabilities
-    "gstrawparse.dll"
-
-    # Additional codecs decodebin may need
-    "gstcodecalpha.dll"
-
-    # G.711 audio decoders: mulawdec, alawdec
-    "gstmulaw.dll"
-    "gstalaw.dll"
-
-    # Audio branch plumbing: audioconvert, audioresample
-    "gstaudioconvert.dll"
-    "gstaudioresample.dll"
-
-    # Audio mute control: volume
-    "gstvolume.dll"
-
-    # Windows audio sinks for autoaudiosink: wasapi2sink (primary),
-    # directsoundsink (fallback on older images)
-    "gstwasapi2.dll"
-    "gstdirectsound.dll"
-)
+$CoreDlls = $Manifest.CoreDlls
+$Plugins  = $Manifest.Plugins
 
 # ── Copy files ────────────────────────────────────────────────────────
 
