@@ -667,6 +667,13 @@ enum AdoptionEvidence {
     /// a device we have history with — strictly stronger evidence than
     /// two spontaneous frames, which is what justifies bypassing dwell.
     CachedMacMatch { cached_ip: Ipv4Addr, mac: String },
+    /// A live first sighting confirmed by a directed on-link probe: the
+    /// device answered a fresh ARP from the scratch with the same MAC
+    /// the sighted frame carried. The solicited reply substitutes for
+    /// the dwell gate's second spontaneous frame — freshness and
+    /// identity-consistency evidence, so a stale or stray frame with no
+    /// live sender behind it can never reach adoption.
+    FreshSightingConfirmed { probed_ip: Ipv4Addr, mac: String },
 }
 
 impl std::fmt::Display for AdoptionEvidence {
@@ -677,6 +684,13 @@ impl std::fmt::Display for AdoptionEvidence {
             }
             AdoptionEvidence::CachedMacMatch { cached_ip, mac } => {
                 write!(f, "cached device {} freshly verified at {}", mac, cached_ip)
+            }
+            AdoptionEvidence::FreshSightingConfirmed { probed_ip, mac } => {
+                write!(
+                    f,
+                    "fresh sighting {} confirmed by a directed probe at {}",
+                    mac, probed_ip
+                )
             }
         }
     }
@@ -973,6 +987,41 @@ async fn attempt_adoption(
 /// by default) so `SendARP` sourced from the scratch actually transmits.
 const SCRATCH_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Which adoption path is driving a probe pass. Picks the evidence
+/// variant a hand-off carries and the prefix its log lines wear, so
+/// fast-adopt activity never masquerades as cache-probe activity in
+/// field logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeOrigin {
+    CacheProbe,
+    FastAdopt,
+}
+
+impl ProbeOrigin {
+    fn label(self) -> &'static str {
+        match self {
+            ProbeOrigin::CacheProbe => "Cache probe",
+            ProbeOrigin::FastAdopt => "Fast adopt",
+        }
+    }
+}
+
+/// Evidence for a probe-confirmed adoption, keyed by which path ran the
+/// probe. Pure so the mapping stays testable — `RealProbeIo` itself
+/// cannot be constructed in lib tests.
+fn probe_evidence(origin: ProbeOrigin, ip: Ipv4Addr, mac: &str) -> AdoptionEvidence {
+    match origin {
+        ProbeOrigin::CacheProbe => AdoptionEvidence::CachedMacMatch {
+            cached_ip: ip,
+            mac: mac.to_string(),
+        },
+        ProbeOrigin::FastAdopt => AdoptionEvidence::FreshSightingConfirmed {
+            probed_ip: ip,
+            mac: mac.to_string(),
+        },
+    }
+}
+
 /// Production `ProbeIo`: scratch discipline via the auto-adopt
 /// breadcrumb helpers, fresh resolution via flush + `SendARP`, and the
 /// shared adoption tail for hand-offs.
@@ -986,6 +1035,8 @@ struct RealProbeIo<'a> {
     /// Set when a hand-off observed a shutdown race; the adopt loop
     /// must break after the pass returns.
     stop: bool,
+    /// Who is driving this pass — evidence variant and log prefix.
+    origin: ProbeOrigin,
 }
 
 impl cache_probe::ProbeIo for RealProbeIo<'_> {
@@ -1001,7 +1052,12 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
         .await
         {
             Ok(()) => {
-                log::info!("Cache probe: bound scratch {} for {}", scratch, subnet);
+                log::info!(
+                    "{}: bound scratch {} for {}",
+                    self.origin.label(),
+                    scratch,
+                    subnet
+                );
                 self.scratch_id = Some(id);
                 // A freshly bound address sits in duplicate-address
                 // detection (tentative) for ~1–3 s and is not usable as
@@ -1014,7 +1070,12 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
                 true
             }
             Err(e) => {
-                log::info!("Cache probe: scratch bind failed for {}: {}", subnet, e);
+                log::info!(
+                    "{}: scratch bind failed for {}: {}",
+                    self.origin.label(),
+                    subnet,
+                    e
+                );
                 false
             }
         }
@@ -1038,16 +1099,21 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
         // session; the pass touches at most a handful of pairs.
         match arp::fresh_resolve_mac(target, scratch).await {
             Ok(Some(mac)) => {
-                log::info!("Cache probe: {} answered with {}", target, mac);
+                log::info!("{}: {} answered with {}", self.origin.label(), target, mac);
                 Ok(Some(mac))
             }
             Ok(None) => {
-                log::info!("Cache probe: {} did not answer a fresh ARP", target);
+                log::info!(
+                    "{}: {} did not answer a fresh ARP",
+                    self.origin.label(),
+                    target
+                );
                 Ok(None)
             }
             Err(e) => {
                 log::info!(
-                    "Cache probe: fresh resolve of {} failed closed: {}",
+                    "{}: fresh resolve of {} failed closed: {}",
+                    self.origin.label(),
                     target,
                     e
                 );
@@ -1065,10 +1131,7 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
             self.ctx,
             ip,
             subnet,
-            AdoptionEvidence::CachedMacMatch {
-                cached_ip: ip,
-                mac: mac.to_string(),
-            },
+            probe_evidence(self.origin, ip, mac),
             &current_ips,
             self.cooldowns,
             self.known_subnets,
@@ -2647,6 +2710,7 @@ impl NetworkManager {
                                 shutdown_rx: &shutdown_rx,
                                 scratch_id: None,
                                 stop: false,
+                                origin: ProbeOrigin::CacheProbe,
                             };
                             let report = cache_probe::run_pass(
                                 &mut io,
@@ -2778,7 +2842,60 @@ impl NetworkManager {
                                 device_subnet,
                                 device.mac
                             );
-                            continue;
+                            // Solicit the second observation instead of
+                            // waiting out the device's beacon cadence: a
+                            // directed probe answered with the sighted MAC
+                            // is the repeat observation. A miss changes
+                            // nothing — the candidacy above stays armed and
+                            // the passive path remains the fallback, so the
+                            // probe must never touch the cooldown map.
+                            let Some(mac) = arp::normalize_mac(&device.mac) else {
+                                continue;
+                            };
+                            log::info!(
+                                "Fast adopt: soliciting confirmation from {} ({}) on {}",
+                                device_ip,
+                                mac,
+                                device_subnet
+                            );
+                            let candidate = cache_probe::ProbeCandidate {
+                                subnet: device_subnet.clone(),
+                                pairs: vec![(device_ip, mac)],
+                            };
+                            let mut io = RealProbeIo {
+                                ctx: &ctx,
+                                cooldowns: &mut cooldowns,
+                                known_subnets: &mut known_subnets,
+                                shutdown_rx: &shutdown_rx,
+                                scratch_id: None,
+                                stop: false,
+                                origin: ProbeOrigin::FastAdopt,
+                            };
+                            let report = cache_probe::run_pass(
+                                &mut io,
+                                vec![candidate],
+                                cache_probe::FAST_ADOPT_PROBE_BUDGET,
+                            )
+                            .await;
+                            if report.handed_off.is_empty() {
+                                log::info!(
+                                    "Fast adopt: {} did not confirm — leaving the two-observation gate armed",
+                                    device_ip
+                                );
+                            } else {
+                                log::info!(
+                                    "Fast adopt: {} confirmed by directed probe",
+                                    device_subnet
+                                );
+                                dwell.prune_subnet(&device_subnet);
+                            }
+                            // One probe per pass: the probe consumed this
+                            // iteration's slot whatever the outcome, and the
+                            // devices not reached keep their own `Started`
+                            // for a later tick. A shutdown observed by the
+                            // hand-off exits via the loop head's check, the
+                            // same way the ShutdownRace break below does.
+                            break;
                         }
                         auto_adopt::DwellVerdict::Waiting => continue,
                         auto_adopt::DwellVerdict::Mature => {}
@@ -3416,6 +3533,51 @@ mod tests {
         );
         // Held nowhere is an error, not a silent success.
         assert_eq!(classify_removal(false, false, false), RemovalRoute::Unknown);
+    }
+
+    // ── probe origin → adoption evidence ──────────────────────────
+
+    #[test]
+    fn probe_evidence_maps_each_origin_to_its_variant() {
+        let ip: Ipv4Addr = "172.31.169.61".parse().unwrap();
+        assert!(matches!(
+            probe_evidence(ProbeOrigin::CacheProbe, ip, "2c:a5:9c:2b:a9:fc"),
+            AdoptionEvidence::CachedMacMatch { cached_ip, ref mac }
+                if cached_ip == ip && mac == "2c:a5:9c:2b:a9:fc"
+        ));
+        assert!(matches!(
+            probe_evidence(ProbeOrigin::FastAdopt, ip, "2c:a5:9c:2b:a9:fc"),
+            AdoptionEvidence::FreshSightingConfirmed { probed_ip, ref mac }
+                if probed_ip == ip && mac == "2c:a5:9c:2b:a9:fc"
+        ));
+    }
+
+    #[test]
+    fn adoption_evidence_display_names_each_justification() {
+        let ip: Ipv4Addr = "172.31.169.61".parse().unwrap();
+        assert_eq!(
+            AdoptionEvidence::DwellMature {
+                mac: "aa:bb:cc:dd:ee:ff".into()
+            }
+            .to_string(),
+            "confirmed by a repeat observation from aa:bb:cc:dd:ee:ff"
+        );
+        assert_eq!(
+            AdoptionEvidence::CachedMacMatch {
+                cached_ip: ip,
+                mac: "aa:bb:cc:dd:ee:ff".into()
+            }
+            .to_string(),
+            "cached device aa:bb:cc:dd:ee:ff freshly verified at 172.31.169.61"
+        );
+        assert_eq!(
+            AdoptionEvidence::FreshSightingConfirmed {
+                probed_ip: ip,
+                mac: "aa:bb:cc:dd:ee:ff".into()
+            }
+            .to_string(),
+            "fresh sighting aa:bb:cc:dd:ee:ff confirmed by a directed probe at 172.31.169.61"
+        );
     }
 
     fn adapter(name: &str, ips: &[&str]) -> interface::InterfaceInfo {

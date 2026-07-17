@@ -127,6 +127,14 @@ pub(crate) struct PassReport {
 /// flush and `SendARP` are 10 s and ~3 s).
 pub(crate) const CACHE_PROBE_PASS_BUDGET: Duration = Duration::from_secs(90);
 
+/// Soft scheduling budget for a fast-adopt probe (one subnet, one
+/// pair). Same semantics as the cache-pass budget: `run_pass` checks
+/// the deadline only between awaited operations, never inside one — the
+/// hard bounds are the per-command timeouts (30 s scratch bind/release,
+/// 10 s flush, ~3 s `SendARP`), so for a single pair this mostly just
+/// documents the intended scale.
+pub(crate) const FAST_ADOPT_PROBE_BUDGET: Duration = Duration::from_secs(20);
+
 /// Run one probe pass over the candidate set. Per subnet: one scratch
 /// bind, each cached pair resolved in order, first fresh MAC match wins
 /// (remaining pairs skipped), and the scratch is always released before
