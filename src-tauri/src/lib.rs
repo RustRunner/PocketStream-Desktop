@@ -406,6 +406,8 @@ pub fn run() {
             // Logging
             commands::log_frontend,
             commands::open_log_folder,
+            // Licensing
+            commands::get_license_document,
             // Config
             commands::get_config,
             commands::save_config,

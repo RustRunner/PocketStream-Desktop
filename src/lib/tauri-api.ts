@@ -19,6 +19,7 @@ import type {
   DeviceRecord,
   DeviceStatus,
   InterfaceInfo,
+  LicenseDocumentId,
   NetworkMode,
   RtspServerConfig,
   RtspServerInfo,
@@ -48,6 +49,12 @@ export function logToFile(level: "info" | "warn" | "error", message: string): vo
 
 export async function openLogFolder(): Promise<void> {
   return await invoke("open_log_folder");
+}
+
+// ── Licensing ───────────────────────────────────────────────────────
+
+export async function getLicenseDocument(id: LicenseDocumentId): Promise<string> {
+  return await invoke<string>("get_license_document", { id });
 }
 
 // ── Config ──────────────────────────────────────────────────────────

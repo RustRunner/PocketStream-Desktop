@@ -140,12 +140,18 @@
                 <p class="about-text muted">
                   Based on PocketStream for Android by RustRunner.
                 </p>
-                <p class="about-text muted">Licensed under GPL-3.0</p>
+                <p class="about-text muted">Licensed under GPL-3.0-only</p>
                 <button id="open-logs" class="text-btn about-action" title="Open log files folder">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
                     <path d="M20 6h-8l-2-2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm0 12H4V8h16v10z"/>
                   </svg>
                   Open Log Folder
+                </button>
+                <button id="open-licenses" class="text-btn about-action" title="View the application license and third-party notices">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/>
+                  </svg>
+                  Licenses &amp; Notices
                 </button>
               </div>
             </div>
@@ -381,6 +387,32 @@
         <button class="text-btn" id="reset-adapter-confirm">Reset Adapter</button>
         <div class="dialog-spacer"></div>
         <button class="filled-btn" id="reset-adapter-cancel">Cancel</button>
+      </div>
+    </dialog>
+
+    <!-- Licenses & Notices Dialog -->
+    <dialog id="license-dialog" class="dialog license-dialog">
+      <h2>Licenses &amp; Notices</h2>
+      <div class="dialog-body">
+        <select id="license-doc-picker" aria-label="Select a license document">
+          <option value="app-license">PocketStream License (GPL-3.0-only)</option>
+          <option value="third-party-notices">Third-Party Notices</option>
+          <option value="rust-crates">Rust Crate Licenses</option>
+          <option value="lgpl-2.1">LGPL-2.1 License Text</option>
+          <option value="lgpl-2.0">LGPL-2.0 License Text</option>
+          <option value="gpl-2.0">GPL-2.0 License Text</option>
+          <option value="mit">MIT License Text</option>
+          <option value="bsd-3-clause">BSD-3-Clause License Text</option>
+          <option value="zlib">Zlib License Text</option>
+          <option value="libpng">libpng License Text</option>
+          <option value="libjpeg-turbo">libjpeg-turbo License Text</option>
+          <option value="bzip2">bzip2 License Text</option>
+        </select>
+        <pre id="license-doc-content"></pre>
+      </div>
+      <div class="dialog-actions">
+        <div class="dialog-spacer"></div>
+        <button class="filled-btn" id="license-dialog-close">Close</button>
       </div>
     </dialog>
 

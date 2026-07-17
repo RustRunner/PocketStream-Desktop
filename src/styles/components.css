@@ -778,6 +778,53 @@
   min-width: 460px;
 }
 
+/* Licenses & Notices dialog */
+.license-dialog {
+  width: min(720px, 90vw);
+}
+
+.license-dialog[open] {
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.license-dialog .dialog-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+}
+
+.license-dialog select {
+  background: var(--md-surface-variant);
+  border: 1px solid transparent;
+  border-radius: var(--md-radius-sm);
+  color: var(--md-on-surface);
+  padding: 10px 12px;
+  font-size: 14px;
+  font-family: var(--md-font);
+  transition: border-color var(--md-transition);
+}
+
+.license-dialog select:focus {
+  outline: none;
+  border-color: var(--md-primary);
+}
+
+#license-doc-content {
+  flex: 1;
+  min-height: 200px;
+  overflow: auto;
+  white-space: pre-wrap;
+  background: var(--md-surface-variant);
+  border-radius: var(--md-radius-sm);
+  padding: 12px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .dialog-title-row {
   display: flex;
   align-items: center;

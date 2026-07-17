@@ -264,3 +264,20 @@ export interface DiscoveryDegradedPayload {
 /** The `discovery-recovered` event (empty payload) fires once after a
  *  `discovery-degraded` when the first ARP frame finally parses. */
 export type DiscoveryRecoveredPayload = Record<string, never>;
+
+/** Document ids accepted by `get_license_document`. Mirrors the fixed
+ *  allowlist in `src-tauri/src/commands/mod.rs` — ids, not paths, are
+ *  the IPC contract. */
+export type LicenseDocumentId =
+  | "app-license"
+  | "third-party-notices"
+  | "rust-crates"
+  | "lgpl-2.1"
+  | "lgpl-2.0"
+  | "gpl-2.0"
+  | "mit"
+  | "bsd-3-clause"
+  | "zlib"
+  | "libpng"
+  | "libjpeg-turbo"
+  | "bzip2";

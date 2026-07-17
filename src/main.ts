@@ -49,6 +49,7 @@ import {
 import { setupPtzControls } from "./lib/ptz.ts";
 import type {
   Credentials,
+  LicenseDocumentId,
   RtspServerConfig,
   StreamConfig,
   StreamProtocol,
@@ -478,6 +479,49 @@ function setupMenuAndAbout(): void {
     api
       .openLogFolder()
       .catch((e: unknown) => showToast("Failed to open logs: " + formatError(e), true));
+  });
+
+  // Licenses & Notices dialog
+  const licenseDialog = $<HTMLDialogElement>("#license-dialog");
+  const licensePicker = $<HTMLSelectElement>("#license-doc-picker");
+  const licenseContent = $<HTMLElement>("#license-doc-content");
+
+  const loadLicenseDoc = async (): Promise<void> => {
+    const id = licensePicker.value as LicenseDocumentId;
+    licenseContent.classList.remove("muted");
+    licenseContent.textContent = "Loading…";
+    try {
+      // textContent only: the documents are plain text/markdown from
+      // the app's own resources, rendered verbatim.
+      licenseContent.textContent = await api.getLicenseDocument(id);
+    } catch (e: unknown) {
+      const msg = formatError(e);
+      if (msg.includes("not generated")) {
+        // The Rust-crate notices file only exists in release builds.
+        licenseContent.classList.add("muted");
+        licenseContent.textContent =
+          "This document is generated during release builds and is not present in a development build.";
+      } else {
+        licenseContent.textContent = "";
+        showToast("Failed to load document: " + msg, true);
+      }
+    }
+  };
+
+  $<HTMLButtonElement>("#open-licenses").addEventListener("click", () => {
+    void (async () => {
+      // Through showModalWithVideo, not showModal: the native video
+      // child z-orders above the WebView, so a bare showModal leaves
+      // the dialog buried under a running stream.
+      await showModalWithVideo(licenseDialog);
+      await loadLicenseDoc();
+    })();
+  });
+  licensePicker.addEventListener("change", () => {
+    void loadLicenseDoc();
+  });
+  $<HTMLButtonElement>("#license-dialog-close").addEventListener("click", () => {
+    licenseDialog.close();
   });
 
   // Hamburger toggles settings sidebar
