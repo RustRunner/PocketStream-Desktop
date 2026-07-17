@@ -64,6 +64,11 @@ interface QueuedPtuCmd {
    *  (resolves null). Used to drop a queued move whose release already
    *  happened. */
   stillWanted?: () => boolean;
+  /** Explicit target for entries that must reach a specific unit
+   *  regardless of the current alias state (the farewell halt) —
+   *  dequeue-time resolution would otherwise drop them once the alias
+   *  is cleared, or worse, send them to the new holder. */
+  targetIp?: string;
 }
 
 const ptuQueue: QueuedPtuCmd[] = [];
@@ -71,10 +76,16 @@ let ptuDraining = false;
 
 function enqueuePtuCmd(
   cmd: string | (() => string),
-  opts?: { stillWanted?: () => boolean }
+  opts?: { stillWanted?: () => boolean; targetIp?: string }
 ): Promise<Record<string, string> | null> {
   return new Promise((resolve, reject) => {
-    ptuQueue.push({ cmd, resolve, reject, stillWanted: opts?.stillWanted });
+    ptuQueue.push({
+      cmd,
+      resolve,
+      reject,
+      stillWanted: opts?.stillWanted,
+      targetIp: opts?.targetIp,
+    });
     if (!ptuDraining) {
       ptuDraining = true;
       void drainPtuQueue();
@@ -89,7 +100,7 @@ async function drainPtuQueue(): Promise<void> {
       item.resolve(null);
       continue;
     }
-    const ip = getPtuIp();
+    const ip = item.targetIp ?? getPtuIp();
     if (!ip) {
       item.resolve(null);
       continue;
@@ -102,6 +113,47 @@ async function drainPtuQueue(): Promise<void> {
     }
   }
   ptuDraining = false;
+}
+
+/** Drop every pending queue entry, resolved null — the same
+ *  disposition as a stillWanted drop. The single in-flight command,
+ *  if any, already left the queue and completes first. */
+function purgePtuQueue(): void {
+  while (ptuQueue.length > 0) {
+    ptuQueue.shift()!.resolve(null);
+  }
+}
+
+/** Halt a specific PTU unit by IP, bypassing alias resolution. Called
+ *  when a unit loses its PTU designation while it may be moving: a
+ *  delivered move whose release-stop is still queued would otherwise
+ *  drive the unit until its firmware limits (and extreme angles are a
+ *  known firmware-crash trigger). Pending entries are purged first —
+ *  they were intended for this unit and are superseded by the halt,
+ *  and once the alias moves they would resolve against the wrong
+ *  target. The velocity-stop then rides the FIFO pinned to the
+ *  outgoing IP so it cannot race the in-flight command on the unit's
+ *  single-threaded control handler. Fire-and-track: the caller is
+ *  never blocked; a failed halt retries once, then surfaces loudly —
+ *  a possibly-still-moving PTU is the one physical-safety event in
+ *  role reassignment. */
+export function haltPtuUnit(ip: string): void {
+  purgePtuQueue();
+  void (async () => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await enqueuePtuCmd("PS=0&TS=0", { targetIp: ip });
+        return;
+      } catch (e) {
+        if (attempt === 0) continue;
+        log(`PTU halt failed for ${ip}: ${formatError(e)}`);
+        showToast(
+          `PTU halt failed — ${ip} may still be moving; stop it via its web interface or power`,
+          true
+        );
+      }
+    }
+  })();
 }
 
 async function ptuCmd(cmd: string): Promise<Record<string, string> | null> {
