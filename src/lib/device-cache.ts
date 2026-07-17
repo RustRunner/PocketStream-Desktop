@@ -142,6 +142,14 @@ async function handleAddNode(): Promise<void> {
     return;
   }
 
+  // CAM/PTU are single-holder role designations assigned from the
+  // Nodes panel — typing one here would bypass that enforcement.
+  // Backend rejects it too; this is the friendlier pre-flight error.
+  if (alias === "CAM" || alias === "PTU") {
+    showToast("CAM and PTU are assigned from the Nodes panel", true);
+    return;
+  }
+
   // Routability check — informational, doesn't block. Lets the user
   // pre-add nodes for a subnet they're about to configure (e.g.,
   // typing 192.168.1.50 before adding a secondary IP on .100). If

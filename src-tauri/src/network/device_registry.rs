@@ -537,10 +537,11 @@ impl Default for DeviceRegistry {
 }
 
 /// Aliases with reserved role semantics: at most one record may hold
-/// each at any time.
+/// each at any time. Exact, case-sensitive match — "Cam" or "CAM2" are
+/// ordinary custom names.
 const ROLE_ALIASES: [&str; 2] = ["CAM", "PTU"];
 
-fn is_role_alias(alias: &str) -> bool {
+pub(crate) fn is_role_alias(alias: &str) -> bool {
     ROLE_ALIASES.contains(&alias)
 }
 
@@ -972,6 +973,18 @@ mod tests {
     }
 
     // ── role exclusivity (single-holder invariant) ──────────────────
+
+    #[test]
+    fn role_alias_match_is_exact_and_case_sensitive() {
+        assert!(is_role_alias("CAM"));
+        assert!(is_role_alias("PTU"));
+        // Near-misses are ordinary custom names.
+        assert!(!is_role_alias("Cam"));
+        assert!(!is_role_alias("cam"));
+        assert!(!is_role_alias("CAM2"));
+        assert!(!is_role_alias("ptu"));
+        assert!(!is_role_alias(""));
+    }
 
     /// Count of records currently holding `role`.
     fn holders(r: &DeviceRegistry, role: &str) -> usize {

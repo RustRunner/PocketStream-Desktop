@@ -153,6 +153,14 @@ pub async fn add_manual_node(
     // up persisted and re-served to the frontend.
     ip.parse::<std::net::Ipv4Addr>()
         .map_err(|_| AppError::Network(format!("Invalid IP: {}", ip)))?;
+    // CAM/PTU are single-holder role designations with their own
+    // assignment path; accepting them here would bypass the
+    // single-holder enforcement.
+    if crate::network::device_registry::is_role_alias(&alias) {
+        return Err(AppError::Network(
+            "CAM and PTU are assigned from the Nodes panel".into(),
+        ));
+    }
     config.add_manual_node(ManualNode { ip, alias })?;
     // Reflect the new pin in the live registry so the Nodes panel
     // updates without a full mode-switch. hydrate_manual_nodes patches
