@@ -22,15 +22,29 @@ pub struct ArpDevice {
     pub last_seen: String,
 }
 
+/// Handle to a live capture session.
+///
+/// Drop-safety: dropping the handle drops `shutdown_tx`; the blocking
+/// capture thread's `changed()` then errors, `session.stop()` runs, and
+/// the callback context is released — a dropped handle can never leak a
+/// live fixed-name capture session. [`ArpListenerHandle::stop_into_join`]
+/// is the deliberate path; the drop path is the safety net.
 pub struct ArpListenerHandle {
     shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// The spawn_blocking capture thread. A blocking task cannot be
+    /// aborted, so teardown must either bounded-join this or park it in
+    /// the prior-capture guard — never abandon it while a new session
+    /// start is possible (the session name is fixed).
+    join: tokio::task::JoinHandle<()>,
+    counters: Arc<SessionCounters>,
 }
 
 /// Monotonic count of ARP frames the capture backend has delivered and
-/// parsed (incremented in [`on_arp_seen`], which only the capture
-/// callback reaches — the OS ARP-table merge does not touch it). The
-/// quiet-network watchdog compares this against a per-session baseline
-/// to tell "capture is delivering payload events" from silence.
+/// parsed. Incremented synchronously in the data callback the moment a
+/// frame passes the sender gate — before the dedupe window, the session
+/// fence, and the task bound — so it cannot under-count during a flood
+/// or a slow registry. Cumulative across sessions; the watchdog samples
+/// the per-session [`SessionCounters`] instead.
 static ARP_FRAMES_SEEN: AtomicU64 = AtomicU64::new(0);
 
 /// Largest missed-packet count the ring has reported in any callback —
@@ -117,9 +131,125 @@ pub(crate) fn capture_health(payload_delta: u64, self_delta: u64) -> CaptureHeal
     }
 }
 
+/// Per-session counters for the two signals the health verdict needs.
+///
+/// The process-global counters cannot isolate a capture-only restart: it
+/// keeps the same discovery generation, so already-spawned callbacks from
+/// a torn-down session still pass the fence and keep incrementing the
+/// globals — a deaf replacement session could look healthy at its
+/// checkpoint. Each listener start gets its own instance, shared between
+/// the callback context and the returned handle; health checks sample
+/// deltas through the current handle only.
+#[derive(Debug, Default)]
+pub(crate) struct SessionCounters {
+    frames_seen: AtomicU64,
+    self_ip_dropped: AtomicU64,
+}
+
+/// A point-in-time read of one session's counters, for delta math across
+/// a checkpoint window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CounterSnapshot {
+    pub frames_seen: u64,
+    pub self_ip_dropped: u64,
+}
+
+impl SessionCounters {
+    pub(crate) fn snapshot(&self) -> CounterSnapshot {
+        CounterSnapshot {
+            frames_seen: self.frames_seen.load(Ordering::Relaxed),
+            self_ip_dropped: self.self_ip_dropped.load(Ordering::Relaxed),
+        }
+    }
+
+    fn note_self_ip_dropped(&self) {
+        self.self_ip_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Synchronous accept-point bookkeeping, called by the data callback the
+/// moment a frame passes the sender gate — before the dedupe window, the
+/// session fence, and the task bound — so the liveness signal never
+/// depends on Tokio scheduling or the flood bound. Registry merging stays
+/// in the spawned task; only the counting lives here.
+fn record_accepted_frame(counters: &SessionCounters) {
+    counters.frames_seen.fetch_add(1, Ordering::Relaxed);
+    ARP_FRAMES_SEEN.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Resolves once the blocking capture thread has run session start: the
+/// achieved scope on success, or the start error. A receiver that drops
+/// without listening loses nothing — the send is fire-and-forget.
+pub(crate) type ActivationRx = tokio::sync::oneshot::Receiver<Result<pktmon::ScopeOutcome, String>>;
+
+/// Bound on joining a prior capture thread before starting a new session.
+pub(crate) const CAPTURE_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// JoinHandles of capture threads that were told to stop but have not yet
+/// been observed dead. The session name is fixed, so a second session must
+/// never start while one of these may still hold the old one open — every
+/// capture start drains this first. A Vec because a stop can park a handle
+/// while an earlier parked one is still running out.
+///
+/// Callers of [`drain_prior_capture`] are serialized structurally, not by
+/// this lock: the initial start runs under the discovery lifecycle mutex,
+/// and any restart path is cooperatively stopped before a new start
+/// reaches the guard.
+pub(crate) type PriorCaptureJoins = Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>;
+
+/// Join every parked capture thread within [`CAPTURE_JOIN_TIMEOUT`].
+/// `Ok` ⇒ all prior threads exited (the fixed session name is free);
+/// `Err` ⇒ at least one still lives — it is re-parked and the caller must
+/// not start a capture session.
+pub(crate) async fn drain_prior_capture(slot: &PriorCaptureJoins) -> Result<(), AppError> {
+    drain_prior_capture_within(slot, CAPTURE_JOIN_TIMEOUT).await
+}
+
+async fn drain_prior_capture_within(
+    slot: &PriorCaptureJoins,
+    bound: Duration,
+) -> Result<(), AppError> {
+    let parked: Vec<tokio::task::JoinHandle<()>> = std::mem::take(&mut *slot.lock().await);
+    if parked.is_empty() {
+        return Ok(());
+    }
+    let deadline = tokio::time::Instant::now() + bound;
+    let mut survivors = Vec::new();
+    for mut handle in parked {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        // `&mut JoinHandle` is pollable, so a timeout does not consume the
+        // handle — the unfinished thread re-parks instead of being lost.
+        match tokio::time::timeout(remaining, &mut handle).await {
+            Ok(_) => {} // exited (a panic also counts — the thread is gone)
+            Err(_) => survivors.push(handle),
+        }
+    }
+    if survivors.is_empty() {
+        Ok(())
+    } else {
+        let n = survivors.len();
+        slot.lock().await.extend(survivors);
+        Err(AppError::Network(format!(
+            "{} previous capture thread(s) have not exited — refusing to start a second fixed-name capture session",
+            n
+        )))
+    }
+}
+
 impl ArpListenerHandle {
-    pub fn stop(&self) {
+    /// Signal shutdown and surrender the blocking thread's JoinHandle so
+    /// the caller can bounded-join it or park it in the prior-capture
+    /// guard. The shutdown is already sent when this returns; dropping
+    /// the returned handle does not un-stop the thread.
+    pub fn stop_into_join(self) -> tokio::task::JoinHandle<()> {
         let _ = self.shutdown_tx.send(true);
+        self.join
+    }
+
+    /// The session's own counters — the only valid sampling source for
+    /// health checks against this session.
+    pub(crate) fn counters(&self) -> Arc<SessionCounters> {
+        self.counters.clone()
     }
 }
 
@@ -246,6 +376,8 @@ struct CallbackContext {
     /// wired Ethernet port's peers become nodes. Empty ⇒ no filtering
     /// (interface enumeration failed, or there were no such subnets).
     excluded_subnets: Vec<ipnetwork::Ipv4Network>,
+    /// This session's liveness counters, shared with the returned handle.
+    counters: Arc<SessionCounters>,
 }
 
 /// No-op event callback. The realtime stream signals lifecycle events
@@ -411,6 +543,7 @@ unsafe fn data_cb_inner(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor
         }
         SenderVerdict::DropSelfIp => {
             ARP_SELF_IP_DROPPED.fetch_add(1, Ordering::Relaxed);
+            ctx.counters.note_self_ip_dropped();
             if !ctx.selfip_logged.swap(true, Ordering::Relaxed) {
                 log::info!(
                     "Filtering ARP from our own IP {} out of discovery — the host never lists itself",
@@ -424,6 +557,10 @@ unsafe fn data_cb_inner(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor
         // against our own IP and cached as a ghost node.
         SenderVerdict::DropOwnMac => return,
     }
+
+    // Liveness is recorded here, at parse-accept — a deduped or fenced
+    // frame still proves the inbound path delivers.
+    record_accepted_frame(&ctx.counters);
 
     if let Ok(mut lru) = ctx.dedupe.lock() {
         if !lru.admit(op, mac, ip.octets(), Instant::now()) {
@@ -485,9 +622,6 @@ async fn on_arp_seen(
     emitter: Arc<DeviceListEmitter>,
     app_handle: tauri::AppHandle,
 ) {
-    // Payload-event liveness signal for the quiet-network watchdog.
-    ARP_FRAMES_SEEN.fetch_add(1, Ordering::Relaxed);
-
     let ip_str = ip.to_string();
     let mac_str = format_mac(&mac);
     let octets = ip.octets();
@@ -556,6 +690,30 @@ async fn on_arp_seen(
     }
 }
 
+/// Everything a capture listener start needs. Bundled so a restart path
+/// can hold a clone and start an identical session later.
+#[derive(Clone)]
+pub(crate) struct ListenerParams {
+    pub devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
+    pub registry: Arc<DeviceRegistry>,
+    pub emitter: Arc<DeviceListEmitter>,
+    pub app_handle: tauri::AppHandle,
+    /// Every IPv4 address currently assigned to any local adapter, shared
+    /// with the discovery loop that refreshes it as addresses change. A
+    /// captured ARP sent from one of these is the host itself and is
+    /// dropped — the host never lists itself as a peer.
+    pub local_ips: Arc<StdMutex<HashSet<Ipv4Addr>>>,
+    /// The target adapter's own MAC; ARP frames sent by it are skipped
+    /// (see [`on_arp_seen`]'s phantom-peer note).
+    pub own_mac: Option<[u8; 6]>,
+    pub fence: super::SweepFence,
+    /// Subnets owned exclusively by non-Ethernet interfaces; a captured
+    /// ARP whose sender IP is in one is dropped.
+    pub excluded_subnets: Vec<ipnetwork::Ipv4Network>,
+    /// The selected wired adapter's capture identity.
+    pub scope: pktmon::CaptureScope,
+}
+
 /// Start the PacketMonitor ARP listener. The capture session is scoped
 /// at attach time to the selected wired adapter's data source (with an
 /// unscoped fresh session as the fail-open fallback), and the in-driver
@@ -563,31 +721,32 @@ async fn on_arp_seen(
 /// stay active in both modes as defense-in-depth — they are the only
 /// scoping when the fallback is in effect.
 ///
-/// `local_ips` — every IPv4 address currently assigned to any local
-/// adapter, shared with the discovery loop that refreshes it as addresses
-/// change. A captured ARP sent from one of these is the host itself and
-/// is dropped — the host never lists itself as a peer.
-///
-/// `own_mac` — the target adapter's own MAC; ARP frames sent by it are
-/// skipped (see [`on_arp_seen`]'s phantom-peer note).
-///
-/// `excluded_subnets` — subnets owned exclusively by non-Ethernet
-/// interfaces; a captured ARP whose sender IP is in one is dropped.
-///
-/// `scope` — the selected wired adapter's capture identity.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn start_listener(
-    devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
-    registry: Arc<DeviceRegistry>,
-    emitter: Arc<DeviceListEmitter>,
-    app_handle: tauri::AppHandle,
-    local_ips: Arc<StdMutex<HashSet<Ipv4Addr>>>,
-    own_mac: Option<[u8; 6]>,
-    fence: super::SweepFence,
-    excluded_subnets: Vec<ipnetwork::Ipv4Network>,
-    scope: pktmon::CaptureScope,
-) -> Result<ArpListenerHandle, AppError> {
+/// The first await drains the prior-capture guard: the session name is
+/// fixed, so no new session may start while a previous capture thread
+/// may still hold it. The returned [`ActivationRx`] resolves once the
+/// blocking thread has actually run the session start.
+pub(crate) async fn start_listener(
+    params: ListenerParams,
+    prior: &PriorCaptureJoins,
+) -> Result<(ArpListenerHandle, ActivationRx), AppError> {
+    drain_prior_capture(prior).await?;
+
+    let ListenerParams {
+        devices,
+        registry,
+        emitter,
+        app_handle,
+        local_ips,
+        own_mac,
+        fence,
+        excluded_subnets,
+        scope,
+    } = params;
+
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let (activation_tx, activation_rx) = tokio::sync::oneshot::channel();
+    let counters = Arc::new(SessionCounters::default());
+    let counters_for_ctx = counters.clone();
     let runtime = tokio::runtime::Handle::current();
 
     {
@@ -601,7 +760,7 @@ pub(crate) fn start_listener(
         );
     }
 
-    tokio::task::spawn_blocking(move || {
+    let join = tokio::task::spawn_blocking(move || {
         let ctx = Arc::new(CallbackContext {
             own_mac,
             local_ips,
@@ -619,6 +778,7 @@ pub(crate) fn start_listener(
             noneth_logged: AtomicBool::new(false),
             selfip_logged: AtomicBool::new(false),
             excluded_subnets,
+            counters: counters_for_ctx,
         });
 
         let config = pktmon::RealtimeStreamConfiguration {
@@ -631,23 +791,28 @@ pub(crate) fn start_listener(
 
         let session = match pktmon::CaptureSession::start("PocketStreamArpCapture", config, &scope)
         {
-            Ok((s, pktmon::ScopeOutcome::SelectedInterface)) => {
-                log::info!(
-                    "PacketMonitor: ARP capture active (scope=selected-interface, adapter='{}')",
-                    scope.display_name
-                );
-                s
-            }
-            Ok((s, pktmon::ScopeOutcome::UnscopedFallback { reason })) => {
-                log::warn!(
-                    "PacketMonitor: ARP capture active (scope=unscoped-fallback, adapter='{}'): {}",
-                    scope.display_name,
-                    reason
-                );
+            Ok((s, outcome)) => {
+                match &outcome {
+                    pktmon::ScopeOutcome::SelectedInterface => {
+                        log::info!(
+                            "PacketMonitor: ARP capture active (scope=selected-interface, adapter='{}')",
+                            scope.display_name
+                        );
+                    }
+                    pktmon::ScopeOutcome::UnscopedFallback { reason } => {
+                        log::warn!(
+                            "PacketMonitor: ARP capture active (scope=unscoped-fallback, adapter='{}'): {}",
+                            scope.display_name,
+                            reason
+                        );
+                    }
+                }
+                let _ = activation_tx.send(Ok(outcome));
                 s
             }
             Err(e) => {
                 log::warn!("PacketMonitor: capture start failed: {}", e);
+                let _ = activation_tx.send(Err(e));
                 return;
             }
         };
@@ -666,7 +831,14 @@ pub(crate) fn start_listener(
         drop(ctx);
     });
 
-    Ok(ArpListenerHandle { shutdown_tx })
+    Ok((
+        ArpListenerHandle {
+            shutdown_tx,
+            join,
+            counters,
+        },
+        activation_rx,
+    ))
 }
 
 /// Parse a full Ethernet II frame carrying an ARP payload into
@@ -972,6 +1144,66 @@ mod tests {
         assert_eq!(capture_health(0, 1), RxDead);
         // Nothing delivered at all — session entirely dead.
         assert_eq!(capture_health(0, 0), FullyDead);
+    }
+
+    #[test]
+    fn session_counters_isolated_across_instances() {
+        // The sampling seam of a capture restart: late callbacks bound to
+        // a torn-down session's counters must not satisfy a checkpoint
+        // that samples the replacement session's counters.
+        let old_session = SessionCounters::default();
+        let new_session = SessionCounters::default();
+        record_accepted_frame(&old_session);
+        record_accepted_frame(&old_session);
+        old_session.note_self_ip_dropped();
+        let stale = old_session.snapshot();
+        let fresh = new_session.snapshot();
+        assert_eq!((stale.frames_seen, stale.self_ip_dropped), (2, 1));
+        assert_eq!((fresh.frames_seen, fresh.self_ip_dropped), (0, 0));
+    }
+
+    #[test]
+    fn accepted_frame_counts_even_when_task_bound_saturated() {
+        // A frame the parser accepts must register as liveness even when
+        // the on_arp_seen task bound would drop it.
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let _held = try_admit_arp_task(&sem).expect("first admit");
+        assert!(try_admit_arp_task(&sem).is_none());
+        let counters = SessionCounters::default();
+        record_accepted_frame(&counters);
+        assert_eq!(counters.snapshot().frames_seen, 1);
+    }
+
+    #[tokio::test]
+    async fn drain_prior_capture_empty_is_ok() {
+        let slot: PriorCaptureJoins = Arc::new(Mutex::new(Vec::new()));
+        assert!(drain_prior_capture(&slot).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn drain_prior_capture_joins_exited_thread() {
+        let slot: PriorCaptureJoins = Arc::new(Mutex::new(Vec::new()));
+        slot.lock().await.push(tokio::task::spawn_blocking(|| {}));
+        assert!(drain_prior_capture(&slot).await.is_ok());
+        assert!(slot.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_prior_capture_reparks_stuck_thread_then_recovers() {
+        let slot: PriorCaptureJoins = Arc::new(Mutex::new(Vec::new()));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        slot.lock().await.push(tokio::task::spawn_blocking(move || {
+            let _ = release_rx.recv();
+        }));
+        // Stuck thread: the bounded join must fail without losing the
+        // handle, so no capture start can proceed while it lives.
+        let res = drain_prior_capture_within(&slot, Duration::from_millis(100)).await;
+        assert!(res.is_err());
+        assert_eq!(slot.lock().await.len(), 1);
+        // Once the thread exits, the next drain frees the session name.
+        release_tx.send(()).expect("release stuck thread");
+        assert!(drain_prior_capture(&slot).await.is_ok());
+        assert!(slot.lock().await.is_empty());
     }
 
     #[test]

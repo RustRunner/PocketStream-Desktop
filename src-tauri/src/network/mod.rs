@@ -222,6 +222,10 @@ pub struct NetworkManager {
     arp_devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
     adopted_ips: Arc<Mutex<HashMap<String, Ipv4Addr>>>,
     arp_listener_handle: Arc<Mutex<Option<arp::ArpListenerHandle>>>,
+    /// Capture threads told to stop but not yet observed dead. Every
+    /// capture start drains this (bounded join) before attaching — the
+    /// session name is fixed, so two live sessions must never overlap.
+    prior_capture_joins: arp::PriorCaptureJoins,
     auto_adopt_handle: Arc<Mutex<Option<AutoAdoptHandle>>>,
     /// Secondary IPs the auto-adopt loop has bound but not yet handed over
     /// to `adopted_ips` (scratch probes and unrecorded final adds), tagged
@@ -442,6 +446,7 @@ impl NetworkManager {
             arp_devices: Arc::new(Mutex::new(HashMap::new())),
             adopted_ips: Arc::new(Mutex::new(HashMap::new())),
             arp_listener_handle: Arc::new(Mutex::new(None)),
+            prior_capture_joins: Arc::new(Mutex::new(Vec::new())),
             auto_adopt_handle: Arc::new(Mutex::new(None)),
             pending_ips: Arc::new(Mutex::new(Vec::new())),
             adoption_seq: Arc::new(AtomicU64::new(0)),
@@ -1324,17 +1329,22 @@ impl NetworkManager {
         // separately call get_device_list.
         emitter.poke();
 
-        let handle = arp::start_listener(
-            devices.clone(),
-            registry.clone(),
-            emitter.clone(),
+        let listener_params = arp::ListenerParams {
+            devices: devices.clone(),
+            registry: registry.clone(),
+            emitter: emitter.clone(),
             app_handle,
-            local_ips.clone(),
+            local_ips: local_ips.clone(),
             own_mac,
-            fence.clone(),
-            excluded_subnets.clone(),
-            capture_scope,
-        )?;
+            fence: fence.clone(),
+            excluded_subnets: excluded_subnets.clone(),
+            scope: capture_scope,
+        };
+        // The activation signal is unconsumed for now — the session start
+        // result is still surfaced by the capture thread's own logging.
+        let (handle, _activation_rx) =
+            arp::start_listener(listener_params, &self.prior_capture_joins).await?;
+        let session_counters = handle.counters();
         *self.arp_listener_handle.lock().await = Some(handle);
 
         // Ping sweep known subnets to provoke ARP traffic so the capture
@@ -1398,6 +1408,7 @@ impl NetworkManager {
         // only — it never flips availability, and emits at most one
         // degraded per session, cleared by a recovered on the first frame.
         let watchdog_app = app_handle_for_adopt.clone();
+        let watchdog_counters = session_counters;
         let watchdog = tokio::spawn(async move {
             use tauri::Emitter;
             // Longer than the 500 ms sweep-start delay plus the sweep
@@ -1406,11 +1417,14 @@ impl NetworkManager {
             const POLL: std::time::Duration = std::time::Duration::from_secs(2);
             const MAX_WATCH: std::time::Duration = std::time::Duration::from_secs(300);
 
-            let baseline = arp::frames_seen();
-            let self_baseline = arp::self_ip_dropped();
+            // Sample through this session's own counters — the globals
+            // keep counting late callbacks from prior sessions, which
+            // could mask a deaf replacement session.
+            let baseline = watchdog_counters.snapshot();
             tokio::time::sleep(INITIAL_WINDOW).await;
-            let payload_delta = arp::frames_seen().saturating_sub(baseline);
-            let self_delta = arp::self_ip_dropped().saturating_sub(self_baseline);
+            let now = watchdog_counters.snapshot();
+            let payload_delta = now.frames_seen.saturating_sub(baseline.frames_seen);
+            let self_delta = now.self_ip_dropped.saturating_sub(baseline.self_ip_dropped);
             let verdict = arp::capture_health(payload_delta, self_delta);
             if verdict == arp::CaptureHealth::Healthy {
                 return; // capture is delivering — healthy, no event
@@ -1418,9 +1432,10 @@ impl NetworkManager {
 
             let missed = arp::missed_max();
             log::warn!(
-                "Discovery degraded ({:?}): no ARP payload events within {}s of the ping sweep (missed_max={}, tasks_dropped={}, noneth_dropped={}, self_ip_dropped={})",
+                "Discovery degraded ({:?}): no ARP payload events within {}s of the ping sweep (payload_total={}, missed_max={}, tasks_dropped={}, noneth_dropped={}, self_ip_dropped={})",
                 verdict,
                 INITIAL_WINDOW.as_secs(),
+                arp::frames_seen(),
                 missed,
                 arp::tasks_dropped(),
                 arp::noneth_dropped(),
@@ -1440,7 +1455,7 @@ impl NetworkManager {
             while waited < MAX_WATCH {
                 tokio::time::sleep(POLL).await;
                 waited += POLL;
-                if arp::frames_seen() > baseline {
+                if watchdog_counters.snapshot().frames_seen > baseline.frames_seen {
                     log::info!("Discovery recovered: ARP payload events resumed");
                     let _ = watchdog_app.emit("discovery-recovered", serde_json::json!({}));
                     return;
@@ -2233,7 +2248,13 @@ impl NetworkManager {
             h.abort();
         }
         if let Some(h) = self.arp_listener_handle.lock().await.take() {
-            h.stop();
+            // Signal shutdown and park the capture thread's join in the
+            // guard — the next capture start bounded-joins it there, so
+            // stop itself never blocks on the blocking thread.
+            self.prior_capture_joins
+                .lock()
+                .await
+                .push(h.stop_into_join());
             log::info!("ARP discovery stopped");
         }
         // Reconcile any secondary IP the (now-stopped) adoption left bound
