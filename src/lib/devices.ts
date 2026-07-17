@@ -40,6 +40,8 @@ import {
   visibleDevices,
 } from "./device-state.ts";
 import * as deviceList from "./device-list.ts";
+import { getActivePlaybackIp, stopStreamNow } from "./streaming.ts";
+import { haltPtuUnit } from "./ptz.ts";
 import { selectedDevice, sessionCamIp } from "./store.ts";
 import { formatError } from "./errors.ts";
 import type {
@@ -732,10 +734,26 @@ export function renderArpDeviceList(): void {
 
 // ── Role dropdown handling ──────────────────────────────────────────
 
-/** Apply a role-menu pick: write the alias and, for CAM, carry the
- *  designation side effects. No-ops (re-picking the held role, Clear
- *  on an alias-less node) short-circuit before the IPC round-trip.
- *  The backend event re-render rebuilds every select on success. */
+/** Apply a role-menu pick through the full transition matrix. Which
+ *  roles are lost is derived from the pre-mutation snapshot rather
+ *  than from the picked action, because one alias field holds both
+ *  roles: assigning CAM onto the node holding PTU strips its PTU
+ *  exactly like a PTU steal would, and every loss carries the same
+ *  teardown regardless of which action caused it.
+ *
+ *  A node losing PTU gets a farewell halt (a delivered move whose
+ *  release-stop is still queued would otherwise drive the unit
+ *  unstoppably). Losing CAM on the node whose stream is playing drops
+ *  the stream — compared against the runtime playback identity, not
+ *  the persisted camera_ip, so a click-selected stream on an
+ *  unrelated node is never touched. Losing CAM without it being
+ *  reassigned also detaches the session pick and persisted camera IP;
+ *  otherwise Start Stream would silently reconnect to the node the
+ *  user just cleared through the fallback chain.
+ *
+ *  Teardown runs before the alias write on purpose: if the write then
+ *  fails, a stopped stream and a halted PTU are the fail-safe
+ *  leftovers — the role state is unchanged and the user re-picks. */
 async function handleRoleSelection(
   select: HTMLSelectElement,
   ip: string,
@@ -752,6 +770,51 @@ async function handleRoleSelection(
   }
 
   const alias = action === "cam" ? "CAM" : action === "ptu" ? "PTU" : "";
+
+  // Pre-mutation holders — the state the user acted on.
+  const devices = deviceList.getDevices();
+  const prevCamIp = devices.find((r) => r.alias === "CAM")?.ip ?? null;
+  const prevPtuIp = devices.find((r) => r.alias === "PTU")?.ip ?? null;
+
+  // A role is lost either by steal (another node takes it) or by the
+  // holder itself being overwritten or cleared.
+  const lostCamIp =
+    prevCamIp && (alias === "CAM" ? prevCamIp !== ip : prevCamIp === ip)
+      ? prevCamIp
+      : null;
+  const lostPtuIp =
+    prevPtuIp && (alias === "PTU" ? prevPtuIp !== ip : prevPtuIp === ip)
+      ? prevPtuIp
+      : null;
+
+  if (lostPtuIp) {
+    // Purges the queue and pins the halt to the outgoing IP before
+    // the alias moves, so nothing pending can reach the wrong unit.
+    haltPtuUnit(lostPtuIp);
+  }
+
+  if (lostCamIp && lostCamIp === getActivePlaybackIp()) {
+    await stopStreamNow(
+      action === "clear"
+        ? "Stream stopped — CAM cleared"
+        : "Stream stopped — CAM reassigned"
+    );
+  }
+
+  if (lostCamIp && action !== "cam") {
+    // CAM removed without a new holder (Clear, or PTU overwriting the
+    // CAM node): fully detach so getActiveCamIp resolves to nothing
+    // instead of falling back to the node that just lost the role.
+    if (sessionCamIp.get() === lostCamIp) {
+      sessionCamIp.set(null);
+    }
+    if (state.config && state.config.stream.camera_ip === lostCamIp) {
+      state.config.stream.camera_ip = "";
+      api.updateStreamSettings(state.config.stream).catch((e: unknown) => {
+        log(`clear persisted CAM failed for ${lostCamIp}: ${formatError(e)}`);
+      });
+    }
+  }
 
   // Disabled while the write is in flight so a double-pick can't race
   // two writes; a failed write restores the current-name face.
