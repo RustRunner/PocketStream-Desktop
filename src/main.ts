@@ -25,7 +25,6 @@ import {
 import {
   setupArpListeners,
   loadExistingArpState,
-  setupAliasDialog,
   resetDiscoveryStatus,
 } from "./lib/devices.ts";
 import { setupCacheDialog } from "./lib/device-cache.ts";
@@ -82,7 +81,6 @@ document.addEventListener("DOMContentLoaded", async () => {
   setupRtspControls();
   setupIpConfigDialog();
   setupSettingsSave();
-  setupAliasDialog();
   setupCacheDialog();
   setupRefreshButton();
   setupResetAdapterButton();

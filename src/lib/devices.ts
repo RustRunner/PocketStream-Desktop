@@ -1,6 +1,6 @@
 /**
  * PocketStream Desktop — discovery triggers, port scanning, device
- * list rendering, and the per-device alias dialog.
+ * list rendering, and the per-node role dropdown.
  *
  * Backend (DeviceRegistry) is the single source of truth for device
  * records. This module is a pure consumer of `device-list.js`'s
@@ -14,7 +14,7 @@
  *   - Settle-debounced scan trigger (UX policy)
  *   - Cache verification retry policy (UX policy)
  *   - The DOM rendering itself
- *   - Alias dialog UI
+ *   - Role dropdown UI (CAM / PTU / Clear per node)
  */
 
 import * as api from "./tauri-api.ts";
@@ -40,7 +40,6 @@ import {
   visibleDevices,
 } from "./device-state.ts";
 import * as deviceList from "./device-list.ts";
-import { showModalWithVideo } from "./streaming.js";
 import { selectedDevice, sessionCamIp } from "./store.ts";
 import { formatError } from "./errors.ts";
 import type {
@@ -546,7 +545,27 @@ async function scanDevicePorts(ip: string, attempt = 0): Promise<void> {
 
 // ── Device list rendering ───────────────────────────────────────────
 
+// Render deferral while a role menu is open: the list is rebuilt
+// wholesale via innerHTML on every snapshot and on ping-dot flips,
+// and that teardown would close an open <select> popup mid-pick.
+// While one is open, renders queue behind a flag and flush on close.
+let roleMenuOpen = false;
+let renderPending = false;
+
+function closeRoleMenu(): void {
+  if (!roleMenuOpen) return;
+  roleMenuOpen = false;
+  if (renderPending) {
+    renderPending = false;
+    renderArpDeviceList();
+  }
+}
+
 export function renderArpDeviceList(): void {
+  if (roleMenuOpen) {
+    renderPending = true;
+    return;
+  }
   const list = $("#device-list");
 
   // While disconnected, render nothing — the records may still be in
@@ -582,9 +601,6 @@ export function renderArpDeviceList(): void {
     return;
   }
 
-  const pencilSvg =
-    '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1.001 1.001 0 000-1.41l-2.34-2.34a1.001 1.001 0 00-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>';
-
   let html = "";
   let nodeIndex = 0;
   for (const [, records] of bySubnet) {
@@ -611,12 +627,20 @@ export function renderArpDeviceList(): void {
       const ipEsc = escapeHtml(r.ip);
       const portsEsc = escapeHtml(ports.join(", "));
 
+      // The node's name doubles as the role dropdown face: a synthetic
+      // first option carries the current display name (selected +
+      // disabled + hidden so it shows on the closed face but never
+      // duplicates CAM/PTU inside the popup), followed by the actions.
       html += `
         <div class="${classes.join(" ")}" data-ip="${ipEsc}">
           <div class="device-name-row">
             ${dot}
-            <span class="device-name">${escapeHtml(name)}</span>
-            <button class="edit-alias-btn" data-alias-ip="${ipEsc}" title="Rename">${pencilSvg}</button>
+            <select class="node-role-select" data-role-ip="${ipEsc}" title="Assign role">
+              <option selected disabled hidden>${escapeHtml(name)}</option>
+              <option value="cam">CAM</option>
+              <option value="ptu">PTU</option>
+              <option value="clear">Clear</option>
+            </select>
           </div>
           <div class="device-detail-row">
             <a class="device-ip" href="#" data-browse="${ipEsc}" title="Open in browser">${ipEsc}</a>
@@ -644,7 +668,7 @@ export function renderArpDeviceList(): void {
   list.querySelectorAll<HTMLElement>(".device-item").forEach((item) => {
     item.addEventListener("click", (e) => {
       const target = e.target as Element;
-      if (target.closest(".device-ip") || target.closest(".edit-alias-btn")) return;
+      if (target.closest(".device-ip") || target.closest(".node-role-select")) return;
       list.querySelectorAll(".device-item").forEach((i) => i.classList.remove("selected"));
       item.classList.add("selected");
       const ip = item.dataset["ip"] ?? null;
@@ -684,142 +708,75 @@ export function renderArpDeviceList(): void {
     });
 
   list
-    .querySelectorAll<HTMLButtonElement>(".edit-alias-btn")
-    .forEach((btn) => {
-      btn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        const ip = btn.dataset["aliasIp"];
-        if (ip) openAliasDialog(ip);
+    .querySelectorAll<HTMLSelectElement>(".node-role-select")
+    .forEach((select) => {
+      // Focus arms the render-deferral latch (an open OS popup would
+      // be destroyed by an innerHTML rebuild); change/blur/Escape all
+      // release it. The row click handler excludes the select, so
+      // opening the menu never doubles as a node click.
+      select.addEventListener("focus", () => {
+        roleMenuOpen = true;
+      });
+      select.addEventListener("blur", () => closeRoleMenu());
+      select.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") closeRoleMenu();
+      });
+      select.addEventListener("change", () => {
+        const ip = select.dataset["roleIp"];
+        const action = select.value;
+        if (ip) void handleRoleSelection(select, ip, action);
+        closeRoleMenu();
       });
     });
 }
 
-// ── Alias dialog ────────────────────────────────────────────────────
+// ── Role dropdown handling ──────────────────────────────────────────
 
-async function openAliasDialog(ip: string): Promise<void> {
-  const dialog = $<HTMLDialogElement>("#alias-dialog");
-  $("#alias-dialog-ip").textContent = ip;
-  $<HTMLInputElement>("#alias-input").value = "";
-  $<HTMLElement>("#alias-custom-field").style.display = "none";
-  dialog.dataset["ip"] = ip;
-
-  // Reset role buttons
-  const record = deviceList.deviceByIp(ip);
-  const existing = record?.alias || "";
-  const roleBtns = dialog.querySelectorAll<HTMLElement>("[data-role]");
-  roleBtns.forEach((b) => b.classList.remove("active"));
-
-  const isCustom = existing && existing !== "CAM" && existing !== "PTU";
-  if (existing === "CAM") {
-    dialog.querySelector("[data-role='cam']")?.classList.add("active");
-  } else if (existing === "PTU") {
-    dialog.querySelector("[data-role='ptu']")?.classList.add("active");
-  } else if (existing) {
-    dialog.querySelector("[data-role='custom']")?.classList.add("active");
-    $<HTMLInputElement>("#alias-input").value = existing;
-    $<HTMLElement>("#alias-custom-field").style.display = "";
+/** Apply a role-menu pick: write the alias and, for CAM, carry the
+ *  designation side effects. No-ops (re-picking the held role, Clear
+ *  on an alias-less node) short-circuit before the IPC round-trip.
+ *  The backend event re-render rebuilds every select on success. */
+async function handleRoleSelection(
+  select: HTMLSelectElement,
+  ip: string,
+  action: string
+): Promise<void> {
+  const current = deviceList.deviceByIp(ip)?.alias || "";
+  const noOp =
+    (action === "cam" && current === "CAM") ||
+    (action === "ptu" && current === "PTU") ||
+    (action === "clear" && current === "");
+  if (noOp) {
+    select.selectedIndex = 0;
+    return;
   }
 
-  // Save is only meaningful when the user has a custom name typed.
-  // Clear Name is always visible — it's a no-op for devices with no
-  // alias yet, but means the user can revert a CAM/PTU/custom-named
-  // node back to the default "Node N" display directly from any
-  // dialog state instead of having to switch to Custom first.
-  $<HTMLElement>("#alias-clear").style.display = "";
-  $<HTMLElement>("#alias-save").style.display = isCustom ? "" : "none";
+  const alias = action === "cam" ? "CAM" : action === "ptu" ? "PTU" : "";
 
-  if (dialog.open) dialog.close();
-  await showModalWithVideo(dialog);
-}
-
-/** Push an alias change to the backend. Render re-fires automatically
- *  via the device-list-changed event the backend emits in response. */
-function persistAlias(ip: string, alias: string): void {
-  api.setDeviceAlias(ip, alias).catch((e: unknown) => {
-    log(`Failed to set alias for ${ip}: ${formatError(e)}`);
-  });
-}
-
-export function setupAliasDialog(): void {
-  const dialog = $<HTMLDialogElement>("#alias-dialog");
-
-  function updateAliasActions(role: string): void {
-    const isCustom = role === "custom";
-    // Save is only meaningful when there's a custom name to commit.
-    // Clear Name stays visible whenever the current record actually
-    // has an alias (handled at open time in openAliasDialog); for
-    // the in-dialog role switch we keep it visible while the user
-    // is editing so they can back out of an in-progress rename.
-    $<HTMLElement>("#alias-save").style.display = isCustom ? "" : "none";
-  }
-
-  // Role toggle buttons
-  const roleBtns = document.querySelectorAll<HTMLElement>(
-    ".alias-role-group [data-role]"
-  );
-  roleBtns.forEach((btn) => {
-    btn.addEventListener("click", (e) => {
-      e.preventDefault();
-      roleBtns.forEach((b) => b.classList.remove("active"));
-      btn.classList.add("active");
-      const role = btn.dataset["role"];
-
-      if (role === "cam") {
-        const ip = dialog.dataset["ip"];
-        if (!ip) return;
-        persistAlias(ip, "CAM");
-        // Aliasing CAM is a deliberate designation — persist it to disk
-        // so getActiveCamIp's config fallback picks it up next session.
-        // (The click-to-select path only sets this in memory.)
-        if (state.config) {
-          state.config.stream.camera_ip = ip;
-          api.updateStreamSettings(state.config.stream).catch((e: unknown) => {
-            log(`persist CAM pick failed for ${ip}: ${formatError(e)}`);
-          });
-        }
-        // Mirror into selectedDevice so subscribers (zoom restore,
-        // Nodes panel highlight) react immediately, and into the
-        // session CAM target so this newest designation outranks any
-        // earlier node click.
-        selectedDevice.set(ip);
-        sessionCamIp.set(ip);
-        dialog.close();
-      } else if (role === "ptu") {
-        const ip = dialog.dataset["ip"];
-        if (!ip) return;
-        persistAlias(ip, "PTU");
-        dialog.close();
-      } else {
-        $<HTMLElement>("#alias-custom-field").style.display = "";
-        updateAliasActions("custom");
-        $<HTMLInputElement>("#alias-input").focus();
+  // Disabled while the write is in flight so a double-pick can't race
+  // two writes; a failed write restores the current-name face.
+  select.disabled = true;
+  try {
+    await api.setDeviceAlias(ip, alias);
+    if (action === "cam") {
+      // A CAM designation is deliberate — persist it to disk so
+      // getActiveCamIp's config fallback picks it up next session
+      // (the click-to-select path only sets this in memory), and
+      // mirror into selectedDevice/sessionCamIp so subscribers (zoom
+      // restore, panel highlight) react immediately and this newest
+      // designation outranks any earlier node click.
+      if (state.config) {
+        state.config.stream.camera_ip = ip;
+        api.updateStreamSettings(state.config.stream).catch((e: unknown) => {
+          log(`persist CAM pick failed for ${ip}: ${formatError(e)}`);
+        });
       }
-    });
-  });
-
-  $<HTMLButtonElement>("#alias-save").addEventListener("click", () => {
-    const ip = dialog.dataset["ip"];
-    if (!ip) return;
-    const alias = $<HTMLInputElement>("#alias-input").value.trim();
-    persistAlias(ip, alias);
-    dialog.close();
-  });
-
-  $<HTMLButtonElement>("#alias-clear").addEventListener("click", () => {
-    const ip = dialog.dataset["ip"];
-    if (!ip) return;
-    persistAlias(ip, "");
-    dialog.close();
-  });
-
-  $<HTMLButtonElement>("#alias-cancel").addEventListener("click", () => {
-    $<HTMLDialogElement>("#alias-dialog").close();
-  });
-
-  $<HTMLInputElement>("#alias-input").addEventListener("keydown", (e) => {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      $<HTMLButtonElement>("#alias-save").click();
+      selectedDevice.set(ip);
+      sessionCamIp.set(ip);
     }
-  });
+  } catch (e) {
+    showToast(`Failed to set role: ${formatError(e)}`, true);
+    select.selectedIndex = 0;
+    select.disabled = false;
+  }
 }
