@@ -119,19 +119,31 @@ pub fn get_license_document(app: tauri::AppHandle, id: String) -> Result<String,
 
     let rel = license_document_path(&id)
         .ok_or_else(|| AppError::Config(format!("Unknown license document '{id}'")))?;
-    let path = app
-        .path()
-        .resolve(rel, tauri::path::BaseDirectory::Resource)
-        .map_err(|e| AppError::Config(format!("Cannot resolve license document '{id}': {e}")))?;
-
+    // The bundler preserves each resource's tauri.conf-relative path, so
+    // an installed build ships the documents under `resources/` inside
+    // the resource root (`<install_dir>\resources\licenses\...` — the
+    // same layout the bundled-GStreamer loader addresses). Try that
+    // first; fall back to the bare path for layouts that strip the
+    // prefix.
+    let resolve = |p: &str| {
+        app.path()
+            .resolve(p, tauri::path::BaseDirectory::Resource)
+            .map_err(|e| AppError::Config(format!("Cannot resolve license document '{id}': {e}")))
+    };
+    let mut path = resolve(&format!("resources/{rel}"))?;
     if !path.exists() {
-        // The Rust-crate notices only exist in release builds (the
-        // release workflow generates them); a dev build legitimately
-        // lacks the file. The frontend keys off the "not generated"
-        // marker to show a note instead of an error toast.
-        return Err(AppError::Config(format!(
-            "not generated: '{id}' is produced during release builds"
-        )));
+        let alt = resolve(rel)?;
+        if alt.exists() {
+            path = alt;
+        } else {
+            // The Rust-crate notices only exist in release builds (the
+            // release workflow generates them); a dev build legitimately
+            // lacks the file. The frontend keys off the "not generated"
+            // marker to show a note instead of an error toast.
+            return Err(AppError::Config(format!(
+                "not generated: '{id}' is produced during release builds"
+            )));
+        }
     }
 
     std::fs::read_to_string(&path).map_err(AppError::Io)
