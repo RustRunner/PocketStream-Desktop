@@ -39,6 +39,12 @@ const ptuPresets = new Map<number, SavedPreset>();
  *  single-threaded control.cgi handler. */
 let zoomRequest: ((percent: number) => void) | null = null;
 
+/** Set by setupZoomSlider for the Home button: pull the zoom back to
+ *  full wide through the same serialised queue, and persist it — home
+ *  is the park pose, and an unpersisted reset would let the next launch
+ *  push the stale pre-home zoom straight back to the camera. */
+let zoomParkWide: (() => void) | null = null;
+
 function getPtuIp(): string | null {
   return getActivePtuIp();
 }
@@ -279,6 +285,10 @@ export function setupPtzControls(): void {
         try {
           await ptuCmd(`C=I&PS=${ptuSpeedBig}&TS=${ptuSpeedBig}&PP=0&TP=0`);
           showToast("PTU homing");
+          // Home is the full resting pose: zoom pulls back to wide while
+          // the pan/tilt goto runs. Gated on a resolved CAM like preset
+          // recall — no CAM means no zoom to park, not a toast.
+          if (getCameraIp() && zoomParkWide) zoomParkWide();
           await waitForPtuTarget(0, 0);
         } catch (e) {
           log(`PTU home: ${formatError(e)}`);
@@ -508,6 +518,16 @@ function setupZoomSlider(): void {
 
   // Expose to preset-recall path so it shares this serialised queue.
   zoomRequest = request;
+
+  // Home-button park: slider to wide, send through the shared queue
+  // (loud — it's a user action), and persist so the saved position
+  // stays truthful for the restore-on-selection path.
+  zoomParkWide = () => {
+    slider.value = "0";
+    request(0);
+    const ip = getCameraIp();
+    if (ip) persistCurrent(ip, 0);
+  };
 
   slider.addEventListener("input", (e) => {
     const target = e.target as HTMLInputElement;
