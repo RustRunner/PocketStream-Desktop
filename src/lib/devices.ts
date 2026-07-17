@@ -680,10 +680,14 @@ export function renderArpDeviceList(): void {
       // Settings builds its payload from there, so a click would leak
       // to disk on the next unrelated save. Persistence happens only
       // when a stream actually starts or the device is explicitly
-      // aliased CAM — a node the user merely clicks but never streams
+      // assigned CAM — a node the user merely clicks but never streams
       // is not persisted across launches. PTU is alias-driven only,
-      // with no click override.
-      if (ip) {
+      // with no click override — and the PTU-designated node itself is
+      // never a camera target, so clicking its row keeps the selection
+      // highlight but must not hijack the CAM pick away from the
+      // assigned CAM (an RTSP start against the PTU wedges in a stall
+      // loop).
+      if (ip && deviceList.deviceByIp(ip)?.alias !== "PTU") {
         sessionCamIp.set(ip);
       }
     });
@@ -812,6 +816,28 @@ async function handleRoleSelection(
       state.config.stream.camera_ip = "";
       api.updateStreamSettings(state.config.stream).catch((e: unknown) => {
         log(`clear persisted CAM failed for ${lostCamIp}: ${formatError(e)}`);
+      });
+    }
+  }
+
+  if (action === "ptu") {
+    // The node just became the PTU, which is never a camera target —
+    // independent of what it was called before. A click-streamed
+    // unaliased node can be assigned PTU directly: drop a stream
+    // playing it, and detach any session pick or persisted camera IP
+    // a bare row click left aimed at it. (When the node also held CAM,
+    // the blocks above already did all of this and these checks
+    // no-op.)
+    if (getActivePlaybackIp() === ip) {
+      await stopStreamNow("Stream stopped — node is now the PTU");
+    }
+    if (sessionCamIp.get() === ip) {
+      sessionCamIp.set(null);
+    }
+    if (state.config && state.config.stream.camera_ip === ip) {
+      state.config.stream.camera_ip = "";
+      api.updateStreamSettings(state.config.stream).catch((e: unknown) => {
+        log(`clear persisted CAM failed for ${ip}: ${formatError(e)}`);
       });
     }
   }

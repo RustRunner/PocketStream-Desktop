@@ -509,20 +509,29 @@ function findDeviceIpByAlias(alias: string): string | undefined {
  *       since camera_ip was last persisted
  *    3. The IP persisted in StreamConfig by the last stream start —
  *       the cold-start fallback
+ *  The PTU-designated node is never a camera target: an RTSP request
+ *  to the pan-tilt unit opens a session that can never preroll and
+ *  wedges the pipeline in a stall loop. A session pick or stale
+ *  persisted camera_ip that lands on the PTU holder is skipped so the
+ *  chain falls through to the real CAM instead (field failure:
+ *  Start Stream targeted the PTU after a row click).
  *  Returns null if none of these resolve — Start Stream surfaces a
  *  "select a CAM" toast in that case. */
 export function getActiveCamIp(): string | null {
+  const ptuIp = findDeviceIpByAlias("PTU");
   const session = sessionCamIp.get();
-  if (session) return session;
+  if (session && session !== ptuIp) return session;
+  // A record holds one alias, so the CAM holder can never be the PTU.
   const aliased = findDeviceIpByAlias("CAM");
   if (aliased) return aliased;
-  return state.config?.stream.camera_ip || null;
+  const configured = state.config?.stream.camera_ip || null;
+  return configured && configured !== ptuIp ? configured : null;
 }
 
 /** The IP to use as the PTU target right now. PTU is alias-driven
  *  only — there's no per-session click override for it (the click on
  *  a node row is reserved for the CAM target). To switch PTU targets,
- *  re-alias the device via the Naming dialog. */
+ *  re-assign the role from the node's dropdown. */
 export function getActivePtuIp(): string | null {
   return findDeviceIpByAlias("PTU") ?? null;
 }
