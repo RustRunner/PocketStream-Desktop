@@ -16,12 +16,15 @@ The application supports two primary streaming modes:
 
 ### Automatic Device Discovery
 - ARP-based device detection on the Ethernet interface — no manual IP entry required
+- Self-healing packet capture: a session that starts deaf is restarted and escalated automatically before discovery is ever reported degraded
+- Known cameras are re-discovered actively — cached devices are verified on-wire by MAC and their subnets adopted in seconds, without waiting for the camera's own broadcasts
 - TCP port scanning of discovered hosts (RTSP, HTTP, SSH, and common camera ports)
-- Automatic subnet adoption when cameras are on non-native networks
-- Node aliasing with role assignment (CAM, PTU, or custom names)
+- Automatic subnet adoption when cameras are on non-native networks, gated on a repeat ARP observation; stale link-local adoptions are reaped automatically
+- Node role assignment — a single CAM and a single PTU, enforced with safe role handoff
 
 ### Video Streaming & Recording
 - Low-latency RTSP and UDP playback via GStreamer
+- G.711 camera audio playback with a persistent mute control
 - Screenshot capture to Pictures directory
 - MP4 recording with one-click start/stop
 - Stream health monitoring with user-friendly error messages
@@ -38,7 +41,7 @@ The application supports two primary streaming modes:
 - VPN interface enumeration for secure remote streaming
 - Automatic Windows Firewall rule management for the RTSP server
 
-### PTZ Camera Control (Still in Development)
+### PTZ Camera Control
 - FLIR PTU control via directional D-pad with hold-to-move
 - Automatic speed limit negotiation with the pan-tilt unit
 - Homing with position convergence detection
@@ -82,7 +85,7 @@ The installer will be generated in `src-tauri/target/release/bundle/nsis/`.
 
 | Layer | Technology | Role |
 |-------|-----------|------|
-| Frontend | HTML/JS + Material Web | UI, settings, device list |
+| Frontend | HTML + TypeScript (vanilla) | UI, settings, device list |
 | Backend | Rust + Tauri 2 | Streaming, network ops, camera control |
 | Video | GStreamer | RTSP/UDP playback, recording, re-streaming |
 | Network | PacketMonitor API + pnet | ARP discovery, interface management |
