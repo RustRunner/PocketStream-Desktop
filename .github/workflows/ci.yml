@@ -227,7 +227,10 @@ jobs:
           $plugins = @('gstmulaw.dll','gstalaw.dll','gstaudioconvert.dll',
                        'gstaudioresample.dll','gstvolume.dll','gstwasapi2.dll','gstdirectsound.dll')
           # OS-inbox and VC-runtime imports the app already relies on.
-          $systemOk = '^(KERNEL32|USER32|ole32|DSOUND|MMDevAPI|AVRT|VCRUNTIME140(_1)?|MSVCP140|api-ms-win-.*)\.dll$'
+          # MFPlat (Media Foundation) is inbox on every desktop SKU; on the
+          # rare N-edition/Server-Core install without it, wasapi2 merely
+          # fails to load and autoaudiosink falls back to directsound.
+          $systemOk = '^(KERNEL32|USER32|ole32|DSOUND|MMDevAPI|AVRT|MFPlat|VCRUNTIME140(_1)?|MSVCP140|api-ms-win-.*)\.dll$'
           $gaps = foreach ($p in $plugins) {
             $file = Join-Path $pwd "src-tauri\resources\gstreamer\lib\gstreamer-1.0\$p"
             $deps = (& $dumpbin /dependents $file | Select-String -Pattern '^\s{4}\S+\.dll').Line.Trim()
