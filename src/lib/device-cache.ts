@@ -11,7 +11,7 @@
 import * as api from "./tauri-api.ts";
 import { $, state, log, escapeHtml, showToast } from "./state.ts";
 import * as deviceList from "./device-list.ts";
-import { visibleDevices } from "./device-state.ts";
+import { markIpScanned, visibleDevices } from "./device-state.ts";
 import { showModalWithVideo } from "./streaming.js";
 import { formatError } from "./errors.ts";
 
@@ -103,6 +103,11 @@ function renderDialogList(): void {
           } else if (mac) {
             await api.forgetDevice(mac);
           }
+          // A forgotten device must be re-scannable if it is rediscovered
+          // later this session: the scan dedup set would otherwise skip
+          // it, its fresh record would never gain open ports, and the
+          // Nodes panel (which requires ports) would never show it again.
+          if (ip) markIpScanned(ip, /* clear */ true);
         } catch (e) {
           log(`Failed to remove node: ${formatError(e)}`);
         }
@@ -209,6 +214,10 @@ async function clearAll(): Promise<void> {
       } else {
         await api.forgetDevice(t.mac);
       }
+      // Same re-scannability release as the per-row forget: without it,
+      // a cleared-then-rediscovered device is skipped by the scan dedup,
+      // never regains ports, and stays invisible for the session.
+      markIpScanned(t.ip, /* clear */ true);
     } catch (e) {
       log(`Failed to clear ${t.mac}: ${formatError(e)}`);
     }
