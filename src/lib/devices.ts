@@ -151,6 +151,46 @@ type DiscoveryPhase = "discovering" | "scanning" | "idle";
 let discoveryPhase: DiscoveryPhase = "idle";
 let initialFlowComplete = false;
 
+// The initial port scans land well before the backend finishes its
+// startup hunt (DHCP gate, cache-probe pass, first-sighting probes,
+// dwell), so dropping to idle the moment pendingScans hits zero makes
+// the card flash "done" and then visibly restart when the adopted
+// subnets arrive. Instead, the first flow holds "discovering" through
+// this grace window after its scans complete; adoption events landing
+// inside it continue the same visual flow. Sized to cover the typical
+// hunt (probe budgets are seconds; the cache pass's 90 s ceiling is a
+// pathology we accept a break for).
+const INITIAL_DISCOVERY_GRACE_MS = 60_000;
+let initialFlowStartedAt = 0;
+let graceTimer: ReturnType<typeof setTimeout> | null = null;
+
+function initialGraceRemaining(): number {
+  if (initialFlowComplete || initialFlowStartedAt === 0) return 0;
+  return initialFlowStartedAt + INITIAL_DISCOVERY_GRACE_MS - Date.now();
+}
+
+function clearGraceTimer(): void {
+  if (graceTimer) clearTimeout(graceTimer);
+  graceTimer = null;
+}
+
+/** Arm the hold-release for the initial flow. When it fires quiet —
+ *  no scans in flight, no settle timer pending — the startup flow is
+ *  genuinely over and the spinner may complete. A scan cycle running
+ *  at expiry re-evaluates on its own completion instead (the grace is
+ *  spent by then, so it falls through to idle normally). */
+function armGraceTimer(delay: number): void {
+  clearGraceTimer();
+  graceTimer = setTimeout(() => {
+    graceTimer = null;
+    if (pendingScans > 0 || settleTimer !== null) return;
+    if (discoveryPhase === "discovering") {
+      initialFlowComplete = true;
+      setDiscoveryPhase("idle");
+    }
+  }, delay);
+}
+
 function applyDiscoveryPhaseToDOM(): void {
   const container = $("#discovery-status");
   if (!container) return;
@@ -166,6 +206,12 @@ function applyDiscoveryPhaseToDOM(): void {
 function setDiscoveryPhase(phase: DiscoveryPhase): void {
   if (phase === "discovering" && initialFlowComplete) {
     phase = "idle";
+  }
+  // First activity of a fresh flow stamps the grace clock — the hold
+  // window is anchored to when discovery actually started, not to when
+  // the first scan batch finished.
+  if (phase !== "idle" && !initialFlowComplete && initialFlowStartedAt === 0) {
+    initialFlowStartedAt = Date.now();
   }
   const wasScanning = discoveryPhase === "scanning";
   discoveryPhase = phase;
@@ -188,6 +234,7 @@ function isDiscoveryActive(): boolean {
 /** Hide the Nodes-card discovery spinner. Exported for the interface
  *  watcher so it can cancel a stuck spinner on link-down. */
 export function hideDiscoveryStatus(): void {
+  clearGraceTimer();
   setDiscoveryPhase("idle");
 }
 
@@ -195,11 +242,14 @@ export function resetDiscoveryStatus(): void {
   clearScannedIps();
   if (settleTimer) clearTimeout(settleTimer);
   settleTimer = null;
+  clearGraceTimer();
   // Clear the one-shot lock so a reconnect / user-initiated rescan can
   // legitimately show "IP Discovery..." again at the start of the fresh
   // flow. Must happen BEFORE setDiscoveryPhase, or the coercion would
-  // bounce "discovering" → "idle".
+  // bounce "discovering" → "idle". The grace clock restarts with the
+  // fresh flow for the same reason.
   initialFlowComplete = false;
+  initialFlowStartedAt = 0;
   setDiscoveryPhase("discovering");
   // Reconnect path: backend preserves device records across disconnect for
   // fast UI recovery, so the backend often doesn't re-fire subnet-adopted
@@ -282,6 +332,17 @@ export function setupArpListeners(): void {
       deviceList.getDevices().some((r) => r.status === "live");
     if (!anyReachable) {
       showToast("No devices responding to discovery yet", true);
+    }
+    // If the only thing keeping the startup spinner alive is the grace
+    // hold, a dead capture channel means there's nothing left to wait
+    // for — unwind just the hold; every other spinner state keeps its
+    // existing behavior.
+    if (graceTimer) {
+      clearGraceTimer();
+      if (pendingScans <= 0 && settleTimer === null) {
+        initialFlowComplete = true;
+        setDiscoveryPhase("idle");
+      }
     }
   });
 
@@ -552,8 +613,21 @@ async function scanDevicePorts(ip: string, attempt = 0): Promise<void> {
   if (pendingScans <= 0) {
     // All port scans done. If the settle timer is still armed from a
     // late ARP / adoption event, drop back to "discovering" until it
-    // fires; otherwise we're fully idle.
-    setDiscoveryPhase(settleTimer !== null ? "discovering" : "idle");
+    // fires. During the initial flow, an otherwise-quiet completion
+    // holds "discovering" for the remaining grace instead of flashing
+    // idle — the backend is typically still hunting foreign subnets,
+    // and their adoption should read as one continuous flow. Only a
+    // quiet grace expiry (or a post-grace completion like this one)
+    // ends the startup spinner.
+    const grace = initialGraceRemaining();
+    if (settleTimer !== null) {
+      setDiscoveryPhase("discovering");
+    } else if (grace > 0) {
+      setDiscoveryPhase("discovering");
+      armGraceTimer(grace);
+    } else {
+      setDiscoveryPhase("idle");
+    }
   }
 }
 
