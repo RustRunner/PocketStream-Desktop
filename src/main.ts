@@ -611,32 +611,12 @@ function updateProtocolVisibility(protocol: string): void {
 
 // ── Refresh Button ──────────────────────────────────────────────────
 
+// The Nodes refresh is the app's single manual refresh affordance: the
+// Host card's adapter state is watcher-maintained (the backend pushes
+// fresh InterfaceInfo on every link/IP change), so a Hosts-side refresh
+// had nothing left to add beyond the discovery restart this one already
+// does — with the dedup wipe this one does and that one didn't.
 function setupRefreshButton(): void {
-  $<HTMLButtonElement>("#btn-refresh-host").addEventListener("click", async () => {
-    const btn = $<HTMLButtonElement>("#btn-refresh-host");
-    btn.disabled = true;
-    btn.classList.add("spinning");
-
-    try {
-      await refreshInterfaces();
-      // Only kick off discovery when the link is actually up. A stale
-      // disconnected adapter has no IPs and nothing to scan — running
-      // ARP capture against it is wasted effort.
-      if (isInterfaceConnected() && state.activeInterface) {
-        await api.startArpDiscovery(state.activeInterface.name);
-        await loadExistingArpState();
-        showToast("Refreshed");
-      } else {
-        warnNoEthernet();
-      }
-    } catch (e) {
-      showToast("Refresh failed: " + formatError(e), true);
-    } finally {
-      btn.disabled = false;
-      btn.classList.remove("spinning");
-    }
-  });
-
   $<HTMLButtonElement>("#btn-refresh-nodes").addEventListener("click", async () => {
     const btn = $<HTMLButtonElement>("#btn-refresh-nodes");
     btn.disabled = true;
