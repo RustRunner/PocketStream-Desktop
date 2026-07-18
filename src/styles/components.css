@@ -825,6 +825,76 @@
   line-height: 1.5;
 }
 
+/* Markdown-authored documents (third-party notices, generated crate
+   notices, libjpeg-turbo) switch from verbatim <pre> flow to rendered
+   text; the inner <pre> blocks are the fenced license texts. */
+#license-doc-content.rendered {
+  white-space: normal;
+  font-family: var(--md-font);
+  font-size: 13px;
+}
+
+#license-doc-content.rendered h1 {
+  font-size: 16px;
+  margin: 0 0 10px;
+}
+
+#license-doc-content.rendered h2 {
+  font-size: 14px;
+  margin: 18px 0 6px;
+  color: var(--md-primary-light);
+}
+
+#license-doc-content.rendered h3,
+#license-doc-content.rendered h4,
+#license-doc-content.rendered h5,
+#license-doc-content.rendered h6 {
+  font-size: 13px;
+  margin: 14px 0 6px;
+}
+
+#license-doc-content.rendered p {
+  margin: 0 0 10px;
+}
+
+#license-doc-content.rendered ul {
+  margin: 0 0 10px;
+  padding-left: 20px;
+}
+
+#license-doc-content.rendered li {
+  margin: 2px 0;
+}
+
+#license-doc-content.rendered hr {
+  border: none;
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+  margin: 14px 0;
+}
+
+#license-doc-content.rendered code {
+  font-family: var(--md-font-mono);
+  font-size: 12px;
+  background: rgba(255, 255, 255, 0.07);
+  padding: 0 4px;
+  border-radius: 3px;
+}
+
+#license-doc-content.rendered pre {
+  font-family: var(--md-font-mono);
+  font-size: 11px;
+  white-space: pre-wrap;
+  background: rgba(0, 0, 0, 0.25);
+  border-radius: var(--md-radius-sm);
+  padding: 10px;
+  margin: 0 0 12px;
+}
+
+#license-doc-content.rendered .md-link {
+  color: var(--md-primary-light);
+  word-break: break-all;
+}
+
 .dialog-title-row {
   display: flex;
   align-items: center;

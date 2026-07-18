@@ -29,6 +29,7 @@ import {
 } from "./lib/devices.ts";
 import { setupCacheDialog } from "./lib/device-cache.ts";
 import * as deviceList from "./lib/device-list.ts";
+import { renderMarkdownLite } from "./lib/markdown-lite.ts";
 import {
   setupStreamControls,
   setupRtspControls,
@@ -484,14 +485,29 @@ function setupMenuAndAbout(): void {
   const licensePicker = $<HTMLSelectElement>("#license-doc-picker");
   const licenseContent = $<HTMLElement>("#license-doc-content");
 
+  // The Markdown-authored documents; everything else is a plain license
+  // text and renders verbatim. Keyed by id because the frontend never
+  // sees file paths.
+  const markdownDocs = new Set<LicenseDocumentId>([
+    "third-party-notices",
+    "rust-crates",
+    "libjpeg-turbo",
+  ]);
+
   const loadLicenseDoc = async (): Promise<void> => {
     const id = licensePicker.value as LicenseDocumentId;
-    licenseContent.classList.remove("muted");
+    licenseContent.classList.remove("muted", "rendered");
     licenseContent.textContent = "Loading…";
     try {
-      // textContent only: the documents are plain text/markdown from
-      // the app's own resources, rendered verbatim.
-      licenseContent.textContent = await api.getLicenseDocument(id);
+      const doc = await api.getLicenseDocument(id);
+      if (markdownDocs.has(id)) {
+        // renderMarkdownLite escapes every line before emitting its own
+        // tags, so innerHTML here can only carry markup we generated.
+        licenseContent.classList.add("rendered");
+        licenseContent.innerHTML = renderMarkdownLite(doc);
+      } else {
+        licenseContent.textContent = doc;
+      }
     } catch (e: unknown) {
       const msg = formatError(e);
       if (msg.includes("not generated")) {
