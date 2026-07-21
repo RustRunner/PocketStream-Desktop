@@ -242,6 +242,7 @@ pub async fn refresh_adapter(name: String, mode: String) -> Result<(), AppError>
 #[tauri::command]
 pub async fn start_arp_discovery(
     manager: State<'_, NetworkManager>,
+    config: State<'_, AppConfig>,
     app: tauri::AppHandle,
     interface: String,
 ) -> Result<(), AppError> {
@@ -250,7 +251,7 @@ pub async fn start_arp_discovery(
             "Packet capture is not available on this Windows build".into(),
         ));
     }
-    manager.start_arp_discovery(&interface, app).await
+    manager.start_arp_discovery(&interface, &config, app).await
 }
 
 #[tauri::command]

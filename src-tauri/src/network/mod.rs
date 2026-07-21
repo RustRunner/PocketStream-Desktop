@@ -242,9 +242,6 @@ pub(crate) struct CaptureIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LiveSourceId {
     /// Native enumeration found this id for the adapter.
-    // Production callers pass EnumFailed until a live probe exists; the
-    // decision table already covers this variant.
-    #[allow(dead_code)]
     Enumerated(u32),
     /// Enumeration was unavailable or failed. Fails open — a transient
     /// enumeration fault must never churn a healthy listener.
@@ -1907,14 +1904,18 @@ impl NetworkManager {
                 let iface = match cached_name {
                     Some(n) => Some(n),
                     None => interface::list_physical().await.ok().and_then(|list| {
-                        list.into_iter()
+                        // Prefer a live camera port; fall back to any
+                        // wired physical adapter so mode entry with the
+                        // cable out still pre-attaches capture.
+                        list.iter()
                             .find(|i| interface::is_wired_ethernet(i) && !i.ips.is_empty())
-                            .map(|i| i.name)
+                            .or_else(|| list.iter().find(|i| interface::is_wired_physical(i)))
+                            .map(|i| i.name.clone())
                     }),
                 };
                 if let Some(name) = iface {
                     if let Err(e) = self
-                        .start_arp_discovery_locked(&name, app_handle.clone())
+                        .start_arp_discovery_locked(&name, config, app_handle.clone())
                         .await
                     {
                         log::warn!("Failed to start ARP after mode change: {}", e);
@@ -2333,10 +2334,11 @@ impl NetworkManager {
     pub async fn start_arp_discovery(
         &self,
         interface_display_name: &str,
+        config: &crate::config::AppConfig,
         app_handle: tauri::AppHandle,
     ) -> Result<(), AppError> {
         let _op = self.discovery_op.lock().await;
-        self.start_arp_discovery_locked(interface_display_name, app_handle)
+        self.start_arp_discovery_locked(interface_display_name, config, app_handle)
             .await
     }
 
@@ -2350,21 +2352,48 @@ impl NetworkManager {
         &self,
         iface_name: &str,
         own_mac: Option<[u8; 6]>,
+        iface_is_up: bool,
         base_params: &arp::ListenerParams,
     ) -> Result<arp::ActivationRx, AppError> {
         let has_listener = self.arp_listener_handle.lock().await.is_some();
+        let (same_adapter, retained_source_id) = {
+            let identity = self.capture_identity.lock().await;
+            (
+                identity
+                    .as_ref()
+                    .is_some_and(|c| c.iface_name == iface_name && c.mac == own_mac),
+                identity.as_ref().and_then(|c| c.source_id),
+            )
+        };
+        // Probe the live data-source id only when a matching listener
+        // could be kept — its sole job is catching the source being
+        // re-created underneath a retained binding (id churn after
+        // driver-level adapter events).
+        let live = if has_listener && same_adapter {
+            let scope = base_params.scope.clone();
+            match tokio::task::spawn_blocking(move || pktmon::live_source_id_for(&scope)).await {
+                Ok(Ok(id)) => LiveSourceId::Enumerated(id),
+                Ok(Err(e)) => {
+                    log::debug!(
+                        "Data-source liveness probe failed ({}) — keeping the listener",
+                        e
+                    );
+                    LiveSourceId::EnumFailed
+                }
+                Err(e) => {
+                    log::debug!(
+                        "Data-source liveness probe did not complete ({}) — keeping the listener",
+                        e
+                    );
+                    LiveSourceId::EnumFailed
+                }
+            }
+        } else {
+            LiveSourceId::EnumFailed
+        };
         let action = {
             let identity = self.capture_identity.lock().await;
-            listener_action(
-                identity.as_ref(),
-                has_listener,
-                iface_name,
-                own_mac,
-                // No native source-id probe is wired up here yet, so the
-                // binding is judged by adapter identity alone — which
-                // fails toward Keep, never toward churn.
-                LiveSourceId::EnumFailed,
-            )
+            listener_action(identity.as_ref(), has_listener, iface_name, own_mac, live)
         };
 
         if action == ListenerAction::Keep {
@@ -2372,7 +2401,15 @@ impl NetworkManager {
             let (tx, rx) = tokio::sync::oneshot::channel();
             // The watchdog only cares that activation succeeded; the
             // retained session proved that when it attached.
-            let _ = tx.send(Ok(pktmon::ScopeOutcome::SelectedInterface));
+            let outcome = match retained_source_id {
+                Some(id) => pktmon::ScopeOutcome::SelectedInterface {
+                    source_id: Some(id),
+                },
+                None => pktmon::ScopeOutcome::UnscopedFallback {
+                    reason: "retained unscoped session".into(),
+                },
+            };
+            let _ = tx.send(Ok(outcome));
             return Ok(rx);
         }
         if let ListenerAction::Replace(reason) = action {
@@ -2430,12 +2467,37 @@ impl NetworkManager {
                 }
             };
 
+        if !iface_is_up {
+            if let pktmon::ScopeOutcome::UnscopedFallback { reason } = &outcome {
+                // A media-disconnected attach must be scoped-only: an
+                // unscoped session hears every adapter, and with the
+                // wire down nothing refreshes the shared self/ghost
+                // filters — WiFi-side ARP could leak in as phantom
+                // nodes. Park it and wait for the next trigger.
+                incarnation.store(false, Ordering::Relaxed);
+                park_capture_handle(&self.arp_listener_handle, &self.prior_capture_joins).await;
+                log::info!(
+                    "ARP pre-attach skipped: scoped join unavailable ({}) — retrying on the next discovery trigger",
+                    reason
+                );
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = tx.send(Ok(outcome));
+                return Ok(rx);
+            }
+            log::info!(
+                "ARP capture pre-attached on '{}' — listening before link-up",
+                iface_name
+            );
+        }
+
+        let source_id = match &outcome {
+            pktmon::ScopeOutcome::SelectedInterface { source_id } => *source_id,
+            pktmon::ScopeOutcome::UnscopedFallback { .. } => None,
+        };
         *self.capture_identity.lock().await = Some(CaptureIdentity {
             iface_name: iface_name.to_string(),
             mac: own_mac,
-            // Recorded once the scope join reports an id; until then a
-            // re-check judges the binding by adapter identity alone.
-            source_id: None,
+            source_id,
             active: incarnation,
         });
 
@@ -2450,55 +2512,40 @@ impl NetworkManager {
     async fn start_arp_discovery_locked(
         &self,
         interface_display_name: &str,
+        config: &crate::config::AppConfig,
         app_handle: tauri::AppHandle,
     ) -> Result<(), AppError> {
+        // Authoritative mode gate, read under the discovery op lock:
+        // set_network_mode persists the mode before apply_mode_change
+        // serializes on the op, so a start queued behind an Auto→Manual
+        // transition observes Manual here. The frontend fires this on
+        // every reconnect regardless of mode (and swallows the error),
+        // so this is the enforcement point. DHCP mode runs discovery
+        // exactly like Static-Auto; only Static-Manual is refused.
+        if config.get_network_mode() == crate::config::NetworkMode::StaticManual {
+            return Err(AppError::Network(
+                "ARP discovery does not run in Static-Manual mode".into(),
+            ));
+        }
+
         // Session-only teardown: a capture listener that is still valid
         // for this adapter is retained and re-evaluated below.
         self.stop_session_locked().await;
 
-        // New discovery session: advance the generation and mark discovery
-        // active so sweeps and capture frames from a prior session can
-        // fence themselves out (that work captures the generation; the
-        // active flag also covers a stop with no restart).
-        let generation = self.discovery_generation.fetch_add(1, Ordering::Relaxed) + 1;
-        self.discovery_active.store(true, Ordering::Relaxed);
-        log::debug!("Discovery session generation → {}", generation);
-
-        // Session fence for sweeps and the adopt loop: stale-session work
-        // (from a prior session, or after a stop) drops itself before
-        // merging or emitting into the shared registry. The capture
-        // listener does NOT use this fence — it runs under the manager's
-        // capture-lifecycle fence (see `ensure_capture_listener`), because
-        // a retained listener must keep merging across session restarts.
-        let fence = SweepFence::new(
-            generation,
-            self.discovery_generation.clone(),
-            self.discovery_active.clone(),
-        );
-
-        *self.interface_name.lock().await = Some(interface_display_name.to_string());
-
-        let devices = self.arp_devices.clone();
-        let adopted = self.adopted_ips.clone();
-        let pending_ips = self.pending_ips.clone();
-        let adoption_seq = self.adoption_seq.clone();
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let iface_name = interface_display_name.to_string();
-        let app_handle_for_adopt = app_handle.clone();
-
-        // Get current IPs so auto-adopt knows which subnets are "known".
         // The adapter's MAC serves double duty: the capture session is
         // attach-time scoped to the data source carrying this MAC, and
         // the listener drops ARP frames the adapter itself sent (our own
         // gratuitous ARP).
         let iface_info = interface::get_by_name(interface_display_name).await?;
-        // Backend authority: discovery only ever runs on an up, wired
-        // Ethernet adapter, no matter what name a caller supplied. The
-        // frontend mirrors this in its selection filters, but the backend
-        // is the enforcement point.
-        if !interface::is_wired_ethernet(&iface_info) {
+        // Structural gate, media-independent: the capture listener may
+        // bind a disconnected wired port — that is the point of
+        // pre-attaching — but never WiFi/VPN/virtual. Callers supply
+        // arbitrary names; the backend is the enforcement point. A
+        // rejection here leaves any listener retained from a previously
+        // validated adapter untouched.
+        if !interface::is_wired_physical(&iface_info) {
             return Err(AppError::Network(format!(
-                "'{}' is not an up, wired Ethernet adapter — ARP discovery only runs on the wired camera port",
+                "'{}' is not a wired Ethernet adapter — ARP discovery only runs on the wired camera port",
                 interface_display_name
             )));
         }
@@ -2524,12 +2571,6 @@ impl NetworkManager {
             *set = interface::all_local_ipv4().into_iter().collect();
         }
         let local_ips = self.local_ips.clone();
-        log::info!(
-            "Starting ARP discovery on '{}' (IPs: {:?}, mac: {})",
-            interface_display_name,
-            known_ips,
-            iface_info.mac
-        );
 
         // Scope discovery to the wired Ethernet port. The capture backend
         // is unscoped, so enumerate the subnets owned exclusively by
@@ -2575,24 +2616,89 @@ impl NetworkManager {
         // separately call get_device_list.
         emitter.poke();
 
+        let devices = self.arp_devices.clone();
+        // Placeholder fence for the shared bundle: the listener swaps in
+        // its capture-lifecycle fence inside `ensure_capture_listener`,
+        // and the session halves below rebind the bundle with the real
+        // session fence once the up-gate passes — this value itself
+        // never fences a merge.
+        let placeholder_fence = SweepFence::new(
+            self.discovery_generation.load(Ordering::Relaxed),
+            self.discovery_generation.clone(),
+            self.discovery_active.clone(),
+        );
         let listener_params = arp::ListenerParams {
             devices: devices.clone(),
             registry: registry.clone(),
             emitter: emitter.clone(),
-            app_handle,
+            app_handle: app_handle.clone(),
             local_ips: local_ips.clone(),
             own_mac,
-            fence: fence.clone(),
+            fence: placeholder_fence,
             excluded_subnets: self.excluded_subnets.clone(),
             scope: capture_scope,
         };
-        // Attach, keep, or replace the persistent listener. Sweeps and
-        // the watchdog below run on the session-fenced bundle; the
-        // listener itself runs under the capture-lifecycle fence that
+        // Attach, keep, or replace the persistent listener. The listener
+        // runs under the capture-lifecycle fence that
         // `ensure_capture_listener` builds per incarnation.
         let activation_rx = self
-            .ensure_capture_listener(interface_display_name, own_mac, &listener_params)
+            .ensure_capture_listener(
+                interface_display_name,
+                own_mac,
+                iface_info.is_up,
+                &listener_params,
+            )
             .await?;
+
+        // Up-gate: the session machinery below (sweep, watchdog, adopt)
+        // needs a live link. On a down link the listener attached above
+        // stays behind, already hearing the wire for the link-up burst,
+        // and the caller gets the same error as always.
+        if !iface_info.is_up {
+            return Err(AppError::Network(format!(
+                "'{}' is not an up, wired Ethernet adapter — ARP discovery only runs on the wired camera port",
+                interface_display_name
+            )));
+        }
+
+        // New discovery session: advance the generation and mark discovery
+        // active so sweeps and capture frames from a prior session can
+        // fence themselves out (that work captures the generation; the
+        // active flag also covers a stop with no restart). Deliberately
+        // after the up-gate — a pre-attach-only start must not burn a
+        // generation or leave the active flag set with no session.
+        let generation = self.discovery_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        self.discovery_active.store(true, Ordering::Relaxed);
+        log::debug!("Discovery session generation → {}", generation);
+
+        // Session fence for sweeps and the adopt loop: stale-session work
+        // (from a prior session, or after a stop) drops itself before
+        // merging or emitting into the shared registry. The capture
+        // listener does NOT use this fence — a retained listener must
+        // keep merging across session restarts.
+        let fence = SweepFence::new(
+            generation,
+            self.discovery_generation.clone(),
+            self.discovery_active.clone(),
+        );
+        // Rebind the shared bundle onto the session fence for every
+        // consumer below (sweeps, watchdog).
+        let listener_params = listener_params.with_fence(fence.clone());
+
+        *self.interface_name.lock().await = Some(interface_display_name.to_string());
+        log::info!(
+            "Starting ARP discovery on '{}' (IPs: {:?}, mac: {})",
+            interface_display_name,
+            known_ips,
+            iface_info.mac
+        );
+
+        let adopted = self.adopted_ips.clone();
+        let pending_ips = self.pending_ips.clone();
+        let adoption_seq = self.adoption_seq.clone();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let iface_name = interface_display_name.to_string();
+        let app_handle_for_adopt = app_handle.clone();
 
         // Ping sweep known subnets to provoke ARP traffic so the capture
         // listener sees all devices, then read the OS ARP table to catch

@@ -367,8 +367,15 @@ pub enum CaptureMode {
 
 /// How the session ended up scoped — logged exactly once per start.
 pub enum ScopeOutcome {
-    SelectedInterface,
-    UnscopedFallback { reason: String },
+    /// Scoped to the selected adapter's data source. The id is what the
+    /// join bound — recorded so a later liveness probe can detect the
+    /// source being re-created (id churn) under a persistent listener.
+    SelectedInterface {
+        source_id: Option<u32>,
+    },
+    UnscopedFallback {
+        reason: String,
+    },
 }
 
 /// Why the join produced no scoped source.
@@ -489,6 +496,25 @@ pub struct CaptureSession {
 // thread and torn down from the shutdown task's thread.
 unsafe impl Send for CaptureSession {}
 
+/// Resolve the data-source id the given scope would join right now,
+/// without building a session: initialize, enumerate + join, release.
+/// Native calls only (sub-100 ms) — used to detect data-source churn
+/// underneath a persistent capture listener. Blocking; call from a
+/// blocking context.
+pub fn live_source_id_for(scope: &CaptureScope) -> Result<u32, String> {
+    let api = PktMonApi::load()?;
+    unsafe {
+        let mut handle: PmHandle = std::ptr::null_mut();
+        let hr = (api.initialize)(API_VERSION_1_0, std::ptr::null_mut(), &mut handle);
+        if hr != 0 {
+            return Err(format!("PacketMonitorInitialize: HRESULT 0x{hr:08X}"));
+        }
+        let result = CaptureSession::enumerate_and_join(&api, handle, scope).map(|(_, _, id)| id);
+        let _ = (api.uninitialize)(handle);
+        result
+    }
+}
+
 impl CaptureSession {
     /// Start a capture scoped to the selected wired adapter. All-or-
     /// nothing: if any part of the scoped build fails — enumeration,
@@ -505,7 +531,7 @@ impl CaptureSession {
     ) -> Result<(Self, ScopeOutcome), String> {
         let api = PktMonApi::load()?;
         if mode == CaptureMode::ForcedUnscoped {
-            let (handle, session, stream) = Self::try_start(&api, session_name, &config, None)?;
+            let (handle, session, stream, _) = Self::try_start(&api, session_name, &config, None)?;
             return Ok((
                 Self {
                     api,
@@ -519,22 +545,29 @@ impl CaptureSession {
             ));
         }
         match Self::try_start(&api, session_name, &config, Some(scope)) {
-            Ok((handle, session, stream)) => Ok((
+            Ok((handle, session, stream, scoped_id)) => Ok((
                 Self {
                     api,
                     handle,
                     session,
                     stream,
                 },
-                ScopeOutcome::SelectedInterface,
+                ScopeOutcome::SelectedInterface {
+                    source_id: scoped_id,
+                },
             )),
             Err(scoped_reason) => {
-                let (handle, session, stream) =
-                    Self::try_start(&api, session_name, &config, None).map_err(|e| {
-                        format!(
-                            "scoped start failed ({scoped_reason}); unscoped fallback also failed: {e}"
-                        )
-                    })?;
+                let (handle, session, stream, _) = Self::try_start(
+                    &api,
+                    session_name,
+                    &config,
+                    None,
+                )
+                .map_err(|e| {
+                    format!(
+                        "scoped start failed ({scoped_reason}); unscoped fallback also failed: {e}"
+                    )
+                })?;
                 Ok((
                     Self {
                         api,
@@ -558,7 +591,7 @@ impl CaptureSession {
         session_name: &str,
         config: &RealtimeStreamConfiguration,
         scope: Option<&CaptureScope>,
-    ) -> Result<(PmHandle, PmHandle, PmHandle), String> {
+    ) -> Result<(PmHandle, PmHandle, PmHandle, Option<u32>), String> {
         unsafe {
             let mut handle: PmHandle = std::ptr::null_mut();
             let hr = (api.initialize)(API_VERSION_1_0, std::ptr::null_mut(), &mut handle);
@@ -568,7 +601,7 @@ impl CaptureSession {
 
             // Enumeration needs only the post-Initialize handle; join
             // before any session exists so a failure unwinds cheaply.
-            let scoped_source: Option<(Vec<u8>, usize)> = match scope {
+            let scoped_source: Option<(Vec<u8>, usize, u32)> = match scope {
                 Some(s) => match Self::enumerate_and_join(api, handle, s) {
                     Ok(found) => Some(found),
                     Err(e) => {
@@ -602,7 +635,7 @@ impl CaptureSession {
             // Attach exactly the returned in-buffer specification. The
             // API copies what it needs at Add time (hardware-verified),
             // but the buffer stays alive through activation anyway.
-            if let Some((buf, offset)) = &scoped_source {
+            if let Some((buf, offset, _)) = &scoped_source {
                 let hr = (api.add_single_data_source)(session, buf.as_ptr().add(*offset));
                 if hr != 0 {
                     let _ = (api.close_session_handle)(session);
@@ -641,20 +674,22 @@ impl CaptureSession {
                 return Err(format!("PacketMonitorSetSessionActive: HRESULT 0x{hr:08X}"));
             }
 
+            let scoped_id = scoped_source.as_ref().map(|(_, _, id)| *id);
             drop(scoped_source);
-            Ok((handle, session, stream))
+            Ok((handle, session, stream, scoped_id))
         }
     }
 
     /// Two-call enumeration of visible network-interface data sources,
     /// then the pure join. Returns the raw list buffer plus the byte
     /// offset of the matched entry — the original in-buffer pointer is
-    /// what `PacketMonitorAddSingleDataSourceToSession` must receive.
+    /// what `PacketMonitorAddSingleDataSourceToSession` must receive —
+    /// and the matched entry's data-source id.
     fn enumerate_and_join(
         api: &PktMonApi,
         handle: PmHandle,
         scope: &CaptureScope,
-    ) -> Result<(Vec<u8>, usize), String> {
+    ) -> Result<(Vec<u8>, usize, u32), String> {
         unsafe {
             let mut needed: usize = 0;
             let hr = (api.enum_data_sources)(
@@ -692,7 +727,8 @@ impl CaptureSession {
                 entries[idx].description
             );
             let offset = entries[idx].offset;
-            Ok((buf, offset))
+            let source_id = entries[idx].id;
+            Ok((buf, offset, source_id))
         }
     }
 

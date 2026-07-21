@@ -925,9 +925,10 @@ pub(crate) async fn start_listener(
         ) {
             Ok((s, outcome)) => {
                 match &outcome {
-                    pktmon::ScopeOutcome::SelectedInterface => {
+                    pktmon::ScopeOutcome::SelectedInterface { source_id } => {
                         log::info!(
-                            "PacketMonitor: ARP capture active (scope=selected-interface, adapter='{}')",
+                            "PacketMonitor: ARP capture active (scope=selected-interface, source_id={}, adapter='{}')",
+                            source_id.map_or_else(|| "unknown".to_string(), |v| v.to_string()),
                             scope.display_name
                         );
                     }

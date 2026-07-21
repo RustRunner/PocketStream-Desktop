@@ -525,9 +525,19 @@ pub fn run() {
 
                 match network::interface::list_physical().await {
                     Ok(interfaces) => {
-                        let eth = interfaces.iter().find(|i| {
+                        // Prefer a live camera port; fall back to any wired
+                        // physical adapter regardless of media state so the
+                        // capture listener can pre-attach and hear the
+                        // link-up burst the moment a cable arrives.
+                        let up_eth = interfaces.iter().find(|i| {
                             network::interface::is_wired_ethernet(i) && !i.ips.is_empty()
                         });
+                        let eth = up_eth.or_else(|| {
+                            interfaces
+                                .iter()
+                                .find(|i| network::interface::is_wired_physical(i))
+                        });
+                        let media_up = up_eth.is_some();
 
                         if let Some(iface) = eth {
                             // ARP discovery (and the auto-adopt loop it
@@ -537,12 +547,37 @@ pub fn run() {
                             if mode != config::NetworkMode::StaticManual {
                                 if is_discovery_available() {
                                     let name = iface.name.clone();
-                                    log::info!("Auto-starting ARP discovery on '{}'", name);
+                                    if media_up {
+                                        log::info!("Auto-starting ARP discovery on '{}'", name);
+                                    } else {
+                                        log::info!(
+                                            "No up Ethernet interface — pre-attaching ARP capture on '{}'",
+                                            name
+                                        );
+                                    }
 
-                                    if let Err(e) =
-                                        manager.start_arp_discovery(&name, handle.clone()).await
+                                    match manager
+                                        .start_arp_discovery(&name, &config, handle.clone())
+                                        .await
                                     {
-                                        log::warn!("Failed to auto-start ARP discovery: {}", e);
+                                        Ok(()) => {}
+                                        // With the cable out, the start
+                                        // pre-attaches the listener and then
+                                        // reports the expected no-link error;
+                                        // discovery proper starts on the
+                                        // frontend's up-event.
+                                        Err(e) if !media_up => {
+                                            log::info!(
+                                                "ARP discovery waiting for link-up: {}",
+                                                e
+                                            );
+                                        }
+                                        Err(e) => {
+                                            log::warn!(
+                                                "Failed to auto-start ARP discovery: {}",
+                                                e
+                                            );
+                                        }
                                     }
                                 } else {
                                     log::info!(
@@ -569,7 +604,7 @@ pub fn run() {
                                 });
                             }
                         } else {
-                            log::info!("No active Ethernet interface found for ARP discovery");
+                            log::info!("No wired Ethernet adapter found for ARP discovery");
                         }
                     }
                     Err(e) => {

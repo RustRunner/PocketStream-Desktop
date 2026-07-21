@@ -83,6 +83,15 @@ pub struct InterfaceInfo {
     pub is_virtual: bool,
 }
 
+/// Structural half of the camera-port predicate: Ethernet media,
+/// neither VPN nor OS-virtual, regardless of link state. This is the
+/// gate for binding the capture listener — a disconnected wired port is
+/// a valid capture source (it hears the link-up burst the moment a
+/// cable arrives), but WiFi/VPN/virtual never is.
+pub fn is_wired_physical(i: &InterfaceInfo) -> bool {
+    i.is_ethernet && !i.is_vpn && !i.is_virtual
+}
+
 /// The shared "is this a wired camera port?" predicate. A camera-capable
 /// adapter is up, Ethernet media, and neither a VPN nor an OS-virtual
 /// adapter. Every adapter-selection site funnels through this so a
@@ -90,7 +99,7 @@ pub struct InterfaceInfo {
 /// camera port. Lives here (not in `ghost`) so selection sites can use it
 /// without pulling in the ghost-subnet module.
 pub fn is_wired_ethernet(i: &InterfaceInfo) -> bool {
-    i.is_up && i.is_ethernet && !i.is_vpn && !i.is_virtual
+    i.is_up && is_wired_physical(i)
 }
 
 /// List physical (non-VPN) network interfaces.
@@ -683,6 +692,45 @@ pub async fn get_by_name(name: &str) -> Result<InterfaceInfo, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Camera-port predicates ──────────────────────────────────────
+
+    fn flags_iface(
+        is_up: bool,
+        is_ethernet: bool,
+        is_vpn: bool,
+        is_virtual: bool,
+    ) -> InterfaceInfo {
+        InterfaceInfo {
+            name: "t".into(),
+            display_name: "t".into(),
+            ips: vec![],
+            mac: String::new(),
+            is_up,
+            is_ethernet,
+            is_wifi: false,
+            is_vpn,
+            is_virtual,
+        }
+    }
+
+    #[test]
+    fn wired_predicates_split_link_state_from_structure() {
+        // A disconnected wired port is structurally valid but not "up".
+        let down_wired = flags_iface(false, true, false, false);
+        assert!(is_wired_physical(&down_wired));
+        assert!(!is_wired_ethernet(&down_wired));
+        // Up and wired satisfies both.
+        let up_wired = flags_iface(true, true, false, false);
+        assert!(is_wired_physical(&up_wired));
+        assert!(is_wired_ethernet(&up_wired));
+        // Structure rejects non-Ethernet, VPN, and virtual no matter
+        // the link state.
+        assert!(!is_wired_physical(&flags_iface(true, false, false, false)));
+        assert!(!is_wired_physical(&flags_iface(true, true, true, false)));
+        assert!(!is_wired_physical(&flags_iface(true, true, false, true)));
+        assert!(!is_wired_ethernet(&flags_iface(true, true, true, false)));
+    }
 
     // ── Enumeration log change-gate ─────────────────────────────────
 
