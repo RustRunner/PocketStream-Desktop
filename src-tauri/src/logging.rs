@@ -3,10 +3,13 @@
 //! `fern` pushes every formatted record through `io::Write`; this writer
 //! appends to the live log file and, when a write would cross the size
 //! cap, renames the live file to a single `.1` survivor generation
-//! (replacing the previous one) and starts fresh. Rotation is by rename,
-//! never truncation, so after a crash the relaunch keeps the pre-crash
-//! tail on disk in `.1` instead of destroying the history that explains
-//! the crash. Steady-state disk use is bounded at two generations.
+//! (replacing the previous one) and starts fresh. The same rotation runs
+//! once at open, so the live file only ever holds the current app
+//! session and the previous session survives in `.1`. Rotation is by
+//! rename, never truncation, so after a crash the relaunch keeps the
+//! pre-crash tail on disk in `.1` instead of destroying the history that
+//! explains the crash. Steady-state disk use is bounded at two
+//! generations.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -30,18 +33,30 @@ struct WriterState {
 }
 
 impl RotatingFileWriter {
-    /// Open the live file for append. `written` starts from the existing
-    /// file's length, so a file already past the cap (e.g. grown by a
-    /// previous session, or under the old trim scheme) rotates on the
-    /// first write instead of growing unbounded.
+    /// Open the live file for append, then rotate any previous session's
+    /// content into the `.1` survivor so the live file starts this
+    /// session empty. A crash-then-relaunch therefore keeps the pre-crash
+    /// log in `.1` rather than mixing sessions or destroying history; if
+    /// the rotation rename fails, the writer appends after the old
+    /// content, which is the same degrade path in-session rotation uses.
     pub fn open(path: PathBuf, max: u64) -> std::io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let written = file.metadata().map(|m| m.len()).unwrap_or(0);
-        Ok(Self {
+        let this = Self {
             path,
             max,
             state: Mutex::new(WriterState { file, written }),
-        })
+        };
+        {
+            let mut state = this
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.written > 0 {
+                this.rotate(&mut state);
+            }
+        }
+        Ok(this)
     }
 
     /// `pocketstream.log` → `pocketstream.log.1`
@@ -162,16 +177,25 @@ mod tests {
     }
 
     #[test]
-    fn preexisting_oversized_file_rotates_on_first_write() {
+    fn preexisting_content_rotates_at_open() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.log");
-        std::fs::write(&path, "x".repeat(200)).unwrap();
+        std::fs::write(&path, "x".repeat(60)).unwrap(); // under the cap
         let mut w = RotatingFileWriter::open(path.clone(), 100).unwrap();
-        write_run(&mut w, b'y', 10);
+        // The previous session moved aside before any write of this one.
         let rotated = std::fs::read_to_string(dir.path().join("test.log.1")).unwrap();
-        let live = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(rotated, "x".repeat(200));
-        assert_eq!(live, "y".repeat(10));
+        assert_eq!(rotated, "x".repeat(60));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        write_run(&mut w, b'y', 10);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "y".repeat(10));
+    }
+
+    #[test]
+    fn empty_or_missing_file_does_not_rotate_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.log");
+        let _w = RotatingFileWriter::open(path.clone(), 100).unwrap();
+        assert!(!dir.path().join("test.log.1").exists());
     }
 
     #[test]

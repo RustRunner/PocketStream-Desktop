@@ -288,9 +288,11 @@ fn setup_logging() {
 
     let log_file = log_dir.join("pocketstream.log");
 
-    // Size-rotating writer: bounded in-session growth, and rotation is a
-    // rename into a `.1` survivor generation — so a crash-then-relaunch
-    // keeps the pre-crash tail on disk instead of trimming it away.
+    // Size-rotating writer: the live file holds only the current session
+    // (the previous session rotates into the `.1` survivor at open), and
+    // in-session growth is capped by the same rotation. Rotation is a
+    // rename, never truncation — a crash-then-relaunch keeps the
+    // pre-crash tail on disk instead of trimming it away.
     let file = logging::RotatingFileWriter::open(log_file, logging::MAX_LOG_BYTES);
 
     let mut dispatch = fern::Dispatch::new()
