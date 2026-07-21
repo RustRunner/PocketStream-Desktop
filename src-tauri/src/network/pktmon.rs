@@ -557,17 +557,12 @@ impl CaptureSession {
                 },
             )),
             Err(scoped_reason) => {
-                let (handle, session, stream, _) = Self::try_start(
-                    &api,
-                    session_name,
-                    &config,
-                    None,
-                )
-                .map_err(|e| {
-                    format!(
+                let (handle, session, stream, _) =
+                    Self::try_start(&api, session_name, &config, None).map_err(|e| {
+                        format!(
                         "scoped start failed ({scoped_reason}); unscoped fallback also failed: {e}"
                     )
-                })?;
+                    })?;
                 Ok((
                     Self {
                         api,
