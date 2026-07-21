@@ -1,6 +1,6 @@
 # PocketStream Desktop
 
-**PocketStream Desktop** is a Windows application for IP camera monitoring, network discovery, and RTSP re-streaming. Built with Tauri and Rust, it transforms a laptop or workstation into a portable video relay station with automatic device detection and pan-tilt-zoom control.
+**PocketStream Desktop** is a Tauri/Rust Windows application for field camera work. It discovers IP cameras on the wire automatically (even ones stranded on stale DHCP leases or link-local addresses), plays and records their RTSP/UDP streams, re-serves them over a token-protected RTSP server, and drives FLIR pan-tilt units.
 
 Based on [PocketStream for Android](https://github.com/RustRunner/PocketStream).
 
