@@ -363,10 +363,51 @@ async fn run_adapter_query(filter: &str) -> Result<String, AppError> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Last-logged adapter-enumeration output plus the count of identical
+/// results suppressed since. The enumeration re-runs every ~30 s from
+/// pollers, the watcher, and commands, and its full JSON dominates log
+/// volume even though the result is nearly always unchanged — so it is
+/// logged only when it differs from the previous logged result.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+static LAST_ENUM_LOG: std::sync::Mutex<Option<(String, u64)>> = std::sync::Mutex::new(None);
+
+/// Change gate for the enumeration log line: `Some(suppressed)` means
+/// "log now, noting how many identical results were withheld";
+/// `None` means the result matches the last logged one.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn enumeration_log_action(last: &mut Option<(String, u64)>, current: &str) -> Option<u64> {
+    match last {
+        Some((prev, suppressed)) if prev == current => {
+            *suppressed += 1;
+            None
+        }
+        _ => {
+            let suppressed = last.as_ref().map(|(_, n)| *n).unwrap_or(0);
+            *last = Some((current.to_string(), 0));
+            Some(suppressed)
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
 async fn list_physical_windows() -> Result<Vec<InterfaceInfo>, AppError> {
     let stdout = run_adapter_query("$_.Virtual -eq $false").await?;
-    log::info!("Windows physical adapter enumeration: {}", stdout);
+    {
+        let mut last = LAST_ENUM_LOG
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(suppressed) = enumeration_log_action(&mut last, &stdout) {
+            if suppressed == 0 {
+                log::info!("Windows physical adapter enumeration: {}", stdout);
+            } else {
+                log::info!(
+                    "Windows physical adapter enumeration (unchanged {} time(s) since last log): {}",
+                    suppressed,
+                    stdout
+                );
+            }
+        }
+    }
     let adapters = parse_adapter_json(&stdout)?;
     Ok(adapters.iter().map(|a| parse_adapter(a, false)).collect())
 }
@@ -642,6 +683,28 @@ pub async fn get_by_name(name: &str) -> Result<InterfaceInfo, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Enumeration log change-gate ─────────────────────────────────
+
+    #[test]
+    fn enumeration_log_first_result_logs_with_zero_suppressed() {
+        let mut last = None;
+        assert_eq!(enumeration_log_action(&mut last, "a"), Some(0));
+    }
+
+    #[test]
+    fn enumeration_log_identical_results_are_suppressed_and_counted() {
+        let mut last = None;
+        let _ = enumeration_log_action(&mut last, "a");
+        assert_eq!(enumeration_log_action(&mut last, "a"), None);
+        assert_eq!(enumeration_log_action(&mut last, "a"), None);
+        assert_eq!(enumeration_log_action(&mut last, "a"), None);
+        // A change logs again and reports how many repeats were withheld.
+        assert_eq!(enumeration_log_action(&mut last, "b"), Some(3));
+        // The counter reset with the new value.
+        assert_eq!(enumeration_log_action(&mut last, "c"), Some(0));
+        assert_eq!(enumeration_log_action(&mut last, "c"), None);
+    }
 
     // ── Data Structure Tests ────────────────────────────────────────
 
