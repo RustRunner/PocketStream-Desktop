@@ -1150,6 +1150,26 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
     }
 }
 
+/// One watchdog checkpoint window: sleep `window`, then read the
+/// session counters against `baseline`. `None` means shutdown was
+/// signalled mid-sleep. On completion returns the end snapshot (the
+/// next window's baseline) plus the payload and self deltas.
+async fn watch_window(
+    counters: &arp::SessionCounters,
+    baseline: arp::CounterSnapshot,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+    window: std::time::Duration,
+) -> Option<(arp::CounterSnapshot, u64, u64)> {
+    tokio::select! {
+        _ = shutdown_rx.changed() => return None,
+        _ = tokio::time::sleep(window) => {}
+    }
+    let now = counters.snapshot();
+    let payload_delta = now.frames_seen.saturating_sub(baseline.frames_seen);
+    let self_delta = now.self_ip_dropped.saturating_sub(baseline.self_ip_dropped);
+    Some((now, payload_delta, self_delta))
+}
+
 /// Capture-health watchdog with a bounded self-heal ladder.
 ///
 /// After each session activation, the provoking sweep plus a checkpoint
@@ -1186,6 +1206,17 @@ async fn watchdog_ladder(
     let mut restarts_used: u32 = 0;
     let mut last_self_delta: u64 = 0;
     'session: loop {
+        // Consecutive quiet windows in this attempt. Structurally
+        // consecutive: the only path to another window without a fresh
+        // activation is the Rebaseline arm, so any other verdict ends
+        // the run and the count never goes stale.
+        let mut quiet_windows: u32 = 0;
+        // Rolling checkpoint baseline — written on activation before
+        // first use, re-anchored at each window end.
+        let mut baseline = arp::CounterSnapshot {
+            frames_seen: 0,
+            self_ip_dropped: 0,
+        };
         let activation = tokio::select! {
             _ = shutdown_rx.changed() => None,
             outcome = tokio::time::timeout(arp::CAPTURE_ACTIVATION_TIMEOUT, activation_rx) => {
@@ -1195,31 +1226,32 @@ async fn watchdog_ladder(
         let mut event = match activation {
             None => arp::AttemptEvent::ShutdownSignalled,
             Some(Ok(Ok(Ok(_scope)))) => {
-                // Activated. Re-provoke on restarts — the initial
-                // session's sweep was already spawned by the start path —
-                // so the fresh session has traffic to prove itself.
-                if restarts_used > 0 {
-                    provoke_sweep(&params, &sweep_ips).await;
-                }
                 match current_session_counters(&listener_slot).await {
                     None => arp::AttemptEvent::ShutdownSignalled, // stop already took the handle
                     Some(counters) => {
-                        let baseline = counters.snapshot();
-                        let window = tokio::select! {
-                            _ = shutdown_rx.changed() => None,
-                            _ = tokio::time::sleep(INITIAL_WINDOW) => Some(()),
-                        };
-                        match window {
+                        // Baseline before the sweep, sweep before the
+                        // window: the sweep's own ARP must land inside
+                        // the measured window, otherwise a deaf-Rx
+                        // session reads as a quiet wire and the watchdog
+                        // holds instead of restarting.
+                        baseline = counters.snapshot();
+                        // Re-provoke on restarts — the initial session's
+                        // sweep was already spawned by the start path —
+                        // so the fresh session has traffic to prove
+                        // itself.
+                        if restarts_used > 0 {
+                            provoke_sweep(&params, &sweep_ips).await;
+                        }
+                        match watch_window(&counters, baseline, &mut shutdown_rx, INITIAL_WINDOW)
+                            .await
+                        {
                             None => arp::AttemptEvent::ShutdownSignalled,
-                            Some(()) => {
-                                let now = counters.snapshot();
-                                let payload_delta =
-                                    now.frames_seen.saturating_sub(baseline.frames_seen);
-                                last_self_delta =
-                                    now.self_ip_dropped.saturating_sub(baseline.self_ip_dropped);
+                            Some((end, payload_delta, self_delta)) => {
+                                baseline = end;
+                                last_self_delta = self_delta;
                                 arp::AttemptEvent::Verdict(arp::capture_health(
                                     payload_delta,
-                                    last_self_delta,
+                                    self_delta,
                                 ))
                             }
                         }
@@ -1238,9 +1270,10 @@ async fn watchdog_ladder(
             }
         };
 
-        // Act on decisions until this attempt resolves. The inner loop
-        // runs at most twice: a Restart that faults feeds the fault back
-        // through the decision function, which always exhausts.
+        // Act on decisions until this attempt resolves. Quiet windows
+        // re-measure in place (bounded by MAX_QUIET_WINDOWS); a Restart
+        // that faults feeds the fault back through the decision
+        // function, which always exhausts.
         loop {
             match arp::next_ladder_step(event, restarts_used) {
                 arp::LadderAction::Done => {
@@ -1251,6 +1284,58 @@ async fn watchdog_ladder(
                         );
                     }
                     return;
+                }
+                arp::LadderAction::Rebaseline => {
+                    quiet_windows += 1;
+                    if quiet_windows == 1 {
+                        log::info!(
+                            "Capture quiet: no traffic in either direction (link down or idle wire) — watchdog holding, no restart"
+                        );
+                    }
+                    if quiet_windows >= arp::MAX_QUIET_WINDOWS {
+                        // The hold has run long enough that "quiet wire"
+                        // needs confirming — a session delivering nothing
+                        // on a live link is dead, not quiet, and must
+                        // resume the ladder rather than end the watch.
+                        let link_up = interface::get_by_name(&params.scope.display_name)
+                            .await
+                            .ok()
+                            .map(|i| i.is_up);
+                        match arp::quiet_exhaust_event(link_up) {
+                            Some(verdict) => {
+                                log::warn!(
+                                    "Capture quiet for {} windows with the link up — treating the session as dead",
+                                    quiet_windows
+                                );
+                                quiet_windows = 0;
+                                event = arp::AttemptEvent::Verdict(verdict);
+                                continue;
+                            }
+                            None => {
+                                log::info!(
+                                    "Capture quiet with the link down or unreadable — ending the watch; the next discovery start re-arms it"
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    // Fresh baseline, same session, another window.
+                    let Some(counters) = current_session_counters(&listener_slot).await else {
+                        return; // stop already took the handle
+                    };
+                    match watch_window(&counters, baseline, &mut shutdown_rx, INITIAL_WINDOW).await
+                    {
+                        None => return, // shutdown mid-window — a stop wins
+                        Some((end, payload_delta, self_delta)) => {
+                            baseline = end;
+                            last_self_delta = self_delta;
+                            event = arp::AttemptEvent::Verdict(arp::capture_health(
+                                payload_delta,
+                                self_delta,
+                            ));
+                            continue;
+                        }
+                    }
                 }
                 arp::LadderAction::Abort => return,
                 arp::LadderAction::Exhaust => break 'session,

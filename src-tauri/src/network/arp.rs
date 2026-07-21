@@ -112,10 +112,15 @@ pub(crate) enum CaptureHealth {
     /// No payload, but the host's own frames were delivered: the session
     /// is alive yet deaf to inbound traffic.
     RxDead,
-    /// Nothing was delivered at all. The provoking sweep always generates
-    /// the host's own ARP, so a flat self counter means the session is
-    /// entirely dead (a truly silent wire is indistinguishable, and
-    /// treating it as dead is harmless).
+    /// Nothing was delivered in either direction. A down or idle wire
+    /// looks exactly like this — nothing transmitted, nothing to hear —
+    /// so the watchdog holds and re-baselines instead of burning a
+    /// restart against a wire that cannot answer.
+    Quiet,
+    /// Nothing delivered although the wire should be answering. Never
+    /// produced by [`capture_health`] — counters alone cannot tell a
+    /// dead session from a dead wire — only synthesized when a quiet
+    /// hold expires while the adapter still reports the link up.
     FullyDead,
 }
 
@@ -127,7 +132,7 @@ pub(crate) fn capture_health(payload_delta: u64, self_delta: u64) -> CaptureHeal
     } else if self_delta > 0 {
         CaptureHealth::RxDead
     } else {
-        CaptureHealth::FullyDead
+        CaptureHealth::Quiet
     }
 }
 
@@ -201,6 +206,9 @@ pub(crate) enum AttemptEvent {
 pub(crate) enum LadderAction {
     /// Healthy — the ladder ends without emitting anything.
     Done,
+    /// Quiet wire: take a fresh baseline and re-run the checkpoint
+    /// window without consuming a restart attempt.
+    Rebaseline,
     /// Tear down the current session and restart at the given scope mode.
     Restart(pktmon::CaptureMode),
     /// Give up loudly: degraded event, then the bounded recovery poll.
@@ -221,6 +229,7 @@ pub(crate) fn next_ladder_step(event: AttemptEvent, restarts_used: u32) -> Ladde
     match event {
         AttemptEvent::ShutdownSignalled => LadderAction::Abort,
         AttemptEvent::Verdict(CaptureHealth::Healthy) => LadderAction::Done,
+        AttemptEvent::Verdict(CaptureHealth::Quiet) => LadderAction::Rebaseline,
         AttemptEvent::Verdict(_) => {
             if restarts_used == 0 {
                 LadderAction::Restart(pktmon::CaptureMode::PreferScoped)
@@ -237,6 +246,26 @@ pub(crate) fn next_ladder_step(event: AttemptEvent, restarts_used: u32) -> Ladde
         | AttemptEvent::ActivationChannelClosed
         | AttemptEvent::StartFailed
         | AttemptEvent::JoinTimedOut => LadderAction::Exhaust,
+    }
+}
+
+/// Consecutive quiet checkpoint windows the watchdog holds through
+/// before the hold itself needs explaining (~5 min at the 10 s window).
+/// Bounds the rebaseline loop so a silent session is never watched
+/// forever.
+pub(crate) const MAX_QUIET_WINDOWS: u32 = 30;
+
+/// What an expired quiet hold means, given the adapter's link state at
+/// that moment (`None` = the state could not be read). Counters alone
+/// cannot distinguish a dead wire from a session delivering nothing on
+/// a live link, so the link is the tie-breaker: up means the silence is
+/// the session's fault — resume the ladder with a fully-dead verdict;
+/// down or unknown means the hold was correct — end the watch quietly
+/// (the next discovery start re-arms it).
+pub(crate) fn quiet_exhaust_event(link_up: Option<bool>) -> Option<CaptureHealth> {
+    match link_up {
+        Some(true) => Some(CaptureHealth::FullyDead),
+        _ => None,
     }
 }
 
@@ -1300,8 +1329,9 @@ mod tests {
         // Alive (own sweep frames delivered) but deaf to inbound.
         assert_eq!(capture_health(0, 7447), RxDead);
         assert_eq!(capture_health(0, 1), RxDead);
-        // Nothing delivered at all — session entirely dead.
-        assert_eq!(capture_health(0, 0), FullyDead);
+        // Nothing delivered in either direction — a quiet or dead wire,
+        // never immediately a dead session.
+        assert_eq!(capture_health(0, 0), Quiet);
     }
 
     #[test]
@@ -1319,7 +1349,8 @@ mod tests {
             next_ladder_step(Verdict(CaptureHealth::RxDead), 2),
             LadderAction::Exhaust
         );
-        // A fully-dead session climbs the same ladder.
+        // A fully-dead session (synthesized at quiet exhaustion on a
+        // live link) climbs the same ladder.
         assert_eq!(
             next_ladder_step(Verdict(CaptureHealth::FullyDead), 0),
             LadderAction::Restart(pktmon::CaptureMode::PreferScoped)
@@ -1328,6 +1359,35 @@ mod tests {
             next_ladder_step(Verdict(CaptureHealth::FullyDead), 1),
             LadderAction::Restart(pktmon::CaptureMode::ForcedUnscoped)
         );
+        assert_eq!(
+            next_ladder_step(Verdict(CaptureHealth::FullyDead), 2),
+            LadderAction::Exhaust
+        );
+    }
+
+    #[test]
+    fn ladder_quiet_rebaselines_at_any_depth() {
+        // A quiet wire never consumes a restart attempt, no matter how
+        // many the session has already spent.
+        for used in 0..=LADDER_MAX_RESTARTS {
+            assert_eq!(
+                next_ladder_step(AttemptEvent::Verdict(CaptureHealth::Quiet), used),
+                LadderAction::Rebaseline
+            );
+        }
+    }
+
+    #[test]
+    fn quiet_exhaust_resumes_ladder_only_on_a_live_link() {
+        // Link up: the silence is the session's fault, not the wire's.
+        assert_eq!(
+            quiet_exhaust_event(Some(true)),
+            Some(CaptureHealth::FullyDead)
+        );
+        // Link down: the hold was correct — end the watch quietly.
+        assert_eq!(quiet_exhaust_event(Some(false)), None);
+        // Unreadable state: never degrade loudly on a probe fault.
+        assert_eq!(quiet_exhaust_event(None), None);
     }
 
     #[test]
