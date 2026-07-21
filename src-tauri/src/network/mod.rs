@@ -222,6 +222,77 @@ impl SweepFence {
     }
 }
 
+/// What the persistent capture listener is currently bound to.
+///
+/// `source_id` is the PacketMonitor data-source id from the scope join
+/// (`None` for an unscoped-fallback session). `active` is this
+/// incarnation's lifecycle flag: allocated fresh for every attach and
+/// flipped false forever on stop, so a wedged prior capture thread can
+/// never merge again once a replacement attaches — the same
+/// permanently-stale property the discovery generation gives sweeps.
+#[derive(Debug, Clone)]
+pub(crate) struct CaptureIdentity {
+    pub(crate) iface_name: String,
+    pub(crate) mac: Option<[u8; 6]>,
+    pub(crate) source_id: Option<u32>,
+    pub(crate) active: Arc<AtomicBool>,
+}
+
+/// A fresh look at the data source the capture scope would bind today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiveSourceId {
+    /// Native enumeration found this id for the adapter.
+    // Production callers pass EnumFailed until a live probe exists; the
+    // decision table already covers this variant.
+    #[allow(dead_code)]
+    Enumerated(u32),
+    /// Enumeration was unavailable or failed. Fails open — a transient
+    /// enumeration fault must never churn a healthy listener.
+    EnumFailed,
+}
+
+/// What `ensure_capture_listener` does with the listener slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ListenerAction {
+    Attach,
+    Keep,
+    Replace(&'static str),
+}
+
+/// Pure decision for the capture-listener slot: keep a healthy binding,
+/// replace an invalidated one, attach when none exists. `has_listener`
+/// is the handle slot's occupancy — a recorded identity without a live
+/// handle (a torn-down session whose reinstall failed) must attach, not
+/// keep.
+pub(crate) fn listener_action(
+    current: Option<&CaptureIdentity>,
+    has_listener: bool,
+    desired_iface: &str,
+    desired_mac: Option<[u8; 6]>,
+    live: LiveSourceId,
+) -> ListenerAction {
+    let Some(current) = current else {
+        return ListenerAction::Attach;
+    };
+    if !has_listener {
+        return ListenerAction::Attach;
+    }
+    if current.iface_name != desired_iface || current.mac != desired_mac {
+        return ListenerAction::Replace("adapter changed");
+    }
+    match (current.source_id, live) {
+        // No live id to compare against — keep what runs.
+        (_, LiveSourceId::EnumFailed) => ListenerAction::Keep,
+        // An unscoped-fallback session never outlives the next start:
+        // every ensure re-attempts the scoped join.
+        (None, LiveSourceId::Enumerated(_)) => ListenerAction::Replace("retry scoped attach"),
+        (Some(bound), LiveSourceId::Enumerated(live_id)) if bound != live_id => {
+            ListenerAction::Replace("data source changed")
+        }
+        _ => ListenerAction::Keep,
+    }
+}
+
 /// RAII guard that removes a subnet from the active-scan set on drop, so a
 /// cancelled `scan_subnet` future can't leave the subnet permanently marked
 /// "scan in progress" (which would reject every later scan of it for the
@@ -248,6 +319,18 @@ pub struct NetworkManager {
     /// capture start drains this (bounded join) before attaching — the
     /// session name is fixed, so two live sessions must never overlap.
     prior_capture_joins: arp::PriorCaptureJoins,
+    /// What the persistent capture listener is bound to (adapter, data
+    /// source, incarnation lifecycle flag). `None` when no listener is
+    /// attached.
+    capture_identity: Arc<Mutex<Option<CaptureIdentity>>>,
+    /// Every IPv4 currently assigned to any local adapter. Shared with
+    /// the capture callback and refreshed at every discovery start (and
+    /// each adopt-loop pass), so a listener retained across sessions
+    /// keeps an accurate self-filter.
+    local_ips: Arc<StdMutex<HashSet<Ipv4Addr>>>,
+    /// Subnets owned exclusively by non-wired interfaces. Shared with
+    /// the capture callback and recomputed at every discovery start.
+    excluded_subnets: Arc<StdMutex<Vec<ipnetwork::Ipv4Network>>>,
     auto_adopt_handle: Arc<Mutex<Option<AutoAdoptHandle>>>,
     /// Secondary IPs the auto-adopt loop has bound but not yet handed over
     /// to `adopted_ips` (scratch probes and unrecorded final adds), tagged
@@ -482,6 +565,11 @@ async fn provoke_sweep(params: &arp::ListenerParams, sweep_ips: &[String]) {
         .lock()
         .map(|s| s.clone())
         .unwrap_or_default();
+    let excluded_snapshot: Vec<ipnetwork::Ipv4Network> = params
+        .excluded_subnets
+        .lock()
+        .map(|v| v.clone())
+        .unwrap_or_default();
 
     // Merge the OS neighbor table for EVERY local/adopted IP, not just
     // the first — a neighbor learned via an adopted secondary subnet
@@ -501,7 +589,7 @@ async fn provoke_sweep(params: &arp::ListenerParams, sweep_ips: &[String]) {
             params.emitter.clone(),
             params.app_handle.clone(),
             sweep_iface_ip,
-            &params.excluded_subnets,
+            &excluded_snapshot,
             &local_snapshot,
             &params.fence,
         )
@@ -1193,6 +1281,7 @@ async fn watchdog_ladder(
     sweep_ips: Vec<String>,
     listener_slot: Arc<Mutex<Option<arp::ArpListenerHandle>>>,
     prior_joins: arp::PriorCaptureJoins,
+    capture_identity: Arc<Mutex<Option<CaptureIdentity>>>,
     mut activation_rx: arp::ActivationRx,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -1346,6 +1435,12 @@ async fn watchdog_ladder(
                         restarts_used + 1,
                         mode
                     );
+                    // Retire the deaf incarnation's fence before tearing
+                    // it down: with the flag false, even a wedged thread
+                    // can never merge after the replacement attaches.
+                    if let Some(identity) = capture_identity.lock().await.as_ref() {
+                        identity.active.store(false, Ordering::Relaxed);
+                    }
                     // Tear down the deaf session; a stop that already
                     // took the handle wins.
                     let Some(old_handle) = listener_slot.lock().await.take() else {
@@ -1362,7 +1457,18 @@ async fn watchdog_ladder(
                         event = arp::AttemptEvent::JoinTimedOut;
                         continue;
                     }
-                    match arp::start_listener(params.clone(), mode, &prior_joins).await {
+                    // A replacement is a fresh incarnation of the same
+                    // binding: new lifecycle flag, new lifecycle fence.
+                    let incarnation = Arc::new(AtomicBool::new(true));
+                    let lifecycle_fence =
+                        SweepFence::new(0, Arc::new(AtomicU64::new(0)), incarnation.clone());
+                    match arp::start_listener(
+                        params.with_fence(lifecycle_fence),
+                        mode,
+                        &prior_joins,
+                    )
+                    .await
+                    {
                         Err(e) => {
                             log::warn!("Capture restart failed: {}", e);
                             event = arp::AttemptEvent::StartFailed;
@@ -1374,12 +1480,20 @@ async fn watchdog_ladder(
                                 // Discovery stopped or restarted while we
                                 // were attaching — the new session belongs
                                 // to nobody; tear it straight back down.
+                                incarnation.store(false, Ordering::Relaxed);
                                 drop(slot);
                                 prior_joins.lock().await.push(new_handle.stop_into_join());
                                 return;
                             }
                             *slot = Some(new_handle);
                             drop(slot);
+                            // Refresh the recorded identity: same
+                            // adapter, new incarnation, and any bound
+                            // source id is no longer this session's.
+                            if let Some(identity) = capture_identity.lock().await.as_mut() {
+                                identity.active = incarnation;
+                                identity.source_id = None;
+                            }
                             restarts_used += 1;
                             activation_rx = new_rx;
                             continue 'session;
@@ -1438,6 +1552,9 @@ impl NetworkManager {
             adopted_ips: Arc::new(Mutex::new(HashMap::new())),
             arp_listener_handle: Arc::new(Mutex::new(None)),
             prior_capture_joins: Arc::new(Mutex::new(Vec::new())),
+            capture_identity: Arc::new(Mutex::new(None)),
+            local_ips: Arc::new(StdMutex::new(HashSet::new())),
+            excluded_subnets: Arc::new(StdMutex::new(Vec::new())),
             auto_adopt_handle: Arc::new(Mutex::new(None)),
             pending_ips: Arc::new(Mutex::new(Vec::new())),
             adoption_seq: Arc::new(AtomicU64::new(0)),
@@ -2223,6 +2340,110 @@ impl NetworkManager {
             .await
     }
 
+    /// Attach, keep, or replace the persistent capture listener so it
+    /// matches the requested adapter. Runs under `discovery_op` (every
+    /// caller holds it). Returns an already-resolved activation channel
+    /// for the watchdog: on attach/replace this method awaited the real
+    /// activation itself; on keep the retained listener proved
+    /// activation when it originally attached.
+    async fn ensure_capture_listener(
+        &self,
+        iface_name: &str,
+        own_mac: Option<[u8; 6]>,
+        base_params: &arp::ListenerParams,
+    ) -> Result<arp::ActivationRx, AppError> {
+        let has_listener = self.arp_listener_handle.lock().await.is_some();
+        let action = {
+            let identity = self.capture_identity.lock().await;
+            listener_action(
+                identity.as_ref(),
+                has_listener,
+                iface_name,
+                own_mac,
+                // No native source-id probe is wired up here yet, so the
+                // binding is judged by adapter identity alone — which
+                // fails toward Keep, never toward churn.
+                LiveSourceId::EnumFailed,
+            )
+        };
+
+        if action == ListenerAction::Keep {
+            log::info!("ARP capture retained across discovery restart");
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            // The watchdog only cares that activation succeeded; the
+            // retained session proved that when it attached.
+            let _ = tx.send(Ok(pktmon::ScopeOutcome::SelectedInterface));
+            return Ok(rx);
+        }
+        if let ListenerAction::Replace(reason) = action {
+            log::info!("ARP capture replaced ({})", reason);
+        }
+
+        // Retire the old incarnation before tearing it down: with the
+        // flag already false, even a wedged capture thread can never
+        // merge again once the replacement attaches.
+        if let Some(old) = self.capture_identity.lock().await.take() {
+            old.active.store(false, Ordering::Relaxed);
+        }
+        park_capture_handle(&self.arp_listener_handle, &self.prior_capture_joins).await;
+
+        let incarnation = Arc::new(AtomicBool::new(true));
+        let lifecycle_fence = SweepFence::new(0, Arc::new(AtomicU64::new(0)), incarnation.clone());
+        let (handle, activation_rx) = arp::start_listener(
+            base_params.with_fence(lifecycle_fence),
+            pktmon::CaptureMode::PreferScoped,
+            &self.prior_capture_joins,
+        )
+        .await?;
+        *self.arp_listener_handle.lock().await = Some(handle);
+
+        // Confirm activation here rather than leaving it to the
+        // watchdog: the recorded identity must describe a live binding,
+        // and an unconfirmed session is parked exactly as the watchdog's
+        // activation-timeout arm parks one. The incarnation flag goes
+        // false on every failure path so a late-activating stray can
+        // never merge.
+        let outcome =
+            match tokio::time::timeout(arp::CAPTURE_ACTIVATION_TIMEOUT, activation_rx).await {
+                Ok(Ok(Ok(outcome))) => outcome,
+                Ok(Ok(Err(start_error))) => {
+                    incarnation.store(false, Ordering::Relaxed);
+                    park_capture_handle(&self.arp_listener_handle, &self.prior_capture_joins).await;
+                    return Err(AppError::Network(format!(
+                        "ARP capture session failed to start: {}",
+                        start_error
+                    )));
+                }
+                Ok(Err(_channel_closed)) => {
+                    incarnation.store(false, Ordering::Relaxed);
+                    park_capture_handle(&self.arp_listener_handle, &self.prior_capture_joins).await;
+                    return Err(AppError::Network(
+                        "ARP capture thread died before confirming activation".into(),
+                    ));
+                }
+                Err(_elapsed) => {
+                    incarnation.store(false, Ordering::Relaxed);
+                    park_capture_handle(&self.arp_listener_handle, &self.prior_capture_joins).await;
+                    return Err(AppError::Network(
+                        "ARP capture session did not confirm activation in time".into(),
+                    ));
+                }
+            };
+
+        *self.capture_identity.lock().await = Some(CaptureIdentity {
+            iface_name: iface_name.to_string(),
+            mac: own_mac,
+            // Recorded once the scope join reports an id; until then a
+            // re-check judges the binding by adapter identity alone.
+            source_id: None,
+            active: incarnation,
+        });
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = tx.send(Ok(outcome));
+        Ok(rx)
+    }
+
     /// Start body, run with the discovery op lock already held. Callers
     /// that already hold it (`apply_mode_change`) delegate here so the
     /// non-reentrant lock isn't acquired twice.
@@ -2231,7 +2452,9 @@ impl NetworkManager {
         interface_display_name: &str,
         app_handle: tauri::AppHandle,
     ) -> Result<(), AppError> {
-        self.stop_locked().await;
+        // Session-only teardown: a capture listener that is still valid
+        // for this adapter is retained and re-evaluated below.
+        self.stop_session_locked().await;
 
         // New discovery session: advance the generation and mark discovery
         // active so sweeps and capture frames from a prior session can
@@ -2241,9 +2464,12 @@ impl NetworkManager {
         self.discovery_active.store(true, Ordering::Relaxed);
         log::debug!("Discovery session generation → {}", generation);
 
-        // Session fence shared by the capture listener and every sweep so
-        // stale-session work (from a prior session, or after a stop) drops
-        // itself before merging or emitting into the shared registry.
+        // Session fence for sweeps and the adopt loop: stale-session work
+        // (from a prior session, or after a stop) drops itself before
+        // merging or emitting into the shared registry. The capture
+        // listener does NOT use this fence — it runs under the manager's
+        // capture-lifecycle fence (see `ensure_capture_listener`), because
+        // a retained listener must keep merging across session restarts.
         let fence = SweepFence::new(
             generation,
             self.discovery_generation.clone(),
@@ -2291,11 +2517,13 @@ impl NetworkManager {
         // camera port. The capture listener drops ARP sent from any of
         // these so the host never lists itself as a node (its own WiFi
         // traffic on a subnet shared with the wired port passes every other
-        // filter). The adopt loop refreshes the set each pass because
-        // addresses move under us (DHCP renew, WiFi roam).
-        let local_ips: Arc<StdMutex<HashSet<Ipv4Addr>>> = Arc::new(StdMutex::new(
-            interface::all_local_ipv4().into_iter().collect(),
-        ));
+        // filter). Manager-owned: every start refreshes the same shared
+        // set (and the adopt loop refreshes it each pass), so a listener
+        // retained across sessions keeps an accurate self-filter.
+        if let Ok(mut set) = self.local_ips.lock() {
+            *set = interface::all_local_ipv4().into_iter().collect();
+        }
+        let local_ips = self.local_ips.clone();
         log::info!(
             "Starting ARP discovery on '{}' (IPs: {:?}, mac: {})",
             interface_display_name,
@@ -2316,6 +2544,12 @@ impl NetworkManager {
                 "Discovery excluding non-wired (WiFi/VPN/virtual) subnets: {:?}",
                 excluded_subnets
             );
+        }
+        // Manager-owned shared value: the capture callback reads it per
+        // frame, so a retained listener picks up the refreshed
+        // exclusions without a re-attach.
+        if let Ok(mut shared) = self.excluded_subnets.lock() {
+            *shared = excluded_subnets;
         }
 
         let registry = self.device_registry.clone();
@@ -2349,16 +2583,16 @@ impl NetworkManager {
             local_ips: local_ips.clone(),
             own_mac,
             fence: fence.clone(),
-            excluded_subnets,
+            excluded_subnets: self.excluded_subnets.clone(),
             scope: capture_scope,
         };
-        let (handle, activation_rx) = arp::start_listener(
-            listener_params.clone(),
-            pktmon::CaptureMode::PreferScoped,
-            &self.prior_capture_joins,
-        )
-        .await?;
-        *self.arp_listener_handle.lock().await = Some(handle);
+        // Attach, keep, or replace the persistent listener. Sweeps and
+        // the watchdog below run on the session-fenced bundle; the
+        // listener itself runs under the capture-lifecycle fence that
+        // `ensure_capture_listener` builds per incarnation.
+        let activation_rx = self
+            .ensure_capture_listener(interface_display_name, own_mac, &listener_params)
+            .await?;
 
         // Ping sweep known subnets to provoke ARP traffic so the capture
         // listener sees all devices, then read the OS ARP table to catch
@@ -2366,7 +2600,11 @@ impl NetworkManager {
         let sweep_params = listener_params.clone();
         let sweep_ips = known_ips.clone();
         tokio::spawn(async move {
-            // Small delay to let the capture listener start first
+            // Small delay so the watchdog's baseline snapshot lands
+            // before the sweep's self-traffic — kept on every start
+            // path, including a retained listener, so a checkpoint
+            // window can never misread the sweep as pre-baseline noise.
+            // Also gives a freshly attached session time to start.
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             provoke_sweep(&sweep_params, &sweep_ips).await;
         });
@@ -2382,6 +2620,7 @@ impl NetworkManager {
             known_ips.clone(),
             self.arp_listener_handle.clone(),
             self.prior_capture_joins.clone(),
+            self.capture_identity.clone(),
             activation_rx,
             watchdog_shutdown_rx,
         ));
@@ -3035,8 +3274,20 @@ impl NetworkManager {
         self.stop_locked().await;
     }
 
-    /// Stop body, run with the discovery op lock already held.
+    /// Full stop — the session machinery plus the capture listener, in
+    /// that order. Run with the discovery op lock already held.
     async fn stop_locked(&self) {
+        self.stop_session_locked().await;
+        self.stop_capture_locked().await;
+        log::info!("ARP discovery stopped");
+    }
+
+    /// Stop the session half only: sweeps' fence, the session clock,
+    /// the adopt task, the watchdog, and pending-IP reconciliation. The
+    /// capture listener keeps running — its frames are fenced by the
+    /// capture lifecycle, not the discovery generation, so a retained
+    /// listener keeps merging across session restarts.
+    async fn stop_session_locked(&self) {
         // Mark inactive before tearing down handles so an in-flight sweep
         // or capture frame fences out. Cleared on every stop — including a
         // stop with no following start (Static Auto → Manual) — which a
@@ -3086,6 +3337,20 @@ impl NetworkManager {
                 abort.abort();
             }
         }
+        // Reconcile any secondary IP the (now-stopped) adoption left bound
+        // but unrecorded — scratch probes and final adds that never reached
+        // adopted_ips. Best-effort; failures are logged and retried next stop.
+        auto_adopt::reconcile_pending(&auto_adopt::RealAdoptOps, &self.pending_ips, None).await;
+    }
+
+    /// Stop the capture half: retire the incarnation's fence flag, park
+    /// the capture thread's join, clear the recorded identity.
+    async fn stop_capture_locked(&self) {
+        // Flag first, park second — a wedged thread that outlives the
+        // park can never merge once its incarnation is retired.
+        if let Some(identity) = self.capture_identity.lock().await.take() {
+            identity.active.store(false, Ordering::Relaxed);
+        }
         if let Some(h) = self.arp_listener_handle.lock().await.take() {
             // Signal shutdown and park the capture thread's join in the
             // guard — the next capture start bounded-joins it there, so
@@ -3094,12 +3359,8 @@ impl NetworkManager {
                 .lock()
                 .await
                 .push(h.stop_into_join());
-            log::info!("ARP discovery stopped");
+            log::info!("ARP capture stopped");
         }
-        // Reconcile any secondary IP the (now-stopped) adoption left bound
-        // but unrecorded — scratch probes and final adds that never reached
-        // adopted_ips. Best-effort; failures are logged and retried next stop.
-        auto_adopt::reconcile_pending(&auto_adopt::RealAdoptOps, &self.pending_ips, None).await;
     }
 
     pub async fn get_adopted_ips(&self) -> HashMap<String, String> {
@@ -3592,6 +3853,150 @@ mod tests {
             Arc::new(AtomicU64::new(current)),
             Arc::new(AtomicBool::new(active)),
         )
+    }
+
+    // ── capture-listener retention ────────────────────────────────
+
+    fn identity(source_id: Option<u32>) -> CaptureIdentity {
+        CaptureIdentity {
+            iface_name: "Ethernet".into(),
+            mac: Some([0x40, 0xcd, 0x3a, 0x00, 0x00, 0x01]),
+            source_id,
+            active: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    #[test]
+    fn listener_action_attaches_when_nothing_is_bound() {
+        let current = identity(Some(101));
+        // No identity at all → attach.
+        assert_eq!(
+            listener_action(
+                None,
+                false,
+                "Ethernet",
+                current.mac,
+                LiveSourceId::EnumFailed
+            ),
+            ListenerAction::Attach
+        );
+        // Identity without a live handle (a torn-down session whose
+        // reinstall failed) must attach, never keep.
+        assert_eq!(
+            listener_action(
+                Some(&current),
+                false,
+                "Ethernet",
+                current.mac,
+                LiveSourceId::Enumerated(101)
+            ),
+            ListenerAction::Attach
+        );
+    }
+
+    #[test]
+    fn listener_action_keeps_a_healthy_binding() {
+        let current = identity(Some(101));
+        assert_eq!(
+            listener_action(
+                Some(&current),
+                true,
+                "Ethernet",
+                current.mac,
+                LiveSourceId::Enumerated(101)
+            ),
+            ListenerAction::Keep
+        );
+        // Enumeration failure fails open to Keep — a transient fault
+        // must never churn a healthy listener.
+        assert_eq!(
+            listener_action(
+                Some(&current),
+                true,
+                "Ethernet",
+                current.mac,
+                LiveSourceId::EnumFailed
+            ),
+            ListenerAction::Keep
+        );
+    }
+
+    #[test]
+    fn listener_action_replaces_an_invalidated_binding() {
+        let current = identity(Some(101));
+        // Renamed adapter.
+        assert_eq!(
+            listener_action(
+                Some(&current),
+                true,
+                "Ethernet 2",
+                current.mac,
+                LiveSourceId::Enumerated(101)
+            ),
+            ListenerAction::Replace("adapter changed")
+        );
+        // Same name, different MAC (hardware swapped under the name).
+        assert_eq!(
+            listener_action(
+                Some(&current),
+                true,
+                "Ethernet",
+                Some([0x2c, 0xa5, 0x9c, 0x00, 0x00, 0x02]),
+                LiveSourceId::Enumerated(101)
+            ),
+            ListenerAction::Replace("adapter changed")
+        );
+        // Data-source churn under the same adapter.
+        assert_eq!(
+            listener_action(
+                Some(&current),
+                true,
+                "Ethernet",
+                current.mac,
+                LiveSourceId::Enumerated(115)
+            ),
+            ListenerAction::Replace("data source changed")
+        );
+    }
+
+    #[test]
+    fn listener_action_unscoped_session_retries_scoped() {
+        let unscoped = identity(None);
+        // A live id exists → re-attempt the scoped join.
+        assert_eq!(
+            listener_action(
+                Some(&unscoped),
+                true,
+                "Ethernet",
+                unscoped.mac,
+                LiveSourceId::Enumerated(101)
+            ),
+            ListenerAction::Replace("retry scoped attach")
+        );
+        // No live id → keep the unscoped session over churning.
+        assert_eq!(
+            listener_action(
+                Some(&unscoped),
+                true,
+                "Ethernet",
+                unscoped.mac,
+                LiveSourceId::EnumFailed
+            ),
+            ListenerAction::Keep
+        );
+    }
+
+    #[test]
+    fn lifecycle_fence_stales_only_on_its_incarnation_flag() {
+        // The listener's fence pins generation zero against a
+        // permanently-zero counter, so staleness is exactly the
+        // incarnation flag — a discovery restart (generation advance)
+        // must not fence out a retained listener.
+        let flag = Arc::new(AtomicBool::new(true));
+        let lifecycle = SweepFence::new(0, Arc::new(AtomicU64::new(0)), flag.clone());
+        assert!(!lifecycle.is_stale());
+        flag.store(false, Ordering::Relaxed);
+        assert!(lifecycle.is_stale());
     }
 
     // ── adoption-removal routing ──────────────────────────────────

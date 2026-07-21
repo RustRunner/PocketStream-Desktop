@@ -476,7 +476,9 @@ struct CallbackContext {
     /// ARP whose sender IP falls in one of these is dropped, so only the
     /// wired Ethernet port's peers become nodes. Empty ⇒ no filtering
     /// (interface enumeration failed, or there were no such subnets).
-    excluded_subnets: Vec<ipnetwork::Ipv4Network>,
+    /// Shared with the manager, which refreshes it at every discovery
+    /// start; read under a brief per-frame lock, poison fails open.
+    excluded_subnets: Arc<StdMutex<Vec<ipnetwork::Ipv4Network>>>,
     /// This session's liveness counters, shared with the returned handle.
     counters: Arc<SessionCounters>,
 }
@@ -625,9 +627,17 @@ unsafe fn data_cb_inner(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor
     // still on its factory/APIPA subnet awaiting adoption, matches none
     // of the drop conditions. A poisoned local-IP lock fails open (frame
     // admitted) — same tolerance as the dedupe lock below.
+    // Snapshot the exclusion set first (brief lock; poison fails open to
+    // "no filtering", the same tolerance as the local-IP set) so the two
+    // locks are never held together.
+    let excluded: Vec<ipnetwork::Ipv4Network> = ctx
+        .excluded_subnets
+        .lock()
+        .map(|v| v.clone())
+        .unwrap_or_default();
     let verdict = match ctx.local_ips.lock() {
-        Ok(local) => classify_sender(ip, mac, ctx.own_mac, &local, &ctx.excluded_subnets),
-        Err(_) => classify_sender(ip, mac, ctx.own_mac, &HashSet::new(), &ctx.excluded_subnets),
+        Ok(local) => classify_sender(ip, mac, ctx.own_mac, &local, &excluded),
+        Err(_) => classify_sender(ip, mac, ctx.own_mac, &HashSet::new(), &excluded),
     };
     match verdict {
         SenderVerdict::Accept => {}
@@ -809,10 +819,26 @@ pub(crate) struct ListenerParams {
     pub own_mac: Option<[u8; 6]>,
     pub fence: super::SweepFence,
     /// Subnets owned exclusively by non-Ethernet interfaces; a captured
-    /// ARP whose sender IP is in one is dropped.
-    pub excluded_subnets: Vec<ipnetwork::Ipv4Network>,
+    /// ARP whose sender IP is in one is dropped. Shared with the
+    /// manager, which refreshes it at every discovery start — the
+    /// callback reads it per frame, so a listener retained across
+    /// sessions picks up new exclusions without re-attaching.
+    pub excluded_subnets: Arc<StdMutex<Vec<ipnetwork::Ipv4Network>>>,
     /// The selected wired adapter's capture identity.
     pub scope: pktmon::CaptureScope,
+}
+
+impl ListenerParams {
+    /// Clone with a different fence. The capture listener runs under
+    /// the manager's capture-lifecycle fence while sweeps carry the
+    /// discovery-session fence; the bundles are otherwise identical, so
+    /// the swap lives here.
+    pub(crate) fn with_fence(&self, fence: super::SweepFence) -> Self {
+        Self {
+            fence,
+            ..self.clone()
+        }
+    }
 }
 
 /// Start the PacketMonitor ARP listener. The capture session is scoped
