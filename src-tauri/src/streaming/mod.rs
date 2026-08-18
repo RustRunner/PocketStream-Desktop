@@ -340,9 +340,10 @@ impl StreamManager {
             p.stop()?;
         }
 
-        // Clear HWND — actual window destruction handled by the command layer
-        // on the main thread to avoid cross-thread DestroyWindow hangs.
-        self.clear_video_child_hwnd();
+        // HWND ownership is reconciled by the command layer, which captured
+        // the handle belonging to this stop before awaiting us. It clears
+        // that exact value conditionally so a late old stop cannot erase a
+        // replacement window's handle.
         self.refresh_status().await;
 
         Ok(())
@@ -749,6 +750,21 @@ impl StreamManager {
         self.video_hwnd
             .store(0, std::sync::atomic::Ordering::Relaxed);
     }
+
+    /// Clear the native video handle only when it is still `expected`.
+    /// A stop can spend time finalizing recording or transitioning an old
+    /// GStreamer pipeline while a replacement window is created. An
+    /// unconditional clear at the end of that stop would lose the new HWND.
+    pub fn clear_video_child_hwnd_if(&self, expected: isize) -> bool {
+        self.video_hwnd
+            .compare_exchange(
+                expected,
+                0,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
 }
 
 /// Compute a status snapshot from the underlying state. Lifted out of
@@ -1125,5 +1141,17 @@ mod tests {
         assert!(mgr.get_video_child_hwnd().is_none());
         mgr.set_video_child_hwnd(0x12345);
         assert_eq!(mgr.get_video_child_hwnd(), Some(0x12345));
+    }
+
+    #[test]
+    fn stale_stop_does_not_clear_replacement_video_hwnd() {
+        let mgr = StreamManager::new();
+        mgr.set_video_child_hwnd(0x12345);
+        mgr.set_video_child_hwnd(0x67890);
+
+        assert!(!mgr.clear_video_child_hwnd_if(0x12345));
+        assert_eq!(mgr.get_video_child_hwnd(), Some(0x67890));
+        assert!(mgr.clear_video_child_hwnd_if(0x67890));
+        assert!(mgr.get_video_child_hwnd().is_none());
     }
 }

@@ -58,10 +58,11 @@ pub(crate) fn async_cmd(program: &str) -> tokio::process::Command {
 
 /// Write alias changes through to every on-disk alias store so a
 /// demoted CAM/PTU can't resurrect from a stale row: the device cache
-/// (only rows with open ports live there — same gate as scan-result
-/// persistence) and the manual-nodes config list. Best-effort: a
-/// failed write logs and the registry stays authoritative — the next
-/// successful persist of the record self-heals the store.
+/// and the manual-nodes config list. Full cache rows are upserted when
+/// the current scan has open ports; an existing zero-port cache row still
+/// receives the alias-only update so a hidden stale role cannot resurrect
+/// on restart. Best-effort: a failed write logs and the registry stays
+/// authoritative — the next successful persist self-heals the store.
 pub(crate) fn persist_alias_writethrough(
     registry: &DeviceRegistry,
     config: &crate::config::AppConfig,
@@ -83,6 +84,8 @@ pub(crate) fn persist_alias_writethrough(
             }) {
                 log::warn!("Failed to persist alias change for {} to cache: {}", ip, e);
             }
+        } else if let Err(e) = config.update_cached_device_alias(&record.mac, &record.alias) {
+            log::warn!("Failed to persist alias change for {} to cache: {}", ip, e);
         }
         if let Err(e) = config.update_manual_node_alias(ip, &record.alias) {
             log::warn!(

@@ -10,13 +10,12 @@
  * nodeAliases Maps and verifyingDevices/offlineDevices/cachedOnlyMacs
  * Sets. All those derived facts now live as fields on a DeviceRecord.
  *
- * This module is *read-only* for callers — it never mutates the list
- * itself in response to UI actions. Writers go through tauri-api.js
- * IPC calls (reportScanResult, setDeviceAlias, setDeviceStatus,
- * forgetDevice); the backend updates the registry, emits a new
- * device-list-changed snapshot, and this module's subscriber picks
- * up the change. That round-trip is the whole point — frontend never
- * gets to disagree with the backend about what the device list is.
+ * This module never changes records speculatively in response to UI
+ * actions. Writers go through backend IPC; the usual update path is a
+ * device-list-changed event. Alias writes additionally return their
+ * authoritative post-write snapshot so a no-op/stale action (which has
+ * no event to emit) still reconciles immediately. The frontend therefore
+ * never has to guess what the backend accepted.
  */
 
 import * as api from "./tauri-api.ts";
@@ -85,6 +84,35 @@ export function devicesBySubnet(): Map<string, DeviceRecord[]> {
     }
   }
   return groups;
+}
+
+// ── Authoritative mutations ─────────────────────────────────────────
+
+/** Serialize role writes and replace the mirror only with the snapshot
+ *  returned by the backend after that write. Serializing prevents two
+ *  quick picks on different rows from applying their response snapshots
+ *  out of order. */
+let aliasWriteTail: Promise<void> = Promise.resolve();
+
+export function setAlias(ip: string, alias: string): Promise<void> {
+  const write = aliasWriteTail.then(async () => {
+    const snapshot = await api.setDeviceAlias(ip, alias);
+    setSnapshot(snapshot);
+
+    // `set_alias` deliberately leaves an unknown IP untouched so a stale
+    // UI action cannot demote the real CAM/PTU holder. Treat that safe
+    // backend no-op as an actionable UI error after reconciling the stale
+    // row away, rather than reporting success that did not apply.
+    const applied = snapshot.some((record) => record.ip === ip && record.alias === alias);
+    if (!applied) {
+      throw new Error(`Device ${ip} is no longer available; refresh Nodes and try again`);
+    }
+  });
+
+  // Keep the queue live after a rejected write while returning the real
+  // rejection to this caller.
+  aliasWriteTail = write.catch(() => undefined);
+  return write;
 }
 
 // ── Lifecycle ─────────────────────────────────────────────────────

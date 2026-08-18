@@ -171,8 +171,8 @@ export async function reportScanResult(
   return await invoke("report_scan_result", { ip, openPorts });
 }
 
-export async function setDeviceAlias(ip: string, alias: string): Promise<void> {
-  return await invoke("set_device_alias", { ip, alias });
+export async function setDeviceAlias(ip: string, alias: string): Promise<DeviceRecord[]> {
+  return await invoke<DeviceRecord[]>("set_device_alias", { ip, alias });
 }
 
 export async function setDeviceStatus(

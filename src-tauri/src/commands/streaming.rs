@@ -45,6 +45,15 @@ pub async fn stop_stream(
 
     // Destroy the video child window on the main thread (must match creation thread)
     if let Some(h) = hwnd {
+        // Clear only the handle this command captured. A loss-recovery
+        // restart can create a replacement while an old pipeline is still
+        // transitioning to Null; that late old stop must preserve the new
+        // handle even though its own old HWND still needs destruction.
+        if !stream.clear_video_child_hwnd_if(h) {
+            log::debug!(
+                "Playback stop completed after video HWND changed; preserving replacement handle"
+            );
+        }
         let app = window.app_handle().clone();
         let _ = app.run_on_main_thread(move || {
             crate::streaming::video_embed::destroy_video_child(h);

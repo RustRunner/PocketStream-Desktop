@@ -312,24 +312,26 @@ pub async fn report_scan_result(
 /// change. Every changed record is written through to the cache and
 /// manual-nodes stores (best-effort — the registry is authoritative,
 /// so the event still emits when a disk write fails and the UI
-/// converges on registry state).
+/// converges on registry state). The authoritative post-write snapshot
+/// is also returned directly: a stale/no-op frontend action produces no
+/// change event, but still needs a response that reconciles and unlocks
+/// its role dropdown.
 #[tauri::command]
 pub async fn set_device_alias(
     manager: State<'_, NetworkManager>,
     config: State<'_, AppConfig>,
     ip: String,
     alias: String,
-) -> Result<(), AppError> {
+) -> Result<Vec<DeviceRecord>, AppError> {
     let registry = manager.registry();
     let changed = registry.set_alias(&ip, &alias);
-    if changed.is_empty() {
-        return Ok(());
+    if !changed.is_empty() {
+        crate::network::persist_alias_writethrough(&registry, &config, &changed);
+        if let Some(emitter) = manager.emitter().await {
+            emitter.poke();
+        }
     }
-    crate::network::persist_alias_writethrough(&registry, &config, &changed);
-    if let Some(emitter) = manager.emitter().await {
-        emitter.poke();
-    }
-    Ok(())
+    Ok(registry.snapshot())
 }
 
 /// Update the reachability status of a device by MAC. Used by the

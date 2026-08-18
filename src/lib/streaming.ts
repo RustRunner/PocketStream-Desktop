@@ -176,7 +176,11 @@ export async function stopStreamNow(message = "Stream stopped"): Promise<void> {
   state.isRecording = false;
   $("#btn-record").classList.remove("recording");
   try {
-    await api.stopStream();
+    // A loss-triggered teardown may already own the old pipeline. Still
+    // issue this stop so a manual Stop wins against a recovery start that
+    // has just passed its guard, but do not let the user start again until
+    // the original teardown has drained too.
+    await Promise.all([api.stopStream(), waitForStreamLossTeardown()]);
     updateStreamUI();
     showToast(message);
   } catch (e) {
@@ -596,6 +600,12 @@ export function endPipelineSwitch(): void {
 const STALL_RETRY_SCHEDULE_MS = [0, 60_000, 60_000];
 let stallRetryIndex = 0;
 let stallRetryTimer: ReturnType<typeof setTimeout> | null = null;
+// `showStreamLost` starts teardown without blocking the status-event
+// handler. Every restart path must await this exact work rather than issue
+// a second stop: overlapping Tauri commands can finish out of order, and a
+// late stop can otherwise clear/stop the replacement pipeline or leave its
+// native video HWND untracked.
+let streamLossTeardown: Promise<void> | null = null;
 // Was the RTSP server running at the moment showStreamLost fired? Stall
 // recovery uses this to bring the server back after the playback
 // pipeline recovers. Without this, an ASIX-style link flap that fails
@@ -607,6 +617,25 @@ let wasRtspRunningBeforeLost = false;
 
 function isStallError(msg: string | null | undefined): boolean {
   return !!msg && msg.toLowerCase().includes("stalled");
+}
+
+function trackStreamLossTeardown(tasks: Promise<void>[]): void {
+  // If an earlier loss teardown somehow still exists, include it in the
+  // fence as well. A replacement must never start while any older stop can
+  // still arrive late.
+  const previous = streamLossTeardown;
+  const teardown = Promise.all(previous ? [previous, ...tasks] : tasks).then(
+    () => undefined
+  );
+  streamLossTeardown = teardown;
+  void teardown.then(() => {
+    if (streamLossTeardown === teardown) streamLossTeardown = null;
+  });
+}
+
+async function waitForStreamLossTeardown(): Promise<void> {
+  const teardown = streamLossTeardown;
+  if (teardown) await teardown;
 }
 
 /** Subscribe to backend stream-status push events. Call once at app
@@ -715,6 +744,11 @@ export async function handleReconnect(): Promise<void> {
   // responsive when the user's waiting for the stream to come back.
   await new Promise((r) => setTimeout(r, 2000));
 
+  // showStreamLost tears playback (and possibly the RTSP relay) down in
+  // the background. Do not create replacements until those exact stop
+  // commands have fully drained.
+  await waitForStreamLossTeardown();
+
   // The user may have hit Stop during that grace window — a manual
   // stop clears both flags, and resuming anyway would override their
   // decision (same guard attemptStallRecovery uses).
@@ -784,14 +818,25 @@ function showStreamLost(errorMsg: string | null | undefined): void {
   }
   overlay.classList.add("visible");
 
-  // Reset stream and RTSP server
-  api.stopStream().catch(() => {});
+  // Reset stream and RTSP server. Track the teardown as one fence so a
+  // zero-delay stall retry (or a fast physical reconnect) cannot overlap
+  // either stop with its replacement start.
+  const teardownTasks: Promise<void>[] = [
+    api.stopStream().catch((e) => {
+      log(`Stream-loss playback teardown failed: ${formatError(e)}`);
+    }),
+  ];
   if (state.isRtspRunning) {
     wasRtspRunningBeforeLost = true;
-    api.stopRtspServer().catch(() => {});
+    teardownTasks.push(
+      api.stopRtspServer().catch((e) => {
+        log(`Stream-loss RTSP teardown failed: ${formatError(e)}`);
+      })
+    );
     state.isRtspRunning = false;
     updateRtspUI(null);
   }
+  trackStreamLossTeardown(teardownTasks);
   // Deliberately leave state.isStreaming = true: the user's intent is
   // still "I want to stream", the connection just failed. Keeps the
   // button labelled "Stop Stream" so clicking it means "give up", not
@@ -860,19 +905,24 @@ async function attemptStallRecovery(): Promise<void> {
   // taken over — bail without consuming another retry slot.
   if (!state.isStreaming || !state.streamLost) return;
 
-  const cameraIp = getActiveCamIp();
-  if (!cameraIp) {
-    log("Stall recovery: no camera IP available, aborting");
-    return;
-  }
-  activePlaybackIp = cameraIp;
-
-  log("Stall recovery: restarting pipeline");
+  // Capture this before any healthy/stale status event can call
+  // hideStreamLost and reset the global latch.
+  const shouldRestartRtsp = wasRtspRunningBeforeLost;
   try {
-    // Make sure the previous pipeline is fully torn down before we
-    // ask for a new video window — startStream below will fail
-    // ambiguously if a stale pipeline still owns the HWND.
-    await api.stopStream().catch(() => {});
+    await waitForStreamLossTeardown();
+
+    // Stop may have been clicked, or the interface-watcher reconnect path
+    // may have taken ownership, while teardown was draining.
+    if (!state.isStreaming || !state.streamLost) return;
+
+    const cameraIp = getActiveCamIp();
+    if (!cameraIp) {
+      log("Stall recovery: no camera IP available, aborting");
+      return;
+    }
+    activePlaybackIp = cameraIp;
+
+    log("Stall recovery: restarting pipeline");
     const bounds = getVideoAreaBounds();
     const handle = await createVideoWindowSynced(bounds);
     await api.startStream(handle);
@@ -881,7 +931,7 @@ async function attemptStallRecovery(): Promise<void> {
     // loss. The hardDisconnect path has its own resumeSnapshot for
     // this; stall recovery has to do it here because showStreamLost
     // tore the server down. Failure isn't fatal — playback is alive.
-    if (wasRtspRunningBeforeLost) {
+    if (shouldRestartRtsp) {
       try {
         const info = await api.startRtspServer();
         state.isRtspRunning = true;

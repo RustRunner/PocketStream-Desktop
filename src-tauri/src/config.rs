@@ -260,14 +260,24 @@ pub struct AppConfig {
     /// Cached devices from prior sessions, keyed by MAC. Stored in
     /// `device_cache.toml` separately from settings so that any future
     /// settings-save bug structurally cannot wipe the cache. Mutated
-    /// only via `upsert_cached_device` / `remove_cached_device` (called
-    /// from the DeviceRegistry-backed IPC handlers in commands::network).
+    /// only via the cache mutation helpers below (called from the
+    /// DeviceRegistry-backed IPC handlers in commands::network).
     cache: Mutex<Vec<CachedDevice>>,
     /// User-facing messages about salvage actions taken during load —
     /// e.g. a corrupted file quarantined and defaults applied. The
     /// frontend fetches these once at init and surfaces them as error
     /// toasts; without this, a settings reset is invisible to the user.
     startup_notices: Mutex<Vec<String>>,
+}
+
+fn update_cached_alias_in_place(cache: &mut [CachedDevice], mac: &str, alias: &str) -> bool {
+    match cache.iter_mut().find(|device| device.mac == mac) {
+        Some(device) if device.alias != alias => {
+            device.alias = alias.to_string();
+            true
+        }
+        _ => false,
+    }
 }
 
 impl AppConfig {
@@ -629,6 +639,30 @@ impl AppConfig {
                 poisoned.into_inner().clone()
             }
         }
+    }
+
+    /// Update only the alias of an existing cached row, including legacy
+    /// or temporarily-unreachable rows whose open-port list is empty.
+    /// Never inserts a new row: manual/synthetic records with no scan
+    /// result do not belong in the device cache. Returns whether a row
+    /// actually changed.
+    pub fn update_cached_device_alias(
+        &self,
+        mac: &str,
+        alias: &str,
+    ) -> Result<bool, crate::AppError> {
+        let changed = match self.cache.lock() {
+            Ok(mut guard) => update_cached_alias_in_place(&mut guard, mac, alias),
+            Err(poisoned) => {
+                log::error!("Cache mutex poisoned during alias update, recovering");
+                let mut guard = poisoned.into_inner();
+                update_cached_alias_in_place(&mut guard, mac, alias)
+            }
+        };
+        if changed {
+            self.save_cache()?;
+        }
+        Ok(changed)
     }
 
     /// Insert or update a cached device entry (keyed by MAC).
@@ -2026,6 +2060,49 @@ password = ""
     fn cache_file_default_is_empty() {
         let parsed: CacheFile = toml::from_str("").unwrap();
         assert!(parsed.devices.is_empty());
+    }
+
+    #[test]
+    fn cached_alias_update_includes_zero_port_rows_without_inserting() {
+        let mut cache = vec![CachedDevice {
+            mac: "AA:BB:CC:DD:EE:FF".into(),
+            ip: "192.168.1.207".into(),
+            subnet: "192.168.1.0/24".into(),
+            open_ports: vec![],
+            alias: "PTU".into(),
+            last_seen: "2026-08-18T12:49:46Z".into(),
+        }];
+
+        assert!(update_cached_alias_in_place(
+            &mut cache,
+            "AA:BB:CC:DD:EE:FF",
+            ""
+        ));
+        assert!(cache[0].alias.is_empty());
+        assert!(cache[0].open_ports.is_empty(), "scan metadata is preserved");
+        assert!(
+            !update_cached_alias_in_place(&mut cache, "missing", "PTU"),
+            "an alias-only write must not create a cache row"
+        );
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn cached_alias_update_is_idempotent() {
+        let mut cache = vec![CachedDevice {
+            mac: "AA:BB:CC:DD:EE:FF".into(),
+            ip: "192.168.1.207".into(),
+            subnet: "192.168.1.0/24".into(),
+            open_ports: vec![80],
+            alias: "PTU".into(),
+            last_seen: "2026-08-18T12:49:46Z".into(),
+        }];
+
+        assert!(!update_cached_alias_in_place(
+            &mut cache,
+            "AA:BB:CC:DD:EE:FF",
+            "PTU"
+        ));
     }
 
     // ── Legacy Cache Migration ──────────────────────────────────────

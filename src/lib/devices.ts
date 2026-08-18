@@ -929,10 +929,12 @@ async function handleRoleSelection(
   }
 
   // Disabled while the write is in flight so a double-pick can't race
-  // two writes; a failed write restores the current-name face.
+  // two writes. The backend returns its post-write registry snapshot,
+  // so this succeeds even when an event is coalesced or the operation
+  // is already a no-op in newer backend state.
   select.disabled = true;
   try {
-    await api.setDeviceAlias(ip, alias);
+    await deviceList.setAlias(ip, alias);
     if (action === "cam") {
       // A CAM designation is deliberate — persist it to disk so
       // getActiveCamIp's config fallback picks it up next session
@@ -951,7 +953,13 @@ async function handleRoleSelection(
     }
   } catch (e) {
     showToast(`Failed to set role: ${formatError(e)}`, true);
-    select.selectedIndex = 0;
-    select.disabled = false;
+  } finally {
+    // A successful authoritative snapshot normally rerenders and detaches
+    // this element. If rendering failed, or the backend call rejected,
+    // never leave the still-visible native control permanently disabled.
+    if (select.isConnected) {
+      select.selectedIndex = 0;
+      select.disabled = false;
+    }
   }
 }
