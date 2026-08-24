@@ -493,6 +493,7 @@ function updateRtspUI(displayUrl: string | null): void {
     statusEl.className = "status-value status-offline";
     $("#rtsp-url").textContent = "--";
     $("#rtsp-uptime").textContent = "--";
+    $("#rtsp-clients").textContent = "--";
     $("#rtsp-bandwidth").textContent = "--";
     rtspFullUrl = null;
     qrBtn.disabled = true;
@@ -663,6 +664,8 @@ function handleStatus(status: StreamStatus | null): void {
 
   if (status.rtsp_server_running) {
     $("#rtsp-uptime").textContent = formatUptime(status.uptime_secs);
+    $("#rtsp-clients").textContent =
+      `${status.rtsp_connected_clients} / ${status.rtsp_client_limit}`;
     $("#rtsp-bandwidth").textContent = `${status.bandwidth_kbps.toFixed(1)} kbps`;
     // Keep rtspFullUrl in sync — it may have been cleared by a
     // transient stream-loss event while the server kept running.

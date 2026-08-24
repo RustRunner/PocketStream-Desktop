@@ -18,7 +18,7 @@ pub struct RtspServerInfo {
 }
 
 use rtsp_client::PlaybackPipeline;
-use rtsp_server::RtspRestreamer;
+use rtsp_server::{RtspRestreamer, MAX_RTSP_CLIENTS};
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StreamStatus {
@@ -29,6 +29,8 @@ pub struct StreamStatus {
     pub recording: bool,
     pub uptime_secs: u64,
     pub bandwidth_kbps: f64,
+    pub rtsp_connected_clients: u32,
+    pub rtsp_client_limit: u32,
     pub error: Option<String>,
     /// True while the playback pipeline has a linked audio branch.
     pub audio_present: bool,
@@ -48,11 +50,24 @@ impl StreamStatus {
             recording: false,
             uptime_secs: 0,
             bandwidth_kbps: 0.0,
+            rtsp_connected_clients: 0,
+            rtsp_client_limit: MAX_RTSP_CLIENTS,
             error: None,
             audio_present: false,
             audio_codec: None,
         }
     }
+}
+
+fn publish_status_if_changed(tx: &watch::Sender<StreamStatus>, snapshot: StreamStatus) {
+    tx.send_if_modified(|current| {
+        if *current == snapshot {
+            false
+        } else {
+            *current = snapshot;
+            true
+        }
+    });
 }
 
 pub struct StreamManager {
@@ -522,14 +537,7 @@ impl StreamManager {
     /// for uptime / bandwidth refresh.
     async fn refresh_status(&self) {
         let snapshot = compute_status(&self.state).await;
-        self.status_tx.send_if_modified(|cur| {
-            if *cur == snapshot {
-                false
-            } else {
-                *cur = snapshot;
-                true
-            }
-        });
+        publish_status_if_changed(self.status_tx.as_ref(), snapshot);
     }
 
     /// Spawn the status ticker (1Hz refresh of uptime/bandwidth/health)
@@ -551,14 +559,7 @@ impl StreamManager {
             loop {
                 interval.tick().await;
                 let snap = compute_status(&state_for_tick).await;
-                tx_for_tick.send_if_modified(|cur| {
-                    if *cur == snap {
-                        false
-                    } else {
-                        *cur = snap;
-                        true
-                    }
-                });
+                publish_status_if_changed(tx_for_tick.as_ref(), snap);
             }
         });
 
@@ -778,11 +779,14 @@ async fn compute_status(state: &Arc<Mutex<StreamState>>) -> StreamStatus {
         .unwrap_or(0);
 
     let cached_ip = state.rtsp_local_ip.as_deref().unwrap_or("0.0.0.0");
-    let bandwidth = state
-        .rtsp_server
-        .as_ref()
-        .map(|s| s.bandwidth_kbps())
-        .unwrap_or(0.0);
+    let (bandwidth, connected_clients, client_limit) = match state.rtsp_server.as_ref() {
+        Some(server) => (
+            server.bandwidth_kbps(),
+            server.connected_clients(),
+            server.client_limit(),
+        ),
+        None => (0.0, 0, MAX_RTSP_CLIENTS),
+    };
 
     let (playing, error) = match state.playback.as_ref() {
         Some(p) => match p.health_check() {
@@ -809,6 +813,8 @@ async fn compute_status(state: &Arc<Mutex<StreamState>>) -> StreamStatus {
         recording: state.recording,
         uptime_secs: uptime,
         bandwidth_kbps: bandwidth,
+        rtsp_connected_clients: connected_clients,
+        rtsp_client_limit: client_limit,
         error,
         audio_present,
         audio_codec,
@@ -1072,6 +1078,8 @@ mod tests {
             recording: false,
             uptime_secs: 120,
             bandwidth_kbps: 0.0,
+            rtsp_connected_clients: 3,
+            rtsp_client_limit: MAX_RTSP_CLIENTS,
             error: None,
             audio_present: true,
             audio_codec: Some("PCMU".into()),
@@ -1080,6 +1088,8 @@ mod tests {
         assert!(json.contains("\"playing\":true"));
         assert!(json.contains("\"uptime_secs\":120"));
         assert!(json.contains("\"display_url\":"));
+        assert!(json.contains("\"rtsp_connected_clients\":3"));
+        assert!(json.contains("\"rtsp_client_limit\":10"));
         assert!(json.contains("\"audio_present\":true"));
         assert!(json.contains("\"audio_codec\":\"PCMU\""));
     }
@@ -1090,6 +1100,8 @@ mod tests {
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("\"rtsp_url\":null"));
         assert!(json.contains("\"display_url\":null"));
+        assert!(json.contains("\"rtsp_connected_clients\":0"));
+        assert!(json.contains("\"rtsp_client_limit\":10"));
         // Idle/stopped/video-only playback: no audio, no codec.
         assert!(json.contains("\"audio_present\":false"));
         assert!(json.contains("\"audio_codec\":null"));
@@ -1106,6 +1118,8 @@ mod tests {
         assert!(!status.recording);
         assert_eq!(status.uptime_secs, 0);
         assert!(status.rtsp_url.is_none());
+        assert_eq!(status.rtsp_connected_clients, 0);
+        assert_eq!(status.rtsp_client_limit, MAX_RTSP_CLIENTS);
     }
 
     #[tokio::test]
@@ -1132,6 +1146,23 @@ mod tests {
         mgr.refresh_status().await;
         // No mutation happened — snapshot is identical to the initial one,
         // so the watch channel must not have ticked.
+        assert!(!rx.has_changed().unwrap());
+    }
+
+    #[test]
+    fn status_publisher_emits_when_only_client_count_changes() {
+        let initial = StreamStatus::idle();
+        let (tx, mut rx) = watch::channel(initial.clone());
+        rx.borrow_and_update();
+
+        let mut updated = initial;
+        updated.rtsp_connected_clients = 1;
+        publish_status_if_changed(&tx, updated.clone());
+
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(rx.borrow_and_update().rtsp_connected_clients, 1);
+
+        publish_status_if_changed(&tx, updated);
         assert!(!rx.has_changed().unwrap());
     }
 

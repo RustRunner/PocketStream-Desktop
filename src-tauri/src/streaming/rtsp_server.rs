@@ -19,6 +19,32 @@ use std::sync::Arc;
 use super::audio;
 use crate::error::AppError;
 
+pub const MAX_RTSP_CLIENTS: u32 = 10;
+
+fn observed_probe_bytes(data: Option<&gst::PadProbeData<'_>>) -> u64 {
+    match data {
+        Some(gst::PadProbeData::Buffer(buffer)) => buffer.size() as u64,
+        Some(gst::PadProbeData::BufferList(list)) => {
+            list.iter().map(|buffer| buffer.size() as u64).sum()
+        }
+        _ => 0,
+    }
+}
+
+fn calculate_bandwidth_kbps(
+    current_bytes: u64,
+    previous_bytes: u64,
+    elapsed: std::time::Duration,
+) -> f64 {
+    let elapsed_secs = elapsed.as_secs_f64();
+    if elapsed_secs < 0.001 {
+        return 0.0;
+    }
+
+    let delta_bits = current_bytes.saturating_sub(previous_bytes) as f64 * 8.0;
+    delta_bits / elapsed_secs / 1000.0
+}
+
 /// Redact the RTSP access token embedded in a mount path for logging.
 /// The path is `/stream-<token>` — the same capability secret
 /// `display_url` deliberately hides from the UI — and `redact_url`
@@ -66,6 +92,46 @@ impl Drop for RtspRestreamer {
 }
 
 impl RtspRestreamer {
+    fn configure_session_pool(
+        server: &gst_rtsp_server::RTSPServer,
+    ) -> Result<gst_rtsp_server::RTSPSessionPool, AppError> {
+        let pool = server
+            .session_pool()
+            .ok_or_else(|| AppError::Stream("Failed to get RTSP session pool".into()))?;
+        pool.set_max_sessions(MAX_RTSP_CLIENTS);
+        log::info!(
+            "RTSP client limit configured: {} sessions",
+            MAX_RTSP_CLIENTS
+        );
+        Ok(pool)
+    }
+
+    fn attach_session_logging(
+        server: &gst_rtsp_server::RTSPServer,
+        pool: &gst_rtsp_server::RTSPSessionPool,
+    ) {
+        pool.connect_session_removed(|pool, _session| {
+            log::debug!(
+                "RTSP session removed: {}/{}",
+                pool.n_sessions(),
+                MAX_RTSP_CLIENTS
+            );
+        });
+
+        let pool_for_clients = pool.clone();
+        server.connect_client_connected(move |_server, client| {
+            log::info!("RTSP client connected");
+            let pool = pool_for_clients.clone();
+            client.connect_new_session(move |_client, _session| {
+                log::debug!(
+                    "RTSP session added: {}/{}",
+                    pool.n_sessions(),
+                    MAX_RTSP_CLIENTS
+                );
+            });
+        });
+    }
+
     /// Attach a pad probe to the payloader inside the media pipeline to count
     /// outgoing bytes for bandwidth measurement.
     fn attach_bandwidth_probe(
@@ -97,12 +163,16 @@ impl RtspRestreamer {
             };
 
             let bytes = bytes_sent.clone();
-            pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
-                if let Some(gst::PadProbeData::Buffer(ref buffer)) = info.data {
-                    bytes.fetch_add(buffer.size() as u64, Ordering::Relaxed);
-                }
-                gst::PadProbeReturn::Ok
-            });
+            pad.add_probe(
+                gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+                move |_pad, info| {
+                    let observed_bytes = observed_probe_bytes(info.data.as_ref());
+                    if observed_bytes != 0 {
+                        bytes.fetch_add(observed_bytes, Ordering::Relaxed);
+                    }
+                    gst::PadProbeReturn::Ok
+                },
+            );
             log::info!("Bandwidth probe attached to RTSP server pipeline");
         });
     }
@@ -113,6 +183,7 @@ impl RtspRestreamer {
     /// `shutdown` can join with a bound.
     fn attach_and_run(
         server: &gst_rtsp_server::RTSPServer,
+        pool: &gst_rtsp_server::RTSPSessionPool,
     ) -> Result<
         (
             glib::MainLoop,
@@ -125,11 +196,23 @@ impl RtspRestreamer {
         let source = server
             .create_source(gio::Cancellable::NONE)
             .map_err(|e| AppError::Stream(format!("RTSP server socket failed: {}", e)))?;
+        let cleanup_source = pool.create_watch(
+            Some("pocketstream-rtsp-session-cleanup"),
+            glib::Priority::DEFAULT,
+            |pool| {
+                let removed = pool.cleanup();
+                if removed != 0 {
+                    log::debug!("RTSP server: cleaned up {} expired session(s)", removed);
+                }
+                glib::ControlFlow::Continue
+            },
+        );
 
         // Use a dedicated context so we don't conflict with GStreamer's
         // internal use of the default GLib main context.
         let ctx = glib::MainContext::new();
         source.attach(Some(&ctx));
+        cleanup_source.attach(Some(&ctx));
 
         let main_loop = glib::MainLoop::new(Some(&ctx), false);
         let loop_clone = main_loop.clone();
@@ -210,6 +293,8 @@ impl RtspRestreamer {
         if let Some(addr) = bind_address {
             server.set_address(addr);
         }
+        let session_pool = Self::configure_session_pool(&server)?;
+        Self::attach_session_logging(&server, &session_pool);
 
         let factory = gst_rtsp_server::RTSPMediaFactory::new();
 
@@ -281,11 +366,7 @@ impl RtspRestreamer {
             .ok_or_else(|| AppError::Stream("Failed to get mount points".into()))?;
         mounts.add_factory(mount_path, factory);
 
-        server.connect_client_connected(|_server, _client| {
-            log::info!("RTSP client connected");
-        });
-
-        let (main_loop, loop_thread, loop_done_rx) = Self::attach_and_run(&server)?;
+        let (main_loop, loop_thread, loop_done_rx) = Self::attach_and_run(&server, &session_pool)?;
 
         log::info!(
             "RTSP server started on port {} at {}",
@@ -318,6 +399,8 @@ impl RtspRestreamer {
         if let Some(addr) = bind_address {
             server.set_address(addr);
         }
+        let session_pool = Self::configure_session_pool(&server)?;
+        Self::attach_session_logging(&server, &session_pool);
 
         let factory = gst_rtsp_server::RTSPMediaFactory::new();
 
@@ -340,7 +423,7 @@ impl RtspRestreamer {
             .ok_or_else(|| AppError::Stream("Failed to get mount points".into()))?;
         mounts.add_factory(mount_path, factory);
 
-        let (main_loop, loop_thread, loop_done_rx) = Self::attach_and_run(&server)?;
+        let (main_loop, loop_thread, loop_done_rx) = Self::attach_and_run(&server, &session_pool)?;
 
         log::info!(
             "RTSP server (UDP source) started on port {} at {}",
@@ -371,21 +454,29 @@ impl RtspRestreamer {
         format!("rtsp://{}:{}", local_ip, self.port)
     }
 
-    /// Get the current average bandwidth in kbps since server start.
-    /// Current throughput over the interval since the previous call, not
-    /// a lifetime average (which never reflected the live rate).
+    /// Get the current throughput in kbps over the interval since the
+    /// previous call.
     pub fn bandwidth_kbps(&self) -> f64 {
         let now = std::time::Instant::now();
         let bytes = self.bytes_sent.load(Ordering::Relaxed);
         let mut prev = self.bw_prev.lock().unwrap_or_else(|p| p.into_inner());
         let (prev_bytes, prev_time) = *prev;
-        let elapsed = now.duration_since(prev_time).as_secs_f64();
+        let elapsed = now.duration_since(prev_time);
         *prev = (bytes, now);
-        if elapsed < 0.001 {
-            return 0.0;
-        }
-        let delta_bits = bytes.saturating_sub(prev_bytes) as f64 * 8.0;
-        delta_bits / elapsed / 1000.0
+        calculate_bandwidth_kbps(bytes, prev_bytes, elapsed)
+    }
+
+    /// Number of live RTSP sessions currently occupying client slots.
+    pub fn connected_clients(&self) -> u32 {
+        self.server
+            .session_pool()
+            .map(|pool| pool.n_sessions())
+            .unwrap_or(0)
+    }
+
+    /// Maximum number of concurrent RTSP sessions accepted by this server.
+    pub fn client_limit(&self) -> u32 {
+        MAX_RTSP_CLIENTS
     }
 
     /// Get the port this server is listening on.
@@ -403,7 +494,27 @@ impl RtspRestreamer {
 
 #[cfg(test)]
 mod tests {
-    use super::redact_mount_path;
+    use super::*;
+
+    fn init_gstreamer() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| gst::init().expect("GStreamer test initialization failed"));
+    }
+
+    fn restreamer_fixture(server: gst_rtsp_server::RTSPServer) -> RtspRestreamer {
+        let context = glib::MainContext::new();
+        RtspRestreamer {
+            server,
+            main_loop: glib::MainLoop::new(Some(&context), false),
+            loop_thread: None,
+            loop_done_rx: None,
+            port: 8554,
+            mount_path: "/test".into(),
+            udp_ingest_port: None,
+            bytes_sent: Arc::new(AtomicU64::new(0)),
+            bw_prev: std::sync::Mutex::new((0, std::time::Instant::now())),
+        }
+    }
 
     #[test]
     fn mount_path_token_is_redacted() {
@@ -413,5 +524,83 @@ mod tests {
     #[test]
     fn non_token_paths_pass_through() {
         assert_eq!(redact_mount_path("/live"), "/live");
+    }
+
+    #[test]
+    fn probe_byte_count_handles_buffers_lists_and_other_data() {
+        init_gstreamer();
+
+        let buffer_data = gst::PadProbeData::Buffer(gst::Buffer::with_size(256).unwrap());
+        assert_eq!(observed_probe_bytes(Some(&buffer_data)), 256);
+
+        let mut list = gst::BufferList::new();
+        {
+            let list = list.get_mut().unwrap();
+            list.add(gst::Buffer::with_size(100).unwrap());
+            list.add(gst::Buffer::with_size(200).unwrap());
+            list.add(gst::Buffer::with_size(300).unwrap());
+        }
+        let list_data = gst::PadProbeData::BufferList(list);
+        assert_eq!(observed_probe_bytes(Some(&list_data)), 600);
+
+        let empty_list_data = gst::PadProbeData::BufferList(gst::BufferList::new());
+        assert_eq!(observed_probe_bytes(Some(&empty_list_data)), 0);
+
+        let event_data = gst::PadProbeData::Event(gst::event::Eos::new());
+        assert_eq!(observed_probe_bytes(Some(&event_data)), 0);
+        assert_eq!(observed_probe_bytes(None), 0);
+    }
+
+    #[test]
+    fn bandwidth_rate_handles_normal_zero_and_rollback_samples() {
+        assert_eq!(
+            calculate_bandwidth_kbps(32_000, 0, std::time::Duration::from_secs(1)),
+            256.0
+        );
+        assert_eq!(
+            calculate_bandwidth_kbps(10_000, 10_000, std::time::Duration::from_secs(1)),
+            0.0
+        );
+        assert_eq!(
+            calculate_bandwidth_kbps(5_000, 10_000, std::time::Duration::from_secs(1)),
+            0.0
+        );
+    }
+
+    #[tokio::test]
+    async fn session_pool_limit_slot_reuse_and_status_count() {
+        init_gstreamer();
+        assert_eq!(MAX_RTSP_CLIENTS, 10);
+
+        let server = gst_rtsp_server::RTSPServer::new();
+        let pool = RtspRestreamer::configure_session_pool(&server).unwrap();
+        assert_eq!(pool.max_sessions(), MAX_RTSP_CLIENTS);
+
+        let sessions: Vec<_> = (0..MAX_RTSP_CLIENTS)
+            .map(|_| pool.create().expect("session within configured capacity"))
+            .collect();
+        assert_eq!(pool.n_sessions(), MAX_RTSP_CLIENTS);
+        assert!(pool.create().is_err());
+
+        pool.remove(&sessions[0]).unwrap();
+        assert_eq!(pool.n_sessions(), MAX_RTSP_CLIENTS - 1);
+        let _replacement = pool.create().expect("released slot should be reusable");
+        assert_eq!(pool.n_sessions(), MAX_RTSP_CLIENTS);
+
+        let restreamer = restreamer_fixture(server);
+        assert_eq!(restreamer.connected_clients(), MAX_RTSP_CLIENTS);
+        assert_eq!(restreamer.client_limit(), MAX_RTSP_CLIENTS);
+
+        let manager = super::super::StreamManager::new();
+        {
+            let mut state = manager.state.lock().await;
+            state.rtsp_server = Some(restreamer);
+            state.rtsp_start_time = Some(std::time::Instant::now());
+            state.rtsp_local_ip = Some("127.0.0.1".into());
+        }
+        let status = super::super::compute_status(&manager.state).await;
+        assert!(status.rtsp_server_running);
+        assert_eq!(status.rtsp_connected_clients, MAX_RTSP_CLIENTS);
+        assert_eq!(status.rtsp_client_limit, MAX_RTSP_CLIENTS);
     }
 }

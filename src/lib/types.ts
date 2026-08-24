@@ -150,6 +150,8 @@ export interface StreamStatus {
   recording: boolean;
   uptime_secs: number;
   bandwidth_kbps: number;
+  rtsp_connected_clients: number;
+  rtsp_client_limit: number;
   /** Friendly error string if the pipeline reported a problem */
   error: string | null;
   /** True while the playback pipeline has a linked audio branch */
