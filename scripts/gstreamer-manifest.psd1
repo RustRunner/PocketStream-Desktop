@@ -12,6 +12,21 @@
 @{
     PinnedVersion = '1.26.11'
 
+    # Canonical SRT 1.5.6 drop-in built by build-patched-libsrt.ps1. The
+    # release tag is deliberately outside v* so it cannot trigger or become
+    # an application update. bundle-gstreamer.ps1 verifies the archive and
+    # inner DLL hashes before replacing the stock 1.5.4 libsrt.dll.
+    PatchedSrt = @{
+        Version           = '1.5.6'
+        RuntimeVersionHex = '0x010506'
+        ReleaseTag        = 'deps-libsrt-1.5.6-gstreamer-1.26.11-1'
+        ArchiveFile       = 'pocketstream-libsrt-1.5.6-gstreamer-1.26.11-windows-x86_64.zip'
+        AssetUrl          = 'https://github.com/RustRunner/PocketStream-Desktop/releases/download/deps-libsrt-1.5.6-gstreamer-1.26.11-1/pocketstream-libsrt-1.5.6-gstreamer-1.26.11-windows-x86_64.zip'
+        ArchiveSha256     = '21aa68ef59e443509756b22421638ba48db206dcffb323e4b080399095af43c4'
+        DllFile           = 'libsrt.dll'
+        DllSha256         = '45d2508afcd922f64124671965a1dabf02bca2bcc295d8c82f70c4653aaeab30'
+    }
+
     # ── Core runtime DLLs (from <root>/bin) ──────────────────────────
     # GStreamer + GLib shared libraries needed at runtime.
     CoreDlls = @(
@@ -59,9 +74,16 @@
         'z-1.dll'
         'orc-0.4-0.dll'
 
-        # (No gnutls/nettle TLS stack: the MSVC runtime doesn't ship it and
-        # the app streams over plain RTP/RTSP, not SRTP/TLS — a complete
-        # install has none of these DLLs and the app runs fine without them.)
+        # SRT output, its OpenSSL AES backend, and MinGW runtime closure.
+        # The stock libsrt.dll is copied first, then replaced only by the
+        # hash-pinned 1.5.6 artifact above.
+        'libsrt.dll'
+        'libcrypto-3-x64.dll'
+        'libstdc++-6.dll'
+        'libgcc_s_seh-1.dll'
+        'libwinpthread-1.dll'
+
+        # GnuTLS/nettle remain absent. SRT encryption uses OpenSSL libcrypto.
 
         # FFmpeg / libav (for avdec_h264)
         'avcodec-61.dll'
@@ -114,6 +136,10 @@
 
         # MPEG-TS demuxer: tsdemux
         'gstmpegtsdemux.dll'
+
+        # MPEG-TS muxer and SRT listener sink
+        'gstmpegtsmux.dll'
+        'gstsrt.dll'
 
         # H.264 parser: h264parse
         'gstvideoparsersbad.dll'
@@ -213,6 +239,8 @@
         'gstrawparse.dll'          = 'gst-plugins-bad'
         'gstcodecalpha.dll'        = 'gst-plugins-bad'
         'gstwasapi2.dll'           = 'gst-plugins-bad'
+        'gstmpegtsmux.dll'         = 'gst-plugins-bad'
+        'gstsrt.dll'               = 'gst-plugins-bad'
 
         # gst-plugins-ugly
         'gstx264.dll'              = 'gst-plugins-ugly'
@@ -239,6 +267,13 @@
         'jpeg8.dll'                = 'libjpeg-turbo'
         'png16.dll'                = 'libpng'
         'bz2.dll'                  = 'bzip2'
+
+        # SRT and its native dependency closure
+        'libsrt.dll'               = 'srt'
+        'libcrypto-3-x64.dll'      = 'openssl'
+        'libstdc++-6.dll'          = 'gcc-runtime'
+        'libgcc_s_seh-1.dll'       = 'gcc-runtime'
+        'libwinpthread-1.dll'      = 'winpthreads'
 
         # FFmpeg
         'avcodec-61.dll'           = 'ffmpeg'

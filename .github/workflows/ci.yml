@@ -98,7 +98,7 @@ jobs:
       # available to operators on supported PocketStream hosts. PrepareOnly
       # performs the pinned Cerbero checkout, commit/blob verification, and
       # recipe patch smoke test without starting the multi-hour bootstrap.
-      - name: Validate patched libsrt build inputs (PowerShell 5.1)
+      - name: Validate native dependency inputs (PowerShell 5.1)
         shell: powershell
         run: |
           if ($PSVersionTable.PSVersion.Major -ne 5) {
@@ -108,6 +108,9 @@ jobs:
           & powershell.exe -NoProfile -ExecutionPolicy Bypass `
             -File scripts\build-patched-libsrt.ps1 -WorkRoot $workRoot -PrepareOnly
           if ($LASTEXITCODE -ne 0) { throw "patched libsrt input validation failed with exit $LASTEXITCODE" }
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+            -File scripts\bundle-gstreamer.ps1 -ValidateManifestOnly
+          if ($LASTEXITCODE -ne 0) { throw "patched libsrt manifest validation failed with exit $LASTEXITCODE" }
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -202,6 +205,7 @@ jobs:
         shell: pwsh
         run: |
           $bundle = Join-Path $pwd 'src-tauri\resources\gstreamer\lib\gstreamer-1.0'
+          $bundleBin = Join-Path $pwd 'src-tauri\resources\gstreamer\bin'
           # Windows deletes an env var assigned an empty string, and an
           # unset GST_PLUGIN_SYSTEM_PATH_1_0 falls back to the default
           # system plugin dir — so isolation needs a real, empty directory.
@@ -210,22 +214,36 @@ jobs:
           $env:GST_PLUGIN_PATH_1_0        = $bundle
           $env:GST_PLUGIN_SYSTEM_PATH_1_0 = $emptyDir
           $env:GST_REGISTRY_1_0 = Join-Path $env:RUNNER_TEMP 'bundle-smoke-registry.bin'
+          $env:GST_REGISTRY_FORK = 'no'
 
-          # Negative control: opusdec ships in the complete SDK install but
-          # is deliberately not bundled. If it resolves, the isolation above
-          # is broken and every positive check below is meaningless.
-          gst-inspect-1.0.exe --exists opusdec
-          if ($LASTEXITCODE -eq 0) { throw 'Smoke-check isolation broken: system plugins are visible' }
+          # Run the inspection process from the bundle bin itself. Otherwise
+          # Windows searches the complete SDK's executable directory first,
+          # where stock SRT 1.5.4 could mask the staged 1.5.6 DLL.
+          $systemInspect = (Get-Command gst-inspect-1.0.exe).Source
+          $isolatedInspect = Join-Path $bundleBin 'gst-inspect-1.0.exe'
+          if (Test-Path $isolatedInspect) { throw "Unexpected bundled tool: $isolatedInspect" }
+          Copy-Item -LiteralPath $systemInspect -Destination $isolatedInspect
+          try {
+            $env:PATH = "$bundleBin;$env:PATH"
 
-          $elements = @('rtppcmudepay','rtppcmadepay','mulawdec','alawdec',
-                        'audioconvert','audioresample','volume','autoaudiosink',
-                        'wasapi2sink','directsoundsink')
-          $missing = foreach ($e in $elements) {
-            gst-inspect-1.0.exe --exists $e
-            if ($LASTEXITCODE -ne 0) { $e }
+            # Negative control: opusdec ships in the complete SDK install but
+            # is deliberately not bundled. If it resolves, the isolation above
+            # is broken and every positive check below is meaningless.
+            & $isolatedInspect --exists opusdec
+            if ($LASTEXITCODE -eq 0) { throw 'Smoke-check isolation broken: system plugins are visible' }
+
+            $elements = @('rtppcmudepay','rtppcmadepay','mulawdec','alawdec',
+                          'audioconvert','audioresample','volume','autoaudiosink',
+                          'wasapi2sink','directsoundsink','mpegtsmux','srtsink')
+            $missing = foreach ($e in $elements) {
+              & $isolatedInspect --exists $e
+              if ($LASTEXITCODE -ne 0) { $e }
+            }
+            if ($missing) { throw "Bundle missing elements: $($missing -join ', ')" }
+            Write-Host "All $($elements.Count) runtime elements present in the bundle."
+          } finally {
+            Remove-Item -LiteralPath $isolatedInspect -Force -ErrorAction SilentlyContinue
           }
-          if ($missing) { throw "Bundle missing elements: $($missing -join ', ')" }
-          Write-Host "All $($elements.Count) audio-path elements present in the bundle."
 
       # Guard the import surface of the audio plugins: every non-system DLL
       # they import must ship in the bundle's bin directory, or the installed
