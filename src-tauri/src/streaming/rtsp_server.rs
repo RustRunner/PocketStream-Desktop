@@ -17,44 +17,13 @@ use gstreamer_rtsp_server::prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::audio;
-use super::relay::{RelayEventSender, RelayFaultKind, RelayRuntimeHealth, RelaySupervisorEvent};
+use super::relay::{
+    RelayEventSender, RelayFaultKind, RelayRuntimeHealth, RelaySupervisorEvent,
+    RestreamBuildFailure, RestreamRuntimeContext,
+};
 use crate::error::AppError;
 
 pub const MAX_RTSP_CLIENTS: u32 = 10;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RestreamBuildFailureKind {
-    Bind,
-    Configuration,
-}
-
-pub struct RestreamBuildFailure {
-    pub kind: RestreamBuildFailureKind,
-    pub error: AppError,
-}
-
-pub struct RtspRuntimeContext {
-    pub health: Arc<RelayRuntimeHealth>,
-    pub event_tx: RelayEventSender,
-    pub server_instance: u64,
-}
-
-impl RestreamBuildFailure {
-    fn bind(error: AppError) -> Self {
-        Self {
-            kind: RestreamBuildFailureKind::Bind,
-            error,
-        }
-    }
-
-    fn configuration(error: AppError) -> Self {
-        Self {
-            kind: RestreamBuildFailureKind::Configuration,
-            error,
-        }
-    }
-}
 
 struct ActiveRtspMedia {
     server_instance: u64,
@@ -725,9 +694,9 @@ impl RtspRestreamer {
         bind_address: Option<&str>,
         username: &str,
         password: &str,
-        runtime: RtspRuntimeContext,
+        runtime: RestreamRuntimeContext,
     ) -> Result<Self, RestreamBuildFailure> {
-        let RtspRuntimeContext {
+        let RestreamRuntimeContext {
             health,
             event_tx,
             server_instance,
@@ -797,21 +766,7 @@ impl RtspRestreamer {
                     // media construction negotiates its own streams.
                     // media-configure fires before SDP/SETUP, so the
                     // handler lands in time.
-                    let selection = audio::SelectionState::default();
-                    src.connect("select-stream", false, move |values| {
-                        let caps = values.get(2).and_then(|v| v.get::<gst::Caps>().ok());
-                        let kind = caps
-                            .as_ref()
-                            .map(|c| audio::classify_rtp_caps(c).0)
-                            .unwrap_or(audio::MediaKind::Other);
-                        let accept = selection.select_video_only(kind);
-                        if !accept {
-                            log::info!("Re-stream: declining non-video stream at SETUP");
-                        }
-                        // A select-stream handler must return a gboolean
-                        // Value — None panics in the closure marshal.
-                        Some(accept.to_value())
-                    });
+                    super::connect_video_only_select_stream(&src);
                 }
             }
         });
@@ -880,9 +835,9 @@ impl RtspRestreamer {
         server_port: u16,
         mount_path: &str,
         bind_address: Option<&str>,
-        runtime: RtspRuntimeContext,
+        runtime: RestreamRuntimeContext,
     ) -> Result<Self, RestreamBuildFailure> {
-        let RtspRuntimeContext {
+        let RestreamRuntimeContext {
             health,
             event_tx,
             server_instance,

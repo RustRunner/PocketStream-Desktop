@@ -10,6 +10,8 @@ use std::sync::{Mutex, MutexGuard};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 
+use crate::error::AppError;
+
 pub const FIRST_BUFFER_TIMEOUT: Duration = Duration::from_secs(15);
 pub const STALL_WINDOW: Duration = Duration::from_secs(5);
 pub const STALL_CONFIRMATION: Duration = Duration::from_secs(10);
@@ -38,6 +40,7 @@ pub enum RelayState {
 pub enum RelayFaultKind {
     GstError,
     Eos,
+    Capability,
     MediaStatusError,
     FirstBufferTimeout,
     BufferStall,
@@ -49,6 +52,7 @@ impl RelayFaultKind {
         match self {
             Self::GstError => "gst_error",
             Self::Eos => "eos",
+            Self::Capability => "capability",
             Self::MediaStatusError => "media_status_error",
             Self::FirstBufferTimeout => "first_buffer_timeout",
             Self::BufferStall => "buffer_stall",
@@ -85,6 +89,41 @@ pub enum RelaySupervisorEvent {
 
 pub type RelayEventSender = mpsc::UnboundedSender<RelaySupervisorEvent>;
 pub type RelayEventReceiver = mpsc::UnboundedReceiver<RelaySupervisorEvent>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestreamBuildFailureKind {
+    Bind,
+    Configuration,
+}
+
+pub struct RestreamBuildFailure {
+    pub kind: RestreamBuildFailureKind,
+    pub error: AppError,
+}
+
+impl RestreamBuildFailure {
+    pub fn bind(error: AppError) -> Self {
+        Self {
+            kind: RestreamBuildFailureKind::Bind,
+            error,
+        }
+    }
+
+    pub fn configuration(error: AppError) -> Self {
+        Self {
+            kind: RestreamBuildFailureKind::Configuration,
+            error,
+        }
+    }
+}
+
+/// Generation-scoped dependencies shared by eager and deferred output
+/// adapters. It deliberately owns no protocol settings or secrets.
+pub struct RestreamRuntimeContext {
+    pub health: std::sync::Arc<RelayRuntimeHealth>,
+    pub event_tx: RelayEventSender,
+    pub server_instance: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelayIngestKind {
@@ -341,9 +380,13 @@ impl RelayRuntimeHealth {
         if inner.server_instance != server_instance {
             return;
         }
-        inner.error = None;
-        inner.first_fault = None;
         inner.consecutive_bind_failures = 0;
+        // `begin_server_instance` already cleared prior-instance faults. Do
+        // not erase a current callback fault that raced listener startup.
+        if inner.first_fault.is_some() {
+            return;
+        }
+        inner.error = None;
         if inner.active_data_generation.is_none() {
             Self::transition(&mut inner, RelayState::Listening, None, None);
         }
@@ -482,7 +525,9 @@ impl RelayRuntimeHealth {
 
     pub fn observe_buffer(&self, server_instance: u64, data_generation: u64, now: Instant) -> bool {
         let mut inner = self.lock();
-        if !Self::is_current_data(&inner, server_instance, data_generation) {
+        if !Self::is_current_data(&inner, server_instance, data_generation)
+            || inner.first_fault.is_some()
+        {
             return false;
         }
         inner.last_buffer_at = Some(now);
@@ -499,7 +544,6 @@ impl RelayRuntimeHealth {
 
     /// Mark an eager, silence-exempt source healthy when its output pipeline
     /// reaches PLAYING even if no payload has arrived yet.
-    #[allow(dead_code)] // exercised by the SRT adapter in the next milestone
     pub fn report_streaming_without_buffer(
         &self,
         server_instance: u64,
@@ -507,7 +551,9 @@ impl RelayRuntimeHealth {
         now: Instant,
     ) -> bool {
         let mut inner = self.lock();
-        if !Self::is_current_data(&inner, server_instance, data_generation) {
+        if !Self::is_current_data(&inner, server_instance, data_generation)
+            || inner.first_fault.is_some()
+        {
             return false;
         }
         inner.first_buffer_armed_at = None;
@@ -824,6 +870,29 @@ mod tests {
                 "duplicate".into(),
             )
             .is_none());
+    }
+
+    #[test]
+    fn eager_success_signals_cannot_erase_an_earlier_fault() {
+        let health = RelayRuntimeHealth::new(1, RelayIngestKind::Udp);
+        let instance = health.begin_server_instance(false);
+        let generation = begin_data(&health, instance);
+        assert!(health
+            .report_fault(
+                instance,
+                generation,
+                RelayFaultKind::Capability,
+                "early callback failure".into(),
+            )
+            .is_some());
+
+        health.mark_listener_bound(instance);
+        assert!(!health.observe_buffer(instance, generation, Instant::now()));
+        assert!(!health.report_streaming_without_buffer(instance, generation, Instant::now()));
+        assert_eq!(
+            health.snapshot().error.as_deref(),
+            Some("early callback failure")
+        );
     }
 
     #[tokio::test(start_paused = true)]

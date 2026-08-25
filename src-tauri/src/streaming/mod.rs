@@ -5,6 +5,8 @@ pub mod recorder;
 mod relay;
 pub mod rtsp_client;
 pub mod rtsp_server;
+#[allow(dead_code)] // Production adapter; StreamManager wiring lands in the next slice.
+mod srt_server;
 pub mod video_embed;
 
 use serde::Serialize;
@@ -43,6 +45,28 @@ pub(super) fn configure_tcp_rtspsrc(src: &gst::Element) -> Result<(), AppError> 
     Ok(())
 }
 
+/// Install the SETUP-time policy shared by RTSP and SRT outputs that ingest
+/// from an RTSP camera. Only the first video stream is accepted; audio,
+/// duplicate video, and other media are declined before their SETUP request.
+pub(super) fn connect_video_only_select_stream(src: &gst::Element) -> glib::SignalHandlerId {
+    let selection = audio::SelectionState::default();
+    src.connect("select-stream", false, move |values| {
+        let caps = values
+            .get(2)
+            .and_then(|value| value.get::<gst::Caps>().ok());
+        let kind = caps
+            .as_ref()
+            .map(|caps| audio::classify_rtp_caps(caps).0)
+            .unwrap_or(audio::MediaKind::Other);
+        let accept = selection.select_video_only(kind);
+        if !accept {
+            log::info!("Re-stream: declining non-video stream at SETUP");
+        }
+        // Dynamic signal marshalling requires a gboolean return value.
+        Some(accept.to_value())
+    })
+}
+
 /// Redact both camera URL credentials and this relay's token-bearing mount
 /// path before retaining or logging callback error text.
 pub(super) fn redact_relay_text(text: &str, mount_path: &str) -> String {
@@ -70,13 +94,11 @@ pub struct RestreamOperationResult {
 
 use relay::{
     RelayEventReceiver, RelayEventSender, RelayFaultEvent, RelayRuntimeHealth, RelayState,
-    RelaySupervisorEvent, ResolvedOutput, ResolvedSource, ResolvedStartSpec,
+    RelaySupervisorEvent, ResolvedOutput, ResolvedSource, ResolvedStartSpec, RestreamBuildFailure,
+    RestreamBuildFailureKind, RestreamRuntimeContext,
 };
 use rtsp_client::PlaybackPipeline;
-use rtsp_server::{
-    RestreamBuildFailure, RestreamBuildFailureKind, RtspRestreamer, RtspRuntimeContext,
-    RtspRuntimeProbe, MAX_RTSP_CLIENTS,
-};
+use rtsp_server::{RtspRestreamer, RtspRuntimeProbe, MAX_RTSP_CLIENTS};
 
 enum RestreamServer {
     Rtsp(RtspRestreamer),
@@ -622,7 +644,7 @@ impl StreamManager {
         recovering: bool,
     ) -> (u64, Result<RestreamServer, RestreamBuildFailure>) {
         let server_instance = health.begin_server_instance(recovering);
-        let runtime = RtspRuntimeContext {
+        let runtime = RestreamRuntimeContext {
             health,
             event_tx,
             server_instance,
