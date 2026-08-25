@@ -531,7 +531,7 @@ if (Test-Path -LiteralPath $wrongNamePath -PathType Leaf) {
     throw "Unexpected srt.dll found beside libsrt.dll; the GStreamer 1.26.11 drop-in filename contract is ambiguous: $wrongNamePath"
 }
 
-$sourceArchive = Join-Path $cerberoHome 'sources\local\srt\v1.5.6.tar.gz'
+$sourceArchive = Join-Path $cerberoHome 'sources\local\srt-1.5.6\v1.5.6.tar.gz'
 if (-not (Test-Path -LiteralPath $sourceArchive -PathType Leaf)) {
     throw "Cerbero's fetched SRT source archive was not found at the expected path: $sourceArchive"
 }
