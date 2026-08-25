@@ -145,6 +145,9 @@ impl PlaybackPipeline {
                 "rtspsrc 'src' element not found in pipeline (GStreamer version mismatch?)".into(),
             )
         })?;
+        if use_tcp {
+            super::configure_tcp_rtspsrc(&src)?;
+        }
         src.set_property("location", url);
         // Credentials as rtspsrc properties, not URL-embedded — handles
         // passwords with URL-special characters and keeps creds out of
@@ -975,7 +978,7 @@ fn attach_fakesink(pipeline: &gst::Pipeline, pad: &gst::Pad, reason: &str) {
 }
 
 /// Translate raw GStreamer/RTSP errors into user-friendly messages.
-fn friendly_rtsp_error(error: &str, debug: &str) -> String {
+pub(super) fn friendly_rtsp_error(error: &str, debug: &str) -> String {
     let combined = format!("{} {}", error, debug).to_lowercase();
 
     // Disk exhaustion during recording — checked before the network

@@ -142,9 +142,24 @@ export interface AppSettings {
 
 // ── Streaming (streaming/mod.rs) ─────────────────────────────────────
 
+export type RelayState =
+  | "stopped"
+  | "listening"
+  | "starting"
+  | "streaming"
+  | "recovering"
+  | "failed";
+
 export interface StreamStatus {
   playing: boolean;
+  /** True only while the listener loop is alive and bound. */
   rtsp_server_running: boolean;
+  /** User intent; remains true while backend recovery replaces a listener. */
+  rtsp_desired: boolean;
+  rtsp_relay_state: RelayState;
+  /** Redacted relay-specific error. Local preview errors remain in `error`. */
+  rtsp_error: string | null;
+  rtsp_recovery_attempt: number;
   rtsp_url: string | null;
   display_url: string | null;
   recording: boolean;

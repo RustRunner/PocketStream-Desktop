@@ -364,7 +364,7 @@ let rtspToggleBusy = false;
  */
 export function syncRtspStartButton(): void {
   const startBtn = $<HTMLButtonElement>("#btn-toggle-rtsp");
-  startBtn.disabled = state.isRtspRunning
+  startBtn.disabled = state.isRtspDesired
     ? false
     : !$<HTMLInputElement>("#rtsp-server-enable").checked;
 }
@@ -379,10 +379,10 @@ export function setupRtspControls(): void {
   startBtn.disabled = !enableToggle.checked;
   enableToggle.addEventListener("change", async () => {
     startBtn.disabled = !enableToggle.checked;
-    if (!enableToggle.checked && state.isRtspRunning) {
+    if (!enableToggle.checked && state.isRtspDesired) {
       try {
         await api.stopRtspServer();
-        state.isRtspRunning = false;
+        state.isRtspDesired = false;
         updateRtspUI(null);
         showToast("RTSP server stopped");
       } catch (e) {
@@ -415,10 +415,10 @@ export function setupRtspControls(): void {
     const spinner = $<HTMLElement>("#rtsp-spinner");
     spinner.style.display = "";
 
-    if (state.isRtspRunning) {
+    if (state.isRtspDesired) {
       try {
         await api.stopRtspServer();
-        state.isRtspRunning = false;
+        state.isRtspDesired = false;
         updateRtspUI(null);
         showToast("RTSP server stopped");
       } catch (e) {
@@ -432,7 +432,7 @@ export function setupRtspControls(): void {
         // select can briefly read empty; writing that back would wipe
         // the saved interface.
         const info = await api.startRtspServer();
-        state.isRtspRunning = true;
+        state.isRtspDesired = true;
         rtspFullUrl = info.rtsp_url;
         updateRtspUI(info.display_url);
         showToast("RTSP server started");
@@ -445,7 +445,7 @@ export function setupRtspControls(): void {
     rtspToggleBusy = false;
     // updateRtspUI ran in the happy paths; re-derive here so a thrown
     // start/stop doesn't leave the button stuck disabled.
-    startBtn.disabled = state.isRtspRunning ? false : !enableToggle.checked;
+    startBtn.disabled = state.isRtspDesired ? false : !enableToggle.checked;
   });
 
   // QR code button + dialog
@@ -472,22 +472,47 @@ async function populateVpnDropdown(): Promise<void> {
   }
 }
 
-function updateRtspUI(displayUrl: string | null): void {
+function updateRtspUI(displayUrl: string | null, status?: StreamStatus): void {
   const btn = $<HTMLButtonElement>("#btn-toggle-rtsp");
-  btn.textContent = state.isRtspRunning ? "Stop Server" : "Start Server";
-  // Always allow stopping; respect Enable toggle when stopped
-  btn.disabled = state.isRtspRunning
+  btn.textContent = state.isRtspDesired ? "Stop Server" : "Start Server";
+  // Always allow stopping, including while the listener is rebuilding.
+  btn.disabled = state.isRtspDesired
     ? false
     : !$<HTMLInputElement>("#rtsp-server-enable").checked;
 
   const statusEl = $("#rtsp-status");
   const qrBtn = $<HTMLButtonElement>("#btn-show-qr");
+  const errorRow = $("#rtsp-error-row");
+  const errorEl = $("#rtsp-error");
 
-  if (state.isRtspRunning) {
-    statusEl.textContent = "Online";
-    statusEl.className = "status-value status-online";
+  if (state.isRtspDesired) {
+    const relayState = status?.rtsp_relay_state ?? "starting";
+    switch (relayState) {
+      case "listening":
+      case "streaming":
+        statusEl.textContent = "Online";
+        statusEl.className = "status-value status-online";
+        break;
+      case "recovering":
+        statusEl.textContent = status?.rtsp_recovery_attempt
+          ? `Reconnecting (attempt ${status.rtsp_recovery_attempt})`
+          : "Reconnecting";
+        statusEl.className = "status-value status-warning";
+        break;
+      case "failed":
+        statusEl.textContent = "Degraded / Reconnecting";
+        statusEl.className = "status-value status-warning";
+        break;
+      default:
+        statusEl.textContent = "Starting";
+        statusEl.className = "status-value status-warning";
+        break;
+    }
     $("#rtsp-url").textContent = displayUrl || "--";
-    qrBtn.disabled = false;
+    qrBtn.disabled = !rtspFullUrl;
+    const error = status?.rtsp_error ?? null;
+    errorEl.textContent = error || "";
+    errorRow.style.display = error ? "contents" : "none";
   } else {
     statusEl.textContent = "Offline";
     statusEl.className = "status-value status-offline";
@@ -495,6 +520,8 @@ function updateRtspUI(displayUrl: string | null): void {
     $("#rtsp-uptime").textContent = "--";
     $("#rtsp-clients").textContent = "--";
     $("#rtsp-bandwidth").textContent = "--";
+    errorEl.textContent = "";
+    errorRow.style.display = "none";
     rtspFullUrl = null;
     qrBtn.disabled = true;
   }
@@ -570,9 +597,8 @@ let notPlayingStreak = 0;
 // the status events emitted while the new pipeline spins up legitimately
 // report playing=false, and on a camera with slow RTSP setup they would
 // accumulate past DROP_THRESHOLD_EVENTS and tear down the just-started
-// pipeline AND the RTSP relay via showStreamLost. Only the drop-detection
-// block honors the latch — RTSP-UI sync and uptime rendering must keep
-// running, since the RTSP server stays live during a playback switch.
+// preview pipeline. Only the preview drop-detection block honors the latch;
+// relay status rendering remains independent.
 let pipelineSwitchInProgress = false;
 
 /** Suppress the drop detector for the duration of a deliberate
@@ -607,15 +633,6 @@ let stallRetryTimer: ReturnType<typeof setTimeout> | null = null;
 // late stop can otherwise clear/stop the replacement pipeline or leave its
 // native video HWND untracked.
 let streamLossTeardown: Promise<void> | null = null;
-// Was the RTSP server running at the moment showStreamLost fired? Stall
-// recovery uses this to bring the server back after the playback
-// pipeline recovers. Without this, an ASIX-style link flap that fails
-// to trip the watcher's hardDisconnect path (link stays "Up", IPs intact)
-// would leave the re-stream dead even after local playback returned.
-// Cleared by hideStreamLost on recovery and by manual stop (which calls
-// hideStreamLost via the toggle handler).
-let wasRtspRunningBeforeLost = false;
-
 function isStallError(msg: string | null | undefined): boolean {
   return !!msg && msg.toLowerCase().includes("stalled");
 }
@@ -648,30 +665,20 @@ export function startStatusListener(): void {
 function handleStatus(status: StreamStatus | null): void {
   if (!status) return;
 
-  // Heal the webview-reload desync: after a reload the backend may
-  // still be serving while the fresh UI shows Offline (uptime used to
-  // tick under an "Offline" label). State is set BEFORE updateRtspUI,
-  // which reads it. Note the backend field is handle-presence, not
-  // liveness — a dead server loop still reports true, and detecting
-  // that belongs to the backend shutdown/liveness work, not here.
-  if (state.isRtspRunning !== status.rtsp_server_running) {
-    state.isRtspRunning = status.rtsp_server_running;
-    if (status.rtsp_url) {
-      rtspFullUrl = status.rtsp_url;
-    }
-    updateRtspUI(status.display_url ?? null);
+  // Heal webview-reload desync from backend-owned desired and health state.
+  // Listener liveness may be false during recovery without making the relay
+  // an actionable Start state in the UI.
+  state.isRtspDesired = status.rtsp_desired;
+  if (status.rtsp_url) {
+    rtspFullUrl = status.rtsp_url;
   }
+  updateRtspUI(status.display_url ?? null, status);
 
-  if (status.rtsp_server_running) {
+  if (status.rtsp_desired) {
     $("#rtsp-uptime").textContent = formatUptime(status.uptime_secs);
     $("#rtsp-clients").textContent =
       `${status.rtsp_connected_clients} / ${status.rtsp_client_limit}`;
     $("#rtsp-bandwidth").textContent = `${status.bandwidth_kbps.toFixed(1)} kbps`;
-    // Keep rtspFullUrl in sync — it may have been cleared by a
-    // transient stream-loss event while the server kept running.
-    if (!rtspFullUrl && status.rtsp_url) {
-      rtspFullUrl = status.rtsp_url;
-    }
   }
 
   // Audio availability drives the mute button. Change-detected so the
@@ -704,11 +711,11 @@ function handleStatus(status: StreamStatus | null): void {
 interface ResumeSnapshot {
   cameraIp: string | null;
   ptuIp: string | null;
-  wasRtspRunning: boolean;
+  wasRtspDesired: boolean;
 }
 
 /** Stream state captured at the moment of a hard network disconnect,
- *  so we can re-start the stream (and any associated RTSP server) as
+ *  so we can re-start the stream and explicitly re-resolve a desired relay as
  *  soon as the link comes back. Cleared on manual stop or after a
  *  successful resume. */
 let resumeSnapshot: ResumeSnapshot | null = null;
@@ -726,7 +733,7 @@ export function handleHardDisconnect(reason: string): void {
       // started, and a resume must bring back what was playing.
       cameraIp: activePlaybackIp ?? getActiveCamIp(),
       ptuIp: getActivePtuIp(),
-      wasRtspRunning: !!state.isRtspRunning,
+      wasRtspDesired: state.isRtspDesired,
     };
     log(`Stream lost on network disconnect: ${reason}`);
     showStreamLost(reason);
@@ -747,9 +754,8 @@ export async function handleReconnect(): Promise<void> {
   // responsive when the user's waiting for the stream to come back.
   await new Promise((r) => setTimeout(r, 2000));
 
-  // showStreamLost tears playback (and possibly the RTSP relay) down in
-  // the background. Do not create replacements until those exact stop
-  // commands have fully drained.
+  // showStreamLost tears playback down in the background. Do not create its
+  // replacement until that exact stop command has fully drained.
   await waitForStreamLossTeardown();
 
   // The user may have hit Stop during that grace window — a manual
@@ -784,12 +790,13 @@ export async function handleReconnect(): Promise<void> {
     notPlayingStreak = 0;
     showToast("Stream resumed");
 
-    // RTSP server was running — bring it back too. Errors here aren't
-    // fatal (the stream is already back); toast and move on.
-    if (snap.wasRtspRunning) {
+    // A hard reconnect may have changed host addresses. Re-submit the desired
+    // relay as an explicit Start: the backend no-ops an identical healthy
+    // endpoint and supersedes recovery when resolution actually changed.
+    if (snap.wasRtspDesired && state.isRtspDesired) {
       try {
         const info = await api.startRtspServer();
-        state.isRtspRunning = true;
+        state.isRtspDesired = true;
         rtspFullUrl = info.rtsp_url;
         updateRtspUI(info.display_url);
       } catch (e) {
@@ -821,24 +828,13 @@ function showStreamLost(errorMsg: string | null | undefined): void {
   }
   overlay.classList.add("visible");
 
-  // Reset stream and RTSP server. Track the teardown as one fence so a
-  // zero-delay stall retry (or a fast physical reconnect) cannot overlap
-  // either stop with its replacement start.
+  // Reset preview only. Relay health and recovery belong to the backend and
+  // remain independent of a preview-only failure.
   const teardownTasks: Promise<void>[] = [
     api.stopStream().catch((e) => {
       log(`Stream-loss playback teardown failed: ${formatError(e)}`);
     }),
   ];
-  if (state.isRtspRunning) {
-    wasRtspRunningBeforeLost = true;
-    teardownTasks.push(
-      api.stopRtspServer().catch((e) => {
-        log(`Stream-loss RTSP teardown failed: ${formatError(e)}`);
-      })
-    );
-    state.isRtspRunning = false;
-    updateRtspUI(null);
-  }
   trackStreamLossTeardown(teardownTasks);
   // Deliberately leave state.isStreaming = true: the user's intent is
   // still "I want to stream", the connection just failed. Keeps the
@@ -873,7 +869,6 @@ function hideStreamLost(): void {
   // restarts and the previous run had retries pending, those should
   // not carry over.
   stallRetryIndex = 0;
-  wasRtspRunningBeforeLost = false;
   if (stallRetryTimer) {
     clearTimeout(stallRetryTimer);
     stallRetryTimer = null;
@@ -908,9 +903,6 @@ async function attemptStallRecovery(): Promise<void> {
   // taken over — bail without consuming another retry slot.
   if (!state.isStreaming || !state.streamLost) return;
 
-  // Capture this before any healthy/stale status event can call
-  // hideStreamLost and reset the global latch.
-  const shouldRestartRtsp = wasRtspRunningBeforeLost;
   try {
     await waitForStreamLossTeardown();
 
@@ -930,21 +922,6 @@ async function attemptStallRecovery(): Promise<void> {
     const handle = await createVideoWindowSynced(bounds);
     await api.startStream(handle);
     log("Stall recovery: stream restart submitted");
-    // Bring the RTSP server back if it was running at the moment of
-    // loss. The hardDisconnect path has its own resumeSnapshot for
-    // this; stall recovery has to do it here because showStreamLost
-    // tore the server down. Failure isn't fatal — playback is alive.
-    if (shouldRestartRtsp) {
-      try {
-        const info = await api.startRtspServer();
-        state.isRtspRunning = true;
-        rtspFullUrl = info.rtsp_url;
-        updateRtspUI(info.display_url);
-        log("Stall recovery: RTSP server restarted");
-      } catch (e) {
-        log(`Stall recovery: RTSP server restart failed: ${formatError(e)}`);
-      }
-    }
     // startStream returns when set_state(Playing) was REQUESTED, not
     // when the pipeline actually reaches Playing. Set a watchdog that
     // schedules another retry if the new pipeline doesn't recover

@@ -421,6 +421,17 @@
   color: var(--status-offline);
 }
 
+.status-warning {
+  color: var(--status-warning);
+}
+
+#card-rtsp .rtsp-error {
+  color: var(--status-warning);
+  max-width: 240px;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
 /* ── Progress Bar ───────────────────────────────────────────────────── */
 
 .progress-bar {
