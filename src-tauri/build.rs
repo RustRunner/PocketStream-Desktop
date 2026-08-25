@@ -15,6 +15,11 @@ fn main() {
         // startup code adds that directory to PATH before any GStreamer
         // function is actually called.
         println!("cargo:rustc-link-lib=delayimp");
+        // `rustc-link-lib` is intentionally applied only to this package's
+        // library target by Cargo. Example targets inherit the delay-load
+        // linker arguments below, so they need the helper library explicitly.
+        // G2's pre-production admission harness is an example target.
+        println!("cargo:rustc-link-arg-examples=delayimp.lib");
 
         // Packet.dll (pnet's import). Delay-loaded so the exe starts
         // without Npcap present: interface enumeration goes through IP

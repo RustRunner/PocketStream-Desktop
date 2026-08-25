@@ -304,6 +304,31 @@ jobs:
           workspaces: src-tauri
           key: windows
 
+      # G2 is the strict pre-production admission boundary. The dedicated
+      # Rust harness runs only after G1-R succeeds, loads the exact staged SRT
+      # 1.5.6 closure, and exercises the dynamic srtsink callbacks with real
+      # callers. Production CallerRegistry/SRT listener work remains blocked
+      # if authentication gating, address correlation, pending expiry, or the
+      # ten-caller invariant changes.
+      - name: G2 patched SRT admission gate
+        shell: powershell
+        timeout-minutes: 15
+        run: |
+          $evidence = Join-Path $env:RUNNER_TEMP 'g2-srt-admission-1.5.6.json'
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+            -File scripts\verify-g2-srt.ps1 -EvidencePath $evidence
+          if ($LASTEXITCODE -ne 0) {
+            throw "G2 admission gate failed with exit $LASTEXITCODE"
+          }
+
+      - name: Upload G2 admission evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g2-srt-admission-evidence
+          path: ${{ runner.temp }}\g2-srt-admission-1.5.6.json
+          if-no-files-found: warn
+
       # Compile AND run the crate's tests, including the #[cfg(windows)]
       # halves the Linux job can't see — DPAPI credential-key handling
       # and the other Windows-only paths execute nowhere else. Tests
