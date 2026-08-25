@@ -94,6 +94,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Keep native-dependency automation on the Windows PowerShell version
+      # available to operators on supported PocketStream hosts. PrepareOnly
+      # performs the pinned Cerbero checkout, commit/blob verification, and
+      # recipe patch smoke test without starting the multi-hour bootstrap.
+      - name: Validate patched libsrt build inputs (PowerShell 5.1)
+        shell: powershell
+        run: |
+          if ($PSVersionTable.PSVersion.Major -ne 5) {
+            throw "Expected Windows PowerShell 5.1, got $($PSVersionTable.PSVersion)"
+          }
+          $workRoot = Join-Path $env:RUNNER_TEMP 'pocketstream-libsrt-input-check'
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+            -File scripts\build-patched-libsrt.ps1 -WorkRoot $workRoot -PrepareOnly
+          if ($LASTEXITCODE -ne 0) { throw "patched libsrt input validation failed with exit $LASTEXITCODE" }
+
       - uses: dtolnay/rust-toolchain@stable
 
       # Install the GStreamer SDK from upstream MSIs, pinned by URL and
