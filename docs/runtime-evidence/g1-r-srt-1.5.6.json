@@ -1,0 +1,321 @@
+{
+    "schema_version":  1,
+    "gate":  "G1-R",
+    "result":  "pass",
+    "g1_r_complete":  true,
+    "generated_at_utc":  "2026-08-25T17:23:40.0031345Z",
+    "harness":  {
+                    "script_sha256":  "acd37bb181fa3e64a77c21918bb01f2ccb3f19cc2c50608925800849f2f90107",
+                    "manifest_sha256":  "d953a0a618253d43ddd3e7a024a84a1efbc18edecf962f8855f41c4447d1862d",
+                    "powershell_version":  "5.1.26100.9168",
+                    "dumpbin_file_version":  "14.44.35224.0"
+                },
+    "canonical_release":  {
+                              "tag":  "deps-libsrt-1.5.6-gstreamer-1.26.11-1",
+                              "prerelease":  true,
+                              "draft":  false,
+                              "html_url":  "https://github.com/RustRunner/PocketStream-Desktop/releases/tag/deps-libsrt-1.5.6-gstreamer-1.26.11-1",
+                              "asset_name":  "pocketstream-libsrt-1.5.6-gstreamer-1.26.11-windows-x86_64.zip",
+                              "asset_url":  "https://github.com/RustRunner/PocketStream-Desktop/releases/download/deps-libsrt-1.5.6-gstreamer-1.26.11-1/pocketstream-libsrt-1.5.6-gstreamer-1.26.11-windows-x86_64.zip",
+                              "archive_sha256":  "21aa68ef59e443509756b22421638ba48db206dcffb323e4b080399095af43c4",
+                              "inner_dll_sha256":  "45d2508afcd922f64124671965a1dabf02bca2bcc295d8c82f70c4653aaeab30",
+                              "clean_download_verified":  true
+                          },
+    "provenance":  {
+                       "srt_version":  "1.5.6",
+                       "source_archive_sha256":  "2c4980c2c4cfd142d21b829d939dc51db9c6628af5967fff62fd7290769569c7",
+                       "cerbero_version":  "1.26.11",
+                       "cerbero_commit":  "cebb549ade5b73048fc29be5a45332246f1c14f6",
+                       "patched_recipe_blob":  "80037d6b64bda97413e143ffb58b8604b9c5ad9b",
+                       "recipe_patch_sha256":  "40d311f06bbf5f2911696b65769c51a8aaa744d07809c06291baa8bb30cf6430",
+                       "srt_can_msvc":  false,
+                       "mingw_compiler_sha256":  "114d0947d549750b1273d765a4fe415e7f2fdd1eb2a3bb2671e2735f20c50cd8",
+                       "mingw_compiler_version":  "x86_64-w64-mingw32-g++.exe (Built by GStreamer (1.24.0-238-g0a9fb4e3)) 14.2.0\nCopyright (C) 2024 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.",
+                       "stock_runtime_url":  "https://gstreamer.freedesktop.org/data/pkg/windows/1.26.11/msvc/gstreamer-1.0-msvc-x86_64-1.26.11.msi",
+                       "stock_runtime_sha256":  "31cbc21fa0950b5c1e79c80959b2799805cb05a7a35953a13a9f790776137605"
+                   },
+    "staged_runtime":  {
+                           "gstreamer_version":  "1.26.11",
+                           "libsrt_sha256":  "45d2508afcd922f64124671965a1dabf02bca2bcc295d8c82f70c4653aaeab30",
+                           "srt_getversion_hex":  "0x010506",
+                           "architecture":  "x86_64",
+                           "stock_architecture":  "x86_64",
+                           "stock_libsrt_sha256":  "2bf7e00787cc8006a81d65f875e46ae75855e255128f9509edef331011c1a8eb",
+                           "staged_imports":  [
+                                                  "api-ms-win-crt-convert-l1-1-0.dll",
+                                                  "api-ms-win-crt-environment-l1-1-0.dll",
+                                                  "api-ms-win-crt-heap-l1-1-0.dll",
+                                                  "api-ms-win-crt-locale-l1-1-0.dll",
+                                                  "api-ms-win-crt-math-l1-1-0.dll",
+                                                  "api-ms-win-crt-private-l1-1-0.dll",
+                                                  "api-ms-win-crt-runtime-l1-1-0.dll",
+                                                  "api-ms-win-crt-stdio-l1-1-0.dll",
+                                                  "api-ms-win-crt-string-l1-1-0.dll",
+                                                  "api-ms-win-crt-time-l1-1-0.dll",
+                                                  "KERNEL32.dll",
+                                                  "libcrypto-3-x64.dll",
+                                                  "libgcc_s_seh-1.dll",
+                                                  "libstdc++-6.dll",
+                                                  "libwinpthread-1.dll",
+                                                  "WS2_32.dll",
+                                                  "WSOCK32.dll"
+                                              ],
+                           "stock_imports_match":  true,
+                           "staged_export_count":  129,
+                           "stock_export_count":  129,
+                           "all_stock_exports_preserved":  true,
+                           "required_exports":  [
+                                                    "srt_cleanup",
+                                                    "srt_getversion",
+                                                    "srt_listen_callback",
+                                                    "srt_startup"
+                                                ],
+                           "gstsrt_imported_srt_symbols":  [
+                                                               "srt_accept",
+                                                               "srt_bind",
+                                                               "srt_bstats",
+                                                               "srt_cleanup",
+                                                               "srt_close",
+                                                               "srt_connect",
+                                                               "srt_create_socket",
+                                                               "srt_epoll_add_ssock",
+                                                               "srt_epoll_add_usock",
+                                                               "srt_epoll_create",
+                                                               "srt_epoll_release",
+                                                               "srt_epoll_remove_usock",
+                                                               "srt_epoll_wait",
+                                                               "srt_getlasterror",
+                                                               "srt_getlasterror_str",
+                                                               "srt_getrejectreason",
+                                                               "srt_getsockflag",
+                                                               "srt_getsockstate",
+                                                               "srt_listen",
+                                                               "srt_listen_callback",
+                                                               "srt_msgctrl_init",
+                                                               "srt_recvmsg2",
+                                                               "srt_rejectreason_str",
+                                                               "srt_sendmsg2",
+                                                               "srt_setlogflags",
+                                                               "srt_setloghandler",
+                                                               "srt_setloglevel",
+                                                               "srt_setsockopt",
+                                                               "srt_startup",
+                                                               "srt_time_now"
+                                                           ],
+                           "isolated_plugin_negative_control":  "opusdec absent",
+                           "isolated_elements":  [
+                                                     "fakesrc",
+                                                     "queue",
+                                                     "fakesink",
+                                                     "mpegtsmux",
+                                                     "srtsink",
+                                                     "srtsrc"
+                                                 ]
+                       },
+    "replacement_closure":  [
+                                {
+                                    "path":  "bin/libcrypto-3-x64.dll",
+                                    "sha256":  "8a0e2418a3106c814a2c117c591750f34c0c1b9bef23d2e95dd36c61558e37e0",
+                                    "architecture":  "x86_64",
+                                    "file_version":  "3.5.0",
+                                    "product_version":  "3.5.0",
+                                    "direct_imports":  [
+                                                           "ADVAPI32.dll",
+                                                           "api-ms-win-crt-convert-l1-1-0.dll",
+                                                           "api-ms-win-crt-environment-l1-1-0.dll",
+                                                           "api-ms-win-crt-filesystem-l1-1-0.dll",
+                                                           "api-ms-win-crt-heap-l1-1-0.dll",
+                                                           "api-ms-win-crt-runtime-l1-1-0.dll",
+                                                           "api-ms-win-crt-stdio-l1-1-0.dll",
+                                                           "api-ms-win-crt-string-l1-1-0.dll",
+                                                           "api-ms-win-crt-time-l1-1-0.dll",
+                                                           "api-ms-win-crt-utility-l1-1-0.dll",
+                                                           "CRYPT32.dll",
+                                                           "KERNEL32.dll",
+                                                           "USER32.dll",
+                                                           "VCRUNTIME140.dll",
+                                                           "WS2_32.dll"
+                                                       ]
+                                },
+                                {
+                                    "path":  "bin/libgcc_s_seh-1.dll",
+                                    "sha256":  "323372c82a994267b23140681c41c44f3aee0d0032ff9d884d69b1a1ed7f2ac1",
+                                    "architecture":  "x86_64",
+                                    "file_version":  null,
+                                    "product_version":  null,
+                                    "direct_imports":  [
+                                                           "api-ms-win-crt-environment-l1-1-0.dll",
+                                                           "api-ms-win-crt-heap-l1-1-0.dll",
+                                                           "api-ms-win-crt-private-l1-1-0.dll",
+                                                           "api-ms-win-crt-runtime-l1-1-0.dll",
+                                                           "api-ms-win-crt-stdio-l1-1-0.dll",
+                                                           "api-ms-win-crt-string-l1-1-0.dll",
+                                                           "api-ms-win-crt-time-l1-1-0.dll",
+                                                           "KERNEL32.dll",
+                                                           "libwinpthread-1.dll"
+                                                       ]
+                                },
+                                {
+                                    "path":  "bin/libsrt.dll",
+                                    "sha256":  "45d2508afcd922f64124671965a1dabf02bca2bcc295d8c82f70c4653aaeab30",
+                                    "architecture":  "x86_64",
+                                    "file_version":  null,
+                                    "product_version":  null,
+                                    "direct_imports":  [
+                                                           "api-ms-win-crt-convert-l1-1-0.dll",
+                                                           "api-ms-win-crt-environment-l1-1-0.dll",
+                                                           "api-ms-win-crt-heap-l1-1-0.dll",
+                                                           "api-ms-win-crt-locale-l1-1-0.dll",
+                                                           "api-ms-win-crt-math-l1-1-0.dll",
+                                                           "api-ms-win-crt-private-l1-1-0.dll",
+                                                           "api-ms-win-crt-runtime-l1-1-0.dll",
+                                                           "api-ms-win-crt-stdio-l1-1-0.dll",
+                                                           "api-ms-win-crt-string-l1-1-0.dll",
+                                                           "api-ms-win-crt-time-l1-1-0.dll",
+                                                           "KERNEL32.dll",
+                                                           "libcrypto-3-x64.dll",
+                                                           "libgcc_s_seh-1.dll",
+                                                           "libstdc++-6.dll",
+                                                           "libwinpthread-1.dll",
+                                                           "WS2_32.dll",
+                                                           "WSOCK32.dll"
+                                                       ]
+                                },
+                                {
+                                    "path":  "bin/libstdc++-6.dll",
+                                    "sha256":  "6d8c75b04fa69225ee34cb65cd06b1dd6757640fb646851d8d87c453c8895812",
+                                    "architecture":  "x86_64",
+                                    "file_version":  null,
+                                    "product_version":  null,
+                                    "direct_imports":  [
+                                                           "api-ms-win-crt-convert-l1-1-0.dll",
+                                                           "api-ms-win-crt-environment-l1-1-0.dll",
+                                                           "api-ms-win-crt-filesystem-l1-1-0.dll",
+                                                           "api-ms-win-crt-heap-l1-1-0.dll",
+                                                           "api-ms-win-crt-locale-l1-1-0.dll",
+                                                           "api-ms-win-crt-math-l1-1-0.dll",
+                                                           "api-ms-win-crt-private-l1-1-0.dll",
+                                                           "api-ms-win-crt-runtime-l1-1-0.dll",
+                                                           "api-ms-win-crt-stdio-l1-1-0.dll",
+                                                           "api-ms-win-crt-string-l1-1-0.dll",
+                                                           "api-ms-win-crt-time-l1-1-0.dll",
+                                                           "api-ms-win-crt-utility-l1-1-0.dll",
+                                                           "KERNEL32.dll",
+                                                           "libgcc_s_seh-1.dll",
+                                                           "libwinpthread-1.dll"
+                                                       ]
+                                },
+                                {
+                                    "path":  "bin/libwinpthread-1.dll",
+                                    "sha256":  "1e165b3f54a3f0387e4e3c1b5ae6143652aee4e4afd6e9474fcfde2cd8a92bbb",
+                                    "architecture":  "x86_64",
+                                    "file_version":  "1, 0, 0, 0",
+                                    "product_version":  "1, 0, 0, 0",
+                                    "direct_imports":  [
+                                                           "api-ms-win-crt-environment-l1-1-0.dll",
+                                                           "api-ms-win-crt-heap-l1-1-0.dll",
+                                                           "api-ms-win-crt-private-l1-1-0.dll",
+                                                           "api-ms-win-crt-runtime-l1-1-0.dll",
+                                                           "api-ms-win-crt-stdio-l1-1-0.dll",
+                                                           "api-ms-win-crt-string-l1-1-0.dll",
+                                                           "api-ms-win-crt-time-l1-1-0.dll",
+                                                           "KERNEL32.dll"
+                                                       ]
+                                },
+                                {
+                                    "path":  "lib/gstreamer-1.0/gstmpegtsmux.dll",
+                                    "sha256":  "55ae613b0d278ff834565177fe889744333f6d60603a52363ecc3f7f85ddd6a5",
+                                    "architecture":  "x86_64",
+                                    "file_version":  null,
+                                    "product_version":  null,
+                                    "direct_imports":  [
+                                                           "api-ms-win-crt-runtime-l1-1-0.dll",
+                                                           "api-ms-win-crt-stdio-l1-1-0.dll",
+                                                           "api-ms-win-crt-string-l1-1-0.dll",
+                                                           "glib-2.0-0.dll",
+                                                           "gobject-2.0-0.dll",
+                                                           "gstaudio-1.0-0.dll",
+                                                           "gstbase-1.0-0.dll",
+                                                           "gstmpegts-1.0-0.dll",
+                                                           "gstpbutils-1.0-0.dll",
+                                                           "gstreamer-1.0-0.dll",
+                                                           "gsttag-1.0-0.dll",
+                                                           "gstvideo-1.0-0.dll",
+                                                           "KERNEL32.dll",
+                                                           "VCRUNTIME140.dll"
+                                                       ]
+                                },
+                                {
+                                    "path":  "lib/gstreamer-1.0/gstsrt.dll",
+                                    "sha256":  "bd6f5fdc71d5c1878e143359fef0468a0edda832977f77228d7bf037ab2805a3",
+                                    "architecture":  "x86_64",
+                                    "file_version":  null,
+                                    "product_version":  null,
+                                    "direct_imports":  [
+                                                           "api-ms-win-crt-runtime-l1-1-0.dll",
+                                                           "gio-2.0-0.dll",
+                                                           "glib-2.0-0.dll",
+                                                           "gobject-2.0-0.dll",
+                                                           "gstbase-1.0-0.dll",
+                                                           "gstreamer-1.0-0.dll",
+                                                           "KERNEL32.dll",
+                                                           "libsrt.dll",
+                                                           "VCRUNTIME140.dll"
+                                                       ]
+                                }
+                            ],
+    "behavior":  {
+                     "explicit_passwordless_transfer":  {
+                                                            "passed":  true,
+                                                            "received_buffers":  30,
+                                                            "listener_released_port":  true
+                                                        },
+                     "encrypted_transfer":  {
+                                                "passed":  true,
+                                                "pbkeylen_bytes":  16,
+                                                "correct_passphrase_received_buffers":  30,
+                                                "wrong_passphrase_rejected":  true,
+                                                "missing_passphrase_rejected":  true,
+                                                "correct_caller_after_rejections_received_buffers":  30
+                                            },
+                     "fan_out_and_removal":  {
+                                                 "passed":  true,
+                                                 "concurrent_callers":  2,
+                                                 "removed_caller_termination":  "ungraceful",
+                                                 "remaining_caller_received_buffers":  500,
+                                                 "replacement_caller_received_buffers":  100
+                                             },
+                     "bind_diagnostics":  {
+                                              "passed":  true,
+                                              "occupied_port":  {
+                                                                    "gstreamer_state_change_failed":  true,
+                                                                    "socket_error":  "AddressAlreadyInUse",
+                                                                    "native_error":  10048,
+                                                                    "rebind_after_holder_release":  true
+                                                                },
+                                              "invalid_local_address":  {
+                                                                            "address_class":  "TEST-NET-1 unassigned local address",
+                                                                            "gstreamer_state_change_failed":  true,
+                                                                            "socket_error":  "AddressNotAvailable",
+                                                                            "native_error":  10049
+                                                                        }
+                                          },
+                     "zero_caller_soak":  {
+                                              "passed":  true,
+                                              "required_seconds":  660,
+                                              "configured_seconds":  660,
+                                              "measured_seconds":  660.126,
+                                              "continuous_buffers":  66000,
+                                              "buffers_per_second":  100,
+                                              "wait_for_connection":  false
+                                          }
+                 },
+    "scope_boundary":  {
+                           "g2_callback_or_admission_signals_exercised":  false,
+                           "note":  "Caller callback ordering, authentication=true behavior, identity correlation, and pending/active admission caps remain reserved for G2."
+                       },
+    "security_review":  {
+                            "record":  "docs/runtime-evidence/g1-r-security-review-2026-08-25.md",
+                            "reviewed_at":  "2026-08-25"
+                        }
+}

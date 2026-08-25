@@ -46,7 +46,11 @@ function Assert-PatchedSrtManifest {
 
     $required = @(
         'Version', 'RuntimeVersionHex', 'ReleaseTag', 'ArchiveFile',
-        'AssetUrl', 'ArchiveSha256', 'DllFile', 'DllSha256'
+        'AssetUrl', 'ArchiveSha256', 'DllFile', 'DllSha256',
+        'SourceArchiveSha256', 'CerberoCommit', 'PatchedRecipeBlob',
+        'RecipePatchSha256', 'MinGwCompilerSha256', 'StockRuntimeUrl',
+        'StockRuntimeSha256', 'StockDllSha256', 'GstInspectSha256',
+        'GstLaunchSha256', 'StagedClosure'
     )
     foreach ($key in $required) {
         if (-not $Srt.ContainsKey($key) -or
@@ -72,9 +76,18 @@ function Assert-PatchedSrtManifest {
     if ($Srt.DllFile -cne 'libsrt.dll') {
         throw "PatchedSrt.DllFile must be exactly libsrt.dll, got '$($Srt.DllFile)'."
     }
-    foreach ($hashKey in @('ArchiveSha256', 'DllSha256')) {
+    foreach ($hashKey in @(
+        'ArchiveSha256', 'DllSha256', 'SourceArchiveSha256',
+        'RecipePatchSha256', 'MinGwCompilerSha256', 'StockRuntimeSha256',
+        'StockDllSha256', 'GstInspectSha256', 'GstLaunchSha256'
+    )) {
         if ([string]$Srt[$hashKey] -notmatch '^[0-9a-f]{64}$') {
             throw "PatchedSrt.$hashKey must be a lowercase SHA256 value."
+        }
+    }
+    foreach ($gitKey in @('CerberoCommit', 'PatchedRecipeBlob')) {
+        if ([string]$Srt[$gitKey] -notmatch '^[0-9a-f]{40}$') {
+            throw "PatchedSrt.$gitKey must be a lowercase 40-character Git object ID."
         }
     }
 
@@ -90,6 +103,57 @@ function Assert-PatchedSrtManifest {
     if ($Srt.AssetUrl -cne $expectedUrl) {
         throw "PatchedSrt.AssetUrl must match its immutable release tag and filename: expected $expectedUrl"
     }
+
+    $expectedStockUrl = "https://gstreamer.freedesktop.org/data/pkg/windows/1.26.11/msvc/gstreamer-1.0-msvc-x86_64-1.26.11.msi"
+    if ($Srt.StockRuntimeUrl -cne $expectedStockUrl) {
+        throw "PatchedSrt.StockRuntimeUrl must identify the pinned GStreamer 1.26.11 runtime MSI."
+    }
+
+    $expectedClosure = @(
+        'bin/libsrt.dll',
+        'bin/libcrypto-3-x64.dll',
+        'bin/libstdc++-6.dll',
+        'bin/libgcc_s_seh-1.dll',
+        'bin/libwinpthread-1.dll',
+        'lib/gstreamer-1.0/gstsrt.dll',
+        'lib/gstreamer-1.0/gstmpegtsmux.dll'
+    )
+    if ($Srt.StagedClosure -isnot [hashtable]) {
+        throw 'PatchedSrt.StagedClosure must be a hashtable.'
+    }
+    $actualClosure = @($Srt.StagedClosure.Keys | Sort-Object)
+    $expectedClosureSorted = @($expectedClosure | Sort-Object)
+    if (($actualClosure -join "`n") -cne ($expectedClosureSorted -join "`n")) {
+        throw 'PatchedSrt.StagedClosure must pin exactly the seven-file SRT runtime closure.'
+    }
+    foreach ($relativePath in $expectedClosure) {
+        if ([string]$Srt.StagedClosure[$relativePath] -notmatch '^[0-9a-f]{64}$') {
+            throw "PatchedSrt.StagedClosure['$relativePath'] must be a lowercase SHA256 value."
+        }
+    }
+    if ($Srt.StagedClosure['bin/libsrt.dll'] -cne $Srt.DllSha256) {
+        throw 'PatchedSrt staged libsrt.dll hash must match PatchedSrt.DllSha256.'
+    }
+}
+
+function Assert-StagedSrtClosure {
+    param(
+        [Parameter(Mandatory = $true)][string]$BundleRoot,
+        [Parameter(Mandatory = $true)][hashtable]$Srt
+    )
+
+    foreach ($relativePath in @($Srt.StagedClosure.Keys | Sort-Object)) {
+        $nativeRelativePath = $relativePath.Replace('/', [System.IO.Path]::DirectorySeparatorChar)
+        $filePath = Join-Path $BundleRoot $nativeRelativePath
+        if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
+            throw "Staged SRT closure file is missing: $relativePath"
+        }
+        Assert-FileSha256 -Path $filePath `
+            -Expected $Srt.StagedClosure[$relativePath] `
+            -Description "Staged SRT closure file $relativePath"
+    }
+
+    Write-Host "Verified exact seven-file staged SRT closure." -ForegroundColor Green
 }
 
 function Get-VerifiedPatchedSrtArchive {
@@ -369,6 +433,14 @@ GStreamer $ExpectedVersion runtime + devel (complete install, ADDLOCAL=ALL) and 
 # checked by Install-PatchedSrt.
 $totalSize += Install-PatchedSrt `
     -ArchivePath $PatchedSrtArchive -Srt $Manifest.PatchedSrt -DestinationBin $OutBin
+
+# Freeze the replacement's complete staged closure, including the official
+# MSI's OpenSSL and MinGW runtime DLLs and the two GStreamer plugins. This is
+# deliberately after the patched DLL replacement so the hashes describe the
+# exact files the installer will consume.
+Assert-StagedSrtClosure `
+    -BundleRoot (Join-Path $ProjectDir 'src-tauri\resources\gstreamer') `
+    -Srt $Manifest.PatchedSrt
 
 # ── Summary ───────────────────────────────────────────────────────────
 

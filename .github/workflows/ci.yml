@@ -274,6 +274,31 @@ jobs:
           if ($gaps) { throw "Plugin imports missing from the bundle: $($gaps -join '; ')" }
           Write-Host 'All audio plugin imports resolve inside the bundle (or the OS/VC runtime).'
 
+      # G1-R is the security/ABI/behavior boundary for the SRT 1.5.6
+      # replacement. It re-downloads the canonical prerelease asset, verifies
+      # the exact staged hash and provenance, hides the machine-wide plugin
+      # path, and repeats encrypted/passwordless transport, fan-out, removal,
+      # bind diagnostics, and the eleven-minute zero-caller soak. Callback and
+      # admission semantics remain deliberately outside this step (G2).
+      - name: G1-R patched SRT runtime gate
+        shell: powershell
+        timeout-minutes: 20
+        run: |
+          $evidence = Join-Path $env:RUNNER_TEMP 'g1-r-srt-1.5.6.json'
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+            -File scripts\verify-g1r-srt.ps1 -EvidencePath $evidence
+          if ($LASTEXITCODE -ne 0) {
+            throw "G1-R runtime gate failed with exit $LASTEXITCODE"
+          }
+
+      - name: Upload G1-R runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g1-r-srt-runtime-evidence
+          path: ${{ runner.temp }}\g1-r-srt-1.5.6.json
+          if-no-files-found: warn
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri

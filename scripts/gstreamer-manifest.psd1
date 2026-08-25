@@ -25,6 +25,35 @@
         ArchiveSha256     = '21aa68ef59e443509756b22421638ba48db206dcffb323e4b080399095af43c4'
         DllFile           = 'libsrt.dll'
         DllSha256         = '45d2508afcd922f64124671965a1dabf02bca2bcc295d8c82f70c4653aaeab30'
+
+        # Reproducibility and stock-ABI pins consumed by the G1-R runtime
+        # verifier. These duplicate the machine-readable dependency artifact
+        # deliberately: disagreement between the repository contract and the
+        # published artifact must fail closed.
+        SourceArchiveSha256 = '2c4980c2c4cfd142d21b829d939dc51db9c6628af5967fff62fd7290769569c7'
+        CerberoCommit       = 'cebb549ade5b73048fc29be5a45332246f1c14f6'
+        PatchedRecipeBlob   = '80037d6b64bda97413e143ffb58b8604b9c5ad9b'
+        RecipePatchSha256   = '40d311f06bbf5f2911696b65769c51a8aaa744d07809c06291baa8bb30cf6430'
+        MinGwCompilerSha256 = '114d0947d549750b1273d765a4fe415e7f2fdd1eb2a3bb2671e2735f20c50cd8'
+        StockRuntimeUrl     = 'https://gstreamer.freedesktop.org/data/pkg/windows/1.26.11/msvc/gstreamer-1.0-msvc-x86_64-1.26.11.msi'
+        StockRuntimeSha256  = '31cbc21fa0950b5c1e79c80959b2799805cb05a7a35953a13a9f790776137605'
+        StockDllSha256      = '2bf7e00787cc8006a81d65f875e46ae75855e255128f9509edef331011c1a8eb'
+        GstInspectSha256    = '2fe64504131d3e66671c361d67fdb5ccf7876bc5d061a5f9b97d1f4c03d04acd'
+        GstLaunchSha256     = 'fca9e1c7c020f94fc941f9391dc6b5b3de758a062ff92e77a053f4a589833e34'
+
+        # Exact seven-file closure exercised by G1-R. The OpenSSL DLL comes
+        # from the pinned official GStreamer MSI, not the Cerbero build
+        # prefix, so its staged hash is intentionally distinct from the
+        # build-time dependency hash recorded inside provenance.json.
+        StagedClosure = @{
+            'bin/libsrt.dll'                         = '45d2508afcd922f64124671965a1dabf02bca2bcc295d8c82f70c4653aaeab30'
+            'bin/libcrypto-3-x64.dll'                = '8a0e2418a3106c814a2c117c591750f34c0c1b9bef23d2e95dd36c61558e37e0'
+            'bin/libstdc++-6.dll'                    = '6d8c75b04fa69225ee34cb65cd06b1dd6757640fb646851d8d87c453c8895812'
+            'bin/libgcc_s_seh-1.dll'                 = '323372c82a994267b23140681c41c44f3aee0d0032ff9d884d69b1a1ed7f2ac1'
+            'bin/libwinpthread-1.dll'                = '1e165b3f54a3f0387e4e3c1b5ae6143652aee4e4afd6e9474fcfde2cd8a92bbb'
+            'lib/gstreamer-1.0/gstsrt.dll'           = 'bd6f5fdc71d5c1878e143359fef0468a0edda832977f77228d7bf037ab2805a3'
+            'lib/gstreamer-1.0/gstmpegtsmux.dll'     = '55ae613b0d278ff834565177fe889744333f6d60603a52363ecc3f7f85ddd6a5'
+        }
     }
 
     # ── Core runtime DLLs (from <root>/bin) ──────────────────────────
