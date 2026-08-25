@@ -23,6 +23,17 @@ pub enum StreamProtocol {
     Udp,
 }
 
+/// Selected re-stream output protocol. The RTSP-only neutralization
+/// checkpoint intentionally exposes only `rtsp`; adding `srt` belongs to the
+/// following runtime milestone, so an early/stale `"srt"` IPC request cannot
+/// select an output that does not exist yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RestreamProtocol {
+    #[default]
+    Rtsp,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamConfig {
     /// Input protocol.
@@ -42,7 +53,7 @@ pub struct StreamConfig {
     pub audio_muted: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RtspServerConfig {
     /// Whether RTSP re-streaming is enabled
     pub enabled: bool,
@@ -53,6 +64,22 @@ pub struct RtspServerConfig {
     /// Network interface to bind the RTSP server to (empty = all interfaces)
     #[serde(default)]
     pub bind_interface: String,
+}
+
+/// IPC update shape. Re-stream numerics stay wide until the centralized
+/// prospective-settings validator accepts them, so negative and oversized
+/// values produce a typed validation error instead of a serde boundary error.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RtspServerUpdate {
+    pub port: i64,
+    pub token: String,
+    pub bind_interface: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RestreamSettingsUpdate {
+    pub enabled: bool,
+    pub rtsp_server: RtspServerUpdate,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +198,10 @@ fn remove_adoption_entry(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub stream: StreamConfig,
+    /// Persisted output selector. Missing values in pre-neutralization config
+    /// files migrate to RTSP.
+    #[serde(default)]
+    pub restream_protocol: RestreamProtocol,
     pub rtsp_server: RtspServerConfig,
     pub credentials: Credentials,
     /// Auto-adopted subnet IPs: subnet string -> adopted IP address
@@ -209,6 +240,7 @@ impl Default for AppSettings {
                 camera_ip: String::new(),
                 audio_muted: false,
             },
+            restream_protocol: RestreamProtocol::Rtsp,
             rtsp_server: RtspServerConfig {
                 enabled: false,
                 port: 8554,
@@ -228,19 +260,35 @@ impl Default for AppSettings {
     }
 }
 
-impl AppSettings {
-    /// Apply only the user-editable sections (`stream`, `rtsp_server`,
-    /// `credentials`) from `incoming`, leaving backend-owned fields
-    /// (`adopted_subnets`, `adopted_meta`, `zoom_positions`) untouched.
-    /// The device cache
-    /// is no longer part of `AppSettings` at all (lives in its own
-    /// file — see `cache_path`), so `save_config` is structurally
-    /// incapable of wiping it now; this merge still guards the other
-    /// two backend-owned fields against the same class of bug.
-    pub fn merge_user_fields(&mut self, incoming: AppSettings) {
-        self.stream = incoming.stream;
-        self.rtsp_server = incoming.rtsp_server;
-        self.credentials = incoming.credentials;
+/// Explicit frontend view. Runtime settings remain an internal persistence
+/// type; this boundary is ready for the non-serializable SRT secret state in
+/// the next milestone without another whole-config IPC migration.
+#[derive(Debug, Clone, Serialize)]
+pub struct AppSettingsView {
+    pub stream: StreamConfig,
+    pub restream_protocol: RestreamProtocol,
+    pub rtsp_server: RtspServerConfig,
+    pub credentials: Credentials,
+    pub adopted_subnets: HashMap<String, String>,
+    pub adopted_meta: HashMap<String, AdoptedMeta>,
+    pub zoom_positions: HashMap<String, i32>,
+    pub network_mode: NetworkMode,
+    pub manual_nodes: Vec<ManualNode>,
+}
+
+impl From<&AppSettings> for AppSettingsView {
+    fn from(settings: &AppSettings) -> Self {
+        Self {
+            stream: settings.stream.clone(),
+            restream_protocol: settings.restream_protocol,
+            rtsp_server: settings.rtsp_server.clone(),
+            credentials: settings.credentials.clone(),
+            adopted_subnets: settings.adopted_subnets.clone(),
+            adopted_meta: settings.adopted_meta.clone(),
+            zoom_positions: settings.zoom_positions.clone(),
+            network_mode: settings.network_mode,
+            manual_nodes: settings.manual_nodes.clone(),
+        }
     }
 }
 
@@ -363,28 +411,15 @@ impl AppConfig {
     }
 
     // NOTE: there is deliberately no whole-struct `update(AppSettings)`
-    // setter. Every writer is either `merge_user_settings` (IPC saves,
-    // preserving backend-owned fields) or a field-scoped updater below —
-    // a get→mutate→update cycle over the whole struct is a lost-update
-    // race against concurrent writers of the other sections.
-
-    /// Apply user-editable sections from `incoming` and persist, preserving
-    /// backend-owned fields. Use from IPC handlers that take a full
-    /// `AppSettings` from the frontend; see `AppSettings::merge_user_fields`
-    /// for the rationale.
-    pub fn merge_user_settings(&self, incoming: AppSettings) -> Result<(), crate::AppError> {
-        match self.settings.lock() {
-            Ok(mut guard) => guard.merge_user_fields(incoming),
-            Err(poisoned) => {
-                log::error!("Config mutex poisoned during merge, recovering");
-                poisoned.into_inner().merge_user_fields(incoming);
-            }
-        }
-        self.save()
-    }
+    // setter. Every writer below owns one field group; a frontend
+    // get→mutate→replace cycle over the whole struct would race concurrent
+    // backend writers of unrelated sections.
 
     /// Replace just the stream config and persist.
     pub fn update_stream(&self, stream: StreamConfig) -> Result<(), crate::AppError> {
+        let mut prospective = self.get();
+        prospective.stream = stream.clone();
+        crate::settings_validation::validate_prospective_settings(prospective)?;
         match self.settings.lock() {
             Ok(mut guard) => guard.stream = stream,
             Err(poisoned) => {
@@ -395,16 +430,28 @@ impl AppConfig {
         self.save()
     }
 
-    /// Replace just the RTSP server config and persist.
-    pub fn update_rtsp(&self, rtsp_server: RtspServerConfig) -> Result<(), crate::AppError> {
+    /// Atomically persist the shared Enable field and current RTSP settings,
+    /// then publish the same validated snapshot in memory. The caller owns
+    /// the surrounding runtime stop/restore/restart transaction.
+    pub fn commit_restream_settings(
+        &self,
+        rtsp_server: RtspServerConfig,
+    ) -> Result<AppSettings, crate::AppError> {
+        let _save_guard = CONFIG_SAVE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut prospective = self.get();
+        prospective.rtsp_server = rtsp_server.clone();
+        let prospective = crate::settings_validation::validate_prospective_settings(prospective)?;
+        save_to_disk(&prospective)?;
         match self.settings.lock() {
             Ok(mut guard) => guard.rtsp_server = rtsp_server,
             Err(poisoned) => {
-                log::error!("Config mutex poisoned during update_rtsp, recovering");
+                log::error!("Config mutex poisoned during re-stream commit, recovering");
                 poisoned.into_inner().rtsp_server = rtsp_server;
             }
         }
-        self.save()
+        Ok(prospective)
     }
 
     /// Replace the adopted-subnets map together with its lifecycle
@@ -924,14 +971,18 @@ fn extract_legacy_device_cache(toml_content: &str) -> Option<Vec<CachedDevice>> 
 /// regenerates the RTSP access token, which invalidates saved client
 /// URLs.
 fn parse_settings(content: &str, path: &Path, notices: &mut Vec<String>) -> Option<AppSettings> {
-    match toml::from_str(content) {
-        Ok(s) => Some(s),
-        Err(e) => {
+    let parsed = match toml::from_str::<AppSettings>(content) {
+        Ok(settings) => crate::settings_validation::validate_prospective_settings(settings),
+        Err(error) => Err(crate::AppError::Config(error.to_string())),
+    };
+    match parsed {
+        Ok(settings) => Some(settings),
+        Err(error) => {
             log::error!(
                 "config: config.toml parse failed ({}). Moving aside to {} and \
                  launching with defaults; the corrupted file is preserved for \
                  inspection.",
-                e,
+                error,
                 quarantine_path(path).display()
             );
             quarantine(path);
@@ -1511,6 +1562,7 @@ mod tests {
     #[test]
     fn default_settings_rtsp_server() {
         let s = AppSettings::default();
+        assert_eq!(s.restream_protocol, RestreamProtocol::Rtsp);
         assert!(!s.rtsp_server.enabled);
         assert_eq!(s.rtsp_server.port, 8554);
         assert!(!s.rtsp_server.token.is_empty());
@@ -1561,6 +1613,22 @@ password = ""
             toml::Value::try_from(StreamProtocol::Udp).unwrap(),
             toml::Value::String("udp".into())
         );
+        assert_eq!(
+            toml::Value::try_from(RestreamProtocol::Rtsp).unwrap(),
+            toml::Value::String("rtsp".into())
+        );
+    }
+
+    #[test]
+    fn checkpoint_rejects_unavailable_srt_selection() {
+        assert!(serde_json::from_str::<RestreamProtocol>("\"srt\"").is_err());
+    }
+
+    #[test]
+    fn app_settings_view_exposes_the_neutral_selector() {
+        let settings = AppSettings::default();
+        let value = serde_json::to_value(AppSettingsView::from(&settings)).unwrap();
+        assert_eq!(value["restream_protocol"], "rtsp");
     }
 
     #[test]
@@ -1585,6 +1653,7 @@ password = ""
                 camera_ip: "10.0.0.5".into(),
                 audio_muted: true,
             },
+            restream_protocol: RestreamProtocol::Rtsp,
             rtsp_server: RtspServerConfig {
                 enabled: true,
                 port: 9554,
@@ -1751,60 +1820,6 @@ password = ""
         assert_eq!(meta.len(), 1);
     }
 
-    #[test]
-    fn merge_user_fields_preserves_adopted_subnets() {
-        let mut current = AppSettings::default();
-        current
-            .adopted_subnets
-            .insert("192.168.1.0/24".into(), "192.168.1.50".into());
-
-        let incoming = AppSettings::default();
-        current.merge_user_fields(incoming);
-
-        assert_eq!(current.adopted_subnets.len(), 1);
-        assert_eq!(
-            current.adopted_subnets.get("192.168.1.0/24"),
-            Some(&"192.168.1.50".to_string())
-        );
-    }
-
-    #[test]
-    fn merge_user_fields_preserves_zoom_positions() {
-        let mut current = AppSettings::default();
-        current.zoom_positions.insert("192.168.1.10".into(), 75);
-
-        let incoming = AppSettings::default();
-        current.merge_user_fields(incoming);
-
-        assert_eq!(current.zoom_positions.len(), 1);
-        assert_eq!(current.zoom_positions.get("192.168.1.10"), Some(&75));
-    }
-
-    #[test]
-    fn merge_user_fields_preserves_network_mode() {
-        // A partial frontend payload (just stream/rtsp/credentials) must
-        // not clobber the user's chosen mode via serde defaults.
-        let mut current = AppSettings {
-            network_mode: NetworkMode::StaticManual,
-            ..Default::default()
-        };
-        current.merge_user_fields(AppSettings::default());
-        assert_eq!(current.network_mode, NetworkMode::StaticManual);
-    }
-
-    #[test]
-    fn merge_user_fields_preserves_manual_nodes() {
-        let mut current = AppSettings::default();
-        current.manual_nodes.push(ManualNode {
-            ip: "192.168.1.50".into(),
-            alias: "CAM".into(),
-        });
-        current.merge_user_fields(AppSettings::default());
-        assert_eq!(current.manual_nodes.len(), 1);
-        assert_eq!(current.manual_nodes[0].ip, "192.168.1.50");
-        assert_eq!(current.manual_nodes[0].alias, "CAM");
-    }
-
     // ── Network Mode ────────────────────────────────────────────────
 
     #[test]
@@ -1872,6 +1887,7 @@ username = ""
 password = ""
 "#;
         let parsed: AppSettings = toml::from_str(legacy).unwrap();
+        assert_eq!(parsed.restream_protocol, RestreamProtocol::Rtsp);
         assert_eq!(parsed.network_mode, NetworkMode::StaticAuto);
         assert!(parsed.manual_nodes.is_empty());
     }
@@ -1968,53 +1984,6 @@ password = ""
             m.last_device_seen.as_deref(),
             Some("2026-07-15T00:00:00+00:00")
         );
-    }
-
-    #[test]
-    fn merge_user_fields_preserves_adopted_meta() {
-        let mut current = AppSettings::default();
-        current
-            .adopted_meta
-            .insert("169.254.168.0/24".into(), AdoptedMeta::default());
-        current.merge_user_fields(AppSettings::default());
-        assert_eq!(current.adopted_meta.len(), 1);
-    }
-
-    #[test]
-    fn merge_user_fields_applies_user_editable_fields() {
-        let mut current = AppSettings::default();
-        let mut incoming = AppSettings::default();
-        incoming.stream.protocol = StreamProtocol::Udp;
-        incoming.stream.rtsp_port = 9999;
-        incoming.rtsp_server.enabled = true;
-        incoming.rtsp_server.port = 7777;
-        incoming.credentials.username = "admin".into();
-        incoming.credentials.password = "hunter2".into();
-
-        current.merge_user_fields(incoming);
-
-        assert_eq!(current.stream.protocol, StreamProtocol::Udp);
-        assert_eq!(current.stream.rtsp_port, 9999);
-        assert!(current.rtsp_server.enabled);
-        assert_eq!(current.rtsp_server.port, 7777);
-        assert_eq!(current.credentials.username, "admin");
-        assert_eq!(current.credentials.password, "hunter2");
-    }
-
-    #[test]
-    fn merge_user_fields_clears_user_editable_fields_when_incoming_empty() {
-        // Sanity check: user-editable fields are *replaced*, not merged
-        // within. An empty username in `incoming` must clear the existing
-        // value — otherwise a user can't actually unset a credential.
-        let mut current = AppSettings::default();
-        current.credentials.username = "old_user".into();
-        current.credentials.password = "old_pass".into();
-
-        let incoming = AppSettings::default();
-        current.merge_user_fields(incoming);
-
-        assert!(current.credentials.username.is_empty());
-        assert!(current.credentials.password.is_empty());
     }
 
     // ── Device Cache File ───────────────────────────────────────────
@@ -2346,6 +2315,24 @@ password = ""
         let parsed = parse_settings(&content, &path, &mut notices);
         assert!(parsed.is_some());
         assert!(notices.is_empty());
+    }
+
+    #[test]
+    fn invalid_persisted_restream_settings_are_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut settings = AppSettings::default();
+        settings.rtsp_server.token = "0123456789ABCDEf".into();
+        let content = toml::to_string(&settings).unwrap();
+        fs::write(&path, &content).unwrap();
+
+        let mut notices = Vec::new();
+        let parsed = parse_settings(&content, &path, &mut notices);
+
+        assert!(parsed.is_none());
+        assert!(!path.exists());
+        assert!(dir.path().join("config.toml.parse-error").exists());
+        assert_eq!(notices.len(), 1);
     }
 
     #[test]

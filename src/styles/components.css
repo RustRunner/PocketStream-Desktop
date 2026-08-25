@@ -358,9 +358,9 @@
   transform: translateX(20px);
 }
 
-/* ── RTSP Card Grid ────────────────────────────────────────────────── */
+/* ── Re-stream Card Grid ───────────────────────────────────────────── */
 
-#card-rtsp .card-body {
+#card-restream .card-body {
   display: grid;
   grid-template-columns: 1fr auto;
   row-gap: 6px;
@@ -368,20 +368,20 @@
   font-size: 13px;
 }
 
-#card-rtsp .status-value {
+#card-restream .status-value {
   font-size: 13px;
 }
 
-#card-rtsp .status-value.monospace {
+#card-restream .status-value.monospace {
   font-size: 13px;
 }
 
-#card-rtsp .status-row {
+#card-restream .status-row {
   display: contents;
 }
 
-#card-rtsp .status-value,
-#card-rtsp .qr-icon-btn {
+#card-restream .status-value,
+#card-restream .qr-icon-btn {
   justify-self: end;
 }
 
@@ -425,7 +425,7 @@
   color: var(--status-warning);
 }
 
-#card-rtsp .rtsp-error {
+#card-restream .restream-error {
   color: var(--status-warning);
   max-width: 240px;
   overflow-wrap: anywhere;
@@ -1201,7 +1201,7 @@
   border-color: var(--md-primary);
 }
 
-#rtsp-bind-interface {
+#restream-bind-interface {
   min-width: 120px;
   max-width: 120px;
   overflow: hidden;

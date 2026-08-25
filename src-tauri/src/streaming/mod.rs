@@ -11,10 +11,10 @@ use tokio::sync::{watch, Mutex, Notify};
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
-use gstreamer_rtsp_server as gst_rtsp_server;
-use gstreamer_rtsp_server::prelude::*;
 
-use crate::config::{AppSettings, StreamProtocol};
+use crate::config::{
+    AppConfig, AppSettings, RestreamProtocol, RestreamSettingsUpdate, StreamProtocol,
+};
 use crate::error::AppError;
 
 /// Apply the required receive policy to an `rtspsrc` that is constrained to
@@ -53,35 +53,119 @@ pub(super) fn redact_relay_text(text: &str, mount_path: &str) -> String {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct RtspServerInfo {
-    pub rtsp_url: String,
+pub struct RestreamServerInfo {
+    pub protocol: RestreamProtocol,
+    pub server_url: String,
     pub display_url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RestreamOperationResult {
+    pub selected_protocol: RestreamProtocol,
+    pub desired: bool,
+    pub server_info: Option<RestreamServerInfo>,
 }
 
 use relay::{
     RelayEventReceiver, RelayEventSender, RelayFaultEvent, RelayRuntimeHealth, RelayState,
-    RelaySupervisorEvent, ResolvedRtspStartSpec, ResolvedSource,
+    RelaySupervisorEvent, ResolvedOutput, ResolvedSource, ResolvedStartSpec,
 };
 use rtsp_client::PlaybackPipeline;
 use rtsp_server::{
-    RtspBuildFailure, RtspBuildFailureKind, RtspRestreamer, RtspRuntimeContext, MAX_RTSP_CLIENTS,
+    RestreamBuildFailure, RestreamBuildFailureKind, RtspRestreamer, RtspRuntimeContext,
+    RtspRuntimeProbe, MAX_RTSP_CLIENTS,
 };
+
+enum RestreamServer {
+    Rtsp(RtspRestreamer),
+}
+
+#[derive(Clone)]
+enum RelayFaultProbe {
+    Rtsp(RtspRuntimeProbe),
+}
+
+impl RelayFaultProbe {
+    fn poll_fault(&self) -> Option<RelayFaultEvent> {
+        match self {
+            Self::Rtsp(probe) => probe.poll_fault(),
+        }
+    }
+}
+
+impl RestreamServer {
+    fn protocol(&self) -> RestreamProtocol {
+        match self {
+            Self::Rtsp(_) => RestreamProtocol::Rtsp,
+        }
+    }
+
+    fn server_generation(&self) -> u64 {
+        match self {
+            Self::Rtsp(server) => server.server_generation(),
+        }
+    }
+
+    fn connected_clients(&self) -> u32 {
+        match self {
+            Self::Rtsp(server) => server.connected_clients(),
+        }
+    }
+
+    fn client_limit(&self) -> u32 {
+        match self {
+            Self::Rtsp(server) => server.client_limit(),
+        }
+    }
+
+    fn bandwidth_kbps(&self) -> f64 {
+        match self {
+            Self::Rtsp(server) => server.bandwidth_kbps(),
+        }
+    }
+
+    fn fault_probe(&self) -> RelayFaultProbe {
+        match self {
+            Self::Rtsp(server) => RelayFaultProbe::Rtsp(server.fault_probe()),
+        }
+    }
+
+    fn loop_alive(&self) -> bool {
+        match self {
+            Self::Rtsp(server) => server.loop_alive(),
+        }
+    }
+
+    fn udp_ingest_port(&self) -> Option<u16> {
+        match self {
+            Self::Rtsp(server) => server.udp_ingest_port(),
+        }
+    }
+
+    async fn shutdown(&mut self) {
+        match self {
+            Self::Rtsp(server) => server.shutdown().await,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StreamStatus {
     pub playing: bool,
-    pub rtsp_server_running: bool,
-    pub rtsp_desired: bool,
-    pub rtsp_relay_state: RelayState,
-    pub rtsp_error: Option<String>,
-    pub rtsp_recovery_attempt: u32,
-    pub rtsp_url: Option<String>,
+    pub selected_protocol: RestreamProtocol,
+    pub active_protocol: Option<RestreamProtocol>,
+    pub server_running: bool,
+    pub desired: bool,
+    pub relay_state: RelayState,
+    pub relay_error: Option<String>,
+    pub recovery_attempt: u32,
+    pub server_url: Option<String>,
     pub display_url: Option<String>,
     pub recording: bool,
     pub uptime_secs: u64,
     pub bandwidth_kbps: f64,
-    pub rtsp_connected_clients: u32,
-    pub rtsp_client_limit: u32,
+    pub connected_clients: u32,
+    pub client_limit: u32,
     pub error: Option<String>,
     /// True while the playback pipeline has a linked audio branch.
     pub audio_present: bool,
@@ -92,21 +176,23 @@ pub struct StreamStatus {
 }
 
 impl StreamStatus {
-    fn idle() -> Self {
+    fn idle(selected_protocol: RestreamProtocol) -> Self {
         Self {
             playing: false,
-            rtsp_server_running: false,
-            rtsp_desired: false,
-            rtsp_relay_state: RelayState::Stopped,
-            rtsp_error: None,
-            rtsp_recovery_attempt: 0,
-            rtsp_url: None,
+            selected_protocol,
+            active_protocol: None,
+            server_running: false,
+            desired: false,
+            relay_state: RelayState::Stopped,
+            relay_error: None,
+            recovery_attempt: 0,
+            server_url: None,
             display_url: None,
             recording: false,
             uptime_secs: 0,
             bandwidth_kbps: 0.0,
-            rtsp_connected_clients: 0,
-            rtsp_client_limit: MAX_RTSP_CLIENTS,
+            connected_clients: 0,
+            client_limit: MAX_RTSP_CLIENTS,
             error: None,
             audio_present: false,
             audio_codec: None,
@@ -129,15 +215,16 @@ pub struct StreamManager {
     state: Arc<Mutex<StreamState>>,
     video_hwnd: Arc<std::sync::atomic::AtomicIsize>,
     status_tx: Arc<watch::Sender<StreamStatus>>,
-    /// Bumped on every `stop_rtsp_server` (even when no server is stored).
-    /// `start_rtsp_server` captures it before its slow interface enumeration
-    /// and, under the storage lock, refuses to store if it changed — so a
-    /// stop that races a start wins instead of leaving a zombie server the
-    /// user asked not to run.
-    rtsp_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// Bumped when a user Start or Stop establishes a new desired-state
+    /// intent. The intent is published before waiting on transaction or
+    /// lifecycle serialization, so a later request invalidates slow interface
+    /// resolution, recovery, or candidate construction immediately.
+    restream_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Generation allocated by each full explicit Start. Automatic rebuilds
     /// remain in that generation; a newer Start invalidates older work.
-    rtsp_generation: Arc<std::sync::atomic::AtomicU64>,
+    restream_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Serializes complete user start/stop/settings/switch transactions.
+    restream_transaction: Arc<Mutex<()>>,
     /// Serializes listener take/shutdown/build/store work without ever holding
     /// the shared StreamState lock across a slow operation.
     relay_lifecycle: Arc<Mutex<()>>,
@@ -146,7 +233,7 @@ pub struct StreamManager {
     relay_wake: Arc<Notify>,
     relay_event_tx: RelayEventSender,
     relay_event_rx: std::sync::Mutex<Option<RelayEventReceiver>>,
-    /// Same stop-beats-start protocol as `rtsp_epoch`, for the playback
+    /// Same stop-beats-start protocol as `restream_epoch`, for the playback
     /// pipeline: bumped on every `stop_playback` (even when no pipeline is
     /// stored), captured by `start_playback` before its slow pipeline
     /// build, and re-checked under the storage lock.
@@ -165,27 +252,34 @@ enum SourceMode {
 
 struct StreamState {
     playback: Option<Arc<PlaybackPipeline>>,
-    rtsp_server: Option<RtspRestreamer>,
-    rtsp_desired: bool,
-    rtsp_spec: Option<ResolvedRtspStartSpec>,
-    rtsp_health: Option<Arc<RelayRuntimeHealth>>,
-    /// RTSP epoch captured by the explicit Start that installed the current
+    selected_protocol: RestreamProtocol,
+    restream_server: Option<RestreamServer>,
+    restream_desired: bool,
+    restream_spec: Option<ResolvedStartSpec>,
+    restream_health: Option<Arc<RelayRuntimeHealth>>,
+    /// Re-stream epoch captured by the explicit Start that installed the current
     /// desired state.  This lets a Stop distinguish an older in-flight Start
     /// from a newer Start that began after the Stop invalidated the epoch.
-    rtsp_intent_epoch: Option<u64>,
+    restream_intent_epoch: Option<u64>,
     recording: bool,
     recording_path: Option<String>,
     start_time: Option<std::time::Instant>,
-    rtsp_start_time: Option<std::time::Instant>,
+    restream_start_time: Option<std::time::Instant>,
     /// Source the running playback was started with (None when idle).
     playback_source: Option<SourceMode>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RestreamStopIntent {
+    epoch: u64,
+    target_generation: Option<u64>,
 }
 
 #[derive(Clone)]
 struct RelaySupervisorContext {
     state: Arc<Mutex<StreamState>>,
     status_tx: Arc<watch::Sender<StreamStatus>>,
-    rtsp_epoch: Arc<std::sync::atomic::AtomicU64>,
+    restream_epoch: Arc<std::sync::atomic::AtomicU64>,
     relay_lifecycle: Arc<Mutex<()>>,
     relay_wake: Arc<Notify>,
     relay_event_tx: RelayEventSender,
@@ -193,27 +287,34 @@ struct RelaySupervisorContext {
 }
 
 impl StreamManager {
+    #[cfg(test)]
     pub fn new() -> Self {
-        let (status_tx, _) = watch::channel(StreamStatus::idle());
+        Self::with_selected_protocol(RestreamProtocol::Rtsp)
+    }
+
+    pub fn with_selected_protocol(selected_protocol: RestreamProtocol) -> Self {
+        let (status_tx, _) = watch::channel(StreamStatus::idle(selected_protocol));
         let (relay_event_tx, relay_event_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             state: Arc::new(Mutex::new(StreamState {
                 playback: None,
-                rtsp_server: None,
-                rtsp_desired: false,
-                rtsp_spec: None,
-                rtsp_health: None,
-                rtsp_intent_epoch: None,
+                selected_protocol,
+                restream_server: None,
+                restream_desired: false,
+                restream_spec: None,
+                restream_health: None,
+                restream_intent_epoch: None,
                 recording: false,
                 recording_path: None,
                 start_time: None,
-                rtsp_start_time: None,
+                restream_start_time: None,
                 playback_source: None,
             })),
             video_hwnd: Arc::new(std::sync::atomic::AtomicIsize::new(0)),
             status_tx: Arc::new(status_tx),
-            rtsp_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            rtsp_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            restream_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            restream_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            restream_transaction: Arc::new(Mutex::new(())),
             relay_lifecycle: Arc::new(Mutex::new(())),
             relay_wake: Arc::new(Notify::new()),
             relay_event_tx,
@@ -306,20 +407,23 @@ impl StreamManager {
             // udpsrc binds lazily on first client connect, which is why
             // this is guarded at start time rather than probed.
             if settings.stream.protocol == StreamProtocol::Udp {
-                let desired_conflict = state.rtsp_desired
+                let desired_conflict = state.restream_desired
                     && state
-                        .rtsp_spec
+                        .restream_spec
                         .as_ref()
-                        .and_then(ResolvedRtspStartSpec::udp_ingest_port)
+                        .and_then(ResolvedStartSpec::udp_ingest_port)
                         == Some(settings.stream.udp_port);
-                let live_conflict = state.rtsp_server.as_ref().and_then(|s| s.udp_ingest_port())
+                let live_conflict = state
+                    .restream_server
+                    .as_ref()
+                    .and_then(|s| s.udp_ingest_port())
                     == Some(settings.stream.udp_port);
                 let conflict = desired_conflict || live_conflict;
                 if conflict {
                     return Err(AppError::Stream(format!(
-                        "UDP port {} is already claimed by the RTSP re-stream \
+                        "UDP port {} is already claimed by the re-stream \
                          server — only one consumer can receive a UDP stream. \
-                         Stop the RTSP server first, or switch the input to RTSP.",
+                         Stop the re-stream server first, or switch the input to RTSP.",
                         settings.stream.udp_port
                     )));
                 }
@@ -462,10 +566,10 @@ impl StreamManager {
         Ok(())
     }
 
-    async fn resolve_rtsp_start_spec(
+    async fn resolve_restream_start_spec(
         settings: &AppSettings,
         adopted: &std::collections::HashSet<String>,
-    ) -> Result<ResolvedRtspStartSpec, AppError> {
+    ) -> Result<ResolvedStartSpec, AppError> {
         let bind_interface = if settings.rtsp_server.bind_interface.is_empty() {
             None
         } else {
@@ -488,15 +592,19 @@ impl StreamManager {
         };
 
         log::info!(
-            "RTSP bind selection: interface={:?} bind={:?} advertise={}",
+            "Re-stream bind selection: interface={:?} bind={:?} advertise={}",
             bind_interface,
             bind_address,
             advertised_ip
         );
-        Ok(ResolvedRtspStartSpec {
+        Ok(ResolvedStartSpec {
             source,
-            server_port: settings.rtsp_server.port,
-            mount_path: format!("/stream-{}", settings.rtsp_server.token),
+            output: match settings.restream_protocol {
+                RestreamProtocol::Rtsp => ResolvedOutput::Rtsp {
+                    server_port: settings.rtsp_server.port,
+                    mount_path: format!("/stream-{}", settings.rtsp_server.token),
+                },
+            },
             bind_interface,
             bind_address,
             advertised_ip,
@@ -505,110 +613,314 @@ impl StreamManager {
         })
     }
 
-    fn build_rtsp_restreamer(
-        spec: &ResolvedRtspStartSpec,
+    fn build_restream_server(
+        spec: &ResolvedStartSpec,
         health: Arc<RelayRuntimeHealth>,
         event_tx: RelayEventSender,
         recovering: bool,
-    ) -> (u64, Result<RtspRestreamer, RtspBuildFailure>) {
+    ) -> (u64, Result<RestreamServer, RestreamBuildFailure>) {
         let server_instance = health.begin_server_instance(recovering);
         let runtime = RtspRuntimeContext {
             health,
             event_tx,
             server_instance,
         };
-        let result = match &spec.source {
-            ResolvedSource::Udp { port } => RtspRestreamer::start_from_udp(
+        let result = match (&spec.output, &spec.source) {
+            (
+                ResolvedOutput::Rtsp {
+                    server_port,
+                    mount_path,
+                },
+                ResolvedSource::Udp { port },
+            ) => RtspRestreamer::start_from_udp(
                 *port,
-                spec.server_port,
-                &spec.mount_path,
+                *server_port,
+                mount_path,
                 spec.bind_address.as_deref(),
                 runtime,
-            ),
-            ResolvedSource::Rtsp { url } => RtspRestreamer::start_from_rtsp(
+            )
+            .map(RestreamServer::Rtsp),
+            (
+                ResolvedOutput::Rtsp {
+                    server_port,
+                    mount_path,
+                },
+                ResolvedSource::Rtsp { url },
+            ) => RtspRestreamer::start_from_rtsp(
                 url,
-                spec.server_port,
-                &spec.mount_path,
+                *server_port,
+                mount_path,
                 spec.bind_address.as_deref(),
                 &spec.username,
                 &spec.password,
                 runtime,
-            ),
+            )
+            .map(RestreamServer::Rtsp),
         };
         (server_instance, result)
     }
 
-    pub async fn start_rtsp_server(
+    async fn publish_restream_start_intent(&self, start_epoch: u64) -> Option<(u64, bool)> {
+        self.relay_wake.notify_waiters();
+
+        let preserve_prior_desired = {
+            let mut state = self.state.lock().await;
+            // A later Start/Stop may advance the epoch between this request's
+            // atomic claim and its state-lock acquisition. Never let the
+            // stale request reassert desired state after that newer intent.
+            if self
+                .restream_epoch
+                .load(std::sync::atomic::Ordering::Acquire)
+                != start_epoch
+            {
+                return None;
+            }
+            let preserve = state.restream_desired
+                && state.restream_spec.is_some()
+                && state.restream_health.is_some();
+            state.restream_desired = true;
+            state.restream_intent_epoch = Some(start_epoch);
+            if !preserve {
+                state.restream_start_time = Some(std::time::Instant::now());
+            }
+            preserve
+        };
+        self.refresh_status().await;
+        Some((start_epoch, preserve_prior_desired))
+    }
+
+    async fn begin_restream_start_intent(&self) -> Option<(u64, bool)> {
+        let start_epoch = self
+            .restream_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            .wrapping_add(1);
+        self.publish_restream_start_intent(start_epoch).await
+    }
+
+    async fn begin_restream_start_intent_if_current(
         &self,
-        settings: &AppSettings,
+        expected_epoch: u64,
+    ) -> Option<(u64, bool)> {
+        let start_epoch = expected_epoch.wrapping_add(1);
+        self.restream_epoch
+            .compare_exchange(
+                expected_epoch,
+                start_epoch,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .ok()?;
+        self.publish_restream_start_intent(start_epoch).await
+    }
+
+    async fn restream_intent_is_current(&self, expected_epoch: u64) -> bool {
+        if self
+            .restream_epoch
+            .load(std::sync::atomic::Ordering::Acquire)
+            != expected_epoch
+        {
+            return false;
+        }
+        let state = self.state.lock().await;
+        self.restream_epoch
+            .load(std::sync::atomic::Ordering::Acquire)
+            == expected_epoch
+            && state.restream_desired
+            && state.restream_intent_epoch == Some(expected_epoch)
+    }
+
+    async fn cancel_restream_start_intent(&self, start_epoch: u64, preserve_prior_desired: bool) {
+        if self
+            .restream_epoch
+            .load(std::sync::atomic::Ordering::Acquire)
+            != start_epoch
+        {
+            return;
+        }
+
+        let retry_generation = {
+            let mut state = self.state.lock().await;
+            if self
+                .restream_epoch
+                .load(std::sync::atomic::Ordering::Acquire)
+                != start_epoch
+                || state.restream_intent_epoch != Some(start_epoch)
+            {
+                return;
+            }
+            if preserve_prior_desired {
+                state.restream_health.as_ref().and_then(|health| {
+                    matches!(
+                        health.snapshot().state,
+                        RelayState::Failed | RelayState::Recovering
+                    )
+                    .then(|| health.server_generation())
+                })
+            } else {
+                if let Some(health) = state.restream_health.as_ref() {
+                    health.stop();
+                }
+                state.restream_desired = false;
+                state.restream_spec = None;
+                state.restream_health = None;
+                state.restream_intent_epoch = None;
+                state.restream_start_time = None;
+                None
+            }
+        };
+
+        if let Some(server_generation) = retry_generation {
+            let _ = self
+                .relay_event_tx
+                .send(RelaySupervisorEvent::RetryRequested { server_generation });
+        }
+        self.refresh_status().await;
+    }
+
+    pub async fn start_restream_server(
+        &self,
+        config: &AppConfig,
         adopted: &std::collections::HashSet<String>,
-    ) -> Result<RtspServerInfo, AppError> {
-        let start_epoch = self.rtsp_epoch.load(std::sync::atomic::Ordering::Acquire);
-        let spec = Self::resolve_rtsp_start_spec(settings, adopted).await?;
-        if self.rtsp_epoch.load(std::sync::atomic::Ordering::Acquire) != start_epoch {
-            return Err(AppError::Stream(
-                "RTSP server start was superseded by a stop".into(),
+    ) -> Result<RestreamServerInfo, AppError> {
+        let initial = crate::settings_validation::validate_prospective_settings(config.get())?;
+        if !initial.rtsp_server.enabled {
+            return Err(AppError::Validation(
+                "Re-stream Server Enable must be on before starting".into(),
             ));
         }
 
-        let info = RtspServerInfo {
-            rtsp_url: spec.client_url(),
+        // Publish intent before waiting for another user transaction or doing
+        // interface resolution. A later Stop/Start can therefore supersede
+        // this operation immediately by advancing the epoch.
+        let Some((start_epoch, preserve_prior_desired)) = self.begin_restream_start_intent().await
+        else {
+            return Err(AppError::Stream(
+                "Re-stream server start was superseded by a newer request".into(),
+            ));
+        };
+        let _transaction = self.restream_transaction.lock().await;
+        if !self.restream_intent_is_current(start_epoch).await {
+            return Err(AppError::Stream(
+                "Re-stream server start was superseded by a newer request".into(),
+            ));
+        }
+
+        // Re-read after serialization so a settings apply that committed
+        // while this Start was queued is authoritative.
+        let settings = match crate::settings_validation::validate_prospective_settings(config.get())
+        {
+            Ok(settings) => settings,
+            Err(error) => {
+                self.cancel_restream_start_intent(start_epoch, preserve_prior_desired)
+                    .await;
+                return Err(error);
+            }
+        };
+        if !settings.rtsp_server.enabled {
+            self.cancel_restream_start_intent(start_epoch, false).await;
+            return Err(AppError::Validation(
+                "Re-stream Server Enable must be on before starting".into(),
+            ));
+        }
+        self.start_restream_server_inner(&settings, adopted, start_epoch, preserve_prior_desired)
+            .await
+    }
+
+    async fn start_restream_server_inner(
+        &self,
+        settings: &AppSettings,
+        adopted: &std::collections::HashSet<String>,
+        start_epoch: u64,
+        preserve_prior_desired: bool,
+    ) -> Result<RestreamServerInfo, AppError> {
+        let spec = match Self::resolve_restream_start_spec(settings, adopted).await {
+            Ok(spec) => spec,
+            Err(error) => {
+                self.cancel_restream_start_intent(start_epoch, preserve_prior_desired)
+                    .await;
+                return Err(error);
+            }
+        };
+        if self
+            .restream_epoch
+            .load(std::sync::atomic::Ordering::Acquire)
+            != start_epoch
+        {
+            return Err(AppError::Stream(
+                "Re-stream server start was superseded by a stop".into(),
+            ));
+        }
+
+        let info = RestreamServerInfo {
+            protocol: spec.protocol(),
+            server_url: spec.client_url(),
             display_url: spec.display_url(),
         };
 
         let (server_generation, health) = {
             let mut state = self.state.lock().await;
-            if self.rtsp_epoch.load(std::sync::atomic::Ordering::Acquire) != start_epoch {
+            if self
+                .restream_epoch
+                .load(std::sync::atomic::Ordering::Acquire)
+                != start_epoch
+            {
                 return Err(AppError::Stream(
-                    "RTSP server start was superseded by a stop".into(),
+                    "Re-stream server start was superseded by a stop".into(),
                 ));
             }
 
-            let health_snapshot = state.rtsp_health.as_ref().map(|health| health.snapshot());
+            let health_snapshot = state
+                .restream_health
+                .as_ref()
+                .map(|health| health.snapshot());
             let healthy_noop = resolved_start_is_healthy_noop(
-                state.rtsp_desired,
-                state.rtsp_spec.as_ref(),
+                state.restream_desired,
+                state.restream_spec.as_ref(),
                 &spec,
                 health_snapshot.as_ref().map(|health| health.state),
                 health_snapshot
                     .as_ref()
                     .map(|health| health.server_generation),
                 state
-                    .rtsp_server
+                    .restream_server
                     .as_ref()
-                    .map(RtspRestreamer::server_generation),
+                    .map(RestreamServer::server_generation),
                 state
-                    .rtsp_server
+                    .restream_server
                     .as_ref()
-                    .is_some_and(RtspRestreamer::loop_alive),
+                    .is_some_and(RestreamServer::loop_alive),
             );
             if healthy_noop {
-                log::info!("RTSP explicit Start resolved to the healthy current endpoint; no-op");
+                log::info!(
+                    "Explicit re-stream Start resolved to the healthy current endpoint; no-op"
+                );
                 return Ok(info);
             }
 
             if let Some(udp_port) = spec.udp_ingest_port() {
                 if state.playback_source == Some(SourceMode::Udp { port: udp_port }) {
-                    return Err(AppError::Stream(format!(
+                    let error = AppError::Stream(format!(
                         "UDP port {} is already claimed by the running preview - only one consumer can receive a UDP stream. Stop the stream first, or switch the input to RTSP.",
                         udp_port
-                    )));
+                    ));
+                    drop(state);
+                    self.cancel_restream_start_intent(start_epoch, preserve_prior_desired)
+                        .await;
+                    return Err(error);
                 }
             }
 
             let server_generation = self
-                .rtsp_generation
+                .restream_generation
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
                 .wrapping_add(1);
             let health = Arc::new(RelayRuntimeHealth::new(
                 server_generation,
                 spec.ingest_kind(),
             ));
-            state.rtsp_desired = true;
-            state.rtsp_spec = Some(spec.clone());
-            state.rtsp_health = Some(health.clone());
-            state.rtsp_intent_epoch = Some(start_epoch);
-            state.rtsp_start_time = Some(std::time::Instant::now());
+            state.restream_spec = Some(spec.clone());
+            state.restream_health = Some(health.clone());
+            state.restream_start_time = Some(std::time::Instant::now());
             (server_generation, health)
         };
 
@@ -616,55 +928,56 @@ impl StreamManager {
         self.refresh_status().await;
 
         let gst_error = crate::ensure_gstreamer().err();
-        if let Err(error) = crate::network::firewall::ensure_rtsp_allowed(spec.server_port).await {
+        if let Err(error) = crate::network::firewall::ensure_rtsp_allowed(spec.server_port()).await
+        {
             log::warn!("Firewall setup: {}", error);
         }
 
         let _lifecycle = self.relay_lifecycle.lock().await;
         if !relay_is_current(
             &self.state,
-            &self.rtsp_epoch,
+            &self.restream_epoch,
             start_epoch,
             server_generation,
         )
         .await
         {
             return Err(AppError::Stream(
-                "RTSP server start was superseded by a newer request".into(),
+                "Re-stream server start was superseded by a newer request".into(),
             ));
         }
 
         let old_server = {
             let mut state = self.state.lock().await;
             if !relay_state_is_generation(&state, server_generation)
-                || state.rtsp_intent_epoch != Some(start_epoch)
+                || state.restream_intent_epoch != Some(start_epoch)
             {
                 return Err(AppError::Stream(
-                    "RTSP server start was superseded by a newer request".into(),
+                    "Re-stream server start was superseded by a newer request".into(),
                 ));
             }
-            state.rtsp_server.take()
+            state.restream_server.take()
         };
-        if let Some(old_server) = old_server {
+        if let Some(mut old_server) = old_server {
             old_server.shutdown().await;
         }
 
         if !relay_is_current(
             &self.state,
-            &self.rtsp_epoch,
+            &self.restream_epoch,
             start_epoch,
             server_generation,
         )
         .await
         {
             return Err(AppError::Stream(
-                "RTSP server start was superseded by a newer request".into(),
+                "Re-stream server start was superseded by a newer request".into(),
             ));
         }
 
         if let Some(error) = gst_error {
             let server_instance = health.begin_server_instance(false);
-            let reason = redact_relay_text(&error.to_string(), &spec.mount_path);
+            let reason = redact_relay_text(&error.to_string(), spec.mount_path());
             health.mark_build_failed(server_instance, reason, false);
             let _ = self
                 .relay_event_tx
@@ -675,11 +988,11 @@ impl StreamManager {
         }
 
         let (server_instance, built) =
-            Self::build_rtsp_restreamer(&spec, health.clone(), self.relay_event_tx.clone(), false);
+            Self::build_restream_server(&spec, health.clone(), self.relay_event_tx.clone(), false);
         let server = match built {
             Ok(server) => server,
             Err(failure) => {
-                let reason = redact_relay_text(&failure.error.to_string(), &spec.mount_path);
+                let reason = redact_relay_text(&failure.error.to_string(), spec.mount_path());
                 health.mark_build_failed(
                     server_instance,
                     reason,
@@ -699,17 +1012,20 @@ impl StreamManager {
         let mut candidate = Some(server);
         {
             let mut state = self.state.lock().await;
-            if self.rtsp_epoch.load(std::sync::atomic::Ordering::Acquire) == start_epoch
-                && state.rtsp_intent_epoch == Some(start_epoch)
+            if self
+                .restream_epoch
+                .load(std::sync::atomic::Ordering::Acquire)
+                == start_epoch
+                && state.restream_intent_epoch == Some(start_epoch)
                 && relay_state_is_generation(&state, server_generation)
             {
-                state.rtsp_server = candidate.take();
+                state.restream_server = candidate.take();
             }
         }
-        if let Some(stale) = candidate {
+        if let Some(mut stale) = candidate {
             stale.shutdown().await;
             return Err(AppError::Stream(
-                "RTSP server start was superseded by a newer request".into(),
+                "Re-stream server start was superseded by a newer request".into(),
             ));
         }
 
@@ -718,68 +1034,256 @@ impl StreamManager {
         Ok(info)
     }
 
-    pub async fn stop_rtsp_server(&self) -> Result<(), AppError> {
-        let stop_epoch = self
-            .rtsp_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-            .wrapping_add(1);
+    pub async fn stop_restream_server(&self) -> Result<(), AppError> {
+        // Invalidate an in-flight Start/recovery before waiting for the user
+        // transaction gate. The teardown itself remains serialized below.
+        let intent = self.begin_restream_stop_intent().await;
+        let _transaction = self.restream_transaction.lock().await;
+        match intent {
+            Some(intent) => self.finish_restream_stop(intent).await,
+            None => Ok(()),
+        }
+    }
+
+    async fn publish_restream_stop_intent(&self, stop_epoch: u64) -> Option<RestreamStopIntent> {
         self.relay_wake.notify_waiters();
 
         let target_generation = {
             let mut state = self.state.lock().await;
+            // A newer intent owns desired state and listener replacement.
+            // This stale Stop must neither clear it nor tear down its server.
+            if self
+                .restream_epoch
+                .load(std::sync::atomic::Ordering::Acquire)
+                != stop_epoch
+            {
+                return None;
+            }
             let desired_generation = state
-                .rtsp_health
+                .restream_health
                 .as_ref()
                 .map(|health| health.server_generation());
             let live_generation = state
-                .rtsp_server
+                .restream_server
                 .as_ref()
-                .map(RtspRestreamer::server_generation);
-            let stops_desired = state.rtsp_desired
-                && state
-                    .rtsp_intent_epoch
-                    .is_none_or(|intent_epoch| intent_epoch < stop_epoch);
+                .map(RestreamServer::server_generation);
+            let stops_desired = state.restream_desired;
 
-            let target = if stops_desired {
-                desired_generation.or(live_generation)
-            } else if live_generation != desired_generation {
-                live_generation
-            } else {
-                None
-            };
+            let target = restream_stop_target(stops_desired, desired_generation, live_generation);
 
             if stops_desired {
-                state.rtsp_desired = false;
-                state.rtsp_spec = None;
-                state.rtsp_health = None;
-                state.rtsp_intent_epoch = None;
-                state.rtsp_start_time = None;
+                if let Some(health) = state.restream_health.as_ref() {
+                    health.stop();
+                }
+                state.restream_desired = false;
+                state.restream_spec = None;
+                state.restream_health = None;
+                state.restream_intent_epoch = None;
+                state.restream_start_time = None;
             }
             target
         };
         self.refresh_status().await;
 
+        Some(RestreamStopIntent {
+            epoch: stop_epoch,
+            target_generation,
+        })
+    }
+
+    async fn begin_restream_stop_intent(&self) -> Option<RestreamStopIntent> {
+        let stop_epoch = self
+            .restream_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            .wrapping_add(1);
+        self.publish_restream_stop_intent(stop_epoch).await
+    }
+
+    async fn begin_restream_stop_intent_if_current(
+        &self,
+        expected_epoch: u64,
+    ) -> Option<RestreamStopIntent> {
+        let stop_epoch = expected_epoch.wrapping_add(1);
+        self.restream_epoch
+            .compare_exchange(
+                expected_epoch,
+                stop_epoch,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .ok()?;
+        self.publish_restream_stop_intent(stop_epoch).await
+    }
+
+    async fn finish_restream_stop(&self, intent: RestreamStopIntent) -> Result<(), AppError> {
         let _lifecycle = self.relay_lifecycle.lock().await;
-        let server = {
-            let mut state = self.state.lock().await;
-            if state
-                .rtsp_server
-                .as_ref()
-                .is_some_and(|server| Some(server.server_generation()) == target_generation)
+        let server =
             {
-                state.rtsp_server.take()
-            } else {
-                None
-            }
-        };
-        if let Some(server) = server {
+                let mut state = self.state.lock().await;
+                if state.restream_server.as_ref().is_some_and(|server| {
+                    Some(server.server_generation()) == intent.target_generation
+                }) {
+                    state.restream_server.take()
+                } else {
+                    None
+                }
+            };
+        if let Some(mut server) = server {
             server.shutdown().await;
-            log::info!("RTSP server fully cleaned up");
+            log::info!("Re-stream server fully cleaned up");
         }
         drop(_lifecycle);
         self.refresh_status().await;
-        log::info!("RTSP server stopped");
+        log::info!("Re-stream server stopped (intent epoch={})", intent.epoch);
         Ok(())
+    }
+
+    async fn current_operation_result(&self) -> RestreamOperationResult {
+        let state = self.state.lock().await;
+        RestreamOperationResult {
+            selected_protocol: state.selected_protocol,
+            desired: state.restream_desired,
+            server_info: state
+                .restream_desired
+                .then(|| state.restream_spec.as_ref().map(Self::info_from_spec))
+                .flatten(),
+        }
+    }
+
+    fn info_from_spec(spec: &ResolvedStartSpec) -> RestreamServerInfo {
+        RestreamServerInfo {
+            protocol: spec.protocol(),
+            server_url: spec.client_url(),
+            display_url: spec.display_url(),
+        }
+    }
+
+    /// Apply the shared Enable field and complete RTSP section as one backend
+    /// lifecycle transaction. The SRT section is deliberately absent until
+    /// the next milestone introduces its runtime and secret-state model.
+    pub async fn apply_restream_settings(
+        &self,
+        config: &AppConfig,
+        update: RestreamSettingsUpdate,
+        adopted: &std::collections::HashSet<String>,
+    ) -> Result<RestreamOperationResult, AppError> {
+        let _transaction = self.restream_transaction.lock().await;
+        let operation_epoch = self
+            .restream_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        let old_settings = config.get();
+        let prospective =
+            crate::settings_validation::prospective_restream_settings(&old_settings, update)?;
+        let was_desired = self.state.lock().await.restream_desired;
+        let runtime_changed = old_settings.rtsp_server != prospective.rtsp_server;
+        let must_stop = was_desired && (runtime_changed || !prospective.rtsp_server.enabled);
+
+        let stop_intent = if must_stop {
+            let intent = self
+                .begin_restream_stop_intent_if_current(operation_epoch)
+                .await
+                .ok_or_else(|| {
+                    AppError::Stream(
+                        "Re-stream settings apply was superseded by a newer request".into(),
+                    )
+                })?;
+            self.finish_restream_stop(intent).await?;
+            Some(intent)
+        } else {
+            None
+        };
+
+        let committed = match config.commit_restream_settings(prospective.rtsp_server.clone()) {
+            Ok(settings) => settings,
+            Err(persistence_error) => {
+                let restoration_intent = if was_desired {
+                    match stop_intent {
+                        Some(intent) => {
+                            self.begin_restream_start_intent_if_current(intent.epoch)
+                                .await
+                        }
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some((start_epoch, preserve_prior_desired)) = restoration_intent {
+                    if let Err(restoration_error) = self
+                        .start_restream_server_inner(
+                            &old_settings,
+                            adopted,
+                            start_epoch,
+                            preserve_prior_desired,
+                        )
+                        .await
+                    {
+                        return Err(AppError::Config(format!(
+                            "{}; restoring the prior re-stream output also failed: {}",
+                            persistence_error, restoration_error
+                        )));
+                    }
+                }
+                return Err(persistence_error);
+            }
+        };
+
+        if was_desired && committed.rtsp_server.enabled {
+            if let Some(intent) = stop_intent {
+                if let Some((start_epoch, preserve_prior_desired)) = self
+                    .begin_restream_start_intent_if_current(intent.epoch)
+                    .await
+                {
+                    self.start_restream_server_inner(
+                        &committed,
+                        adopted,
+                        start_epoch,
+                        preserve_prior_desired,
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        Ok(self.current_operation_result().await)
+    }
+
+    pub async fn switch_restream_protocol(
+        &self,
+        config: &AppConfig,
+        protocol: RestreamProtocol,
+        adopted: &std::collections::HashSet<String>,
+    ) -> Result<RestreamOperationResult, AppError> {
+        let _transaction = self.restream_transaction.lock().await;
+        let operation_epoch = self
+            .restream_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        let settings = crate::settings_validation::validate_prospective_settings(config.get())?;
+        debug_assert_eq!(protocol, RestreamProtocol::Rtsp);
+
+        let desired = self.state.lock().await.restream_desired;
+        if desired {
+            if !settings.rtsp_server.enabled {
+                return Err(AppError::Validation(
+                    "Re-stream Server Enable must be on before switching".into(),
+                ));
+            }
+            let (start_epoch, preserve_prior_desired) = self
+                .begin_restream_start_intent_if_current(operation_epoch)
+                .await
+                .ok_or_else(|| {
+                    AppError::Stream(
+                        "Re-stream protocol switch was superseded by a newer request".into(),
+                    )
+                })?;
+            self.start_restream_server_inner(
+                &settings,
+                adopted,
+                start_epoch,
+                preserve_prior_desired,
+            )
+            .await?;
+        }
+        Ok(self.current_operation_result().await)
     }
 
     /// Recompute status from internal state and publish to subscribers.
@@ -810,7 +1314,7 @@ impl StreamManager {
             let supervisor = RelaySupervisorContext {
                 state: self.state.clone(),
                 status_tx: self.status_tx.clone(),
-                rtsp_epoch: self.rtsp_epoch.clone(),
+                restream_epoch: self.restream_epoch.clone(),
                 relay_lifecycle: self.relay_lifecycle.clone(),
                 relay_wake: self.relay_wake.clone(),
                 relay_event_tx: self.relay_event_tx.clone(),
@@ -818,7 +1322,7 @@ impl StreamManager {
             };
             tauri::async_runtime::spawn(run_relay_supervisor(relay_events, supervisor));
         } else {
-            log::warn!("RTSP relay supervisor was already started");
+            log::warn!("Re-stream relay supervisor was already started");
         }
 
         let state_for_tick = self.state.clone();
@@ -1040,8 +1544,8 @@ impl StreamManager {
 
 fn resolved_start_is_healthy_noop(
     desired: bool,
-    current_spec: Option<&ResolvedRtspStartSpec>,
-    candidate_spec: &ResolvedRtspStartSpec,
+    current_spec: Option<&ResolvedStartSpec>,
+    candidate_spec: &ResolvedStartSpec,
     relay_state: Option<RelayState>,
     health_generation: Option<u64>,
     listener_generation: Option<u64>,
@@ -1058,10 +1562,30 @@ fn resolved_start_is_healthy_noop(
         && listener_loop_alive
 }
 
+fn restream_stop_target(
+    stops_desired: bool,
+    desired_generation: Option<u64>,
+    live_generation: Option<u64>,
+) -> Option<u64> {
+    if stops_desired {
+        // A newer desired generation can coexist briefly with the previous
+        // stored listener while Start is resolving/building. The epoch makes
+        // that candidate self-discard; teardown must target the listener that
+        // is actually stored, not merely the newer health generation.
+        live_generation
+    } else if live_generation != desired_generation {
+        // This Stop was superseded by a newer intent. It may still clean up a
+        // listener that does not belong to that newer desired generation.
+        live_generation
+    } else {
+        None
+    }
+}
+
 fn relay_state_is_generation(state: &StreamState, server_generation: u64) -> bool {
-    state.rtsp_desired
+    state.restream_desired
         && state
-            .rtsp_health
+            .restream_health
             .as_ref()
             .is_some_and(|health| health.server_generation() == server_generation)
 }
@@ -1077,7 +1601,7 @@ async fn relay_is_current(
     }
     let state = state.lock().await;
     epoch.load(std::sync::atomic::Ordering::Acquire) == expected_epoch
-        && state.rtsp_intent_epoch == Some(expected_epoch)
+        && state.restream_intent_epoch == Some(expected_epoch)
         && relay_state_is_generation(&state, server_generation)
 }
 
@@ -1116,11 +1640,15 @@ async fn current_relay_context(
     if !relay_state_is_generation(&state, server_generation) {
         return None;
     }
-    let expected_epoch = state.rtsp_intent_epoch?;
-    if ctx.rtsp_epoch.load(std::sync::atomic::Ordering::Acquire) != expected_epoch {
+    let expected_epoch = state.restream_intent_epoch?;
+    if ctx
+        .restream_epoch
+        .load(std::sync::atomic::Ordering::Acquire)
+        != expected_epoch
+    {
         return None;
     }
-    Some((expected_epoch, state.rtsp_health.as_ref()?.clone()))
+    Some((expected_epoch, state.restream_health.as_ref()?.clone()))
 }
 
 async fn publish_relay_status(ctx: &RelaySupervisorContext) {
@@ -1129,27 +1657,22 @@ async fn publish_relay_status(ctx: &RelaySupervisorContext) {
 }
 
 async fn poll_relay_fault(ctx: &RelaySupervisorContext) -> Option<RelayFaultEvent> {
-    let health = {
+    let (health, probe) = {
         let state = ctx.state.lock().await;
-        if !state.rtsp_desired {
+        if !state.restream_desired {
             return None;
         }
-        state.rtsp_health.as_ref()?.clone()
+        (
+            state.restream_health.as_ref()?.clone(),
+            state
+                .restream_server
+                .as_ref()
+                .map(RestreamServer::fault_probe),
+        )
     };
 
-    if let Some((server_instance, media_generation, weak_media)) = health.active_media() {
-        if let Some(media) = weak_media.upgrade() {
-            if media.status() == gst_rtsp_server::RTSPMediaStatus::Error {
-                if let Some(event) = health.record_media_fault(
-                    server_instance,
-                    media_generation,
-                    relay::RelayFaultKind::MediaStatusError,
-                    "RTSP relay media entered error status".into(),
-                ) {
-                    return Some(event);
-                }
-            }
-        }
+    if let Some(event) = probe.and_then(|probe| probe.poll_fault()) {
+        return Some(event);
     }
 
     health.evaluate_watchdog(tokio::time::Instant::now())
@@ -1198,7 +1721,10 @@ async fn run_relay_supervisor(mut events: RelayEventReceiver, ctx: RelaySupervis
                 else {
                     continue;
                 };
-                if health.snapshot().state != RelayState::Failed {
+                if !matches!(
+                    health.snapshot().state,
+                    RelayState::Failed | RelayState::Recovering
+                ) {
                     continue;
                 }
                 recover_relay_generation(&ctx, expected_epoch, server_generation).await;
@@ -1225,7 +1751,7 @@ async fn recover_relay_generation(
         let _lifecycle = ctx.relay_lifecycle.lock().await;
         if !relay_is_current(
             &ctx.state,
-            &ctx.rtsp_epoch,
+            &ctx.restream_epoch,
             expected_epoch,
             server_generation,
         )
@@ -1236,16 +1762,16 @@ async fn recover_relay_generation(
         let failed_server = {
             let mut state = ctx.state.lock().await;
             if state
-                .rtsp_server
+                .restream_server
                 .as_ref()
                 .is_some_and(|server| server.server_generation() == server_generation)
             {
-                state.rtsp_server.take()
+                state.restream_server.take()
             } else {
                 None
             }
         };
-        if let Some(failed_server) = failed_server {
+        if let Some(mut failed_server) = failed_server {
             failed_server.shutdown().await;
         }
     }
@@ -1264,7 +1790,7 @@ async fn recover_relay_generation(
         publish_relay_status(ctx).await;
         if !wait_relay_backoff(
             &ctx.state,
-            &ctx.rtsp_epoch,
+            &ctx.restream_epoch,
             &ctx.relay_wake,
             expected_epoch,
             server_generation,
@@ -1279,7 +1805,7 @@ async fn recover_relay_generation(
 
         let base_spec = {
             let state = ctx.state.lock().await;
-            let Some(spec) = state.rtsp_spec.as_ref() else {
+            let Some(spec) = state.restream_spec.as_ref() else {
                 return;
             };
             spec.clone()
@@ -1291,7 +1817,7 @@ async fn recover_relay_generation(
                 let adopted = adopted_ip_set(&ctx.app_handle).await;
                 if !relay_is_current(
                     &ctx.state,
-                    &ctx.rtsp_epoch,
+                    &ctx.restream_epoch,
                     expected_epoch,
                     server_generation,
                 )
@@ -1308,10 +1834,10 @@ async fn recover_relay_generation(
                     Err(error) => {
                         let reason = redact_relay_text(
                             &format!(
-                                "RTSP bind interface '{}' is unavailable: {}",
+                                "Re-stream bind interface '{}' is unavailable: {}",
                                 interface_name, error
                             ),
-                            &base_spec.mount_path,
+                            base_spec.mount_path(),
                         );
                         health.mark_resolution_failed(reason);
                         health.force_max_backoff();
@@ -1325,7 +1851,7 @@ async fn recover_relay_generation(
         let _lifecycle = ctx.relay_lifecycle.lock().await;
         if !relay_is_current(
             &ctx.state,
-            &ctx.rtsp_epoch,
+            &ctx.restream_epoch,
             expected_epoch,
             server_generation,
         )
@@ -1340,21 +1866,21 @@ async fn recover_relay_generation(
         let prior = {
             let mut state = ctx.state.lock().await;
             if state
-                .rtsp_server
+                .restream_server
                 .as_ref()
                 .is_some_and(|server| server.server_generation() == server_generation)
             {
-                state.rtsp_server.take()
+                state.restream_server.take()
             } else {
                 None
             }
         };
-        if let Some(prior) = prior {
+        if let Some(mut prior) = prior {
             prior.shutdown().await;
         }
         if !relay_is_current(
             &ctx.state,
-            &ctx.rtsp_epoch,
+            &ctx.restream_epoch,
             expected_epoch,
             server_generation,
         )
@@ -1365,14 +1891,14 @@ async fn recover_relay_generation(
 
         if let Err(error) = crate::ensure_gstreamer() {
             let server_instance = health.begin_server_instance(true);
-            let reason = redact_relay_text(&error.to_string(), &build_spec.mount_path);
+            let reason = redact_relay_text(&error.to_string(), build_spec.mount_path());
             health.mark_build_failed(server_instance, reason, false);
             drop(_lifecycle);
             publish_relay_status(ctx).await;
             continue;
         }
 
-        let (server_instance, result) = StreamManager::build_rtsp_restreamer(
+        let (server_instance, result) = StreamManager::build_restream_server(
             &build_spec,
             health.clone(),
             ctx.relay_event_tx.clone(),
@@ -1381,11 +1907,11 @@ async fn recover_relay_generation(
         let server = match result {
             Ok(server) => server,
             Err(failure) => {
-                let reason = redact_relay_text(&failure.error.to_string(), &build_spec.mount_path);
+                let reason = redact_relay_text(&failure.error.to_string(), build_spec.mount_path());
                 health.mark_build_failed(
                     server_instance,
                     reason,
-                    failure.kind == RtspBuildFailureKind::Bind,
+                    failure.kind == RestreamBuildFailureKind::Bind,
                 );
                 drop(_lifecycle);
                 publish_relay_status(ctx).await;
@@ -1396,18 +1922,21 @@ async fn recover_relay_generation(
         let mut candidate = Some(server);
         {
             let mut state = ctx.state.lock().await;
-            if ctx.rtsp_epoch.load(std::sync::atomic::Ordering::Acquire) == expected_epoch
-                && state.rtsp_intent_epoch == Some(expected_epoch)
+            if ctx
+                .restream_epoch
+                .load(std::sync::atomic::Ordering::Acquire)
+                == expected_epoch
+                && state.restream_intent_epoch == Some(expected_epoch)
                 && relay_state_is_generation(&state, server_generation)
             {
                 // Publish a re-resolved address only after it bound
                 // successfully. Port, interface, mount, token, and source are
                 // byte-for-byte inherited from the desired specification.
-                state.rtsp_spec = Some(build_spec);
-                state.rtsp_server = candidate.take();
+                state.restream_spec = Some(build_spec);
+                state.restream_server = candidate.take();
             }
         }
-        if let Some(stale) = candidate {
+        if let Some(mut stale) = candidate {
             stale.shutdown().await;
             return;
         }
@@ -1424,14 +1953,17 @@ async fn recover_relay_generation(
 async fn compute_status(state: &Arc<Mutex<StreamState>>) -> StreamStatus {
     let state = state.lock().await;
     let uptime = state
-        .rtsp_start_time
+        .restream_start_time
         .map(|t| t.elapsed().as_secs())
         .unwrap_or(0);
 
-    let health = state.rtsp_health.as_ref().map(|health| health.snapshot());
+    let health = state
+        .restream_health
+        .as_ref()
+        .map(|health| health.snapshot());
     let current_generation = health.as_ref().map(|health| health.server_generation);
     let current_server = state
-        .rtsp_server
+        .restream_server
         .as_ref()
         .filter(|server| Some(server.server_generation()) == current_generation);
     let (bandwidth, connected_clients, client_limit, listener_alive) = match current_server {
@@ -1463,9 +1995,15 @@ async fn compute_status(state: &Arc<Mutex<StreamState>>) -> StreamStatus {
 
     StreamStatus {
         playing,
-        rtsp_server_running: listener_alive,
-        rtsp_desired: state.rtsp_desired,
-        rtsp_relay_state: if state.rtsp_desired {
+        selected_protocol: state.selected_protocol,
+        active_protocol: state
+            .restream_spec
+            .as_ref()
+            .map(ResolvedStartSpec::protocol)
+            .or_else(|| state.restream_server.as_ref().map(RestreamServer::protocol)),
+        server_running: listener_alive,
+        desired: state.restream_desired,
+        relay_state: if state.restream_desired {
             health
                 .as_ref()
                 .map(|health| health.state)
@@ -1473,12 +2011,12 @@ async fn compute_status(state: &Arc<Mutex<StreamState>>) -> StreamStatus {
         } else {
             RelayState::Stopped
         },
-        rtsp_error: if state.rtsp_desired {
+        relay_error: if state.restream_desired {
             health.as_ref().and_then(|health| health.error.clone())
         } else {
             None
         },
-        rtsp_recovery_attempt: if state.rtsp_desired {
+        recovery_attempt: if state.restream_desired {
             health
                 .as_ref()
                 .map(|health| health.recovery_attempt)
@@ -1486,29 +2024,29 @@ async fn compute_status(state: &Arc<Mutex<StreamState>>) -> StreamStatus {
         } else {
             0
         },
-        rtsp_url: state
-            .rtsp_desired
+        server_url: state
+            .restream_desired
             .then(|| {
                 state
-                    .rtsp_spec
+                    .restream_spec
                     .as_ref()
-                    .map(ResolvedRtspStartSpec::client_url)
+                    .map(ResolvedStartSpec::client_url)
             })
             .flatten(),
         display_url: state
-            .rtsp_desired
+            .restream_desired
             .then(|| {
                 state
-                    .rtsp_spec
+                    .restream_spec
                     .as_ref()
-                    .map(ResolvedRtspStartSpec::display_url)
+                    .map(ResolvedStartSpec::display_url)
             })
             .flatten(),
         recording: state.recording,
         uptime_secs: uptime,
         bandwidth_kbps: bandwidth,
-        rtsp_connected_clients: connected_clients,
-        rtsp_client_limit: client_limit,
+        connected_clients,
+        client_limit,
         error,
         audio_present,
         audio_codec,
@@ -1523,7 +2061,7 @@ fn is_apipa(addr: &str) -> bool {
 
 /// First IPv4 on `ips` that is neither an adopted camera-network secondary
 /// nor APIPA. `None` if the interface carries only such addresses — the
-/// caller turns that into a clear error rather than binding the RTSP socket
+/// caller turns that into a clear error rather than binding the output socket
 /// to the camera network.
 fn first_usable_ip(
     ips: &[crate::network::interface::IpInfo],
@@ -1654,6 +2192,7 @@ mod tests {
                 camera_ip: camera_ip.into(),
                 audio_muted: false,
             },
+            restream_protocol: RestreamProtocol::Rtsp,
             rtsp_server: RtspServerConfig {
                 enabled: false,
                 port: 8554,
@@ -1759,19 +2298,21 @@ mod tests {
 
     #[test]
     fn explicit_start_noop_requires_identical_identity_and_healthy_listener() {
-        let spec = ResolvedRtspStartSpec {
+        let spec = ResolvedStartSpec {
             source: ResolvedSource::Rtsp {
                 url: "rtsp://192.0.2.20/live".into(),
             },
-            server_port: 8554,
-            mount_path: "/stream-token".into(),
+            output: ResolvedOutput::Rtsp {
+                server_port: 8554,
+                mount_path: "/stream-token".into(),
+            },
             bind_interface: Some("VPN".into()),
             bind_address: Some("192.0.2.10".into()),
             advertised_ip: "192.0.2.10".into(),
             username: "camera".into(),
             password: "secret".into(),
         };
-        let is_noop = |candidate: &ResolvedRtspStartSpec, relay_state, loop_alive| {
+        let is_noop = |candidate: &ResolvedStartSpec, relay_state, loop_alive| {
             resolved_start_is_healthy_noop(
                 true,
                 Some(&spec),
@@ -1872,42 +2413,48 @@ mod tests {
     fn stream_status_serializes() {
         let status = StreamStatus {
             playing: true,
-            rtsp_server_running: false,
-            rtsp_desired: true,
-            rtsp_relay_state: RelayState::Recovering,
-            rtsp_error: Some("camera unavailable".into()),
-            rtsp_recovery_attempt: 2,
-            rtsp_url: Some("rtsp://127.0.0.1:8554/stream-abc".into()),
+            selected_protocol: RestreamProtocol::Rtsp,
+            active_protocol: Some(RestreamProtocol::Rtsp),
+            server_running: false,
+            desired: true,
+            relay_state: RelayState::Recovering,
+            relay_error: Some("camera unavailable".into()),
+            recovery_attempt: 2,
+            server_url: Some("rtsp://127.0.0.1:8554/stream-abc".into()),
             display_url: Some("rtsp://127.0.0.1:8554".into()),
             recording: false,
             uptime_secs: 120,
             bandwidth_kbps: 0.0,
-            rtsp_connected_clients: 3,
-            rtsp_client_limit: MAX_RTSP_CLIENTS,
+            connected_clients: 3,
+            client_limit: MAX_RTSP_CLIENTS,
             error: None,
             audio_present: true,
             audio_codec: Some("PCMU".into()),
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("\"playing\":true"));
+        assert!(json.contains("\"selected_protocol\":\"rtsp\""));
+        assert!(json.contains("\"active_protocol\":\"rtsp\""));
         assert!(json.contains("\"uptime_secs\":120"));
         assert!(json.contains("\"display_url\":"));
-        assert!(json.contains("\"rtsp_relay_state\":\"recovering\""));
-        assert!(json.contains("\"rtsp_recovery_attempt\":2"));
-        assert!(json.contains("\"rtsp_connected_clients\":3"));
-        assert!(json.contains("\"rtsp_client_limit\":10"));
+        assert!(json.contains("\"relay_state\":\"recovering\""));
+        assert!(json.contains("\"recovery_attempt\":2"));
+        assert!(json.contains("\"connected_clients\":3"));
+        assert!(json.contains("\"client_limit\":10"));
         assert!(json.contains("\"audio_present\":true"));
         assert!(json.contains("\"audio_codec\":\"PCMU\""));
     }
 
     #[test]
     fn stream_status_default_values() {
-        let status = StreamStatus::idle();
+        let status = StreamStatus::idle(RestreamProtocol::Rtsp);
         let json = serde_json::to_string(&status).unwrap();
-        assert!(json.contains("\"rtsp_url\":null"));
+        assert!(json.contains("\"server_url\":null"));
+        assert!(json.contains("\"selected_protocol\":\"rtsp\""));
+        assert!(json.contains("\"active_protocol\":null"));
         assert!(json.contains("\"display_url\":null"));
-        assert!(json.contains("\"rtsp_connected_clients\":0"));
-        assert!(json.contains("\"rtsp_client_limit\":10"));
+        assert!(json.contains("\"connected_clients\":0"));
+        assert!(json.contains("\"client_limit\":10"));
         // Idle/stopped/video-only playback: no audio, no codec.
         assert!(json.contains("\"audio_present\":false"));
         assert!(json.contains("\"audio_codec\":null"));
@@ -1920,23 +2467,150 @@ mod tests {
         let mgr = StreamManager::new();
         let status = mgr.status_tx.borrow().clone();
         assert!(!status.playing);
-        assert!(!status.rtsp_server_running);
+        assert!(!status.server_running);
+        assert_eq!(status.selected_protocol, RestreamProtocol::Rtsp);
+        assert_eq!(status.active_protocol, None);
         assert!(!status.recording);
         assert_eq!(status.uptime_secs, 0);
-        assert!(status.rtsp_url.is_none());
-        assert_eq!(status.rtsp_connected_clients, 0);
-        assert_eq!(status.rtsp_client_limit, MAX_RTSP_CLIENTS);
+        assert!(status.server_url.is_none());
+        assert_eq!(status.connected_clients, 0);
+        assert_eq!(status.client_limit, MAX_RTSP_CLIENTS);
+    }
+
+    #[tokio::test]
+    async fn start_intent_is_visible_before_resolution_and_stop_supersedes_it() {
+        let manager = StreamManager::new();
+        let (start_epoch, preserve_prior_desired) = manager
+            .begin_restream_start_intent()
+            .await
+            .expect("start intent should remain current");
+        assert!(!preserve_prior_desired);
+
+        {
+            let state = manager.state.lock().await;
+            assert!(state.restream_desired);
+            assert_eq!(state.restream_intent_epoch, Some(start_epoch));
+            assert!(state.restream_spec.is_none());
+            assert!(state.restream_health.is_none());
+        }
+        let status = compute_status(&manager.state).await;
+        assert!(status.desired);
+        assert_eq!(status.relay_state, RelayState::Starting);
+        assert_eq!(status.active_protocol, None);
+
+        let stop_intent = manager
+            .begin_restream_stop_intent()
+            .await
+            .expect("stop intent should remain current");
+        assert!(stop_intent.epoch > start_epoch);
+        assert!(!manager.restream_intent_is_current(start_epoch).await);
+        manager
+            .cancel_restream_start_intent(start_epoch, false)
+            .await;
+
+        let state = manager.state.lock().await;
+        assert!(!state.restream_desired);
+        assert!(state.restream_intent_epoch.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_initial_start_clears_current_intent() {
+        let manager = StreamManager::new();
+        let (start_epoch, preserve_prior_desired) = manager
+            .begin_restream_start_intent()
+            .await
+            .expect("start intent should remain current");
+        assert!(!preserve_prior_desired);
+
+        manager
+            .cancel_restream_start_intent(start_epoch, preserve_prior_desired)
+            .await;
+
+        let state = manager.state.lock().await;
+        assert!(!state.restream_desired);
+        assert!(state.restream_intent_epoch.is_none());
+        assert!(state.restream_spec.is_none());
+        assert!(state.restream_health.is_none());
+        assert!(state.restream_start_time.is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_start_publication_cannot_reassert_desired() {
+        let manager = StreamManager::new();
+        manager
+            .restream_epoch
+            .store(2, std::sync::atomic::Ordering::Release);
+
+        assert!(manager.publish_restream_start_intent(1).await.is_none());
+        let state = manager.state.lock().await;
+        assert!(!state.restream_desired);
+        assert!(state.restream_intent_epoch.is_none());
+    }
+
+    #[tokio::test]
+    async fn settings_stop_claim_rejects_a_newer_start() {
+        let manager = StreamManager::new();
+        let operation_epoch = manager
+            .restream_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        let (newer_epoch, _) = manager
+            .begin_restream_start_intent()
+            .await
+            .expect("newer start should publish");
+
+        assert!(manager
+            .begin_restream_stop_intent_if_current(operation_epoch)
+            .await
+            .is_none());
+        let state = manager.state.lock().await;
+        assert!(state.restream_desired);
+        assert_eq!(state.restream_intent_epoch, Some(newer_epoch));
+    }
+
+    #[tokio::test]
+    async fn transactional_restart_cannot_override_a_newer_stop() {
+        let manager = StreamManager::new();
+        manager
+            .begin_restream_start_intent()
+            .await
+            .expect("initial start should publish");
+        let transaction_stop = manager
+            .begin_restream_stop_intent()
+            .await
+            .expect("transaction stop should publish");
+        manager
+            .begin_restream_stop_intent()
+            .await
+            .expect("newer stop should publish");
+
+        assert!(manager
+            .begin_restream_start_intent_if_current(transaction_stop.epoch)
+            .await
+            .is_none());
+        let state = manager.state.lock().await;
+        assert!(!state.restream_desired);
+        assert!(state.restream_intent_epoch.is_none());
+    }
+
+    #[test]
+    fn stop_tears_down_the_stored_listener_not_an_in_flight_generation() {
+        assert_eq!(restream_stop_target(true, Some(2), Some(1)), Some(1));
+        assert_eq!(restream_stop_target(true, Some(2), None), None);
+        assert_eq!(restream_stop_target(false, Some(2), Some(2)), None);
+        assert_eq!(restream_stop_target(false, Some(2), Some(1)), Some(1));
     }
 
     #[tokio::test]
     async fn recovery_status_keeps_desired_urls_without_a_listener() {
         let manager = StreamManager::new();
-        let spec = ResolvedRtspStartSpec {
+        let spec = ResolvedStartSpec {
             source: ResolvedSource::Rtsp {
                 url: "rtsp://192.0.2.20/live".into(),
             },
-            server_port: 8554,
-            mount_path: "/stream-stable-token".into(),
+            output: ResolvedOutput::Rtsp {
+                server_port: 8554,
+                mount_path: "/stream-stable-token".into(),
+            },
             bind_interface: Some("VPN".into()),
             bind_address: Some("192.0.2.10".into()),
             advertised_ip: "192.0.2.10".into(),
@@ -1950,19 +2624,20 @@ mod tests {
         health.mark_recovery_in_progress();
         {
             let mut state = manager.state.lock().await;
-            state.rtsp_desired = true;
-            state.rtsp_spec = Some(spec);
-            state.rtsp_health = Some(health);
-            state.rtsp_intent_epoch = Some(0);
-            state.rtsp_start_time = Some(std::time::Instant::now());
+            state.restream_desired = true;
+            state.restream_spec = Some(spec);
+            state.restream_health = Some(health);
+            state.restream_intent_epoch = Some(0);
+            state.restream_start_time = Some(std::time::Instant::now());
         }
 
         let status = compute_status(&manager.state).await;
-        assert!(status.rtsp_desired);
-        assert!(!status.rtsp_server_running);
-        assert_eq!(status.rtsp_relay_state, RelayState::Recovering);
+        assert!(status.desired);
+        assert_eq!(status.active_protocol, Some(RestreamProtocol::Rtsp));
+        assert!(!status.server_running);
+        assert_eq!(status.relay_state, RelayState::Recovering);
         assert_eq!(
-            status.rtsp_url.as_deref(),
+            status.server_url.as_deref(),
             Some(expected_client_url.as_str())
         );
         assert_eq!(
@@ -1973,12 +2648,12 @@ mod tests {
 
     async fn seed_desired_relay(manager: &StreamManager, generation: u64, epoch: u64) {
         let mut state = manager.state.lock().await;
-        state.rtsp_desired = true;
-        state.rtsp_health = Some(Arc::new(RelayRuntimeHealth::new(
+        state.restream_desired = true;
+        state.restream_health = Some(Arc::new(RelayRuntimeHealth::new(
             generation,
             relay::RelayIngestKind::Rtsp,
         )));
-        state.rtsp_intent_epoch = Some(epoch);
+        state.restream_intent_epoch = Some(epoch);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1990,7 +2665,7 @@ mod tests {
             let manager = StreamManager::new();
             seed_desired_relay(&manager, 1, 0).await;
             let state = manager.state.clone();
-            let epoch = manager.rtsp_epoch.clone();
+            let epoch = manager.restream_epoch.clone();
             let wake = manager.relay_wake.clone();
             let started_at = tokio::time::Instant::now();
             let waiter = tokio::spawn(async move {
@@ -1999,7 +2674,7 @@ mod tests {
             tokio::task::yield_now().await;
 
             manager
-                .rtsp_epoch
+                .restream_epoch
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             manager.relay_wake.notify_waiters();
             assert!(!waiter.await.unwrap());
@@ -2012,7 +2687,7 @@ mod tests {
         let manager = StreamManager::new();
         seed_desired_relay(&manager, 1, 0).await;
         let state = manager.state.clone();
-        let epoch = manager.rtsp_epoch.clone();
+        let epoch = manager.restream_epoch.clone();
         let wake = manager.relay_wake.clone();
         let waiter = tokio::spawn(async move {
             wait_relay_backoff(
@@ -2029,7 +2704,7 @@ mod tests {
 
         {
             let mut state = manager.state.lock().await;
-            state.rtsp_health = Some(Arc::new(RelayRuntimeHealth::new(
+            state.restream_health = Some(Arc::new(RelayRuntimeHealth::new(
                 2,
                 relay::RelayIngestKind::Rtsp,
             )));
@@ -2067,16 +2742,16 @@ mod tests {
 
     #[test]
     fn status_publisher_emits_when_only_client_count_changes() {
-        let initial = StreamStatus::idle();
+        let initial = StreamStatus::idle(RestreamProtocol::Rtsp);
         let (tx, mut rx) = watch::channel(initial.clone());
         rx.borrow_and_update();
 
         let mut updated = initial;
-        updated.rtsp_connected_clients = 1;
+        updated.connected_clients = 1;
         publish_status_if_changed(&tx, updated.clone());
 
         assert!(rx.has_changed().unwrap());
-        assert_eq!(rx.borrow_and_update().rtsp_connected_clients, 1);
+        assert_eq!(rx.borrow_and_update().connected_clients, 1);
 
         publish_status_if_changed(&tx, updated);
         assert!(!rx.has_changed().unwrap());

@@ -86,6 +86,10 @@ export interface ScanResult {
  *  rejects any other value at the IPC boundary. */
 export type StreamProtocol = "rtsp" | "udp";
 
+/** Re-stream output selector. SRT is intentionally not part of the wire union
+ * until its runtime milestone is implemented. */
+export type RestreamProtocol = "rtsp";
+
 export interface StreamConfig {
   protocol: StreamProtocol;
   rtsp_port: number;
@@ -107,6 +111,17 @@ export interface RtspServerConfig {
   bind_interface: string;
 }
 
+export interface RtspServerUpdate {
+  port: number;
+  token: string;
+  bind_interface: string;
+}
+
+export interface RestreamSettingsUpdate {
+  enabled: boolean;
+  rtsp_server: RtspServerUpdate;
+}
+
 export interface Credentials {
   username: string;
   password: string;
@@ -125,6 +140,7 @@ export interface AdoptedMeta {
 
 export interface AppSettings {
   stream: StreamConfig;
+  restream_protocol: RestreamProtocol;
   rtsp_server: RtspServerConfig;
   credentials: Credentials;
   /** subnet (e.g. "192.168.1.0/24") -> adopted secondary IP */
@@ -152,21 +168,25 @@ export type RelayState =
 
 export interface StreamStatus {
   playing: boolean;
-  /** True only while the listener loop is alive and bound. */
-  rtsp_server_running: boolean;
+  /** Persisted output selector, including while stopped. */
+  selected_protocol: RestreamProtocol;
+  /** Stored or starting runtime; null once teardown completes. */
+  active_protocol: RestreamProtocol | null;
+  /** True only while the selected listener loop is alive and bound. */
+  server_running: boolean;
   /** User intent; remains true while backend recovery replaces a listener. */
-  rtsp_desired: boolean;
-  rtsp_relay_state: RelayState;
+  desired: boolean;
+  relay_state: RelayState;
   /** Redacted relay-specific error. Local preview errors remain in `error`. */
-  rtsp_error: string | null;
-  rtsp_recovery_attempt: number;
-  rtsp_url: string | null;
+  relay_error: string | null;
+  recovery_attempt: number;
+  server_url: string | null;
   display_url: string | null;
   recording: boolean;
   uptime_secs: number;
   bandwidth_kbps: number;
-  rtsp_connected_clients: number;
-  rtsp_client_limit: number;
+  connected_clients: number;
+  client_limit: number;
   /** Friendly error string if the pipeline reported a problem */
   error: string | null;
   /** True while the playback pipeline has a linked audio branch */
@@ -176,9 +196,16 @@ export interface StreamStatus {
   audio_codec: string | null;
 }
 
-export interface RtspServerInfo {
-  rtsp_url: string;
+export interface RestreamServerInfo {
+  protocol: RestreamProtocol;
+  server_url: string;
   display_url: string;
+}
+
+export interface RestreamOperationResult {
+  selected_protocol: RestreamProtocol;
+  desired: boolean;
+  server_info: RestreamServerInfo | null;
 }
 
 // ── Errors (error.rs) ────────────────────────────────────────────────
@@ -193,6 +220,7 @@ export interface TypedAppError {
     | "DiscoveryUnavailable"
     | "Stream"
     | "Config"
+    | "Validation"
     | "Camera"
     | "Io"
     | "Serde";

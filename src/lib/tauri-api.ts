@@ -21,8 +21,10 @@ import type {
   InterfaceInfo,
   LicenseDocumentId,
   NetworkMode,
-  RtspServerConfig,
-  RtspServerInfo,
+  RestreamOperationResult,
+  RestreamProtocol,
+  RestreamServerInfo,
+  RestreamSettingsUpdate,
   ScanResult,
   StreamConfig,
 } from "./types.ts";
@@ -73,8 +75,10 @@ export async function updateStreamSettings(stream: StreamConfig): Promise<void> 
   return await invoke("update_stream_settings", { stream });
 }
 
-export async function updateRtspSettings(rtspServer: RtspServerConfig): Promise<void> {
-  return await invoke("update_rtsp_settings", { rtspServer });
+export async function applyRestreamSettings(
+  update: RestreamSettingsUpdate
+): Promise<RestreamOperationResult> {
+  return await invoke<RestreamOperationResult>("apply_restream_settings", { update });
 }
 
 export async function updateCredentials(credentials: Credentials): Promise<void> {
@@ -254,12 +258,18 @@ export async function stopStream(): Promise<void> {
   return await invoke("stop_stream");
 }
 
-export async function startRtspServer(): Promise<RtspServerInfo> {
-  return await invoke<RtspServerInfo>("start_rtsp_server");
+export async function startRestreamServer(): Promise<RestreamServerInfo> {
+  return await invoke<RestreamServerInfo>("start_restream_server");
 }
 
-export async function stopRtspServer(): Promise<void> {
-  return await invoke("stop_rtsp_server");
+export async function stopRestreamServer(): Promise<void> {
+  return await invoke("stop_restream_server");
+}
+
+export async function switchRestreamProtocol(
+  protocol: RestreamProtocol
+): Promise<RestreamOperationResult> {
+  return await invoke<RestreamOperationResult>("switch_restream_protocol", { protocol });
 }
 
 export async function takeScreenshot(): Promise<string> {

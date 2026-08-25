@@ -15,7 +15,7 @@ use gstreamer_rtsp_server as gst_rtsp_server;
 use gstreamer_rtsp_server::prelude::*;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::audio;
 use super::relay::{RelayEventSender, RelayFaultKind, RelayRuntimeHealth, RelaySupervisorEvent};
@@ -24,13 +24,13 @@ use crate::error::AppError;
 pub const MAX_RTSP_CLIENTS: u32 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RtspBuildFailureKind {
+pub enum RestreamBuildFailureKind {
     Bind,
     Configuration,
 }
 
-pub struct RtspBuildFailure {
-    pub kind: RtspBuildFailureKind,
+pub struct RestreamBuildFailure {
+    pub kind: RestreamBuildFailureKind,
     pub error: AppError,
 }
 
@@ -40,19 +40,199 @@ pub struct RtspRuntimeContext {
     pub server_instance: u64,
 }
 
-impl RtspBuildFailure {
+impl RestreamBuildFailure {
     fn bind(error: AppError) -> Self {
         Self {
-            kind: RtspBuildFailureKind::Bind,
+            kind: RestreamBuildFailureKind::Bind,
             error,
         }
     }
 
     fn configuration(error: AppError) -> Self {
         Self {
-            kind: RtspBuildFailureKind::Configuration,
+            kind: RestreamBuildFailureKind::Configuration,
             error,
         }
+    }
+}
+
+struct ActiveRtspMedia {
+    server_instance: u64,
+    data_generation: u64,
+    media: glib::WeakRef<gst_rtsp_server::RTSPMedia>,
+    target_playing: bool,
+}
+
+/// Cheap cloneable RTSP fault/health adapter. This is the only owner of the
+/// `RTSPMedia` weak reference and the only polling path that inspects
+/// `RTSPMediaStatus`; the shared supervisor sees only `poll_fault`.
+#[derive(Clone)]
+pub struct RtspRuntimeProbe {
+    health: Arc<RelayRuntimeHealth>,
+    active: Arc<Mutex<Option<ActiveRtspMedia>>>,
+}
+
+impl RtspRuntimeProbe {
+    fn new(health: Arc<RelayRuntimeHealth>) -> Self {
+        Self {
+            health,
+            active: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn lock_active(&self) -> std::sync::MutexGuard<'_, Option<ActiveRtspMedia>> {
+        self.active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn media_constructed(
+        &self,
+        server_instance: u64,
+        media: glib::WeakRef<gst_rtsp_server::RTSPMedia>,
+    ) -> Option<u64> {
+        let data_generation = self.health.begin_data_generation(server_instance)?;
+        *self.lock_active() = Some(ActiveRtspMedia {
+            server_instance,
+            data_generation,
+            media,
+            target_playing: false,
+        });
+        Some(data_generation)
+    }
+
+    fn with_current(
+        &self,
+        server_instance: u64,
+        data_generation: u64,
+        update: impl FnOnce(&mut ActiveRtspMedia),
+    ) -> bool {
+        let mut active = self.lock_active();
+        let Some(current) = active.as_mut() else {
+            return false;
+        };
+        if current.server_instance != server_instance || current.data_generation != data_generation
+        {
+            return false;
+        }
+        update(current);
+        true
+    }
+
+    fn target_state(
+        &self,
+        server_instance: u64,
+        data_generation: u64,
+        playing: bool,
+        now: tokio::time::Instant,
+    ) {
+        if !self.with_current(server_instance, data_generation, |current| {
+            current.target_playing = playing;
+        }) {
+            return;
+        }
+        if playing {
+            self.health
+                .arm_first_buffer(server_instance, data_generation, now);
+        } else {
+            self.health
+                .disarm_first_buffer(server_instance, data_generation);
+        }
+    }
+
+    fn prepared(&self, server_instance: u64, data_generation: u64, now: tokio::time::Instant) {
+        let target_playing = {
+            let active = self.lock_active();
+            active.as_ref().is_some_and(|current| {
+                current.server_instance == server_instance
+                    && current.data_generation == data_generation
+                    && current.target_playing
+            })
+        };
+        if target_playing {
+            self.health
+                .arm_first_buffer(server_instance, data_generation, now);
+        }
+    }
+
+    fn unprepared(&self, server_instance: u64, data_generation: u64) {
+        let removed = {
+            let mut active = self.lock_active();
+            let current = active.as_ref().is_some_and(|current| {
+                current.server_instance == server_instance
+                    && current.data_generation == data_generation
+            });
+            if current {
+                active.take();
+            }
+            current
+        };
+        if !removed {
+            return;
+        }
+        self.health
+            .end_data_generation(server_instance, data_generation);
+    }
+
+    fn report_fault(
+        &self,
+        server_instance: u64,
+        data_generation: u64,
+        kind: RelayFaultKind,
+        reason: String,
+    ) -> Option<super::relay::RelayFaultEvent> {
+        let active = self.lock_active();
+        let current = active.as_ref()?;
+        if current.server_instance != server_instance
+            || current.data_generation != data_generation
+            || kind == RelayFaultKind::Eos && !current.target_playing
+        {
+            return None;
+        }
+        drop(active);
+        self.health
+            .report_fault(server_instance, data_generation, kind, reason)
+    }
+
+    fn observe_buffer(
+        &self,
+        server_instance: u64,
+        data_generation: u64,
+        now: tokio::time::Instant,
+    ) -> bool {
+        self.health
+            .observe_buffer(server_instance, data_generation, now)
+    }
+
+    fn report_media_status(
+        &self,
+        server_instance: u64,
+        data_generation: u64,
+        status: gst_rtsp_server::RTSPMediaStatus,
+    ) -> Option<super::relay::RelayFaultEvent> {
+        if status != gst_rtsp_server::RTSPMediaStatus::Error {
+            return None;
+        }
+        self.report_fault(
+            server_instance,
+            data_generation,
+            RelayFaultKind::MediaStatusError,
+            "RTSP relay media entered error status".into(),
+        )
+    }
+
+    pub fn poll_fault(&self) -> Option<super::relay::RelayFaultEvent> {
+        let (server_instance, data_generation, media) = {
+            let active = self.lock_active();
+            let current = active.as_ref()?;
+            (
+                current.server_instance,
+                current.data_generation,
+                current.media.clone(),
+            )
+        };
+        let media = media.upgrade()?;
+        self.report_media_status(server_instance, data_generation, media.status())
     }
 }
 
@@ -110,15 +290,15 @@ fn release_client_sessions(
 }
 
 fn emit_media_fault(
-    health: &Arc<RelayRuntimeHealth>,
+    probe: &RtspRuntimeProbe,
     event_tx: &RelayEventSender,
     server_instance: u64,
-    media_generation: u64,
+    data_generation: u64,
     reason: String,
 ) {
-    if let Some(event) = health.record_media_fault(
+    if let Some(event) = probe.report_fault(
         server_instance,
-        media_generation,
+        data_generation,
         RelayFaultKind::GstError,
         reason,
     ) {
@@ -150,6 +330,7 @@ pub struct RtspRestreamer {
     server_generation: u64,
     server_instance: u64,
     health: Arc<RelayRuntimeHealth>,
+    fault_probe: RtspRuntimeProbe,
     shutdown_requested: Arc<AtomicBool>,
     port: u16,
     mount_path: String,
@@ -242,21 +423,18 @@ impl RtspRestreamer {
     fn attach_media_observers(
         factory: &gst_rtsp_server::RTSPMediaFactory,
         bytes_sent: Arc<AtomicU64>,
-        health: Arc<RelayRuntimeHealth>,
+        probe: RtspRuntimeProbe,
         event_tx: RelayEventSender,
         server_instance: u64,
         mount_path: String,
     ) {
         factory.connect_media_constructed(move |_factory, media| {
-            let Some(media_generation) = health.media_constructed(
-                server_instance,
-                media.downgrade(),
-                tokio::time::Instant::now(),
-            ) else {
+            let Some(data_generation) = probe.media_constructed(server_instance, media.downgrade())
+            else {
                 return;
             };
 
-            let health_for_messages = health.clone();
+            let probe_for_messages = probe.clone();
             let tx_for_messages = event_tx.clone();
             let mount_for_messages = mount_path.clone();
             media.connect_handle_message(None, move |_media, message| {
@@ -273,16 +451,16 @@ impl RtspRestreamer {
                         let friendly = super::rtsp_client::friendly_rtsp_error(&raw, &debug);
                         let reason = super::redact_relay_text(&friendly, &mount_for_messages);
                         log::warn!("RTSP relay media error: {} | debug: {}", raw, debug);
-                        health_for_messages.record_media_fault(
+                        probe_for_messages.report_fault(
                             server_instance,
-                            media_generation,
+                            data_generation,
                             RelayFaultKind::GstError,
                             reason,
                         )
                     }
-                    gst::MessageView::Eos(..) => health_for_messages.record_media_fault(
+                    gst::MessageView::Eos(..) => probe_for_messages.report_fault(
                         server_instance,
-                        media_generation,
+                        data_generation,
                         RelayFaultKind::Eos,
                         "RTSP relay media reached end of stream".into(),
                     ),
@@ -296,40 +474,40 @@ impl RtspRestreamer {
                 false
             });
 
-            let health_for_prepared = health.clone();
+            let probe_for_prepared = probe.clone();
             media.connect_prepared(move |_media| {
-                health_for_prepared.media_prepared(
+                probe_for_prepared.prepared(
                     server_instance,
-                    media_generation,
+                    data_generation,
                     tokio::time::Instant::now(),
                 );
             });
 
-            let health_for_target = health.clone();
+            let probe_for_target = probe.clone();
             media.connect_target_state(move |_media, state| {
                 use glib::translate::IntoGlib;
-                health_for_target.media_target_state(
+                probe_for_target.target_state(
                     server_instance,
-                    media_generation,
+                    data_generation,
                     state == gst::State::Playing.into_glib(),
                     tokio::time::Instant::now(),
                 );
             });
 
-            let health_for_state = health.clone();
+            let probe_for_state = probe.clone();
             media.connect_new_state(move |_media, state| {
                 use glib::translate::IntoGlib;
-                health_for_state.media_target_state(
+                probe_for_state.target_state(
                     server_instance,
-                    media_generation,
+                    data_generation,
                     state == gst::State::Playing.into_glib(),
                     tokio::time::Instant::now(),
                 );
             });
 
-            let health_for_unprepared = health.clone();
+            let probe_for_unprepared = probe.clone();
             media.connect_unprepared(move |_media| {
-                health_for_unprepared.media_unprepared(server_instance, media_generation);
+                probe_for_unprepared.unprepared(server_instance, data_generation);
             });
 
             let element: gst::Element = media.element();
@@ -337,10 +515,10 @@ impl RtspRestreamer {
                 Ok(b) => b,
                 Err(_) => {
                     emit_media_fault(
-                        &health,
+                        &probe,
                         &event_tx,
                         server_instance,
-                        media_generation,
+                        data_generation,
                         "RTSP relay media element is not a Bin".into(),
                     );
                     return;
@@ -350,10 +528,10 @@ impl RtspRestreamer {
                 Some(e) => e,
                 None => {
                     emit_media_fault(
-                        &health,
+                        &probe,
                         &event_tx,
                         server_instance,
-                        media_generation,
+                        data_generation,
                         "RTSP relay payloader was not constructed".into(),
                     );
                     return;
@@ -363,10 +541,10 @@ impl RtspRestreamer {
                 Some(p) => p,
                 None => {
                     emit_media_fault(
-                        &health,
+                        &probe,
                         &event_tx,
                         server_instance,
-                        media_generation,
+                        data_generation,
                         "RTSP relay payloader has no source pad".into(),
                     );
                     return;
@@ -374,7 +552,7 @@ impl RtspRestreamer {
             };
 
             let bytes = bytes_sent.clone();
-            let health_for_probe = health.clone();
+            let runtime_probe = probe.clone();
             pad.add_probe(
                 gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
                 move |_pad, info| {
@@ -383,9 +561,9 @@ impl RtspRestreamer {
                         bytes.fetch_add(observed_bytes, Ordering::Relaxed);
                     }
                     if observed_probe_arrival(info.data.as_ref()) {
-                        health_for_probe.observe_buffer(
+                        runtime_probe.observe_buffer(
                             server_instance,
-                            media_generation,
+                            data_generation,
                             tokio::time::Instant::now(),
                         );
                     }
@@ -394,7 +572,7 @@ impl RtspRestreamer {
             );
             log::info!(
                 "RTSP relay media={} byte/heartbeat probe attached",
-                media_generation
+                data_generation
             );
         });
     }
@@ -416,11 +594,11 @@ impl RtspRestreamer {
             std::thread::JoinHandle<()>,
             tokio::sync::oneshot::Receiver<()>,
         ),
-        RtspBuildFailure,
+        RestreamBuildFailure,
     > {
         // create_source gives us the real error (port in use, permission denied, etc.)
         let source = server.create_source(gio::Cancellable::NONE).map_err(|e| {
-            RtspBuildFailure::bind(AppError::Stream(format!(
+            RestreamBuildFailure::bind(AppError::Stream(format!(
                 "RTSP server socket failed: {}",
                 e
             )))
@@ -471,7 +649,7 @@ impl RtspRestreamer {
                 let _ = done_tx.send(());
             })
             .map_err(|e| {
-                RtspBuildFailure::configuration(AppError::Stream(format!(
+                RestreamBuildFailure::configuration(AppError::Stream(format!(
                     "Failed to spawn RTSP server thread: {}",
                     e
                 )))
@@ -484,7 +662,7 @@ impl RtspRestreamer {
             shutdown_requested.store(true, Ordering::Release);
             main_loop.quit();
             drop(handle);
-            return Err(RtspBuildFailure::configuration(AppError::Stream(
+            return Err(RestreamBuildFailure::configuration(AppError::Stream(
                 "RTSP server loop thread did not start within 1 second".into(),
             )));
         }
@@ -501,7 +679,7 @@ impl RtspRestreamer {
     /// 3. Quit the loop and join the thread, bounded by the completion
     ///    channel — if the loop never exits, leak the thread rather
     ///    than hang stop.
-    pub async fn shutdown(mut self) {
+    pub async fn shutdown(&mut self) {
         self.shutdown_requested.store(true, Ordering::Release);
         if let Some(mounts) = self.server.mount_points() {
             mounts.remove_factory(&self.mount_path);
@@ -548,7 +726,7 @@ impl RtspRestreamer {
         username: &str,
         password: &str,
         runtime: RtspRuntimeContext,
-    ) -> Result<Self, RtspBuildFailure> {
+    ) -> Result<Self, RestreamBuildFailure> {
         let RtspRuntimeContext {
             health,
             event_tx,
@@ -558,12 +736,12 @@ impl RtspRestreamer {
         // now.  Without this preflight, an old runtime would panic or fail only
         // after a downstream viewer connected.
         let policy_probe = gst::ElementFactory::make("rtspsrc").build().map_err(|e| {
-            RtspBuildFailure::configuration(AppError::Stream(format!(
+            RestreamBuildFailure::configuration(AppError::Stream(format!(
                 "Failed to create rtspsrc for TCP policy validation: {}",
                 e
             )))
         })?;
-        super::configure_tcp_rtspsrc(&policy_probe).map_err(RtspBuildFailure::configuration)?;
+        super::configure_tcp_rtspsrc(&policy_probe).map_err(RestreamBuildFailure::configuration)?;
 
         let server = gst_rtsp_server::RTSPServer::new();
         server.set_service(&port.to_string());
@@ -571,7 +749,7 @@ impl RtspRestreamer {
             server.set_address(addr);
         }
         let session_pool =
-            Self::configure_session_pool(&server).map_err(RtspBuildFailure::configuration)?;
+            Self::configure_session_pool(&server).map_err(RestreamBuildFailure::configuration)?;
         Self::attach_session_logging(&server, &session_pool);
 
         let factory = gst_rtsp_server::RTSPMediaFactory::new();
@@ -644,17 +822,20 @@ impl RtspRestreamer {
         factory.set_protocols(gst_rtsp::RTSPLowerTrans::TCP);
 
         let bytes_sent = Arc::new(AtomicU64::new(0));
+        let fault_probe = RtspRuntimeProbe::new(health.clone());
         Self::attach_media_observers(
             &factory,
             bytes_sent.clone(),
-            health.clone(),
+            fault_probe.clone(),
             event_tx.clone(),
             server_instance,
             mount_path.to_string(),
         );
 
         let mounts = server.mount_points().ok_or_else(|| {
-            RtspBuildFailure::configuration(AppError::Stream("Failed to get mount points".into()))
+            RestreamBuildFailure::configuration(AppError::Stream(
+                "Failed to get mount points".into(),
+            ))
         })?;
         mounts.add_factory(mount_path, factory);
 
@@ -683,6 +864,7 @@ impl RtspRestreamer {
             server_generation: health.server_generation(),
             server_instance,
             health,
+            fault_probe,
             shutdown_requested,
             port,
             mount_path: mount_path.into(),
@@ -699,7 +881,7 @@ impl RtspRestreamer {
         mount_path: &str,
         bind_address: Option<&str>,
         runtime: RtspRuntimeContext,
-    ) -> Result<Self, RtspBuildFailure> {
+    ) -> Result<Self, RestreamBuildFailure> {
         let RtspRuntimeContext {
             health,
             event_tx,
@@ -711,7 +893,7 @@ impl RtspRestreamer {
             server.set_address(addr);
         }
         let session_pool =
-            Self::configure_session_pool(&server).map_err(RtspBuildFailure::configuration)?;
+            Self::configure_session_pool(&server).map_err(RestreamBuildFailure::configuration)?;
         Self::attach_session_logging(&server, &session_pool);
 
         let factory = gst_rtsp_server::RTSPMediaFactory::new();
@@ -728,17 +910,20 @@ impl RtspRestreamer {
         factory.set_protocols(gst_rtsp::RTSPLowerTrans::TCP);
 
         let bytes_sent = Arc::new(AtomicU64::new(0));
+        let fault_probe = RtspRuntimeProbe::new(health.clone());
         Self::attach_media_observers(
             &factory,
             bytes_sent.clone(),
-            health.clone(),
+            fault_probe.clone(),
             event_tx.clone(),
             server_instance,
             mount_path.to_string(),
         );
 
         let mounts = server.mount_points().ok_or_else(|| {
-            RtspBuildFailure::configuration(AppError::Stream("Failed to get mount points".into()))
+            RestreamBuildFailure::configuration(AppError::Stream(
+                "Failed to get mount points".into(),
+            ))
         })?;
         mounts.add_factory(mount_path, factory);
 
@@ -767,6 +952,7 @@ impl RtspRestreamer {
             server_generation: health.server_generation(),
             server_instance,
             health,
+            fault_probe,
             shutdown_requested,
             port: server_port,
             mount_path: mount_path.into(),
@@ -805,6 +991,10 @@ impl RtspRestreamer {
         self.server_generation
     }
 
+    pub fn fault_probe(&self) -> RtspRuntimeProbe {
+        self.fault_probe.clone()
+    }
+
     pub fn loop_alive(&self) -> bool {
         self.health.loop_alive_for(self.server_instance)
     }
@@ -831,6 +1021,108 @@ mod tests {
         INIT.call_once(|| gst::init().expect("GStreamer test initialization failed"));
     }
 
+    fn probe_fixture() -> (Arc<RelayRuntimeHealth>, RtspRuntimeProbe, u64) {
+        init_gstreamer();
+        let health = Arc::new(RelayRuntimeHealth::new(
+            7,
+            super::super::relay::RelayIngestKind::Rtsp,
+        ));
+        let server_instance = health.begin_server_instance(false);
+        health.loop_started(server_instance);
+        health.mark_listener_bound(server_instance);
+        let probe = RtspRuntimeProbe::new(health.clone());
+        (health, probe, server_instance)
+    }
+
+    #[test]
+    fn media_error_status_is_generation_checked_and_first_fault_wins() {
+        let (_health, probe, server_instance) = probe_fixture();
+        let old_media = gst_rtsp_server::RTSPMedia::new(gst::Pipeline::new());
+        let old_generation = probe
+            .media_constructed(server_instance, old_media.downgrade())
+            .unwrap();
+        let current_media = gst_rtsp_server::RTSPMedia::new(gst::Pipeline::new());
+        let current_generation = probe
+            .media_constructed(server_instance, current_media.downgrade())
+            .unwrap();
+
+        assert!(probe
+            .report_media_status(
+                server_instance,
+                old_generation,
+                gst_rtsp_server::RTSPMediaStatus::Error,
+            )
+            .is_none());
+        let callback_fault = probe
+            .report_fault(
+                server_instance,
+                current_generation,
+                RelayFaultKind::GstError,
+                "redacted callback fault".into(),
+            )
+            .expect("callback fault should win");
+        assert_eq!(callback_fault.fault.kind, RelayFaultKind::GstError);
+        assert!(probe
+            .report_media_status(
+                server_instance,
+                current_generation,
+                gst_rtsp_server::RTSPMediaStatus::Error,
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn media_error_status_maps_to_fallback_fault_and_weak_expiry_is_benign() {
+        let (_health, probe, server_instance) = probe_fixture();
+        let media = gst_rtsp_server::RTSPMedia::new(gst::Pipeline::new());
+        let generation = probe
+            .media_constructed(server_instance, media.downgrade())
+            .unwrap();
+        let event = probe
+            .report_media_status(
+                server_instance,
+                generation,
+                gst_rtsp_server::RTSPMediaStatus::Error,
+            )
+            .expect("Error status should produce the fallback fault");
+        assert_eq!(event.fault.kind, RelayFaultKind::MediaStatusError);
+
+        let (_health, expired_probe, expired_instance) = probe_fixture();
+        let expired_media = gst_rtsp_server::RTSPMedia::new(gst::Pipeline::new());
+        expired_probe
+            .media_constructed(expired_instance, expired_media.downgrade())
+            .unwrap();
+        drop(expired_media);
+        assert!(expired_probe.poll_fault().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn constructed_media_remains_unarmed_until_playing_and_prepared() {
+        let (health, probe, server_instance) = probe_fixture();
+        let media = gst_rtsp_server::RTSPMedia::new(gst::Pipeline::new());
+        let generation = probe
+            .media_constructed(server_instance, media.downgrade())
+            .unwrap();
+
+        tokio::time::advance(super::super::relay::FIRST_BUFFER_TIMEOUT).await;
+        assert!(health
+            .evaluate_watchdog(tokio::time::Instant::now())
+            .is_none());
+
+        probe.target_state(
+            server_instance,
+            generation,
+            true,
+            tokio::time::Instant::now(),
+        );
+        probe.prepared(server_instance, generation, tokio::time::Instant::now());
+        tokio::time::advance(super::super::relay::FIRST_BUFFER_TIMEOUT).await;
+        let event = health
+            .evaluate_watchdog(tokio::time::Instant::now())
+            .expect("the existing 15-second RTSP deadline must remain armed");
+        assert_eq!(event.fault.kind, RelayFaultKind::FirstBufferTimeout);
+    }
+
     fn restreamer_fixture(server: gst_rtsp_server::RTSPServer) -> RtspRestreamer {
         let context = glib::MainContext::new();
         let health = Arc::new(RelayRuntimeHealth::new(
@@ -840,6 +1132,7 @@ mod tests {
         let server_instance = health.begin_server_instance(false);
         health.loop_started(server_instance);
         health.mark_listener_bound(server_instance);
+        let fault_probe = RtspRuntimeProbe::new(health.clone());
         RtspRestreamer {
             server,
             main_loop: glib::MainLoop::new(Some(&context), false),
@@ -848,6 +1141,7 @@ mod tests {
             server_generation: 1,
             server_instance,
             health,
+            fault_probe,
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             port: 8554,
             mount_path: "/test".into(),
@@ -957,27 +1251,29 @@ mod tests {
         let manager = super::super::StreamManager::new();
         {
             let mut state = manager.state.lock().await;
-            state.rtsp_server = Some(restreamer);
-            state.rtsp_desired = true;
-            state.rtsp_spec = Some(super::super::ResolvedRtspStartSpec {
+            state.restream_server = Some(super::super::RestreamServer::Rtsp(restreamer));
+            state.restream_desired = true;
+            state.restream_spec = Some(super::super::ResolvedStartSpec {
                 source: super::super::ResolvedSource::Rtsp {
                     url: "rtsp://192.0.2.1/live".into(),
                 },
-                server_port: 8554,
-                mount_path: "/test".into(),
+                output: super::super::ResolvedOutput::Rtsp {
+                    server_port: 8554,
+                    mount_path: "/test".into(),
+                },
                 bind_interface: None,
                 bind_address: None,
                 advertised_ip: "127.0.0.1".into(),
                 username: String::new(),
                 password: String::new(),
             });
-            state.rtsp_health = Some(health);
-            state.rtsp_intent_epoch = Some(0);
-            state.rtsp_start_time = Some(std::time::Instant::now());
+            state.restream_health = Some(health);
+            state.restream_intent_epoch = Some(0);
+            state.restream_start_time = Some(std::time::Instant::now());
         }
         let status = super::super::compute_status(&manager.state).await;
-        assert!(status.rtsp_server_running);
-        assert_eq!(status.rtsp_connected_clients, MAX_RTSP_CLIENTS);
-        assert_eq!(status.rtsp_client_limit, MAX_RTSP_CLIENTS);
+        assert!(status.server_running);
+        assert_eq!(status.connected_clients, MAX_RTSP_CLIENTS);
+        assert_eq!(status.client_limit, MAX_RTSP_CLIENTS);
     }
 }

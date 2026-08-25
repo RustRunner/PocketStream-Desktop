@@ -17,7 +17,7 @@ export interface AppState {
   activeInterface: InterfaceInfo | null;
   isStreaming: boolean;
   /** Desired relay state, independent of temporary listener liveness. */
-  isRtspDesired: boolean;
+  isRestreamDesired: boolean;
   isRecording: boolean;
   /** Set by streaming.js when the connection drops mid-session. The
    *  video child window is hidden and the "Stream Lost..." overlay is
@@ -40,7 +40,7 @@ export const state: AppState = {
   config: null,
   activeInterface: null,
   isStreaming: false,
-  isRtspDesired: false,
+  isRestreamDesired: false,
   isRecording: false,
   activeAdoptionId: null,
   suppressedReconnect: false,

@@ -4,6 +4,7 @@ mod config;
 mod error;
 mod logging;
 mod network;
+mod settings_validation;
 mod streaming;
 mod validation;
 
@@ -396,12 +397,16 @@ pub fn run() {
         }
     });
 
+    let app_config = config::AppConfig::load_or_default();
+    let stream_manager =
+        streaming::StreamManager::with_selected_protocol(app_config.get().restream_protocol);
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .manage(config::AppConfig::load_or_default())
-        .manage(streaming::StreamManager::new())
+        .manage(app_config)
+        .manage(stream_manager)
         .manage(network::NetworkManager::new())
         .manage(camera::flir_ptu::PtuController::new())
         .invoke_handler(tauri::generate_handler![
@@ -412,10 +417,9 @@ pub fn run() {
             commands::get_license_document,
             // Config
             commands::get_config,
-            commands::save_config,
             commands::get_startup_notices,
             commands::update_stream_settings,
-            commands::update_rtsp_settings,
+            commands::apply_restream_settings,
             commands::update_credentials,
             // Network
             commands::scan_network,
@@ -451,8 +455,9 @@ pub fn run() {
             commands::start_stream,
             commands::stop_stream,
             commands::set_audio_muted,
-            commands::start_rtsp_server,
-            commands::stop_rtsp_server,
+            commands::start_restream_server,
+            commands::stop_restream_server,
+            commands::switch_restream_protocol,
             commands::take_screenshot,
             commands::start_recording,
             commands::stop_recording,

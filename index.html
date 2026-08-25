@@ -98,13 +98,13 @@
               </div>
             </section>
 
-            <!-- RTSP Server Settings -->
+            <!-- Re-stream Server Settings -->
             <section class="setting-group">
-              <h3 class="setting-label">RTSP Server</h3>
+              <h3 class="setting-label">Re-stream Server</h3>
               <div class="switch-row">
-                <span>Enable RTSP Server</span>
+                <span>Enable Re-stream Server</span>
                 <label class="switch">
-                  <input type="checkbox" id="rtsp-server-enable" />
+                  <input type="checkbox" id="restream-server-enable" />
                   <span class="slider"></span>
                 </label>
               </div>
@@ -215,41 +215,41 @@
               </div>
             </div>
 
-            <!-- RTSP Server Card -->
-            <div class="card" id="card-rtsp">
+            <!-- Re-stream Server Card -->
+            <div class="card" id="card-restream">
               <div class="card-header">
                 <svg class="card-icon" width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
                   <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/>
                 </svg>
-                <h2>RTSP Server</h2>
+                <h2>Re-stream Server</h2>
                 <div class="header-actions">
-                  <div id="rtsp-spinner" class="spinner" style="display:none"></div>
+                  <div id="restream-spinner" class="spinner" style="display:none"></div>
                 </div>
               </div>
               <div class="card-body">
                 <div class="status-row">
                   <span class="status-label">Status:</span>
-                  <span id="rtsp-status" class="status-value status-offline">Offline</span>
+                  <span id="restream-status" class="status-value status-offline">Offline</span>
                 </div>
-                <div id="rtsp-error-row" class="status-row" style="display:none">
+                <div id="restream-error-row" class="status-row" style="display:none">
                   <span class="status-label">Reason:</span>
-                  <span id="rtsp-error" class="status-value rtsp-error"></span>
+                  <span id="restream-error" class="status-value restream-error"></span>
                 </div>
                 <div class="status-row">
                   <span class="status-label">URL:</span>
-                  <span id="rtsp-url" class="status-value monospace">--</span>
+                  <span id="restream-url" class="status-value monospace">--</span>
                 </div>
                 <div class="status-row">
                   <span class="status-label">Uptime:</span>
-                  <span id="rtsp-uptime" class="status-value">--</span>
+                  <span id="restream-uptime" class="status-value">--</span>
                 </div>
                 <div class="status-row">
                   <span class="status-label">Clients:</span>
-                  <span id="rtsp-clients" class="status-value">--</span>
+                  <span id="restream-clients" class="status-value">--</span>
                 </div>
                 <div class="status-row">
                   <span class="status-label">Stream bitrate:</span>
-                  <span id="rtsp-bandwidth" class="status-value">--</span>
+                  <span id="restream-bandwidth" class="status-value" title="Stream payload / estimated aggregate to active clients">--</span>
                 </div>
                 <div class="status-row">
                   <span class="status-label"></span>
@@ -262,11 +262,11 @@
               </div>
               <div class="card-footer">
                 <span class="status-label">VPN:</span>
-                <select id="rtsp-bind-interface" class="status-select" title="Bind RTSP server to a VPN interface">
+                <select id="restream-bind-interface" class="status-select" title="Bind the re-stream server to a VPN interface" disabled>
                   <option value="">None</option>
                 </select>
                 <div class="card-footer-spacer"></div>
-                <button id="btn-toggle-rtsp" class="text-btn">Start Server</button>
+                <button id="btn-toggle-restream" class="text-btn">Start Server</button>
               </div>
             </div>
 

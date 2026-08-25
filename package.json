@@ -6,10 +6,13 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "build": "npm run check:contracts && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "check:dom": "node scripts/check-dom-selectors.mjs",
+    "check:restream": "node scripts/check-restream-card.mjs && node scripts/check-restream-ui.mjs",
+    "check:contracts": "npm run check:dom && npm run check:restream"
   },
   "dependencies": {
     "qrcode": "^1.5.4"

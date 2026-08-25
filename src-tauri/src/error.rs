@@ -21,6 +21,9 @@ pub enum AppError {
     #[error("Config error: {0}")]
     Config(String),
 
+    #[error("Validation error: {0}")]
+    Validation(String),
+
     #[error("Camera error: {0}")]
     Camera(String),
 
@@ -40,6 +43,7 @@ impl AppError {
             AppError::DiscoveryUnavailable(_) => "DiscoveryUnavailable",
             AppError::Stream(_) => "Stream",
             AppError::Config(_) => "Config",
+            AppError::Validation(_) => "Validation",
             AppError::Camera(_) => "Camera",
             AppError::Io(_) => "Io",
             AppError::Serde(_) => "Serde",
@@ -90,6 +94,12 @@ mod tests {
     }
 
     #[test]
+    fn display_validation_error() {
+        let err = AppError::Validation("bad port".into());
+        assert_eq!(err.to_string(), "Validation error: bad port");
+    }
+
+    #[test]
     fn display_camera_error() {
         let err = AppError::Camera("no device".into());
         assert_eq!(err.to_string(), "Camera error: no device");
@@ -120,6 +130,7 @@ mod tests {
         );
         assert_eq!(AppError::Stream("x".into()).kind(), "Stream");
         assert_eq!(AppError::Config("x".into()).kind(), "Config");
+        assert_eq!(AppError::Validation("x".into()).kind(), "Validation");
         assert_eq!(AppError::Camera("x".into()).kind(), "Camera");
     }
 

@@ -323,7 +323,7 @@ function applyUpEvent(iface: InterfaceInfo, wasDown: boolean): void {
     renderArpDeviceList();
     resetDiscoveryStatus();
     api.startArpDiscovery(iface.name).catch(() => {});
-    // Restart the stream (and RTSP server) if they were running
+    // Restart the stream (and re-stream server) if they were running
     // before the disconnect. Fires in the background; failures
     // surface as toasts inside handleReconnect.
     handleReconnect().catch((e: unknown) =>

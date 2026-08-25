@@ -1,11 +1,10 @@
-//! RTSP relay health and recovery state.
+//! Protocol-neutral re-stream health and recovery state.
 //!
 //! This module deliberately contains no `StreamManager` locking or slow
 //! GStreamer/network work.  GStreamer and GLib callbacks update the small
 //! in-memory health object and enqueue a fault; the async supervisor in
 //! `streaming::mod` owns teardown, backoff, and rebuilding.
 
-use gstreamer_rtsp_server as gst_rtsp_server;
 use serde::Serialize;
 use std::sync::{Mutex, MutexGuard};
 use tokio::sync::mpsc;
@@ -65,7 +64,7 @@ pub struct RelayFault {
     /// text must never be put in this field.
     pub reason: String,
     pub server_generation: u64,
-    pub media_generation: u64,
+    pub data_generation: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -100,10 +99,9 @@ pub enum RelayIngestKind {
 /// Do not derive `Debug`; this structure contains credentials and the
 /// token-bearing mount path.
 #[derive(Clone, PartialEq, Eq)]
-pub struct ResolvedRtspStartSpec {
+pub struct ResolvedStartSpec {
     pub source: ResolvedSource,
-    pub server_port: u16,
-    pub mount_path: String,
+    pub output: ResolvedOutput,
     pub bind_interface: Option<String>,
     pub bind_address: Option<String>,
     pub advertised_ip: String,
@@ -112,12 +110,38 @@ pub struct ResolvedRtspStartSpec {
 }
 
 #[derive(Clone, PartialEq, Eq)]
+pub enum ResolvedOutput {
+    Rtsp {
+        server_port: u16,
+        mount_path: String,
+    },
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub enum ResolvedSource {
     Rtsp { url: String },
     Udp { port: u16 },
 }
 
-impl ResolvedRtspStartSpec {
+impl ResolvedStartSpec {
+    pub fn protocol(&self) -> crate::config::RestreamProtocol {
+        match self.output {
+            ResolvedOutput::Rtsp { .. } => crate::config::RestreamProtocol::Rtsp,
+        }
+    }
+
+    pub fn server_port(&self) -> u16 {
+        match self.output {
+            ResolvedOutput::Rtsp { server_port, .. } => server_port,
+        }
+    }
+
+    pub fn mount_path(&self) -> &str {
+        match &self.output {
+            ResolvedOutput::Rtsp { mount_path, .. } => mount_path,
+        }
+    }
+
     pub fn ingest_kind(&self) -> RelayIngestKind {
         match &self.source {
             ResolvedSource::Rtsp { .. } => RelayIngestKind::Rtsp,
@@ -135,12 +159,14 @@ impl ResolvedRtspStartSpec {
     pub fn client_url(&self) -> String {
         format!(
             "rtsp://{}:{}{}",
-            self.advertised_ip, self.server_port, self.mount_path
+            self.advertised_ip,
+            self.server_port(),
+            self.mount_path()
         )
     }
 
     pub fn display_url(&self) -> String {
-        format!("rtsp://{}:{}", self.advertised_ip, self.server_port)
+        format!("rtsp://{}:{}", self.advertised_ip, self.server_port())
     }
 }
 
@@ -155,19 +181,17 @@ pub struct RelayHealthSnapshot {
 
 struct RelayRuntimeInner {
     server_generation: u64,
-    /// Monotonic across every lazy media pipeline and automatic listener
-    /// replacement in this explicit-start generation.
-    media_generation: u64,
-    active_media_generation: Option<u64>,
+    /// Monotonic across protocol data pipelines and automatic output
+    /// replacements in this explicit-start generation.
+    data_generation: u64,
+    active_data_generation: Option<u64>,
     /// Distinguishes automatic replacement listener instances while the
     /// explicit-start generation remains stable.  It prevents a late loop or
     /// media callback from an old listener from changing replacement health.
     server_instance: u64,
     state: RelayState,
     ingest_kind: RelayIngestKind,
-    target_playing: bool,
-    media_constructed_at: Option<Instant>,
-    playing_since: Option<Instant>,
+    first_buffer_armed_at: Option<Instant>,
     last_buffer_at: Option<Instant>,
     healthy_since: Option<Instant>,
     stall_warning_emitted: bool,
@@ -176,7 +200,6 @@ struct RelayRuntimeInner {
     recovery_attempt: u32,
     consecutive_bind_failures: u32,
     loop_alive: bool,
-    active_media: Option<glib::WeakRef<gst_rtsp_server::RTSPMedia>>,
 }
 
 /// Callback-safe relay health.  The mutex protects only a small in-memory
@@ -191,14 +214,12 @@ impl RelayRuntimeHealth {
         Self {
             inner: Mutex::new(RelayRuntimeInner {
                 server_generation,
-                media_generation: 0,
-                active_media_generation: None,
+                data_generation: 0,
+                active_data_generation: None,
                 server_instance: 0,
                 state: RelayState::Starting,
                 ingest_kind,
-                target_playing: false,
-                media_constructed_at: None,
-                playing_since: None,
+                first_buffer_armed_at: None,
                 last_buffer_at: None,
                 healthy_since: None,
                 stall_warning_emitted: false,
@@ -207,7 +228,6 @@ impl RelayRuntimeHealth {
                 recovery_attempt: 0,
                 consecutive_bind_failures: 0,
                 loop_alive: false,
-                active_media: None,
             }),
         }
     }
@@ -227,9 +247,9 @@ impl RelayRuntimeHealth {
             return;
         }
         log::info!(
-            "RTSP relay generation={} media={} state {:?} -> {:?} fault={} attempt={} loop_alive={}{}",
+            "Re-stream generation={} data={} state {:?} -> {:?} fault={} attempt={} loop_alive={}{}",
             inner.server_generation,
-            inner.media_generation,
+            inner.data_generation,
             prior,
             next,
             fault_kind.map(RelayFaultKind::as_str).unwrap_or("none"),
@@ -263,11 +283,8 @@ impl RelayRuntimeHealth {
     pub fn begin_server_instance(&self, recovering: bool) -> u64 {
         let mut inner = self.lock();
         inner.server_instance = inner.server_instance.wrapping_add(1).max(1);
-        inner.active_media_generation = None;
-        inner.active_media = None;
-        inner.target_playing = false;
-        inner.media_constructed_at = None;
-        inner.playing_since = None;
+        inner.active_data_generation = None;
+        inner.first_buffer_armed_at = None;
         inner.last_buffer_at = None;
         inner.healthy_since = None;
         inner.stall_warning_emitted = false;
@@ -308,14 +325,14 @@ impl RelayRuntimeHealth {
         if intentional {
             return None;
         }
-        let media_generation = inner
-            .active_media_generation
-            .unwrap_or(inner.media_generation);
+        let data_generation = inner
+            .active_data_generation
+            .unwrap_or(inner.data_generation);
         Self::record_fault_locked(
             &mut inner,
             RelayFaultKind::MainLoopExited,
             reason,
-            media_generation,
+            data_generation,
         )
     }
 
@@ -327,7 +344,7 @@ impl RelayRuntimeHealth {
         inner.error = None;
         inner.first_fault = None;
         inner.consecutive_bind_failures = 0;
-        if inner.active_media_generation.is_none() {
+        if inner.active_data_generation.is_none() {
             Self::transition(&mut inner, RelayState::Listening, None, None);
         }
     }
@@ -353,7 +370,7 @@ impl RelayRuntimeHealth {
         let attempt = inner.recovery_attempt;
         let delay = recovery_delay(attempt);
         log::info!(
-            "RTSP relay recovery attempt={} delay={}s generation={}",
+            "Re-stream recovery attempt={} delay={}s generation={}",
             attempt,
             delay.as_secs(),
             inner.server_generation
@@ -388,84 +405,70 @@ impl RelayRuntimeHealth {
         self.lock().consecutive_bind_failures >= 3
     }
 
-    pub fn media_constructed(
-        &self,
-        server_instance: u64,
-        media: glib::WeakRef<gst_rtsp_server::RTSPMedia>,
-        now: Instant,
-    ) -> Option<u64> {
+    /// Begin a protocol data generation. Callers choose when (or whether) to
+    /// arm its first-buffer deadline: a deferred adapter constructs here but
+    /// arms only when PLAYING is requested, while an eager adapter may arm
+    /// immediately.
+    pub fn begin_data_generation(&self, server_instance: u64) -> Option<u64> {
         let mut inner = self.lock();
         if inner.server_instance != server_instance {
             return None;
         }
-        inner.media_generation = inner.media_generation.wrapping_add(1).max(1);
-        let media_generation = inner.media_generation;
-        inner.active_media_generation = Some(media_generation);
-        inner.active_media = Some(media);
-        inner.target_playing = false;
-        inner.media_constructed_at = Some(now);
-        inner.playing_since = None;
+        inner.data_generation = inner.data_generation.wrapping_add(1).max(1);
+        let data_generation = inner.data_generation;
+        inner.active_data_generation = Some(data_generation);
+        inner.first_buffer_armed_at = None;
         inner.last_buffer_at = None;
         inner.healthy_since = None;
         inner.stall_warning_emitted = false;
         inner.first_fault = None;
         inner.error = None;
         Self::transition(&mut inner, RelayState::Starting, None, None);
-        Some(media_generation)
+        Some(data_generation)
     }
 
-    fn is_current_media(
+    fn is_current_data(
         inner: &RelayRuntimeInner,
         server_instance: u64,
-        media_generation: u64,
+        data_generation: u64,
     ) -> bool {
         inner.server_instance == server_instance
-            && inner.active_media_generation == Some(media_generation)
+            && inner.active_data_generation == Some(data_generation)
     }
 
-    pub fn media_prepared(&self, server_instance: u64, media_generation: u64, now: Instant) {
+    /// Arm (or reconcile) the first-buffer deadline for the current data
+    /// generation. Re-arming before the first buffer intentionally resets the
+    /// deadline; a deferred adapter uses that at `prepared` after an earlier
+    /// target-state notification.
+    pub fn arm_first_buffer(&self, server_instance: u64, data_generation: u64, now: Instant) {
         let mut inner = self.lock();
-        if !Self::is_current_media(&inner, server_instance, media_generation) {
+        if !Self::is_current_data(&inner, server_instance, data_generation)
+            || inner.last_buffer_at.is_some()
+        {
             return;
         }
-        inner.media_constructed_at = Some(now);
-        if inner.target_playing && inner.last_buffer_at.is_none() {
-            inner.playing_since = Some(now);
-        }
-    }
-
-    pub fn media_target_state(
-        &self,
-        server_instance: u64,
-        media_generation: u64,
-        playing: bool,
-        now: Instant,
-    ) {
-        let mut inner = self.lock();
-        if !Self::is_current_media(&inner, server_instance, media_generation) {
-            return;
-        }
-        inner.target_playing = playing;
-        if playing {
-            inner.playing_since.get_or_insert(now);
-            if inner.state == RelayState::Listening {
-                Self::transition(&mut inner, RelayState::Starting, None, None);
-            }
-        } else {
-            inner.playing_since = None;
+        inner.first_buffer_armed_at = Some(now);
+        if inner.state == RelayState::Listening {
+            Self::transition(&mut inner, RelayState::Starting, None, None);
         }
     }
 
-    pub fn media_unprepared(&self, server_instance: u64, media_generation: u64) {
+    pub fn disarm_first_buffer(&self, server_instance: u64, data_generation: u64) {
         let mut inner = self.lock();
-        if !Self::is_current_media(&inner, server_instance, media_generation) {
+        if Self::is_current_data(&inner, server_instance, data_generation)
+            && inner.last_buffer_at.is_none()
+        {
+            inner.first_buffer_armed_at = None;
+        }
+    }
+
+    pub fn end_data_generation(&self, server_instance: u64, data_generation: u64) {
+        let mut inner = self.lock();
+        if !Self::is_current_data(&inner, server_instance, data_generation) {
             return;
         }
-        inner.active_media_generation = None;
-        inner.active_media = None;
-        inner.target_playing = false;
-        inner.media_constructed_at = None;
-        inner.playing_since = None;
+        inner.active_data_generation = None;
+        inner.first_buffer_armed_at = None;
         inner.last_buffer_at = None;
         inner.healthy_since = None;
         inner.stall_warning_emitted = false;
@@ -477,14 +480,9 @@ impl RelayRuntimeHealth {
         }
     }
 
-    pub fn observe_buffer(
-        &self,
-        server_instance: u64,
-        media_generation: u64,
-        now: Instant,
-    ) -> bool {
+    pub fn observe_buffer(&self, server_instance: u64, data_generation: u64, now: Instant) -> bool {
         let mut inner = self.lock();
-        if !Self::is_current_media(&inner, server_instance, media_generation) {
+        if !Self::is_current_data(&inner, server_instance, data_generation) {
             return false;
         }
         inner.last_buffer_at = Some(now);
@@ -499,28 +497,44 @@ impl RelayRuntimeHealth {
         true
     }
 
-    pub fn record_media_fault(
+    /// Mark an eager, silence-exempt source healthy when its output pipeline
+    /// reaches PLAYING even if no payload has arrived yet.
+    #[allow(dead_code)] // exercised by the SRT adapter in the next milestone
+    pub fn report_streaming_without_buffer(
         &self,
         server_instance: u64,
-        media_generation: u64,
+        data_generation: u64,
+        now: Instant,
+    ) -> bool {
+        let mut inner = self.lock();
+        if !Self::is_current_data(&inner, server_instance, data_generation) {
+            return false;
+        }
+        inner.first_buffer_armed_at = None;
+        inner.healthy_since.get_or_insert(now);
+        Self::transition(&mut inner, RelayState::Streaming, None, None);
+        true
+    }
+
+    pub fn report_fault(
+        &self,
+        server_instance: u64,
+        data_generation: u64,
         kind: RelayFaultKind,
         reason: String,
     ) -> Option<RelayFaultEvent> {
         let mut inner = self.lock();
-        if !Self::is_current_media(&inner, server_instance, media_generation) {
+        if !Self::is_current_data(&inner, server_instance, data_generation) {
             return None;
         }
-        if kind == RelayFaultKind::Eos && !inner.target_playing {
-            return None;
-        }
-        Self::record_fault_locked(&mut inner, kind, reason, media_generation)
+        Self::record_fault_locked(&mut inner, kind, reason, data_generation)
     }
 
     fn record_fault_locked(
         inner: &mut RelayRuntimeInner,
         kind: RelayFaultKind,
         reason: String,
-        media_generation: u64,
+        data_generation: u64,
     ) -> Option<RelayFaultEvent> {
         if inner.first_fault.is_some() {
             return None;
@@ -529,7 +543,7 @@ impl RelayRuntimeHealth {
             kind,
             reason: reason.clone(),
             server_generation: inner.server_generation,
-            media_generation,
+            data_generation,
         };
         inner.first_fault = Some(fault.clone());
         inner.error = Some(reason);
@@ -546,10 +560,8 @@ impl RelayRuntimeHealth {
         {
             return false;
         }
-        inner.active_media_generation = None;
-        inner.active_media = None;
-        inner.target_playing = false;
-        inner.playing_since = None;
+        inner.active_data_generation = None;
+        inner.first_buffer_armed_at = None;
         inner.healthy_since = None;
         Self::transition(
             &mut inner,
@@ -558,15 +570,6 @@ impl RelayRuntimeHealth {
             Some(&fault.reason),
         );
         true
-    }
-
-    pub fn active_media(&self) -> Option<(u64, u64, glib::WeakRef<gst_rtsp_server::RTSPMedia>)> {
-        let inner = self.lock();
-        Some((
-            inner.server_instance,
-            inner.active_media_generation?,
-            inner.active_media.as_ref()?.clone(),
-        ))
     }
 
     /// Evaluate monotonic watchdog deadlines and the healthy reset window.
@@ -580,7 +583,7 @@ impl RelayRuntimeHealth {
                     && inner.recovery_attempt != 0
                 {
                     log::info!(
-                        "RTSP relay generation={} healthy for {}s; recovery backoff reset",
+                        "Re-stream generation={} healthy for {}s; recovery backoff reset",
                         inner.server_generation,
                         HEALTHY_RESET_WINDOW.as_secs()
                     );
@@ -591,26 +594,26 @@ impl RelayRuntimeHealth {
 
         if inner.ingest_kind != RelayIngestKind::Rtsp
             || inner.first_fault.is_some()
-            || inner.active_media_generation.is_none()
-            || !inner.target_playing
+            || inner.active_data_generation.is_none()
+            || inner.first_buffer_armed_at.is_none() && inner.last_buffer_at.is_none()
         {
             return None;
         }
 
-        let media_generation = inner.active_media_generation.unwrap_or(0);
+        let data_generation = inner.active_data_generation.unwrap_or(0);
         match inner.last_buffer_at {
             None => {
-                let started = inner.playing_since?;
+                let started = inner.first_buffer_armed_at?;
                 let elapsed = now.saturating_duration_since(started);
                 if elapsed >= FIRST_BUFFER_TIMEOUT {
                     return Self::record_fault_locked(
                         &mut inner,
                         RelayFaultKind::FirstBufferTimeout,
                         format!(
-                            "RTSP relay produced no first RTP buffer for {}s",
+                            "Re-stream output produced no first buffer for {}s",
                             elapsed.as_secs()
                         ),
-                        media_generation,
+                        data_generation,
                     );
                 }
             }
@@ -622,9 +625,9 @@ impl RelayRuntimeHealth {
                     // window even if it heals before the confirmation fault.
                     inner.healthy_since = None;
                     log::warn!(
-                        "RTSP relay generation={} media={} no pay0 buffer for {:.1}s; waiting for second window",
+                        "Re-stream generation={} data={} has no output buffer for {:.1}s; waiting for second window",
                         inner.server_generation,
-                        media_generation,
+                        data_generation,
                         elapsed.as_secs_f32()
                     );
                 }
@@ -633,15 +636,27 @@ impl RelayRuntimeHealth {
                         &mut inner,
                         RelayFaultKind::BufferStall,
                         format!(
-                            "RTSP relay produced no RTP buffers for {:.1}s (two windows)",
+                            "Re-stream output produced no buffers for {:.1}s (two windows)",
                             elapsed.as_secs_f32()
                         ),
-                        media_generation,
+                        data_generation,
                     );
                 }
             }
         }
         None
+    }
+
+    pub fn stop(&self) {
+        let mut inner = self.lock();
+        inner.active_data_generation = None;
+        inner.first_buffer_armed_at = None;
+        inner.last_buffer_at = None;
+        inner.healthy_since = None;
+        inner.first_fault = None;
+        inner.error = None;
+        inner.loop_alive = false;
+        Self::transition(&mut inner, RelayState::Stopped, None, None);
     }
 }
 
@@ -653,24 +668,11 @@ pub fn recovery_delay(attempt: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glib::prelude::*;
 
-    fn init_gstreamer() {
-        static INIT: std::sync::Once = std::sync::Once::new();
-        INIT.call_once(|| gstreamer::init().expect("GStreamer test initialization failed"));
-    }
-
-    fn construct_media(
-        health: &RelayRuntimeHealth,
-        server_instance: u64,
-        now: Instant,
-    ) -> (gst_rtsp_server::RTSPMedia, u64) {
-        init_gstreamer();
-        let media = gst_rtsp_server::RTSPMedia::new(gstreamer::Pipeline::new());
-        let generation = health
-            .media_constructed(server_instance, media.downgrade(), now)
-            .expect("current listener should accept media");
-        (media, generation)
+    fn begin_data(health: &RelayRuntimeHealth, server_instance: u64) -> u64 {
+        health
+            .begin_data_generation(server_instance)
+            .expect("current output instance should accept data")
     }
 
     #[test]
@@ -683,12 +685,14 @@ mod tests {
 
     #[test]
     fn resolved_identity_includes_credentials() {
-        let base = ResolvedRtspStartSpec {
+        let base = ResolvedStartSpec {
             source: ResolvedSource::Rtsp {
                 url: "rtsp://192.0.2.1/live".into(),
             },
-            server_port: 8554,
-            mount_path: "/stream-token".into(),
+            output: ResolvedOutput::Rtsp {
+                server_port: 8554,
+                mount_path: "/stream-token".into(),
+            },
             bind_interface: None,
             bind_address: None,
             advertised_ip: "192.0.2.10".into(),
@@ -710,18 +714,18 @@ mod tests {
         health.mark_listener_bound(instance);
         assert_eq!(health.snapshot().state, RelayState::Listening);
 
-        let (_media, media_generation) = construct_media(&health, instance, Instant::now());
-        health.media_target_state(instance, media_generation, true, Instant::now());
+        let data_generation = begin_data(&health, instance);
+        health.arm_first_buffer(instance, data_generation, Instant::now());
         assert_eq!(health.snapshot().state, RelayState::Starting);
-        assert!(health.observe_buffer(instance, media_generation, Instant::now()));
+        assert!(health.observe_buffer(instance, data_generation, Instant::now()));
         assert_eq!(health.snapshot().state, RelayState::Streaming);
 
         let event = health
-            .record_media_fault(
+            .report_fault(
                 instance,
-                media_generation,
+                data_generation,
                 RelayFaultKind::Eos,
-                "relay EOS".into(),
+                "output EOS".into(),
             )
             .expect("first fault");
         assert!(health.accept_fault(&event.fault));
@@ -738,21 +742,14 @@ mod tests {
         let instance = health.begin_server_instance(false);
         health.loop_started(instance);
         health.mark_listener_bound(instance);
-        let (_media, generation) = construct_media(&health, instance, Instant::now());
+        let generation = begin_data(&health, instance);
 
         tokio::time::advance(FIRST_BUFFER_TIMEOUT + Duration::from_secs(5)).await;
         assert!(health.evaluate_watchdog(Instant::now()).is_none());
-        assert!(health
-            .record_media_fault(
-                instance,
-                generation,
-                RelayFaultKind::Eos,
-                "idle media EOS".into(),
-            )
-            .is_none());
 
-        health.media_target_state(instance, generation, true, Instant::now());
-        health.media_prepared(instance, generation, Instant::now());
+        health.arm_first_buffer(instance, generation, Instant::now());
+        // Prepared-state reconciliation resets the same deferred clock.
+        health.arm_first_buffer(instance, generation, Instant::now());
         tokio::time::advance(FIRST_BUFFER_TIMEOUT - Duration::from_millis(1)).await;
         assert!(health.evaluate_watchdog(Instant::now()).is_none());
         tokio::time::advance(Duration::from_millis(1)).await;
@@ -768,8 +765,8 @@ mod tests {
         let instance = health.begin_server_instance(false);
         health.loop_started(instance);
         health.mark_listener_bound(instance);
-        let (_media, generation) = construct_media(&health, instance, Instant::now());
-        health.media_target_state(instance, generation, true, Instant::now());
+        let generation = begin_data(&health, instance);
+        health.arm_first_buffer(instance, generation, Instant::now());
         assert!(health.observe_buffer(instance, generation, Instant::now()));
 
         tokio::time::advance(STALL_WINDOW).await;
@@ -787,7 +784,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn listener_without_downstream_media_never_stalls() {
+    async fn listener_without_downstream_data_never_stalls() {
         let health = RelayRuntimeHealth::new(1, RelayIngestKind::Rtsp);
         let instance = health.begin_server_instance(false);
         health.loop_started(instance);
@@ -799,20 +796,20 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn duplicate_faults_and_stale_media_updates_are_ignored() {
+    async fn duplicate_faults_and_stale_data_updates_are_ignored() {
         let health = RelayRuntimeHealth::new(1, RelayIngestKind::Rtsp);
         let instance = health.begin_server_instance(false);
         health.loop_started(instance);
         health.mark_listener_bound(instance);
-        let (_old_media, old_generation) = construct_media(&health, instance, Instant::now());
-        let (_new_media, new_generation) = construct_media(&health, instance, Instant::now());
+        let old_generation = begin_data(&health, instance);
+        let new_generation = begin_data(&health, instance);
 
         assert!(!health.observe_buffer(instance, old_generation, Instant::now()));
         assert_eq!(health.snapshot().state, RelayState::Starting);
         assert!(health.observe_buffer(instance, new_generation, Instant::now()));
 
         assert!(health
-            .record_media_fault(
+            .report_fault(
                 instance,
                 new_generation,
                 RelayFaultKind::GstError,
@@ -820,7 +817,7 @@ mod tests {
             )
             .is_some());
         assert!(health
-            .record_media_fault(
+            .report_fault(
                 instance,
                 new_generation,
                 RelayFaultKind::Eos,
@@ -836,8 +833,8 @@ mod tests {
         let instance = health.begin_server_instance(true);
         health.loop_started(instance);
         health.mark_listener_bound(instance);
-        let (_media, generation) = construct_media(&health, instance, Instant::now());
-        health.media_target_state(instance, generation, true, Instant::now());
+        let generation = begin_data(&health, instance);
+        health.arm_first_buffer(instance, generation, Instant::now());
         assert!(health.observe_buffer(instance, generation, Instant::now()));
 
         for _ in 0..29 {
@@ -853,23 +850,48 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn udp_is_exempt_from_silence_but_not_media_errors() {
+    async fn udp_is_exempt_from_silence_but_not_runtime_errors() {
         let health = RelayRuntimeHealth::new(1, RelayIngestKind::Udp);
         let instance = health.begin_server_instance(false);
         health.loop_started(instance);
         health.mark_listener_bound(instance);
-        let (_media, generation) = construct_media(&health, instance, Instant::now());
-        health.media_target_state(instance, generation, true, Instant::now());
+        let generation = begin_data(&health, instance);
+        health.arm_first_buffer(instance, generation, Instant::now());
 
         tokio::time::advance(Duration::from_secs(120)).await;
         assert!(health.evaluate_watchdog(Instant::now()).is_none());
-        let event = health.record_media_fault(
+        let event = health.report_fault(
             instance,
             generation,
             RelayFaultKind::GstError,
             "UDP media error".into(),
         );
         assert!(event.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eager_arming_faults_without_a_playing_notification() {
+        let health = RelayRuntimeHealth::new(1, RelayIngestKind::Rtsp);
+        let instance = health.begin_server_instance(false);
+        let generation = begin_data(&health, instance);
+        health.arm_first_buffer(instance, generation, Instant::now());
+
+        tokio::time::advance(FIRST_BUFFER_TIMEOUT).await;
+        let event = health
+            .evaluate_watchdog(Instant::now())
+            .expect("an eagerly armed output must not wait forever for PLAYING");
+        assert_eq!(event.fault.kind, RelayFaultKind::FirstBufferTimeout);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silence_exempt_output_can_become_healthy_without_a_buffer() {
+        let health = RelayRuntimeHealth::new(1, RelayIngestKind::Udp);
+        let instance = health.begin_server_instance(false);
+        let generation = begin_data(&health, instance);
+        assert!(health.report_streaming_without_buffer(instance, generation, Instant::now()));
+        tokio::time::advance(Duration::from_secs(120)).await;
+        assert!(health.evaluate_watchdog(Instant::now()).is_none());
+        assert_eq!(health.snapshot().state, RelayState::Streaming);
     }
 
     #[test]

@@ -1,10 +1,10 @@
-//! Streaming, RTSP server, recording, and video-embed IPC handlers.
+//! Streaming, re-stream server, recording, and video-embed IPC handlers.
 
 use tauri::{Manager, State};
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, RestreamProtocol};
 use crate::error::AppError;
-use crate::streaming::{RtspServerInfo, StreamManager};
+use crate::streaming::{RestreamOperationResult, RestreamServerInfo, StreamManager};
 
 #[tauri::command]
 pub async fn start_stream(
@@ -78,24 +78,36 @@ pub async fn set_audio_muted(
 }
 
 #[tauri::command]
-pub async fn start_rtsp_server(
+pub async fn start_restream_server(
     stream: State<'_, StreamManager>,
     config: State<'_, AppConfig>,
     network: State<'_, crate::network::NetworkManager>,
-) -> Result<RtspServerInfo, AppError> {
-    let settings = config.get();
+) -> Result<RestreamServerInfo, AppError> {
     // Adopted camera-network secondaries must never be chosen as the RTSP
     // bind or advertise IP — pass them so selection can skip them. Tauri
     // injects the managed NetworkManager, so the JS invoke signature is
     // unchanged.
     let adopted: std::collections::HashSet<String> =
         network.get_adopted_ips().await.into_values().collect();
-    stream.start_rtsp_server(&settings, &adopted).await
+    stream.start_restream_server(&config, &adopted).await
 }
 
 #[tauri::command]
-pub async fn stop_rtsp_server(stream: State<'_, StreamManager>) -> Result<(), AppError> {
-    stream.stop_rtsp_server().await
+pub async fn stop_restream_server(stream: State<'_, StreamManager>) -> Result<(), AppError> {
+    stream.stop_restream_server().await
+}
+
+#[tauri::command]
+pub async fn switch_restream_protocol(
+    stream: State<'_, StreamManager>,
+    config: State<'_, AppConfig>,
+    network: State<'_, crate::network::NetworkManager>,
+    protocol: RestreamProtocol,
+) -> Result<RestreamOperationResult, AppError> {
+    let adopted = network.get_adopted_ips().await.into_values().collect();
+    stream
+        .switch_restream_protocol(&config, protocol, &adopted)
+        .await
 }
 
 #[tauri::command]

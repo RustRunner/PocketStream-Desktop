@@ -1,5 +1,5 @@
 /**
- * PocketStream Desktop — Stream, RTSP server, recording, QR code
+ * PocketStream Desktop — Stream, re-stream server, recording, QR code
  */
 
 import QRCode from "qrcode";
@@ -7,11 +7,12 @@ import * as api from "./tauri-api.ts";
 import { $, state, log, showToast, formatUptime } from "./state.ts";
 import { sessionCamIp } from "./store.ts";
 import { formatError } from "./errors.ts";
+import { formatRestreamBitrate } from "./restream-format.ts";
 import { getActiveCamIp, getActivePtuIp } from "./network.ts";
-import type { StreamStatus } from "./types.ts";
+import type { RestreamOperationResult, RestreamSettingsUpdate, StreamStatus } from "./types.ts";
 
-/** Full RTSP URL (with token) — stored for QR code generation */
-let rtspFullUrl: string | null = null;
+/** Full client URL (including protocol access data) for QR generation. */
+let restreamFullUrl: string | null = null;
 
 // ── Video area bounds ───────────────────────────────────────────────
 
@@ -350,112 +351,145 @@ export function updateMuteButton(): void {
   btn.title = audioCodec ? `${action} (${audioCodec})` : action;
 }
 
-// ── RTSP server controls ────────────────────────────────────────────
+// ── Re-stream server controls ──────────────────────────────────────
 
-/** Busy latch for the RTSP toggle (see streamToggleBusy). */
-let rtspToggleBusy = false;
+/** Busy latch for the re-stream toggle (see streamToggleBusy). */
+let restreamToggleBusy = false;
+let restreamBindGeneration = 0;
+let restreamBindReady = false;
 
 /**
- * Re-derive the RTSP Start button's enabled state from the Enable
+ * Re-derive the re-stream Start button's enabled state from the Enable
  * checkbox. `loadConfig` sets `.checked` programmatically, which fires
  * no `change` event — without this call, a user whose config has the
  * server enabled got a dead Start button until they toggled the
  * checkbox off and on.
  */
-export function syncRtspStartButton(): void {
-  const startBtn = $<HTMLButtonElement>("#btn-toggle-rtsp");
-  startBtn.disabled = state.isRtspDesired
+export function syncRestreamStartButton(): void {
+  const startBtn = $<HTMLButtonElement>("#btn-toggle-restream");
+  startBtn.disabled = state.isRestreamDesired
     ? false
-    : !$<HTMLInputElement>("#rtsp-server-enable").checked;
+    : !$<HTMLInputElement>("#restream-server-enable").checked;
 }
 
-export function setupRtspControls(): void {
-  // The Enable toggle is also a kill switch: turning it off while the
-  // server is running stops it immediately (rather than only blocking
-  // a future start). Persistence still happens on Save Settings — the
-  // toggle change here only affects live state.
-  const enableToggle = $<HTMLInputElement>("#rtsp-server-enable");
-  const startBtn = $<HTMLButtonElement>("#btn-toggle-rtsp");
+export function setupRestreamControls(): void {
+  const enableToggle = $<HTMLInputElement>("#restream-server-enable");
+  const startBtn = $<HTMLButtonElement>("#btn-toggle-restream");
   startBtn.disabled = !enableToggle.checked;
-  enableToggle.addEventListener("change", async () => {
-    startBtn.disabled = !enableToggle.checked;
-    if (!enableToggle.checked && state.isRtspDesired) {
-      try {
-        await api.stopRtspServer();
-        state.isRtspDesired = false;
-        updateRtspUI(null);
-        showToast("RTSP server stopped");
-      } catch (e) {
-        showToast("Failed to stop RTSP server: " + formatError(e), true);
+  enableToggle.addEventListener("change", () => {
+    // Enable is persisted and enforced by the atomic Settings Save command.
+    // A desired output always remains stoppable before that save.
+    startBtn.disabled = state.isRestreamDesired ? false : !enableToggle.checked;
+  });
+
+  refreshRestreamBindOptions();
+
+  $<HTMLSelectElement>("#restream-bind-interface").addEventListener("change", async () => {
+    if (!state.config || !restreamBindReady) return;
+    const select = $<HTMLSelectElement>("#restream-bind-interface");
+    const previous = state.config.rtsp_server.bind_interface;
+    const requested = select.value;
+    const changeGeneration = restreamBindGeneration;
+    select.disabled = true;
+    try {
+      const result = await api.applyRestreamSettings({
+        enabled: state.config.rtsp_server.enabled,
+        rtsp_server: {
+          port: state.config.rtsp_server.port,
+          token: state.config.rtsp_server.token,
+          bind_interface: requested,
+        },
+      });
+      state.config.rtsp_server.bind_interface = requested;
+      applyRestreamOperationResult(result);
+    } catch (e) {
+      if (!(await reloadCanonicalRestreamConfig())) {
+        select.value = previous;
+      }
+      showToast("Failed to save VPN selection: " + formatError(e), true);
+    } finally {
+      if (changeGeneration === restreamBindGeneration && restreamBindReady) {
+        select.disabled = false;
       }
     }
   });
 
-  // Populate VPN dropdown in background — don't block other setup
-  populateVpnDropdown();
-
-  $<HTMLSelectElement>("#rtsp-bind-interface").addEventListener("change", async () => {
-    if (!state.config) return;
-    state.config.rtsp_server.bind_interface = $<HTMLSelectElement>(
-      "#rtsp-bind-interface"
-    ).value;
-    try {
-      await api.updateRtspSettings(state.config.rtsp_server);
-    } catch (e) {
-      showToast("Failed to save VPN selection: " + formatError(e), true);
-    }
-  });
-
-  $<HTMLButtonElement>("#btn-toggle-rtsp").addEventListener("click", async () => {
+  $<HTMLButtonElement>("#btn-toggle-restream").addEventListener("click", async () => {
     // Same double-tap defense as the stream toggle.
-    if (rtspToggleBusy) return;
-    rtspToggleBusy = true;
+    if (restreamToggleBusy) return;
+    restreamToggleBusy = true;
     startBtn.disabled = true;
 
-    const spinner = $<HTMLElement>("#rtsp-spinner");
+    const spinner = $<HTMLElement>("#restream-spinner");
     spinner.style.display = "";
 
-    if (state.isRtspDesired) {
+    if (state.isRestreamDesired) {
       try {
-        await api.stopRtspServer();
-        state.isRtspDesired = false;
-        updateRtspUI(null);
-        showToast("RTSP server stopped");
+        await api.stopRestreamServer();
+        state.isRestreamDesired = false;
+        updateRestreamUI(null);
+        showToast("Re-stream server stopped");
       } catch (e) {
         showToast("Failed to stop: " + formatError(e), true);
       }
     } else {
       try {
-        // bind_interface is persisted by the dropdown's change handler,
-        // so don't re-copy the <select> value here. During startup the
-        // VPN options are still being populated asynchronously and the
-        // select can briefly read empty; writing that back would wipe
-        // the saved interface.
-        const info = await api.startRtspServer();
-        state.isRtspDesired = true;
-        rtspFullUrl = info.rtsp_url;
-        updateRtspUI(info.display_url);
-        showToast("RTSP server started");
+        const info = await api.startRestreamServer();
+        state.isRestreamDesired = true;
+        restreamFullUrl = info.server_url;
+        updateRestreamUI(info.display_url);
+        showToast("Re-stream server started");
       } catch (e) {
-        showToast("RTSP server failed: " + formatError(e), true);
+        showToast("Re-stream server failed: " + formatError(e), true);
       }
     }
 
     spinner.style.display = "none";
-    rtspToggleBusy = false;
-    // updateRtspUI ran in the happy paths; re-derive here so a thrown
+    restreamToggleBusy = false;
+    // updateRestreamUI ran in the happy paths; re-derive here so a thrown
     // start/stop doesn't leave the button stuck disabled.
-    startBtn.disabled = state.isRtspDesired ? false : !enableToggle.checked;
+    startBtn.disabled = state.isRestreamDesired ? false : !enableToggle.checked;
   });
 
   // QR code button + dialog
   setupQrDialog();
 }
 
-async function populateVpnDropdown(): Promise<void> {
-  const select = $<HTMLSelectElement>("#rtsp-bind-interface");
+export function refreshRestreamBindOptions(): void {
+  const generation = ++restreamBindGeneration;
+  const select = $<HTMLSelectElement>("#restream-bind-interface");
+  restreamBindReady = false;
+  select.disabled = true;
+  void populateRestreamBindOptions(generation);
+}
+
+/** Reconcile local state after a command error. A settings transaction may
+ * have committed successfully before its live restart failed, so an error is
+ * not proof that the old frontend snapshot remains authoritative. */
+export async function reloadCanonicalRestreamConfig(): Promise<boolean> {
+  try {
+    state.config = await api.getConfig();
+    refreshRestreamBindOptions();
+    return true;
+  } catch (error) {
+    log(`Failed to reload canonical re-stream settings: ${formatError(error)}`);
+    return false;
+  }
+}
+
+async function populateRestreamBindOptions(generation: number): Promise<void> {
+  const select = $<HTMLSelectElement>("#restream-bind-interface");
   try {
     const vpns = (await api.listVpnInterfaces()).filter((i) => i.ips.length > 0);
+    if (generation !== restreamBindGeneration) return;
+
+    const saved = state.config?.rtsp_server.bind_interface ?? "";
+    select.replaceChildren();
+    const all = document.createElement("option");
+    all.value = "";
+    all.textContent = "None";
+    select.appendChild(all);
+
     for (const iface of vpns) {
       const opt = document.createElement("option");
       opt.value = iface.name;
@@ -463,30 +497,76 @@ async function populateVpnDropdown(): Promise<void> {
       opt.textContent = firstIp ? `${iface.name} (${firstIp.address})` : iface.name;
       select.appendChild(opt);
     }
-    // Restore saved selection
-    if (state.config && state.config.rtsp_server.bind_interface) {
-      select.value = state.config.rtsp_server.bind_interface;
+
+    if (saved && !vpns.some((iface) => iface.name === saved)) {
+      const unavailable = document.createElement("option");
+      unavailable.value = saved;
+      unavailable.textContent = `${saved} (unavailable)`;
+      select.appendChild(unavailable);
     }
+    select.value = saved;
   } catch (e) {
+    if (generation !== restreamBindGeneration) return;
     console.warn("Failed to list VPN interfaces:", e);
+    const saved = state.config?.rtsp_server.bind_interface ?? "";
+    select.replaceChildren();
+    const all = document.createElement("option");
+    all.value = "";
+    all.textContent = "None";
+    select.appendChild(all);
+    if (saved) {
+      const unavailable = document.createElement("option");
+      unavailable.value = saved;
+      unavailable.textContent = `${saved} (unavailable)`;
+      select.appendChild(unavailable);
+      select.value = saved;
+    }
+  } finally {
+    if (generation === restreamBindGeneration) {
+      restreamBindReady = true;
+      select.disabled = false;
+    }
   }
 }
 
-function updateRtspUI(displayUrl: string | null, status?: StreamStatus): void {
-  const btn = $<HTMLButtonElement>("#btn-toggle-rtsp");
-  btn.textContent = state.isRtspDesired ? "Stop Server" : "Start Server";
+export function applyRestreamOperationResult(result: RestreamOperationResult): void {
+  if (state.config) state.config.restream_protocol = result.selected_protocol;
+  state.isRestreamDesired = result.desired;
+  if (result.server_info) {
+    restreamFullUrl = result.server_info.server_url;
+    updateRestreamUI(result.server_info.display_url);
+  } else if (!result.desired) {
+    updateRestreamUI(null);
+  }
+}
+
+export function buildRestreamSettingsUpdate(
+  enabled: boolean,
+  port: number,
+  token: string,
+  bindInterface: string
+): RestreamSettingsUpdate {
+  return {
+    enabled,
+    rtsp_server: { port, token, bind_interface: bindInterface },
+  };
+}
+
+function updateRestreamUI(displayUrl: string | null, status?: StreamStatus): void {
+  const btn = $<HTMLButtonElement>("#btn-toggle-restream");
+  btn.textContent = state.isRestreamDesired ? "Stop Server" : "Start Server";
   // Always allow stopping, including while the listener is rebuilding.
-  btn.disabled = state.isRtspDesired
+  btn.disabled = state.isRestreamDesired
     ? false
-    : !$<HTMLInputElement>("#rtsp-server-enable").checked;
+    : !$<HTMLInputElement>("#restream-server-enable").checked;
 
-  const statusEl = $("#rtsp-status");
+  const statusEl = $("#restream-status");
   const qrBtn = $<HTMLButtonElement>("#btn-show-qr");
-  const errorRow = $("#rtsp-error-row");
-  const errorEl = $("#rtsp-error");
+  const errorRow = $("#restream-error-row");
+  const errorEl = $("#restream-error");
 
-  if (state.isRtspDesired) {
-    const relayState = status?.rtsp_relay_state ?? "starting";
+  if (state.isRestreamDesired) {
+    const relayState = status?.relay_state ?? "starting";
     switch (relayState) {
       case "listening":
       case "streaming":
@@ -494,8 +574,8 @@ function updateRtspUI(displayUrl: string | null, status?: StreamStatus): void {
         statusEl.className = "status-value status-online";
         break;
       case "recovering":
-        statusEl.textContent = status?.rtsp_recovery_attempt
-          ? `Reconnecting (attempt ${status.rtsp_recovery_attempt})`
+        statusEl.textContent = status?.recovery_attempt
+          ? `Reconnecting (attempt ${status.recovery_attempt})`
           : "Reconnecting";
         statusEl.className = "status-value status-warning";
         break;
@@ -508,21 +588,21 @@ function updateRtspUI(displayUrl: string | null, status?: StreamStatus): void {
         statusEl.className = "status-value status-warning";
         break;
     }
-    $("#rtsp-url").textContent = displayUrl || "--";
-    qrBtn.disabled = !rtspFullUrl;
-    const error = status?.rtsp_error ?? null;
+    $("#restream-url").textContent = displayUrl || "--";
+    qrBtn.disabled = !restreamFullUrl;
+    const error = status?.relay_error ?? null;
     errorEl.textContent = error || "";
     errorRow.style.display = error ? "contents" : "none";
   } else {
     statusEl.textContent = "Offline";
     statusEl.className = "status-value status-offline";
-    $("#rtsp-url").textContent = "--";
-    $("#rtsp-uptime").textContent = "--";
-    $("#rtsp-clients").textContent = "--";
-    $("#rtsp-bandwidth").textContent = "--";
+    $("#restream-url").textContent = "--";
+    $("#restream-uptime").textContent = "--";
+    $("#restream-clients").textContent = "--";
+    $("#restream-bandwidth").textContent = "--";
     errorEl.textContent = "";
     errorRow.style.display = "none";
-    rtspFullUrl = null;
+    restreamFullUrl = null;
     qrBtn.disabled = true;
   }
 }
@@ -535,17 +615,17 @@ function setupQrDialog(): void {
   const closeBtn = $<HTMLButtonElement>("#qr-close");
 
   qrBtn.addEventListener("click", async () => {
-    if (!rtspFullUrl) return;
+    if (!restreamFullUrl) return;
 
     // Show dialog first so the canvas is in the visible DOM —
     // rendering to a canvas inside a hidden <dialog> can produce
     // blank output on some WebView2 / Chromium builds.
-    $("#qr-url").textContent = rtspFullUrl;
+    $("#qr-url").textContent = restreamFullUrl;
     await showModalWithVideo(dialog);
 
     const canvas = $<HTMLCanvasElement>("#qr-canvas");
     try {
-      await QRCode.toCanvas(canvas, rtspFullUrl, {
+      await QRCode.toCanvas(canvas, restreamFullUrl, {
         width: 256,
         margin: 2,
         color: { dark: "#000000", light: "#ffffff" },
@@ -668,17 +748,20 @@ function handleStatus(status: StreamStatus | null): void {
   // Heal webview-reload desync from backend-owned desired and health state.
   // Listener liveness may be false during recovery without making the relay
   // an actionable Start state in the UI.
-  state.isRtspDesired = status.rtsp_desired;
-  if (status.rtsp_url) {
-    rtspFullUrl = status.rtsp_url;
+  state.isRestreamDesired = status.desired;
+  if (status.server_url) {
+    restreamFullUrl = status.server_url;
   }
-  updateRtspUI(status.display_url ?? null, status);
+  updateRestreamUI(status.display_url ?? null, status);
 
-  if (status.rtsp_desired) {
-    $("#rtsp-uptime").textContent = formatUptime(status.uptime_secs);
-    $("#rtsp-clients").textContent =
-      `${status.rtsp_connected_clients} / ${status.rtsp_client_limit}`;
-    $("#rtsp-bandwidth").textContent = `${status.bandwidth_kbps.toFixed(1)} kbps`;
+  if (status.desired) {
+    $("#restream-uptime").textContent = formatUptime(status.uptime_secs);
+    $("#restream-clients").textContent =
+      `${status.connected_clients} / ${status.client_limit}`;
+    $("#restream-bandwidth").textContent = formatRestreamBitrate(
+      status.bandwidth_kbps,
+      status.connected_clients
+    );
   }
 
   // Audio availability drives the mute button. Change-detected so the
@@ -711,7 +794,7 @@ function handleStatus(status: StreamStatus | null): void {
 interface ResumeSnapshot {
   cameraIp: string | null;
   ptuIp: string | null;
-  wasRtspDesired: boolean;
+  wasRestreamDesired: boolean;
 }
 
 /** Stream state captured at the moment of a hard network disconnect,
@@ -733,7 +816,7 @@ export function handleHardDisconnect(reason: string): void {
       // started, and a resume must bring back what was playing.
       cameraIp: activePlaybackIp ?? getActiveCamIp(),
       ptuIp: getActivePtuIp(),
-      wasRtspDesired: state.isRtspDesired,
+      wasRestreamDesired: state.isRestreamDesired,
     };
     log(`Stream lost on network disconnect: ${reason}`);
     showStreamLost(reason);
@@ -741,7 +824,7 @@ export function handleHardDisconnect(reason: string): void {
 }
 
 /** Called by the interface watcher on reconnect (wasDown=true).
- *  Restores dropdown selections and restarts the stream + RTSP server
+ *  Restores dropdown selections and restarts the stream + re-stream server
  *  if they were running before the disconnect. */
 export async function handleReconnect(): Promise<void> {
   if (!resumeSnapshot) return;
@@ -793,15 +876,15 @@ export async function handleReconnect(): Promise<void> {
     // A hard reconnect may have changed host addresses. Re-submit the desired
     // relay as an explicit Start: the backend no-ops an identical healthy
     // endpoint and supersedes recovery when resolution actually changed.
-    if (snap.wasRtspDesired && state.isRtspDesired) {
+    if (snap.wasRestreamDesired && state.isRestreamDesired) {
       try {
-        const info = await api.startRtspServer();
-        state.isRtspDesired = true;
-        rtspFullUrl = info.rtsp_url;
-        updateRtspUI(info.display_url);
+        const info = await api.startRestreamServer();
+        state.isRestreamDesired = true;
+        restreamFullUrl = info.server_url;
+        updateRestreamUI(info.display_url);
       } catch (e) {
-        log(`RTSP auto-resume failed: ${formatError(e)}`);
-        showToast("Stream back — RTSP server failed to resume", true);
+        log(`Re-stream auto-resume failed: ${formatError(e)}`);
+        showToast("Stream back — re-stream server failed to resume", true);
       }
     }
   } catch (e) {
