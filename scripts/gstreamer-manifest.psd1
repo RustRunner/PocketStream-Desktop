@@ -54,7 +54,7 @@
         'gmodule-2.0-0.dll'
         'gio-2.0-0.dll'
         'intl-8.dll'
-        'ffi-8.dll'
+        'ffi-7.dll'
         'pcre2-8-0.dll'
         'z-1.dll'
         'orc-0.4-0.dll'
@@ -231,7 +231,7 @@
 
         # Support libraries
         'intl-8.dll'               = 'proxy-libintl'
-        'ffi-8.dll'                = 'libffi'
+        'ffi-7.dll'                = 'libffi'
         'pcre2-8-0.dll'            = 'pcre2'
         'z-1.dll'                  = 'zlib'
         'orc-0.4-0.dll'            = 'orc'
