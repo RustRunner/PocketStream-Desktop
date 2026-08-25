@@ -117,9 +117,39 @@ export interface RtspServerUpdate {
   bind_interface: string;
 }
 
+export type SrtPassphraseAvailability = "unencrypted" | "available" | "unavailable";
+
+export interface SrtPassphraseView {
+  state: SrtPassphraseAvailability;
+  /** Present only while the protected plaintext is available in memory. */
+  value: string | null;
+}
+
+export interface SrtServerConfig {
+  port: number;
+  passphrase: SrtPassphraseView;
+  latency_ms: number;
+  stream_id: string;
+  bind_interface: string;
+}
+
+export type SrtPassphraseUpdate =
+  | { action: "keep" }
+  | { action: "replace"; value: string }
+  | { action: "clear" };
+
+export interface SrtServerUpdate {
+  port: number;
+  passphrase: SrtPassphraseUpdate;
+  latency_ms: number;
+  stream_id: string;
+  bind_interface: string;
+}
+
 export interface RestreamSettingsUpdate {
   enabled: boolean;
   rtsp_server: RtspServerUpdate;
+  srt_server: SrtServerUpdate;
 }
 
 export interface Credentials {
@@ -142,6 +172,7 @@ export interface AppSettings {
   stream: StreamConfig;
   restream_protocol: RestreamProtocol;
   rtsp_server: RtspServerConfig;
+  srt_server: SrtServerConfig;
   credentials: Credentials;
   /** subnet (e.g. "192.168.1.0/24") -> adopted secondary IP */
   adopted_subnets: Record<string, string>;
@@ -221,6 +252,7 @@ export interface TypedAppError {
     | "Stream"
     | "Config"
     | "Validation"
+    | "SrtPassphraseUnavailable"
     | "Camera"
     | "Io"
     | "Serde";

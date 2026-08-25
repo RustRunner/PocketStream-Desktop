@@ -1158,9 +1158,9 @@ impl StreamManager {
         }
     }
 
-    /// Apply the shared Enable field and complete RTSP section as one backend
-    /// lifecycle transaction. The SRT section is deliberately absent until
-    /// the next milestone introduces its runtime and secret-state model.
+    /// Apply the shared Enable field and both complete protocol sections as
+    /// one backend lifecycle transaction. Until the SRT runtime slice lands,
+    /// only RTSP settings can affect the active listener.
     pub async fn apply_restream_settings(
         &self,
         config: &AppConfig,
@@ -1193,7 +1193,10 @@ impl StreamManager {
             None
         };
 
-        let committed = match config.commit_restream_settings(prospective.rtsp_server.clone()) {
+        let committed = match config.commit_restream_settings(
+            prospective.rtsp_server.clone(),
+            prospective.srt_server.clone(),
+        ) {
             Ok(settings) => settings,
             Err(persistence_error) => {
                 let restoration_intent = if was_desired {
@@ -2196,9 +2199,10 @@ mod tests {
             rtsp_server: RtspServerConfig {
                 enabled: false,
                 port: 8554,
-                token: "testtoken".into(),
+                token: "0123456789abcdef".into(),
                 bind_interface: String::new(),
             },
+            srt_server: SrtServerConfig::default(),
             credentials: Credentials {
                 username: username.into(),
                 password: password.into(),

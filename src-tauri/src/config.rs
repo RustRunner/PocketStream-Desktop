@@ -66,6 +66,38 @@ pub struct RtspServerConfig {
     pub bind_interface: String,
 }
 
+/// Runtime-only SRT passphrase state. Deliberately neither `Debug` nor
+/// serializable: plaintext and preserved ciphertext may only cross the
+/// explicit persistence/view boundaries below.
+#[derive(Clone, PartialEq, Eq)]
+pub enum SrtPassphraseState {
+    Unencrypted,
+    Available(String),
+    Unavailable { preserved_ciphertext: String },
+}
+
+/// Validated, narrow runtime SRT settings.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SrtServerConfig {
+    pub port: u16,
+    pub passphrase: SrtPassphraseState,
+    pub latency_ms: u32,
+    pub stream_id: String,
+    pub bind_interface: String,
+}
+
+impl Default for SrtServerConfig {
+    fn default() -> Self {
+        Self {
+            port: 8890,
+            passphrase: SrtPassphraseState::Unencrypted,
+            latency_ms: 125,
+            stream_id: String::new(),
+            bind_interface: String::new(),
+        }
+    }
+}
+
 /// IPC update shape. Re-stream numerics stay wide until the centralized
 /// prospective-settings validator accepts them, so negative and oversized
 /// values produce a typed validation error instead of a serde boundary error.
@@ -76,10 +108,31 @@ pub struct RtspServerUpdate {
     pub bind_interface: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Explicit passphrase intent. `Keep` is the only untouched-field action;
+/// an empty `Replace` is invalid, while `Clear` intentionally requests an
+/// unencrypted listener.
+#[derive(Clone, Deserialize)]
+#[serde(tag = "action", content = "value", rename_all = "snake_case")]
+pub enum SrtPassphraseUpdate {
+    Keep,
+    Replace(String),
+    Clear,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct SrtServerUpdate {
+    pub port: i64,
+    pub passphrase: SrtPassphraseUpdate,
+    pub latency_ms: i64,
+    pub stream_id: String,
+    pub bind_interface: String,
+}
+
+#[derive(Clone, Deserialize)]
 pub struct RestreamSettingsUpdate {
     pub enabled: bool,
     pub rtsp_server: RtspServerUpdate,
+    pub srt_server: SrtServerUpdate,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,37 +248,32 @@ fn remove_adoption_entry(
     adopted.remove(subnet).is_some()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct AppSettings {
     pub stream: StreamConfig,
     /// Persisted output selector. Missing values in pre-neutralization config
     /// files migrate to RTSP.
-    #[serde(default)]
     pub restream_protocol: RestreamProtocol,
     pub rtsp_server: RtspServerConfig,
+    pub srt_server: SrtServerConfig,
     pub credentials: Credentials,
     /// Auto-adopted subnet IPs: subnet string -> adopted IP address
-    #[serde(default)]
     pub adopted_subnets: HashMap<String, String>,
     /// Lifecycle metadata per adopted subnet, keyed like
     /// `adopted_subnets`. See `AdoptedMeta` for what is (and is
     /// deliberately not) stored.
-    #[serde(default)]
     pub adopted_meta: HashMap<String, AdoptedMeta>,
     /// Last zoom slider position (0–100 %) per camera IP.
     /// Restored on launch so the slider doesn't reset to Wide when the
     /// camera is still pointed at the last-set zoom. Stored as percent
     /// rather than raw integer so different max ranges remain portable.
-    #[serde(default)]
     pub zoom_positions: HashMap<String, i32>,
     /// User's chosen network mode. See `NetworkMode` doc-comment.
-    #[serde(default)]
     pub network_mode: NetworkMode,
     /// User-pinned nodes for `NetworkMode::StaticManual`. Persisted
     /// across mode toggles; the typical workflow is to use `StaticAuto`
     /// to discover IPs, then switch to `StaticManual` for steady-state
     /// operation against the discovered set.
-    #[serde(default)]
     pub manual_nodes: Vec<ManualNode>,
 }
 
@@ -247,6 +295,7 @@ impl Default for AppSettings {
                 token: generate_token(),
                 bind_interface: String::new(),
             },
+            srt_server: SrtServerConfig::default(),
             credentials: Credentials {
                 username: String::new(),
                 password: String::new(),
@@ -260,14 +309,71 @@ impl Default for AppSettings {
     }
 }
 
-/// Explicit frontend view. Runtime settings remain an internal persistence
-/// type; this boundary is ready for the non-serializable SRT secret state in
-/// the next milestone without another whole-config IPC migration.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SrtPassphraseAvailability {
+    Unencrypted,
+    Available,
+    Unavailable,
+}
+
+/// IPC-only secret projection. Do not derive `Debug`: `value` can contain
+/// authorized plaintext for the masked settings control.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct SrtPassphraseView {
+    pub state: SrtPassphraseAvailability,
+    pub value: Option<String>,
+}
+
+impl From<&SrtPassphraseState> for SrtPassphraseView {
+    fn from(passphrase: &SrtPassphraseState) -> Self {
+        match passphrase {
+            SrtPassphraseState::Unencrypted => Self {
+                state: SrtPassphraseAvailability::Unencrypted,
+                value: None,
+            },
+            SrtPassphraseState::Available(value) => Self {
+                state: SrtPassphraseAvailability::Available,
+                value: Some(value.clone()),
+            },
+            SrtPassphraseState::Unavailable { .. } => Self {
+                state: SrtPassphraseAvailability::Unavailable,
+                value: None,
+            },
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct SrtServerView {
+    pub port: u16,
+    pub passphrase: SrtPassphraseView,
+    pub latency_ms: u32,
+    pub stream_id: String,
+    pub bind_interface: String,
+}
+
+impl From<&SrtServerConfig> for SrtServerView {
+    fn from(settings: &SrtServerConfig) -> Self {
+        Self {
+            port: settings.port,
+            passphrase: SrtPassphraseView::from(&settings.passphrase),
+            latency_ms: settings.latency_ms,
+            stream_id: settings.stream_id.clone(),
+            bind_interface: settings.bind_interface.clone(),
+        }
+    }
+}
+
+/// Explicit frontend view. Runtime settings and opaque SRT ciphertext remain
+/// behind this boundary; only available plaintext is intentionally exposed
+/// for the existing masked/copy settings interaction.
+#[derive(Clone, Serialize)]
 pub struct AppSettingsView {
     pub stream: StreamConfig,
     pub restream_protocol: RestreamProtocol,
     pub rtsp_server: RtspServerConfig,
+    pub srt_server: SrtServerView,
     pub credentials: Credentials,
     pub adopted_subnets: HashMap<String, String>,
     pub adopted_meta: HashMap<String, AdoptedMeta>,
@@ -282,6 +388,7 @@ impl From<&AppSettings> for AppSettingsView {
             stream: settings.stream.clone(),
             restream_protocol: settings.restream_protocol,
             rtsp_server: settings.rtsp_server.clone(),
+            srt_server: SrtServerView::from(&settings.srt_server),
             credentials: settings.credentials.clone(),
             adopted_subnets: settings.adopted_subnets.clone(),
             adopted_meta: settings.adopted_meta.clone(),
@@ -290,6 +397,222 @@ impl From<&AppSettings> for AppSettingsView {
             manual_nodes: settings.manual_nodes.clone(),
         }
     }
+}
+
+/// Private on-disk re-stream shapes keep numerics wide so invalid hand-edited
+/// values reach the centralized validator instead of failing at serde's
+/// integer narrowing boundary.
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedRtspServerConfig {
+    enabled: bool,
+    port: i64,
+    token: String,
+    #[serde(default)]
+    bind_interface: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct PersistedSrtServerConfig {
+    port: i64,
+    passphrase: String,
+    latency_ms: i64,
+    stream_id: String,
+    bind_interface: String,
+}
+
+impl Default for PersistedSrtServerConfig {
+    fn default() -> Self {
+        Self {
+            port: 8890,
+            passphrase: String::new(),
+            latency_ms: 125,
+            stream_id: String::new(),
+            bind_interface: String::new(),
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedAppSettings {
+    stream: StreamConfig,
+    #[serde(default)]
+    restream_protocol: RestreamProtocol,
+    rtsp_server: PersistedRtspServerConfig,
+    #[serde(default)]
+    srt_server: PersistedSrtServerConfig,
+    credentials: Credentials,
+    #[serde(default)]
+    adopted_subnets: HashMap<String, String>,
+    #[serde(default)]
+    adopted_meta: HashMap<String, AdoptedMeta>,
+    #[serde(default)]
+    zoom_positions: HashMap<String, i32>,
+    #[serde(default)]
+    network_mode: NetworkMode,
+    #[serde(default)]
+    manual_nodes: Vec<ManualNode>,
+}
+
+/// Resolve the stored SRT passphrase without ever treating decryption failure
+/// as an intentionally empty secret. The original ciphertext is retained for
+/// a later Replace/Clear repair or an unrelated save under a replacement key.
+fn resolve_srt_passphrase(stored: String, key: Option<&[u8]>) -> SrtPassphraseState {
+    if stored.is_empty() {
+        return SrtPassphraseState::Unencrypted;
+    }
+    if let Some(plaintext) = key
+        .filter(|key| key.len() == 32)
+        .and_then(|key| decrypt_string(&stored, key))
+    {
+        return SrtPassphraseState::Available(plaintext);
+    }
+
+    log::error!(
+        "config: saved SRT passphrase could not be decrypted; preserving it as unavailable until the user replaces or explicitly clears it"
+    );
+    SrtPassphraseState::Unavailable {
+        preserved_ciphertext: stored,
+    }
+}
+
+fn runtime_settings_from_persisted(
+    persisted: PersistedAppSettings,
+    key: Option<&[u8]>,
+) -> Result<AppSettings, crate::AppError> {
+    let PersistedAppSettings {
+        stream,
+        restream_protocol,
+        rtsp_server,
+        srt_server,
+        credentials,
+        adopted_subnets,
+        adopted_meta,
+        zoom_positions,
+        network_mode,
+        manual_nodes,
+    } = persisted;
+
+    let (username, password) =
+        resolve_credentials(&credentials.username, &credentials.password, key);
+    let passphrase = resolve_srt_passphrase(srt_server.passphrase, key);
+    let (rtsp_server, srt_server) = crate::settings_validation::normalize_restream_servers(
+        &stream,
+        rtsp_server.enabled,
+        RtspServerUpdate {
+            port: rtsp_server.port,
+            token: rtsp_server.token,
+            bind_interface: rtsp_server.bind_interface,
+        },
+        crate::settings_validation::ResolvedSrtServerUpdate {
+            port: srt_server.port,
+            passphrase,
+            latency_ms: srt_server.latency_ms,
+            stream_id: srt_server.stream_id,
+            bind_interface: srt_server.bind_interface,
+        },
+    )?;
+
+    crate::settings_validation::validate_prospective_settings(AppSettings {
+        stream,
+        restream_protocol,
+        rtsp_server,
+        srt_server,
+        credentials: Credentials { username, password },
+        adopted_subnets,
+        adopted_meta,
+        zoom_positions,
+        network_mode,
+        manual_nodes,
+    })
+}
+
+fn persisted_settings_with_srt_encryptor<F>(
+    settings: &AppSettings,
+    key: &[u8],
+    encrypt_srt: F,
+) -> Result<PersistedAppSettings, crate::AppError>
+where
+    F: FnOnce(&str, &[u8]) -> Result<String, crate::AppError>,
+{
+    let settings = crate::settings_validation::validate_prospective_settings(settings.clone())?;
+    let passphrase = match &settings.srt_server.passphrase {
+        SrtPassphraseState::Unencrypted => String::new(),
+        SrtPassphraseState::Available(plaintext) => {
+            let encrypted = encrypt_srt(plaintext, key)?;
+            if encrypted.is_empty() {
+                return Err(crate::AppError::Config(
+                    "protected SRT passphrase encryption returned no ciphertext; settings were not saved"
+                        .into(),
+                ));
+            }
+            encrypted
+        }
+        SrtPassphraseState::Unavailable {
+            preserved_ciphertext,
+        } => {
+            if preserved_ciphertext.is_empty() {
+                return Err(crate::AppError::Config(
+                    "unavailable SRT passphrase has no preserved ciphertext; settings were not saved"
+                        .into(),
+                ));
+            }
+            preserved_ciphertext.clone()
+        }
+    };
+
+    Ok(PersistedAppSettings {
+        stream: settings.stream,
+        restream_protocol: settings.restream_protocol,
+        rtsp_server: PersistedRtspServerConfig {
+            enabled: settings.rtsp_server.enabled,
+            port: i64::from(settings.rtsp_server.port),
+            token: settings.rtsp_server.token,
+            bind_interface: settings.rtsp_server.bind_interface,
+        },
+        srt_server: PersistedSrtServerConfig {
+            port: i64::from(settings.srt_server.port),
+            passphrase,
+            latency_ms: i64::from(settings.srt_server.latency_ms),
+            stream_id: settings.srt_server.stream_id,
+            bind_interface: settings.srt_server.bind_interface,
+        },
+        credentials: Credentials {
+            username: encrypt_string(&settings.credentials.username, key),
+            password: encrypt_string(&settings.credentials.password, key),
+        },
+        adopted_subnets: settings.adopted_subnets,
+        adopted_meta: settings.adopted_meta,
+        zoom_positions: settings.zoom_positions,
+        network_mode: settings.network_mode,
+        manual_nodes: settings.manual_nodes,
+    })
+}
+
+fn serialize_settings_with_srt_encryptor<F>(
+    settings: &AppSettings,
+    key: &[u8],
+    encrypt_srt: F,
+) -> Result<String, crate::AppError>
+where
+    F: FnOnce(&str, &[u8]) -> Result<String, crate::AppError>,
+{
+    let persisted = persisted_settings_with_srt_encryptor(settings, key, encrypt_srt)?;
+    toml::to_string_pretty(&persisted).map_err(|error| crate::AppError::Config(error.to_string()))
+}
+
+fn save_settings_to_path_with_srt_encryptor<F>(
+    settings: &AppSettings,
+    path: &Path,
+    key: &[u8],
+    encrypt_srt: F,
+) -> Result<(), crate::AppError>
+where
+    F: FnOnce(&str, &[u8]) -> Result<String, crate::AppError>,
+{
+    let content = serialize_settings_with_srt_encryptor(settings, key, encrypt_srt)?;
+    atomic_write(path, content.as_bytes())
+        .map_err(|error| crate::AppError::Config(error.to_string()))
 }
 
 /// On-disk shape of `device_cache.toml`. Wrapping `Vec<CachedDevice>`
@@ -430,25 +753,33 @@ impl AppConfig {
         self.save()
     }
 
-    /// Atomically persist the shared Enable field and current RTSP settings,
+    /// Atomically persist the shared Enable field and both protocol sections,
     /// then publish the same validated snapshot in memory. The caller owns
-    /// the surrounding runtime stop/restore/restart transaction.
+    /// the surrounding runtime stop/restore/restart transaction, so no narrow
+    /// re-stream writer can expose a partially updated configuration.
     pub fn commit_restream_settings(
         &self,
         rtsp_server: RtspServerConfig,
+        srt_server: SrtServerConfig,
     ) -> Result<AppSettings, crate::AppError> {
         let _save_guard = CONFIG_SAVE_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut prospective = self.get();
         prospective.rtsp_server = rtsp_server.clone();
+        prospective.srt_server = srt_server.clone();
         let prospective = crate::settings_validation::validate_prospective_settings(prospective)?;
         save_to_disk(&prospective)?;
         match self.settings.lock() {
-            Ok(mut guard) => guard.rtsp_server = rtsp_server,
+            Ok(mut guard) => {
+                guard.rtsp_server = rtsp_server;
+                guard.srt_server = srt_server;
+            }
             Err(poisoned) => {
                 log::error!("Config mutex poisoned during re-stream commit, recovering");
-                poisoned.into_inner().rtsp_server = rtsp_server;
+                let mut guard = poisoned.into_inner();
+                guard.rtsp_server = rtsp_server;
+                guard.srt_server = srt_server;
             }
         }
         Ok(prospective)
@@ -970,9 +1301,14 @@ fn extract_legacy_device_cache(toml_content: &str) -> Option<Vec<CachedDevice>> 
 /// The notice mentions the token because falling back to defaults
 /// regenerates the RTSP access token, which invalidates saved client
 /// URLs.
-fn parse_settings(content: &str, path: &Path, notices: &mut Vec<String>) -> Option<AppSettings> {
-    let parsed = match toml::from_str::<AppSettings>(content) {
-        Ok(settings) => crate::settings_validation::validate_prospective_settings(settings),
+fn parse_settings(
+    content: &str,
+    path: &Path,
+    notices: &mut Vec<String>,
+    key: Option<&[u8]>,
+) -> Option<AppSettings> {
+    let parsed = match toml::from_str::<PersistedAppSettings>(content) {
+        Ok(settings) => runtime_settings_from_persisted(settings, key),
         Err(error) => Err(crate::AppError::Config(error.to_string())),
     };
     match parsed {
@@ -1008,25 +1344,21 @@ fn load_from_disk(notices: &mut Vec<String>) -> Option<AppSettings> {
         }
     };
 
-    let mut settings = parse_settings(&content, &path, notices)?;
-
-    // Resolve the stored (encrypted) credentials against the key. A
-    // usable key decrypts them; an absent or unusable key clears any
-    // non-empty field rather than handing base64 ciphertext to the UI —
-    // which would otherwise be re-encrypted into permanent garbage on
-    // the next save. A transient key-read error (Err) also clears for
-    // this load (we can't decrypt now) but leaves the on-disk key/cipher
-    // untouched, so a later launch recovers.
-    let key: Option<[u8; 32]> = read_key().ok().flatten().map(|(k, _)| k);
-    let (username, password) = resolve_credentials(
-        &settings.credentials.username,
-        &settings.credentials.password,
-        key.as_ref().map(|k| &k[..]),
-    );
-    settings.credentials.username = username;
-    settings.credentials.password = password;
-
-    Some(settings)
+    // A transient key read error does not regenerate the key. Camera
+    // credentials follow their established clear-for-this-load policy; a
+    // non-empty SRT ciphertext becomes Unavailable and remains preserved.
+    let key: Option<[u8; 32]> = match read_key() {
+        Ok(Some((key, _needs_rewrap))) => Some(key),
+        Ok(None) => None,
+        Err(error) => {
+            log::error!(
+                "config: encryption key is temporarily unreadable; protected fields will remain unavailable for this launch: {}",
+                error
+            );
+            None
+        }
+    };
+    parse_settings(&content, &path, notices, key.as_ref().map(|key| &key[..]))
 }
 
 /// Resolve stored (possibly encrypted) credential fields to plaintext.
@@ -1074,16 +1406,12 @@ fn save_to_disk(settings: &AppSettings) -> Result<(), crate::AppError> {
     fs::create_dir_all(&dir).map_err(|e| crate::AppError::Config(e.to_string()))?;
 
     let key_bytes = get_or_create_key()?;
-
-    let mut save_settings = settings.clone();
-    save_settings.credentials.username = encrypt_string(&settings.credentials.username, &key_bytes);
-    save_settings.credentials.password = encrypt_string(&settings.credentials.password, &key_bytes);
-
-    let content = toml::to_string_pretty(&save_settings)
-        .map_err(|e| crate::AppError::Config(e.to_string()))?;
-    atomic_write(&config_path(), content.as_bytes())
-        .map_err(|e| crate::AppError::Config(e.to_string()))?;
-    Ok(())
+    save_settings_to_path_with_srt_encryptor(
+        settings,
+        &config_path(),
+        &key_bytes,
+        encrypt_string_checked,
+    )
 }
 
 /// DPAPI-wrap bytes for the current user (Windows). Returns the opaque
@@ -1273,22 +1601,35 @@ fn get_or_create_key() -> Result<Vec<u8>, crate::AppError> {
 }
 
 fn encrypt_string(plaintext: &str, key: &[u8]) -> String {
+    encrypt_string_checked(plaintext, key).unwrap_or_else(|error| {
+        // Preserve the established camera-credential behavior. SRT never
+        // calls this lossy wrapper; its checked path aborts the whole save.
+        log::error!("config: credential encryption failed: {}", error);
+        String::new()
+    })
+}
+
+fn encrypt_string_checked(plaintext: &str, key: &[u8]) -> Result<String, crate::AppError> {
     if plaintext.is_empty() {
-        return String::new();
+        return Ok(String::new());
     }
-    let cipher = Aes256Gcm::new_from_slice(key).expect("invalid key length");
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|_| crate::AppError::Config("invalid protected-secret key length".into()))?;
     let mut nonce_bytes = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    match cipher.encrypt(nonce, plaintext.as_bytes()) {
-        Ok(ciphertext) => {
-            let mut combined = nonce_bytes.to_vec();
-            combined.extend(ciphertext);
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &combined)
-        }
-        Err(_) => String::new(),
-    }
+    let ciphertext = cipher.encrypt(nonce, plaintext.as_bytes()).map_err(|_| {
+        crate::AppError::Config(
+            "protected-secret encryption failed; settings were not saved".into(),
+        )
+    })?;
+    let mut combined = nonce_bytes.to_vec();
+    combined.extend(ciphertext);
+    Ok(base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        &combined,
+    ))
 }
 
 fn decrypt_string(encrypted: &str, key: &[u8]) -> Option<String> {
@@ -1323,6 +1664,19 @@ mod hex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_KEY: [u8; 32] = [0x42; 32];
+
+    fn serialize_for_test(settings: &AppSettings) -> String {
+        serialize_settings_with_srt_encryptor(settings, &TEST_KEY, encrypt_string_checked)
+            .expect("test settings should serialize")
+    }
+
+    fn parse_for_test(content: &str) -> Result<AppSettings, crate::AppError> {
+        let persisted: PersistedAppSettings =
+            toml::from_str(content).map_err(|error| crate::AppError::Config(error.to_string()))?;
+        runtime_settings_from_persisted(persisted, Some(&TEST_KEY))
+    }
 
     // ── Encryption / Decryption ─────────────────────────────────────
 
@@ -1576,6 +1930,82 @@ mod tests {
         assert!(s.credentials.password.is_empty());
     }
 
+    #[test]
+    fn default_settings_srt_server_is_passwordless() {
+        let s = AppSettings::default();
+        assert_eq!(s.srt_server.port, 8_890);
+        assert_eq!(s.srt_server.latency_ms, 125);
+        assert!(s.srt_server.stream_id.is_empty());
+        assert!(s.srt_server.bind_interface.is_empty());
+        assert!(matches!(
+            s.srt_server.passphrase,
+            SrtPassphraseState::Unencrypted
+        ));
+    }
+
+    #[test]
+    fn settings_view_exposes_only_available_srt_plaintext() {
+        let mut settings = AppSettings::default();
+
+        let unencrypted = serde_json::to_value(AppSettingsView::from(&settings)).unwrap();
+        assert_eq!(
+            unencrypted["srt_server"]["passphrase"]["state"],
+            "unencrypted"
+        );
+        assert!(unencrypted["srt_server"]["passphrase"]["value"].is_null());
+
+        settings.srt_server.passphrase = SrtPassphraseState::Available("strongPass1".into());
+        let available = serde_json::to_value(AppSettingsView::from(&settings)).unwrap();
+        assert_eq!(available["srt_server"]["passphrase"]["state"], "available");
+        assert_eq!(
+            available["srt_server"]["passphrase"]["value"],
+            "strongPass1"
+        );
+
+        settings.srt_server.passphrase = SrtPassphraseState::Unavailable {
+            preserved_ciphertext: "ciphertext-must-not-cross-ipc".into(),
+        };
+        let unavailable = serde_json::to_value(AppSettingsView::from(&settings)).unwrap();
+        assert_eq!(
+            unavailable["srt_server"]["passphrase"]["state"],
+            "unavailable"
+        );
+        assert!(unavailable["srt_server"]["passphrase"]["value"].is_null());
+        assert!(!unavailable
+            .to_string()
+            .contains("ciphertext-must-not-cross-ipc"));
+    }
+
+    #[test]
+    fn srt_passphrase_update_json_requires_an_explicit_action() {
+        assert!(matches!(
+            serde_json::from_str::<SrtPassphraseUpdate>(r#"{"action":"keep"}"#).unwrap(),
+            SrtPassphraseUpdate::Keep
+        ));
+        assert!(matches!(
+            serde_json::from_str::<SrtPassphraseUpdate>(r#"{"action":"clear"}"#).unwrap(),
+            SrtPassphraseUpdate::Clear
+        ));
+        match serde_json::from_str::<SrtPassphraseUpdate>(
+            r#"{"action":"replace","value":"strongPass1"}"#,
+        )
+        .unwrap()
+        {
+            SrtPassphraseUpdate::Replace(value) => assert_eq!(value, "strongPass1"),
+            _ => panic!("replace action should carry its explicit value"),
+        }
+
+        for malformed in [
+            r#"{}"#,
+            r#"{"action":""}"#,
+            r#"{"action":"replace"}"#,
+            r#"{"value":"strongPass1"}"#,
+            r#"{"action":"keep","value":"strongPass1"}"#,
+        ] {
+            assert!(serde_json::from_str::<SrtPassphraseUpdate>(malformed).is_err());
+        }
+    }
+
     // ── TOML Serialization ──────────────────────────────────────────
 
     #[test]
@@ -1594,13 +2024,13 @@ camera_ip = ""
 [rtsp_server]
 enabled = false
 port = 8554
-token = "abc"
+token = "0123456789abcdef"
 
 [credentials]
 username = ""
 password = ""
 "#;
-        assert!(toml::from_str::<AppSettings>(toml_str).is_err());
+        assert!(toml::from_str::<PersistedAppSettings>(toml_str).is_err());
     }
 
     #[test]
@@ -1634,8 +2064,8 @@ password = ""
     #[test]
     fn settings_toml_roundtrip() {
         let original = AppSettings::default();
-        let toml_str = toml::to_string_pretty(&original).unwrap();
-        let parsed: AppSettings = toml::from_str(&toml_str).unwrap();
+        let toml_str = serialize_for_test(&original);
+        let parsed = parse_for_test(&toml_str).unwrap();
         assert_eq!(parsed.stream.protocol, original.stream.protocol);
         assert_eq!(parsed.stream.rtsp_port, original.stream.rtsp_port);
         assert_eq!(parsed.rtsp_server.port, original.rtsp_server.port);
@@ -1657,9 +2087,10 @@ password = ""
             rtsp_server: RtspServerConfig {
                 enabled: true,
                 port: 9554,
-                token: "abc123".into(),
+                token: "0123456789abcdef".into(),
                 bind_interface: "Ethernet 2".into(),
             },
+            srt_server: SrtServerConfig::default(),
             credentials: Credentials {
                 username: "admin".into(),
                 password: "secret".into(),
@@ -1670,8 +2101,8 @@ password = ""
             network_mode: NetworkMode::default(),
             manual_nodes: Vec::new(),
         };
-        let toml_str = toml::to_string_pretty(&settings).unwrap();
-        let parsed: AppSettings = toml::from_str(&toml_str).unwrap();
+        let toml_str = serialize_for_test(&settings);
+        let parsed = parse_for_test(&toml_str).unwrap();
         assert_eq!(parsed.stream.protocol, StreamProtocol::Udp);
         assert_eq!(parsed.stream.camera_ip, "10.0.0.5");
         assert_eq!(parsed.rtsp_server.bind_interface, "Ethernet 2");
@@ -1695,17 +2126,187 @@ password = ""
             [rtsp_server]
             enabled = false
             port = 8554
-            token = "tok"
+            token = "0123456789abcdef"
 
             [credentials]
             username = ""
             password = ""
         "#;
-        let parsed: AppSettings = toml::from_str(toml_str).unwrap();
+        let parsed = parse_for_test(toml_str).unwrap();
         assert!(!parsed.stream.audio_muted);
         // The rest of the stream section must survive the migration.
         assert_eq!(parsed.stream.camera_ip, "192.168.1.10");
         assert_eq!(parsed.stream.rtsp_path, "/live");
+    }
+
+    #[test]
+    fn srt_available_passphrase_is_encrypted_at_rest_and_roundtrips() {
+        let mut settings = AppSettings::default();
+        settings.srt_server.port = 9_001;
+        settings.srt_server.passphrase = SrtPassphraseState::Available("strongPass1".into());
+        settings.srt_server.latency_ms = 250;
+        settings.srt_server.stream_id = "#!::name=Field Unit 7".into();
+        settings.srt_server.bind_interface = "ZeroTier One".into();
+
+        let content = serialize_for_test(&settings);
+        assert!(!content.contains("strongPass1"));
+        let persisted: PersistedAppSettings = toml::from_str(&content).unwrap();
+        assert!(!persisted.srt_server.passphrase.is_empty());
+        assert_ne!(persisted.srt_server.passphrase, "strongPass1");
+
+        let parsed = parse_for_test(&content).unwrap();
+        assert_eq!(parsed.srt_server.port, 9_001);
+        assert_eq!(parsed.srt_server.latency_ms, 250);
+        assert_eq!(parsed.srt_server.stream_id, "#!::name=Field Unit 7");
+        assert_eq!(parsed.srt_server.bind_interface, "ZeroTier One");
+        match parsed.srt_server.passphrase {
+            SrtPassphraseState::Available(value) => assert_eq!(value, "strongPass1"),
+            _ => panic!("encrypted SRT passphrase should decrypt as Available"),
+        }
+    }
+
+    #[test]
+    fn missing_wrong_or_corrupt_key_preserves_srt_ciphertext_as_unavailable() {
+        let mut settings = AppSettings::default();
+        settings.srt_server.passphrase = SrtPassphraseState::Available("strongPass1".into());
+        let persisted =
+            persisted_settings_with_srt_encryptor(&settings, &TEST_KEY, encrypt_string_checked)
+                .unwrap();
+        let ciphertext = persisted.srt_server.passphrase.clone();
+
+        for loaded in [
+            runtime_settings_from_persisted(persisted.clone(), None).unwrap(),
+            runtime_settings_from_persisted(persisted.clone(), Some(&[0x99; 32])).unwrap(),
+        ] {
+            match loaded.srt_server.passphrase {
+                SrtPassphraseState::Unavailable {
+                    preserved_ciphertext,
+                } => assert_eq!(preserved_ciphertext, ciphertext),
+                _ => panic!("an unreadable protected passphrase must remain Unavailable"),
+            }
+        }
+
+        let mut corrupt = persisted;
+        corrupt.srt_server.passphrase = "not-valid-base64!!!".into();
+        let loaded = runtime_settings_from_persisted(corrupt, Some(&TEST_KEY)).unwrap();
+        match loaded.srt_server.passphrase {
+            SrtPassphraseState::Unavailable {
+                preserved_ciphertext,
+            } => assert_eq!(preserved_ciphertext, "not-valid-base64!!!"),
+            _ => panic!("corrupt ciphertext must remain Unavailable"),
+        }
+    }
+
+    #[test]
+    fn unrelated_save_preserves_unavailable_srt_ciphertext_exactly() {
+        let mut settings = AppSettings::default();
+        settings.srt_server.passphrase = SrtPassphraseState::Available("strongPass1".into());
+        let persisted =
+            persisted_settings_with_srt_encryptor(&settings, &TEST_KEY, encrypt_string_checked)
+                .unwrap();
+        let ciphertext = persisted.srt_server.passphrase.clone();
+        let mut unavailable = runtime_settings_from_persisted(persisted, None).unwrap();
+        unavailable.network_mode = NetworkMode::Dhcp;
+
+        let replacement_key = [0x77; 32];
+        let content = serialize_settings_with_srt_encryptor(
+            &unavailable,
+            &replacement_key,
+            encrypt_string_checked,
+        )
+        .unwrap();
+        let rewritten: PersistedAppSettings = toml::from_str(&content).unwrap();
+        assert_eq!(rewritten.srt_server.passphrase, ciphertext);
+    }
+
+    #[test]
+    fn explicit_passwordless_srt_serializes_as_empty_passphrase() {
+        let settings = AppSettings::default();
+        let content = serialize_for_test(&settings);
+        let persisted: PersistedAppSettings = toml::from_str(&content).unwrap();
+        assert!(persisted.srt_server.passphrase.is_empty());
+        assert!(content.contains("passphrase = \"\""));
+    }
+
+    #[test]
+    fn srt_encryption_failure_preserves_existing_settings_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "existing settings").unwrap();
+        let mut settings = AppSettings::default();
+        settings.srt_server.passphrase = SrtPassphraseState::Available("strongPass1".into());
+
+        let error =
+            save_settings_to_path_with_srt_encryptor(&settings, &path, &TEST_KEY, |_, _| {
+                Err(crate::AppError::Config(
+                    "injected encryption failure".into(),
+                ))
+            })
+            .expect_err("save must fail closed");
+
+        assert_eq!(error.kind(), "Config");
+        assert_eq!(fs::read_to_string(path).unwrap(), "existing settings");
+    }
+
+    #[test]
+    fn protected_srt_states_can_never_serialize_an_empty_ciphertext() {
+        let mut available = AppSettings::default();
+        available.srt_server.passphrase = SrtPassphraseState::Available("strongPass1".into());
+        let error =
+            serialize_settings_with_srt_encryptor(&available, &TEST_KEY, |_, _| Ok(String::new()))
+                .expect_err("an empty encryption result must fail closed");
+        assert_eq!(error.kind(), "Config");
+
+        let mut unavailable = AppSettings::default();
+        unavailable.srt_server.passphrase = SrtPassphraseState::Unavailable {
+            preserved_ciphertext: String::new(),
+        };
+        let error =
+            serialize_settings_with_srt_encryptor(&unavailable, &TEST_KEY, encrypt_string_checked)
+                .expect_err("Unavailable must always retain non-empty ciphertext");
+        assert_eq!(error.kind(), "Config");
+    }
+
+    #[test]
+    fn checked_secret_encryption_rejects_invalid_key_length() {
+        let error =
+            encrypt_string_checked("strongPass1", &[0x42; 31]).expect_err("invalid key must fail");
+        assert_eq!(error.kind(), "Config");
+    }
+
+    #[test]
+    fn persisted_wide_restream_values_reach_typed_validation() {
+        let base = persisted_settings_with_srt_encryptor(
+            &AppSettings::default(),
+            &TEST_KEY,
+            encrypt_string_checked,
+        )
+        .unwrap();
+
+        for port in [i64::MIN, -1, 0, 65_536, i64::MAX] {
+            let mut candidate = base.clone();
+            candidate.rtsp_server.port = port;
+            let error = runtime_settings_from_persisted(candidate, Some(&TEST_KEY))
+                .err()
+                .expect("wide RTSP port must be rejected by validation");
+            assert_eq!(error.kind(), "Validation");
+        }
+        for port in [i64::MIN, -1, 0, 65_536, i64::MAX] {
+            let mut candidate = base.clone();
+            candidate.srt_server.port = port;
+            let error = runtime_settings_from_persisted(candidate, Some(&TEST_KEY))
+                .err()
+                .expect("wide SRT port must be rejected by validation");
+            assert_eq!(error.kind(), "Validation");
+        }
+        for latency_ms in [i64::MIN, -1, 0, 19, 8_001, i64::MAX] {
+            let mut candidate = base.clone();
+            candidate.srt_server.latency_ms = latency_ms;
+            let error = runtime_settings_from_persisted(candidate, Some(&TEST_KEY))
+                .err()
+                .expect("wide SRT latency must be rejected by validation");
+            assert_eq!(error.kind(), "Validation");
+        }
     }
 
     // ── Config Paths ────────────────────────────────────────────────
@@ -1755,14 +2356,12 @@ password = ""
     // still cover the remaining backend-owned fields.
 
     #[test]
-    fn appsettings_no_longer_carries_device_cache() {
-        // Compile-time check that AppSettings doesn't accidentally
-        // regrow a `device_cache` field — if someone re-adds it the
-        // round-trip TOML would carry it, and we'd be back where T0.1
-        // started. The field name must not appear in the serialized
-        // form.
+    fn persisted_settings_exclude_device_cache() {
+        // The private persisted DTO structurally excludes device_cache,
+        // which lives in device_cache.toml. Keep that separation visible in
+        // the complete serialized settings form.
         let s = AppSettings::default();
-        let toml_str = toml::to_string_pretty(&s).unwrap();
+        let toml_str = serialize_for_test(&s);
         assert!(
             !toml_str.contains("device_cache"),
             "AppSettings must not serialize a device_cache field — \
@@ -1856,8 +2455,8 @@ password = ""
             ip: "10.13.248.55".into(),
             alias: String::new(),
         });
-        let toml_str = toml::to_string_pretty(&settings).unwrap();
-        let parsed: AppSettings = toml::from_str(&toml_str).unwrap();
+        let toml_str = serialize_for_test(&settings);
+        let parsed = parse_for_test(&toml_str).unwrap();
         assert_eq!(parsed.manual_nodes.len(), 2);
         assert_eq!(parsed.manual_nodes[0].ip, "192.168.1.202");
         assert_eq!(parsed.manual_nodes[0].alias, "PTU");
@@ -1880,16 +2479,22 @@ camera_ip = ""
 [rtsp_server]
 enabled = false
 port = 8554
-token = "abc"
+token = "0123456789abcdef"
 
 [credentials]
 username = ""
 password = ""
 "#;
-        let parsed: AppSettings = toml::from_str(legacy).unwrap();
+        let parsed = parse_for_test(legacy).unwrap();
         assert_eq!(parsed.restream_protocol, RestreamProtocol::Rtsp);
         assert_eq!(parsed.network_mode, NetworkMode::StaticAuto);
         assert!(parsed.manual_nodes.is_empty());
+        assert_eq!(parsed.srt_server.port, 8_890);
+        assert_eq!(parsed.srt_server.latency_ms, 125);
+        assert!(matches!(
+            parsed.srt_server.passphrase,
+            SrtPassphraseState::Unencrypted
+        ));
     }
 
     #[test]
@@ -1905,8 +2510,8 @@ password = ""
                 last_device_seen: None,
             },
         );
-        let toml_str = toml::to_string_pretty(&settings).unwrap();
-        let parsed: AppSettings = toml::from_str(&toml_str).unwrap();
+        let toml_str = serialize_for_test(&settings);
+        let parsed = parse_for_test(&toml_str).unwrap();
         assert_eq!(parsed.adopted_meta.len(), 1);
         let meta = &parsed.adopted_meta["169.254.168.0/24"];
         assert_eq!(
@@ -1932,7 +2537,7 @@ camera_ip = ""
 [rtsp_server]
 enabled = false
 port = 8554
-token = "abc"
+token = "0123456789abcdef"
 
 [credentials]
 username = ""
@@ -1941,7 +2546,7 @@ password = ""
 [adopted_subnets]
 "169.254.168.0/24" = "169.254.168.102"
 "#;
-        let parsed: AppSettings = toml::from_str(legacy).unwrap();
+        let parsed = parse_for_test(legacy).unwrap();
         assert_eq!(parsed.adopted_subnets.len(), 1);
         assert!(parsed.adopted_meta.is_empty());
     }
@@ -2295,7 +2900,7 @@ password = ""
         let path = dir.path().join("config.toml");
         fs::write(&path, "not [valid toml").unwrap();
         let mut notices = Vec::new();
-        let parsed = parse_settings("not [valid toml", &path, &mut notices);
+        let parsed = parse_settings("not [valid toml", &path, &mut notices, None);
         assert!(parsed.is_none());
         assert!(!path.exists(), "corrupted file should be moved aside");
         assert!(dir.path().join("config.toml.parse-error").exists());
@@ -2310,9 +2915,9 @@ password = ""
     fn clean_settings_toml_records_no_notice() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let content = toml::to_string(&AppSettings::default()).unwrap();
+        let content = serialize_for_test(&AppSettings::default());
         let mut notices = Vec::new();
-        let parsed = parse_settings(&content, &path, &mut notices);
+        let parsed = parse_settings(&content, &path, &mut notices, Some(&TEST_KEY));
         assert!(parsed.is_some());
         assert!(notices.is_empty());
     }
@@ -2321,13 +2926,18 @@ password = ""
     fn invalid_persisted_restream_settings_are_quarantined() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let mut settings = AppSettings::default();
-        settings.rtsp_server.token = "0123456789ABCDEf".into();
-        let content = toml::to_string(&settings).unwrap();
+        let mut persisted = persisted_settings_with_srt_encryptor(
+            &AppSettings::default(),
+            &TEST_KEY,
+            encrypt_string_checked,
+        )
+        .unwrap();
+        persisted.srt_server.port = 65_536;
+        let content = toml::to_string(&persisted).unwrap();
         fs::write(&path, &content).unwrap();
 
         let mut notices = Vec::new();
-        let parsed = parse_settings(&content, &path, &mut notices);
+        let parsed = parse_settings(&content, &path, &mut notices, Some(&TEST_KEY));
 
         assert!(parsed.is_none());
         assert!(!path.exists());

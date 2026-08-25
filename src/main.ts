@@ -407,6 +407,11 @@ function setupSettingsSave(): void {
   });
 
   $<HTMLButtonElement>("#save-settings").addEventListener("click", async () => {
+    if (!state.config) {
+      showToast("Settings are still loading", true);
+      return;
+    }
+
     // Narrow to the StreamProtocol union — the backend enum rejects
     // anything else, and the only two toggle buttons carry these values.
     const activeProto: StreamProtocol =
@@ -438,7 +443,8 @@ function setupSettingsSave(): void {
       $<HTMLInputElement>("#restream-server-enable").checked,
       Number.isNaN(parsedRestreamPort) ? 8554 : parsedRestreamPort,
       $<HTMLInputElement>("#rtsp-token").value,
-      state.config?.rtsp_server?.bind_interface || ""
+      state.config.rtsp_server.bind_interface,
+      state.config.srt_server
     );
     const credentials: Credentials = {
       username: $<HTMLInputElement>("#camera-user").value,

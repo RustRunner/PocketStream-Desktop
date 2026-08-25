@@ -9,7 +9,12 @@ import { sessionCamIp } from "./store.ts";
 import { formatError } from "./errors.ts";
 import { formatRestreamBitrate } from "./restream-format.ts";
 import { getActiveCamIp, getActivePtuIp } from "./network.ts";
-import type { RestreamOperationResult, RestreamSettingsUpdate, StreamStatus } from "./types.ts";
+import type {
+  RestreamOperationResult,
+  RestreamSettingsUpdate,
+  SrtServerConfig,
+  StreamStatus,
+} from "./types.ts";
 
 /** Full client URL (including protocol access data) for QR generation. */
 let restreamFullUrl: string | null = null;
@@ -392,14 +397,15 @@ export function setupRestreamControls(): void {
     const changeGeneration = restreamBindGeneration;
     select.disabled = true;
     try {
-      const result = await api.applyRestreamSettings({
-        enabled: state.config.rtsp_server.enabled,
-        rtsp_server: {
-          port: state.config.rtsp_server.port,
-          token: state.config.rtsp_server.token,
-          bind_interface: requested,
-        },
-      });
+      const result = await api.applyRestreamSettings(
+        buildRestreamSettingsUpdate(
+          state.config.rtsp_server.enabled,
+          state.config.rtsp_server.port,
+          state.config.rtsp_server.token,
+          requested,
+          state.config.srt_server
+        )
+      );
       state.config.rtsp_server.bind_interface = requested;
       applyRestreamOperationResult(result);
     } catch (e) {
@@ -544,11 +550,22 @@ export function buildRestreamSettingsUpdate(
   enabled: boolean,
   port: number,
   token: string,
-  bindInterface: string
+  bindInterface: string,
+  srtServer: SrtServerConfig
 ): RestreamSettingsUpdate {
   return {
     enabled,
     rtsp_server: { port, token, bind_interface: bindInterface },
+    // The SRT controls remain hidden until the runtime slice. Sending the
+    // complete canonical section with Keep prevents an RTSP save from
+    // rewriting, clearing, or exposing its protected secret state.
+    srt_server: {
+      port: srtServer.port,
+      passphrase: { action: "keep" },
+      latency_ms: srtServer.latency_ms,
+      stream_id: srtServer.stream_id,
+      bind_interface: srtServer.bind_interface,
+    },
   };
 }
 

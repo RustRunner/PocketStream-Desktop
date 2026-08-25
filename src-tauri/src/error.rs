@@ -24,6 +24,9 @@ pub enum AppError {
     #[error("Validation error: {0}")]
     Validation(String),
 
+    #[error("SRT passphrase unavailable: {0}")]
+    SrtPassphraseUnavailable(String),
+
     #[error("Camera error: {0}")]
     Camera(String),
 
@@ -44,6 +47,7 @@ impl AppError {
             AppError::Stream(_) => "Stream",
             AppError::Config(_) => "Config",
             AppError::Validation(_) => "Validation",
+            AppError::SrtPassphraseUnavailable(_) => "SrtPassphraseUnavailable",
             AppError::Camera(_) => "Camera",
             AppError::Io(_) => "Io",
             AppError::Serde(_) => "Serde",
@@ -100,6 +104,15 @@ mod tests {
     }
 
     #[test]
+    fn display_srt_passphrase_unavailable_error() {
+        let err = AppError::SrtPassphraseUnavailable("replace or clear it".into());
+        assert_eq!(
+            err.to_string(),
+            "SRT passphrase unavailable: replace or clear it"
+        );
+    }
+
+    #[test]
     fn display_camera_error() {
         let err = AppError::Camera("no device".into());
         assert_eq!(err.to_string(), "Camera error: no device");
@@ -131,6 +144,10 @@ mod tests {
         assert_eq!(AppError::Stream("x".into()).kind(), "Stream");
         assert_eq!(AppError::Config("x".into()).kind(), "Config");
         assert_eq!(AppError::Validation("x".into()).kind(), "Validation");
+        assert_eq!(
+            AppError::SrtPassphraseUnavailable("x".into()).kind(),
+            "SrtPassphraseUnavailable"
+        );
         assert_eq!(AppError::Camera("x".into()).kind(), "Camera");
     }
 
