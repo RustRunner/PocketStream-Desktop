@@ -309,6 +309,7 @@ struct StreamState {
 struct RestreamStopIntent {
     epoch: u64,
     target_generation: Option<u64>,
+    was_desired: bool,
 }
 
 #[derive(Clone)]
@@ -794,6 +795,22 @@ impl StreamManager {
             && state.restream_intent_epoch == Some(expected_epoch)
     }
 
+    async fn current_restream_epoch_and_desired(&self) -> (u64, bool) {
+        loop {
+            let epoch = self
+                .restream_epoch
+                .load(std::sync::atomic::Ordering::Acquire);
+            let desired = self.state.lock().await.restream_desired;
+            if self
+                .restream_epoch
+                .load(std::sync::atomic::Ordering::Acquire)
+                == epoch
+            {
+                return (epoch, desired);
+            }
+        }
+    }
+
     async fn cancel_restream_start_intent(&self, start_epoch: u64, preserve_prior_desired: bool) {
         if self
             .restream_epoch
@@ -1125,7 +1142,7 @@ impl StreamManager {
     async fn publish_restream_stop_intent(&self, stop_epoch: u64) -> Option<RestreamStopIntent> {
         self.relay_wake.notify_waiters();
 
-        let target_generation = {
+        let (target_generation, was_desired) = {
             let mut state = self.state.lock().await;
             // A newer intent owns desired state and listener replacement.
             // This stale Stop must neither clear it nor tear down its server.
@@ -1158,13 +1175,14 @@ impl StreamManager {
                 state.restream_intent_epoch = None;
                 state.restream_start_time = None;
             }
-            target
+            (target, stops_desired)
         };
         self.refresh_status().await;
 
         Some(RestreamStopIntent {
             epoch: stop_epoch,
             target_generation,
+            was_desired,
         })
     }
 
@@ -1235,6 +1253,34 @@ impl StreamManager {
         }
     }
 
+    async fn restore_restream_after_transaction_error(
+        &self,
+        old_settings: &AppSettings,
+        adopted: &std::collections::HashSet<String>,
+        stop_intent: RestreamStopIntent,
+        error: AppError,
+    ) -> AppError {
+        if !stop_intent.was_desired {
+            return error;
+        }
+        let Some((start_epoch, preserve_prior_desired)) = self
+            .begin_restream_start_intent_if_current(stop_intent.epoch)
+            .await
+        else {
+            return error;
+        };
+        match self
+            .start_restream_server_inner(old_settings, adopted, start_epoch, preserve_prior_desired)
+            .await
+        {
+            Ok(_) => error,
+            Err(restoration_error) => AppError::Config(format!(
+                "{}; restoring the prior re-stream output also failed: {}",
+                error, restoration_error
+            )),
+        }
+    }
+
     /// Apply the shared Enable field and both complete protocol sections as
     /// one backend lifecycle transaction. Inactive-protocol edits persist
     /// without replacing the selected runtime.
@@ -1244,70 +1290,149 @@ impl StreamManager {
         update: RestreamSettingsUpdate,
         adopted: &std::collections::HashSet<String>,
     ) -> Result<RestreamOperationResult, AppError> {
+        self.apply_restream_settings_with(config, update, adopted, |config, prospective| {
+            config.commit_restream_settings(
+                prospective.rtsp_server.clone(),
+                prospective.srt_server.clone(),
+            )
+        })
+        .await
+    }
+
+    async fn apply_restream_settings_with<F>(
+        &self,
+        config: &AppConfig,
+        update: RestreamSettingsUpdate,
+        adopted: &std::collections::HashSet<String>,
+        commit: F,
+    ) -> Result<RestreamOperationResult, AppError>
+    where
+        F: FnOnce(&AppConfig, &AppSettings) -> Result<AppSettings, AppError>,
+    {
+        let initial_settings = config.get();
+        let initial_prospective = crate::settings_validation::prospective_restream_settings(
+            &initial_settings,
+            update.clone(),
+        )?;
+        let (operation_epoch, initial_was_desired) =
+            self.current_restream_epoch_and_desired().await;
+        let initial_runtime_changed =
+            selected_restream_runtime_changed(&initial_settings, &initial_prospective);
+        let initial_will_restart = initial_was_desired
+            && initial_runtime_changed
+            && initial_prospective.rtsp_server.enabled;
+        if initial_will_restart {
+            validate_selected_restream_startable(&initial_prospective)?;
+        }
+        let initial_must_stop = initial_was_desired
+            && (initial_runtime_changed || !initial_prospective.rtsp_server.enabled);
+
+        // Claim the stop epoch before waiting for an in-flight Start. That
+        // Start will observe the newer epoch before it can store a candidate.
+        let mut stop_intent = if initial_must_stop {
+            Some(
+                self.begin_restream_stop_intent_if_current(operation_epoch)
+                    .await
+                    .ok_or_else(|| {
+                        AppError::Stream(
+                            "Re-stream settings apply was superseded by a newer request".into(),
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+
         let _transaction = self.restream_transaction.lock().await;
-        let operation_epoch = self
+        let expected_epoch = stop_intent
+            .map(|intent| intent.epoch)
+            .unwrap_or(operation_epoch);
+        if self
             .restream_epoch
-            .load(std::sync::atomic::Ordering::Acquire);
-        let old_settings = config.get();
-        let prospective =
-            crate::settings_validation::prospective_restream_settings(&old_settings, update)?;
-        let was_desired = self.state.lock().await.restream_desired;
+            .load(std::sync::atomic::Ordering::Acquire)
+            != expected_epoch
+        {
+            return Err(AppError::Stream(
+                "Re-stream settings apply was superseded by a newer request".into(),
+            ));
+        }
+
+        // A transaction that already held the gate may have committed while
+        // this request was waiting. Rebase the complete update on its result.
+        let old_settings = crate::settings_validation::validate_prospective_settings(config.get())?;
+        let prospective = match crate::settings_validation::prospective_restream_settings(
+            &old_settings,
+            update,
+        ) {
+            Ok(settings) => settings,
+            Err(error) => {
+                return Err(match stop_intent {
+                    Some(intent) => {
+                        self.restore_restream_after_transaction_error(
+                            &old_settings,
+                            adopted,
+                            intent,
+                            error,
+                        )
+                        .await
+                    }
+                    None => error,
+                });
+            }
+        };
+        let mut was_desired = stop_intent
+            .map(|intent| intent.was_desired)
+            .unwrap_or(self.state.lock().await.restream_desired);
         let runtime_changed = selected_restream_runtime_changed(&old_settings, &prospective);
         let will_restart = was_desired && runtime_changed && prospective.rtsp_server.enabled;
         if will_restart {
-            validate_selected_restream_startable(&prospective)?;
+            if let Err(error) = validate_selected_restream_startable(&prospective) {
+                return Err(match stop_intent {
+                    Some(intent) => {
+                        self.restore_restream_after_transaction_error(
+                            &old_settings,
+                            adopted,
+                            intent,
+                            error,
+                        )
+                        .await
+                    }
+                    None => error,
+                });
+            }
         }
         let must_stop = was_desired && (runtime_changed || !prospective.rtsp_server.enabled);
-
-        let stop_intent = if must_stop {
+        if must_stop && stop_intent.is_none() {
             let intent = self
-                .begin_restream_stop_intent_if_current(operation_epoch)
+                .begin_restream_stop_intent_if_current(expected_epoch)
                 .await
                 .ok_or_else(|| {
                     AppError::Stream(
                         "Re-stream settings apply was superseded by a newer request".into(),
                     )
                 })?;
+            was_desired = intent.was_desired;
+            stop_intent = Some(intent);
+        }
+        if let Some(intent) = stop_intent {
             self.finish_restream_stop(intent).await?;
-            Some(intent)
-        } else {
-            None
-        };
+        }
 
-        let committed = match config.commit_restream_settings(
-            prospective.rtsp_server.clone(),
-            prospective.srt_server.clone(),
-        ) {
+        let committed = match commit(config, &prospective) {
             Ok(settings) => settings,
             Err(persistence_error) => {
-                let restoration_intent = if was_desired {
-                    match stop_intent {
-                        Some(intent) => {
-                            self.begin_restream_start_intent_if_current(intent.epoch)
-                                .await
-                        }
-                        None => None,
-                    }
-                } else {
-                    None
-                };
-                if let Some((start_epoch, preserve_prior_desired)) = restoration_intent {
-                    if let Err(restoration_error) = self
-                        .start_restream_server_inner(
+                return Err(match stop_intent {
+                    Some(intent) => {
+                        self.restore_restream_after_transaction_error(
                             &old_settings,
                             adopted,
-                            start_epoch,
-                            preserve_prior_desired,
+                            intent,
+                            persistence_error,
                         )
                         .await
-                    {
-                        return Err(AppError::Config(format!(
-                            "{}; restoring the prior re-stream output also failed: {}",
-                            persistence_error, restoration_error
-                        )));
                     }
-                }
-                return Err(persistence_error);
+                    None => persistence_error,
+                });
             }
         };
 
@@ -1337,30 +1462,112 @@ impl StreamManager {
         protocol: RestreamProtocol,
         adopted: &std::collections::HashSet<String>,
     ) -> Result<RestreamOperationResult, AppError> {
+        self.switch_restream_protocol_with(config, protocol, adopted, |config, protocol| {
+            config.commit_restream_protocol(protocol)
+        })
+        .await
+    }
+
+    async fn switch_restream_protocol_with<F>(
+        &self,
+        config: &AppConfig,
+        protocol: RestreamProtocol,
+        adopted: &std::collections::HashSet<String>,
+        commit: F,
+    ) -> Result<RestreamOperationResult, AppError>
+    where
+        F: FnOnce(&AppConfig, RestreamProtocol) -> Result<AppSettings, AppError>,
+    {
+        let initial_settings =
+            crate::settings_validation::validate_prospective_settings(config.get())?;
+        let mut initial_prospective = initial_settings.clone();
+        initial_prospective.restream_protocol = protocol;
+        let initial_prospective =
+            crate::settings_validation::validate_prospective_settings(initial_prospective)?;
+        let (operation_epoch, initial_was_desired) =
+            self.current_restream_epoch_and_desired().await;
+        validate_restream_switch_target(&initial_prospective, initial_was_desired)?;
+
+        // A different selector owns a new stop epoch as soon as validation
+        // succeeds, before it waits for a Start that may be resolving a bind.
+        let mut stop_intent = if initial_settings.restream_protocol != protocol {
+            Some(
+                self.begin_restream_stop_intent_if_current(operation_epoch)
+                    .await
+                    .ok_or_else(|| {
+                        AppError::Stream(
+                            "Re-stream protocol switch was superseded by a newer request".into(),
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+
         let _transaction = self.restream_transaction.lock().await;
-        let operation_epoch = self
+        let expected_epoch = stop_intent
+            .map(|intent| intent.epoch)
+            .unwrap_or(operation_epoch);
+        if self
             .restream_epoch
-            .load(std::sync::atomic::Ordering::Acquire);
+            .load(std::sync::atomic::Ordering::Acquire)
+            != expected_epoch
+        {
+            return Err(AppError::Stream(
+                "Re-stream protocol switch was superseded by a newer request".into(),
+            ));
+        }
+
         let old_settings = crate::settings_validation::validate_prospective_settings(config.get())?;
         let mut prospective = old_settings.clone();
         prospective.restream_protocol = protocol;
-        let prospective = crate::settings_validation::validate_prospective_settings(prospective)?;
-        let was_desired = self.state.lock().await.restream_desired;
-
-        if was_desired {
-            if !prospective.rtsp_server.enabled {
-                return Err(AppError::Validation(
-                    "Re-stream Server Enable must be on before switching".into(),
-                ));
-            }
-            validate_selected_restream_startable(&prospective)?;
+        let prospective =
+            match crate::settings_validation::validate_prospective_settings(prospective) {
+                Ok(settings) => settings,
+                Err(error) => {
+                    return Err(match stop_intent {
+                        Some(intent) => {
+                            self.restore_restream_after_transaction_error(
+                                &old_settings,
+                                adopted,
+                                intent,
+                                error,
+                            )
+                            .await
+                        }
+                        None => error,
+                    });
+                }
+            };
+        let mut was_desired = stop_intent
+            .map(|intent| intent.was_desired)
+            .unwrap_or(self.state.lock().await.restream_desired);
+        if let Err(error) = validate_restream_switch_target(&prospective, was_desired) {
+            return Err(match stop_intent {
+                Some(intent) => {
+                    self.restore_restream_after_transaction_error(
+                        &old_settings,
+                        adopted,
+                        intent,
+                        error,
+                    )
+                    .await
+                }
+                None => error,
+            });
         }
 
         if old_settings.restream_protocol == protocol {
             self.state.lock().await.selected_protocol = protocol;
+            if let Some(intent) = stop_intent {
+                self.finish_restream_stop(intent).await?;
+            }
             if was_desired {
+                let restart_epoch = stop_intent
+                    .map(|intent| intent.epoch)
+                    .unwrap_or(expected_epoch);
                 let Some((start_epoch, preserve_prior_desired)) = self
-                    .begin_restream_start_intent_if_current(operation_epoch)
+                    .begin_restream_start_intent_if_current(restart_epoch)
                     .await
                 else {
                     return Ok(self.current_operation_result().await);
@@ -1378,41 +1585,32 @@ impl StreamManager {
             return Ok(self.current_operation_result().await);
         }
 
-        let stop_intent = self
-            .begin_restream_stop_intent_if_current(operation_epoch)
-            .await
-            .ok_or_else(|| {
-                AppError::Stream(
-                    "Re-stream protocol switch was superseded by a newer request".into(),
-                )
-            })?;
+        if stop_intent.is_none() {
+            let intent = self
+                .begin_restream_stop_intent_if_current(expected_epoch)
+                .await
+                .ok_or_else(|| {
+                    AppError::Stream(
+                        "Re-stream protocol switch was superseded by a newer request".into(),
+                    )
+                })?;
+            was_desired = intent.was_desired;
+            stop_intent = Some(intent);
+        }
+        let stop_intent = stop_intent.expect("a selector change must own a stop intent");
         self.finish_restream_stop(stop_intent).await?;
 
-        let committed = match config.commit_restream_protocol(protocol) {
+        let committed = match commit(config, protocol) {
             Ok(settings) => settings,
             Err(persistence_error) => {
-                if was_desired {
-                    if let Some((start_epoch, preserve_prior_desired)) = self
-                        .begin_restream_start_intent_if_current(stop_intent.epoch)
-                        .await
-                    {
-                        if let Err(restoration_error) = self
-                            .start_restream_server_inner(
-                                &old_settings,
-                                adopted,
-                                start_epoch,
-                                preserve_prior_desired,
-                            )
-                            .await
-                        {
-                            return Err(AppError::Config(format!(
-                                "{}; restoring the prior re-stream output also failed: {}",
-                                persistence_error, restoration_error
-                            )));
-                        }
-                    }
-                }
-                return Err(persistence_error);
+                return Err(self
+                    .restore_restream_after_transaction_error(
+                        &old_settings,
+                        adopted,
+                        stop_intent,
+                        persistence_error,
+                    )
+                    .await);
             }
         };
 
@@ -1737,6 +1935,21 @@ fn validate_selected_restream_startable(settings: &AppSettings) -> Result<(), Ap
         crate::settings_validation::validate_srt_startable(settings)?;
     }
     Ok(())
+}
+
+fn validate_restream_switch_target(
+    settings: &AppSettings,
+    was_desired: bool,
+) -> Result<(), AppError> {
+    if !was_desired {
+        return Ok(());
+    }
+    if !settings.rtsp_server.enabled {
+        return Err(AppError::Validation(
+            "Re-stream Server Enable must be on before switching".into(),
+        ));
+    }
+    validate_selected_restream_startable(settings)
 }
 
 fn selected_restream_runtime_changed(old: &AppSettings, prospective: &AppSettings) -> bool {
@@ -2355,6 +2568,14 @@ mod tests {
             .port()
     }
 
+    fn unused_tcp_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
     #[test]
     fn bind_ip_prefers_native_over_adopted() {
         // Interface carries a native client IP and an adopted camera
@@ -2423,6 +2644,146 @@ mod tests {
             network_mode: NetworkMode::default(),
             manual_nodes: Vec::new(),
         }
+    }
+
+    fn restream_test_settings(protocol: RestreamProtocol) -> AppSettings {
+        let mut settings = make_settings(StreamProtocol::Udp, "", "", "");
+        settings.stream.udp_port = unused_udp_port();
+        settings.restream_protocol = protocol;
+        settings.rtsp_server.enabled = true;
+        settings.rtsp_server.port = unused_tcp_port();
+        settings.rtsp_server.token = "0123456789abcdef".into();
+        settings.srt_server.port = unused_udp_port();
+        while settings.srt_server.port == settings.stream.udp_port {
+            settings.srt_server.port = unused_udp_port();
+        }
+        settings.srt_server.passphrase = SrtPassphraseState::Unencrypted;
+        settings
+    }
+
+    fn restream_update_from(settings: &AppSettings, enabled: bool) -> RestreamSettingsUpdate {
+        RestreamSettingsUpdate {
+            enabled,
+            rtsp_server: RtspServerUpdate {
+                port: i64::from(settings.rtsp_server.port),
+                token: settings.rtsp_server.token.clone(),
+                bind_interface: settings.rtsp_server.bind_interface.clone(),
+            },
+            srt_server: SrtServerUpdate {
+                port: i64::from(settings.srt_server.port),
+                passphrase: SrtPassphraseUpdate::Keep,
+                latency_ms: i64::from(settings.srt_server.latency_ms),
+                stream_id: settings.srt_server.stream_id.clone(),
+                bind_interface: settings.srt_server.bind_interface.clone(),
+            },
+        }
+    }
+
+    fn commit_restream_settings_in_memory(
+        config: &AppConfig,
+        prospective: &AppSettings,
+    ) -> Result<AppSettings, AppError> {
+        config.commit_restream_settings_with(
+            prospective.rtsp_server.clone(),
+            prospective.srt_server.clone(),
+            |_| Ok(()),
+        )
+    }
+
+    fn commit_restream_protocol_in_memory(
+        config: &AppConfig,
+        protocol: RestreamProtocol,
+    ) -> Result<AppSettings, AppError> {
+        config.commit_restream_protocol_with(protocol, |_| Ok(()))
+    }
+
+    async fn active_restream_generation(manager: &StreamManager) -> Option<u64> {
+        manager
+            .state
+            .lock()
+            .await
+            .restream_server
+            .as_ref()
+            .map(RestreamServer::server_generation)
+    }
+
+    fn resolved_spec_for_test(settings: &AppSettings) -> ResolvedStartSpec {
+        let (_, output) = resolve_selected_restream_output(settings).unwrap();
+        ResolvedStartSpec {
+            source: ResolvedSource::Udp {
+                port: settings.stream.udp_port,
+            },
+            output,
+            bind_interface: None,
+            bind_address: None,
+            advertised_ip: "127.0.0.1".into(),
+            username: String::new(),
+            password: String::new(),
+        }
+    }
+
+    async fn seed_desired_relay_state(
+        manager: &StreamManager,
+        settings: &AppSettings,
+        relay_state: RelayState,
+    ) {
+        let health = Arc::new(RelayRuntimeHealth::new(41, relay::RelayIngestKind::Udp));
+        let instance = health.begin_server_instance(relay_state == RelayState::Recovering);
+        match relay_state {
+            RelayState::Starting => {}
+            RelayState::Listening => health.mark_listener_bound(instance),
+            RelayState::Streaming => {
+                health.mark_listener_bound(instance);
+                let generation = health.begin_data_generation(instance).unwrap();
+                assert!(health.report_streaming_without_buffer(
+                    instance,
+                    generation,
+                    tokio::time::Instant::now(),
+                ));
+            }
+            RelayState::Recovering => health.mark_recovery_in_progress(),
+            RelayState::Failed => {
+                health.mark_build_failed(instance, "injected runtime failure".into(), false)
+            }
+            RelayState::Stopped => panic!("Stopped has no desired relay state"),
+        }
+        assert_eq!(health.snapshot().state, relay_state);
+
+        let mut state = manager.state.lock().await;
+        state.restream_desired = true;
+        state.restream_spec = Some(resolved_spec_for_test(settings));
+        state.restream_health = Some(health);
+        state.restream_intent_epoch = Some(
+            manager
+                .restream_epoch
+                .load(std::sync::atomic::Ordering::Acquire),
+        );
+        state.restream_start_time = Some(std::time::Instant::now());
+    }
+
+    async fn wait_for_udp_rebind(port: u16) -> bool {
+        for _ in 0..40 {
+            if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    fn bind_udp_after_release(port: u16) -> std::net::UdpSocket {
+        let mut last_error = None;
+        for _ in 0..80 {
+            match std::net::UdpSocket::bind(("0.0.0.0", port)) {
+                Ok(socket) => return socket,
+                Err(error) => last_error = Some(error),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        panic!(
+            "the old listener did not release UDP port {port}: {}",
+            last_error.expect("at least one bind attempt must run")
+        );
     }
 
     // ── redact_url ─────────────────────────────────────────────────
@@ -2761,6 +3122,469 @@ mod tests {
         assert!(status.server_url.is_none());
         assert_eq!(status.connected_clients, 0);
         assert_eq!(status.client_limit, MAX_RTSP_CLIENTS);
+    }
+
+    #[tokio::test]
+    async fn stopped_switch_can_select_unavailable_srt_but_start_remains_blocked() {
+        let mut settings = restream_test_settings(RestreamProtocol::Rtsp);
+        settings.srt_server.passphrase = SrtPassphraseState::Unavailable {
+            preserved_ciphertext: "opaque-ciphertext".into(),
+        };
+        let config = AppConfig::for_test(settings);
+        let manager = StreamManager::with_selected_protocol(RestreamProtocol::Rtsp);
+        let adopted = adopted_set(&[]);
+
+        let result = manager
+            .switch_restream_protocol_with(
+                &config,
+                RestreamProtocol::Srt,
+                &adopted,
+                commit_restream_protocol_in_memory,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.selected_protocol, RestreamProtocol::Srt);
+        assert!(!result.desired);
+        assert!(result.server_info.is_none());
+        assert_eq!(config.get().restream_protocol, RestreamProtocol::Srt);
+        assert!(active_restream_generation(&manager).await.is_none());
+
+        let error = manager
+            .start_restream_server(&config, &adopted)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), "SrtPassphraseUnavailable");
+        assert!(!error.to_string().contains("opaque-ciphertext"));
+        let state = manager.state.lock().await;
+        assert!(!state.restream_desired);
+        assert!(state.restream_server.is_none());
+    }
+
+    #[tokio::test]
+    async fn switch_invalidates_a_start_before_waiting_for_the_transaction_gate() {
+        let settings = restream_test_settings(RestreamProtocol::Rtsp);
+        let config = AppConfig::for_test(settings);
+        let manager = StreamManager::with_selected_protocol(RestreamProtocol::Rtsp);
+        let gate = manager.restream_transaction.clone().lock_owned().await;
+        let (start_epoch, _) = manager.begin_restream_start_intent().await.unwrap();
+        let commit_called = std::sync::atomic::AtomicBool::new(false);
+        let adopted = adopted_set(&[]);
+
+        let operation = manager.switch_restream_protocol_with(
+            &config,
+            RestreamProtocol::Srt,
+            &adopted,
+            |config, protocol| {
+                commit_called.store(true, std::sync::atomic::Ordering::Release);
+                commit_restream_protocol_in_memory(config, protocol)
+            },
+        );
+        let supersede = async {
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if manager
+                        .restream_epoch
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        > start_epoch
+                        && !manager.state.lock().await.restream_desired
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("switch must invalidate the old Start before waiting for the gate");
+            assert!(!manager.restream_intent_is_current(start_epoch).await);
+            manager
+                .begin_restream_stop_intent()
+                .await
+                .expect("a newer Stop should supersede the waiting switch");
+            drop(gate);
+        };
+        let (result, ()) = tokio::join!(operation, supersede);
+
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), "Stream");
+        assert!(error.to_string().contains("superseded"));
+        assert!(!commit_called.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(config.get().restream_protocol, RestreamProtocol::Rtsp);
+        assert!(active_restream_generation(&manager).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn active_settings_apply_invalidates_start_before_waiting_for_the_gate() {
+        let settings = restream_test_settings(RestreamProtocol::Rtsp);
+        let mut update = restream_update_from(&settings, true);
+        update.rtsp_server.token = "fedcba9876543210".into();
+        let config = AppConfig::for_test(settings);
+        let manager = StreamManager::with_selected_protocol(RestreamProtocol::Rtsp);
+        let gate = manager.restream_transaction.clone().lock_owned().await;
+        let (start_epoch, _) = manager.begin_restream_start_intent().await.unwrap();
+        let commit_called = std::sync::atomic::AtomicBool::new(false);
+        let adopted = adopted_set(&[]);
+
+        let operation = manager.apply_restream_settings_with(
+            &config,
+            update,
+            &adopted,
+            |config, prospective| {
+                commit_called.store(true, std::sync::atomic::Ordering::Release);
+                commit_restream_settings_in_memory(config, prospective)
+            },
+        );
+        let supersede = async {
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if manager
+                        .restream_epoch
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        > start_epoch
+                        && !manager.state.lock().await.restream_desired
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("settings apply must invalidate the old Start before waiting for the gate");
+            manager
+                .begin_restream_stop_intent()
+                .await
+                .expect("a newer Stop should supersede the waiting apply");
+            drop(gate);
+        };
+        let (result, ()) = tokio::join!(operation, supersede);
+
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), "Stream");
+        assert!(error.to_string().contains("superseded"));
+        assert!(!commit_called.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(config.get().rtsp_server.token, "0123456789abcdef");
+    }
+
+    #[tokio::test]
+    async fn live_switch_replaces_exactly_one_listener_in_each_direction() {
+        init_gstreamer();
+        let settings = restream_test_settings(RestreamProtocol::Rtsp);
+        let rtsp_port = settings.rtsp_server.port;
+        let srt_port = settings.srt_server.port;
+        let config = AppConfig::for_test(settings);
+        let manager = StreamManager::with_selected_protocol(RestreamProtocol::Rtsp);
+        let adopted = adopted_set(&[]);
+
+        manager
+            .start_restream_server(&config, &adopted)
+            .await
+            .unwrap();
+        let initial_generation = active_restream_generation(&manager).await.unwrap();
+
+        let srt_result = manager
+            .switch_restream_protocol_with(
+                &config,
+                RestreamProtocol::Srt,
+                &adopted,
+                commit_restream_protocol_in_memory,
+            )
+            .await
+            .unwrap();
+        assert!(srt_result.desired);
+        assert_eq!(srt_result.selected_protocol, RestreamProtocol::Srt);
+        assert_eq!(
+            srt_result.server_info.unwrap().protocol,
+            RestreamProtocol::Srt
+        );
+        assert_eq!(
+            active_restream_generation(&manager).await,
+            Some(initial_generation + 1)
+        );
+        assert!(std::net::TcpListener::bind(("127.0.0.1", rtsp_port)).is_ok());
+
+        let rtsp_result = manager
+            .switch_restream_protocol_with(
+                &config,
+                RestreamProtocol::Rtsp,
+                &adopted,
+                commit_restream_protocol_in_memory,
+            )
+            .await
+            .unwrap();
+        assert!(rtsp_result.desired);
+        assert_eq!(rtsp_result.selected_protocol, RestreamProtocol::Rtsp);
+        assert_eq!(
+            active_restream_generation(&manager).await,
+            Some(initial_generation + 2)
+        );
+        assert!(wait_for_udp_rebind(srt_port).await);
+
+        manager.stop_restream_server().await.unwrap();
+        assert!(std::net::TcpListener::bind(("127.0.0.1", rtsp_port)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn desired_recovering_and_failed_outputs_switch_to_the_new_protocol() {
+        init_gstreamer();
+        for prior_state in [RelayState::Recovering, RelayState::Failed] {
+            let settings = restream_test_settings(RestreamProtocol::Rtsp);
+            let srt_port = settings.srt_server.port;
+            let config = AppConfig::for_test(settings.clone());
+            let manager = StreamManager::with_selected_protocol(RestreamProtocol::Rtsp);
+            let adopted = adopted_set(&[]);
+            seed_desired_relay_state(&manager, &settings, prior_state).await;
+            assert_eq!(
+                compute_status(&manager.state).await.relay_state,
+                prior_state
+            );
+
+            let result = manager
+                .switch_restream_protocol_with(
+                    &config,
+                    RestreamProtocol::Srt,
+                    &adopted,
+                    commit_restream_protocol_in_memory,
+                )
+                .await
+                .unwrap();
+            assert!(result.desired);
+            assert_eq!(result.selected_protocol, RestreamProtocol::Srt);
+            assert_eq!(result.server_info.unwrap().protocol, RestreamProtocol::Srt);
+            let status = compute_status(&manager.state).await;
+            assert!(status.desired);
+            assert_eq!(status.active_protocol, Some(RestreamProtocol::Srt));
+            assert!(status.server_running);
+
+            manager.stop_restream_server().await.unwrap();
+            assert!(wait_for_udp_rebind(srt_port).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_apply_restarts_only_active_changes_and_honors_enable() {
+        init_gstreamer();
+        let settings = restream_test_settings(RestreamProtocol::Rtsp);
+        let config = AppConfig::for_test(settings);
+        let manager = StreamManager::with_selected_protocol(RestreamProtocol::Rtsp);
+        let adopted = adopted_set(&[]);
+        manager
+            .start_restream_server(&config, &adopted)
+            .await
+            .unwrap();
+        let initial_generation = active_restream_generation(&manager).await.unwrap();
+
+        let mut inactive_update = restream_update_from(&config.get(), true);
+        inactive_update.srt_server.latency_ms = 250;
+        let inactive_result = manager
+            .apply_restream_settings_with(
+                &config,
+                inactive_update,
+                &adopted,
+                commit_restream_settings_in_memory,
+            )
+            .await
+            .unwrap();
+        assert!(inactive_result.desired);
+        assert_eq!(config.get().srt_server.latency_ms, 250);
+        assert_eq!(
+            active_restream_generation(&manager).await,
+            Some(initial_generation)
+        );
+
+        let mut active_update = restream_update_from(&config.get(), true);
+        active_update.rtsp_server.token = "fedcba9876543210".into();
+        let active_result = manager
+            .apply_restream_settings_with(
+                &config,
+                active_update,
+                &adopted,
+                commit_restream_settings_in_memory,
+            )
+            .await
+            .unwrap();
+        assert!(active_result.desired);
+        assert_eq!(
+            active_restream_generation(&manager).await,
+            Some(initial_generation + 1)
+        );
+
+        let disable_result = manager
+            .apply_restream_settings_with(
+                &config,
+                restream_update_from(&config.get(), false),
+                &adopted,
+                commit_restream_settings_in_memory,
+            )
+            .await
+            .unwrap();
+        assert!(!disable_result.desired);
+        assert!(disable_result.server_info.is_none());
+        assert!(!config.get().rtsp_server.enabled);
+        assert!(active_restream_generation(&manager).await.is_none());
+
+        let enable_result = manager
+            .apply_restream_settings_with(
+                &config,
+                restream_update_from(&config.get(), true),
+                &adopted,
+                commit_restream_settings_in_memory,
+            )
+            .await
+            .unwrap();
+        assert!(!enable_result.desired);
+        assert!(enable_result.server_info.is_none());
+        assert!(config.get().rtsp_server.enabled);
+        assert!(active_restream_generation(&manager).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn persistence_failures_restore_settings_selection_and_runtime() {
+        init_gstreamer();
+        let settings = restream_test_settings(RestreamProtocol::Rtsp);
+        let config = AppConfig::for_test(settings);
+        let manager = StreamManager::with_selected_protocol(RestreamProtocol::Rtsp);
+        let adopted = adopted_set(&[]);
+        manager
+            .start_restream_server(&config, &adopted)
+            .await
+            .unwrap();
+        let initial_generation = active_restream_generation(&manager).await.unwrap();
+
+        let mut update = restream_update_from(&config.get(), true);
+        update.rtsp_server.token = "fedcba9876543210".into();
+        let settings_error = manager
+            .apply_restream_settings_with(&config, update, &adopted, |_, _| {
+                Err(AppError::Config("injected settings write failure".into()))
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(settings_error.kind(), "Config");
+        assert_eq!(config.get().rtsp_server.token, "0123456789abcdef");
+        assert_eq!(
+            active_restream_generation(&manager).await,
+            Some(initial_generation + 1)
+        );
+        {
+            let state = manager.state.lock().await;
+            assert!(state.restream_desired);
+            assert_eq!(state.selected_protocol, RestreamProtocol::Rtsp);
+            assert!(state
+                .restream_server
+                .as_ref()
+                .is_some_and(|server| server.protocol() == RestreamProtocol::Rtsp));
+        }
+
+        let selector_error = manager
+            .switch_restream_protocol_with(&config, RestreamProtocol::Srt, &adopted, |_, _| {
+                Err(AppError::Config("injected selector write failure".into()))
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(selector_error.kind(), "Config");
+        assert_eq!(config.get().restream_protocol, RestreamProtocol::Rtsp);
+        assert_eq!(
+            active_restream_generation(&manager).await,
+            Some(initial_generation + 2)
+        );
+        let status = compute_status(&manager.state).await;
+        assert!(status.desired);
+        assert_eq!(status.selected_protocol, RestreamProtocol::Rtsp);
+        assert_eq!(status.active_protocol, Some(RestreamProtocol::Rtsp));
+
+        manager.stop_restream_server().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn persistence_and_restoration_failures_are_reported_together() {
+        init_gstreamer();
+        let settings = restream_test_settings(RestreamProtocol::Srt);
+        let srt_port = settings.srt_server.port;
+        let config = AppConfig::for_test(settings);
+        let manager = StreamManager::with_selected_protocol(RestreamProtocol::Srt);
+        let adopted = adopted_set(&[]);
+        manager
+            .start_restream_server(&config, &adopted)
+            .await
+            .unwrap();
+        let occupied = std::sync::Mutex::new(None);
+
+        let mut update = restream_update_from(&config.get(), true);
+        update.srt_server.stream_id = "replacement".into();
+        let error = manager
+            .apply_restream_settings_with(&config, update, &adopted, |_, _| {
+                let listener = bind_udp_after_release(srt_port);
+                *occupied.lock().unwrap() = Some(listener);
+                Err(AppError::Config("injected settings write failure".into()))
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), "Config");
+        assert!(error
+            .to_string()
+            .contains("injected settings write failure"));
+        assert!(
+            error
+                .to_string()
+                .contains("restoring the prior re-stream output also failed"),
+            "unexpected error: {error}"
+        );
+        assert!(config.get().srt_server.stream_id.is_empty());
+        let status = compute_status(&manager.state).await;
+        assert!(status.desired);
+        assert_eq!(status.relay_state, RelayState::Failed);
+        assert!(!status.server_running);
+
+        occupied.lock().unwrap().take();
+        manager.stop_restream_server().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unavailable_live_srt_switch_fails_before_disrupting_rtsp() {
+        init_gstreamer();
+        let mut settings = restream_test_settings(RestreamProtocol::Rtsp);
+        settings.srt_server.passphrase = SrtPassphraseState::Unavailable {
+            preserved_ciphertext: "opaque-ciphertext".into(),
+        };
+        let config = AppConfig::for_test(settings);
+        let manager = StreamManager::with_selected_protocol(RestreamProtocol::Rtsp);
+        let adopted = adopted_set(&[]);
+        manager
+            .start_restream_server(&config, &adopted)
+            .await
+            .unwrap();
+        let generation = active_restream_generation(&manager).await.unwrap();
+        let epoch = manager
+            .restream_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        let commit_called = std::sync::atomic::AtomicBool::new(false);
+
+        let error = manager
+            .switch_restream_protocol_with(
+                &config,
+                RestreamProtocol::Srt,
+                &adopted,
+                |config, protocol| {
+                    commit_called.store(true, std::sync::atomic::Ordering::Release);
+                    commit_restream_protocol_in_memory(config, protocol)
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), "SrtPassphraseUnavailable");
+        assert!(!error.to_string().contains("opaque-ciphertext"));
+        assert!(!commit_called.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            manager
+                .restream_epoch
+                .load(std::sync::atomic::Ordering::Acquire),
+            epoch
+        );
+        assert_eq!(active_restream_generation(&manager).await, Some(generation));
+        let status = compute_status(&manager.state).await;
+        assert!(status.desired);
+        assert_eq!(status.selected_protocol, RestreamProtocol::Rtsp);
+        assert_eq!(status.active_protocol, Some(RestreamProtocol::Rtsp));
+
+        manager.stop_restream_server().await.unwrap();
     }
 
     #[tokio::test]

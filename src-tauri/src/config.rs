@@ -699,6 +699,15 @@ impl AppConfig {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test(settings: AppSettings) -> Self {
+        Self {
+            settings: Mutex::new(settings),
+            cache: Mutex::new(Vec::new()),
+            startup_notices: Mutex::new(Vec::new()),
+        }
+    }
+
     /// Messages about salvage actions taken during load, for the
     /// frontend to surface once at startup.
     pub fn startup_notices(&self) -> Vec<String> {
@@ -761,6 +770,18 @@ impl AppConfig {
         rtsp_server: RtspServerConfig,
         srt_server: SrtServerConfig,
     ) -> Result<AppSettings, crate::AppError> {
+        self.commit_restream_settings_with(rtsp_server, srt_server, save_to_disk)
+    }
+
+    pub(crate) fn commit_restream_settings_with<F>(
+        &self,
+        rtsp_server: RtspServerConfig,
+        srt_server: SrtServerConfig,
+        persist: F,
+    ) -> Result<AppSettings, crate::AppError>
+    where
+        F: FnOnce(&AppSettings) -> Result<(), crate::AppError>,
+    {
         let _save_guard = CONFIG_SAVE_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -768,7 +789,7 @@ impl AppConfig {
         prospective.rtsp_server = rtsp_server.clone();
         prospective.srt_server = srt_server.clone();
         let prospective = crate::settings_validation::validate_prospective_settings(prospective)?;
-        save_to_disk(&prospective)?;
+        persist(&prospective)?;
         match self.settings.lock() {
             Ok(mut guard) => {
                 guard.rtsp_server = rtsp_server;
@@ -793,7 +814,7 @@ impl AppConfig {
         self.commit_restream_protocol_with(protocol, save_to_disk)
     }
 
-    fn commit_restream_protocol_with<F>(
+    pub(crate) fn commit_restream_protocol_with<F>(
         &self,
         protocol: RestreamProtocol,
         persist: F,
@@ -1711,14 +1732,6 @@ mod tests {
         runtime_settings_from_persisted(persisted, Some(&TEST_KEY))
     }
 
-    fn app_config_for_test(settings: AppSettings) -> AppConfig {
-        AppConfig {
-            settings: Mutex::new(settings),
-            cache: Mutex::new(Vec::new()),
-            startup_notices: Mutex::new(Vec::new()),
-        }
-    }
-
     // ── Encryption / Decryption ─────────────────────────────────────
 
     #[test]
@@ -2104,7 +2117,7 @@ password = ""
 
     #[test]
     fn selector_commit_publishes_only_after_persistence_succeeds() {
-        let config = app_config_for_test(AppSettings::default());
+        let config = AppConfig::for_test(AppSettings::default());
         let error = match config.commit_restream_protocol_with(RestreamProtocol::Srt, |_| {
             Err(crate::AppError::Config("injected write failure".into()))
         }) {
@@ -2122,6 +2135,56 @@ password = ""
             .unwrap();
         assert_eq!(committed.restream_protocol, RestreamProtocol::Srt);
         assert_eq!(config.get().restream_protocol, RestreamProtocol::Srt);
+    }
+
+    #[test]
+    fn restream_settings_commit_publishes_both_sections_only_after_persistence() {
+        let config = AppConfig::for_test(AppSettings::default());
+        let rtsp = RtspServerConfig {
+            enabled: true,
+            port: 9_554,
+            token: "fedcba9876543210".into(),
+            bind_interface: "ZeroTier".into(),
+        };
+        let srt = SrtServerConfig {
+            port: 9_000,
+            passphrase: SrtPassphraseState::Unavailable {
+                preserved_ciphertext: "opaque-ciphertext".into(),
+            },
+            latency_ms: 250,
+            stream_id: "field unit".into(),
+            bind_interface: "ZeroTier".into(),
+        };
+
+        let error = match config.commit_restream_settings_with(rtsp.clone(), srt.clone(), |_| {
+            Err(crate::AppError::Config("injected write failure".into()))
+        }) {
+            Ok(_) => panic!("injected persistence failure must abort both sections"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), "Config");
+        let unchanged = config.get();
+        assert_eq!(unchanged.rtsp_server.port, 8_554);
+        assert_eq!(unchanged.srt_server.port, 8_890);
+        assert!(matches!(
+            unchanged.srt_server.passphrase,
+            SrtPassphraseState::Unencrypted
+        ));
+
+        let committed = config
+            .commit_restream_settings_with(rtsp, srt, |prospective| {
+                assert_eq!(prospective.rtsp_server.port, 9_554);
+                assert_eq!(prospective.srt_server.port, 9_000);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(committed.rtsp_server.port, 9_554);
+        assert_eq!(config.get().srt_server.stream_id, "field unit");
+        assert!(matches!(
+            config.get().srt_server.passphrase,
+            SrtPassphraseState::Unavailable { ref preserved_ciphertext }
+                if preserved_ciphertext == "opaque-ciphertext"
+        ));
     }
 
     #[test]

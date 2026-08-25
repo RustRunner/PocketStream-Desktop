@@ -33,6 +33,9 @@ impl FirewallRule {
 /// This is idempotent and safe to call every time a listener starts.
 #[cfg(target_os = "windows")]
 pub async fn ensure_restream_allowed(rule: FirewallRule, port: u16) -> Result<(), AppError> {
+    if cfg!(test) {
+        return Ok(());
+    }
     remove_block_rules().await;
     ensure_allow_rule(rule, port).await
 }
