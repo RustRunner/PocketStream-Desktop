@@ -4,6 +4,22 @@ use std::net::IpAddr;
 
 use crate::error::AppError;
 
+/// Windows' NetAdapter/CIM provider is prone to hanging when multiple
+/// PowerShell queries run concurrently. The app has several independent
+/// interface pollers, so keep the shared provider boundary single-flight.
+#[cfg(target_os = "windows")]
+static ADAPTER_QUERY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(target_os = "windows")]
+async fn with_adapter_query_lock<T, F, Fut>(gate: &tokio::sync::Mutex<()>, query: F) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let _query_guard = gate.lock().await;
+    query().await
+}
+
 /// How long a validated interface name stays trusted before the next
 /// `validate_interface_name` re-enumerates. Bounds staleness (an adapter
 /// removed within the window still validates) while keeping the 2 s
@@ -333,24 +349,26 @@ async fn run_adapter_query(filter: &str) -> Result<String, AppError> {
     // Bounded so a hung PowerShell (broken WMI has been observed) can't
     // wedge the calling worker indefinitely. kill_on_drop ensures the
     // child is reaped if the timeout fires and drops the future.
-    let fut = super::async_cmd("powershell")
-        .args(["-NoProfile", "-Command", &script])
-        .kill_on_drop(true)
-        .output();
-    let output = match tokio::time::timeout(std::time::Duration::from_secs(10), fut).await {
-        Ok(Ok(o)) => o,
-        Ok(Err(e)) => {
-            return Err(AppError::Network(format!(
+    // Keep the lock around process creation and collection. The timeout still
+    // bounds the active query, and dropping the guard wakes the next queued
+    // caller after every success, failure, or timeout.
+    let output = with_adapter_query_lock(&ADAPTER_QUERY_LOCK, || async {
+        let fut = super::async_cmd("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .kill_on_drop(true)
+            .output();
+        match tokio::time::timeout(std::time::Duration::from_secs(10), fut).await {
+            Ok(Ok(o)) => Ok(o),
+            Ok(Err(e)) => Err(AppError::Network(format!(
                 "Failed to run PowerShell: {}",
                 e
-            )))
-        }
-        Err(_) => {
-            return Err(AppError::Network(
+            ))),
+            Err(_) => Err(AppError::Network(
                 "Adapter enumeration timed out after 10s (PowerShell/WMI may be hung)".into(),
-            ))
+            )),
         }
-    };
+    })
+    .await?;
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !stderr.is_empty() {
@@ -798,6 +816,36 @@ mod tests {
     mod windows_tests {
         use super::super::*;
 
+        #[tokio::test]
+        async fn adapter_query_lock_serializes_callers() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            async fn probe(
+                gate: &tokio::sync::Mutex<()>,
+                active: &AtomicUsize,
+                peak: &AtomicUsize,
+            ) {
+                with_adapter_query_lock(gate, || async {
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(current, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                })
+                .await;
+            }
+
+            let gate = tokio::sync::Mutex::new(());
+            let active = AtomicUsize::new(0);
+            let peak = AtomicUsize::new(0);
+            tokio::join!(
+                probe(&gate, &active, &peak),
+                probe(&gate, &active, &peak),
+                probe(&gate, &active, &peak),
+            );
+
+            assert_eq!(peak.load(Ordering::SeqCst), 1);
+        }
+
         #[test]
         fn is_vpn_adapter_matches_known_keywords() {
             assert!(is_vpn_adapter("Tailscale Tunnel"));
@@ -1194,13 +1242,13 @@ mod tests {
     async fn list_physical_returns_ok() {
         // Should succeed on any platform (may be empty in CI)
         let result = list_physical().await;
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "physical enumeration failed: {result:?}");
     }
 
     #[tokio::test]
     async fn list_all_returns_ok() {
         let result = list_all().await;
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "combined enumeration failed: {result:?}");
     }
 
     #[tokio::test]
@@ -1208,15 +1256,19 @@ mod tests {
         // Full enumeration (physical + virtual) must succeed on any
         // platform; may be empty in CI.
         let result = list_all_adapters().await;
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "full enumeration failed: {result:?}");
     }
 
     #[tokio::test]
     async fn get_by_name_nonexistent_returns_err() {
         let result = get_by_name("__nonexistent_interface_42__").await;
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("not found"));
+        let err_msg = result
+            .expect_err("the nonexistent interface unexpectedly resolved")
+            .to_string();
+        assert!(
+            err_msg.contains("not found"),
+            "unexpected lookup error: {err_msg}"
+        );
     }
 
     #[test]
@@ -1230,10 +1282,12 @@ mod tests {
     #[tokio::test]
     async fn validate_interface_name_rejects_unknown() {
         let result = validate_interface_name("__nonexistent_interface_43__").await;
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Unknown network interface"));
+        let err_msg = result
+            .expect_err("the unknown interface unexpectedly validated")
+            .to_string();
+        assert!(
+            err_msg.contains("Unknown network interface"),
+            "unexpected validation error: {err_msg}"
+        );
     }
 }
