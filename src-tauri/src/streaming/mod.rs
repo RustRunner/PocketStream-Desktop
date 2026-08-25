@@ -1,4 +1,6 @@
 pub mod audio;
+#[allow(dead_code)] // Production admission core; wired into the SRT adapter in the next slice.
+mod caller_registry;
 pub mod recorder;
 mod relay;
 pub mod rtsp_client;
