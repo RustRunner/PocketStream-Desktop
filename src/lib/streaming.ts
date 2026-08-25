@@ -4,15 +4,28 @@
 
 import QRCode from "qrcode";
 import * as api from "./tauri-api.ts";
-import { $, state, log, showToast, formatUptime } from "./state.ts";
+import { $, $$, state, log, showToast, formatUptime } from "./state.ts";
 import { sessionCamIp } from "./store.ts";
 import { formatError } from "./errors.ts";
 import { formatRestreamBitrate } from "./restream-format.ts";
+import {
+  buildRestreamBindOptions,
+  buildRestreamBindUpdate,
+  buildRestreamSettingsUpdate,
+  resolveSrtPassphraseUpdate,
+  restreamSwitchStatusIsFinal,
+  RestreamBindRequestGate,
+  selectedRestreamBindInterface,
+} from "./restream-settings.ts";
 import { getActiveCamIp, getActivePtuIp } from "./network.ts";
 import type {
+  RestreamBindRequest,
+} from "./restream-settings.ts";
+import type {
   RestreamOperationResult,
+  RestreamProtocol,
   RestreamSettingsUpdate,
-  SrtServerConfig,
+  SrtPassphraseView,
   StreamStatus,
 } from "./types.ts";
 
@@ -360,8 +373,96 @@ export function updateMuteButton(): void {
 
 /** Busy latch for the re-stream toggle (see streamToggleBusy). */
 let restreamToggleBusy = false;
-let restreamBindGeneration = 0;
+let restreamProtocolBusy = false;
+let restreamProtocolPending: RestreamProtocol | null = null;
+let restreamProtocolExpectedDesired: boolean | null = null;
+let restreamProtocolRequestGeneration = 0;
+let renderedRestreamProtocol: RestreamProtocol = "rtsp";
+const restreamBindRequests = new RestreamBindRequestGate();
 let restreamBindReady = false;
+let restreamBindApplyBusy = false;
+let restreamSettingsBusy = false;
+let srtPassphraseCurrent: SrtPassphraseView = {
+  state: "unencrypted",
+  value: null,
+};
+let srtPassphraseDirty = false;
+let srtPassphraseClearConfirmed = false;
+
+function currentRestreamProtocol(): RestreamProtocol {
+  return state.config?.restream_protocol ?? renderedRestreamProtocol;
+}
+
+function syncRestreamProtocolButtons(): void {
+  const disabled =
+    !state.config ||
+    restreamToggleBusy ||
+    restreamProtocolBusy ||
+    restreamBindApplyBusy ||
+    restreamSettingsBusy;
+  $$<HTMLButtonElement>("[data-restream-protocol]").forEach((button) => {
+    const active = button.dataset["restreamProtocol"] === renderedRestreamProtocol;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+    button.disabled = disabled;
+  });
+}
+
+function syncRestreamSpinner(): void {
+  $("#restream-spinner").style.display =
+    restreamToggleBusy ||
+    restreamProtocolBusy ||
+    restreamBindApplyBusy ||
+    restreamSettingsBusy
+      ? ""
+      : "none";
+}
+
+function syncRestreamBindAvailability(): void {
+  $<HTMLSelectElement>("#restream-bind-interface").disabled =
+    !restreamBindReady ||
+    restreamProtocolBusy ||
+    restreamBindApplyBusy ||
+    restreamSettingsBusy;
+}
+
+function syncRestreamOperationControls(): void {
+  syncRestreamStartButton();
+  syncRestreamProtocolButtons();
+  syncRestreamSpinner();
+  syncRestreamBindAvailability();
+  $<HTMLButtonElement>("#save-settings").disabled =
+    !state.config ||
+    restreamToggleBusy ||
+    restreamProtocolBusy ||
+    restreamBindApplyBusy ||
+    restreamSettingsBusy;
+}
+
+function finishRestreamProtocolSwitch(expected?: RestreamProtocol): void {
+  if (expected && restreamProtocolPending !== expected) return;
+  restreamProtocolPending = null;
+  restreamProtocolExpectedDesired = null;
+  restreamProtocolBusy = false;
+  syncRestreamOperationControls();
+}
+
+function renderRestreamProtocol(protocol: RestreamProtocol): void {
+  renderedRestreamProtocol = protocol;
+  $("#restream-rtsp-settings").style.display = protocol === "rtsp" ? "" : "none";
+  $("#restream-srt-settings").style.display = protocol === "srt" ? "" : "none";
+  syncRestreamProtocolButtons();
+}
+
+function acceptRestreamProtocol(
+  protocol: RestreamProtocol,
+  refreshBindOnChange = true
+): void {
+  const changed = currentRestreamProtocol() !== protocol || renderedRestreamProtocol !== protocol;
+  if (state.config) state.config.restream_protocol = protocol;
+  renderRestreamProtocol(protocol);
+  if (changed && refreshBindOnChange && state.config) refreshRestreamBindOptions();
+}
 
 /**
  * Re-derive the re-stream Start button's enabled state from the Enable
@@ -372,41 +473,115 @@ let restreamBindReady = false;
  */
 export function syncRestreamStartButton(): void {
   const startBtn = $<HTMLButtonElement>("#btn-toggle-restream");
-  startBtn.disabled = state.isRestreamDesired
-    ? false
-    : !$<HTMLInputElement>("#restream-server-enable").checked;
+  startBtn.disabled =
+    restreamToggleBusy ||
+    restreamProtocolBusy ||
+    restreamBindApplyBusy ||
+    restreamSettingsBusy ||
+    (!state.isRestreamDesired &&
+      !$<HTMLInputElement>("#restream-server-enable").checked);
+}
+
+/** Serialize the shared Settings Save button with live re-stream controls so
+ * two frontend requests cannot submit competing canonical bind snapshots. */
+export function beginRestreamSettingsSave(): boolean {
+  if (
+    restreamToggleBusy ||
+    restreamProtocolBusy ||
+    restreamBindApplyBusy ||
+    restreamSettingsBusy
+  ) {
+    return false;
+  }
+  restreamSettingsBusy = true;
+  syncRestreamOperationControls();
+  return true;
+}
+
+export function finishRestreamSettingsSave(): void {
+  restreamSettingsBusy = false;
+  syncRestreamOperationControls();
 }
 
 export function setupRestreamControls(): void {
   const enableToggle = $<HTMLInputElement>("#restream-server-enable");
-  const startBtn = $<HTMLButtonElement>("#btn-toggle-restream");
-  startBtn.disabled = !enableToggle.checked;
   enableToggle.addEventListener("change", () => {
     // Enable is persisted and enforced by the atomic Settings Save command.
     // A desired output always remains stoppable before that save.
-    startBtn.disabled = state.isRestreamDesired ? false : !enableToggle.checked;
+    syncRestreamStartButton();
+  });
+
+  $$<HTMLButtonElement>("[data-restream-protocol]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const value = button.dataset["restreamProtocol"];
+      if (
+        !state.config ||
+        restreamProtocolBusy ||
+        restreamToggleBusy ||
+        restreamBindApplyBusy ||
+        restreamSettingsBusy ||
+        (value !== "rtsp" && value !== "srt") ||
+        value === currentRestreamProtocol()
+      ) {
+        return;
+      }
+
+      const protocol: RestreamProtocol = value;
+      const requestGeneration = ++restreamProtocolRequestGeneration;
+      restreamProtocolPending = protocol;
+      restreamProtocolExpectedDesired = state.isRestreamDesired;
+      restreamProtocolBusy = true;
+      restreamBindReady = false;
+      $<HTMLSelectElement>("#restream-bind-interface").disabled = true;
+      syncRestreamOperationControls();
+      try {
+        const result = await api.switchRestreamProtocol(protocol);
+        if (requestGeneration !== restreamProtocolRequestGeneration) return;
+        applyRestreamOperationResult(result);
+        showToast(`Re-stream output switched to ${protocol.toUpperCase()}`);
+      } catch (error) {
+        if (requestGeneration !== restreamProtocolRequestGeneration) return;
+        await reloadCanonicalRestreamConfig();
+        showToast("Failed to switch re-stream output: " + formatError(error), true);
+      } finally {
+        // A matching status event may have released the latch before the
+        // command returned. Never let this older completion release a newer
+        // selector request.
+        if (requestGeneration === restreamProtocolRequestGeneration) {
+          finishRestreamProtocolSwitch();
+        }
+      }
+    });
   });
 
   refreshRestreamBindOptions();
 
   $<HTMLSelectElement>("#restream-bind-interface").addEventListener("change", async () => {
-    if (!state.config || !restreamBindReady) return;
+    if (
+      !state.config ||
+      !restreamBindReady ||
+      restreamProtocolBusy ||
+      restreamToggleBusy ||
+      restreamBindApplyBusy ||
+      restreamSettingsBusy
+    ) {
+      return;
+    }
     const select = $<HTMLSelectElement>("#restream-bind-interface");
-    const previous = state.config.rtsp_server.bind_interface;
+    const protocol = currentRestreamProtocol();
+    const previous = selectedRestreamBindInterface(state.config, protocol);
     const requested = select.value;
-    const changeGeneration = restreamBindGeneration;
-    select.disabled = true;
+    restreamBindApplyBusy = true;
+    syncRestreamOperationControls();
     try {
       const result = await api.applyRestreamSettings(
-        buildRestreamSettingsUpdate(
-          state.config.rtsp_server.enabled,
-          state.config.rtsp_server.port,
-          state.config.rtsp_server.token,
-          requested,
-          state.config.srt_server
-        )
+        buildRestreamBindUpdate(state.config, protocol, requested)
       );
-      state.config.rtsp_server.bind_interface = requested;
+      if (protocol === "srt") {
+        state.config.srt_server.bind_interface = requested;
+      } else {
+        state.config.rtsp_server.bind_interface = requested;
+      }
       applyRestreamOperationResult(result);
     } catch (e) {
       if (!(await reloadCanonicalRestreamConfig())) {
@@ -414,20 +589,65 @@ export function setupRestreamControls(): void {
       }
       showToast("Failed to save VPN selection: " + formatError(e), true);
     } finally {
-      if (changeGeneration === restreamBindGeneration && restreamBindReady) {
-        select.disabled = false;
-      }
+      restreamBindApplyBusy = false;
+      syncRestreamOperationControls();
     }
+  });
+
+  const passphraseInput = $<HTMLInputElement>("#srt-passphrase");
+  passphraseInput.addEventListener("input", () => {
+    srtPassphraseDirty = true;
+    srtPassphraseClearConfirmed = false;
+    renderSrtPassphraseState();
+  });
+
+  $<HTMLButtonElement>("#srt-copy-passphrase").addEventListener("click", async () => {
+    if (!passphraseInput.value || srtPassphraseClearConfirmed) return;
+    try {
+      await navigator.clipboard.writeText(passphraseInput.value);
+      showToast("SRT passphrase copied");
+    } catch (_) {
+      showToast("Failed to copy SRT passphrase", true);
+    }
+  });
+
+  const clearDialog = $<HTMLDialogElement>("#srt-clear-passphrase-dialog");
+  let clearDialogOpening = false;
+  $<HTMLButtonElement>("#srt-clear-passphrase").addEventListener("click", async () => {
+    if (clearDialog.open || clearDialogOpening) return;
+    clearDialogOpening = true;
+    try {
+      await showModalWithVideo(clearDialog);
+    } finally {
+      clearDialogOpening = false;
+    }
+  });
+  $<HTMLButtonElement>("#srt-clear-passphrase-confirm").addEventListener("click", () => {
+    srtPassphraseClearConfirmed = true;
+    srtPassphraseDirty = false;
+    passphraseInput.value = "";
+    renderSrtPassphraseState();
+    clearDialog.close();
+  });
+  $<HTMLButtonElement>("#srt-clear-passphrase-cancel").addEventListener("click", () => {
+    clearDialog.close();
+  });
+  clearDialog.addEventListener("click", (event) => {
+    if (event.target === clearDialog) clearDialog.close();
   });
 
   $<HTMLButtonElement>("#btn-toggle-restream").addEventListener("click", async () => {
     // Same double-tap defense as the stream toggle.
-    if (restreamToggleBusy) return;
+    if (
+      restreamToggleBusy ||
+      restreamProtocolBusy ||
+      restreamBindApplyBusy ||
+      restreamSettingsBusy
+    ) {
+      return;
+    }
     restreamToggleBusy = true;
-    startBtn.disabled = true;
-
-    const spinner = $<HTMLElement>("#restream-spinner");
-    spinner.style.display = "";
+    syncRestreamOperationControls();
 
     if (state.isRestreamDesired) {
       try {
@@ -450,23 +670,24 @@ export function setupRestreamControls(): void {
       }
     }
 
-    spinner.style.display = "none";
     restreamToggleBusy = false;
     // updateRestreamUI ran in the happy paths; re-derive here so a thrown
     // start/stop doesn't leave the button stuck disabled.
-    startBtn.disabled = state.isRestreamDesired ? false : !enableToggle.checked;
+    syncRestreamOperationControls();
   });
 
   // QR code button + dialog
   setupQrDialog();
+  syncRestreamOperationControls();
 }
 
 export function refreshRestreamBindOptions(): void {
-  const generation = ++restreamBindGeneration;
+  const protocol = currentRestreamProtocol();
+  const request = restreamBindRequests.begin(protocol);
   const select = $<HTMLSelectElement>("#restream-bind-interface");
   restreamBindReady = false;
   select.disabled = true;
-  void populateRestreamBindOptions(generation);
+  void populateRestreamBindOptions(request);
 }
 
 /** Reconcile local state after a command error. A settings transaction may
@@ -475,7 +696,7 @@ export function refreshRestreamBindOptions(): void {
 export async function reloadCanonicalRestreamConfig(): Promise<boolean> {
   try {
     state.config = await api.getConfig();
-    refreshRestreamBindOptions();
+    syncRestreamSettingsUI();
     return true;
   } catch (error) {
     log(`Failed to reload canonical re-stream settings: ${formatError(error)}`);
@@ -483,61 +704,49 @@ export async function reloadCanonicalRestreamConfig(): Promise<boolean> {
   }
 }
 
-async function populateRestreamBindOptions(generation: number): Promise<void> {
+function renderRestreamBindOptions(
+  interfaces: Awaited<ReturnType<typeof api.listVpnInterfaces>>,
+  saved: string
+): void {
+  const select = $<HTMLSelectElement>("#restream-bind-interface");
+  select.replaceChildren();
+  for (const model of buildRestreamBindOptions(interfaces, saved)) {
+    const option = document.createElement("option");
+    option.value = model.value;
+    option.textContent = model.label;
+    if (model.unavailable) option.dataset["unavailable"] = "true";
+    select.appendChild(option);
+  }
+  select.value = saved;
+}
+
+async function populateRestreamBindOptions(request: RestreamBindRequest): Promise<void> {
   const select = $<HTMLSelectElement>("#restream-bind-interface");
   try {
     const vpns = (await api.listVpnInterfaces()).filter((i) => i.ips.length > 0);
-    if (generation !== restreamBindGeneration) return;
-
-    const saved = state.config?.rtsp_server.bind_interface ?? "";
-    select.replaceChildren();
-    const all = document.createElement("option");
-    all.value = "";
-    all.textContent = "None";
-    select.appendChild(all);
-
-    for (const iface of vpns) {
-      const opt = document.createElement("option");
-      opt.value = iface.name;
-      const firstIp = iface.ips[0];
-      opt.textContent = firstIp ? `${iface.name} (${firstIp.address})` : iface.name;
-      select.appendChild(opt);
-    }
-
-    if (saved && !vpns.some((iface) => iface.name === saved)) {
-      const unavailable = document.createElement("option");
-      unavailable.value = saved;
-      unavailable.textContent = `${saved} (unavailable)`;
-      select.appendChild(unavailable);
-    }
-    select.value = saved;
+    if (!restreamBindRequests.isCurrent(request, currentRestreamProtocol())) return;
+    const saved = state.config
+      ? selectedRestreamBindInterface(state.config, request.protocol)
+      : "";
+    renderRestreamBindOptions(vpns, saved);
   } catch (e) {
-    if (generation !== restreamBindGeneration) return;
+    if (!restreamBindRequests.isCurrent(request, currentRestreamProtocol())) return;
     console.warn("Failed to list VPN interfaces:", e);
-    const saved = state.config?.rtsp_server.bind_interface ?? "";
-    select.replaceChildren();
-    const all = document.createElement("option");
-    all.value = "";
-    all.textContent = "None";
-    select.appendChild(all);
-    if (saved) {
-      const unavailable = document.createElement("option");
-      unavailable.value = saved;
-      unavailable.textContent = `${saved} (unavailable)`;
-      select.appendChild(unavailable);
-      select.value = saved;
-    }
+    const saved = state.config
+      ? selectedRestreamBindInterface(state.config, request.protocol)
+      : "";
+    renderRestreamBindOptions([], saved);
   } finally {
-    if (generation === restreamBindGeneration) {
-      restreamBindReady = true;
-      select.disabled = false;
+    if (restreamBindRequests.isCurrent(request, currentRestreamProtocol())) {
+      restreamBindReady = state.config !== null;
+      syncRestreamBindAvailability();
     }
   }
 }
 
 export function applyRestreamOperationResult(result: RestreamOperationResult): void {
-  if (state.config) state.config.restream_protocol = result.selected_protocol;
   state.isRestreamDesired = result.desired;
+  acceptRestreamProtocol(result.selected_protocol);
   if (result.server_info) {
     restreamFullUrl = result.server_info.server_url;
     updateRestreamUI(result.server_info.display_url);
@@ -546,36 +755,114 @@ export function applyRestreamOperationResult(result: RestreamOperationResult): v
   }
 }
 
-export function buildRestreamSettingsUpdate(
-  enabled: boolean,
-  port: number,
-  token: string,
-  bindInterface: string,
-  srtServer: SrtServerConfig
-): RestreamSettingsUpdate {
-  return {
-    enabled,
-    rtsp_server: { port, token, bind_interface: bindInterface },
-    // The SRT controls remain hidden until the runtime slice. Sending the
-    // complete canonical section with Keep prevents an RTSP save from
-    // rewriting, clearing, or exposing its protected secret state.
-    srt_server: {
-      port: srtServer.port,
-      passphrase: { action: "keep" },
-      latency_ms: srtServer.latency_ms,
-      stream_id: srtServer.stream_id,
-      bind_interface: srtServer.bind_interface,
-    },
-  };
+function renderSrtPassphraseState(): void {
+  const input = $<HTMLInputElement>("#srt-passphrase");
+  const status = $("#srt-passphrase-state");
+  const copy = $<HTMLButtonElement>("#srt-copy-passphrase");
+  const clear = $<HTMLButtonElement>("#srt-clear-passphrase");
+
+  status.className = "setting-helper";
+  if (srtPassphraseClearConfirmed) {
+    input.placeholder = "No passphrase (unencrypted)";
+    status.textContent = "Unencrypted output confirmed; save settings to apply.";
+    status.classList.add("warning");
+  } else if (srtPassphraseDirty) {
+    input.placeholder = "10-79 visible ASCII characters (no spaces)";
+    if (input.value.length === 0) {
+      status.textContent = "Enter a replacement, or use Clear encryption.";
+      status.classList.add("error");
+    } else if (
+      srtPassphraseCurrent.state === "available" &&
+      srtPassphraseCurrent.value === input.value
+    ) {
+      status.textContent = "Protected passphrase unchanged.";
+    } else {
+      status.textContent = "Replacement will be protected when settings are saved.";
+    }
+  } else {
+    switch (srtPassphraseCurrent.state) {
+      case "available":
+        input.placeholder = "Protected passphrase";
+        status.textContent = "Protected passphrase saved.";
+        break;
+      case "unencrypted":
+        input.placeholder = "No passphrase (unencrypted)";
+        status.textContent = "Unencrypted output is intentionally enabled.";
+        status.classList.add("warning");
+        break;
+      case "unavailable":
+        input.placeholder = "Re-entry required";
+        status.textContent =
+          "Saved passphrase is unavailable; enter a replacement or confirm Clear encryption.";
+        status.classList.add("error");
+        break;
+    }
+  }
+
+  copy.disabled = input.value.length === 0 || srtPassphraseClearConfirmed;
+  clear.disabled =
+    srtPassphraseClearConfirmed ||
+    (srtPassphraseCurrent.state === "unencrypted" && !srtPassphraseDirty);
+}
+
+function loadSrtPassphraseView(passphrase: SrtPassphraseView): void {
+  srtPassphraseCurrent = { ...passphrase };
+  srtPassphraseDirty = false;
+  srtPassphraseClearConfirmed = false;
+  $<HTMLInputElement>("#srt-passphrase").value =
+    passphrase.state === "available" ? (passphrase.value ?? "") : "";
+  renderSrtPassphraseState();
+}
+
+/** Paint only the complete re-stream settings model from a canonical backend
+ * snapshot. It is never called with transient DOM values. */
+export function syncRestreamSettingsUI(): void {
+  const config = state.config;
+  if (!config) return;
+
+  $<HTMLInputElement>("#restream-server-enable").checked = config.rtsp_server.enabled;
+  $<HTMLInputElement>("#rtsp-server-port").value = String(config.rtsp_server.port);
+  $<HTMLInputElement>("#rtsp-token").value = config.rtsp_server.token;
+  $<HTMLInputElement>("#srt-server-port").value = String(config.srt_server.port);
+  $<HTMLInputElement>("#srt-latency-ms").value = String(config.srt_server.latency_ms);
+  $<HTMLInputElement>("#srt-stream-id").value = config.srt_server.stream_id;
+  loadSrtPassphraseView(config.srt_server.passphrase);
+  acceptRestreamProtocol(config.restream_protocol, false);
+  syncRestreamOperationControls();
+  refreshRestreamBindOptions();
+}
+
+function readIntegerInput(selector: string): number {
+  const parsed = Number.parseInt($<HTMLInputElement>(selector).value, 10);
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+/** Read both output sections for the one atomic Settings Save command. */
+export function readRestreamSettingsUpdate(): RestreamSettingsUpdate {
+  if (!state.config) throw new Error("Settings are still loading");
+  const passphraseInput = $<HTMLInputElement>("#srt-passphrase");
+  return buildRestreamSettingsUpdate(state.config, {
+    enabled: $<HTMLInputElement>("#restream-server-enable").checked,
+    rtspPort: readIntegerInput("#rtsp-server-port"),
+    rtspToken: $<HTMLInputElement>("#rtsp-token").value,
+    srtPort: readIntegerInput("#srt-server-port"),
+    srtLatencyMs: readIntegerInput("#srt-latency-ms"),
+    srtStreamId: $<HTMLInputElement>("#srt-stream-id").value,
+    srtPassphrase: resolveSrtPassphraseUpdate(
+      srtPassphraseCurrent,
+      passphraseInput.value,
+      srtPassphraseDirty,
+      srtPassphraseClearConfirmed
+    ),
+  });
 }
 
 function updateRestreamUI(displayUrl: string | null, status?: StreamStatus): void {
   const btn = $<HTMLButtonElement>("#btn-toggle-restream");
   btn.textContent = state.isRestreamDesired ? "Stop Server" : "Start Server";
-  // Always allow stopping, including while the listener is rebuilding.
-  btn.disabled = state.isRestreamDesired
-    ? false
-    : !$<HTMLInputElement>("#restream-server-enable").checked;
+  // A desired listener remains stoppable while rebuilding; transaction busy
+  // latches only disable actions until their backend operation establishes state.
+  syncRestreamStartButton();
 
   const statusEl = $("#restream-status");
   const qrBtn = $<HTMLButtonElement>("#btn-show-qr");
@@ -766,6 +1053,17 @@ function handleStatus(status: StreamStatus | null): void {
   // Listener liveness may be false during recovery without making the relay
   // an actionable Start state in the UI.
   state.isRestreamDesired = status.desired;
+  acceptRestreamProtocol(status.selected_protocol);
+  if (
+    restreamSwitchStatusIsFinal(
+      restreamProtocolPending,
+      restreamProtocolExpectedDesired,
+      status.selected_protocol,
+      status.desired
+    )
+  ) {
+    finishRestreamProtocolSwitch(status.selected_protocol);
+  }
   if (status.server_url) {
     restreamFullUrl = status.server_url;
   }

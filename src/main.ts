@@ -37,7 +37,6 @@ import {
   getVideoAreaBounds,
   startStatusListener,
   handleHardDisconnect,
-  syncRestreamStartButton,
   syncVideoVisibility,
   showModalWithVideo,
   createVideoWindowSynced,
@@ -46,9 +45,11 @@ import {
   updateStreamUI,
   updateMuteButton,
   applyRestreamOperationResult,
-  buildRestreamSettingsUpdate,
-  refreshRestreamBindOptions,
+  beginRestreamSettingsSave,
+  finishRestreamSettingsSave,
+  readRestreamSettingsUpdate,
   reloadCanonicalRestreamConfig,
+  syncRestreamSettingsUI,
 } from "./lib/streaming.ts";
 import { setupPtzControls } from "./lib/ptz.ts";
 import type {
@@ -353,16 +354,9 @@ async function loadConfig(): Promise<void> {
     $<HTMLInputElement>("#udp-port").value = String(state.config.stream.udp_port);
     $<HTMLInputElement>("#camera-user").value = state.config.credentials.username;
     $<HTMLInputElement>("#camera-pass").value = state.config.credentials.password;
-    $<HTMLInputElement>("#restream-server-enable").checked = state.config.rtsp_server.enabled;
-    // Programmatic .checked fires no change event — re-derive the Start
-    // button's enabled state, or enabled-in-config users get a dead
-    // button until they toggle the checkbox off and on.
-    syncRestreamStartButton();
-    $<HTMLInputElement>("#rtsp-server-port").value = String(state.config.rtsp_server.port);
-    $<HTMLInputElement>("#rtsp-token").value = state.config.rtsp_server.token;
-    // Re-run the generation-checked async option model now that canonical
-    // config exists. A delayed pre-config enumeration cannot overwrite this.
-    refreshRestreamBindOptions();
+    // Paint both output sections, the canonical selector, protected-secret
+    // state, and a generation-checked bind model from one backend snapshot.
+    syncRestreamSettingsUI();
 
     // Set active protocol
     const proto = state.config.stream.protocol;
@@ -435,21 +429,22 @@ function setupSettingsSave(): void {
       // state.config in sync when it flips this).
       audio_muted: state.config?.stream?.audio_muted ?? false,
     };
-    const parsedRestreamPort = Number.parseInt(
-      $<HTMLInputElement>("#rtsp-server-port").value,
-      10
-    );
-    const restreamUpdate = buildRestreamSettingsUpdate(
-      $<HTMLInputElement>("#restream-server-enable").checked,
-      Number.isNaN(parsedRestreamPort) ? 8554 : parsedRestreamPort,
-      $<HTMLInputElement>("#rtsp-token").value,
-      state.config.rtsp_server.bind_interface,
-      state.config.srt_server
-    );
     const credentials: Credentials = {
       username: $<HTMLInputElement>("#camera-user").value,
       password: $<HTMLInputElement>("#camera-pass").value,
     };
+
+    let restreamUpdate: ReturnType<typeof readRestreamSettingsUpdate>;
+    try {
+      restreamUpdate = readRestreamSettingsUpdate();
+    } catch (error) {
+      showToast("Failed to save: " + formatError(error), true);
+      return;
+    }
+    if (!beginRestreamSettingsSave()) {
+      showToast("Wait for the current re-stream operation to finish", true);
+      return;
+    }
 
     try {
       // Sequential so a failure points clearly at one section. Each
@@ -463,7 +458,7 @@ function setupSettingsSave(): void {
       // Re-pull the canonical settings so state.config reflects whatever
       // the backend currently holds for the fields we don't own.
       state.config = await api.getConfig();
-      refreshRestreamBindOptions();
+      syncRestreamSettingsUI();
       // Re-sync the Path UI (and lastAppliedRtspPath) to what was saved,
       // so a later blur on the custom input doesn't re-fire applyPathChange
       // and needlessly restart the stream — and so an empty-Custom save
@@ -473,6 +468,8 @@ function setupSettingsSave(): void {
     } catch (e) {
       await reloadCanonicalRestreamConfig();
       showToast("Failed to save: " + formatError(e), true);
+    } finally {
+      finishRestreamSettingsSave();
     }
   });
 

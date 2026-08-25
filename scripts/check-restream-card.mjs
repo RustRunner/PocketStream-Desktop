@@ -21,6 +21,18 @@ const requiredIds = [
   "restream-clients",
   "restream-bandwidth",
   "restream-bind-interface",
+  "restream-rtsp-settings",
+  "restream-srt-settings",
+  "srt-server-port",
+  "srt-passphrase",
+  "srt-passphrase-state",
+  "srt-copy-passphrase",
+  "srt-clear-passphrase",
+  "srt-latency-ms",
+  "srt-stream-id",
+  "srt-clear-passphrase-dialog",
+  "srt-clear-passphrase-confirm",
+  "srt-clear-passphrase-cancel",
   "btn-toggle-restream",
 ];
 const failures = requiredIds
@@ -69,15 +81,25 @@ const inputProtocolButtons = [...html.matchAll(/data-protocol="(rtsp|udp)"/g)].m
 if (inputProtocolButtons.join(",") !== "rtsp,udp") {
   failures.push("camera input data-protocol controls changed during the card rename");
 }
-if (html.includes("data-restream-protocol") || /\bSRT\b/.test(html)) {
-  failures.push("the SRT selector/control surface must remain unavailable in this checkpoint");
+const outputProtocolButtons = [
+  ...html.matchAll(/data-restream-protocol="(rtsp|srt)"/g),
+].map((match) => match[1]);
+if (outputProtocolButtons.join(",") !== "rtsp,srt") {
+  failures.push("the re-stream selector must expose exactly RTSP and SRT");
+}
+if (!/<input(?=[^>]*id="srt-passphrase")(?=[^>]*type="password")[^>]*>/.test(html)) {
+  failures.push("the SRT passphrase must render as a masked password field");
+}
+if (!html.includes("Run SRT without encryption?")) {
+  failures.push("the explicit unencrypted-SRT confirmation is missing");
 }
 if (!/id="restream-bind-interface"[^>]*\bdisabled\b/.test(html)) {
   failures.push("the asynchronous re-stream bind selector must start disabled");
 }
 for (const raceGuard of [
-  "generation !== restreamBindGeneration",
-  "state.config?.rtsp_server.bind_interface",
+  "RestreamBindRequestGate",
+  "isCurrent(request, currentRestreamProtocol())",
+  "selectedRestreamBindInterface",
   "reloadCanonicalRestreamConfig",
 ]) {
   if (!streaming.includes(raceGuard)) {
@@ -90,6 +112,10 @@ for (const wiring of [
   "updateRestreamUI",
   "startRestreamServer",
   "stopRestreamServer",
+  "switchRestreamProtocol(protocol)",
+  "beginRestreamSettingsSave",
+  "readRestreamSettingsUpdate",
+  "resolveSrtPassphraseUpdate",
 ]) {
   if (!streaming.includes(wiring)) failures.push(`re-stream card wiring is missing ${wiring}`);
 }
@@ -98,4 +124,4 @@ if (failures.length) {
   console.error(failures.join("\n"));
   process.exit(1);
 }
-console.log("RTSP-only neutral re-stream card contract passed");
+console.log("RTSP/SRT re-stream card contract passed");

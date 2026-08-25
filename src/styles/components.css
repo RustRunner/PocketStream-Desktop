@@ -301,6 +301,32 @@
 
 .input-with-action input {
   flex: 1;
+  min-width: 0;
+}
+
+.setting-helper {
+  min-height: 16px;
+  margin: 5px 0 4px;
+  color: var(--md-on-surface-variant);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.setting-helper.warning {
+  color: var(--status-warning);
+}
+
+.setting-helper.error {
+  color: var(--md-error);
+}
+
+.text-btn.compact {
+  padding: 4px 0;
+  font-size: 12px;
+}
+
+.srt-passphrase-actions .icon-btn {
+  flex: 0 0 auto;
 }
 
 /* ── Switch ─────────────────────────────────────────────────────────── */
@@ -383,6 +409,22 @@
 #card-restream .status-value,
 #card-restream .qr-icon-btn {
   justify-self: end;
+}
+
+.restream-protocol-toggle {
+  justify-self: end;
+  margin: 0;
+}
+
+.restream-protocol-toggle .toggle-btn {
+  min-width: 52px;
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.restream-protocol-toggle .toggle-btn:disabled {
+  cursor: wait;
+  opacity: 0.65;
 }
 
 .qr-icon-btn {
