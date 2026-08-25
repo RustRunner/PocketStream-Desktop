@@ -1727,12 +1727,25 @@ mod tests {
     }
 
     #[test]
-    fn tcp_receive_policy_sets_both_boolean_properties() {
+    fn tcp_receive_policy_matches_runtime_capability() {
         init_gstreamer();
         let source = gst::ElementFactory::make("rtspsrc").build().unwrap();
-        configure_tcp_rtspsrc(&source).unwrap();
-        assert!(source.property::<bool>("tcp-timestamp"));
-        assert!(source.property::<bool>("drop-on-latency"));
+        let supports_policy = ["tcp-timestamp", "drop-on-latency"].iter().all(|property| {
+            source
+                .find_property(property)
+                .is_some_and(|spec| spec.value_type() == glib::Type::BOOL)
+        });
+
+        let result = configure_tcp_rtspsrc(&source);
+        if supports_policy {
+            result.unwrap();
+            assert!(source.property::<bool>("tcp-timestamp"));
+            assert!(source.property::<bool>("drop-on-latency"));
+        } else {
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), "Stream");
+            assert!(error.to_string().contains("GStreamer"));
+        }
     }
 
     #[test]
