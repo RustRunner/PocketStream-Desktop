@@ -658,9 +658,9 @@ fn classify_state_change_failure(bind_address: Option<&str>, port: u16) -> Restr
 pub struct SrtRestreamer {
     pipeline: gst::Pipeline,
     bus: gst::Bus,
-    source: gst::Element,
-    mux: gst::Element,
-    sink: gst::Element,
+    _source: gst::Element,
+    _mux: gst::Element,
+    _sink: gst::Element,
     signal_handlers: Vec<(gst::Element, glib::SignalHandlerId)>,
     output_probe: Option<(gst::Pad, gst::PadProbeId)>,
     caller_registry: Arc<CallerRegistry>,
@@ -673,7 +673,6 @@ pub struct SrtRestreamer {
     data_generation: u64,
     health: Arc<RelayRuntimeHealth>,
     fault_probe: SrtRuntimeProbe,
-    port: u16,
     udp_ingest_port: Option<u16>,
     bytes_sent: Arc<AtomicU64>,
     bw_prev: Mutex<(u64, Instant)>,
@@ -746,9 +745,9 @@ impl SrtRestreamer {
         Ok(Self {
             pipeline: parts.pipeline,
             bus,
-            source: parts.source,
-            mux: parts.mux,
-            sink: parts.sink,
+            _source: parts.source,
+            _mux: parts.mux,
+            _sink: parts.sink,
             signal_handlers,
             output_probe,
             caller_registry,
@@ -761,7 +760,6 @@ impl SrtRestreamer {
             data_generation,
             health,
             fault_probe,
-            port: server_port,
             udp_ingest_port,
             bytes_sent,
             bw_prev: Mutex::new((0, Instant::now())),
@@ -999,10 +997,6 @@ impl SrtRestreamer {
 
     pub fn udp_ingest_port(&self) -> Option<u16> {
         self.udp_ingest_port
-    }
-
-    pub fn port(&self) -> u16 {
-        self.port
     }
 }
 

@@ -86,9 +86,8 @@ export interface ScanResult {
  *  rejects any other value at the IPC boundary. */
 export type StreamProtocol = "rtsp" | "udp";
 
-/** Re-stream output selector. SRT is intentionally not part of the wire union
- * until its runtime milestone is implemented. */
-export type RestreamProtocol = "rtsp";
+/** Re-stream output selector. */
+export type RestreamProtocol = "rtsp" | "srt";
 
 export interface StreamConfig {
   protocol: StreamProtocol;

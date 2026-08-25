@@ -131,12 +131,12 @@ pub enum RelayIngestKind {
     Udp,
 }
 
-/// Fully validated start identity.  Credentials deliberately participate in
-/// `PartialEq`: changing camera authentication must replace the ingest even
-/// when the public relay endpoint is otherwise identical.
+/// Fully validated start identity. Credentials and SRT access controls
+/// deliberately participate in `PartialEq`: changing either must replace the
+/// runtime even when the public relay endpoint is otherwise identical.
 ///
-/// Do not derive `Debug`; this structure contains credentials and the
-/// token-bearing mount path.
+/// Do not derive `Debug`; this structure contains credentials, a passphrase,
+/// and the token-bearing RTSP mount path.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ResolvedStartSpec {
     pub source: ResolvedSource,
@@ -154,6 +154,12 @@ pub enum ResolvedOutput {
         server_port: u16,
         mount_path: String,
     },
+    Srt {
+        server_port: u16,
+        passphrase: String,
+        latency_ms: u32,
+        stream_id: String,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -166,18 +172,22 @@ impl ResolvedStartSpec {
     pub fn protocol(&self) -> crate::config::RestreamProtocol {
         match self.output {
             ResolvedOutput::Rtsp { .. } => crate::config::RestreamProtocol::Rtsp,
+            ResolvedOutput::Srt { .. } => crate::config::RestreamProtocol::Srt,
         }
     }
 
     pub fn server_port(&self) -> u16 {
         match self.output {
-            ResolvedOutput::Rtsp { server_port, .. } => server_port,
+            ResolvedOutput::Rtsp { server_port, .. } | ResolvedOutput::Srt { server_port, .. } => {
+                server_port
+            }
         }
     }
 
     pub fn mount_path(&self) -> &str {
         match &self.output {
             ResolvedOutput::Rtsp { mount_path, .. } => mount_path,
+            ResolvedOutput::Srt { .. } => "",
         }
     }
 
@@ -196,17 +206,46 @@ impl ResolvedStartSpec {
     }
 
     pub fn client_url(&self) -> String {
-        format!(
-            "rtsp://{}:{}{}",
-            self.advertised_ip,
-            self.server_port(),
-            self.mount_path()
-        )
+        match &self.output {
+            ResolvedOutput::Rtsp { .. } => format!(
+                "rtsp://{}:{}{}",
+                self.advertised_ip,
+                self.server_port(),
+                self.mount_path()
+            ),
+            ResolvedOutput::Srt { stream_id, .. } => {
+                let endpoint = format!("srt://{}:{}", self.advertised_ip, self.server_port());
+                if stream_id.is_empty() {
+                    endpoint
+                } else {
+                    format!("{endpoint}?streamid={}", encode_query_value(stream_id))
+                }
+            }
+        }
     }
 
     pub fn display_url(&self) -> String {
-        format!("rtsp://{}:{}", self.advertised_ip, self.server_port())
+        let scheme = match self.output {
+            ResolvedOutput::Rtsp { .. } => "rtsp",
+            ResolvedOutput::Srt { .. } => "srt",
+        };
+        format!("{scheme}://{}:{}", self.advertised_ip, self.server_port())
     }
+}
+
+fn encode_query_value(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[(byte >> 4) as usize]));
+            encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
+        }
+    }
+    encoded
 }
 
 #[derive(Clone)]
@@ -748,6 +787,69 @@ mod tests {
         let mut changed = base.clone();
         changed.password = "new".into();
         assert!(base != changed);
+    }
+
+    #[test]
+    fn srt_identity_includes_access_controls() {
+        let base = ResolvedStartSpec {
+            source: ResolvedSource::Udp { port: 8_600 },
+            output: ResolvedOutput::Srt {
+                server_port: 8_890,
+                passphrase: "strongPass1".into(),
+                latency_ms: 125,
+                stream_id: "field unit".into(),
+            },
+            bind_interface: None,
+            bind_address: None,
+            advertised_ip: "192.0.2.10".into(),
+            username: String::new(),
+            password: String::new(),
+        };
+
+        let mut passphrase_changed = base.clone();
+        let ResolvedOutput::Srt { passphrase, .. } = &mut passphrase_changed.output else {
+            unreachable!()
+        };
+        *passphrase = "replacement1".into();
+        assert!(base != passphrase_changed);
+
+        let mut stream_id_changed = base.clone();
+        let ResolvedOutput::Srt { stream_id, .. } = &mut stream_id_changed.output else {
+            unreachable!()
+        };
+        *stream_id = "other".into();
+        assert!(base != stream_id_changed);
+    }
+
+    #[test]
+    fn srt_urls_encode_stream_id_and_never_include_passphrase() {
+        let mut spec = ResolvedStartSpec {
+            source: ResolvedSource::Udp { port: 8_600 },
+            output: ResolvedOutput::Srt {
+                server_port: 8_890,
+                passphrase: "strongPass1".into(),
+                latency_ms: 125,
+                stream_id: "#!::r=Pocket Stream/%#&=,snowman-☃".into(),
+            },
+            bind_interface: Some("ZeroTier".into()),
+            bind_address: Some("192.0.2.10".into()),
+            advertised_ip: "192.0.2.10".into(),
+            username: String::new(),
+            password: String::new(),
+        };
+
+        assert_eq!(
+            spec.client_url(),
+            "srt://192.0.2.10:8890?streamid=%23%21%3A%3Ar%3DPocket%20Stream%2F%25%23%26%3D%2Csnowman-%E2%98%83"
+        );
+        assert_eq!(spec.display_url(), "srt://192.0.2.10:8890");
+        assert!(!spec.client_url().contains("strongPass1"));
+
+        let ResolvedOutput::Srt { stream_id, .. } = &mut spec.output else {
+            unreachable!()
+        };
+        stream_id.clear();
+        assert_eq!(spec.client_url(), "srt://192.0.2.10:8890");
     }
 
     #[tokio::test(start_paused = true)]

@@ -188,15 +188,10 @@ pub fn prospective_restream_settings(
     validate_prospective_settings(prospective)
 }
 
-/// An unavailable secret is a valid preservation state but cannot start an
-/// SRT listener. Runtime/switch/recovery paths call this before disruption or
-/// bind once the SRT protocol variant is enabled.
-#[allow(dead_code)] // Wired into the SRT runtime start path in the next slice.
-pub fn validate_srt_startable(settings: &AppSettings) -> Result<(), AppError> {
-    if matches!(
-        &settings.srt_server.passphrase,
-        SrtPassphraseState::Unavailable { .. }
-    ) {
+pub(crate) fn validate_srt_startable_from_state(
+    passphrase: &SrtPassphraseState,
+) -> Result<(), AppError> {
+    if matches!(passphrase, SrtPassphraseState::Unavailable { .. }) {
         Err(AppError::SrtPassphraseUnavailable(
             "the saved SRT passphrase cannot be decrypted; replace it or explicitly clear encryption"
                 .into(),
@@ -204,6 +199,13 @@ pub fn validate_srt_startable(settings: &AppSettings) -> Result<(), AppError> {
     } else {
         Ok(())
     }
+}
+
+/// An unavailable secret is a valid preservation state but cannot start an
+/// SRT listener. Runtime, switch, and recovery paths call this before any
+/// existing output is disrupted or a new listener can bind.
+pub fn validate_srt_startable(settings: &AppSettings) -> Result<(), AppError> {
+    validate_srt_startable_from_state(&settings.srt_server.passphrase)
 }
 
 #[cfg(test)]

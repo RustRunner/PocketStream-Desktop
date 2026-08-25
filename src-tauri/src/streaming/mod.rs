@@ -1,11 +1,9 @@
 pub mod audio;
-#[allow(dead_code)] // Production admission core; wired into the SRT adapter in the next slice.
 mod caller_registry;
 pub mod recorder;
 mod relay;
 pub mod rtsp_client;
 pub mod rtsp_server;
-#[allow(dead_code)] // Production adapter; StreamManager wiring lands in the next slice.
 mod srt_server;
 pub mod video_embed;
 
@@ -17,7 +15,8 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 
 use crate::config::{
-    AppConfig, AppSettings, RestreamProtocol, RestreamSettingsUpdate, StreamProtocol,
+    AppConfig, AppSettings, RestreamProtocol, RestreamSettingsUpdate, SrtPassphraseState,
+    StreamProtocol,
 };
 use crate::error::AppError;
 
@@ -99,20 +98,24 @@ use relay::{
 };
 use rtsp_client::PlaybackPipeline;
 use rtsp_server::{RtspRestreamer, RtspRuntimeProbe, MAX_RTSP_CLIENTS};
+use srt_server::{SrtRestreamer, SrtRuntimeProbe};
 
 enum RestreamServer {
     Rtsp(RtspRestreamer),
+    Srt(SrtRestreamer),
 }
 
 #[derive(Clone)]
 enum RelayFaultProbe {
     Rtsp(RtspRuntimeProbe),
+    Srt(SrtRuntimeProbe),
 }
 
 impl RelayFaultProbe {
     fn poll_fault(&self) -> Option<RelayFaultEvent> {
         match self {
             Self::Rtsp(probe) => probe.poll_fault(),
+            Self::Srt(probe) => probe.poll_fault(),
         }
     }
 }
@@ -121,54 +124,63 @@ impl RestreamServer {
     fn protocol(&self) -> RestreamProtocol {
         match self {
             Self::Rtsp(_) => RestreamProtocol::Rtsp,
+            Self::Srt(_) => RestreamProtocol::Srt,
         }
     }
 
     fn server_generation(&self) -> u64 {
         match self {
             Self::Rtsp(server) => server.server_generation(),
+            Self::Srt(server) => server.server_generation(),
         }
     }
 
     fn connected_clients(&self) -> u32 {
         match self {
             Self::Rtsp(server) => server.connected_clients(),
+            Self::Srt(server) => server.connected_clients(),
         }
     }
 
     fn client_limit(&self) -> u32 {
         match self {
             Self::Rtsp(server) => server.client_limit(),
+            Self::Srt(server) => server.client_limit(),
         }
     }
 
     fn bandwidth_kbps(&self) -> f64 {
         match self {
             Self::Rtsp(server) => server.bandwidth_kbps(),
+            Self::Srt(server) => server.bandwidth_kbps(),
         }
     }
 
     fn fault_probe(&self) -> RelayFaultProbe {
         match self {
             Self::Rtsp(server) => RelayFaultProbe::Rtsp(server.fault_probe()),
+            Self::Srt(server) => RelayFaultProbe::Srt(server.fault_probe()),
         }
     }
 
     fn loop_alive(&self) -> bool {
         match self {
             Self::Rtsp(server) => server.loop_alive(),
+            Self::Srt(server) => server.loop_alive(),
         }
     }
 
     fn udp_ingest_port(&self) -> Option<u16> {
         match self {
             Self::Rtsp(server) => server.udp_ingest_port(),
+            Self::Srt(server) => server.udp_ingest_port(),
         }
     }
 
     async fn shutdown(&mut self) {
         match self {
             Self::Rtsp(server) => server.shutdown().await,
+            Self::Srt(server) => server.shutdown().await,
         }
     }
 }
@@ -594,11 +606,7 @@ impl StreamManager {
         settings: &AppSettings,
         adopted: &std::collections::HashSet<String>,
     ) -> Result<ResolvedStartSpec, AppError> {
-        let bind_interface = if settings.rtsp_server.bind_interface.is_empty() {
-            None
-        } else {
-            Some(settings.rtsp_server.bind_interface.clone())
-        };
+        let (bind_interface, output) = resolve_selected_restream_output(settings)?;
         let bind_address = resolve_explicit_bind(bind_interface.as_deref(), adopted).await?;
         let advertised_ip = match &bind_address {
             Some(ip) => ip.clone(),
@@ -623,12 +631,7 @@ impl StreamManager {
         );
         Ok(ResolvedStartSpec {
             source,
-            output: match settings.restream_protocol {
-                RestreamProtocol::Rtsp => ResolvedOutput::Rtsp {
-                    server_port: settings.rtsp_server.port,
-                    mount_path: format!("/stream-{}", settings.rtsp_server.token),
-                },
-            },
+            output,
             bind_interface,
             bind_address,
             advertised_ip,
@@ -680,6 +683,44 @@ impl StreamManager {
                 runtime,
             )
             .map(RestreamServer::Rtsp),
+            (
+                ResolvedOutput::Srt {
+                    server_port,
+                    passphrase,
+                    latency_ms,
+                    stream_id,
+                },
+                ResolvedSource::Udp { port },
+            ) => SrtRestreamer::start_from_udp(
+                *port,
+                *server_port,
+                spec.bind_address.as_deref(),
+                (!passphrase.is_empty()).then_some(passphrase.as_str()),
+                *latency_ms,
+                stream_id,
+                runtime,
+            )
+            .map(RestreamServer::Srt),
+            (
+                ResolvedOutput::Srt {
+                    server_port,
+                    passphrase,
+                    latency_ms,
+                    stream_id,
+                },
+                ResolvedSource::Rtsp { url },
+            ) => SrtRestreamer::start_from_rtsp(
+                url,
+                *server_port,
+                spec.bind_address.as_deref(),
+                &spec.username,
+                &spec.password,
+                (!passphrase.is_empty()).then_some(passphrase.as_str()),
+                *latency_ms,
+                stream_id,
+                runtime,
+            )
+            .map(RestreamServer::Srt),
         };
         (server_instance, result)
     }
@@ -812,6 +853,7 @@ impl StreamManager {
                 "Re-stream Server Enable must be on before starting".into(),
             ));
         }
+        validate_selected_restream_startable(&initial)?;
 
         // Publish intent before waiting for another user transaction or doing
         // interface resolution. A later Stop/Start can therefore supersede
@@ -845,6 +887,11 @@ impl StreamManager {
             return Err(AppError::Validation(
                 "Re-stream Server Enable must be on before starting".into(),
             ));
+        }
+        if let Err(error) = validate_selected_restream_startable(&settings) {
+            self.cancel_restream_start_intent(start_epoch, preserve_prior_desired)
+                .await;
+            return Err(error);
         }
         self.start_restream_server_inner(&settings, adopted, start_epoch, preserve_prior_desired)
             .await
@@ -952,7 +999,13 @@ impl StreamManager {
         self.refresh_status().await;
 
         let gst_error = crate::ensure_gstreamer().err();
-        if let Err(error) = crate::network::firewall::ensure_rtsp_allowed(spec.server_port()).await
+        let firewall_rule = match spec.protocol() {
+            RestreamProtocol::Rtsp => crate::network::firewall::FirewallRule::Rtsp,
+            RestreamProtocol::Srt => crate::network::firewall::FirewallRule::Srt,
+        };
+        if let Err(error) =
+            crate::network::firewall::ensure_restream_allowed(firewall_rule, spec.server_port())
+                .await
         {
             log::warn!("Firewall setup: {}", error);
         }
@@ -1183,8 +1236,8 @@ impl StreamManager {
     }
 
     /// Apply the shared Enable field and both complete protocol sections as
-    /// one backend lifecycle transaction. Until the SRT runtime slice lands,
-    /// only RTSP settings can affect the active listener.
+    /// one backend lifecycle transaction. Inactive-protocol edits persist
+    /// without replacing the selected runtime.
     pub async fn apply_restream_settings(
         &self,
         config: &AppConfig,
@@ -1199,7 +1252,11 @@ impl StreamManager {
         let prospective =
             crate::settings_validation::prospective_restream_settings(&old_settings, update)?;
         let was_desired = self.state.lock().await.restream_desired;
-        let runtime_changed = old_settings.rtsp_server != prospective.rtsp_server;
+        let runtime_changed = selected_restream_runtime_changed(&old_settings, &prospective);
+        let will_restart = was_desired && runtime_changed && prospective.rtsp_server.enabled;
+        if will_restart {
+            validate_selected_restream_startable(&prospective)?;
+        }
         let must_stop = was_desired && (runtime_changed || !prospective.rtsp_server.enabled);
 
         let stop_intent = if must_stop {
@@ -1284,31 +1341,98 @@ impl StreamManager {
         let operation_epoch = self
             .restream_epoch
             .load(std::sync::atomic::Ordering::Acquire);
-        let settings = crate::settings_validation::validate_prospective_settings(config.get())?;
-        debug_assert_eq!(protocol, RestreamProtocol::Rtsp);
+        let old_settings = crate::settings_validation::validate_prospective_settings(config.get())?;
+        let mut prospective = old_settings.clone();
+        prospective.restream_protocol = protocol;
+        let prospective = crate::settings_validation::validate_prospective_settings(prospective)?;
+        let was_desired = self.state.lock().await.restream_desired;
 
-        let desired = self.state.lock().await.restream_desired;
-        if desired {
-            if !settings.rtsp_server.enabled {
+        if was_desired {
+            if !prospective.rtsp_server.enabled {
                 return Err(AppError::Validation(
                     "Re-stream Server Enable must be on before switching".into(),
                 ));
             }
-            let (start_epoch, preserve_prior_desired) = self
-                .begin_restream_start_intent_if_current(operation_epoch)
+            validate_selected_restream_startable(&prospective)?;
+        }
+
+        if old_settings.restream_protocol == protocol {
+            self.state.lock().await.selected_protocol = protocol;
+            if was_desired {
+                let Some((start_epoch, preserve_prior_desired)) = self
+                    .begin_restream_start_intent_if_current(operation_epoch)
+                    .await
+                else {
+                    return Ok(self.current_operation_result().await);
+                };
+                self.start_restream_server_inner(
+                    &prospective,
+                    adopted,
+                    start_epoch,
+                    preserve_prior_desired,
+                )
+                .await?;
+            } else {
+                self.refresh_status().await;
+            }
+            return Ok(self.current_operation_result().await);
+        }
+
+        let stop_intent = self
+            .begin_restream_stop_intent_if_current(operation_epoch)
+            .await
+            .ok_or_else(|| {
+                AppError::Stream(
+                    "Re-stream protocol switch was superseded by a newer request".into(),
+                )
+            })?;
+        self.finish_restream_stop(stop_intent).await?;
+
+        let committed = match config.commit_restream_protocol(protocol) {
+            Ok(settings) => settings,
+            Err(persistence_error) => {
+                if was_desired {
+                    if let Some((start_epoch, preserve_prior_desired)) = self
+                        .begin_restream_start_intent_if_current(stop_intent.epoch)
+                        .await
+                    {
+                        if let Err(restoration_error) = self
+                            .start_restream_server_inner(
+                                &old_settings,
+                                adopted,
+                                start_epoch,
+                                preserve_prior_desired,
+                            )
+                            .await
+                        {
+                            return Err(AppError::Config(format!(
+                                "{}; restoring the prior re-stream output also failed: {}",
+                                persistence_error, restoration_error
+                            )));
+                        }
+                    }
+                }
+                return Err(persistence_error);
+            }
+        };
+
+        self.state.lock().await.selected_protocol = protocol;
+        self.refresh_status().await;
+
+        if was_desired {
+            if let Some((start_epoch, preserve_prior_desired)) = self
+                .begin_restream_start_intent_if_current(stop_intent.epoch)
                 .await
-                .ok_or_else(|| {
-                    AppError::Stream(
-                        "Re-stream protocol switch was superseded by a newer request".into(),
-                    )
-                })?;
-            self.start_restream_server_inner(
-                &settings,
-                adopted,
-                start_epoch,
-                preserve_prior_desired,
-            )
-            .await?;
+            {
+                validate_selected_restream_startable(&committed)?;
+                self.start_restream_server_inner(
+                    &committed,
+                    adopted,
+                    start_epoch,
+                    preserve_prior_desired,
+                )
+                .await?;
+            }
         }
         Ok(self.current_operation_result().await)
     }
@@ -1566,6 +1690,60 @@ impl StreamManager {
                 std::sync::atomic::Ordering::Acquire,
             )
             .is_ok()
+    }
+}
+
+fn optional_bind_interface(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn resolve_selected_restream_output(
+    settings: &AppSettings,
+) -> Result<(Option<String>, ResolvedOutput), AppError> {
+    validate_selected_restream_startable(settings)?;
+    match settings.restream_protocol {
+        RestreamProtocol::Rtsp => Ok((
+            optional_bind_interface(&settings.rtsp_server.bind_interface),
+            ResolvedOutput::Rtsp {
+                server_port: settings.rtsp_server.port,
+                mount_path: format!("/stream-{}", settings.rtsp_server.token),
+            },
+        )),
+        RestreamProtocol::Srt => Ok((
+            optional_bind_interface(&settings.srt_server.bind_interface),
+            ResolvedOutput::Srt {
+                server_port: settings.srt_server.port,
+                passphrase: resolved_srt_passphrase(&settings.srt_server.passphrase)?,
+                latency_ms: settings.srt_server.latency_ms,
+                stream_id: settings.srt_server.stream_id.clone(),
+            },
+        )),
+    }
+}
+
+fn resolved_srt_passphrase(passphrase: &SrtPassphraseState) -> Result<String, AppError> {
+    match passphrase {
+        SrtPassphraseState::Unencrypted => Ok(String::new()),
+        SrtPassphraseState::Available(value) => Ok(value.clone()),
+        SrtPassphraseState::Unavailable { .. } => {
+            crate::settings_validation::validate_srt_startable_from_state(passphrase)?;
+            unreachable!("unavailable SRT passphrase validation must fail")
+        }
+    }
+}
+
+fn validate_selected_restream_startable(settings: &AppSettings) -> Result<(), AppError> {
+    if settings.restream_protocol == RestreamProtocol::Srt {
+        crate::settings_validation::validate_srt_startable(settings)?;
+    }
+    Ok(())
+}
+
+fn selected_restream_runtime_changed(old: &AppSettings, prospective: &AppSettings) -> bool {
+    debug_assert_eq!(old.restream_protocol, prospective.restream_protocol);
+    match old.restream_protocol {
+        RestreamProtocol::Rtsp => old.rtsp_server != prospective.rtsp_server,
+        RestreamProtocol::Srt => old.srt_server != prospective.srt_server,
     }
 }
 
@@ -2169,6 +2347,14 @@ mod tests {
         addrs.iter().map(|s| s.to_string()).collect()
     }
 
+    fn unused_udp_port() -> u16 {
+        std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
     #[test]
     fn bind_ip_prefers_native_over_adopted() {
         // Interface carries a native client IP and an adopted camera
@@ -2366,6 +2552,78 @@ mod tests {
         assert!(!is_noop(&credentials_changed, RelayState::Listening, true));
     }
 
+    #[test]
+    fn only_selected_protocol_settings_replace_the_runtime() {
+        let old = make_settings(StreamProtocol::Rtsp, "192.0.2.20", "camera", "secret");
+
+        let mut inactive_srt_changed = old.clone();
+        inactive_srt_changed.srt_server.latency_ms = 250;
+        assert!(!selected_restream_runtime_changed(
+            &old,
+            &inactive_srt_changed
+        ));
+
+        let mut active_rtsp_changed = old.clone();
+        active_rtsp_changed.rtsp_server.port = 9_554;
+        assert!(selected_restream_runtime_changed(
+            &old,
+            &active_rtsp_changed
+        ));
+
+        let mut old_srt = old;
+        old_srt.restream_protocol = RestreamProtocol::Srt;
+        let mut inactive_rtsp_changed = old_srt.clone();
+        inactive_rtsp_changed.rtsp_server.port = 9_554;
+        assert!(!selected_restream_runtime_changed(
+            &old_srt,
+            &inactive_rtsp_changed
+        ));
+
+        let mut active_srt_changed = old_srt.clone();
+        active_srt_changed.srt_server.stream_id = "replacement".into();
+        assert!(selected_restream_runtime_changed(
+            &old_srt,
+            &active_srt_changed
+        ));
+    }
+
+    #[test]
+    fn srt_output_resolution_is_complete_and_fail_closed() {
+        let mut settings = make_settings(StreamProtocol::Rtsp, "192.0.2.20", "camera", "secret");
+        settings.restream_protocol = RestreamProtocol::Srt;
+        settings.srt_server.port = 9_000;
+        settings.srt_server.passphrase = SrtPassphraseState::Available("strongPass1".into());
+        settings.srt_server.latency_ms = 250;
+        settings.srt_server.stream_id = "field unit".into();
+        settings.srt_server.bind_interface = "ZeroTier".into();
+
+        let (bind_interface, output) = resolve_selected_restream_output(&settings).unwrap();
+        assert_eq!(bind_interface.as_deref(), Some("ZeroTier"));
+        let ResolvedOutput::Srt {
+            server_port,
+            passphrase,
+            latency_ms,
+            stream_id,
+        } = output
+        else {
+            panic!("SRT selection must resolve to an SRT output")
+        };
+        assert_eq!(server_port, 9_000);
+        assert_eq!(passphrase, "strongPass1");
+        assert_eq!(latency_ms, 250);
+        assert_eq!(stream_id, "field unit");
+
+        settings.srt_server.passphrase = SrtPassphraseState::Unavailable {
+            preserved_ciphertext: "opaque-ciphertext".into(),
+        };
+        let error = match resolve_selected_restream_output(&settings) {
+            Ok(_) => panic!("unavailable SRT encryption must fail before bind resolution"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), "SrtPassphraseUnavailable");
+        assert!(!error.to_string().contains("opaque-ciphertext"));
+    }
+
     // ── build_input_url ─────────────────────────────────────────────
 
     #[test]
@@ -2503,6 +2761,74 @@ mod tests {
         assert!(status.server_url.is_none());
         assert_eq!(status.connected_clients, 0);
         assert_eq!(status.client_limit, MAX_RTSP_CLIENTS);
+    }
+
+    #[tokio::test]
+    async fn srt_dispatch_populates_protocol_neutral_status() {
+        init_gstreamer();
+        let udp_port = unused_udp_port();
+        let mut server_port = unused_udp_port();
+        while server_port == udp_port {
+            server_port = unused_udp_port();
+        }
+        let manager = StreamManager::with_selected_protocol(RestreamProtocol::Srt);
+        let spec = ResolvedStartSpec {
+            source: ResolvedSource::Udp { port: udp_port },
+            output: ResolvedOutput::Srt {
+                server_port,
+                passphrase: String::new(),
+                latency_ms: 125,
+                stream_id: "field unit".into(),
+            },
+            bind_interface: Some("ZeroTier".into()),
+            bind_address: Some("127.0.0.1".into()),
+            advertised_ip: "127.0.0.1".into(),
+            username: String::new(),
+            password: String::new(),
+        };
+        let health = Arc::new(RelayRuntimeHealth::new(73, relay::RelayIngestKind::Udp));
+        let (_, built) = StreamManager::build_restream_server(
+            &spec,
+            health.clone(),
+            manager.relay_event_tx.clone(),
+            false,
+        );
+        let server = match built {
+            Ok(server) => server,
+            Err(failure) => panic!("SRT dispatch failed: {}", failure.error),
+        };
+        assert_eq!(server.protocol(), RestreamProtocol::Srt);
+        assert_eq!(server.client_limit(), 10);
+        assert!(server.loop_alive());
+        assert!(matches!(server.fault_probe(), RelayFaultProbe::Srt(_)));
+
+        {
+            let mut state = manager.state.lock().await;
+            state.restream_desired = true;
+            state.restream_spec = Some(spec);
+            state.restream_health = Some(health);
+            state.restream_server = Some(server);
+            state.restream_intent_epoch = Some(0);
+            state.restream_start_time = Some(std::time::Instant::now());
+        }
+        let status = compute_status(&manager.state).await;
+        assert_eq!(status.selected_protocol, RestreamProtocol::Srt);
+        assert_eq!(status.active_protocol, Some(RestreamProtocol::Srt));
+        assert!(status.server_running);
+        let expected_url = format!("srt://127.0.0.1:{server_port}?streamid=field%20unit");
+        let expected_display_url = format!("srt://127.0.0.1:{server_port}");
+        assert_eq!(status.server_url.as_deref(), Some(expected_url.as_str()));
+        assert_eq!(
+            status.display_url.as_deref(),
+            Some(expected_display_url.as_str())
+        );
+
+        let mut server = {
+            let mut state = manager.state.lock().await;
+            state.restream_server.take().unwrap()
+        };
+        server.shutdown().await;
+        assert!(!server.loop_alive());
     }
 
     #[tokio::test]

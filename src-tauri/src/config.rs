@@ -23,15 +23,14 @@ pub enum StreamProtocol {
     Udp,
 }
 
-/// Selected re-stream output protocol. The RTSP-only neutralization
-/// checkpoint intentionally exposes only `rtsp`; adding `srt` belongs to the
-/// following runtime milestone, so an early/stale `"srt"` IPC request cannot
-/// select an output that does not exist yet.
+/// Selected re-stream output protocol. Missing persisted values default to
+/// RTSP so pre-selector installations retain their existing output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum RestreamProtocol {
     #[default]
     Rtsp,
+    Srt,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -780,6 +779,40 @@ impl AppConfig {
                 let mut guard = poisoned.into_inner();
                 guard.rtsp_server = rtsp_server;
                 guard.srt_server = srt_server;
+            }
+        }
+        Ok(prospective)
+    }
+
+    /// Atomically persist the output selector before publishing it in memory.
+    /// StreamManager owns the surrounding stop/restore/restart transaction.
+    pub fn commit_restream_protocol(
+        &self,
+        protocol: RestreamProtocol,
+    ) -> Result<AppSettings, crate::AppError> {
+        self.commit_restream_protocol_with(protocol, save_to_disk)
+    }
+
+    fn commit_restream_protocol_with<F>(
+        &self,
+        protocol: RestreamProtocol,
+        persist: F,
+    ) -> Result<AppSettings, crate::AppError>
+    where
+        F: FnOnce(&AppSettings) -> Result<(), crate::AppError>,
+    {
+        let _save_guard = CONFIG_SAVE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut prospective = self.get();
+        prospective.restream_protocol = protocol;
+        let prospective = crate::settings_validation::validate_prospective_settings(prospective)?;
+        persist(&prospective)?;
+        match self.settings.lock() {
+            Ok(mut guard) => guard.restream_protocol = protocol,
+            Err(poisoned) => {
+                log::error!("Config mutex poisoned during re-stream selector commit, recovering");
+                poisoned.into_inner().restream_protocol = protocol;
             }
         }
         Ok(prospective)
@@ -1678,6 +1711,14 @@ mod tests {
         runtime_settings_from_persisted(persisted, Some(&TEST_KEY))
     }
 
+    fn app_config_for_test(settings: AppSettings) -> AppConfig {
+        AppConfig {
+            settings: Mutex::new(settings),
+            cache: Mutex::new(Vec::new()),
+            startup_notices: Mutex::new(Vec::new()),
+        }
+    }
+
     // ── Encryption / Decryption ─────────────────────────────────────
 
     #[test]
@@ -2047,11 +2088,40 @@ password = ""
             toml::Value::try_from(RestreamProtocol::Rtsp).unwrap(),
             toml::Value::String("rtsp".into())
         );
+        assert_eq!(
+            toml::Value::try_from(RestreamProtocol::Srt).unwrap(),
+            toml::Value::String("srt".into())
+        );
     }
 
     #[test]
-    fn checkpoint_rejects_unavailable_srt_selection() {
-        assert!(serde_json::from_str::<RestreamProtocol>("\"srt\"").is_err());
+    fn srt_selection_is_available_on_the_wire() {
+        assert_eq!(
+            serde_json::from_str::<RestreamProtocol>("\"srt\"").unwrap(),
+            RestreamProtocol::Srt
+        );
+    }
+
+    #[test]
+    fn selector_commit_publishes_only_after_persistence_succeeds() {
+        let config = app_config_for_test(AppSettings::default());
+        let error = match config.commit_restream_protocol_with(RestreamProtocol::Srt, |_| {
+            Err(crate::AppError::Config("injected write failure".into()))
+        }) {
+            Ok(_) => panic!("injected persistence failure must abort the selector commit"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), "Config");
+        assert_eq!(config.get().restream_protocol, RestreamProtocol::Rtsp);
+
+        let committed = config
+            .commit_restream_protocol_with(RestreamProtocol::Srt, |prospective| {
+                assert_eq!(prospective.restream_protocol, RestreamProtocol::Srt);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(committed.restream_protocol, RestreamProtocol::Srt);
+        assert_eq!(config.get().restream_protocol, RestreamProtocol::Srt);
     }
 
     #[test]
@@ -2059,6 +2129,11 @@ password = ""
         let settings = AppSettings::default();
         let value = serde_json::to_value(AppSettingsView::from(&settings)).unwrap();
         assert_eq!(value["restream_protocol"], "rtsp");
+
+        let mut settings = settings;
+        settings.restream_protocol = RestreamProtocol::Srt;
+        let value = serde_json::to_value(AppSettingsView::from(&settings)).unwrap();
+        assert_eq!(value["restream_protocol"], "srt");
     }
 
     #[test]
@@ -2070,6 +2145,18 @@ password = ""
         assert_eq!(parsed.stream.rtsp_port, original.stream.rtsp_port);
         assert_eq!(parsed.rtsp_server.port, original.rtsp_server.port);
         assert_eq!(parsed.rtsp_server.token, original.rtsp_server.token);
+    }
+
+    #[test]
+    fn srt_selector_persists_and_roundtrips() {
+        let original = AppSettings {
+            restream_protocol: RestreamProtocol::Srt,
+            ..AppSettings::default()
+        };
+        let content = serialize_for_test(&original);
+        assert!(content.contains("restream_protocol = \"srt\""));
+        let parsed = parse_for_test(&content).unwrap();
+        assert_eq!(parsed.restream_protocol, RestreamProtocol::Srt);
     }
 
     #[test]
