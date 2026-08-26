@@ -82,12 +82,29 @@ export function resolveSrtPassphraseUpdate(
   if (!dirty || (current.state === "available" && current.value === draft)) {
     return { action: "keep" };
   }
+  if (current.state === "unencrypted" && draft.length === 0) {
+    return { action: "keep" };
+  }
   if (draft.length === 0) {
     throw new Error(
-      "Enter a replacement SRT passphrase, or use Clear encryption and confirm unencrypted output"
+      "Enter a replacement SRT passphrase, or save the empty field and confirm passwordless output"
     );
   }
   return { action: "replace", value: draft };
+}
+
+export function srtPassphraseClearNeedsConfirmation(
+  current: SrtPassphraseView,
+  draft: string,
+  dirty: boolean,
+  clearConfirmed: boolean
+): boolean {
+  return (
+    !clearConfirmed &&
+    dirty &&
+    draft.length === 0 &&
+    current.state !== "unencrypted"
+  );
 }
 
 /** A selector status is final only after both the committed protocol and the

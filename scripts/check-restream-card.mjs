@@ -27,7 +27,6 @@ const requiredIds = [
   "srt-passphrase",
   "srt-passphrase-state",
   "srt-copy-passphrase",
-  "srt-clear-passphrase",
   "srt-latency-ms",
   "srt-stream-id",
   "srt-clear-passphrase-dialog",
@@ -87,10 +86,30 @@ const outputProtocolButtons = [
 if (outputProtocolButtons.join(",") !== "rtsp,srt") {
   failures.push("the re-stream selector must expose exactly RTSP and SRT");
 }
+const outputProtocolLabel = html.indexOf(">Output Protocol</h3>");
+const restreamSettingsLabel = html.indexOf(">Re-stream Server</h3>");
+const firstOutputProtocolButton = html.indexOf('data-restream-protocol="rtsp"');
+const restreamCard = html.indexOf('id="card-restream"');
+if (
+  outputProtocolLabel < 0 ||
+  firstOutputProtocolButton < outputProtocolLabel ||
+  restreamSettingsLabel < firstOutputProtocolButton ||
+  restreamCard < restreamSettingsLabel
+) {
+  failures.push(
+    "the full-size Output Protocol selector must sit immediately before Re-stream Server settings"
+  );
+}
+if (html.includes('<span class="status-label">Output:</span>')) {
+  failures.push("the output protocol selector must not remain in the status card");
+}
 if (!/<input(?=[^>]*id="srt-passphrase")(?=[^>]*type="password")[^>]*>/.test(html)) {
   failures.push("the SRT passphrase must render as a masked password field");
 }
-if (!html.includes("Run SRT without encryption?")) {
+if (html.includes('id="srt-clear-passphrase"')) {
+  failures.push("the redundant standalone Clear encryption button remains");
+}
+if (!html.includes("Run SRT without a password?")) {
   failures.push("the explicit unencrypted-SRT confirmation is missing");
 }
 if (!/id="restream-bind-interface"[^>]*\bdisabled\b/.test(html)) {
@@ -114,6 +133,7 @@ for (const wiring of [
   "stopRestreamServer",
   "switchRestreamProtocol(protocol)",
   "beginRestreamSettingsSave",
+  "confirmSrtPassphraseClearIfNeeded",
   "readRestreamSettingsUpdate",
   "resolveSrtPassphraseUpdate",
 ]) {

@@ -46,7 +46,7 @@
         <!-- Sidebar / Settings Panel -->
         <aside id="sidebar" class="sidebar collapsed">
           <div class="sidebar-content">
-            <!-- Protocol Selection -->
+            <!-- Input Protocol Selection -->
             <section class="setting-group">
               <h3 class="setting-label">Input Protocol</h3>
               <div class="toggle-group">
@@ -98,6 +98,15 @@
               </div>
             </section>
 
+            <!-- Output Protocol Selection -->
+            <section class="setting-group">
+              <h3 class="setting-label">Output Protocol</h3>
+              <div class="toggle-group" role="group" aria-label="Re-stream output protocol">
+                <button type="button" class="toggle-btn active" data-restream-protocol="rtsp" aria-pressed="true" disabled>RTSP</button>
+                <button type="button" class="toggle-btn" data-restream-protocol="srt" aria-pressed="false" disabled>SRT</button>
+              </div>
+            </section>
+
             <!-- Re-stream Server Settings -->
             <section class="setting-group">
               <h3 class="setting-label">Re-stream Server</h3>
@@ -141,7 +150,6 @@
                     </button>
                   </div>
                   <p id="srt-passphrase-state" class="setting-helper" aria-live="polite"></p>
-                  <button type="button" id="srt-clear-passphrase" class="text-btn compact" disabled>Clear encryption</button>
                 </div>
                 <div class="input-field">
                   <label for="srt-latency-ms">SRT Latency (ms)</label>
@@ -256,13 +264,6 @@
                 </div>
               </div>
               <div class="card-body">
-                <div class="status-row">
-                  <span class="status-label">Output:</span>
-                  <div class="toggle-group restream-protocol-toggle" role="group" aria-label="Re-stream output protocol">
-                    <button type="button" class="toggle-btn active" data-restream-protocol="rtsp" aria-pressed="true" disabled>RTSP</button>
-                    <button type="button" class="toggle-btn" data-restream-protocol="srt" aria-pressed="false" disabled>SRT</button>
-                  </div>
-                </div>
                 <div class="status-row">
                   <span class="status-label">Status:</span>
                   <span id="restream-status" class="status-value status-offline">Offline</span>
@@ -427,16 +428,16 @@
       </div>
     </dialog>
 
-    <!-- Explicit confirmation: an empty SRT passphrase is intentional,
-         never inferred from an empty or unavailable secret field. -->
+    <!-- Saving a deliberately emptied SRT passphrase still requires explicit
+         confirmation; an untouched unavailable secret remains protected. -->
     <dialog id="srt-clear-passphrase-dialog" class="dialog">
-      <h2>Run SRT without encryption?</h2>
+      <h2>Run SRT without a password?</h2>
       <div class="dialog-body">
         <p>This removes the SRT passphrase when you next save settings. Anyone who can reach the listener can connect.</p>
         <p class="muted">Use passwordless SRT only on a trusted private network or VPN such as ZeroTier.</p>
       </div>
       <div class="dialog-actions">
-        <button class="text-btn" id="srt-clear-passphrase-confirm">Clear encryption</button>
+        <button class="text-btn" id="srt-clear-passphrase-confirm">Use No Password</button>
         <div class="dialog-spacer"></div>
         <button class="filled-btn" id="srt-clear-passphrase-cancel">Cancel</button>
       </div>

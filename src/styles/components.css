@@ -411,18 +411,7 @@
   justify-self: end;
 }
 
-.restream-protocol-toggle {
-  justify-self: end;
-  margin: 0;
-}
-
-.restream-protocol-toggle .toggle-btn {
-  min-width: 52px;
-  padding: 4px 10px;
-  font-size: 12px;
-}
-
-.restream-protocol-toggle .toggle-btn:disabled {
+.toggle-btn[data-restream-protocol]:disabled {
   cursor: wait;
   opacity: 0.65;
 }

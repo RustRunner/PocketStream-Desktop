@@ -46,6 +46,7 @@ import {
   updateMuteButton,
   applyRestreamOperationResult,
   beginRestreamSettingsSave,
+  confirmSrtPassphraseClearIfNeeded,
   finishRestreamSettingsSave,
   readRestreamSettingsUpdate,
   reloadCanonicalRestreamConfig,
@@ -434,19 +435,22 @@ function setupSettingsSave(): void {
       password: $<HTMLInputElement>("#camera-pass").value,
     };
 
-    let restreamUpdate: ReturnType<typeof readRestreamSettingsUpdate>;
-    try {
-      restreamUpdate = readRestreamSettingsUpdate();
-    } catch (error) {
-      showToast("Failed to save: " + formatError(error), true);
-      return;
-    }
     if (!beginRestreamSettingsSave()) {
       showToast("Wait for the current re-stream operation to finish", true);
       return;
     }
 
     try {
+      if (!(await confirmSrtPassphraseClearIfNeeded())) return;
+
+      let restreamUpdate: ReturnType<typeof readRestreamSettingsUpdate>;
+      try {
+        restreamUpdate = readRestreamSettingsUpdate();
+      } catch (error) {
+        showToast("Failed to save: " + formatError(error), true);
+        return;
+      }
+
       // Sequential so a failure points clearly at one section. Each
       // command mutates only its own slice of AppSettings server-side
       // — backend-owned fields (device_cache, adopted_subnets,

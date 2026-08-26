@@ -14,6 +14,7 @@ import {
   buildRestreamSettingsUpdate,
   resolveSrtPassphraseUpdate,
   restreamSwitchStatusIsFinal,
+  srtPassphraseClearNeedsConfirmation,
   RestreamBindRequestGate,
   selectedRestreamBindInterface,
 } from "./restream-settings.ts";
@@ -388,6 +389,7 @@ let srtPassphraseCurrent: SrtPassphraseView = {
 };
 let srtPassphraseDirty = false;
 let srtPassphraseClearConfirmed = false;
+let srtPassphraseClearPromptOpening = false;
 
 function currentRestreamProtocol(): RestreamProtocol {
   return state.config?.restream_protocol ?? renderedRestreamProtocol;
@@ -503,6 +505,45 @@ export function finishRestreamSettingsSave(): void {
   syncRestreamOperationControls();
 }
 
+/** An empty edited field is the user's clear intent, but it remains fail-closed
+ * until the save flow receives an explicit passwordless confirmation. */
+export async function confirmSrtPassphraseClearIfNeeded(): Promise<boolean> {
+  const input = $<HTMLInputElement>("#srt-passphrase");
+  if (!srtPassphraseClearNeedsConfirmation(
+    srtPassphraseCurrent,
+    input.value,
+    srtPassphraseDirty,
+    srtPassphraseClearConfirmed
+  )) {
+    return true;
+  }
+
+  const dialog = $<HTMLDialogElement>("#srt-clear-passphrase-dialog");
+  if (srtPassphraseClearPromptOpening || dialog.open) return false;
+  srtPassphraseClearPromptOpening = true;
+  dialog.returnValue = "";
+  const closed = new Promise<boolean>((resolve) => {
+    dialog.addEventListener(
+      "close",
+      () => resolve(dialog.returnValue === "passwordless"),
+      { once: true }
+    );
+  });
+  try {
+    await showModalWithVideo(dialog);
+    const confirmed = await closed;
+    if (confirmed) {
+      srtPassphraseClearConfirmed = true;
+      srtPassphraseDirty = false;
+      input.value = "";
+      renderSrtPassphraseState();
+    }
+    return confirmed;
+  } finally {
+    srtPassphraseClearPromptOpening = false;
+  }
+}
+
 export function setupRestreamControls(): void {
   const enableToggle = $<HTMLInputElement>("#restream-server-enable");
   enableToggle.addEventListener("change", () => {
@@ -600,6 +641,19 @@ export function setupRestreamControls(): void {
     srtPassphraseClearConfirmed = false;
     renderSrtPassphraseState();
   });
+  passphraseInput.addEventListener("keydown", (event) => {
+    if (
+      (event.key === "Backspace" || event.key === "Delete") &&
+      passphraseInput.value.length === 0 &&
+      srtPassphraseCurrent.state === "unavailable"
+    ) {
+      // The protected value cannot be displayed, so Backspace/Delete on the
+      // empty repair field is the explicit removal gesture for this state.
+      srtPassphraseDirty = true;
+      srtPassphraseClearConfirmed = false;
+      renderSrtPassphraseState();
+    }
+  });
 
   $<HTMLButtonElement>("#srt-copy-passphrase").addEventListener("click", async () => {
     if (!passphraseInput.value || srtPassphraseClearConfirmed) return;
@@ -612,28 +666,14 @@ export function setupRestreamControls(): void {
   });
 
   const clearDialog = $<HTMLDialogElement>("#srt-clear-passphrase-dialog");
-  let clearDialogOpening = false;
-  $<HTMLButtonElement>("#srt-clear-passphrase").addEventListener("click", async () => {
-    if (clearDialog.open || clearDialogOpening) return;
-    clearDialogOpening = true;
-    try {
-      await showModalWithVideo(clearDialog);
-    } finally {
-      clearDialogOpening = false;
-    }
-  });
   $<HTMLButtonElement>("#srt-clear-passphrase-confirm").addEventListener("click", () => {
-    srtPassphraseClearConfirmed = true;
-    srtPassphraseDirty = false;
-    passphraseInput.value = "";
-    renderSrtPassphraseState();
-    clearDialog.close();
+    clearDialog.close("passwordless");
   });
   $<HTMLButtonElement>("#srt-clear-passphrase-cancel").addEventListener("click", () => {
-    clearDialog.close();
+    clearDialog.close("cancel");
   });
   clearDialog.addEventListener("click", (event) => {
-    if (event.target === clearDialog) clearDialog.close();
+    if (event.target === clearDialog) clearDialog.close("cancel");
   });
 
   $<HTMLButtonElement>("#btn-toggle-restream").addEventListener("click", async () => {
@@ -759,18 +799,17 @@ function renderSrtPassphraseState(): void {
   const input = $<HTMLInputElement>("#srt-passphrase");
   const status = $("#srt-passphrase-state");
   const copy = $<HTMLButtonElement>("#srt-copy-passphrase");
-  const clear = $<HTMLButtonElement>("#srt-clear-passphrase");
 
   status.className = "setting-helper";
   if (srtPassphraseClearConfirmed) {
     input.placeholder = "No passphrase (unencrypted)";
-    status.textContent = "Unencrypted output confirmed; save settings to apply.";
+    status.textContent = "Passwordless SRT confirmed; save settings to apply.";
     status.classList.add("warning");
   } else if (srtPassphraseDirty) {
     input.placeholder = "10-79 visible ASCII characters (no spaces)";
     if (input.value.length === 0) {
-      status.textContent = "Enter a replacement, or use Clear encryption.";
-      status.classList.add("error");
+      status.textContent = "Passphrase removed; save settings to confirm passwordless SRT.";
+      status.classList.add("warning");
     } else if (
       srtPassphraseCurrent.state === "available" &&
       srtPassphraseCurrent.value === input.value
@@ -793,16 +832,13 @@ function renderSrtPassphraseState(): void {
       case "unavailable":
         input.placeholder = "Re-entry required";
         status.textContent =
-          "Saved passphrase is unavailable; enter a replacement or confirm Clear encryption.";
+          "Saved passphrase is unavailable; enter a replacement, or press Backspace then save to use no password.";
         status.classList.add("error");
         break;
     }
   }
 
   copy.disabled = input.value.length === 0 || srtPassphraseClearConfirmed;
-  clear.disabled =
-    srtPassphraseClearConfirmed ||
-    (srtPassphraseCurrent.state === "unencrypted" && !srtPassphraseDirty);
 }
 
 function loadSrtPassphraseView(passphrase: SrtPassphraseView): void {

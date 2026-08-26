@@ -22,6 +22,7 @@ const {
   buildRestreamSettingsUpdate,
   resolveSrtPassphraseUpdate,
   restreamSwitchStatusIsFinal,
+  srtPassphraseClearNeedsConfirmation,
   selectedRestreamBindInterface,
 } = await importTypeScript("src/lib/restream-settings.ts");
 
@@ -120,6 +121,9 @@ if (replacement.action !== "replace" || replacement.value !== "replacement1") {
 if (resolveSrtPassphraseUpdate(available, "", true, true).action !== "clear") {
   throw new Error("confirmed passwordless operation must submit Clear");
 }
+if (resolveSrtPassphraseUpdate({ state: "unencrypted", value: null }, "", true, false).action !== "keep") {
+  throw new Error("editing an already-passwordless field back to empty must remain Keep");
+}
 let emptyEditRejected = false;
 try {
   resolveSrtPassphraseUpdate(available, "", true, false);
@@ -128,6 +132,25 @@ try {
 }
 if (!emptyEditRejected) {
   throw new Error("an empty edit must not silently clear SRT encryption");
+}
+if (!srtPassphraseClearNeedsConfirmation(available, "", true, false)) {
+  throw new Error("deleting an available passphrase must request confirmation on Save");
+}
+if (srtPassphraseClearNeedsConfirmation(unavailable, "", false, false)) {
+  throw new Error("an untouched unavailable passphrase must remain Keep without prompting");
+}
+if (!srtPassphraseClearNeedsConfirmation(unavailable, "", true, false)) {
+  throw new Error("Backspace intent on an unavailable passphrase must request confirmation");
+}
+if (
+  srtPassphraseClearNeedsConfirmation(
+    { state: "unencrypted", value: null },
+    "",
+    true,
+    false
+  )
+) {
+  throw new Error("an already-passwordless field must not request redundant confirmation");
 }
 
 if (restreamSwitchStatusIsFinal("srt", true, "srt", false)) {
