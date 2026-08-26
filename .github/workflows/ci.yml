@@ -111,6 +111,12 @@ jobs:
           & powershell.exe -NoProfile -ExecutionPolicy Bypass `
             -File scripts\bundle-gstreamer.ps1 -ValidateManifestOnly
           if ($LASTEXITCODE -ne 0) { throw "patched libsrt manifest validation failed with exit $LASTEXITCODE" }
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+            -File scripts\mirror-gstreamer-src.ps1 -ValidateManifestOnly
+          if ($LASTEXITCODE -ne 0) { throw "native source manifest validation failed with exit $LASTEXITCODE" }
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+            -File scripts\check-third-party.ps1
+          if ($LASTEXITCODE -ne 0) { throw "third-party closure validation failed with exit $LASTEXITCODE" }
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -314,9 +320,11 @@ jobs:
         shell: powershell
         timeout-minutes: 15
         run: |
+          $g1Evidence = Join-Path $env:RUNNER_TEMP 'g1-r-srt-1.5.6.json'
           $evidence = Join-Path $env:RUNNER_TEMP 'g2-srt-admission-1.5.6.json'
           & powershell.exe -NoProfile -ExecutionPolicy Bypass `
-            -File scripts\verify-g2-srt.ps1 -EvidencePath $evidence
+            -File scripts\verify-g2-srt.ps1 `
+            -G1EvidencePath $g1Evidence -EvidencePath $evidence
           if ($LASTEXITCODE -ne 0) {
             throw "G2 admission gate failed with exit $LASTEXITCODE"
           }
@@ -342,6 +350,34 @@ jobs:
       - name: cargo test
         working-directory: src-tauri
         run: cargo test --lib --locked
+
+      # This records the staging half of G3 after the feature tests have
+      # passed. It is deliberately marked incomplete: only the release job can
+      # install the NSIS artifact and issue g3_complete=true evidence. Source
+      # content is still fully validated here from the pinned offline manifest.
+      - name: G3 staged dependency and source closure gate
+        shell: powershell
+        timeout-minutes: 10
+        run: |
+          $g1Evidence = Join-Path $env:RUNNER_TEMP 'g1-r-srt-1.5.6.json'
+          $g2Evidence = Join-Path $env:RUNNER_TEMP 'g2-srt-admission-1.5.6.json'
+          $g3Evidence = Join-Path $env:RUNNER_TEMP 'g3-srt-staged-1.5.6.json'
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+            -File scripts\verify-g3-srt.ps1 -StagedOnly `
+            -SkipPublishedSourceCheck `
+            -G1EvidencePath $g1Evidence -G2EvidencePath $g2Evidence `
+            -EvidencePath $g3Evidence
+          if ($LASTEXITCODE -ne 0) {
+            throw "G3 staged closure gate failed with exit $LASTEXITCODE"
+          }
+
+      - name: Upload G3 staged closure evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g3-srt-staged-evidence
+          path: ${{ runner.temp }}\g3-srt-staged-1.5.6.json
+          if-no-files-found: warn
 
   audit:
     name: Security Audit

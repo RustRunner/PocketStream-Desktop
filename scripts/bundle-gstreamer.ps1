@@ -156,6 +156,75 @@ function Assert-StagedSrtClosure {
     Write-Host "Verified exact seven-file staged SRT closure." -ForegroundColor Green
 }
 
+function Get-DeclaredBundlePaths {
+    param([Parameter(Mandatory = $true)][hashtable]$RootManifest)
+
+    $paths = @()
+    foreach ($dll in $RootManifest.CoreDlls) {
+        $paths += "bin/$dll"
+    }
+    foreach ($plugin in $RootManifest.Plugins) {
+        $paths += "lib/gstreamer-1.0/$plugin"
+    }
+    return @($paths | Sort-Object)
+}
+
+function Assert-BundleClosureManifest {
+    param([Parameter(Mandatory = $true)][hashtable]$RootManifest)
+
+    if (-not $RootManifest.ContainsKey('BundleClosure') -or
+        $RootManifest.BundleClosure -isnot [hashtable]) {
+        throw 'BundleClosure must be a hashtable.'
+    }
+    $declaredPaths = Get-DeclaredBundlePaths -RootManifest $RootManifest
+    $lockedPaths = @($RootManifest.BundleClosure.Keys | Sort-Object)
+    if (($declaredPaths -join "`n") -cne ($lockedPaths -join "`n")) {
+        $delta = @(Compare-Object -CaseSensitive `
+            -ReferenceObject $declaredPaths -DifferenceObject $lockedPaths)
+        $details = @($delta | ForEach-Object { "$($_.SideIndicator) $($_.InputObject)" })
+        throw "BundleClosure must lock exactly CoreDlls and Plugins:`n$($details -join "`n")"
+    }
+    foreach ($relativePath in $lockedPaths) {
+        if ([string]$RootManifest.BundleClosure[$relativePath] -notmatch '^[0-9a-f]{64}$') {
+            throw "BundleClosure['$relativePath'] must be a lowercase SHA256 value."
+        }
+    }
+    foreach ($relativePath in $RootManifest.PatchedSrt.StagedClosure.Keys) {
+        if (-not $RootManifest.BundleClosure.ContainsKey($relativePath) -or
+            [string]$RootManifest.BundleClosure[$relativePath] -cne
+                [string]$RootManifest.PatchedSrt.StagedClosure[$relativePath]) {
+            throw "BundleClosure and PatchedSrt.StagedClosure disagree for '$relativePath'."
+        }
+    }
+}
+
+function Assert-ExactBundleClosure {
+    param(
+        [Parameter(Mandatory = $true)][string]$BundleRoot,
+        [Parameter(Mandatory = $true)][hashtable]$RootManifest
+    )
+
+    $resolvedRoot = [System.IO.Path]::GetFullPath($BundleRoot).TrimEnd('\', '/')
+    $actualPaths = @(Get-ChildItem -LiteralPath $resolvedRoot -Recurse -File |
+        ForEach-Object {
+            $_.FullName.Substring($resolvedRoot.Length + 1).Replace('\', '/')
+        } | Sort-Object)
+    $expectedPaths = @($RootManifest.BundleClosure.Keys | Sort-Object)
+    if (($actualPaths -join "`n") -cne ($expectedPaths -join "`n")) {
+        $delta = @(Compare-Object -CaseSensitive `
+            -ReferenceObject $expectedPaths -DifferenceObject $actualPaths)
+        $details = @($delta | ForEach-Object { "$($_.SideIndicator) $($_.InputObject)" })
+        throw "Staged bundle does not contain the exact declared closure:`n$($details -join "`n")"
+    }
+    foreach ($relativePath in $expectedPaths) {
+        $nativePath = $relativePath.Replace('/', [System.IO.Path]::DirectorySeparatorChar)
+        Assert-FileSha256 -Path (Join-Path $resolvedRoot $nativePath) `
+            -Expected $RootManifest.BundleClosure[$relativePath] `
+            -Description "Staged bundle file $relativePath"
+    }
+    Write-Host "Verified exact $($expectedPaths.Count)-file staged bundle closure." -ForegroundColor Green
+}
+
 function Get-VerifiedPatchedSrtArchive {
     param(
         [Parameter(Mandatory = $true)][hashtable]$Srt,
@@ -290,8 +359,10 @@ if (-not $Manifest.ContainsKey('PatchedSrt')) {
     throw 'gstreamer-manifest.psd1 has no PatchedSrt dependency contract.'
 }
 Assert-PatchedSrtManifest -Srt $Manifest.PatchedSrt
+Assert-BundleClosureManifest -RootManifest $Manifest
 if ($ValidateManifestOnly) {
-    Write-Host "Patched SRT manifest validation passed for $($Manifest.PatchedSrt.ReleaseTag)." -ForegroundColor Green
+    Write-Host ("Runtime manifest validation passed for {0} ({1} locked files)." -f `
+        $Manifest.PatchedSrt.ReleaseTag, $Manifest.BundleClosure.Count) -ForegroundColor Green
     return
 }
 
@@ -386,18 +457,9 @@ foreach ($dll in $CoreDlls) {
             $missing += "bin/$dll"
             continue
         }
-        # Try wildcard match for versioned DLLs (e.g., x264-164.dll may differ)
-        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($dll) -replace '-\d+$', ''
-        $match = Get-ChildItem $GstBin -Filter "$baseName*.dll" | Select-Object -First 1
-        if ($match) {
-            Copy-Item $match.FullName -Destination $OutBin
-            $size = $match.Length
-            $totalSize += $size
-            $copied++
-            Write-Host "  (matched $($match.Name) for $dll)" -ForegroundColor DarkYellow
-        } else {
-            $missing += "bin/$dll"
-        }
+        # Every filename is part of the hash-locked bundle contract. A wildcard
+        # substitute can silently select a different ABI and is never accepted.
+        $missing += "bin/$dll"
     }
 }
 
@@ -441,6 +503,9 @@ $totalSize += Install-PatchedSrt `
 Assert-StagedSrtClosure `
     -BundleRoot (Join-Path $ProjectDir 'src-tauri\resources\gstreamer') `
     -Srt $Manifest.PatchedSrt
+Assert-ExactBundleClosure `
+    -BundleRoot (Join-Path $ProjectDir 'src-tauri\resources\gstreamer') `
+    -RootManifest $Manifest
 
 # ── Summary ───────────────────────────────────────────────────────────
 

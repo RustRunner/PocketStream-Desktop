@@ -1,6 +1,6 @@
 # Publishing checklist (drafts are published by hand): before publishing
-# a draft, confirm the corresponding-source prerelease for the pinned
-# GStreamer version exists (tag gst-src-<version>, staged by
+# a draft, confirm the complete corresponding-source prerelease from
+# gstreamer-manifest.psd1 exists (staged by
 # scripts/mirror-gstreamer-src.ps1 — see its header for the publish
 # command) and link it from the release notes.
 name: Release
@@ -124,6 +124,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "typecheck failed" }
           ./scripts/check-third-party.ps1
           if ($LASTEXITCODE -ne 0) { throw "third-party notices check failed" }
+          ./scripts/mirror-gstreamer-src.ps1 -ValidateManifestOnly
+          if ($LASTEXITCODE -ne 0) { throw "native source manifest check failed" }
           Push-Location src-tauri
           try {
             cargo fmt --check
@@ -164,6 +166,22 @@ jobs:
         shell: pwsh
         run: pwsh -File scripts/bundle-gstreamer.ps1
 
+      # Prove the exact packaged input and require the complete native-source
+      # prerelease before spending time signing and drafting an application
+      # release. This evidence remains staged-only until the NSIS artifact is
+      # installed and checked below.
+      - name: G3 staged release closure gate
+        shell: powershell
+        timeout-minutes: 10
+        run: |
+          $evidence = Join-Path $env:RUNNER_TEMP 'g3-srt-release-staged-1.5.6.json'
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+            -File scripts\verify-g3-srt.ps1 -StagedOnly `
+            -EvidencePath $evidence
+          if ($LASTEXITCODE -ne 0) {
+            throw "G3 staged release gate failed with exit $LASTEXITCODE"
+          }
+
       # Build + sign + assemble latest.json + publish as a DRAFT release.
       # POCKETSTREAM_RELEASE embeds the requireAdministrator manifest.
       # The draft is a deliberate human approval gate: the updater only
@@ -184,3 +202,45 @@ jobs:
           # Trailing args after -- reach cargo: fail on a drifted
           # Cargo.lock instead of silently re-resolving at release time.
           args: -- --locked
+
+      # Install the just-built NSIS artifact into a fresh runner directory and
+      # rerun the exact hash/import/plugin checks there. Only this invocation
+      # can emit g3_complete=true. The GitHub release is still a draft, so a
+      # failed installed-package gate cannot reach the updater.
+      - name: Install draft artifact and complete G3
+        shell: powershell
+        timeout-minutes: 15
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $installerName = "PocketStream Desktop_${version}_x64-setup.exe"
+          $installerPath = Join-Path $pwd "src-tauri\target\release\bundle\nsis\$installerName"
+          if (-not (Test-Path -LiteralPath $installerPath -PathType Leaf)) {
+            throw "Expected NSIS installer is missing: $installerPath"
+          }
+          $installRoot = Join-Path $env:RUNNER_TEMP "pocketstream-g3-install-$version"
+          if (Test-Path -LiteralPath $installRoot) {
+            throw "Fresh G3 install root already exists: $installRoot"
+          }
+          $installer = Start-Process -FilePath $installerPath -Wait -PassThru `
+            -ArgumentList @('/S', "/D=$installRoot")
+          if ($installer.ExitCode -ne 0) {
+            throw "NSIS silent install failed with exit $($installer.ExitCode)"
+          }
+          $evidence = Join-Path $env:RUNNER_TEMP 'g3-srt-installed-1.5.6.json'
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+            -File scripts\verify-g3-srt.ps1 `
+            -InstalledAppRoot $installRoot -InstallerPath $installerPath `
+            -EvidencePath $evidence
+          if ($LASTEXITCODE -ne 0) {
+            throw "G3 installed-package gate failed with exit $LASTEXITCODE"
+          }
+
+      - name: Upload G3 release evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g3-srt-release-evidence
+          path: |
+            ${{ runner.temp }}\g3-srt-release-staged-1.5.6.json
+            ${{ runner.temp }}\g3-srt-installed-1.5.6.json
+          if-no-files-found: warn
