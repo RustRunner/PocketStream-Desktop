@@ -196,6 +196,7 @@ mod tests {
         InterfaceInfo {
             name: "t".into(),
             display_name: "t".into(),
+            description: String::new(),
             ips,
             mac: String::new(),
             is_up,

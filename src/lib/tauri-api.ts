@@ -15,6 +15,7 @@
 import type {
   AdoptionSnapshot,
   AppSettings,
+  CaptureState,
   Credentials,
   DeviceRecord,
   DeviceStatus,
@@ -153,6 +154,10 @@ export async function refreshAdapter(
 }
 
 // ── ARP Discovery ───────────────────────────────────────────────────
+
+export async function getCaptureState(): Promise<CaptureState> {
+  return await invoke<CaptureState>("get_capture_state");
+}
 
 export async function startArpDiscovery(iface: string): Promise<void> {
   return await invoke("start_arp_discovery", { interface: iface });

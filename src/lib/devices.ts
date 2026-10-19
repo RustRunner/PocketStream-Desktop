@@ -47,6 +47,7 @@ import { formatError } from "./errors.ts";
 import type {
   AdoptionFailedPayload,
   ArpDevicePayload,
+  CaptureState,
   DevicePingResultPayload,
   DeviceRecord,
   DiscoveryDegradedPayload,
@@ -64,6 +65,13 @@ function cssAttrValue(value: string): string {
 }
 
 // ── Local scanning state ────────────────────────────────────────────
+
+/** Current capture state for the launch notice and degraded indicator. */
+export let captureState: CaptureState = {
+  active: false,
+  adapter_name: null,
+  outcome: null,
+};
 
 let pendingScans = 0;
 
@@ -265,6 +273,17 @@ export function resetDiscoveryStatus(): void {
 // ── ARP event listeners ─────────────────────────────────────────────
 
 export function setupArpListeners(): void {
+  // Subscribe before fetching: startup may activate before the webview
+  // loads. An event received during the fetch wins over its older reply.
+  let receivedCaptureEvent = false;
+  void api.onEvent<CaptureState>("capture-active", (next) => {
+    receivedCaptureEvent = true;
+    captureState = next;
+  }).then(async () => {
+    const current = await api.getCaptureState();
+    if (current && !receivedCaptureEvent) captureState = current;
+  }).catch((e) => log(`Failed to load capture state: ${formatError(e)}`));
+
   // Re-render whenever the backend pushes a new snapshot.
   deviceList.subscribe(renderArpDeviceList);
 

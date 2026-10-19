@@ -230,6 +230,7 @@ mod imp {
                 let sentinel = interface::InterfaceInfo {
                     name: String::new(),
                     display_name: String::new(),
+                    description: String::new(),
                     ips: vec![],
                     mac: String::new(),
                     is_up: false,

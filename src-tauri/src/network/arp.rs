@@ -932,6 +932,13 @@ pub(crate) async fn start_listener(
                             scope.display_name
                         );
                     }
+                    pktmon::ScopeOutcome::ScopedByName { source_id } => {
+                        log::warn!(
+                            "PacketMonitor: ARP capture active (scope=scoped-by-name, source_id={}, adapter='{}'); name match is not identity proof",
+                            source_id,
+                            scope.display_name
+                        );
+                    }
                     pktmon::ScopeOutcome::UnscopedFallback { reason } => {
                         log::warn!(
                             "PacketMonitor: ARP capture active (scope=unscoped-fallback, adapter='{}'): {}",

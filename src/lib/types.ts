@@ -60,6 +60,7 @@ export interface IpInfo {
 export interface InterfaceInfo {
   name: string;
   display_name: string;
+  description: string;
   ips: IpInfo[];
   mac: string;
   is_up: boolean;
@@ -279,6 +280,18 @@ export interface AdoptionFailedPayload {
  *  told apart from the active one. */
 export interface AdoptionLifecyclePayload {
   adoption_id: string;
+}
+
+export type CaptureScopeOutcome =
+  | { scope: "selected_interface"; source_id: number | null }
+  | { scope: "scoped_by_name"; source_id: number }
+  | { scope: "unscoped_fallback"; reason: string };
+
+/** Shared by the `capture-active` event and get_capture_state query. */
+export interface CaptureState {
+  active: boolean;
+  adapter_name: string | null;
+  outcome: CaptureScopeOutcome | null;
 }
 
 /** Payload for the `discovery-degraded` event: the capture backend
