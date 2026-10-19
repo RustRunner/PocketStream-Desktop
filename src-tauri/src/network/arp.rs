@@ -22,6 +22,99 @@ pub struct ArpDevice {
     pub last_seen: String,
 }
 
+const CANDIDATE_TTL: Duration = Duration::from_secs(30);
+const MAX_CANDIDATES: usize = 1024;
+type CandidateKey = (u32, [u8; 6], Ipv4Addr, [u8; 6]);
+
+/// Read by S5a's verifier; never serialized or used as presence evidence.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct Candidate {
+    pub interface_index: u32,
+    pub adapter_mac: [u8; 6],
+    pub ip: Ipv4Addr,
+    pub mac: [u8; 6],
+    pub observed_at: Instant,
+}
+
+/// Transient observations, never registry records or cache rows.
+#[derive(Default)]
+pub(crate) struct CandidateSet {
+    entries: StdMutex<HashMap<CandidateKey, Instant>>,
+}
+
+impl CandidateSet {
+    #[allow(dead_code)] // S5a consumes the dormant queue.
+    pub(crate) fn snapshot(&self, now: Instant) -> Vec<Candidate> {
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        entries.retain(|_, seen| now.saturating_duration_since(*seen) < CANDIDATE_TTL);
+        entries
+            .iter()
+            .map(|((index, adapter, ip, mac), observed_at)| Candidate {
+                interface_index: *index,
+                adapter_mac: *adapter,
+                ip: *ip,
+                mac: *mac,
+                observed_at: *observed_at,
+            })
+            .collect()
+    }
+    pub(crate) fn count(&self, now: Instant) -> usize {
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        entries.retain(|_, seen| now.saturating_duration_since(*seen) < CANDIDATE_TTL);
+        entries.len()
+    }
+
+    pub(crate) fn clear(&self) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct CandidateIngress {
+    pub(crate) store: Arc<CandidateSet>,
+    pub(crate) interface_index: u32,
+    pub(crate) adapter_mac: [u8; 6],
+}
+
+impl CandidateIngress {
+    pub(crate) fn observe(
+        &self,
+        ip: Ipv4Addr,
+        mac: [u8; 6],
+        fence: &super::SweepFence,
+        now: Instant,
+    ) {
+        let mut entries = self.store.entries.lock().unwrap_or_else(|p| p.into_inner());
+        if fence.is_stale()
+            || self.interface_index == 0
+            || crate::validation::prohibited_camera_ip(ip)
+            || mac == [0; 6]
+            || mac[0] & 1 != 0
+            || mac == self.adapter_mac
+            || self.adapter_mac == [0; 6]
+            || self.adapter_mac[0] & 1 != 0
+        {
+            return;
+        }
+        entries.retain(|_, seen| now.saturating_duration_since(*seen) < CANDIDATE_TTL);
+        let key = (self.interface_index, self.adapter_mac, ip, mac);
+        if entries.len() >= MAX_CANDIDATES && !entries.contains_key(&key) {
+            if let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, seen)| **seen)
+                .map(|(key, _)| *key)
+            {
+                entries.remove(&oldest);
+            }
+        }
+        entries.insert(key, now);
+    }
+}
+
 /// Handle to a live capture session.
 ///
 /// Drop-safety: dropping the handle drops `shutdown_tx`; the blocking
@@ -458,12 +551,21 @@ fn classify_sender(
     SenderVerdict::Accept
 }
 
+fn identity_scoped(outcome: &pktmon::ScopeOutcome) -> bool {
+    matches!(
+        outcome,
+        pktmon::ScopeOutcome::SelectedInterface { source_id: Some(_) }
+    )
+}
+
 /// Everything the C data callback needs. Reached through the stream's
 /// `user_context` pointer; lives (in an `Arc`) on the listener's
 /// spawn_blocking thread for the whole session, so the pointer stays
 /// valid until after `SetSessionActive(FALSE)` — no callback fires
 /// afterward.
 struct CallbackContext {
+    candidates: Option<CandidateIngress>,
+    scope_proven: AtomicBool,
     own_mac: Option<[u8; 6]>,
     /// Every IPv4 address currently assigned to any local adapter, shared
     /// with the discovery loop that refreshes it as addresses change
@@ -711,6 +813,13 @@ unsafe fn data_cb_inner(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor
         return;
     }
 
+    if !ctx.scope_proven.load(Ordering::Acquire) {
+        if let Some(candidates) = &ctx.candidates {
+            candidates.observe(ip, mac, &ctx.fence, Instant::now());
+            return;
+        }
+    }
+
     // Bound in-flight on_arp_seen tasks: a distinct-tuple ARP flood bypasses
     // the identical-tuple dedupe, and each task blocking-locks the registry
     // across an O(n log n) snapshot. Reserve a slot without blocking (this is
@@ -737,18 +846,31 @@ unsafe fn data_cb_inner(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor
     let registry = ctx.registry.clone();
     let emitter = ctx.emitter.clone();
     let app_handle = ctx.app_handle.clone();
+    let fence = ctx.fence.clone();
+    // Only the D1 input wired by S5a can authorize the new verified path.
+    let verified_by = ctx.candidates.as_ref().map(|ingress| ingress.adapter_mac);
     ctx.runtime.spawn(async move {
         // Hold the permit for the task's lifetime; dropping it on completion
         // frees the slot for the next admitted frame.
         let _permit = permit;
-        on_arp_seen(ip, mac, devices, registry, emitter, app_handle).await;
+        on_arp_seen(
+            ip,
+            mac,
+            devices,
+            registry,
+            emitter,
+            app_handle,
+            &fence,
+            verified_by,
+        )
+        .await;
     });
 }
 
 /// Merge one observed (ip, mac) into the legacy map and the canonical
-/// registry, mirror same-IP cache evictions, and emit on first sight.
-/// Extracted from the old listener loop unchanged so swapping the
-/// capture backend doesn't disturb it.
+/// registry, persist verified identities, and emit on first sight. The
+/// legacy observation path stays wired until S5a supplies candidate ingress.
+#[allow(clippy::too_many_arguments)]
 async fn on_arp_seen(
     ip: Ipv4Addr,
     mac: [u8; 6],
@@ -756,7 +878,12 @@ async fn on_arp_seen(
     registry: Arc<DeviceRegistry>,
     emitter: Arc<DeviceListEmitter>,
     app_handle: tauri::AppHandle,
+    fence: &super::SweepFence,
+    verified_by: Option<[u8; 6]>,
 ) {
+    if fence.is_stale() {
+        return;
+    }
     let ip_str = ip.to_string();
     let mac_str = format_mac(&mac);
     let octets = ip.octets();
@@ -779,6 +906,9 @@ async fn on_arp_seen(
     // iterates over it; can be retired once auto-adopt uses the registry.
     let is_new = {
         let mut map = devices.lock().await;
+        if fence.is_stale() {
+            return;
+        }
         let is_new = !map.contains_key(&mac_str);
         let entry = map.entry(mac_str.clone()).or_insert(device.clone());
         entry.last_seen = device.last_seen.clone();
@@ -796,14 +926,34 @@ async fn on_arp_seen(
     // no-op unless that subnet is adopted.
     {
         let manager: tauri::State<'_, crate::network::NetworkManager> = app_handle.state();
-        manager.note_positive_liveness(&app_handle, ip).await;
+        manager
+            .note_positive_liveness_fenced(&app_handle, ip, fence)
+            .await;
     }
 
-    // Mirror into the canonical DeviceRegistry (its own lock) and evict
-    // same-IP dupe cache rows — all outside the `devices` lock.
-    let result = registry.merge_arp(&device);
+    // Merge into the canonical registry outside the `devices` lock.
+    // Other identities at the same IP stay inactive with their own aliases.
+    let result = match verified_by {
+        Some(adapter) => {
+            registry.merge_verified(&device, &format_mac(&adapter), &device.last_seen, fence)
+        }
+        None => registry.merge_arp_fenced(&device, fence),
+    };
     if result.changed {
         emitter.poke();
+    }
+    if verified_by.is_some() {
+        if let Some(record) = registry.cache_record(&device.mac) {
+            let cache_handle = app_handle.clone();
+            let cache_fence = fence.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let config: tauri::State<'_, crate::config::AppConfig> = cache_handle.state();
+                if let Err(e) = config.upsert_cached_device_fenced(record, Some(&cache_fence)) {
+                    log::warn!("Failed to persist verified capture identity: {e}");
+                }
+            })
+            .await;
+        }
     }
     if !result.dropped_macs.is_empty() {
         let cfg: tauri::State<'_, crate::config::AppConfig> = app_handle.state();
@@ -829,6 +979,7 @@ async fn on_arp_seen(
 /// can hold a clone and start an identical session later.
 #[derive(Clone)]
 pub(crate) struct ListenerParams {
+    pub candidates: Option<CandidateIngress>,
     pub devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
     pub registry: Arc<DeviceRegistry>,
     pub emitter: Arc<DeviceListEmitter>,
@@ -884,6 +1035,7 @@ pub(crate) async fn start_listener(
     drain_prior_capture(prior).await?;
 
     let ListenerParams {
+        candidates,
         devices,
         registry,
         emitter,
@@ -914,6 +1066,8 @@ pub(crate) async fn start_listener(
 
     let join = tokio::task::spawn_blocking(move || {
         let ctx = Arc::new(CallbackContext {
+            candidates,
+            scope_proven: AtomicBool::new(false),
             own_mac,
             local_ips,
             dedupe: StdMutex::new(DedupeLru::new()),
@@ -948,6 +1102,8 @@ pub(crate) async fn start_listener(
             mode,
         ) {
             Ok((s, outcome)) => {
+                ctx.scope_proven
+                    .store(identity_scoped(&outcome), Ordering::Release);
                 match &outcome {
                     pktmon::ScopeOutcome::SelectedInterface { source_id } => {
                         log::info!(
@@ -1222,7 +1378,7 @@ async fn run_powershell(script: &str) -> Option<String> {
 /// Parse `Get-NetNeighbor | ConvertTo-Json` output into dynamic
 /// (IP, MAC) pairs. ConvertTo-Json emits a bare object for one row and
 /// an array for many.
-fn parse_neighbors_json(stdout: &str) -> Vec<(Ipv4Addr, String)> {
+pub(crate) fn parse_neighbors_json(stdout: &str) -> Vec<(Ipv4Addr, String)> {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
         return vec![];
@@ -2121,5 +2277,58 @@ mod tests {
     fn parse_neighbors_json_empty_and_blank() {
         assert!(parse_neighbors_json("").is_empty());
         assert!(parse_neighbors_json("   \r\n ").is_empty());
+    }
+
+    #[test]
+    fn candidate_ttl_scope_bound_and_retirement() {
+        let store = Arc::new(CandidateSet::default());
+        let ingress = CandidateIngress {
+            store: store.clone(),
+            interface_index: 7,
+            adapter_mac: WIRED_MAC,
+        };
+        let active = Arc::new(AtomicBool::new(true));
+        let fence = super::super::SweepFence::new(1, Arc::new(AtomicU64::new(1)), active.clone());
+        let now = Instant::now();
+        ingress.observe(ipv4("192.168.1.204"), OTHER_MAC, &fence, now);
+        assert_eq!(store.count(now), 1);
+        let observed = store.snapshot(now);
+        assert_eq!(observed[0].interface_index, 7);
+        assert_eq!(observed[0].adapter_mac, WIRED_MAC);
+        assert_eq!(observed[0].ip, ipv4("192.168.1.204"));
+        assert_eq!(observed[0].mac, OTHER_MAC);
+        assert_eq!(observed[0].observed_at, now);
+        ingress.observe(ipv4("169.254.1.1"), OTHER_MAC, &fence, now);
+        assert_eq!(store.count(now), 1);
+        assert_eq!(store.count(now + CANDIDATE_TTL), 0);
+        for i in 0..(MAX_CANDIDATES + 1) {
+            ingress.observe(
+                Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8),
+                OTHER_MAC,
+                &fence,
+                now,
+            );
+        }
+        assert_eq!(store.count(now), MAX_CANDIDATES);
+        store.clear();
+        active.store(false, Ordering::Relaxed);
+        ingress.observe(ipv4("192.168.1.204"), OTHER_MAC, &fence, now);
+        assert_eq!(store.count(now), 0);
+    }
+
+    #[test]
+    fn name_and_unscoped_capture_require_candidate_verification() {
+        assert!(!identity_scoped(&pktmon::ScopeOutcome::ScopedByName {
+            source_id: 42
+        }));
+        assert!(!identity_scoped(&pktmon::ScopeOutcome::UnscopedFallback {
+            reason: "join failed".into()
+        }));
+        assert!(!identity_scoped(&pktmon::ScopeOutcome::SelectedInterface {
+            source_id: None
+        }));
+        assert!(identity_scoped(&pktmon::ScopeOutcome::SelectedInterface {
+            source_id: Some(42)
+        }));
     }
 }

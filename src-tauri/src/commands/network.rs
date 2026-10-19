@@ -2,7 +2,7 @@
 
 use tauri::State;
 
-use crate::config::{AppConfig, CachedDevice, ManualNode, NetworkMode};
+use crate::config::{AppConfig, ManualNode, NetworkMode};
 use crate::error::AppError;
 use crate::network::{DeviceRecord, DeviceStatus, InterfaceInfo, NetworkManager, ScanResult};
 use crate::validation::parse_cidr;
@@ -317,20 +317,30 @@ pub async fn report_scan_result(
     open_ports: Vec<u16>,
 ) -> Result<(), AppError> {
     crate::validation::parse_camera_ip(&ip)?;
-    // A successful scan (any open port) is positive device evidence for
-    // the adoption lifecycle — even when the port set is unchanged and
-    // the registry merge below turns out to be a no-op. Stamp before
-    // the early return. A zero-port result is not evidence.
-    if !open_ports.is_empty() {
-        if let Ok(parsed) = ip.parse::<std::net::Ipv4Addr>() {
-            manager.note_positive_liveness(&app, parsed).await;
-        }
-    }
-    let registry = manager.registry();
-    if !registry.merge_scan_result(&ip, &open_ports) {
+    let fence = manager.sweep_fence();
+    // Manual has no discovery session yet. Keep its legacy capability path
+    // until S5a supplies the independent adapter-epoch presence fence.
+    let fence = (config.get_network_mode() != NetworkMode::StaticManual).then_some(&fence);
+    if fence.is_some_and(|f| f.is_stale()) {
         return Ok(());
     }
-    persist_record_for_ip(&registry, &config, &ip)?;
+    if !open_ports.is_empty() {
+        if let Some(fence) = fence {
+            manager
+                .note_positive_liveness_fenced(&app, ip.parse().unwrap(), fence)
+                .await;
+        }
+    }
+    if fence.is_some_and(|f| f.is_stale()) {
+        return Ok(());
+    }
+    let registry = manager.registry();
+    if !registry.merge_scan_result_fenced(&ip, &open_ports, fence) {
+        return Ok(());
+    }
+    for record in registry.snapshot().iter().filter(|r| r.ip == ip) {
+        persist_record_for_key(&registry, &config, &record.mac, fence)?;
+    }
     if let Some(emitter) = manager.emitter().await {
         emitter.poke();
     }
@@ -430,29 +440,24 @@ pub async fn forget_device(
     Ok(())
 }
 
-/// Look up the registry record for `ip` and persist it to the cache
-/// file (if it has open ports). No-op for records with no open ports
-/// since the cache only stores entries useful for cold-start render.
-fn persist_record_for_ip(
+/// Cache by identity, including verified zero-port records. Unverified
+/// legacy port-bearing writes remain compatible until S5a activation.
+fn persist_record_for_key(
     registry: &crate::network::DeviceRegistry,
     config: &AppConfig,
-    ip: &str,
+    key: &str,
+    fence: Option<&crate::network::SweepFence>,
 ) -> Result<(), AppError> {
-    let record = match registry.snapshot().into_iter().find(|r| r.ip == ip) {
-        Some(r) => r,
-        None => return Ok(()),
-    };
-    if record.open_ports.is_empty() {
+    if fence.is_some_and(|f| f.is_stale()) {
         return Ok(());
     }
-    config.upsert_cached_device(CachedDevice {
-        mac: record.mac,
-        ip: record.ip,
-        subnet: record.subnet,
-        open_ports: record.open_ports,
-        alias: record.alias,
-        last_seen: record.last_seen,
-    })
+    if let Some(record) = registry.cache_record(key) {
+        if fence.is_some_and(|f| f.is_stale()) {
+            return Ok(());
+        }
+        config.upsert_cached_device_fenced(record, fence)?;
+    }
+    Ok(())
 }
 
 /// Atomic adoption snapshot: the routing map plus per-subnet lifecycle

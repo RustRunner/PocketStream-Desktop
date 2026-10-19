@@ -35,12 +35,18 @@ pub enum DeviceStatus {
     /// Hydrated from disk cache only, never confirmed by live ARP this
     /// session. Render path scopes these to currently-routable subnets.
     CachedOnly,
+    OfflineNonWiredSubnet,
+    OfflineHostOwnedIp,
 }
 
 /// Unified device record. Replaces the old split between ARP map +
 /// scan-result map + alias map + cache file rows.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DeviceRecord {
+    #[serde(default)]
+    pub verified_by_mac: Option<String>,
+    #[serde(default)]
+    pub last_verified_at: Option<String>,
     pub mac: String,
     pub ip: String,
     pub subnet: String,
@@ -83,10 +89,8 @@ pub fn is_user_pinned(key: &str, alias: &str, ip: &str, configured_pins: &HashSe
     key.starts_with("manual:") || !alias.is_empty() || configured_pins.contains(ip)
 }
 
-/// Result of a mutation that may also drop stale records (e.g. merge_arp
-/// dedups records at the same IP with different MACs). `dropped_macs`
-/// lets callers with access to the on-disk cache mirror the removal so
-/// the cache file doesn't keep the orphan rows.
+/// Mutation result. Retained identities never populate dropped_macs; the
+/// empty compatibility field lets old callers remain wired until S5a.
 #[derive(Debug, Default, PartialEq)]
 pub struct MergeResult {
     pub changed: bool,
@@ -138,76 +142,28 @@ impl DeviceRegistry {
             a.subnet
                 .cmp(&b.subnet)
                 .then_with(|| compare_ips(&a.ip, &b.ip))
+                .then_with(|| a.mac.cmp(&b.mac))
         });
         list
     }
 
-    /// Hydrate from the on-disk cache. Records start as `CachedOnly` —
-    /// a live ARP discovery flips them to `Live`, and the verify path
-    /// flips them to `Verifying` then `Live` or `Offline`. No-op if
-    /// the registry already has entries (cache load is one-shot).
-    ///
-    /// Dedups by IP: when the cache contains multiple rows at the same
-    /// IP (different MACs left over from device replacement, firmware
-    /// re-flash, etc.), keep the row with the newest `last_seen` and
-    /// inherit its alias if the survivor's is empty. Dropped MACs are
-    /// returned so the caller can remove them from the on-disk cache
-    /// file too.
+    /// Retain every cached identity, including different MACs at one IP.
+    /// Historical verification metadata never establishes current liveness.
     pub fn hydrate_from_cache(&self, cached: &[CachedDevice]) -> MergeResult {
         let mut map = self.lock();
         if !map.is_empty() {
             return MergeResult::default();
         }
-
-        // Group cached rows by IP, keep newest per IP, surface losers.
-        let mut by_ip: HashMap<String, &CachedDevice> = HashMap::new();
-        let mut dropped: Vec<String> = Vec::new();
         for entry in cached {
-            // Drop rows whose IP isn't a valid IPv4 address (corrupted
-            // cache, a hand-edited hostname): otherwise the string reaches
-            // ping.exe's argv and triggers a DNS lookup / false dot.
-            // APIPA (169.254.x.x) parses fine and is kept.
             if entry.mac.is_empty() || entry.ip.parse::<std::net::Ipv4Addr>().is_err() {
                 continue;
             }
-            match by_ip.get(&entry.ip) {
-                Some(existing) if existing.last_seen >= entry.last_seen => {
-                    dropped.push(entry.mac.clone());
-                }
-                Some(existing) => {
-                    dropped.push(existing.mac.clone());
-                    by_ip.insert(entry.ip.clone(), entry);
-                }
-                None => {
-                    by_ip.insert(entry.ip.clone(), entry);
-                }
-            }
-        }
-
-        // Inherit aliases from dropped duplicates if the surviving row
-        // is unnamed — the user's "this is my CAM" label should follow
-        // the IP, not the (potentially-replaced) MAC.
-        let mut inherited_alias_by_ip: HashMap<String, String> = HashMap::new();
-        for entry in cached {
-            if entry.alias.is_empty() {
+            if map
+                .get(&entry.mac)
+                .is_some_and(|r| r.last_seen >= entry.last_seen)
+            {
                 continue;
             }
-            if dropped.contains(&entry.mac) {
-                inherited_alias_by_ip
-                    .entry(entry.ip.clone())
-                    .or_insert_with(|| entry.alias.clone());
-            }
-        }
-
-        for (_, entry) in by_ip {
-            let alias = if entry.alias.is_empty() {
-                inherited_alias_by_ip
-                    .get(&entry.ip)
-                    .cloned()
-                    .unwrap_or_default()
-            } else {
-                entry.alias.clone()
-            };
             map.insert(
                 entry.mac.clone(),
                 DeviceRecord {
@@ -215,17 +171,18 @@ impl DeviceRegistry {
                     ip: entry.ip.clone(),
                     subnet: entry.subnet.clone(),
                     open_ports: entry.open_ports.clone(),
-                    alias,
+                    alias: entry.alias.clone(),
                     status: DeviceStatus::CachedOnly,
                     first_seen: entry.last_seen.clone(),
                     last_seen: entry.last_seen.clone(),
+                    verified_by_mac: entry.verified_by_mac.clone(),
+                    last_verified_at: entry.last_verified_at.clone(),
                 },
             );
         }
-
         MergeResult {
-            changed: !map.is_empty() || !dropped.is_empty(),
-            dropped_macs: dropped,
+            changed: !map.is_empty(),
+            dropped_macs: vec![],
         }
     }
 
@@ -274,6 +231,8 @@ impl DeviceRegistry {
             map.insert(
                 key.clone(),
                 DeviceRecord {
+                    verified_by_mac: None,
+                    last_verified_at: None,
                     mac: key,
                     ip: node.ip.clone(),
                     subnet,
@@ -291,37 +250,76 @@ impl DeviceRegistry {
 
     /// Insert or refresh a record from a live ARP discovery. New entries
     /// land as `Live`. Existing entries get their ip/subnet/last_seen
-    /// refreshed; status is promoted from CachedOnly → Live (since live
-    /// ARP confirms the device is here now), but Verifying/Offline are
-    /// left alone — the verify path owns those transitions.
+    /// refreshed; cached and topology-conflicting entries become Live after
+    /// passing current capture filters. Verifying/Offline remain owned by
+    /// the legacy verify path until S5a activation.
+    #[allow(dead_code)] // Legacy mutator remains available until S5a.
     pub fn merge_arp(&self, device: &ArpDevice) -> MergeResult {
+        Self::merge_arp_locked(&mut self.lock(), device)
+    }
+
+    pub(crate) fn merge_arp_fenced(
+        &self,
+        device: &ArpDevice,
+        fence: &super::SweepFence,
+    ) -> MergeResult {
         let mut map = self.lock();
+        if fence.is_stale() {
+            return MergeResult::default();
+        }
+        Self::merge_arp_locked(&mut map, device)
+    }
 
-        // Collect other records at the same IP with a different MAC — these
-        // are stale identities (device replaced, MAC randomization toggled,
-        // firmware re-flash, etc.) that would otherwise appear as duplicate
-        // rows in the UI and cause the IP-scoped `merge_scan_result` to mark
-        // both Live on a single successful verify. Surface them so the caller
-        // can drop them from the on-disk cache too.
-        let stale_macs: Vec<String> = map
-            .values()
+    // Wired by S5a's verifier, never by the legacy observation path.
+    #[allow(dead_code)]
+    pub(crate) fn merge_verified(
+        &self,
+        device: &ArpDevice,
+        adapter: &str,
+        verified_at: &str,
+        fence: &super::SweepFence,
+    ) -> MergeResult {
+        let valid_mac =
+            |s: &str| super::parse_mac_bytes(s).is_some_and(|m| m != [0; 6] && m[0] & 1 == 0);
+        if chrono::DateTime::parse_from_rfc3339(verified_at).is_err()
+            || !valid_mac(adapter)
+            || !valid_mac(&device.mac)
+            || device
+                .ip
+                .parse()
+                .map_or(true, crate::validation::prohibited_camera_ip)
+        {
+            return MergeResult::default();
+        }
+        let mut map = self.lock();
+        if fence.is_stale() {
+            return MergeResult::default();
+        }
+        let mut result = Self::merge_arp_locked(&mut map, device);
+        let record = map.get_mut(&device.mac).expect("merged record");
+        let adapter = adapter.replace('-', ":").to_ascii_lowercase();
+        result.changed |= record.verified_by_mac.as_ref() != Some(&adapter)
+            || record.last_verified_at.as_deref() != Some(verified_at)
+            || record.status != DeviceStatus::Live;
+        record.verified_by_mac = Some(adapter);
+        record.last_verified_at = Some(verified_at.into());
+        record.status = DeviceStatus::Live;
+        result
+    }
+
+    fn merge_arp_locked(
+        map: &mut HashMap<String, DeviceRecord>,
+        device: &ArpDevice,
+    ) -> MergeResult {
+        let mut retired = false;
+        for other in map
+            .values_mut()
             .filter(|r| r.ip == device.ip && r.mac != device.mac)
-            .map(|r| r.mac.clone())
-            .collect();
-
-        let inherited_alias: Option<String> = stale_macs
-            .iter()
-            .filter_map(|mac| map.get(mac))
-            .find_map(|r| {
-                if r.alias.is_empty() {
-                    None
-                } else {
-                    Some(r.alias.clone())
-                }
-            });
-
-        for mac in &stale_macs {
-            map.remove(mac);
+        {
+            if other.status != DeviceStatus::Offline {
+                other.status = DeviceStatus::Offline;
+                retired = true;
+            }
         }
 
         let upsert_changed = match map.get_mut(&device.mac) {
@@ -329,6 +327,8 @@ impl DeviceRegistry {
                 let mut changed = false;
                 if existing.ip != device.ip {
                     existing.ip = device.ip.clone();
+                    existing.verified_by_mac = None;
+                    existing.last_verified_at = None;
                     changed = true;
                 }
                 if existing.subnet != device.subnet {
@@ -339,17 +339,14 @@ impl DeviceRegistry {
                     existing.last_seen = device.last_seen.clone();
                     changed = true;
                 }
-                if existing.status == DeviceStatus::CachedOnly {
+                if matches!(
+                    existing.status,
+                    DeviceStatus::CachedOnly
+                        | DeviceStatus::OfflineNonWiredSubnet
+                        | DeviceStatus::OfflineHostOwnedIp
+                ) {
                     existing.status = DeviceStatus::Live;
                     changed = true;
-                }
-                // Adopt the alias from a stale record at the same IP only
-                // when the surviving record doesn't already have one.
-                if existing.alias.is_empty() {
-                    if let Some(alias) = inherited_alias {
-                        existing.alias = alias;
-                        changed = true;
-                    }
                 }
                 changed
             }
@@ -357,11 +354,13 @@ impl DeviceRegistry {
                 map.insert(
                     device.mac.clone(),
                     DeviceRecord {
+                        verified_by_mac: None,
+                        last_verified_at: None,
                         mac: device.mac.clone(),
                         ip: device.ip.clone(),
                         subnet: device.subnet.clone(),
                         open_ports: Vec::new(),
-                        alias: inherited_alias.unwrap_or_default(),
+                        alias: String::new(),
                         status: DeviceStatus::Live,
                         first_seen: device.first_seen.clone(),
                         last_seen: device.last_seen.clone(),
@@ -372,20 +371,73 @@ impl DeviceRegistry {
         };
 
         MergeResult {
-            changed: upsert_changed || !stale_macs.is_empty(),
-            dropped_macs: stale_macs,
+            changed: upsert_changed || retired,
+            dropped_macs: vec![],
         }
+    }
+
+    /// Identity-keyed persistence; legacy port-bearing rows remain compatible
+    /// until S5a replaces their promotion path. Verified zero-port rows persist.
+    pub(crate) fn cache_record(&self, key: &str) -> Option<CachedDevice> {
+        let map = self.lock();
+        let r = map.get(key)?;
+        if r.open_ports.is_empty() && (r.verified_by_mac.is_none() || r.last_verified_at.is_none())
+        {
+            return None;
+        }
+        Some(CachedDevice {
+            mac: r.mac.clone(),
+            ip: r.ip.clone(),
+            subnet: r.subnet.clone(),
+            open_ports: r.open_ports.clone(),
+            alias: r.alias.clone(),
+            last_seen: r.last_seen.clone(),
+            verified_by_mac: r.verified_by_mac.clone(),
+            last_verified_at: r.last_verified_at.clone(),
+        })
     }
 
     /// Apply the result of a successful port scan. Looks the device up by
     /// IP (scans don't carry MACs) and updates `open_ports` + flips
     /// `Verifying`/`CachedOnly` → `Live`. No-op if the IP isn't tracked
     /// — discovery has to land first.
+    #[allow(dead_code)] // Compatibility for the S4 keyed-IPC transition.
     pub fn merge_scan_result(&self, ip: &str, open_ports: &[u16]) -> bool {
+        self.merge_scan_result_fenced(ip, open_ports, None)
+    }
+
+    pub(crate) fn merge_scan_result_fenced(
+        &self,
+        ip: &str,
+        open_ports: &[u16],
+        fence: Option<&super::SweepFence>,
+    ) -> bool {
         let mut map = self.lock();
+        if fence.is_some_and(|f| f.is_stale()) {
+            return false;
+        }
+        // Until S4 carries the key over IPC, preserve the one current
+        // identity's scan behavior without reviving retained replacements.
+        let matching: Vec<_> = map.values().filter(|r| r.ip == ip).collect();
+        let live: Vec<_> = matching
+            .iter()
+            .filter(|r| r.status == DeviceStatus::Live)
+            .collect();
+        let key = match live.as_slice() {
+            [record] => record.mac.clone(),
+            [] if matching.len() == 1
+                && !matches!(
+                    matching[0].status,
+                    DeviceStatus::OfflineNonWiredSubnet | DeviceStatus::OfflineHostOwnedIp
+                ) =>
+            {
+                matching[0].mac.clone()
+            }
+            _ => return false,
+        };
         let mut changed = false;
         for record in map.values_mut() {
-            if record.ip != ip {
+            if record.mac != key {
                 continue;
             }
             if record.open_ports != open_ports {
@@ -671,6 +723,8 @@ mod tests {
 
     fn cached(mac: &str, ip: &str, subnet: &str, ports: Vec<u16>, alias: &str) -> CachedDevice {
         CachedDevice {
+            verified_by_mac: None,
+            last_verified_at: None,
             mac: mac.into(),
             ip: ip.into(),
             subnet: subnet.into(),
@@ -1095,6 +1149,8 @@ mod tests {
 
     fn cached_at(mac: &str, ip: &str, alias: &str, last_seen: &str) -> CachedDevice {
         CachedDevice {
+            verified_by_mac: None,
+            last_verified_at: None,
             mac: mac.into(),
             ip: ip.into(),
             subnet: "192.168.1.0/24".into(),
@@ -1207,7 +1263,7 @@ mod tests {
     // ── merge paths move roles, never copy them ─────────────────────
 
     #[test]
-    fn merge_arp_alias_inheritance_moves_role_never_copies() {
+    fn merge_arp_keeps_role_with_original_identity() {
         // One CAM before the MAC change at its IP → one CAM after.
         let r = DeviceRegistry::new();
         r.hydrate_from_cache(&[cached(
@@ -1219,11 +1275,14 @@ mod tests {
         )]);
         r.merge_arp(&arp("NEW:MAC", "192.168.1.10", "192.168.1.0/24"));
         assert_eq!(holders(&r, "CAM"), 1);
-        assert_eq!(r.snapshot()[0].mac, "NEW:MAC");
+        assert_eq!(
+            r.snapshot().iter().find(|r| r.alias == "CAM").unwrap().mac,
+            "OLD:MAC"
+        );
     }
 
     #[test]
-    fn hydrate_dedup_alias_inheritance_moves_role_never_copies() {
+    fn hydrate_keeps_each_alias_with_its_identity() {
         // One CAM among the same-IP duplicates → one CAM after hydration.
         let r = DeviceRegistry::new();
         r.hydrate_from_cache(&[
@@ -1232,8 +1291,11 @@ mod tests {
         ]);
         assert_eq!(holders(&r, "CAM"), 1);
         let snap = r.snapshot();
-        assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].mac, "NEW:MAC", "survivor inherits the role");
+        assert_eq!(snap.len(), 2);
+        assert_eq!(
+            snap.iter().find(|r| r.alias == "CAM").unwrap().mac,
+            "OLD:MAC"
+        );
     }
 
     #[test]
@@ -1283,7 +1345,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_arp_drops_stale_record_at_same_ip() {
+    fn merge_arp_retains_stale_record_at_same_ip() {
         let r = DeviceRegistry::new();
         r.hydrate_from_cache(&[cached(
             "OLD:MAC",
@@ -1296,14 +1358,22 @@ mod tests {
         let result = r.merge_arp(&arp("NEW:MAC", "192.168.1.202", "192.168.1.0/24"));
 
         assert!(result.changed);
-        assert_eq!(result.dropped_macs, vec!["OLD:MAC".to_string()]);
+        assert!(result.dropped_macs.is_empty());
         let snap = r.snapshot();
-        assert_eq!(snap.len(), 1, "stale MAC must be dropped, not co-listed");
-        assert_eq!(snap[0].mac, "NEW:MAC");
-        assert_eq!(
-            snap[0].alias, "PTU",
-            "alias should follow the IP across MAC changes"
-        );
+        assert_eq!(snap.len(), 2);
+        let old = snap.iter().find(|r| r.mac == "OLD:MAC").unwrap();
+        let new = snap.iter().find(|r| r.mac == "NEW:MAC").unwrap();
+        assert_eq!(old.status, DeviceStatus::Offline);
+        assert_eq!(old.alias, "PTU");
+        assert!(new.alias.is_empty());
+        assert_eq!(new.status, DeviceStatus::Live);
+        assert!(r.merge_scan_result(&new.ip, &[554]));
+        let after_scan = r.snapshot();
+        let old = after_scan.iter().find(|r| r.mac == "OLD:MAC").unwrap();
+        let new = after_scan.iter().find(|r| r.mac == "NEW:MAC").unwrap();
+        assert_eq!(old.status, DeviceStatus::Offline);
+        assert_eq!(old.open_ports, vec![80]);
+        assert_eq!(new.open_ports, vec![554]);
     }
 
     #[test]
@@ -1329,9 +1399,11 @@ mod tests {
     }
 
     #[test]
-    fn hydrate_dedups_same_ip_keeping_newest() {
+    fn hydrate_retains_same_ip_identities_without_alias_transfer() {
         let r = DeviceRegistry::new();
         let older = CachedDevice {
+            verified_by_mac: None,
+            last_verified_at: None,
             mac: "OLD:MAC".into(),
             ip: "192.168.1.202".into(),
             subnet: "192.168.1.0/24".into(),
@@ -1340,6 +1412,8 @@ mod tests {
             last_seen: "2026-04-01T00:00:00Z".into(),
         };
         let newer = CachedDevice {
+            verified_by_mac: None,
+            last_verified_at: None,
             mac: "NEW:MAC".into(),
             ip: "192.168.1.202".into(),
             subnet: "192.168.1.0/24".into(),
@@ -1350,14 +1424,20 @@ mod tests {
         let result = r.hydrate_from_cache(&[older, newer]);
 
         assert!(result.changed);
-        assert_eq!(result.dropped_macs, vec!["OLD:MAC".to_string()]);
+        assert!(result.dropped_macs.is_empty());
         let snap = r.snapshot();
-        assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].mac, "NEW:MAC");
+        assert_eq!(snap.len(), 2);
         assert_eq!(
-            snap[0].alias, "PTU",
-            "alias inherits from the dropped duplicate when survivor is unnamed"
+            snap.iter().find(|r| r.mac == "OLD:MAC").unwrap().alias,
+            "PTU"
         );
+        assert!(snap
+            .iter()
+            .find(|r| r.mac == "NEW:MAC")
+            .unwrap()
+            .alias
+            .is_empty());
+        assert!(snap.iter().all(|r| r.status == DeviceStatus::CachedOnly));
     }
 
     // ── hydrate_manual_nodes ────────────────────────────────────────
@@ -1438,5 +1518,52 @@ mod tests {
         assert_eq!(r.snapshot().len(), 2);
         assert!(r.clear());
         assert!(r.snapshot().is_empty());
+    }
+
+    #[test]
+    fn verified_zero_port_cache_is_keyed_and_round_trips_without_promoting_on_load() {
+        let registry = DeviceRegistry::new();
+        let active = Arc::new(AtomicBool::new(true));
+        let fence = super::super::SweepFence::new(
+            1,
+            Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            active.clone(),
+        );
+        let device = arp("aa:bb:cc:dd:ee:02", "192.168.1.204", "192.168.1.0/24");
+        assert!(
+            registry
+                .merge_verified(&device, "40:cd:3a:00:00:01", "2026-10-19T12:00:00Z", &fence)
+                .changed
+        );
+        assert!(registry.cache_record(&device.ip).is_none());
+        let cached = registry.cache_record(&device.mac).unwrap();
+        assert!(cached.open_ports.is_empty());
+        let restored: CachedDevice = toml::from_str(&toml::to_string(&cached).unwrap()).unwrap();
+        assert_eq!(
+            restored.verified_by_mac.as_deref(),
+            Some("40:cd:3a:00:00:01")
+        );
+        assert_eq!(
+            restored.last_verified_at.as_deref(),
+            Some("2026-10-19T12:00:00Z")
+        );
+        let cold = DeviceRegistry::new();
+        cold.hydrate_from_cache(&[restored]);
+        assert_eq!(cold.snapshot()[0].status, DeviceStatus::CachedOnly);
+        active.store(false, Ordering::Relaxed);
+        let before = registry.snapshot();
+        assert!(!registry.merge_scan_result_fenced(&device.ip, &[80], Some(&fence)));
+        assert!(
+            !registry
+                .merge_verified(
+                    &arp("aa:bb:cc:dd:ee:04", &device.ip, &device.subnet),
+                    "40:cd:3a:00:00:01",
+                    "2026-10-19T12:00:01Z",
+                    &fence
+                )
+                .changed
+        );
+        assert!(!registry.merge_arp_fenced(&device, &fence).changed);
+        assert_eq!(registry.snapshot(), before);
     }
 }

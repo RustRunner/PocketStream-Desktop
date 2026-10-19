@@ -226,6 +226,8 @@ mod tests {
 
     fn record(mac: &str, ip: &str, stored_subnet: &str) -> CachedDevice {
         CachedDevice {
+            verified_by_mac: None,
+            last_verified_at: None,
             mac: mac.into(),
             ip: ip.into(),
             subnet: stored_subnet.into(),
