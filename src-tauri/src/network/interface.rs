@@ -84,6 +84,7 @@ pub struct IpInfo {
 pub struct InterfaceInfo {
     pub name: String,
     pub display_name: String,
+    pub description: String,
     pub ips: Vec<IpInfo>,
     pub mac: String,
     pub is_up: bool,
@@ -305,6 +306,7 @@ fn parse_adapter(a: &serde_json::Value, force_vpn: bool) -> InterfaceInfo {
 
     InterfaceInfo {
         display_name: name.clone(),
+        description: description.to_string(),
         name,
         ips,
         mac,
@@ -499,6 +501,7 @@ fn list_all_pnet() -> Result<Vec<InterfaceInfo>, AppError> {
             InterfaceInfo {
                 name: iface.name.clone(),
                 display_name: iface.name.clone(),
+                description: iface.description.clone(),
                 ips,
                 mac: iface.mac.map(|m| m.to_string()).unwrap_or_default(),
                 is_up: iface.is_up(),
@@ -722,6 +725,7 @@ mod tests {
         InterfaceInfo {
             name: "t".into(),
             display_name: "t".into(),
+            description: String::new(),
             ips: vec![],
             mac: String::new(),
             is_up,
@@ -791,6 +795,7 @@ mod tests {
         let iface = InterfaceInfo {
             name: "eth0".into(),
             display_name: "Ethernet".into(),
+            description: "Test Adapter".into(),
             ips: vec![IpInfo {
                 address: "10.0.0.1".into(),
                 prefix: 24,

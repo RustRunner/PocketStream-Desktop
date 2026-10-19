@@ -258,6 +258,7 @@ async fn watch_interface(mac: String, display_name: String, handle: tauri::AppHa
         let info = network::interface::InterfaceInfo {
             name: display_name.clone(),
             display_name: display_name.clone(),
+            description: String::new(),
             ips,
             mac: mac.clone(),
             is_up,
@@ -437,6 +438,7 @@ pub fn run() {
             commands::get_interface_info,
             // ARP Discovery
             commands::start_arp_discovery,
+            commands::get_capture_state,
             commands::stop_arp_discovery,
             commands::get_device_list,
             commands::report_scan_result,

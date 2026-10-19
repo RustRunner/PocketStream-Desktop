@@ -241,6 +241,46 @@ pub(crate) struct CaptureIdentity {
     pub(crate) active: Arc<AtomicBool>,
 }
 
+/// One payload for capture events and the subscribe-then-fetch query.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct CaptureState {
+    pub active: bool,
+    pub adapter_name: Option<String>,
+    pub outcome: Option<pktmon::ScopeOutcome>,
+}
+
+#[derive(Default)]
+struct CaptureSignal {
+    state: CaptureState,
+    app: Option<tauri::AppHandle>,
+}
+
+impl CaptureSignal {
+    fn activate(&mut self, params: &arp::ListenerParams, outcome: pktmon::ScopeOutcome) {
+        self.app = Some(params.app_handle.clone());
+        self.state = CaptureState {
+            active: true,
+            adapter_name: Some(params.scope.display_name.clone()),
+            outcome: Some(outcome),
+        };
+        self.emit();
+    }
+
+    fn deactivate(&mut self) {
+        if self.state.active {
+            self.state.active = false;
+            self.emit();
+        }
+    }
+
+    fn emit(&self) {
+        use tauri::Emitter;
+        if let Some(app) = &self.app {
+            let _ = app.emit("capture-active", &self.state);
+        }
+    }
+}
+
 /// A fresh look at the data source the capture scope would bind today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LiveSourceId {
@@ -323,6 +363,7 @@ pub struct NetworkManager {
     /// source, incarnation lifecycle flag). `None` when no listener is
     /// attached.
     capture_identity: Arc<Mutex<Option<CaptureIdentity>>>,
+    capture_signal: Arc<Mutex<CaptureSignal>>,
     /// Every IPv4 currently assigned to any local adapter. Shared with
     /// the capture callback and refreshed at every discovery start (and
     /// each adopt-loop pass), so a listener retained across sessions
@@ -1285,7 +1326,12 @@ async fn watchdog_ladder(
     mut activation_rx: arp::ActivationRx,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
-    use tauri::Emitter;
+    use tauri::{Emitter, Manager};
+    let capture_signal = params
+        .app_handle
+        .state::<NetworkManager>()
+        .capture_signal
+        .clone();
     // Longer than the 500 ms sweep-start delay plus the sweep itself, so
     // a healthy backend has time to deliver frames.
     const INITIAL_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
@@ -1314,7 +1360,16 @@ async fn watchdog_ladder(
         };
         let mut event = match activation {
             None => arp::AttemptEvent::ShutdownSignalled,
-            Some(Ok(Ok(Ok(_scope)))) => {
+            Some(Ok(Ok(Ok(scope)))) => {
+                if restarts_used > 0 {
+                    if params.fence.is_stale() {
+                        return;
+                    }
+                    if let Some(identity) = capture_identity.lock().await.as_mut() {
+                        identity.source_id = scope.source_id();
+                    }
+                    capture_signal.lock().await.activate(&params, scope);
+                }
                 match current_session_counters(&listener_slot).await {
                     None => arp::AttemptEvent::ShutdownSignalled, // stop already took the handle
                     Some(counters) => {
@@ -1441,6 +1496,7 @@ async fn watchdog_ladder(
                     if let Some(identity) = capture_identity.lock().await.as_ref() {
                         identity.active.store(false, Ordering::Relaxed);
                     }
+                    capture_signal.lock().await.deactivate();
                     // Tear down the deaf session; a stop that already
                     // took the handle wins.
                     let Some(old_handle) = listener_slot.lock().await.take() else {
@@ -1553,6 +1609,7 @@ impl NetworkManager {
             arp_listener_handle: Arc::new(Mutex::new(None)),
             prior_capture_joins: Arc::new(Mutex::new(Vec::new())),
             capture_identity: Arc::new(Mutex::new(None)),
+            capture_signal: Arc::new(Mutex::new(CaptureSignal::default())),
             local_ips: Arc::new(StdMutex::new(HashSet::new())),
             excluded_subnets: Arc::new(StdMutex::new(Vec::new())),
             auto_adopt_handle: Arc::new(Mutex::new(None)),
@@ -2359,14 +2416,11 @@ impl NetworkManager {
         base_params: &arp::ListenerParams,
     ) -> Result<arp::ActivationRx, AppError> {
         let has_listener = self.arp_listener_handle.lock().await.is_some();
-        let (same_adapter, retained_source_id) = {
+        let same_adapter = {
             let identity = self.capture_identity.lock().await;
-            (
-                identity
-                    .as_ref()
-                    .is_some_and(|c| c.iface_name == iface_name && c.mac == own_mac),
-                identity.as_ref().and_then(|c| c.source_id),
-            )
+            identity
+                .as_ref()
+                .is_some_and(|c| c.iface_name == iface_name && c.mac == own_mac)
         };
         // Probe the live data-source id only when a matching listener
         // could be kept — its sole job is catching the source being
@@ -2399,19 +2453,12 @@ impl NetworkManager {
             listener_action(identity.as_ref(), has_listener, iface_name, own_mac, live)
         };
 
-        if action == ListenerAction::Keep {
+        let retained_outcome = self.capture_signal.lock().await.state.outcome.clone();
+        if let (ListenerAction::Keep, Some(outcome)) = (action, retained_outcome) {
             log::info!("ARP capture retained across discovery restart");
             let (tx, rx) = tokio::sync::oneshot::channel();
             // The watchdog only cares that activation succeeded; the
             // retained session proved that when it attached.
-            let outcome = match retained_source_id {
-                Some(id) => pktmon::ScopeOutcome::SelectedInterface {
-                    source_id: Some(id),
-                },
-                None => pktmon::ScopeOutcome::UnscopedFallback {
-                    reason: "retained unscoped session".into(),
-                },
-            };
             let _ = tx.send(Ok(outcome));
             return Ok(rx);
         }
@@ -2425,6 +2472,7 @@ impl NetworkManager {
         if let Some(old) = self.capture_identity.lock().await.take() {
             old.active.store(false, Ordering::Relaxed);
         }
+        self.capture_signal.lock().await.deactivate();
         park_capture_handle(&self.arp_listener_handle, &self.prior_capture_joins).await;
 
         let incarnation = Arc::new(AtomicBool::new(true));
@@ -2471,7 +2519,7 @@ impl NetworkManager {
             };
 
         if !iface_is_up {
-            if let pktmon::ScopeOutcome::UnscopedFallback { reason } = &outcome {
+            if !matches!(outcome, pktmon::ScopeOutcome::SelectedInterface { .. }) {
                 // A media-disconnected attach must be scoped-only: an
                 // unscoped session hears every adapter, and with the
                 // wire down nothing refreshes the shared self/ghost
@@ -2480,8 +2528,8 @@ impl NetworkManager {
                 incarnation.store(false, Ordering::Relaxed);
                 park_capture_handle(&self.arp_listener_handle, &self.prior_capture_joins).await;
                 log::info!(
-                    "ARP pre-attach skipped: scoped join unavailable ({}) — retrying on the next discovery trigger",
-                    reason
+                    "ARP pre-attach skipped: MAC-scoped join unavailable ({:?}) — retrying on the next discovery trigger",
+                    outcome
                 );
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 let _ = tx.send(Ok(outcome));
@@ -2493,16 +2541,17 @@ impl NetworkManager {
             );
         }
 
-        let source_id = match &outcome {
-            pktmon::ScopeOutcome::SelectedInterface { source_id } => *source_id,
-            pktmon::ScopeOutcome::UnscopedFallback { .. } => None,
-        };
+        let source_id = outcome.source_id();
         *self.capture_identity.lock().await = Some(CaptureIdentity {
             iface_name: iface_name.to_string(),
             mac: own_mac,
             source_id,
             active: incarnation,
         });
+        self.capture_signal
+            .lock()
+            .await
+            .activate(base_params, outcome.clone());
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         let _ = tx.send(Ok(outcome));
@@ -2561,6 +2610,7 @@ impl NetworkManager {
         let capture_scope = pktmon::CaptureScope {
             mac: own_mac,
             display_name: interface_display_name.to_string(),
+            description: iface_info.description.clone(),
         };
 
         // Every IPv4 currently assigned to any local adapter — not just the
@@ -3460,6 +3510,7 @@ impl NetworkManager {
         if let Some(identity) = self.capture_identity.lock().await.take() {
             identity.active.store(false, Ordering::Relaxed);
         }
+        self.capture_signal.lock().await.deactivate();
         if let Some(h) = self.arp_listener_handle.lock().await.take() {
             // Signal shutdown and park the capture thread's join in the
             // guard — the next capture start bounded-joins it there, so
@@ -3470,6 +3521,10 @@ impl NetworkManager {
                 .push(h.stop_into_join());
             log::info!("ARP capture stopped");
         }
+    }
+
+    pub async fn get_capture_state(&self) -> CaptureState {
+        self.capture_signal.lock().await.state.clone()
     }
 
     pub async fn get_adopted_ips(&self) -> HashMap<String, String> {
@@ -3966,6 +4021,34 @@ mod tests {
 
     // ── capture-listener retention ────────────────────────────────
 
+    #[tokio::test]
+    async fn capture_state_starts_inactive_without_an_outcome() {
+        let manager = NetworkManager::new();
+        let state = manager.get_capture_state().await;
+        assert!(!state.active);
+        assert!(state.outcome.is_none());
+        assert!(state.adapter_name.is_none());
+    }
+
+    #[test]
+    fn capture_stop_keeps_last_scope_outcome_for_the_query() {
+        let mut signal = CaptureSignal {
+            state: CaptureState {
+                active: true,
+                adapter_name: Some("Ethernet".into()),
+                outcome: Some(pktmon::ScopeOutcome::ScopedByName { source_id: 42 }),
+            },
+            app: None,
+        };
+        signal.deactivate();
+        signal.deactivate();
+        let state = serde_json::to_value(&signal.state).unwrap();
+        assert_eq!(state["active"], false);
+        assert_eq!(state["adapter_name"], "Ethernet");
+        assert_eq!(state["outcome"]["scope"], "scoped_by_name");
+        assert_eq!(state["outcome"]["source_id"], 42);
+    }
+
     fn identity(source_id: Option<u32>) -> CaptureIdentity {
         CaptureIdentity {
             iface_name: "Ethernet".into(),
@@ -4183,6 +4266,7 @@ mod tests {
         interface::InterfaceInfo {
             name: name.into(),
             display_name: name.into(),
+            description: String::new(),
             ips: ips
                 .iter()
                 .map(|addr| interface::IpInfo {

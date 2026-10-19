@@ -23,6 +23,13 @@ pub async fn scan_network(
 }
 
 #[tauri::command]
+pub async fn get_capture_state(
+    manager: State<'_, NetworkManager>,
+) -> Result<crate::network::CaptureState, AppError> {
+    Ok(manager.get_capture_state().await)
+}
+
+#[tauri::command]
 pub async fn list_interfaces(
     manager: State<'_, NetworkManager>,
 ) -> Result<Vec<InterfaceInfo>, AppError> {
