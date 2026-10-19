@@ -9,24 +9,65 @@
 //! The callback runs on a system thread owned by IP Helper. It is deliberately
 //! tiny (just a non-blocking send) to avoid holding that thread.
 //!
-//! On non-Windows platforms this module is a no-op — the legacy pnet-based
-//! watcher in `lib.rs::watch_interface` continues to handle those.
+//! Where native notifications are unavailable, `lib.rs::watch_interface`
+//! polls this same selection refresh path.
 
-use tauri::AppHandle;
+use super::{AdapterSelection, InterfaceInfo, NetworkManager};
+use tauri::{AppHandle, Emitter, Manager};
 
-use super::auto_adopt::PendingIps;
+pub(crate) fn selected_status(selection: &AdapterSelection) -> InterfaceInfo {
+    selection
+        .adapter
+        .clone()
+        .filter(|_| selection.interface_index.is_some())
+        .unwrap_or_else(|| InterfaceInfo {
+            name: String::new(),
+            display_name: "Selected Ethernet adapter unavailable".into(),
+            description: String::new(),
+            mac: selection.selected_mac.clone().unwrap_or_default(),
+            ips: vec![],
+            is_up: false,
+            is_ethernet: true,
+            is_wifi: false,
+            is_vpn: false,
+            is_virtual: false,
+        })
+}
 
-/// `pending` is the manager's pending-IP registry: scratch and
-/// not-yet-handed-over addresses are stripped from every emission so
-/// transient probe binds neither render as host rows nor read as IP
-/// changes to the frontend.
+pub(crate) fn emit_selection(handle: &AppHandle, selection: &AdapterSelection) {
+    let _ = handle.emit("adapter-selection-changed", selection);
+    let _ = handle.emit("interface-status-changed", selected_status(selection));
+}
+
+/// Shared by native notifications, the fallback poller and the UI query.
+pub(crate) async fn refresh(handle: &AppHandle) -> Result<(), crate::AppError> {
+    let manager = handle.state::<NetworkManager>();
+    let config = handle.state::<crate::config::AppConfig>();
+    let previous = manager.adapter_selection_state().await;
+    let mut selection = manager.get_adapter_selection(&config).await?;
+    if (previous.selected_mac != selection.selected_mac
+        || previous.interface_index != selection.interface_index)
+        && selection.adapter.is_some()
+        && selection.interface_index.is_some()
+    {
+        manager.start_selected_adapter(&config, handle).await;
+        selection = manager.get_adapter_selection(&config).await?;
+    }
+    if serde_json::to_value(previous).ok() != serde_json::to_value(&selection).ok() {
+        emit_selection(handle, &selection);
+    }
+    Ok(())
+}
+
+/// Interface enumeration goes through the manager, which strips pending
+/// scratch addresses before selection or emission.
 #[cfg(target_os = "windows")]
-pub fn start(handle: AppHandle, pending: PendingIps) -> bool {
-    imp::start(handle, pending)
+pub fn start(handle: AppHandle) -> bool {
+    imp::start(handle)
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn start(_handle: AppHandle, _pending: PendingIps) -> bool {
+pub fn start(_handle: AppHandle) -> bool {
     false
 }
 
@@ -37,7 +78,7 @@ mod imp {
     use std::sync::OnceLock;
     use std::time::Duration;
 
-    use tauri::{AppHandle, Emitter};
+    use tauri::AppHandle;
     use tokio::sync::mpsc;
 
     use windows_sys::Win32::Foundation::{BOOLEAN, HANDLE, NO_ERROR};
@@ -45,9 +86,6 @@ mod imp {
         CancelMibChangeNotify2, NotifyIpInterfaceChange, NotifyUnicastIpAddressChange,
         MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE, MIB_UNICASTIPADDRESS_ROW,
     };
-
-    use crate::network::auto_adopt::PendingIps;
-    use crate::network::interface;
 
     // AF_UNSPEC covers both IPv4 and IPv6 in a single registration.
     const AF_UNSPEC: u16 = 0;
@@ -95,7 +133,7 @@ mod imp {
         wake();
     }
 
-    pub fn start(handle: AppHandle, pending: PendingIps) -> bool {
+    pub fn start(handle: AppHandle) -> bool {
         // Claim the init slot. INITIALIZED stays true ONLY on success —
         // a failed attempt below resets it so a later call can retry.
         // (The old code latched it before registration, so one failure
@@ -164,15 +202,11 @@ mod imp {
         // which runs outside any tokio runtime context — a bare tokio::spawn
         // panics with "there is no reactor running", killing the process
         // silently on a Windows GUI app (no stderr to see the panic).
-        tauri::async_runtime::spawn(debounce_loop(rx, handle, pending));
+        tauri::async_runtime::spawn(debounce_loop(rx, handle));
         true
     }
 
-    async fn debounce_loop(
-        mut rx: mpsc::UnboundedReceiver<()>,
-        handle: AppHandle,
-        pending: PendingIps,
-    ) {
+    async fn debounce_loop(mut rx: mpsc::UnboundedReceiver<()>, handle: AppHandle) {
         loop {
             if rx.recv().await.is_none() {
                 return;
@@ -183,63 +217,52 @@ mod imp {
             tokio::time::sleep(Duration::from_millis(300)).await;
             while rx.try_recv().is_ok() {}
 
-            let list = match interface::list_physical().await {
-                Ok(l) => l,
-                Err(e) => {
-                    log::debug!("Watcher enumeration failed: {}", e);
-                    continue;
-                }
+            if let Err(e) = super::refresh(&handle).await {
+                log::debug!("Watcher selection refresh failed: {e}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watcher_reports_selected_usb_or_unavailable_never_the_dock() {
+        let iface = |name: &str, mac: &str| InterfaceInfo {
+            name: name.into(),
+            display_name: name.into(),
+            description: String::new(),
+            ips: vec![],
+            mac: mac.into(),
+            is_up: true,
+            is_ethernet: true,
+            is_wifi: false,
+            is_vpn: false,
+            is_virtual: false,
+        };
+        let dock = iface("Dock", "40:cd:3a:00:00:01");
+        let usb = iface("USB", "40:cd:3a:00:00:02");
+        for list in [
+            vec![dock.clone(), usb.clone()],
+            vec![usb.clone(), dock.clone()],
+            vec![dock],
+        ] {
+            let adapter = crate::network::pick_adapter(&list, Some(&usb.mac)).cloned();
+            let selection = AdapterSelection {
+                selected_mac: Some(usb.mac.clone()),
+                interface_index: adapter.as_ref().map(|_| 23),
+                adapter,
+                ..Default::default()
             };
-            // Strip transient scratch/pending addresses before the pick:
-            // a probe's bind/release must not surface as a host IP or
-            // masquerade as an IP change.
-            let pending_now: std::collections::HashSet<String> = pending
-                .lock()
-                .await
-                .iter()
-                .map(|e| e.ip.to_string())
-                .collect();
-            let list = crate::network::strip_pending_ips(list, &pending_now);
-
-            // Prefer an ethernet adapter that has at least one IPv4 address.
-            // Fall back to the first ethernet adapter so "disconnected but
-            // still known" surfaces in the UI as per the relaxed-filter plan.
-            // Exclude VPN and virtual adapters from both arms so a
-            // VPN-as-Ethernet or virtual switch never drives the camera-port
-            // banner; the relaxed up-state (no is_up check) is kept on
-            // purpose so a disconnected wired port still shows the banner.
-            let pick = list
-                .iter()
-                .find(|i| i.is_ethernet && !i.is_vpn && !i.is_virtual && !i.ips.is_empty())
-                .or_else(|| {
-                    list.iter()
-                        .find(|i| i.is_ethernet && !i.is_vpn && !i.is_virtual)
-                })
-                .cloned();
-
-            if let Some(iface) = pick {
-                log::debug!(
-                    "Watcher emitting interface-status-changed: '{}' ips={}",
-                    iface.display_name,
-                    iface.ips.len()
-                );
-                let _ = handle.emit("interface-status-changed", &iface);
+            let event = selected_status(&selection);
+            assert_eq!(event.mac, usb.mac);
+            if selection.adapter.is_some() {
+                assert_eq!(event.name, "USB");
             } else {
-                // No ethernet adapter present — emit an empty sentinel so
-                // the UI can show the "no adapter" banner.
-                let sentinel = interface::InterfaceInfo {
-                    name: String::new(),
-                    display_name: String::new(),
-                    description: String::new(),
-                    ips: vec![],
-                    mac: String::new(),
-                    is_up: false,
-                    is_ethernet: true,
-                    is_wifi: false,
-                    is_vpn: false,
-                    is_virtual: false,
-                };
-                let _ = handle.emit("interface-status-changed", &sentinel);
+                assert!(event.name.is_empty());
+                assert!(!event.is_up);
             }
         }
     }

@@ -18,6 +18,7 @@ import { handleHardDisconnect, handleReconnect, showModalWithVideo } from "./str
 import { sessionCamIp } from "./store.ts";
 import { formatError } from "./errors.ts";
 import type {
+  AdapterSelection,
   AdoptionLifecyclePayload,
   InterfaceInfo,
   NetworkMode,
@@ -34,6 +35,29 @@ void $$;
 // Host card and the radio state in the IP Config dialog. null =
 // unknown / not yet probed.
 let hostMode: NetworkMode | null = null;
+let adapterSelection: AdapterSelection | null = null;
+let interfaceRefresh = 0;
+let selectingAdapter = false;
+
+function rememberAdapterSelection(next: AdapterSelection): void {
+  if (adapterSelection && (adapterSelection.selected_mac !== next.selected_mac ||
+      adapterSelection.interface_index !== next.interface_index)) {
+    if (pendingDownTimer) clearTimeout(pendingDownTimer);
+    pendingDownTimer = null;
+    pendingDownIface = null;
+    if (state.activeInterface) handleHardDisconnect("Ethernet adapter changed or unavailable");
+    state.activeInterface = null;
+  }
+  adapterSelection = next;
+  if (state.config) state.config.selected_adapter_mac = next.selected_mac;
+}
+
+function unavailableAdapterLabel(): string {
+  if (adapterSelection?.selection_required) return "Select Ethernet adapter in Configure";
+  return adapterSelection?.selected_mac
+    ? `Selected adapter ${adapterSelection.selected_mac} unavailable`
+    : "None found";
+}
 
 /** Sync hostMode from state.config (no IPC). Cheap and synchronous —
  *  callable as soon as loadConfig() resolves, which lets the Host card
@@ -64,28 +88,25 @@ function isWiredCandidate(i: InterfaceInfo): boolean {
 }
 
 export async function refreshInterfaces(): Promise<void> {
+  const request = ++interfaceRefresh;
   try {
-    const interfaces = await api.listInterfaces();
-    const ethList = (interfaces || []).filter(isWiredCandidate);
-    // Pick the first truly-connected adapter. "Connected" means link up AND
-    // at least one real IPv4 — APIPA (169.254.x.x) addresses don't count,
-    // since Windows assigns them when no real network is reachable.
-    const eth = ethList.find(
-      (i) => i.is_up && i.ips.some((ip) => !ip.address.startsWith("169.254."))
-    );
+    const selection = await api.getAdapterSelection();
+    if (request !== interfaceRefresh || !selection) return;
+    rememberAdapterSelection(selection);
+    const eth = selection.interface_index !== null ? selection.adapter : null;
 
-    if (eth) {
+    if (eth && eth.is_up && eth.ips.some((ip) => !isApipa(ip.address))) {
       state.activeInterface = eth;
       $("#iface-name").textContent = eth.display_name || eth.name;
       await refreshHostMode();
       renderSubnetList();
       // Recovery — reset the dedup so the next failure toasts again.
       lastAdapterWarningAt = 0;
-    } else if (ethList.length > 0) {
+    } else if (eth) {
       // Adapter is known to Windows but has no IP. Treat this the same
       // as "no ethernet detected" from the user's perspective — the
       // actionable state is identical (click Reset adapter).
-      const stale = ethList[0]!;
+      const stale = eth;
       state.activeInterface = stale;
       $("#iface-name").textContent =
         (stale.display_name || stale.name) + " (Disconnected)";
@@ -93,10 +114,13 @@ export async function refreshInterfaces(): Promise<void> {
       warnNoEthernet();
     } else {
       state.activeInterface = null;
-      $("#iface-name").textContent = "None found";
+      $("#iface-name").textContent = unavailableAdapterLabel();
+      renderSubnetList();
       warnNoEthernet();
     }
   } catch (e) {
+    if (request !== interfaceRefresh) return;
+    state.activeInterface = null;
     log(`Failed to list interfaces: ${formatError(e)}`);
     $("#iface-name").textContent = "Error";
     warnNoEthernet();
@@ -117,7 +141,11 @@ export function warnNoEthernet(): void {
   if (now - lastAdapterWarningAt < NO_ETHERNET_COOLDOWN_MS) return;
   lastAdapterWarningAt = now;
   showToast(
-    "No Ethernet detected — check Ethernet connection and/or reset Ethernet adapter",
+    adapterSelection?.selection_required
+      ? "Choose the camera's Ethernet adapter in Configure"
+      : adapterSelection?.selected_mac && (!adapterSelection.adapter || adapterSelection.interface_index === null)
+        ? unavailableAdapterLabel()
+        : "No Ethernet detected — check Ethernet connection and/or reset Ethernet adapter",
     true
   );
 }
@@ -174,7 +202,13 @@ function isDownEvent(iface: InterfaceInfo): boolean {
 }
 
 export function setupInterfaceWatcher(): void {
+  api.onEvent<AdapterSelection>("adapter-selection-changed", (selection) => {
+    ++interfaceRefresh;
+    rememberAdapterSelection(selection);
+  });
   api.onEvent<InterfaceInfo>("interface-status-changed", (iface) => {
+    const expectedMac = adapterSelection?.selected_mac?.replaceAll("-", ":").toLowerCase();
+    if (iface.mac.replaceAll("-", ":").toLowerCase() !== (expectedMac ?? "")) return;
     // Capture the prior connection state BEFORE any state mutation so
     // applyUpEvent can decide whether this is a true reconnect.
     // isInterfaceConnected() is our single source of truth — it also
@@ -264,7 +298,7 @@ function applyDownEvent(iface: InterfaceInfo): void {
   if (!iface.name) {
     handleHardDisconnect("Ethernet disconnected");
     state.activeInterface = null;
-    $("#iface-name").textContent = "None found";
+    $("#iface-name").textContent = unavailableAdapterLabel();
     // Preserve the backend's DeviceRegistry across a "no adapter"
     // blip so a quick replug restores the UI without waiting for a
     // full re-scan. renderArpDeviceList self-hides when not connected.
@@ -545,6 +579,21 @@ export function getActivePtuIp(): string | null {
 /** Interfaces loaded when dialog opens — used by add/remove handlers. */
 let dialogInterfaces: InterfaceInfo[] = [];
 
+async function loadAdapterChoices(): Promise<void> {
+  const selection = await api.getAdapterSelection();
+  if (!selection) return;
+  rememberAdapterSelection(selection);
+  dialogInterfaces = selection.candidates.filter(isWiredCandidate);
+  const select = $<HTMLSelectElement>("#static-iface");
+  select.innerHTML = '<option value="" disabled>Select Ethernet adapter</option>' +
+    dialogInterfaces.map((i) => `<option value="${escapeHtml(i.name)}">${escapeHtml(
+      `${i.display_name || i.name} (${i.mac})`
+    )}</option>`).join("");
+  select.value = selection.adapter?.name ?? "";
+  const field = select.closest<HTMLElement>(".input-field");
+  if (field) field.style.display = dialogInterfaces.length > 1 ? "" : "none";
+}
+
 export function setupIpConfigDialog(): void {
   const dialog = $<HTMLDialogElement>("#ip-config-dialog");
 
@@ -556,18 +605,7 @@ export function setupIpConfigDialog(): void {
     await showModalWithVideo(dialog);
 
     try {
-      dialogInterfaces = ((await api.listInterfaces()) || []).filter(isWiredCandidate);
-      select.innerHTML = dialogInterfaces
-        .map((i) => {
-          const ip = i.ips.length > 0 ? i.ips[0]!.address : "no IP";
-          // Adapter names are backend-sourced and can carry arbitrary
-          // characters (user renames, vendor strings) — escape before
-          // innerHTML, value attribute included.
-          const nameEsc = escapeHtml(i.name);
-          const labelEsc = escapeHtml(`${i.display_name || i.name} (${ip})`);
-          return `<option value="${nameEsc}">${labelEsc}</option>`;
-        })
-        .join("");
+      await loadAdapterChoices();
       populateDialogFields();
       await syncModeFromInterface();
     } catch (_) {
@@ -576,9 +614,23 @@ export function setupIpConfigDialog(): void {
   });
 
   // Re-populate when interface selection changes
-  $<HTMLSelectElement>("#static-iface").addEventListener("change", () => {
-    populateDialogFields();
-    void syncModeFromInterface();
+  $<HTMLSelectElement>("#static-iface").addEventListener("change", async () => {
+    const select = $<HTMLSelectElement>("#static-iface");
+    const iface = dialogInterfaces.find((i) => i.name === select.value);
+    if (!iface || selectingAdapter) return;
+    selectingAdapter = true;
+    select.disabled = true;
+    try {
+      rememberAdapterSelection(await api.selectAdapter(iface.mac));
+      await reloadDialogInterfaces();
+      await syncModeFromInterface();
+    } catch (e) {
+      showToast("Adapter selection failed: " + formatError(e), true);
+      await reloadDialogInterfaces();
+    } finally {
+      selectingAdapter = false;
+      select.disabled = false;
+    }
   });
 
   // Mode toggle: hide/show the static-only fields. Applying happens via
@@ -589,6 +641,7 @@ export function setupIpConfigDialog(): void {
 
   // ── Add secondary IP ─────────────────────────────────────────────
   $<HTMLButtonElement>("#btn-add-sec-ip").addEventListener("click", async () => {
+    if (selectingAdapter) return;
     const iface = $<HTMLSelectElement>("#static-iface").value;
     const ip = $<HTMLInputElement>("#add-sec-ip").value.trim();
     const mask = $<HTMLInputElement>("#add-sec-mask").value.trim();
@@ -621,6 +674,7 @@ export function setupIpConfigDialog(): void {
   // settled adapter (auto-adopt loop reads current IPs to decide
   // rescue vs pause).
   $<HTMLButtonElement>("#ip-config-apply").addEventListener("click", async () => {
+    if (selectingAdapter) return;
     const iface = $<HTMLSelectElement>("#static-iface").value;
     if (!iface) {
       showToast("Select an interface", true);
@@ -795,6 +849,7 @@ function renderSecondaryIps(
     .querySelectorAll<HTMLButtonElement>("[data-remove-sec-ip]")
     .forEach((btn) => {
       btn.addEventListener("click", async () => {
+        if (selectingAdapter) return;
         const ip = btn.dataset["removeSecIp"];
         if (!ip) return;
         const ifaceName = $<HTMLSelectElement>("#static-iface").value;
@@ -859,7 +914,7 @@ export async function refreshIpDialogIfOpen(): Promise<void> {
 /** Reload interfaces and refresh dialog fields without closing. */
 async function reloadDialogInterfaces(): Promise<void> {
   try {
-    dialogInterfaces = ((await api.listInterfaces()) || []).filter(isWiredCandidate);
+    await loadAdapterChoices();
     populateDialogFields();
     // Also refresh the host card
     await refreshInterfaces();
