@@ -34,14 +34,14 @@ pub(crate) struct ProbeCandidate {
 }
 
 /// Derive the probe candidate set from the device cache. Excluded rows
-/// keep their existing discovery paths:
+/// are not scratch-probed:
 /// - rows without a usable stored MAC (the MAC match is the identity
 ///   evidence that justifies the dwell bypass);
 /// - subnets native to the adapter, currently adopted, held for restore,
 ///   or already probed this session;
 /// - subnets owned by a non-wired local interface (same structural
-///   screens the broadcast path applies). APIPA subnets pass — a camera
-///   in APIPA fallback is a primary use case.
+///   screens the broadcast path applies), and prohibited addresses,
+///   including APIPA. Historical APIPA rows remain in the cache.
 ///
 /// Candidates sharing a /24 are grouped so the pass binds one scratch
 /// per subnet.
@@ -61,6 +61,9 @@ pub(crate) fn derive_candidates(
         let Ok(ip) = record.ip.parse::<Ipv4Addr>() else {
             continue;
         };
+        if crate::validation::prohibited_camera_ip(ip) {
+            continue;
+        }
         let o = ip.octets();
         let subnet = format!("{}.{}.{}.0/24", o[0], o[1], o[2]);
         if native_subnets.contains(&subnet)
@@ -284,18 +287,20 @@ mod tests {
     }
 
     #[test]
-    fn candidates_apply_ghost_screen_but_admit_apipa() {
+    fn candidates_exclude_ghosts_and_apipa_without_changing_history() {
         let cached = vec![
             // Owned by a non-wired local interface — structurally ghost.
             record("aa:bb:cc:dd:ee:01", "10.5.0.9", "10.5.0.0/24"),
-            // APIPA is a primary use case (camera DHCP fallback) — in.
+            // APIPA is excluded even with a usable cached MAC.
             record("2c:a5:9c:2b:a9:fc", "169.254.73.42", "169.254.73.0/24"),
+            record("2c:a5:9c:2b:a9:fd", "172.31.169.64", "169.254.73.0/24"),
         ];
         let ghost_nets = vec!["10.5.0.0/16".parse::<ipnetwork::Ipv4Network>().unwrap()];
         let none = HashSet::new();
         let out = derive_candidates(&cached, &none, &none, &none, &ghost_nets, &none);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].subnet, "169.254.73.0/24");
+        assert_eq!(out[0].subnet, "172.31.169.0/24");
+        assert_eq!(cached[1].ip, "169.254.73.42");
     }
 
     #[test]

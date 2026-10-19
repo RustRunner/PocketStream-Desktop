@@ -177,10 +177,19 @@ pub async fn add_manual_node(
     ip: String,
     alias: String,
 ) -> Result<(), AppError> {
+    let node = validated_manual_node(ip, alias)?;
+    config.add_manual_node(node)?;
+    // Reflect the new pin in the live registry so the Nodes panel
+    // updates without a full mode-switch. hydrate_manual_nodes patches
+    // an existing record at the same IP rather than spawning a dupe.
+    manager.hydrate_manual_nodes(&config).await;
+    Ok(())
+}
+
+fn validated_manual_node(ip: String, alias: String) -> Result<ManualNode, AppError> {
     // Validate IP shape at the boundary so a malformed string can't end
     // up persisted and re-served to the frontend.
-    ip.parse::<std::net::Ipv4Addr>()
-        .map_err(|_| AppError::Network(format!("Invalid IP: {}", ip)))?;
+    crate::validation::parse_camera_ip(&ip)?;
     // CAM/PTU are single-holder role designations with their own
     // assignment path; accepting them here would bypass the
     // single-holder enforcement.
@@ -189,12 +198,7 @@ pub async fn add_manual_node(
             "CAM and PTU are assigned from the Nodes panel".into(),
         ));
     }
-    config.add_manual_node(ManualNode { ip, alias })?;
-    // Reflect the new pin in the live registry so the Nodes panel
-    // updates without a full mode-switch. hydrate_manual_nodes patches
-    // an existing record at the same IP rather than spawning a dupe.
-    manager.hydrate_manual_nodes(&config).await;
-    Ok(())
+    Ok(ManualNode { ip, alias })
 }
 
 #[tauri::command]
@@ -243,9 +247,7 @@ pub async fn resolve_mac(
     manager: State<'_, NetworkManager>,
     ip: String,
 ) -> Result<Option<String>, AppError> {
-    let parsed: std::net::Ipv4Addr = ip
-        .parse()
-        .map_err(|_| AppError::Network(format!("Invalid IP: {}", ip)))?;
+    let parsed = crate::validation::parse_camera_ip(&ip)?;
     let source = manager.wired_source_for(parsed).await;
     crate::network::arp::resolve_mac_for_ip(parsed, source, std::time::Duration::from_secs(1)).await
 }
@@ -314,6 +316,7 @@ pub async fn report_scan_result(
     ip: String,
     open_ports: Vec<u16>,
 ) -> Result<(), AppError> {
+    crate::validation::parse_camera_ip(&ip)?;
     // A successful scan (any open port) is positive device evidence for
     // the adoption lifecycle — even when the port set is unchanged and
     // the registry merge below turns out to be a no-op. Stamp before
@@ -501,4 +504,20 @@ pub async fn get_configured_adoptions(
     config: State<'_, AppConfig>,
 ) -> Result<std::collections::HashMap<String, String>, AppError> {
     Ok(config.get().adopted_subnets)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manual_apipa_is_rejected_before_persistence_or_hydration() {
+        let error = validated_manual_node("169.254.20.7".into(), "bench PTU".into())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("give the camera a routable IPv4 address first"));
+        let node = validated_manual_node("192.168.1.204".into(), "bench PTU".into()).unwrap();
+        assert_eq!(node.ip, "192.168.1.204");
+        assert!(validated_manual_node("192.168.1.204".into(), "CAM".into()).is_err());
+    }
 }

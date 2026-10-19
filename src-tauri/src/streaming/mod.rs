@@ -257,16 +257,8 @@ impl StreamManager {
             StreamProtocol::Rtsp => {
                 // Validate camera IP before building URL (defense in depth)
                 if !settings.stream.camera_ip.is_empty() {
-                    settings
-                        .stream
-                        .camera_ip
-                        .parse::<std::net::Ipv4Addr>()
-                        .map_err(|_| {
-                            AppError::Stream(format!(
-                                "Invalid camera IP: {}",
-                                settings.stream.camera_ip
-                            ))
-                        })?;
+                    crate::validation::parse_camera_ip(&settings.stream.camera_ip)
+                        .map_err(|e| AppError::Stream(e.to_string()))?;
                 }
                 Ok(format!(
                     "rtsp://{}:{}{}",
@@ -466,6 +458,14 @@ impl StreamManager {
         settings: &AppSettings,
         adopted: &std::collections::HashSet<String>,
     ) -> Result<ResolvedRtspStartSpec, AppError> {
+        let source = match settings.stream.protocol {
+            StreamProtocol::Rtsp => ResolvedSource::Rtsp {
+                url: Self::build_input_url(settings)?,
+            },
+            StreamProtocol::Udp => ResolvedSource::Udp {
+                port: settings.stream.udp_port,
+            },
+        };
         let bind_interface = if settings.rtsp_server.bind_interface.is_empty() {
             None
         } else {
@@ -478,15 +478,6 @@ impl StreamManager {
                 .await
                 .unwrap_or_else(|| "0.0.0.0".into()),
         };
-        let source = match settings.stream.protocol {
-            StreamProtocol::Rtsp => ResolvedSource::Rtsp {
-                url: Self::build_input_url(settings)?,
-            },
-            StreamProtocol::Udp => ResolvedSource::Udp {
-                port: settings.stream.udp_port,
-            },
-        };
-
         log::info!(
             "RTSP bind selection: interface={:?} bind={:?} advertise={}",
             bind_interface,
@@ -1828,7 +1819,7 @@ mod tests {
 
     #[test]
     fn build_url_udp_ignores_camera_ip() {
-        let s = make_settings(StreamProtocol::Udp, "192.168.1.1", "admin", "pass");
+        let s = make_settings(StreamProtocol::Udp, "169.254.1.1", "admin", "pass");
         let url = StreamManager::build_input_url(&s).unwrap();
         assert_eq!(url, "udp://@:8600");
     }
@@ -1854,6 +1845,18 @@ mod tests {
     fn build_url_rejects_invalid_camera_ip() {
         let s = make_settings(StreamProtocol::Rtsp, "not-an-ip", "", "");
         assert!(StreamManager::build_input_url(&s).is_err());
+    }
+
+    #[tokio::test]
+    async fn build_url_rejects_apipa_for_preview_and_relay() {
+        let s = make_settings(StreamProtocol::Rtsp, "169.254.73.42", "", "");
+        let error = StreamManager::build_input_url(&s).unwrap_err().to_string();
+        assert!(error.contains("routable IPv4 address first"));
+        assert!(
+            StreamManager::resolve_rtsp_start_spec(&s, &std::collections::HashSet::new())
+                .await
+                .is_err()
+        );
     }
 
     #[test]
