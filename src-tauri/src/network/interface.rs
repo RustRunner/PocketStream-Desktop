@@ -521,6 +521,7 @@ fn list_all_pnet() -> Result<Vec<InterfaceInfo>, AppError> {
 /// Windows without touching pnet.
 #[cfg(target_os = "windows")]
 struct WinAdapter {
+    index: u32,
     /// Colon-separated, matching the format `parse_adapter` produces, so
     /// callers can compare MACs regardless of which enumeration path built
     /// the value they hold.
@@ -621,10 +622,66 @@ fn local_adapters_iphelper() -> Vec<WinAdapter> {
             ua = u.Next;
         }
 
-        adapters.push(WinAdapter { mac, is_up, ips });
+        adapters.push(WinAdapter {
+            index: unsafe { ad.Anonymous1.Anonymous.IfIndex },
+            mac,
+            is_up,
+            ips,
+        });
         cur = ad.Next;
     }
     adapters
+}
+
+/// Resolve the current adapter's IPv4 index without spawning PowerShell.
+pub(crate) fn index_for_mac(mac: &str) -> Option<u32> {
+    let target = mac.replace('-', ":");
+    #[cfg(target_os = "windows")]
+    let indices: Vec<u32> = local_adapters_iphelper()
+        .into_iter()
+        .filter(|a| !a.mac.is_empty() && a.mac.eq_ignore_ascii_case(&target))
+        .map(|a| a.index)
+        .collect();
+    #[cfg(not(target_os = "windows"))]
+    let indices: Vec<u32> = pnet::datalink::interfaces()
+        .into_iter()
+        .filter(|a| {
+            a.mac
+                .is_some_and(|m| m.to_string().eq_ignore_ascii_case(&target))
+        })
+        .map(|a| a.index)
+        .collect();
+    match indices.as_slice() {
+        [index] if *index != 0 => Some(*index),
+        _ => None,
+    }
+}
+
+/// SourceAddress selects an interface in ResolveIpNetEntry2: reject an
+/// address shared by adapters as well as a missing/wrong-index source.
+#[cfg(any(target_os = "windows", test))]
+fn source_matches_index(
+    index: u32,
+    source: std::net::Ipv4Addr,
+    addresses: impl Iterator<Item = (u32, std::net::Ipv4Addr)>,
+) -> bool {
+    let mut owners = addresses.filter(|(_, address)| *address == source);
+    index != 0 && owners.next() == Some((index, source)) && owners.next().is_none()
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn source_matches_interface(index: u32, source: std::net::Ipv4Addr) -> bool {
+    source_matches_index(
+        index,
+        source,
+        local_adapters_iphelper().into_iter().flat_map(|adapter| {
+            let index = adapter.index;
+            adapter
+                .ips
+                .into_iter()
+                .filter_map(move |ip| ip.address.parse().ok().map(|address| (index, address)))
+        }),
+    )
 }
 
 /// Lightweight interface status check by MAC (no process spawning, no
@@ -713,6 +770,22 @@ pub async fn get_by_name(name: &str) -> Result<InterfaceInfo, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_must_belong_uniquely_to_the_selected_index() {
+        let wired = "192.168.1.101".parse().unwrap();
+        let wifi = "192.168.1.102".parse().unwrap();
+        let addresses = [(7, wired), (8, wifi)];
+        assert!(source_matches_index(7, wired, addresses.into_iter()));
+        assert!(!source_matches_index(8, wired, addresses.into_iter()));
+        assert!(!source_matches_index(0, wired, addresses.into_iter()));
+        assert!(!source_matches_index(7, wired, [].into_iter()));
+        assert!(!source_matches_index(
+            7,
+            wired,
+            [(7, wired), (8, wired)].into_iter()
+        ));
+    }
 
     // ── Camera-port predicates ──────────────────────────────────────
 

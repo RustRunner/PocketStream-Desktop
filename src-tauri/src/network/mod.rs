@@ -392,6 +392,7 @@ pub struct NetworkManager {
     /// on the first frame — the pre-ladder event contract, unchanged.
     discovery_watchdog_handle: Arc<Mutex<Option<WatchdogHandle>>>,
     interface_name: Arc<Mutex<Option<String>>>,
+    interface_index: Arc<Mutex<Option<u32>>>,
     /// Canonical store of merged device records (ARP + scan + cache +
     /// alias + status). Mutated alongside `arp_devices` during the
     /// transition; once the frontend is fully migrated to subscribe-only
@@ -772,6 +773,7 @@ async fn unbind_ip_resolving_owner(
 /// dozen-argument signature.
 struct AdoptionCtx {
     iface_name: String,
+    interface_index: u32,
     ops: auto_adopt::RealAdoptOps,
     app_handle: tauri::AppHandle,
     adopted: Arc<Mutex<HashMap<String, Ipv4Addr>>>,
@@ -1152,7 +1154,7 @@ fn probe_evidence(origin: ProbeOrigin, ip: Ipv4Addr, mac: &str) -> AdoptionEvide
 }
 
 /// Production `ProbeIo`: scratch discipline via the auto-adopt
-/// breadcrumb helpers, fresh resolution via flush + `SendARP`, and the
+/// breadcrumb helpers, fresh resolution via `ResolveIpNetEntry2`, and the
 /// shared adoption tail for hand-offs.
 struct RealProbeIo<'a> {
     ctx: &'a AdoptionCtx,
@@ -1169,6 +1171,10 @@ struct RealProbeIo<'a> {
 }
 
 impl cache_probe::ProbeIo for RealProbeIo<'_> {
+    fn interface_index(&self) -> u32 {
+        self.ctx.interface_index
+    }
+
     async fn bind_scratch(&mut self, subnet: &str, scratch: Ipv4Addr) -> bool {
         let id = self.ctx.adoption_seq.fetch_add(1, Ordering::Relaxed) + 1;
         match auto_adopt::bind_scratch(
@@ -1223,10 +1229,22 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
         }
     }
 
-    async fn resolve(&mut self, target: Ipv4Addr, scratch: Ipv4Addr) -> Result<Option<String>, ()> {
+    async fn resolve(
+        &mut self,
+        target: Ipv4Addr,
+        scratch: Ipv4Addr,
+        interface_index: u32,
+    ) -> Result<Option<String>, ()> {
+        if interface_index != self.ctx.interface_index || self.ctx.fence.is_stale() {
+            return Err(());
+        }
         // Logged at info per outcome — a silent miss here cost a field
         // session; the pass touches at most a handful of pairs.
-        match arp::fresh_resolve_mac(target, scratch).await {
+        let resolved = arp::fresh_resolve_mac(target, scratch, interface_index).await;
+        if self.ctx.fence.is_stale() {
+            return Err(());
+        }
+        match resolved {
             Ok(Some(mac)) => {
                 log::info!("{}: {} answered with {}", self.origin.label(), target, mac);
                 Ok(Some(mac))
@@ -1275,7 +1293,7 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
     }
 
     fn shutdown(&self) -> bool {
-        *self.shutdown_rx.borrow()
+        *self.shutdown_rx.borrow() || self.ctx.fence.is_stale()
     }
 }
 
@@ -1618,6 +1636,7 @@ impl NetworkManager {
             pending_restore: Arc::new(Mutex::new(HashMap::new())),
             discovery_watchdog_handle: Arc::new(Mutex::new(None)),
             interface_name: Arc::new(Mutex::new(None)),
+            interface_index: Arc::new(Mutex::new(None)),
             device_registry: Arc::new(DeviceRegistry::new()),
             device_emitter: Arc::new(Mutex::new(None)),
             ping_dot_handle: Arc::new(Mutex::new(None)),
@@ -2603,6 +2622,13 @@ impl NetworkManager {
         }
         let known_ips: Vec<String> = iface_info.ips.iter().map(|ip| ip.address.clone()).collect();
         let own_mac = parse_mac_bytes(&iface_info.mac);
+        let interface_index = interface::index_for_mac(&iface_info.mac).ok_or_else(|| {
+            AppError::Network(format!(
+                "No unique IPv4 interface index for adapter '{}'",
+                interface_display_name
+            ))
+        })?;
+        *self.interface_index.lock().await = Some(interface_index);
         // Capture identity for attach-time scoping: the same MAC that
         // feeds the own-frame filter, plus the display name for logs. A
         // None MAC (unparseable) makes the join fail and the capture
@@ -2817,6 +2843,7 @@ impl NetworkManager {
             // path below and the cache probe.
             let ctx = AdoptionCtx {
                 iface_name: iface_name.clone(),
+                interface_index,
                 ops: auto_adopt::RealAdoptOps,
                 app_handle: app_handle_for_adopt.clone(),
                 adopted: adopted.clone(),
@@ -3541,14 +3568,15 @@ impl NetworkManager {
     /// re-read costs one PowerShell query per call — acceptable because
     /// this only runs after a TCP scan already succeeded; cache the
     /// selected adapter's IPs in memory if verify latency ever matters.
-    pub async fn wired_source_for(&self, target: Ipv4Addr) -> Option<Ipv4Addr> {
+    pub async fn wired_source_for(&self, target: Ipv4Addr) -> Option<(u32, Ipv4Addr)> {
+        let index = (*self.interface_index.lock().await)?;
         let adopted = self.adopted_ips.lock().await.clone();
         let iface = self.interface_name.lock().await.clone()?;
-        let iface_ips = match interface::get_by_name(&iface).await {
-            Ok(info) => info.ips,
-            Err(_) => Vec::new(),
-        };
-        select_wired_source(target, &adopted, &iface_ips)
+        let info = interface::get_by_name(&iface).await.ok()?;
+        if interface::index_for_mac(&info.mac)? != index {
+            return None;
+        }
+        select_wired_source(target, &adopted, &info.ips).map(|source| (index, source))
     }
 
     /// Forget that `ip` was auto-adopted. Used when the user manually
