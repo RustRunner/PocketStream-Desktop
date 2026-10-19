@@ -1646,6 +1646,7 @@ mod tests {
         password: &str,
     ) -> AppSettings {
         AppSettings {
+            selected_adapter_mac: None,
             stream: StreamConfig {
                 protocol,
                 rtsp_port: 554,

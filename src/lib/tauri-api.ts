@@ -13,6 +13,7 @@
  */
 
 import type {
+  AdapterSelection,
   AdoptionSnapshot,
   AppSettings,
   CaptureState,
@@ -95,6 +96,14 @@ export async function scanNetwork(subnet: string): Promise<ScanResult[]> {
 
 export async function listInterfaces(): Promise<InterfaceInfo[]> {
   return await invoke<InterfaceInfo[]>("list_interfaces");
+}
+
+export async function getAdapterSelection(): Promise<AdapterSelection> {
+  return await invoke<AdapterSelection>("get_adapter_selection");
+}
+
+export async function selectAdapter(mac: string): Promise<AdapterSelection> {
+  return await invoke<AdapterSelection>("select_adapter", { mac });
 }
 
 export async function listVpnInterfaces(): Promise<InterfaceInfo[]> {

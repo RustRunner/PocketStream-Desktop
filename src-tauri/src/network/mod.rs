@@ -249,6 +249,41 @@ pub struct CaptureState {
     pub outcome: Option<pktmon::ScopeOutcome>,
 }
 
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct AdapterSelection {
+    pub selected_mac: Option<String>,
+    pub adapter: Option<InterfaceInfo>,
+    pub interface_index: Option<u32>,
+    pub selection_required: bool,
+    pub candidates: Vec<InterfaceInfo>,
+}
+
+fn adapter_mac(mac: &str) -> Option<String> {
+    let bytes = parse_mac_bytes(mac)?;
+    (bytes != [0; 6] && bytes[0] & 1 == 0).then(|| mac.replace('-', ":").to_ascii_lowercase())
+}
+
+fn adapter_candidate(iface: &InterfaceInfo) -> bool {
+    interface::is_wired_physical(iface) && !iface.is_wifi && adapter_mac(&iface.mac).is_some()
+}
+
+/// A saved identity wins even when absent; enumeration order never selects.
+pub(crate) fn pick_adapter<'a>(
+    list: &'a [InterfaceInfo],
+    mac: Option<&str>,
+) -> Option<&'a InterfaceInfo> {
+    let mut candidates = list.iter().filter(|iface| adapter_candidate(iface));
+    if let Some(mac) = mac {
+        let mac = adapter_mac(mac)?;
+        let mut matching =
+            candidates.filter(|iface| adapter_mac(&iface.mac).as_ref() == Some(&mac));
+        let found = matching.next()?;
+        return matching.next().is_none().then_some(found);
+    }
+    let found = candidates.next()?;
+    candidates.next().is_none().then_some(found)
+}
+
 #[derive(Default)]
 struct CaptureSignal {
     state: CaptureState,
@@ -393,6 +428,7 @@ pub struct NetworkManager {
     discovery_watchdog_handle: Arc<Mutex<Option<WatchdogHandle>>>,
     interface_name: Arc<Mutex<Option<String>>>,
     interface_index: Arc<Mutex<Option<u32>>>,
+    adapter_selection: Arc<Mutex<AdapterSelection>>,
     /// Canonical store of merged device records (ARP + scan + cache +
     /// alias + status). Mutated alongside `arp_devices` during the
     /// transition; once the frontend is fully migrated to subscribe-only
@@ -1637,6 +1673,7 @@ impl NetworkManager {
             discovery_watchdog_handle: Arc::new(Mutex::new(None)),
             interface_name: Arc::new(Mutex::new(None)),
             interface_index: Arc::new(Mutex::new(None)),
+            adapter_selection: Arc::new(Mutex::new(AdapterSelection::default())),
             device_registry: Arc::new(DeviceRegistry::new()),
             device_emitter: Arc::new(Mutex::new(None)),
             ping_dot_handle: Arc::new(Mutex::new(None)),
@@ -1979,19 +2016,12 @@ impl NetworkManager {
                 emitter.poke();
             }
             if crate::is_discovery_available() {
-                let cached_name = self.interface_name.lock().await.clone();
-                let iface = match cached_name {
-                    Some(n) => Some(n),
-                    None => interface::list_physical().await.ok().and_then(|list| {
-                        // Prefer a live camera port; fall back to any
-                        // wired physical adapter so mode entry with the
-                        // cable out still pre-attaches capture.
-                        list.iter()
-                            .find(|i| interface::is_wired_ethernet(i) && !i.ips.is_empty())
-                            .or_else(|| list.iter().find(|i| interface::is_wired_physical(i)))
-                            .map(|i| i.name.clone())
-                    }),
-                };
+                let list = self.list_interfaces().await?;
+                let iface = self
+                    .resolve_adapter_locked(config, &list)
+                    .await?
+                    .adapter
+                    .map(|i| i.name);
                 if let Some(name) = iface {
                     if let Err(e) = self
                         .start_arp_discovery_locked(&name, config, app_handle.clone())
@@ -2083,11 +2113,15 @@ impl NetworkManager {
         // mutate adopted_ips and bind secondary IPs), and vice versa.
         let _op = self.discovery_op.lock().await;
 
-        // Get the active ethernet interface
-        let iface = match interface::list_physical().await {
-            Ok(interfaces) => interfaces
-                .into_iter()
-                .find(|i| interface::is_wired_ethernet(i) && !i.ips.is_empty()),
+        let iface = match self.list_interfaces().await {
+            Ok(list) => self
+                .resolve_adapter_locked(config, &list)
+                .await
+                .ok()
+                .and_then(|s| {
+                    s.adapter
+                        .filter(|i| i.is_up && !i.ips.is_empty() && s.interface_index.is_some())
+                }),
             Err(_) => None,
         };
 
@@ -2362,6 +2396,112 @@ impl NetworkManager {
         Ok(strip_pending_ips(list, &self.pending_ip_strings().await))
     }
 
+    pub async fn adapter_selection_state(&self) -> AdapterSelection {
+        self.adapter_selection.lock().await.clone()
+    }
+
+    pub async fn get_adapter_selection(
+        &self,
+        config: &crate::config::AppConfig,
+    ) -> Result<AdapterSelection, AppError> {
+        let list = self.list_interfaces().await?;
+        self.resolve_adapter_selection(config, &list).await
+    }
+
+    pub async fn resolve_adapter_selection(
+        &self,
+        config: &crate::config::AppConfig,
+        list: &[InterfaceInfo],
+    ) -> Result<AdapterSelection, AppError> {
+        let _op = self.discovery_op.lock().await;
+        self.resolve_adapter_locked(config, list).await
+    }
+
+    async fn resolve_adapter_locked(
+        &self,
+        config: &crate::config::AppConfig,
+        list: &[InterfaceInfo],
+    ) -> Result<AdapterSelection, AppError> {
+        let mut mac = config.get().selected_adapter_mac;
+        let adapter = pick_adapter(list, mac.as_deref()).cloned();
+        if mac.is_none() {
+            if let Some(iface) = &adapter {
+                mac = adapter_mac(&iface.mac);
+                config.set_selected_adapter_mac(mac.clone().unwrap())?;
+            }
+        }
+        let index = adapter
+            .as_ref()
+            .and_then(|i| interface::index_for_mac(&i.mac));
+        let previous = self.adapter_selection_state().await;
+        if previous.selected_mac != mac || previous.interface_index != index {
+            self.stop_locked().await;
+            // Retire routes from the live map without losing saved bindings.
+            let prior = std::mem::take(&mut *self.adopted_ips.lock().await);
+            self.pending_restore.lock().await.extend(prior);
+        }
+        let candidates: Vec<_> = list
+            .iter()
+            .filter(|i| adapter_candidate(i))
+            .cloned()
+            .collect();
+        let selection = AdapterSelection {
+            selection_required: mac.is_none() && candidates.len() > 1,
+            selected_mac: mac,
+            adapter,
+            interface_index: index,
+            candidates,
+        };
+        *self.interface_name.lock().await = selection
+            .adapter
+            .as_ref()
+            .filter(|_| index.is_some())
+            .map(|i| i.name.clone());
+        *self.interface_index.lock().await = index;
+        *self.adapter_selection.lock().await = selection.clone();
+        Ok(selection)
+    }
+
+    pub async fn select_adapter(
+        &self,
+        config: &crate::config::AppConfig,
+        app: &tauri::AppHandle,
+        mac: &str,
+    ) -> Result<AdapterSelection, AppError> {
+        {
+            let _op = self.discovery_op.lock().await;
+            let list = self.list_interfaces().await?;
+            let iface = pick_adapter(&list, Some(mac)).ok_or_else(|| {
+                AppError::Network("Selected Ethernet adapter is unavailable or ineligible".into())
+            })?;
+            config.set_selected_adapter_mac(adapter_mac(&iface.mac).unwrap())?;
+            self.resolve_adapter_locked(config, &list).await?;
+        }
+        self.start_selected_adapter(config, app).await;
+        self.get_adapter_selection(config).await
+    }
+
+    pub async fn start_selected_adapter(
+        &self,
+        config: &crate::config::AppConfig,
+        app: &tauri::AppHandle,
+    ) {
+        self.load_adopted_from_config(config, app).await;
+        let selection = self.adapter_selection_state().await;
+        if config.get_network_mode() != crate::config::NetworkMode::StaticManual
+            && crate::is_discovery_available()
+        {
+            if let Some(iface) = selection.adapter {
+                if let Err(e) = self
+                    .start_arp_discovery(&iface.name, config, app.clone())
+                    .await
+                {
+                    log::info!("Selected Ethernet discovery waiting: {e}");
+                }
+            }
+        }
+    }
+
     /// String forms of every pending (scratch or not-yet-handed-over)
     /// address, for filtering UI-facing interface enumerations.
     pub(crate) async fn pending_ip_strings(&self) -> HashSet<String> {
@@ -2371,12 +2511,6 @@ impl NetworkManager {
             .iter()
             .map(|e| e.ip.to_string())
             .collect()
-    }
-
-    /// Clone of the pending-IP registry for collaborators spawned outside
-    /// the manager (the NIC watcher filters its emissions with it).
-    pub fn pending_ips_handle(&self) -> auto_adopt::PendingIps {
-        self.pending_ips.clone()
     }
 
     pub async fn get_interface(&self, name: &str) -> Result<InterfaceInfo, AppError> {
@@ -2599,6 +2733,15 @@ impl NetworkManager {
             ));
         }
 
+        let list = self.list_interfaces().await?;
+        let selection = self.resolve_adapter_locked(config, &list).await?;
+        let iface_info = selection.adapter.ok_or_else(|| AppError::Network("Selected Ethernet adapter unavailable; select an adapter in Configure when multiple candidates exist".into()))?;
+        if iface_info.name != interface_display_name || selection.interface_index.is_none() {
+            return Err(AppError::Network(
+                "Discovery target does not match the selected Ethernet adapter".into(),
+            ));
+        }
+
         // Session-only teardown: a capture listener that is still valid
         // for this adapter is retained and re-evaluated below.
         self.stop_session_locked().await;
@@ -2607,7 +2750,6 @@ impl NetworkManager {
         // attach-time scoped to the data source carrying this MAC, and
         // the listener drops ARP frames the adapter itself sent (our own
         // gratuitous ARP).
-        let iface_info = interface::get_by_name(interface_display_name).await?;
         // Structural gate, media-independent: the capture listener may
         // bind a disconnected wired port — that is the point of
         // pre-attaching — but never WiFi/VPN/virtual. Callers supply
@@ -3569,11 +3711,15 @@ impl NetworkManager {
     /// this only runs after a TCP scan already succeeded; cache the
     /// selected adapter's IPs in memory if verify latency ever matters.
     pub async fn wired_source_for(&self, target: Ipv4Addr) -> Option<(u32, Ipv4Addr)> {
-        let index = (*self.interface_index.lock().await)?;
+        let selection = self.adapter_selection_state().await;
+        let index = selection.interface_index?;
+        let mac = selection.selected_mac?;
         let adopted = self.adopted_ips.lock().await.clone();
-        let iface = self.interface_name.lock().await.clone()?;
+        let iface = selection.adapter?.name;
         let info = interface::get_by_name(&iface).await.ok()?;
-        if interface::index_for_mac(&info.mac)? != index {
+        if adapter_mac(&info.mac) != adapter_mac(&mac)
+            || interface::index_for_mac(&info.mac)? != index
+        {
             return None;
         }
         select_wired_source(target, &adopted, &info.ips).map(|source| (index, source))
@@ -4310,6 +4456,58 @@ mod tests {
             is_vpn: false,
             is_virtual: false,
         }
+    }
+
+    #[test]
+    fn persisted_adapter_survives_reordering_absence_and_return() {
+        let mut dock = adapter("Dock", &["192.168.1.101"]);
+        dock.mac = "40:cd:3a:00:00:01".into();
+        let mut usb = adapter("USB", &["192.168.1.102"]);
+        usb.mac = "40:cd:3a:00:00:02".into();
+        for list in [
+            vec![dock.clone(), usb.clone()],
+            vec![usb.clone(), dock.clone()],
+        ] {
+            assert_eq!(
+                pick_adapter(&list, Some("40-CD-3A-00-00-02")).unwrap().name,
+                "USB"
+            );
+        }
+        assert!(pick_adapter(&[dock], Some(&usb.mac)).is_none());
+        assert_eq!(
+            pick_adapter(&[usb], Some("40:cd:3a:00:00:02"))
+                .unwrap()
+                .name,
+            "USB"
+        );
+    }
+
+    #[test]
+    fn automatic_selection_requires_one_eligible_physical_adapter() {
+        let mut wired = adapter("Wired", &[]);
+        wired.mac = "40:cd:3a:00:00:01".into();
+        wired.is_up = false; // the only disconnected port can pre-attach
+        assert_eq!(pick_adapter(&[wired.clone()], None).unwrap().name, "Wired");
+        assert!(pick_adapter(&[], None).is_none());
+        let mut other = wired.clone();
+        other.mac = "40:cd:3a:00:00:02".into();
+        other.is_up = true;
+        assert!(pick_adapter(&[wired.clone(), other.clone()], None).is_none());
+        assert!(pick_adapter(&[other.clone(), wired.clone()], None).is_none());
+        for kind in ["wifi", "vpn", "virtual", "invalid_mac"] {
+            let mut excluded = other.clone();
+            match kind {
+                "wifi" => excluded.is_wifi = true,
+                "vpn" => excluded.is_vpn = true,
+                "virtual" => excluded.is_virtual = true,
+                _ => excluded.mac.clear(),
+            }
+            assert_eq!(
+                pick_adapter(&[excluded, wired.clone()], None).unwrap().mac,
+                wired.mac
+            );
+        }
+        assert!(pick_adapter(&[wired], Some("invalid-mac")).is_none());
     }
 
     #[test]

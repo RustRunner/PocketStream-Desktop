@@ -170,6 +170,8 @@ fn remove_adoption_entry(
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
+    #[serde(default)]
+    pub selected_adapter_mac: Option<String>,
     pub stream: StreamConfig,
     pub rtsp_server: RtspServerConfig,
     pub credentials: Credentials,
@@ -201,6 +203,7 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            selected_adapter_mac: None,
             stream: StreamConfig {
                 protocol: StreamProtocol::Rtsp,
                 rtsp_port: 554,
@@ -507,6 +510,17 @@ impl AppConfig {
                 poisoned.into_inner().network_mode
             }
         }
+    }
+
+    /// Persist before exposing the new selection to network operations.
+    pub fn set_selected_adapter_mac(&self, mac: String) -> Result<(), crate::AppError> {
+        let _save = CONFIG_SAVE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut settings = self.settings.lock().unwrap_or_else(|p| p.into_inner());
+        let mut next = settings.clone();
+        next.selected_adapter_mac = Some(mac);
+        save_to_disk(&next)?;
+        *settings = next;
+        Ok(())
     }
 
     /// Replace the network mode and persist.
@@ -1577,6 +1591,7 @@ password = ""
     #[test]
     fn settings_toml_with_populated_fields() {
         let settings = AppSettings {
+            selected_adapter_mac: None,
             stream: StreamConfig {
                 protocol: StreamProtocol::Udp,
                 rtsp_port: 8554,
@@ -1790,6 +1805,22 @@ password = ""
         };
         current.merge_user_fields(AppSettings::default());
         assert_eq!(current.network_mode, NetworkMode::StaticManual);
+    }
+
+    #[test]
+    fn selected_adapter_is_defaulted_round_tripped_and_backend_owned() {
+        let legacy = toml::to_string(&AppSettings::default()).unwrap();
+        assert!(!legacy.contains("selected_adapter_mac"));
+        let mut settings: AppSettings = toml::from_str(&legacy).unwrap();
+        assert_eq!(settings.selected_adapter_mac, None);
+        settings.selected_adapter_mac = Some("40:cd:3a:00:00:01".into());
+        settings.merge_user_fields(AppSettings::default());
+        let encoded = toml::to_string(&settings).unwrap();
+        let restored: AppSettings = toml::from_str(&encoded).unwrap();
+        assert_eq!(
+            restored.selected_adapter_mac.as_deref(),
+            Some("40:cd:3a:00:00:01")
+        );
     }
 
     #[test]

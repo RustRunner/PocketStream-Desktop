@@ -125,6 +125,7 @@ export interface AdoptedMeta {
 }
 
 export interface AppSettings {
+  selected_adapter_mac: string | null;
   stream: StreamConfig;
   rtsp_server: RtspServerConfig;
   credentials: Credentials;
@@ -139,6 +140,14 @@ export interface AppSettings {
   network_mode: NetworkMode;
   /** User-pinned nodes for Static — Manual mode. */
   manual_nodes: ManualNode[];
+}
+
+export interface AdapterSelection {
+  selected_mac: string | null;
+  adapter: InterfaceInfo | null;
+  interface_index: number | null;
+  selection_required: boolean;
+  candidates: InterfaceInfo[];
 }
 
 // ── Streaming (streaming/mod.rs) ─────────────────────────────────────

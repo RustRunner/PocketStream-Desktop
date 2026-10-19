@@ -30,6 +30,27 @@ pub async fn get_capture_state(
 }
 
 #[tauri::command]
+pub async fn get_adapter_selection(
+    manager: State<'_, NetworkManager>,
+    app: tauri::AppHandle,
+) -> Result<crate::network::AdapterSelection, AppError> {
+    crate::network::watcher::refresh(&app).await?;
+    Ok(manager.adapter_selection_state().await)
+}
+
+#[tauri::command]
+pub async fn select_adapter(
+    manager: State<'_, NetworkManager>,
+    config: State<'_, AppConfig>,
+    app: tauri::AppHandle,
+    mac: String,
+) -> Result<crate::network::AdapterSelection, AppError> {
+    let selection = manager.select_adapter(&config, &app, &mac).await?;
+    crate::network::watcher::emit_selection(&app, &selection);
+    Ok(selection)
+}
+
+#[tauri::command]
 pub async fn list_interfaces(
     manager: State<'_, NetworkManager>,
 ) -> Result<Vec<InterfaceInfo>, AppError> {
