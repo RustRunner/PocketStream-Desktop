@@ -17,11 +17,13 @@
 
 /** User-visible reachability status of a device record.
  *  Wire shape uses snake_case via `#[serde(rename_all = "snake_case")]`. */
-export type DeviceStatus = "live" | "verifying" | "offline" | "cached_only";
+export type DeviceStatus = "live" | "verifying" | "offline" | "cached_only" | "offline_non_wired_subnet" | "offline_host_owned_ip";
 
 /** Unified device record. Replaces the old split between ARP map +
  *  scan-result map + alias map + cache file rows. */
 export interface DeviceRecord {
+  verified_by_mac: string | null;
+  last_verified_at: string | null;
   mac: string;
   ip: string;
   subnet: string;
@@ -298,6 +300,7 @@ export type CaptureScopeOutcome =
 
 /** Shared by the `capture-active` event and get_capture_state query. */
 export interface CaptureState {
+  candidate_count: number;
   active: boolean;
   adapter_name: string | null;
   outcome: CaptureScopeOutcome | null;

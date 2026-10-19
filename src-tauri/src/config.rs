@@ -103,6 +103,10 @@ pub struct ManualNode {
 /// targeted port scan confirms they are still reachable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedDevice {
+    #[serde(default)]
+    pub verified_by_mac: Option<String>,
+    #[serde(default)]
+    pub last_verified_at: Option<String>,
     pub mac: String,
     pub ip: String,
     pub subnet: String,
@@ -682,24 +686,19 @@ impl AppConfig {
     /// Insert or update a cached device entry (keyed by MAC).
     /// Persists the cache file after mutation.
     pub fn upsert_cached_device(&self, device: CachedDevice) -> Result<(), crate::AppError> {
-        match self.cache.lock() {
-            Ok(mut guard) => {
-                if let Some(existing) = guard.iter_mut().find(|d| d.mac == device.mac) {
-                    *existing = device;
-                } else {
-                    guard.push(device);
-                }
-            }
-            Err(poisoned) => {
-                log::error!("Cache mutex poisoned during upsert, recovering");
-                let mut guard = poisoned.into_inner();
-                if let Some(existing) = guard.iter_mut().find(|d| d.mac == device.mac) {
-                    *existing = device;
-                } else {
-                    guard.push(device);
-                }
-            }
+        self.upsert_cached_device_fenced(device, None)
+    }
+
+    pub(crate) fn upsert_cached_device_fenced(
+        &self,
+        device: CachedDevice,
+        fence: Option<&crate::network::SweepFence>,
+    ) -> Result<(), crate::AppError> {
+        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        if !upsert_cache_record(&mut cache, device, fence) {
+            return Ok(());
         }
+        drop(cache);
         self.save_cache()
     }
 
@@ -750,6 +749,22 @@ impl AppConfig {
 /// write order — which is why `save`/`save_cache` take it BEFORE locking
 /// the data mutex, not inside the write helper.
 static CONFIG_SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn upsert_cache_record(
+    cache: &mut Vec<CachedDevice>,
+    device: CachedDevice,
+    fence: Option<&crate::network::SweepFence>,
+) -> bool {
+    if fence.is_some_and(|f| f.is_stale()) {
+        return false;
+    }
+    if let Some(existing) = cache.iter_mut().find(|r| r.mac == device.mac) {
+        *existing = device;
+    } else {
+        cache.push(device);
+    }
+    true
+}
+
 static CACHE_SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn config_dir() -> PathBuf {
@@ -2062,6 +2077,8 @@ password = ""
         let original = CacheFile {
             devices: vec![
                 CachedDevice {
+                    verified_by_mac: None,
+                    last_verified_at: None,
                     mac: "AA:BB:CC:DD:EE:FF".into(),
                     ip: "192.168.1.10".into(),
                     subnet: "192.168.1.0/24".into(),
@@ -2070,6 +2087,8 @@ password = ""
                     last_seen: "2026-04-27T12:00:00Z".into(),
                 },
                 CachedDevice {
+                    verified_by_mac: None,
+                    last_verified_at: None,
                     mac: "11:22:33:44:55:66".into(),
                     ip: "192.168.1.20".into(),
                     subnet: "192.168.1.0/24".into(),
@@ -2096,6 +2115,8 @@ password = ""
     #[test]
     fn cached_alias_update_includes_zero_port_rows_without_inserting() {
         let mut cache = vec![CachedDevice {
+            verified_by_mac: None,
+            last_verified_at: None,
             mac: "AA:BB:CC:DD:EE:FF".into(),
             ip: "192.168.1.207".into(),
             subnet: "192.168.1.0/24".into(),
@@ -2121,6 +2142,8 @@ password = ""
     #[test]
     fn cached_alias_update_is_idempotent() {
         let mut cache = vec![CachedDevice {
+            verified_by_mac: None,
+            last_verified_at: None,
             mac: "AA:BB:CC:DD:EE:FF".into(),
             ip: "192.168.1.207".into(),
             subnet: "192.168.1.0/24".into(),
@@ -2418,5 +2441,48 @@ password = ""
         let extracted = extract_legacy_device_cache(toml_content);
         assert!(extracted.is_some());
         assert!(extracted.unwrap().is_empty());
+    }
+
+    #[test]
+    fn cache_identity_write_fences_stale_results_and_keeps_zero_ports() {
+        let make = |mac: &str| CachedDevice {
+            mac: mac.into(),
+            ip: "192.168.1.204".into(),
+            subnet: "192.168.1.0/24".into(),
+            open_ports: vec![],
+            alias: "CAM".into(),
+            last_seen: "2026-10-19T12:00:00Z".into(),
+            verified_by_mac: Some("40:cd:3a:00:00:01".into()),
+            last_verified_at: Some("2026-10-19T12:00:00Z".into()),
+        };
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let fence = crate::network::SweepFence::new(
+            1,
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            active.clone(),
+        );
+        let mut cache = vec![];
+        assert!(upsert_cache_record(&mut cache, make("old"), Some(&fence)));
+        assert!(upsert_cache_record(&mut cache, make("new"), Some(&fence)));
+        active.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(!upsert_cache_record(
+            &mut cache,
+            make("stale"),
+            Some(&fence)
+        ));
+        let parsed: CacheFile =
+            toml::from_str(&toml::to_string(&CacheFile { devices: cache }).unwrap()).unwrap();
+        assert_eq!(parsed.devices.len(), 2);
+        assert!(parsed.devices.iter().all(|d| d.open_ports.is_empty()
+            && d.verified_by_mac.is_some()
+            && d.last_verified_at.is_some()));
+        let legacy: CachedDevice = toml::from_str(
+            r#"mac='old'
+ip='192.168.1.204'
+subnet='192.168.1.0/24'
+last_seen='old'"#,
+        )
+        .unwrap();
+        assert!(legacy.verified_by_mac.is_none() && legacy.last_verified_at.is_none());
     }
 }

@@ -75,6 +75,8 @@ pub(crate) fn persist_alias_writethrough(
         };
         if !record.open_ports.is_empty() {
             if let Err(e) = config.upsert_cached_device(crate::config::CachedDevice {
+                verified_by_mac: record.verified_by_mac.clone(),
+                last_verified_at: record.last_verified_at.clone(),
                 mac: record.mac.clone(),
                 ip: record.ip.clone(),
                 subnet: record.subnet.clone(),
@@ -244,6 +246,7 @@ pub(crate) struct CaptureIdentity {
 /// One payload for capture events and the subscribe-then-fetch query.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct CaptureState {
+    pub candidate_count: usize,
     pub active: bool,
     pub adapter_name: Option<String>,
     pub outcome: Option<pktmon::ScopeOutcome>,
@@ -295,6 +298,10 @@ impl CaptureSignal {
         self.app = Some(params.app_handle.clone());
         self.state = CaptureState {
             active: true,
+            candidate_count: params
+                .candidates
+                .as_ref()
+                .map_or(0, |i| i.store.count(std::time::Instant::now())),
             adapter_name: Some(params.scope.display_name.clone()),
             outcome: Some(outcome),
         };
@@ -399,6 +406,7 @@ pub struct NetworkManager {
     /// attached.
     capture_identity: Arc<Mutex<Option<CaptureIdentity>>>,
     capture_signal: Arc<Mutex<CaptureSignal>>,
+    candidates: Arc<arp::CandidateSet>,
     /// Every IPv4 currently assigned to any local adapter. Shared with
     /// the capture callback and refreshed at every discovery start (and
     /// each adopt-loop pass), so a listener retained across sessions
@@ -681,6 +689,7 @@ async fn provoke_sweep(params: &arp::ListenerParams, sweep_ips: &[String]) {
             &excluded_snapshot,
             &local_snapshot,
             &params.fence,
+            params.candidates.as_ref(),
         )
         .await;
     }
@@ -821,6 +830,7 @@ async fn unbind_ip_resolving_owner(
 struct AdoptionCtx {
     iface_name: String,
     interface_index: u32,
+    candidates: Option<arp::CandidateIngress>,
     ops: auto_adopt::RealAdoptOps,
     app_handle: tauri::AppHandle,
     adopted: Arc<Mutex<HashMap<String, Ipv4Addr>>>,
@@ -1044,6 +1054,7 @@ async fn attempt_adoption(
             let sweep_emitter = ctx.emitter.clone();
             let sweep_handle = ctx.app_handle.clone();
             let sweep_fence = ctx.fence.clone();
+            let sweep_candidates = ctx.candidates.clone();
             let sweep_local = ctx.local_ips.clone();
             tokio::spawn(async move {
                 let passes: [u64; 3] = [1500, 5000, 12000];
@@ -1077,6 +1088,7 @@ async fn attempt_adoption(
                         &[],
                         &local_snapshot,
                         &sweep_fence,
+                        sweep_candidates.as_ref(),
                     )
                     .await;
                 }
@@ -1681,6 +1693,7 @@ impl NetworkManager {
             prior_capture_joins: Arc::new(Mutex::new(Vec::new())),
             capture_identity: Arc::new(Mutex::new(None)),
             capture_signal: Arc::new(Mutex::new(CaptureSignal::default())),
+            candidates: Arc::new(arp::CandidateSet::default()),
             local_ips: Arc::new(StdMutex::new(HashSet::new())),
             excluded_subnets: Arc::new(StdMutex::new(Vec::new())),
             auto_adopt_handle: Arc::new(Mutex::new(None)),
@@ -1763,11 +1776,29 @@ impl NetworkManager {
     /// Cheap no-op unless that subnet is adopted. Metadata reaches disk
     /// at most once per `META_FLUSH_INTERVAL` from here; adoption and
     /// removal writes flush immediately through their own saves.
-    pub async fn note_positive_liveness(&self, app_handle: &tauri::AppHandle, ip: Ipv4Addr) {
+    // Compatibility for the legacy reachability dot. S6 removes ping-based
+    // liveness; capture/scan callers already carry their scheduled fence.
+    pub(crate) async fn note_positive_liveness(&self, app: &tauri::AppHandle, ip: Ipv4Addr) {
+        self.note_positive_liveness_fenced(app, ip, &self.sweep_fence())
+            .await;
+    }
+
+    pub(crate) async fn note_positive_liveness_fenced(
+        &self,
+        app_handle: &tauri::AppHandle,
+        ip: Ipv4Addr,
+        fence: &SweepFence,
+    ) {
+        if fence.is_stale() {
+            return;
+        }
         let now = std::time::Instant::now();
         let wall = chrono::Utc::now().to_rfc3339();
         let landed = {
             let adopted = self.adopted_ips.lock().await;
+            if fence.is_stale() {
+                return;
+            }
             match (self.adoption_liveness.lock(), self.adopted_meta.lock()) {
                 (Ok(mut liveness), Ok(mut meta)) => {
                     record_positive_liveness(ip, &adopted, &mut liveness, &mut meta, now, &wall)
@@ -1838,13 +1869,8 @@ impl NetworkManager {
     /// expected to be called once at startup before ARP discovery so
     /// the initial snapshot reflects last-known state.
     ///
-    /// Cached rows on a subnet owned by an up non-wired local interface
-    /// (WiFi/VPN/virtual), or sitting at an IP this host currently owns,
-    /// are filtered out before hydration and evicted from the on-disk
-    /// cache, so ghost devices and stale self-rows don't reappear as nodes
-    /// or persist across restarts. Rejection keys on ghost overlap or
-    /// host-owned IP only — never on offline status — so a foreign/offline
-    /// camera (CAM/PTU) is kept.
+    /// Topology conflicts stay inactive with a reason. Hydration never
+    /// deletes stored history; APIPA remains stored outside live Nodes.
     pub async fn hydrate_device_registry(&self, config: &crate::config::AppConfig) {
         // Retain APIPA history on disk without making it a live node or
         // sending it through topology pruning and frontend verify/eviction.
@@ -1859,45 +1885,13 @@ impl NetworkManager {
             })
             .collect();
 
-        // Fail-open: an empty ghost set (enumeration failure) rejects
-        // nothing, so a transient adapter-query hiccup can't wipe the cache.
+        // Failed topology enumeration leaves history cached/inactive.
         let ghosts = ghost::non_wired_interface_networks().await;
         // Host-owned IPs: a cached row at one of our own current addresses
         // is the host itself, not a device (e.g. a self-row captured before
         // live discovery filtered our own traffic). Same fail-open contract.
         let local_ips: HashSet<Ipv4Addr> = interface::all_local_ipv4().into_iter().collect();
-        let (allowed, rejected) = ghost::partition_cached(cached, &ghosts, &local_ips);
-
-        let result = self.device_registry.hydrate_from_cache(&allowed);
-
-        // Evict rejected rows from the on-disk cache (best-effort) so they
-        // don't resurrect on next startup. Runs independently of
-        // `result.changed` — if every cached row was rejected, nothing
-        // hydrated but the cache still needs cleaning.
-        for (device, reason) in &rejected {
-            let why = match reason {
-                ghost::CacheReject::NonWiredSubnet => "on a non-wired subnet",
-                ghost::CacheReject::HostOwnedIp => "at a host-owned IP",
-            };
-            log::info!(
-                "Evicting cached device {} ({}) — {}",
-                device.ip,
-                device.mac,
-                why
-            );
-            if let Err(e) = config.remove_cached_device(&device.mac) {
-                log::warn!("Failed to evict cache row {}: {}", device.mac, e);
-            }
-        }
-
-        // Mirror same-IP dedup decisions onto the on-disk cache so the
-        // orphans don't reappear on next startup. Cache file mutations
-        // are best-effort: a failure logs but doesn't block boot.
-        for mac in &result.dropped_macs {
-            if let Err(e) = config.remove_cached_device(mac) {
-                log::warn!("Failed to evict dupe cache row {}: {}", mac, e);
-            }
-        }
+        hydrate_retained_history(&self.device_registry, cached, &ghosts, &local_ips);
 
         // Legacy cache files can hold CAM/PTU on more than one row.
         // Repair to a single holder per role now that all rows are in,
@@ -1911,19 +1905,22 @@ impl NetworkManager {
             persist_alias_writethrough(&self.device_registry, config, &demoted);
         }
 
-        if !result.changed && rejected.is_empty() {
-            return;
-        }
         log::info!(
-            "DeviceRegistry: hydrated {} cached device(s) (dropped {} dupe(s), evicted {} rejected row(s))",
-            allowed.len() - result.dropped_macs.len(),
-            result.dropped_macs.len(),
-            rejected.len()
+            "DeviceRegistry: retained {} cached identities",
+            self.device_registry.snapshot().len()
         );
     }
 
     /// Borrow the device registry. Used by IPC handlers that need to
     /// read snapshots or apply mutations.
+    pub(crate) fn sweep_fence(&self) -> SweepFence {
+        SweepFence::new(
+            self.discovery_generation.load(Ordering::Relaxed),
+            self.discovery_generation.clone(),
+            self.discovery_active.clone(),
+        )
+    }
+
     pub fn registry(&self) -> Arc<DeviceRegistry> {
         self.device_registry.clone()
     }
@@ -2655,6 +2652,7 @@ impl NetworkManager {
             old.active.store(false, Ordering::Relaxed);
         }
         self.capture_signal.lock().await.deactivate();
+        self.candidates.clear();
         park_capture_handle(&self.arp_listener_handle, &self.prior_capture_joins).await;
 
         let incarnation = Arc::new(AtomicBool::new(true));
@@ -2878,6 +2876,7 @@ impl NetworkManager {
             self.discovery_active.clone(),
         );
         let listener_params = arp::ListenerParams {
+            candidates: self.candidate_ingress(interface_index, own_mac),
             devices: devices.clone(),
             registry: registry.clone(),
             emitter: emitter.clone(),
@@ -2986,6 +2985,7 @@ impl NetworkManager {
         });
 
         // Auto-adopt handler for foreign subnets
+        let candidates_for_adopt = listener_params.candidates.clone();
         let devices_for_adopt = devices.clone();
         let registry_for_adopt = registry.clone();
         let emitter_for_adopt = emitter.clone();
@@ -3015,6 +3015,7 @@ impl NetworkManager {
             let ctx = AdoptionCtx {
                 iface_name: iface_name.clone(),
                 interface_index,
+                candidates: candidates_for_adopt,
                 ops: auto_adopt::RealAdoptOps,
                 app_handle: app_handle_for_adopt.clone(),
                 adopted: adopted.clone(),
@@ -3714,6 +3715,7 @@ impl NetworkManager {
             identity.active.store(false, Ordering::Relaxed);
         }
         self.capture_signal.lock().await.deactivate();
+        self.candidates.clear();
         if let Some(h) = self.arp_listener_handle.lock().await.take() {
             // Signal shutdown and park the capture thread's join in the
             // guard — the next capture start bounded-joins it there, so
@@ -3726,8 +3728,19 @@ impl NetworkManager {
         }
     }
 
+    fn candidate_ingress(
+        &self,
+        _index: u32,
+        _mac: Option<[u8; 6]>,
+    ) -> Option<arp::CandidateIngress> {
+        // D1 dormant: S5a replaces None with the manager's candidate ingress.
+        None
+    }
+
     pub async fn get_capture_state(&self) -> CaptureState {
-        self.capture_signal.lock().await.state.clone()
+        let mut state = self.capture_signal.lock().await.state.clone();
+        state.candidate_count = self.candidates.count(std::time::Instant::now());
+        state
     }
 
     pub async fn get_adopted_ips(&self) -> HashMap<String, String> {
@@ -4091,6 +4104,7 @@ async fn merge_arp_table(
     excluded: &[ipnetwork::Ipv4Network],
     local_ips: &HashSet<Ipv4Addr>,
     fence: &SweepFence,
+    candidates: Option<&arp::CandidateIngress>,
 ) {
     use tauri::{Emitter, Manager};
 
@@ -4102,50 +4116,14 @@ async fn merge_arp_table(
     }
 
     let entries = arp::read_system_arp_table(interface_ip).await;
-    let now = chrono::Utc::now().to_rfc3339();
-
-    // Insert new entries into the legacy map under the lock, then release
-    // it before the registry merge and any cache-file disk writes below —
-    // holding `devices` across disk I/O stalls the listener during ARP
-    // bursts (L31).
-    let new_devices: Vec<ArpDevice> = {
-        let mut map = devices.lock().await;
-        let mut collected = Vec::new();
-        for (ip, mac) in entries {
-            if crate::validation::prohibited_camera_ip(ip) {
-                continue;
-            }
-            if excluded.iter().any(|net| net.contains(ip)) {
-                // Sender on a non-Ethernet (WiFi/VPN) subnet — not a wired
-                // peer. The OS neighbor read is InterfaceIndex-scoped, so
-                // this usually has nothing to drop; it is a safety net for a
-                // shared-subnet or bridged layout.
-                continue;
-            }
-            if local_ips.contains(&ip) {
-                // Our own address (any adapter) — the host never lists
-                // itself. Normally unreachable: the neighbor table holds
-                // resolved peers, not local addresses; defense in depth
-                // beside the subnet safety net above.
-                log::debug!("ARP table: skipping our own IP {}", ip);
-                continue;
-            }
-            if map.contains_key(&mac) {
-                continue;
-            }
-            let octets = ip.octets();
-            let device = ArpDevice {
-                mac: mac.clone(),
-                ip: ip.to_string(),
-                subnet: format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]),
-                first_seen: now.clone(),
-                last_seen: now.clone(),
-            };
-            map.insert(mac, device.clone());
-            collected.push(device);
-        }
-        collected
-    };
+    let new_devices = import_neighbors(
+        entries,
+        &mut *devices.lock().await,
+        excluded,
+        local_ips,
+        fence,
+        candidates,
+    );
 
     let mut registry_changed = false;
     for device in &new_devices {
@@ -4156,9 +4134,11 @@ async fn merge_arp_table(
         // a captured frame.
         if let Ok(device_ip) = device.ip.parse::<Ipv4Addr>() {
             let manager: tauri::State<'_, NetworkManager> = app_handle.state();
-            manager.note_positive_liveness(&app_handle, device_ip).await;
+            manager
+                .note_positive_liveness_fenced(&app_handle, device_ip, fence)
+                .await;
         }
-        let result = registry.merge_arp(device);
+        let result = registry.merge_arp_fenced(device, fence);
         if result.changed {
             registry_changed = true;
         }
@@ -4197,6 +4177,67 @@ async fn merge_arp_table(
     if registry_changed {
         emitter.poke();
     }
+}
+
+fn hydrate_retained_history(
+    registry: &DeviceRegistry,
+    cached: Vec<crate::config::CachedDevice>,
+    ghosts: &[ipnetwork::Ipv4Network],
+    local_ips: &HashSet<Ipv4Addr>,
+) {
+    let (mut allowed, rejected) = ghost::partition_cached(cached, ghosts, local_ips);
+    allowed.extend(rejected.iter().map(|(d, _)| d.clone()));
+    registry.hydrate_from_cache(&allowed);
+    for (d, reason) in rejected {
+        registry.set_status(
+            &d.mac,
+            match reason {
+                ghost::CacheReject::NonWiredSubnet => DeviceStatus::OfflineNonWiredSubnet,
+                ghost::CacheReject::HostOwnedIp => DeviceStatus::OfflineHostOwnedIp,
+            },
+        );
+    }
+}
+
+fn import_neighbors(
+    entries: Vec<(Ipv4Addr, String)>,
+    devices: &mut HashMap<String, ArpDevice>,
+    excluded: &[ipnetwork::Ipv4Network],
+    local_ips: &HashSet<Ipv4Addr>,
+    fence: &SweepFence,
+    candidates: Option<&arp::CandidateIngress>,
+) -> Vec<ArpDevice> {
+    let mut collected = Vec::new();
+    for (ip, mac) in entries {
+        if fence.is_stale() {
+            break;
+        }
+        if crate::validation::prohibited_camera_ip(ip)
+            || local_ips.contains(&ip)
+            || excluded.iter().any(|net| net.contains(ip))
+        {
+            continue;
+        }
+        if let Some(ingress) = candidates {
+            if let Some(mac) = parse_mac_bytes(&mac) {
+                ingress.observe(ip, mac, fence, std::time::Instant::now());
+            }
+            continue;
+        }
+        if devices.contains_key(&mac) {
+            continue;
+        }
+        let device = ArpDevice {
+            ip: ip.to_string(),
+            mac: mac.clone(),
+            subnet: subnet_key_for(ip),
+            first_seen: chrono::Utc::now().to_rfc3339(),
+            last_seen: chrono::Utc::now().to_rfc3339(),
+        };
+        devices.insert(mac, device.clone());
+        collected.push(device);
+    }
+    collected
 }
 
 /// Merge the live adopted map with the pending-restore map for persistence.
@@ -4246,6 +4287,7 @@ mod tests {
         let mut signal = CaptureSignal {
             state: CaptureState {
                 active: true,
+                candidate_count: 0,
                 adapter_name: Some("Ethernet".into()),
                 outcome: Some(pktmon::ScopeOutcome::ScopedByName { source_id: 42 }),
             },
@@ -4974,5 +5016,81 @@ mod tests {
             assert!(active.lock().unwrap().contains("10.0.0.0/24"));
         }
         assert!(!active.lock().unwrap().contains("10.0.0.0/24"));
+    }
+
+    #[test]
+    fn neighbor_import_candidates_only_is_dormant_until_s5a() {
+        let manager = NetworkManager::new();
+        assert!(manager
+            .candidate_ingress(7, Some([0x40, 0xcd, 0x3a, 0, 0, 1]))
+            .is_none());
+        let rows = arp::parse_neighbors_json(
+            r#"[{"IPAddress":"192.168.1.204","LinkLayerAddress":"AA-BB-CC-DD-EE-02","State":"Stale"}]"#,
+        );
+        assert_eq!(rows.len(), 1);
+        let ingress = arp::CandidateIngress {
+            store: manager.candidates.clone(),
+            interface_index: 7,
+            adapter_mac: [0x40, 0xcd, 0x3a, 0, 0, 1],
+        };
+        let mut devices = HashMap::new();
+        let source_fence = fence(1, 1, true);
+        let imported = import_neighbors(
+            rows.clone(),
+            &mut devices,
+            &[],
+            &HashSet::new(),
+            &source_fence,
+            Some(&ingress),
+        );
+        assert!(imported.is_empty());
+        assert!(devices.is_empty());
+        assert!(manager.registry().snapshot().is_empty());
+        assert_eq!(manager.candidates.count(std::time::Instant::now()), 1);
+        assert_eq!(
+            import_neighbors(
+                rows,
+                &mut devices,
+                &[],
+                &HashSet::new(),
+                &source_fence,
+                None
+            )
+            .len(),
+            1
+        );
+        assert_eq!(devices.len(), 1); // shipping legacy route still works
+    }
+
+    #[test]
+    fn topology_conflicts_retain_history_with_inactive_reasons() {
+        let cached = |mac: &str, ip: &str| {
+            serde_json::from_value::<crate::config::CachedDevice>(serde_json::json!({
+                "mac": mac, "ip": ip, "subnet": "10.0.0.0/24", "last_seen": "2026-10-19T12:00:00Z"
+            }))
+            .unwrap()
+        };
+        let registry = DeviceRegistry::new();
+        hydrate_retained_history(
+            &registry,
+            vec![
+                cached("AA:01", "10.0.0.2"),
+                cached("AA:02", "192.168.1.101"),
+            ],
+            &["10.0.0.0/24".parse().unwrap()],
+            &["192.168.1.101".parse().unwrap()].into_iter().collect(),
+        );
+        let records = registry.snapshot();
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records.iter().find(|r| r.mac == "AA:01").unwrap().status,
+            DeviceStatus::OfflineNonWiredSubnet
+        );
+        assert_eq!(
+            records.iter().find(|r| r.mac == "AA:02").unwrap().status,
+            DeviceStatus::OfflineHostOwnedIp
+        );
+        assert!(!registry.merge_scan_result("10.0.0.2", &[80]));
+        assert!(!registry.merge_scan_result("192.168.1.101", &[80]));
     }
 }

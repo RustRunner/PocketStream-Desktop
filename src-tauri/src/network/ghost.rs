@@ -439,6 +439,8 @@ mod tests {
 
     fn cached(mac: &str, ip: &str) -> CachedDevice {
         CachedDevice {
+            verified_by_mac: None,
+            last_verified_at: None,
             mac: mac.into(),
             ip: ip.into(),
             subnet: String::new(),

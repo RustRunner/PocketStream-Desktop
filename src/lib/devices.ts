@@ -68,6 +68,7 @@ function cssAttrValue(value: string): string {
 
 /** Current capture state for the launch notice and degraded indicator. */
 export let captureState: CaptureState = {
+  candidate_count: 0,
   active: false,
   adapter_name: null,
   outcome: null,
