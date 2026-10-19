@@ -135,6 +135,7 @@ function ownHostIps(): Set<string> {
 /** Filter a registry snapshot down to the nodes worth showing the user.
  *  Shared by the Nodes panel and the Add/Remove Nodes dialog so the two
  *  never disagree about what counts as a node:
+ *    - APIPA entries are hidden, including retained history and manual pins
  *    - the host's own IPs are dropped
  *    - manual pins always qualify (they carry no scan result yet)
  *    - everything else needs at least one discovered open port
@@ -153,6 +154,7 @@ export function visibleDevices(
   const ownIps = ownHostIps();
   const ownMac = state.activeInterface?.mac?.toLowerCase() || null;
   return records.filter((r) => {
+    if (r.ip.startsWith("169.254.")) return false;
     if (ownIps.has(r.ip)) return false;
     if (panelStrict) {
       if (r.status === "cached_only" && !hasRouteToSubnet(r.subnet)) return false;

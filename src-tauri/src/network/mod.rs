@@ -591,21 +591,32 @@ fn record_positive_liveness(
     true
 }
 
-/// True when the wired adapter has no native IPv4 address — nothing
-/// that isn't APIPA, an adopted secondary, or a still-pending adoption
-/// bind. In that state APIPA bindings are the host's only connectivity
-/// (the adoption rescue path), so the lifecycle check must not remove
-/// any of them. An older adopted non-APIPA secondary deliberately does
-/// not count as native: it must not make a DHCP-less host look
-/// connected.
-fn host_in_apipa_rescue(
-    current_ips: &[Ipv4Addr],
-    adopted_ips: &HashSet<Ipv4Addr>,
-    pending_ips: &HashSet<Ipv4Addr>,
-) -> bool {
-    !current_ips
+/// DHCP never authorizes new addresses, including when its only address is APIPA.
+fn dhcp_adoption_pause(is_dhcp: bool, ips: &[Ipv4Addr]) -> Option<&'static str> {
+    if !is_dhcp {
+        None
+    } else if ips
         .iter()
-        .any(|ip| !ip.is_link_local() && !adopted_ips.contains(ip) && !pending_ips.contains(ip))
+        .all(|ip| crate::validation::prohibited_camera_ip(*ip))
+    {
+        Some("no usable address; set a static address")
+    } else {
+        Some("DHCP enabled; automatic address adoption paused")
+    }
+}
+
+fn keep_prohibited_history_inactive(registry: &DeviceRegistry) -> bool {
+    let mut changed = false;
+    for record in registry.snapshot() {
+        if record
+            .ip
+            .parse()
+            .is_ok_and(crate::validation::prohibited_camera_ip)
+        {
+            changed |= registry.set_status(&record.mac, DeviceStatus::Offline);
+        }
+    }
+    changed
 }
 
 /// Adapter guards for an automatic unbind, mirroring shutdown cleanup:
@@ -891,6 +902,10 @@ async fn attempt_adoption(
 ) -> AdoptionAttemptOutcome {
     use tauri::Emitter;
     use tauri::Manager;
+
+    if crate::validation::prohibited_camera_ip(device_ip) {
+        return AdoptionAttemptOutcome::NoOp;
+    }
 
     log::info!("Foreign subnet {} — adopting ({})", device_subnet, evidence);
 
@@ -1405,6 +1420,7 @@ async fn watchdog_ladder(
         let mut baseline = arp::CounterSnapshot {
             frames_seen: 0,
             self_ip_dropped: 0,
+            prohibited_dropped: 0,
         };
         let activation = tokio::select! {
             _ = shutdown_rx.changed() => None,
@@ -1618,12 +1634,13 @@ async fn watchdog_ladder(
     // then poll (bounded) for late recovery on the live session, if any.
     let missed = arp::missed_max();
     log::warn!(
-        "Discovery degraded: no ARP payload events and the capture self-heal is exhausted (payload_total={}, missed_max={}, tasks_dropped={}, noneth_dropped={}, self_ip_dropped={})",
+        "Discovery degraded: no ARP payload events and the capture self-heal is exhausted (payload_total={}, missed_max={}, tasks_dropped={}, noneth_dropped={}, self_ip_dropped={}, prohibited_dropped={})",
         arp::frames_seen(),
         missed,
         arp::tasks_dropped(),
         arp::noneth_dropped(),
-        arp::self_ip_dropped()
+        arp::self_ip_dropped(),
+        arp::prohibited_dropped()
     );
     let _ = params.app_handle.emit(
         "discovery-degraded",
@@ -1829,7 +1846,18 @@ impl NetworkManager {
     /// host-owned IP only — never on offline status — so a foreign/offline
     /// camera (CAM/PTU) is kept.
     pub async fn hydrate_device_registry(&self, config: &crate::config::AppConfig) {
-        let cached = config.get_cache();
+        // Retain APIPA history on disk without making it a live node or
+        // sending it through topology pruning and frontend verify/eviction.
+        let cached = config
+            .get_cache()
+            .into_iter()
+            .filter(|record| {
+                !record
+                    .ip
+                    .parse::<Ipv4Addr>()
+                    .is_ok_and(|ip| ip.is_link_local())
+            })
+            .collect();
 
         // Fail-open: an empty ghost set (enumeration failure) rejects
         // nothing, so a transient adapter-query hiccup can't wipe the cache.
@@ -1924,7 +1952,8 @@ impl NetworkManager {
             return;
         }
         let count = nodes.len();
-        let hydrated = self.device_registry.hydrate_manual_nodes(&nodes);
+        let mut hydrated = self.device_registry.hydrate_manual_nodes(&nodes);
+        hydrated |= keep_prohibited_history_inactive(&self.device_registry);
         if hydrated {
             log::info!("DeviceRegistry: hydrated {} manual node(s)", count);
         }
@@ -2796,8 +2825,8 @@ impl NetworkManager {
         // Scope discovery to the wired Ethernet port. The capture backend
         // is unscoped, so enumerate the subnets owned exclusively by
         // non-wired interfaces (WiFi/VPN/virtual) and drop ARP for any peer
-        // on them. Cameras on the Ethernet subnet, or on a foreign/APIPA
-        // subnet awaiting adoption, are untouched.
+        // on them. Prohibited addresses, including APIPA, are rejected
+        // independently by the capture sender gate.
         let excluded_subnets = ghost::non_wired_interface_networks().await;
         if excluded_subnets.is_empty() {
             log::info!("Discovery: no non-wired subnets to exclude");
@@ -3034,6 +3063,7 @@ impl NetworkManager {
             // enough that a user toggling Static via the dialog sees adoption
             // resume promptly.
             let mut cached_dhcp_state: Option<(bool, std::time::Instant)> = None;
+            let mut last_dhcp_pause = None;
             const DHCP_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
             // Failed-adoption backoff (module-level COOLDOWN_* constants).
@@ -3141,17 +3171,8 @@ impl NetworkManager {
                         .iter()
                         .any(|ip| &subnet_key_for(*ip) == reap_subnet);
 
-                    let current_ips = get_interface_ips(&iface_name).await;
-                    let adopted_vals: HashSet<Ipv4Addr> =
-                        adopted_snapshot.values().copied().collect();
-                    let pending_vals: HashSet<Ipv4Addr> =
-                        pending_ips.lock().await.iter().map(|p| p.ip).collect();
-                    let host_rescued =
-                        host_in_apipa_rescue(&current_ips, &adopted_vals, &pending_vals);
-
                     let verdict = reaper::lifecycle_verdict(&reaper::LifecycleInput {
                         pinned,
-                        host_rescued,
                         ..base_input
                     });
                     if verdict != reaper::ReapVerdict::Reap {
@@ -3269,14 +3290,8 @@ impl NetworkManager {
                     }
                 }
 
-                // Gate the adoption pass on host mode: while the adapter
-                // is DHCP and *has a real lease*, any secondary we add is
-                // at the mercy of the next renew/release cycle, so pause
-                // until the user transitions to Static. BUT when DHCP has
-                // failed to a 169.254/16 APIPA-only state, auto-adopt is
-                // the user's only path to connectivity — keep it running
-                // as a rescue. Read failures fail-open (treat as Static)
-                // so a broken cmdlet doesn't permanently silence adoption.
+                // DHCP never adds an address, including in APIPA-only state.
+                // Failed DHCP-state reads retain their existing policy until S7.
                 let needs_refresh = cached_dhcp_state
                     .map(|(_, t)| t.elapsed() > DHCP_CACHE_TTL)
                     .unwrap_or(true);
@@ -3304,22 +3319,39 @@ impl NetworkManager {
                     cached_dhcp_state.map(|(d, _)| d).unwrap_or(false)
                 };
 
-                if is_dhcp {
-                    let current_ips = get_interface_ips(&iface_name).await;
-                    let has_real_lease = current_ips.iter().any(|ip| !ip.is_link_local());
-                    if has_real_lease {
-                        continue;
+                let current_ips = if is_dhcp {
+                    get_interface_ips(&iface_name).await
+                } else {
+                    Vec::new()
+                };
+                let pause = dhcp_adoption_pause(is_dhcp, &current_ips);
+                if let Some(reason) = pause {
+                    if pause != last_dhcp_pause
+                        && current_ips
+                            .iter()
+                            .all(|ip| crate::validation::prohibited_camera_ip(*ip))
+                    {
+                        let reason = format!("{reason} on {iface_name}");
+                        log::warn!("Discovery degraded: {reason}");
+                        let _ = app_handle_for_adopt.emit(
+                            "discovery-degraded",
+                            serde_json::json!({
+                                "reason": reason,
+                                "missed_packets": 0,
+                            }),
+                        );
                     }
-                    // APIPA-only DHCP: fall through and adopt as rescue.
+                    last_dhcp_pause = pause;
+                    continue;
                 }
+                last_dhcp_pause = None;
 
                 // Cached-device on-link probe: runs on the first tick the
                 // DHCP gate allows adoption at all (the `continue` above
                 // keeps it pending, so a DHCP→Static transition still
                 // gets its pass). Rediscovers quiet known devices in
                 // seconds instead of waiting for their spontaneous
-                // broadcast ARP — the FLIR in APIPA fallback and the
-                // Annke's minutes-apart gateway ARP are the field cases.
+                // broadcast ARP, which can be minutes apart on a quiet camera.
                 if !cache_probe_done {
                     cache_probe_done = true;
                     let cached_records = {
@@ -3405,10 +3437,12 @@ impl NetworkManager {
                         Err(_) => continue,
                     };
 
+                    if crate::validation::prohibited_camera_ip(device_ip) {
+                        continue;
+                    }
+
                     // Derive the subnet from the live IP rather than trusting
-                    // the stored device.subnet — a device that first ARPed
-                    // from APIPA then re-ARPed from its real address can carry
-                    // a stale subnet, which would key the adoption wrongly.
+                    // a stored subnet left over from a previous address.
                     let o = device_ip.octets();
                     let device_subnet = format!("{}.{}.{}.0/24", o[0], o[1], o[2]);
 
@@ -4078,6 +4112,9 @@ async fn merge_arp_table(
         let mut map = devices.lock().await;
         let mut collected = Vec::new();
         for (ip, mac) in entries {
+            if crate::validation::prohibited_camera_ip(ip) {
+                continue;
+            }
             if excluded.iter().any(|net| net.contains(ip)) {
                 // Sender on a non-Ethernet (WiFi/VPN) subnet — not a wired
                 // peer. The OS neighbor read is InterfaceIndex-scoped, so
@@ -4832,32 +4869,40 @@ mod tests {
     }
 
     #[test]
-    fn rescue_state_ignores_apipa_adopted_and_pending_addresses() {
-        let apipa_native = Ipv4Addr::new(169, 254, 7, 20);
-        let adopted_foreign = Ipv4Addr::new(172, 31, 169, 102);
-        let pending_scratch = Ipv4Addr::new(10, 0, 0, 254);
-        let real_lease = Ipv4Addr::new(192, 168, 12, 64);
-        let adopted: HashSet<Ipv4Addr> = [adopted_foreign].into_iter().collect();
-        let pending: HashSet<Ipv4Addr> = [pending_scratch].into_iter().collect();
+    fn dhcp_never_adopts_even_with_only_apipa_or_no_address() {
+        for ips in [vec![], vec![Ipv4Addr::new(169, 254, 7, 20)]] {
+            assert_eq!(
+                dhcp_adoption_pause(true, &ips),
+                Some("no usable address; set a static address")
+            );
+            assert_eq!(dhcp_adoption_pause(false, &ips), None);
+        }
+        assert_eq!(
+            dhcp_adoption_pause(true, &[Ipv4Addr::new(192, 168, 1, 10)]),
+            Some("DHCP enabled; automatic address adoption paused")
+        );
+    }
 
-        // Only APIPA + adopted + pending addresses on the adapter: the
-        // host is rescued. The adopted non-APIPA secondary deliberately
-        // does not count as native connectivity.
-        assert!(host_in_apipa_rescue(
-            &[apipa_native, adopted_foreign, pending_scratch],
-            &adopted,
-            &pending,
-        ));
-
-        // A real (native, non-APIPA) address ends the rescue state.
-        assert!(!host_in_apipa_rescue(
-            &[apipa_native, adopted_foreign, real_lease],
-            &adopted,
-            &pending,
-        ));
-
-        // No addresses at all is rescue too — nothing native to rely on.
-        assert!(host_in_apipa_rescue(&[], &adopted, &pending));
+    #[test]
+    fn legacy_manual_apipa_stays_in_history_but_inactive() {
+        let registry = DeviceRegistry::new();
+        registry.hydrate_manual_nodes(&[
+            crate::config::ManualNode {
+                ip: "169.254.20.7".into(),
+                alias: "bench PTU".into(),
+            },
+            crate::config::ManualNode {
+                ip: "192.168.1.204".into(),
+                alias: "camera".into(),
+            },
+        ]);
+        assert!(keep_prohibited_history_inactive(&registry));
+        let records = registry.snapshot();
+        assert_eq!(records.len(), 2);
+        let historical = records.iter().find(|r| r.ip == "169.254.20.7").unwrap();
+        assert_eq!(historical.status, DeviceStatus::Offline);
+        assert_eq!(historical.alias, "bench PTU");
+        assert!(!keep_prohibited_history_inactive(&registry));
     }
 
     #[test]
