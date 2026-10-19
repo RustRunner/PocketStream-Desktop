@@ -1045,85 +1045,96 @@ fn format_mac(mac: &[u8; 6]) -> String {
     )
 }
 
-/// Force a fresh on-wire ARP resolution of `target`, pinned to the
-/// adapter that owns `scratch` (the caller's temporary probe address).
-///
-/// Two steps, neither of which parses localized OS text:
-/// 1. Flush the target's neighbor entry, scoped to the adapter — so a
-///    Stale/Delay/Probe leftover cannot masquerade as a fresh answer.
-///    Flush failure fails closed.
-/// 2. `SendARP` (IP Helper) with the scratch as the source: it transmits
-///    a real ARP request and returns the responder's MAC directly.
-///    Because step 1 emptied the cache entry, any MAC returned is fresh
-///    on-wire evidence by construction — and being pure ARP, devices
-///    that drop ICMP still answer. Runs on the blocking pool relying on
-///    the call's own internal retry bound (a few seconds);
-///    `spawn_blocking` cannot be aborted, so no abort wrapper is
-///    layered on top — the caller budgets for the duration instead.
-///
-/// `Ok(Some(mac))` — colon-lowercase MAC of the fresh responder;
-/// `Ok(None)` — no response; `Err` — the resolution could not be
-/// attempted (flush failed, task lost).
+/// Fresh ARP on the selected interface. ResolveIpNetEntry2 flushes the
+/// matching neighbor entry itself, then sends ARP; never read the cache as
+/// a fallback. The source must uniquely belong to this index. One native
+/// resolution stays in flight until it returns; spawn_blocking cannot be
+/// aborted, so the sequential caller retains its pass budget and fence.
 pub(crate) async fn fresh_resolve_mac(
     target: Ipv4Addr,
     scratch: Ipv4Addr,
+    interface_index: u32,
 ) -> Result<Option<String>, AppError> {
-    flush_neighbor(target, scratch).await?;
-
     #[cfg(target_os = "windows")]
     {
-        tokio::task::spawn_blocking(move || send_arp_blocking(target, scratch))
-            .await
-            .map_err(|e| AppError::Network(format!("SendARP task failed to join: {}", e)))
+        tokio::task::spawn_blocking(move || {
+            resolve_neighbor_blocking(target, scratch, interface_index)
+        })
+        .await
+        .map_err(|e| AppError::Network(format!("ResolveIpNetEntry2 task failed to join: {e}")))?
     }
     #[cfg(not(target_os = "windows"))]
     {
+        let _ = (target, scratch, interface_index);
         Err(AppError::Network(
             "fresh ARP resolution is Windows-only".into(),
         ))
     }
 }
 
-/// Remove the target's neighbor-cache entry on the adapter owning
-/// `scratch`. Success is signalled by our own sentinel on stdout, never
-/// by parsing cmdlet output (which is localized). A missing sentinel —
-/// no adapter owns the scratch, cmdlet failure, timeout — is an error:
-/// the caller must fail closed rather than trust a possibly-stale cache.
-async fn flush_neighbor(target: Ipv4Addr, scratch: Ipv4Addr) -> Result<(), AppError> {
-    let script = format!(
-        "$idx=(Get-NetIPAddress -IPAddress '{scratch}' -AddressFamily IPv4 -ErrorAction SilentlyContinue \
-         | Select-Object -First 1).InterfaceIndex; \
-         if ($null -ne $idx) {{ Remove-NetNeighbor -InterfaceIndex $idx -IPAddress '{target}' \
-         -Confirm:$false -ErrorAction SilentlyContinue; Write-Output 'flushed' }}"
-    );
-    match run_powershell(&script).await {
-        Some(out) if out.contains("flushed") => Ok(()),
-        _ => Err(AppError::Network(format!(
-            "could not flush the neighbor entry for {} on the adapter owning {}",
-            target, scratch
-        ))),
+#[cfg(target_os = "windows")]
+fn resolve_neighbor_blocking(
+    target: Ipv4Addr,
+    source: Ipv4Addr,
+    interface_index: u32,
+) -> Result<Option<String>, AppError> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{ResolveIpNetEntry2, MIB_IPNET_ROW2};
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKADDR_IN, SOCKADDR_INET};
+
+    if !super::interface::source_matches_interface(interface_index, source) {
+        return Err(AppError::Network(format!(
+            "ARP source {source} does not uniquely belong to interface {interface_index}"
+        )));
     }
+    // Zeroed rows/addresses are valid initializers. Only Address and the
+    // selected InterfaceIndex are supplied; no cached MAC enters the call.
+    let mut row: MIB_IPNET_ROW2 = unsafe { std::mem::zeroed() };
+    row.InterfaceIndex = interface_index;
+    let sockaddr = |ip: Ipv4Addr| {
+        let mut address: SOCKADDR_IN = unsafe { std::mem::zeroed() };
+        address.sin_family = AF_INET;
+        address.sin_addr.S_un.S_addr = u32::from_ne_bytes(ip.octets());
+        SOCKADDR_INET { Ipv4: address }
+    };
+    row.Address = sockaddr(target);
+    let src = sockaddr(source);
+    let result = unsafe { ResolveIpNetEntry2(&mut row, &src) };
+    let mac = resolved_neighbor_mac(result, interface_index, &row)?;
+    if !super::interface::source_matches_interface(interface_index, source) {
+        return Err(AppError::Network(
+            "ARP source changed during resolution".into(),
+        ));
+    }
+    Ok(Some(mac))
 }
 
-/// Blocking `SendARP` call (IP Helper — kernel-provided FFI, no
-/// Packet.dll involvement). `IPAddr` is a u32 holding the address bytes
-/// in network order in memory; reinterpreting the octets native-endian
-/// produces exactly that layout on either endianness.
 #[cfg(target_os = "windows")]
-fn send_arp_blocking(target: Ipv4Addr, scratch: Ipv4Addr) -> Option<String> {
-    use windows_sys::Win32::NetworkManagement::IpHelper::SendARP;
-    let dest = u32::from_ne_bytes(target.octets());
-    let src = u32::from_ne_bytes(scratch.octets());
-    let mut mac = [0u8; 8];
-    let mut len: u32 = mac.len() as u32;
-    let rc = unsafe { SendARP(dest, src, mac.as_mut_ptr() as *mut _, &mut len) };
-    if rc == 0 && len == 6 {
-        Some(format_mac(&[
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-        ]))
-    } else {
-        None
+fn resolved_neighbor_mac(
+    result: u32,
+    interface_index: u32,
+    row: &windows_sys::Win32::NetworkManagement::IpHelper::MIB_IPNET_ROW2,
+) -> Result<String, AppError> {
+    use windows_sys::Win32::Networking::WinSock::NlnsReachable;
+    if result != 0 {
+        return Err(AppError::Network(format!(
+            "ResolveIpNetEntry2 failed: {result}"
+        )));
     }
+    if row.InterfaceIndex != interface_index
+        || row.State != NlnsReachable
+        || row.PhysicalAddressLength != 6
+    {
+        return Err(AppError::Network(
+            "ARP resolution returned invalid interface/state/MAC length".into(),
+        ));
+    }
+    let mac: [u8; 6] = row.PhysicalAddress[..6].try_into().unwrap();
+    if mac == [0; 6] || mac[0] & 1 != 0 {
+        return Err(AppError::Network(
+            "ARP resolution returned a non-unicast MAC".into(),
+        ));
+    }
+    Ok(format_mac(&mac))
 }
 
 /// Read the OS ARP table for a specific interface and return dynamic entries.
@@ -1260,10 +1271,10 @@ pub(crate) fn normalize_mac(raw: &str) -> Option<String> {
 /// record as a false-positive Live.
 pub async fn resolve_mac_for_ip(
     target_ip: Ipv4Addr,
-    source: Option<Ipv4Addr>,
+    source: Option<(u32, Ipv4Addr)>,
     timeout: std::time::Duration,
 ) -> Result<Option<String>, AppError> {
-    let Some(source) = source else {
+    let Some((_interface_index, source)) = source else {
         log::debug!(
             "MAC verify for {}: no wired source IP for its subnet — verification fails",
             target_ip
@@ -1351,6 +1362,41 @@ pub async fn send_arp_probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn fresh_neighbor_result_rejects_errors_stale_rows_and_wrong_interfaces() {
+        use windows_sys::Win32::NetworkManagement::IpHelper::MIB_IPNET_ROW2;
+        use windows_sys::Win32::Networking::WinSock::{
+            NlnsDelay, NlnsProbe, NlnsReachable, NlnsStale,
+        };
+        let mut row: MIB_IPNET_ROW2 = unsafe { std::mem::zeroed() };
+        row.InterfaceIndex = 7;
+        row.State = NlnsReachable;
+        row.PhysicalAddressLength = 6;
+        row.PhysicalAddress[..6].copy_from_slice(&[0x40, 0xcd, 0x3a, 3, 0x28, 0xe2]);
+        assert_eq!(
+            resolved_neighbor_mac(0, 7, &row).unwrap(),
+            "40:cd:3a:03:28:e2"
+        );
+        // A failed native flush/resolve never returns a populated old MAC.
+        for error in [5, 53, 1168] {
+            assert!(resolved_neighbor_mac(error, 7, &row).is_err());
+        }
+        assert!(resolved_neighbor_mac(0, 8, &row).is_err());
+        for state in [NlnsStale, NlnsDelay, NlnsProbe] {
+            row.State = state;
+            assert!(resolved_neighbor_mac(0, 7, &row).is_err());
+        }
+        row.State = NlnsReachable;
+        row.PhysicalAddressLength = 8;
+        assert!(resolved_neighbor_mac(0, 7, &row).is_err());
+        row.PhysicalAddressLength = 6;
+        for mac in [[0; 6], [0xff; 6], [1, 2, 3, 4, 5, 6]] {
+            row.PhysicalAddress[..6].copy_from_slice(&mac);
+            assert!(resolved_neighbor_mac(0, 7, &row).is_err());
+        }
+    }
     use std::net::Ipv4Addr;
 
     #[test]

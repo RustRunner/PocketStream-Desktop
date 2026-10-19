@@ -92,6 +92,7 @@ pub(crate) fn derive_candidates(
 /// real addresses.
 #[allow(async_fn_in_trait)]
 pub(crate) trait ProbeIo {
+    fn interface_index(&self) -> u32;
     /// Bind the subnet's scratch address. `false` = bind failed; the
     /// pass moves to the next subnet.
     async fn bind_scratch(&mut self, subnet: &str, scratch: Ipv4Addr) -> bool;
@@ -100,7 +101,12 @@ pub(crate) trait ProbeIo {
     /// Fresh on-wire MAC resolution of `target`, sourced from `scratch`.
     /// `Ok(None)` = no response; `Err(())` = could not attempt (flush
     /// failed) — the pair fails closed.
-    async fn resolve(&mut self, target: Ipv4Addr, scratch: Ipv4Addr) -> Result<Option<String>, ()>;
+    async fn resolve(
+        &mut self,
+        target: Ipv4Addr,
+        scratch: Ipv4Addr,
+        interface_index: u32,
+    ) -> Result<Option<String>, ()>;
     /// Hand a freshly verified (ip, mac) match to the adoption tail. The
     /// scratch is already released when this is called. `false` = stop
     /// the whole pass (a shutdown raced the adoption).
@@ -124,15 +130,15 @@ pub(crate) struct PassReport {
 /// auto-adopt task with the reaper and broadcast adoption, so a large
 /// cache must not stall them for long: sized as a small multiple of the
 /// worst per-command bound in the chain (the 30 s scratch bind/release;
-/// flush and `SendARP` are 10 s and ~3 s).
+/// native resolution timing must be measured on the reference adapter).
 pub(crate) const CACHE_PROBE_PASS_BUDGET: Duration = Duration::from_secs(90);
 
 /// Soft scheduling budget for a fast-adopt probe (one subnet, one
 /// pair). Same semantics as the cache-pass budget: `run_pass` checks
 /// the deadline only between awaited operations, never inside one — the
 /// hard bounds are the per-command timeouts (30 s scratch bind/release,
-/// 10 s flush, ~3 s `SendARP`), so for a single pair this mostly just
-/// documents the intended scale.
+/// and native neighbor resolution), so this documents scheduling scale,
+/// not an abort deadline for an in-flight native call.
 pub(crate) const FAST_ADOPT_PROBE_BUDGET: Duration = Duration::from_secs(20);
 
 /// Run one probe pass over the candidate set. Per subnet: one scratch
@@ -155,6 +161,10 @@ pub(crate) async fn run_pass<I: ProbeIo>(
 ) -> PassReport {
     let deadline = tokio::time::Instant::now() + budget;
     let mut report = PassReport::default();
+    let interface_index = io.interface_index();
+    if interface_index == 0 {
+        return report; // no selected interface: never bind or probe unbound
+    }
     let mut remaining = candidates.into_iter();
     while let Some(candidate) = remaining.next() {
         if io.shutdown() {
@@ -177,7 +187,11 @@ pub(crate) async fn run_pass<I: ProbeIo>(
             if io.shutdown() || tokio::time::Instant::now() >= deadline {
                 break;
             }
-            match io.resolve(*ip, scratch).await {
+            let resolved = io.resolve(*ip, scratch, interface_index).await;
+            if io.shutdown() {
+                break;
+            }
+            match resolved {
                 Ok(Some(fresh_mac)) if fresh_mac == *cached_mac => {
                     matched = Some((*ip, fresh_mac));
                     break;
@@ -190,6 +204,9 @@ pub(crate) async fn run_pass<I: ProbeIo>(
             }
         }
         io.release_scratch(&candidate.subnet, scratch).await;
+        if io.shutdown() {
+            break;
+        }
         if let Some((ip, mac)) = matched {
             report.handed_off.push(candidate.subnet.clone());
             if !io.adopt(&candidate.subnet, ip, &mac).await {
@@ -299,6 +316,11 @@ mod tests {
 
     #[derive(Default)]
     struct MockProbeIo {
+        interface_index: u32,
+        source_index: u32,
+        resolved_indices: Vec<u32>,
+        fence: Option<super::super::SweepFence>,
+        retire_at: Option<(&'static str, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
         /// (target, result-mac). Missing target ⇒ no answer; the literal
         /// mac "FLUSH-FAIL" scripts an `Err(())`.
         answers: std::collections::HashMap<Ipv4Addr, String>,
@@ -315,12 +337,18 @@ mod tests {
         fn new() -> Self {
             Self {
                 adopt_returns: true,
+                interface_index: 7,
+                source_index: 7,
                 ..Self::default()
             }
         }
     }
 
     impl ProbeIo for MockProbeIo {
+        fn interface_index(&self) -> u32 {
+            self.interface_index
+        }
+
         async fn bind_scratch(&mut self, subnet: &str, scratch: Ipv4Addr) -> bool {
             self.events.push(format!("bind {} {}", subnet, scratch));
             if self.fail_bind {
@@ -332,14 +360,25 @@ mod tests {
         async fn release_scratch(&mut self, subnet: &str, scratch: Ipv4Addr) {
             self.events.push(format!("release {} {}", subnet, scratch));
             self.bound.retain(|s| *s != scratch);
+            if let Some(("release", active)) = &self.retire_at {
+                active.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         async fn resolve(
             &mut self,
             target: Ipv4Addr,
             _scratch: Ipv4Addr,
+            interface_index: u32,
         ) -> Result<Option<String>, ()> {
             self.events.push(format!("resolve {}", target));
+            self.resolved_indices.push(interface_index);
             tokio::time::sleep(self.resolve_delay).await;
+            if let Some(("resolve", active)) = &self.retire_at {
+                active.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            if interface_index != self.source_index {
+                return Err(());
+            }
             match self.answers.get(&target) {
                 Some(mac) if mac == "FLUSH-FAIL" => Err(()),
                 Some(mac) => Ok(Some(mac.clone())),
@@ -357,6 +396,7 @@ mod tests {
         fn shutdown(&self) -> bool {
             self.shutdown_at_event
                 .is_some_and(|n| self.events.len() >= n)
+                || self.fence.as_ref().is_some_and(|f| f.is_stale())
         }
     }
 
@@ -368,6 +408,62 @@ mod tests {
                 .map(|(ip, mac)| (ip.parse().unwrap(), (*mac).to_string()))
                 .collect(),
         }
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_no_answer_or_wrong_index_cannot_use_cached_identity() {
+        for answer in [Some("FLUSH-FAIL"), None, Some("aa:bb:cc:dd:ee:02")] {
+            let mut io = MockProbeIo::new();
+            let target = "172.31.169.64".parse().unwrap();
+            if let Some(answer) = answer {
+                io.answers.insert(target, answer.into());
+                if answer != "FLUSH-FAIL" {
+                    io.source_index = 8;
+                }
+            }
+            let c = candidate("172.31.169.0/24", &[("172.31.169.64", "aa:bb:cc:dd:ee:02")]);
+            let report = run_pass(&mut io, vec![c], CACHE_PROBE_PASS_BUDGET).await;
+            assert_eq!(io.resolved_indices, [7]);
+            assert!(report.handed_off.is_empty());
+            assert!(io.bound.is_empty());
+            assert!(!io.events.iter().any(|e| e.starts_with("adopt")));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retired_adapter_session_discards_probe_and_release_completions() {
+        use std::sync::{
+            atomic::{AtomicBool, AtomicU64},
+            Arc,
+        };
+        for phase in ["resolve", "release"] {
+            let mut io = MockProbeIo::new();
+            let active = Arc::new(AtomicBool::new(true));
+            io.fence = Some(super::super::SweepFence::new(
+                1,
+                Arc::new(AtomicU64::new(1)),
+                active.clone(),
+            ));
+            io.retire_at = Some((phase, active));
+            io.resolve_delay = Duration::from_secs(2);
+            io.answers
+                .insert("172.31.169.64".parse().unwrap(), "aa:bb:cc:dd:ee:02".into());
+            let c = candidate("172.31.169.0/24", &[("172.31.169.64", "aa:bb:cc:dd:ee:02")]);
+            let report = run_pass(&mut io, vec![c], CACHE_PROBE_PASS_BUDGET).await;
+            assert!(report.handed_off.is_empty(), "stale after {phase}");
+            assert!(io.bound.is_empty());
+            assert!(!io.events.iter().any(|e| e.starts_with("adopt")));
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_interface_never_binds_a_scratch() {
+        let mut io = MockProbeIo::new();
+        io.interface_index = 0;
+        let c = candidate("172.31.169.0/24", &[("172.31.169.64", "aa:bb:cc:dd:ee:02")]);
+        let report = run_pass(&mut io, vec![c], CACHE_PROBE_PASS_BUDGET).await;
+        assert_eq!(report, PassReport::default());
+        assert!(io.events.is_empty());
     }
 
     #[tokio::test]
