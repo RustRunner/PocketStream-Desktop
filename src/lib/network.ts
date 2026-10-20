@@ -38,10 +38,30 @@ let hostMode: NetworkMode | null = null;
 let adapterSelection: AdapterSelection | null = null;
 let interfaceRefresh = 0;
 let selectingAdapter = false;
+/** Presentation only, empty at launch and never persisted. */
+export const sessionAdoptedSubnets = new Set<string>();
+let bindingRefresh = 0;
+
+export async function refreshHostBindings(): Promise<void> {
+  const request = ++bindingRefresh;
+  try {
+    const snapshot = await api.getAdoptionState();
+    if (!snapshot || request !== bindingRefresh) return;
+    adoptedSubnets.clear(); adoptionMeta.clear();
+    for (const [subnet, ip] of Object.entries(snapshot.adopted_subnets)) adoptedSubnets.set(subnet, ip);
+    for (const [subnet, meta] of Object.entries(snapshot.meta)) adoptionMeta.set(subnet, meta);
+    for (const subnet of sessionAdoptedSubnets) {
+      const meta = adoptionMeta.get(subnet);
+      if (!meta?.applied || meta.desired !== "present") sessionAdoptedSubnets.delete(subnet);
+    }
+    renderSubnetList();
+  } catch (e) { log(`Failed to refresh saved bindings: ${formatError(e)}`); }
+}
 
 function rememberAdapterSelection(next: AdapterSelection): void {
   if (adapterSelection && (adapterSelection.selected_mac !== next.selected_mac ||
       adapterSelection.interface_index !== next.interface_index)) {
+    sessionAdoptedSubnets.clear();
     if (pendingDownTimer) clearTimeout(pendingDownTimer);
     pendingDownTimer = null;
     pendingDownIface = null;
@@ -93,7 +113,10 @@ export async function refreshInterfaces(): Promise<void> {
     const selection = await api.getAdapterSelection();
     if (request !== interfaceRefresh || !selection) return;
     rememberAdapterSelection(selection);
+    await refreshHostBindings();
+    if (request !== interfaceRefresh) return;
     const eth = selection.interface_index !== null ? selection.adapter : null;
+    if (!eth?.is_up) sessionAdoptedSubnets.clear();
 
     if (eth && eth.is_up && eth.ips.some((ip) => !isApipa(ip.address))) {
       state.activeInterface = eth;
@@ -122,7 +145,9 @@ export async function refreshInterfaces(): Promise<void> {
     if (request !== interfaceRefresh) return;
     state.activeInterface = null;
     log(`Failed to list interfaces: ${formatError(e)}`);
+    sessionAdoptedSubnets.clear();
     $("#iface-name").textContent = "Error";
+    renderSubnetList();
     warnNoEthernet();
   }
 }
@@ -209,6 +234,8 @@ export function setupInterfaceWatcher(): void {
   api.onEvent<InterfaceInfo>("interface-status-changed", (iface) => {
     const expectedMac = adapterSelection?.selected_mac?.replaceAll("-", ":").toLowerCase();
     if (iface.mac.replaceAll("-", ":").toLowerCase() !== (expectedMac ?? "")) return;
+    if (isDownEvent(iface)) sessionAdoptedSubnets.clear();
+    void refreshHostBindings();
     // Capture the prior connection state BEFORE any state mutation so
     // applyUpEvent can decide whether this is a true reconnect.
     // isInterfaceConnected() is our single source of truth — it also
@@ -288,6 +315,7 @@ export function setupInterfaceWatcher(): void {
 }
 
 function applyDownEvent(iface: InterfaceInfo): void {
+  sessionAdoptedSubnets.clear();
   // Sentinel from the backend watcher: no ethernet adapter present
   // at all. Deliberately does NOT raise the banner here — a mid-
   // session unplug during active use is noise, not a call to action.
@@ -415,20 +443,22 @@ export function renderModeBadge(): void {
 // listener survives re-renders without stacking duplicates.
 let subnetRemoveWired = false;
 
-/** Remove an auto-adopted subnet from the host card. Optimistic: on success
- *  drop it from the local map and re-render immediately; the NIC watcher
- *  refreshes the interface IP list shortly after the unbind, and the backend
- *  drops any held-over restore so the row can't resurrect on the next save. */
+/** The backend persists exact removal intent before touching the adapter. */
 async function handleRemoveAdopted(subnet: string, btn: HTMLButtonElement): Promise<void> {
+  const meta = adoptionMeta.get(subnet);
+  if (!meta?.address || !window.confirm(`Remove ${meta.address}/${meta.prefix ?? "?"} from saved adapter ${meta.adapter_mac ?? "unknown"}? Nodes on ${subnet} may share this host address and lose connectivity. History is retained.`)) return;
   btn.disabled = true;
   try {
     await api.removeAdoptedSubnet(subnet);
-    adoptedSubnets.delete(subnet);
-    renderSubnetList();
-    showToast(`Removed adopted subnet ${subnet}`);
+    sessionAdoptedSubnets.delete(subnet);
+    showToast(`Removed ${meta.address}/${meta.prefix}`);
   } catch (e) {
-    btn.disabled = false;
     showToast("Failed: " + formatError(e), true);
+  } finally {
+    btn.disabled = false;
+    await refreshHostBindings();
+    await refreshInterfaces();
+    await refreshIpDialogIfOpen();
   }
 }
 
@@ -437,87 +467,46 @@ export function renderSubnetList(): void {
   if (!subnetRemoveWired) {
     subnetRemoveWired = true;
     subnetList.addEventListener("click", (e) => {
-      const btn = (e.target as HTMLElement).closest<HTMLButtonElement>(
-        "[data-remove-adopted]"
-      );
-      if (!btn) return;
-      const subnet = btn.dataset["removeAdopted"];
-      if (subnet) void handleRemoveAdopted(subnet, btn);
+      const btn = (e.target as HTMLElement).closest<HTMLButtonElement>("[data-remove-adopted]");
+      const subnet = btn?.dataset["removeAdopted"];
+      if (btn && subnet) void handleRemoveAdopted(subnet, btn);
     });
   }
   renderModeBadge();
-  if (!state.activeInterface) return;
-
-  const adoptedIpSet = new Set(adoptedSubnets.values());
-  // An adopted row stays on the Host card until the adoption is
-  // explicitly removed — the per-row trash control, the Configure
-  // dialog, or the APIPA reaper (all of which emit subnet-removed and
-  // clear the map). It is NOT tied to Nodes-panel contents: clearing or
-  // losing the nodes behind an adoption must not make the binding look
-  // deleted while the secondary IP is still live on the adapter.
-  // Trash-icon control shared by both auto-row shapes below. `subnetEsc`
-  // must already be HTML-escaped; it doubles as the removal key.
-  const removeBtn = (subnetEsc: string) =>
-    `<button class="btn-remove-ip" data-remove-adopted="${subnetEsc}" title="Remove adopted subnet">` +
-    `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>` +
-    `</button>`;
-  // Native rows: hide APIPA addresses — Windows leaves them as a
-  // secondary after any brief DHCP failure and they can't carry usable
-  // traffic, so showing them as if they were a selectable subnet just
-  // confuses users (seen on multiple Getac installs in the field).
-  // Adopted rows always render (see above).
-  const sortedIps = [...state.activeInterface.ips]
-    .filter((ip) => adoptedIpSet.has(ip.address) || !isApipa(ip.address))
-    .sort((a, b) => {
-      const aAuto = adoptedIpSet.has(a.address) ? 1 : 0;
-      const bAuto = adoptedIpSet.has(b.address) ? 1 : 0;
-      return aAuto - bAuto;
-    });
-  let html = sortedIps
-    .map((ip) => {
-      const isAuto = adoptedIpSet.has(ip.address);
-      // Escape backend-sourced strings interpolated into innerHTML.
-      const subnetEsc = escapeHtml(ip.subnet);
-      const ipEsc = escapeHtml(`${ip.address}/${ip.prefix}`);
-      if (isAuto) {
-        return `
-        <div class="status-row subnet-row subnet-row-auto" data-subnet="${subnetEsc}">
-          <span class="status-label">IP:</span>
-          <span class="auto-ip-group">
-            <span class="badge-auto">(auto)</span>
-            <span class="status-value">${ipEsc}</span>
-          </span>
-          ${removeBtn(subnetEsc)}
-        </div>`;
-      }
-      return `
-      <div class="status-row subnet-row" data-subnet="${subnetEsc}">
-        <span class="status-label">IP:</span>
-        <span class="status-value">${ipEsc}</span>
-      </div>`;
-    })
-    .join("");
-
-  // Add auto-adopted subnets not yet bound as interface IPs (skip if
-  // already shown).
-  const renderedIps = new Set(state.activeInterface.ips.map((ip) => ip.address));
-  for (const [subnet, adoptedIp] of adoptedSubnets) {
-    if (renderedIps.has(adoptedIp)) continue;
-    html += `
-      <div class="status-row subnet-row subnet-row-auto" data-subnet="${escapeHtml(subnet)}">
-        <span class="status-label">IP:</span>
-        <span class="auto-ip-group">
-          <span class="badge-auto">(auto)</span>
-          <span class="status-value">${escapeHtml(`${adoptedIp}/24`)}</span>
-        </span>
-        ${removeBtn(escapeHtml(subnet))}
-      </div>`;
+  type HostRow = { address: string; prefix: number | null; subnet: string; observed: boolean; meta?: import("./types.ts").AdoptedMetaView };
+  const rows = new Map<string, HostRow>();
+  const savedAddresses = new Set([...adoptionMeta.values()].map((m) => m.address));
+  for (const ip of state.activeInterface?.ips ?? []) {
+    if (isApipa(ip.address) && !savedAddresses.has(ip.address)) continue;
+    rows.set(`${ip.address}/${ip.prefix}`, { ...ip, observed: true });
   }
-
-  // Auto-adopted rows carry a per-row remove control. Clicks are handled by
-  // the delegated listener wired above (keyed on data-remove-adopted), which
-  // unbinds the secondary IP and drops the adoption from config.
-  subnetList.innerHTML = html;
+  for (const [subnet, meta] of adoptionMeta) {
+    const address = meta.address ?? adoptedSubnets.get(subnet);
+    if (!address || (meta.desired === "removed" && !meta.applied && !meta.last_error)) continue;
+    const prefix = meta.prefix ?? null;
+    const key = `${address}/${prefix}`;
+    rows.set(key, { address, prefix, subnet, observed: rows.get(key)?.observed ?? false, meta });
+  }
+  const normalizeMac = (mac: string | null | undefined) => mac?.replaceAll("-", ":").toLowerCase();
+  const usable = !!state.activeInterface?.is_up;
+  subnetList.innerHTML = [...rows.values()].sort((a, b) =>
+    a.address.localeCompare(b.address) || (a.prefix ?? -1) - (b.prefix ?? -1)
+  ).map(({ address, prefix, subnet, observed, meta }) => {
+    const ownerKnown = /^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/i.test(normalizeMac(meta?.adapter_mac) ?? "") && prefix !== null && prefix >= 0 && prefix <= 32;
+    const mismatch = observed && normalizeMac(meta?.adapter_mac) !== normalizeMac(state.activeInterface?.mac);
+    const managed = ownerKnown && !mismatch && meta?.desired === "present";
+    const applied = usable && observed && (!meta || (meta.applied === true && !mismatch));
+    const badge = managed && applied && sessionAdoptedSubnets.has(subnet);
+    const availability = !usable || /^(adapter is DHCP|saved mode is DHCP|adapter mismatch|selected adapter unavailable)/.test(meta?.last_error ?? "");
+    const status = meta?.desired === "removed" ? "pending removal" : applied ? "applied" : meta?.last_error && !availability ? "failed" : "pending";
+    const reason = [meta?.last_error || (!usable ? "selected adapter unavailable" : meta && !observed ? "address not observed on selected adapter" : ""),
+      !meta || !ownerKnown || mismatch ? "ownership ambiguous — use Configure" : ""].filter(Boolean).join("; ");
+    const cidr = `${address}/${prefix ?? "?"}`;
+    const remove = managed ? `<button class="btn-remove-ip" data-remove-adopted="${escapeHtml(subnet)}" title="Remove saved ${escapeHtml(cidr)} from ${escapeHtml(meta!.adapter_mac!)}"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg></button>` : "";
+    return `<div class="status-row subnet-row${badge ? " subnet-row-auto" : ""}" data-subnet="${escapeHtml(subnet)}">
+      <span class="status-label">IP:</span><span class="auto-ip-group">${badge ? '<span class="badge-auto">(auto)</span>' : ""}<span class="status-value">${escapeHtml(cidr)}</span></span>
+      <span class="muted">${escapeHtml(`${status}${reason ? ` — ${reason}` : ""}`)}</span>${remove}</div>`;
+  }).join("");
 }
 
 // ── CAM / PTU target resolution ─────────────────────────────────────
@@ -799,11 +788,7 @@ export async function refreshIpDialogIfOpen(): Promise<void> {
 async function reloadDialogInterfaces(): Promise<void> {
   try {
     await loadAdapterChoices();
-    const snapshot = await api.getAdoptionState();
-    adoptedSubnets.clear();
-    adoptionMeta.clear();
-    for (const [subnet, ip] of Object.entries(snapshot.adopted_subnets)) adoptedSubnets.set(subnet, ip);
-    for (const [subnet, meta] of Object.entries(snapshot.meta)) adoptionMeta.set(subnet, meta);
+    await refreshHostBindings();
     populateDialogFields();
     // Also refresh the host card
     await refreshInterfaces();

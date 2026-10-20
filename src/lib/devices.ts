@@ -30,6 +30,8 @@ import {
   renderSubnetList,
   isInterfaceConnected,
   refreshIpDialogIfOpen,
+  refreshHostBindings,
+  sessionAdoptedSubnets,
 } from "./network.ts";
 import {
   clearScannedIps,
@@ -276,7 +278,14 @@ export function setupArpListeners(): void {
 
   // Re-render whenever the backend pushes a new snapshot.
   let scanReadyKeys = new Set<string>();
+  let liveSubnets = new Set<string>();
   deviceList.subscribe((snapshot) => {
+    const nextLive = new Set(snapshot.filter((r) => r.status === "live").map((r) => r.subnet));
+    for (const subnet of sessionAdoptedSubnets) {
+      if (liveSubnets.has(subnet) && !nextLive.has(subnet)) sessionAdoptedSubnets.delete(subnet);
+    }
+    liveSubnets = nextLive;
+    renderSubnetList();
     renderArpDeviceList();
     const ready = snapshot.filter((r) => r.status === "live" && hasRouteToSubnet(r.subnet));
     const newPeer = ready.some((r) => !scanReadyKeys.has(r.mac) && !isIpScanned(r.ip));
@@ -348,28 +357,23 @@ export function setupArpListeners(): void {
     log("Discovery recovered — devices responding again");
   });
 
-  api.onEvent<SubnetAdoptedPayload>("subnet-adopted", (data) => {
+  api.onEvent<SubnetAdoptedPayload & import("./types.ts").AdoptedMetaView & { restored: boolean }>("subnet-adopted", (data) => {
     log(`Subnet adopted: ${data.subnet} -> ${data.adopted_ip}`);
     adoptedSubnets.set(data.subnet, data.adopted_ip);
-    adoptionMeta.set(data.subnet, {
-      adopted_at: data.adopted_at,
-      last_device_seen: data.last_device_seen,
-      stale: data.stale,
-    });
+    adoptionMeta.set(data.subnet, data);
+    if (data.restored === false && state.activeInterface?.is_up && data.adapter_mac?.replaceAll("-", ":").toLowerCase() === state.activeInterface.mac.replaceAll("-", ":").toLowerCase()) sessionAdoptedSubnets.add(data.subnet);
     renderSubnetList();
-    // Briefly flash the row so the user notices a live adoption. The
-    // class auto-clears after the CSS animation; the persistent "(auto)"
-    // badge stays put. No state to clean up because renderSubnetList
-    // rebuilds the row from scratch next render.
+    // Flash only a fresh adoption; restored rows remain plain.
     const row = $(
       `#subnet-list .subnet-row[data-subnet="${cssAttrValue(data.subnet)}"]`
     );
-    if (row) {
+    if (row && data.restored === false) {
       row.classList.add("subnet-row-just-adopted");
       setTimeout(() => row.classList.remove("subnet-row-just-adopted"), 2500);
     }
     // Reset the settle timer — netsh needs time to activate the IP
     debounceScan();
+    void refreshHostBindings();
   });
 
   api.onEvent<AdoptionFailedPayload>("adoption-failed", (data) => {
@@ -378,17 +382,15 @@ export function setupArpListeners(): void {
     showToast(`Couldn't join ${data.subnet} — will retry`, true);
   });
 
-  // One removal path for every surface: whether the backend reaped a
-  // stale adoption or the user removed one from either panel, this
-  // event is what clears the frontend maps and re-renders — the
-  // optimistic local deletes in the click handlers are just immediate
-  // feedback, this is authoritative.
+  // Removal does not erase backend tombstones; refresh their final status.
   api.onEvent<SubnetRemovedPayload>("subnet-removed", (data) => {
     log(`Subnet removed (${data.reason}): ${data.subnet} (${data.adopted_ip})`);
     adoptedSubnets.delete(data.subnet);
+    sessionAdoptedSubnets.delete(data.subnet);
     adoptionMeta.delete(data.subnet);
     renderSubnetList();
     void refreshIpDialogIfOpen();
+    void refreshHostBindings();
     // Manual removals already toast from their click handler; only a
     // background reap needs to tell the user something happened.
     if (data.reason === "stale_apipa") {
@@ -415,15 +417,7 @@ export async function loadExistingArpState(): Promise<void> {
   }
 
   try {
-    const snapshot = await api.getAdoptionState();
-    const entries = Object.entries(snapshot.adopted_subnets);
-    for (const [subnet, ip] of entries) {
-      adoptedSubnets.set(subnet, ip);
-    }
-    for (const [subnet, meta] of Object.entries(snapshot.meta)) {
-      adoptionMeta.set(subnet, meta);
-    }
-    if (entries.length > 0) renderSubnetList();
+    await refreshHostBindings();
 
     // Presence is owned by the backend. Scan only for capabilities.
 

@@ -703,6 +703,20 @@ pub struct AdoptionSnapshot {
     pub meta: HashMap<String, AdoptedMetaView>,
 }
 
+/// Both paths carry complete binding state; only fresh commits get a badge.
+fn adoption_event(
+    subnet: &str,
+    ip: &str,
+    meta: &AdoptedMetaView,
+    restored: bool,
+) -> serde_json::Value {
+    let mut payload = serde_json::to_value(meta).expect("binding view serializes");
+    payload["subnet"] = serde_json::json!(subnet);
+    payload["adopted_ip"] = serde_json::json!(ip);
+    payload["restored"] = serde_json::json!(restored);
+    payload
+}
+
 /// Wall-clock age of the last recorded sighting (or of the adoption
 /// itself when no device was ever seen), for the informational badge.
 /// `None` when there is nothing to measure, the stamp is unparseable,
@@ -1144,21 +1158,24 @@ async fn attempt_adoption(
                 liveness.insert(device_subnet.to_string(), std::time::Instant::now());
             }
             if let Ok(mut meta) = ctx.meta.lock() {
-                meta.insert(device_subnet.to_string(), row);
+                meta.insert(device_subnet.to_string(), row.clone());
             }
             known_subnets.insert(device_subnet.to_string());
 
             let _ = ctx.app_handle.emit(
                 "subnet-adopted",
-                serde_json::json!({
-                    "subnet": device_subnet,
-                    "adopted_ip": adopted_ip.to_string(),
-                    "adopted_at": adoption_wall,
-                    "last_device_seen": adoption_wall,
-                    // Freshly adopted is never stale — the liveness
-                    // clock was seeded moments ago.
-                    "stale": false,
-                }),
+                adoption_event(
+                    device_subnet,
+                    &adopted_ip.to_string(),
+                    &adoption_meta_view(
+                        device_subnet,
+                        Some(&row),
+                        Some(std::time::Duration::ZERO),
+                        std::time::Duration::ZERO,
+                        None,
+                    ),
+                    false,
+                ),
             );
 
             log::info!("Auto-adopted {} with IP {}", device_subnet, adopted_ip);
@@ -2351,14 +2368,7 @@ impl NetworkManager {
         let snapshot = self.adoption_snapshot().await;
         for (subnet, ip) in &snapshot.adopted_subnets {
             let meta = &snapshot.meta[subnet];
-            let _ = app.emit(
-                "subnet-adopted",
-                serde_json::json!({
-                    "subnet": subnet, "adopted_ip": ip, "restored": true,
-                    "adopted_at": meta.adopted_at, "last_device_seen": meta.last_device_seen,
-                    "stale": false,
-                }),
-            );
+            let _ = app.emit("subnet-adopted", adoption_event(subnet, ip, meta, true));
         }
     }
 
@@ -4470,6 +4480,28 @@ fn merge_adopted_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adoption_events_distinguish_restore_and_carry_binding_ownership() {
+        let mut row = saved_binding("172.26.95.99");
+        row.applied = true;
+        let view = adoption_meta_view(
+            "172.26.95.0/24",
+            Some(&row),
+            None,
+            std::time::Duration::ZERO,
+            None,
+        );
+        for restored in [false, true] {
+            let event = adoption_event("172.26.95.0/24", "172.26.95.99", &view, restored);
+            assert_eq!(event["restored"], restored);
+            assert_eq!(event["address"], "172.26.95.99");
+            assert_eq!(event["prefix"], 24);
+            assert_eq!(event["adapter_mac"], "40:cd:3a:00:00:01");
+            assert_eq!(event["desired"], "present");
+            assert_eq!(event["applied"], true);
+        }
+    }
 
     fn saved_binding(address: &str) -> crate::config::AdoptedMeta {
         crate::config::AdoptedMeta {
