@@ -427,7 +427,6 @@ pub fn run() {
             commands::set_device_alias,
             commands::set_device_status,
             commands::forget_device,
-            commands::evict_phantom_device,
             commands::get_adoption_state,
             commands::get_configured_adoptions,
             commands::remove_adopted_subnet,

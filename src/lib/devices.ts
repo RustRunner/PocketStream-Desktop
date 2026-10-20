@@ -40,9 +40,9 @@ import {
   visibleDevices,
 } from "./device-state.ts";
 import * as deviceList from "./device-list.ts";
-import { getActivePlaybackIp, stopStreamNow } from "./streaming.ts";
+import { getActivePlaybackTarget, stopStreamNow } from "./streaming.ts";
 import { haltPtuUnit } from "./ptz.ts";
-import { selectedDevice, sessionCamIp } from "./store.ts";
+import { selectedDevice, sessionCamTarget } from "./store.ts";
 import { formatError } from "./errors.ts";
 import type {
   AdoptionFailedPayload,
@@ -115,10 +115,10 @@ function debounceScan(): void {
 /** Scan every device the backend currently knows about that's on a
  *  routable subnet and we haven't scanned this session. */
 function scanAllRoutableDevices(): void {
-  const toScan: string[] = [];
+  const toScan: DeviceRecord[] = [];
   for (const record of deviceList.getDevices()) {
     if (!isIpScanned(record.ip) && hasRouteToSubnet(record.subnet)) {
-      toScan.push(record.ip);
+      toScan.push(record);
     }
   }
   if (toScan.length === 0) {
@@ -132,8 +132,8 @@ function scanAllRoutableDevices(): void {
   }
   log(`Scanning ${toScan.length} routable device(s)...`);
   setDiscoveryPhase("scanning");
-  for (const ip of toScan) {
-    scanDevicePorts(ip);
+  for (const record of toScan) {
+    scanDevicePorts(record.mac, record.ip);
   }
 }
 
@@ -533,9 +533,8 @@ async function fastVerifyCachedDevice(
           // would resurrect the record as a false-positive Live.
           const liveMac = await api.resolveMac(ip);
           if (liveMac && liveMac.toLowerCase() === mac.toLowerCase()) {
-            // Backend's report_scan_result auto-flips the record to
-            // "live" + persists to cache + emits a new snapshot.
-            await api.reportScanResult(r.ip, r.open_ports);
+            // Diagnostic comparison only; capability data never promotes presence.
+            await api.reportScanResult(mac, r.open_ports);
             verified = true;
           } else {
             log(
@@ -568,17 +567,6 @@ async function fastVerifyCachedDevice(
     // periodic re-verify so the status self-heals when conditions
     // improve.
     markIpScanned(ip, /* clear */ true);
-    // Evict phantom cache rows: a device that never verifies is probably
-    // gone. The backend exempts aliased CAM/PTU, manual nodes, and Live
-    // entries, so only genuinely-unimportant phantoms are removed; the
-    // exempt ones fall through to the dim-and-re-verify self-heal path.
-    let evicted = false;
-    try {
-      evicted = await api.evictPhantomDevice(ip);
-    } catch (e) {
-      log(`evict phantom ${ip} failed: ${formatError(e)}`);
-    }
-    if (evicted) return;
     api.setDeviceStatus(mac, "offline").catch((e: unknown) => {
       log(`set offline status failed for ${ip}: ${formatError(e)}`);
     });
@@ -591,7 +579,7 @@ async function fastVerifyCachedDevice(
 const MAX_SCAN_RETRIES = 2;
 const RETRY_DELAY_MS = 4000;
 
-async function scanDevicePorts(ip: string, attempt = 0): Promise<void> {
+async function scanDevicePorts(mac: string, ip: string, attempt = 0): Promise<void> {
   if (attempt === 0 && isIpScanned(ip)) return;
   markIpScanned(ip);
   if (attempt === 0) pendingScans++;
@@ -602,8 +590,8 @@ async function scanDevicePorts(ip: string, attempt = 0): Promise<void> {
     if (results) {
       for (const r of results) {
         if (r.reachable && r.open_ports.length > 0) {
-          // Backend persists, flips status to live, and emits a snapshot.
-          await api.reportScanResult(r.ip, r.open_ports);
+          // Attach capabilities to the scheduled identity, without promoting it.
+          await api.reportScanResult(mac, r.open_ports);
           found = true;
         }
       }
@@ -615,7 +603,7 @@ async function scanDevicePorts(ip: string, attempt = 0): Promise<void> {
       // duplicate scan chain for this IP; release it only once retries
       // are exhausted.
       if (attempt < MAX_SCAN_RETRIES) {
-        setTimeout(() => scanDevicePorts(ip, attempt + 1), RETRY_DELAY_MS);
+        setTimeout(() => scanDevicePorts(mac, ip, attempt + 1), RETRY_DELAY_MS);
         return; // don't decrement pendingScans yet
       }
       markIpScanned(ip, /* clear */ true);
@@ -623,7 +611,7 @@ async function scanDevicePorts(ip: string, attempt = 0): Promise<void> {
   } catch (e) {
     log(`Port scan failed for ${ip}: ${formatError(e)}`);
     if (attempt < MAX_SCAN_RETRIES) {
-      setTimeout(() => scanDevicePorts(ip, attempt + 1), RETRY_DELAY_MS);
+      setTimeout(() => scanDevicePorts(mac, ip, attempt + 1), RETRY_DELAY_MS);
       return;
     }
     markIpScanned(ip, /* clear */ true);
@@ -722,7 +710,7 @@ export function renderArpDeviceList(): void {
       const ports = r.open_ports;
 
       const classes = ["device-item"];
-      if (selectedDevice.get() === r.ip) classes.push("selected");
+      if (selectedDevice.get()?.key === r.mac) classes.push("selected");
 
       // ICMP-result dot replaces the old verifying/offline/cached
       // badges — one signal, three colors. Missing entry = no probe
@@ -734,16 +722,18 @@ export function renderArpDeviceList(): void {
       // are attribute-safe, so the data-* attributes are covered too.
       const ipEsc = escapeHtml(r.ip);
       const portsEsc = escapeHtml(ports.join(", "));
+      const identityReason = r.status === "offline_different_device" ? "different device at this address"
+        : r.status === "offline_ambiguous_role" ? "ambiguous role; reassign explicitly" : "";
 
       // The node's name doubles as the role dropdown face: a synthetic
       // first option carries the current display name (selected +
       // disabled + hidden so it shows on the closed face but never
       // duplicates CAM/PTU inside the popup), followed by the actions.
       html += `
-        <div class="${classes.join(" ")}" data-ip="${ipEsc}">
+        <div class="${classes.join(" ")}" data-key="${escapeHtml(r.mac)}" data-ip="${ipEsc}">
           <div class="device-name-row">
             ${dot}
-            <select class="node-role-select" data-role-ip="${ipEsc}" title="Assign role">
+            <select class="node-role-select" data-role-key="${escapeHtml(r.mac)}" title="Assign role">
               <option selected disabled hidden>${escapeHtml(name)}</option>
               <option value="cam">CAM</option>
               <option value="ptu">PTU</option>
@@ -753,6 +743,7 @@ export function renderArpDeviceList(): void {
           <div class="device-detail-row">
             <a class="device-ip" href="#" data-browse="${ipEsc}" title="Open in browser">${ipEsc}</a>
             <span class="device-ports">${portsEsc}</span>
+            <span>${escapeHtml(identityReason)}</span>
           </div>
         </div>`;
     }
@@ -779,8 +770,10 @@ export function renderArpDeviceList(): void {
       if (target.closest(".device-ip") || target.closest(".node-role-select")) return;
       list.querySelectorAll(".device-item").forEach((i) => i.classList.remove("selected"));
       item.classList.add("selected");
-      const ip = item.dataset["ip"] ?? null;
-      selectedDevice.set(ip);
+      const record = deviceList.deviceByKey(item.dataset["key"]);
+      if (!record) return;
+      const targetChoice = deviceList.targetFor(record);
+      selectedDevice.set(targetChoice);
       // Remember this pick as the session's CAM target (getActiveCamIp
       // reads it first). Deliberately kept out of state.config: Save
       // Settings builds its payload from there, so a click would leak
@@ -793,8 +786,8 @@ export function renderArpDeviceList(): void {
       // highlight but must not hijack the CAM pick away from the
       // assigned CAM (an RTSP start against the PTU wedges in a stall
       // loop).
-      if (ip && deviceList.deviceByIp(ip)?.alias !== "PTU") {
-        sessionCamIp.set(ip);
+      if (record.alias !== "PTU") {
+        sessionCamTarget.set(targetChoice);
       }
     });
   });
@@ -834,9 +827,9 @@ export function renderArpDeviceList(): void {
         if (e.key === "Escape") closeRoleMenu();
       });
       select.addEventListener("change", () => {
-        const ip = select.dataset["roleIp"];
+        const key = select.dataset["roleKey"];
         const action = select.value;
-        if (ip) void handleRoleSelection(select, ip, action);
+        if (key) void handleRoleSelection(select, key, action);
         closeRoleMenu();
       });
     });
@@ -866,13 +859,17 @@ export function renderArpDeviceList(): void {
  *  leftovers — the role state is unchanged and the user re-picks. */
 async function handleRoleSelection(
   select: HTMLSelectElement,
-  ip: string,
+  key: string,
   action: string
 ): Promise<void> {
-  const current = deviceList.deviceByIp(ip)?.alias || "";
+  const record = deviceList.deviceByKey(key);
+  if (!record) return;
+  const target = deviceList.targetFor(record);
+  const ip = record.ip;
+  const current = record.alias || "";
   const noOp =
-    (action === "cam" && current === "CAM") ||
-    (action === "ptu" && current === "PTU") ||
+    (action === "cam" && current === "CAM" && deviceList.getDevices().filter((r) => r.alias === "CAM").length === 1) ||
+    (action === "ptu" && current === "PTU" && deviceList.getDevices().filter((r) => r.alias === "PTU").length === 1) ||
     (action === "clear" && current === "");
   if (noOp) {
     select.selectedIndex = 0;
@@ -881,71 +878,34 @@ async function handleRoleSelection(
 
   const alias = action === "cam" ? "CAM" : action === "ptu" ? "PTU" : "";
 
-  // Pre-mutation holders — the state the user acted on.
   const devices = deviceList.getDevices();
-  const prevCamIp = devices.find((r) => r.alias === "CAM")?.ip ?? null;
-  const prevPtuIp = devices.find((r) => r.alias === "PTU")?.ip ?? null;
+  const losesRole = (recordKey: string, role: string): boolean =>
+    recordKey === key ? alias !== role : alias === role;
+  const lostCams = devices.filter((r) => r.alias === "CAM" && losesRole(r.mac, "CAM"));
+  const lostPtus = devices.filter((r) => r.alias === "PTU" && losesRole(r.mac, "PTU"));
+  for (const outgoing of lostPtus) haltPtuUnit(outgoing.ip);
 
-  // A role is lost either by steal (another node takes it) or by the
-  // holder itself being overwritten or cleared.
-  const lostCamIp =
-    prevCamIp && (alias === "CAM" ? prevCamIp !== ip : prevCamIp === ip)
-      ? prevCamIp
-      : null;
-  const lostPtuIp =
-    prevPtuIp && (alias === "PTU" ? prevPtuIp !== ip : prevPtuIp === ip)
-      ? prevPtuIp
-      : null;
-
-  if (lostPtuIp) {
-    // Purges the queue and pins the halt to the outgoing IP before
-    // the alias moves, so nothing pending can reach the wrong unit.
-    haltPtuUnit(lostPtuIp);
-  }
-
-  if (lostCamIp && lostCamIp === getActivePlaybackIp()) {
-    await stopStreamNow(
-      action === "clear"
-        ? "Stream stopped — CAM cleared"
-        : "Stream stopped — CAM reassigned"
-    );
-  }
-
-  if (lostCamIp && action !== "cam") {
-    // CAM removed without a new holder (Clear, or PTU overwriting the
-    // CAM node): fully detach so getActiveCamIp resolves to nothing
-    // instead of falling back to the node that just lost the role.
-    if (sessionCamIp.get() === lostCamIp) {
-      sessionCamIp.set(null);
-    }
-    if (state.config && state.config.stream.camera_ip === lostCamIp) {
-      state.config.stream.camera_ip = "";
-      api.updateStreamSettings(state.config.stream).catch((e: unknown) => {
-        log(`clear persisted CAM failed for ${lostCamIp}: ${formatError(e)}`);
+  function detachCamera(recordKey: string): void {
+    if (sessionCamTarget.get()?.key === recordKey) sessionCamTarget.set(null);
+    const stream = state.config?.stream;
+    const configuredKey = stream?.camera_mac ?? (stream?.camera_ip ? `manual:${stream.camera_ip}` : null);
+    if (stream && configuredKey?.toLowerCase() === recordKey.toLowerCase()) {
+      stream.camera_ip = "";
+      stream.camera_mac = null;
+      api.updateStreamSettings(stream).catch((e: unknown) => {
+        log(`clear persisted CAM failed for ${recordKey}: ${formatError(e)}`);
       });
     }
   }
-
+  for (const outgoing of lostCams) {
+    if (getActivePlaybackTarget()?.key === outgoing.mac) {
+      await stopStreamNow(action === "clear" ? "Stream stopped — CAM cleared" : "Stream stopped — CAM reassigned");
+    }
+    if (action !== "cam") detachCamera(outgoing.mac);
+  }
   if (action === "ptu") {
-    // The node just became the PTU, which is never a camera target —
-    // independent of what it was called before. A click-streamed
-    // unaliased node can be assigned PTU directly: drop a stream
-    // playing it, and detach any session pick or persisted camera IP
-    // a bare row click left aimed at it. (When the node also held CAM,
-    // the blocks above already did all of this and these checks
-    // no-op.)
-    if (getActivePlaybackIp() === ip) {
-      await stopStreamNow("Stream stopped — node is now the PTU");
-    }
-    if (sessionCamIp.get() === ip) {
-      sessionCamIp.set(null);
-    }
-    if (state.config && state.config.stream.camera_ip === ip) {
-      state.config.stream.camera_ip = "";
-      api.updateStreamSettings(state.config.stream).catch((e: unknown) => {
-        log(`clear persisted CAM failed for ${ip}: ${formatError(e)}`);
-      });
-    }
+    if (getActivePlaybackTarget()?.key === key) await stopStreamNow("Stream stopped — node is now the PTU");
+    detachCamera(key);
   }
 
   // Disabled while the write is in flight so a double-pick can't race
@@ -954,22 +914,23 @@ async function handleRoleSelection(
   // is already a no-op in newer backend state.
   select.disabled = true;
   try {
-    await deviceList.setAlias(ip, alias);
+    await deviceList.setAlias(key, alias);
     if (action === "cam") {
       // A CAM designation is deliberate — persist it to disk so
       // getActiveCamIp's config fallback picks it up next session
       // (the click-to-select path only sets this in memory), and
-      // mirror into selectedDevice/sessionCamIp so subscribers (zoom
+      // mirror into selectedDevice/sessionCamTarget so subscribers (zoom
       // restore, panel highlight) react immediately and this newest
       // designation outranks any earlier node click.
       if (state.config) {
         state.config.stream.camera_ip = ip;
+        state.config.stream.camera_mac = target.expectedMac;
         api.updateStreamSettings(state.config.stream).catch((e: unknown) => {
           log(`persist CAM pick failed for ${ip}: ${formatError(e)}`);
         });
       }
-      selectedDevice.set(ip);
-      sessionCamIp.set(ip);
+      selectedDevice.set(target);
+      sessionCamTarget.set(target);
     }
   } catch (e) {
     showToast(`Failed to set role: ${formatError(e)}`, true);

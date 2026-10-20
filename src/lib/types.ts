@@ -17,7 +17,7 @@
 
 /** User-visible reachability status of a device record.
  *  Wire shape uses snake_case via `#[serde(rename_all = "snake_case")]`. */
-export type DeviceStatus = "live" | "verifying" | "offline" | "cached_only" | "offline_non_wired_subnet" | "offline_host_owned_ip";
+export type DeviceStatus = "live" | "verifying" | "offline" | "cached_only" | "offline_non_wired_subnet" | "offline_host_owned_ip" | "offline_different_device" | "offline_ambiguous_role";
 
 /** Unified device record. Replaces the old split between ARP map +
  *  scan-result map + alias map + cache file rows. */
@@ -46,6 +46,7 @@ export type NetworkMode = "dhcp" | "static_auto" | "static_manual";
 /** User-pinned device for `NetworkMode = "static_manual"`. Persists
  *  across mode toggles. */
 export interface ManualNode {
+  expected_mac: string | null;
   ip: string;
   alias: string;
 }
@@ -95,6 +96,7 @@ export interface StreamConfig {
   rtsp_path: string;
   udp_port: number;
   camera_ip: string;
+  camera_mac: string | null;
   /** Audio mute preference; false = audio plays when a stream carries
    *  a supported track. Required so every StreamConfig literal carries
    *  it — an omitted field would deserialize to false backend-side and

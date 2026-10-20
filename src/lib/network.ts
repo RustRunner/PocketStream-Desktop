@@ -15,7 +15,7 @@ import {
 } from "./state.ts";
 import { resetDiscoveryStatus, hideDiscoveryStatus, renderArpDeviceList } from "./devices.js";
 import { handleHardDisconnect, handleReconnect, showModalWithVideo } from "./streaming.js";
-import { sessionCamIp } from "./store.ts";
+import { sessionCamTarget, type DeviceTarget } from "./store.ts";
 import { formatError } from "./errors.ts";
 import type {
   AdapterSelection,
@@ -531,47 +531,40 @@ export function renderSubnetList(): void {
 // so any state shift in the Nodes panel takes effect on the next
 // action without needing dropdown re-population.
 
-/** Look up the device IP currently aliased to a role string (CAM /
- *  PTU / custom). Aliases are persisted server-side via set_device_alias
- *  and hydrated into the registry from the device cache on cold start,
- *  so this round-trips a role designation across program restarts. */
-function findDeviceIpByAlias(alias: string): string | undefined {
-  return deviceList.getDevices().find((r) => r.alias === alias)?.ip;
+/** Ambiguous legacy roles require an explicit user choice. */
+function targetByAlias(alias: string): DeviceTarget | null {
+  const matches = deviceList.getDevices().filter((r) => r.alias === alias);
+  return matches.length === 1 ? deviceList.targetFor(matches[0]!) : null;
 }
 
-/** The IP to use as the camera target right now. Tries (in order):
- *    1. The session pick — node click, CAM aliasing, or reconnect
- *       resume; the user's most recent explicit intent
- *    2. The device currently aliased CAM — resolved from the live
- *       device list, so it tracks the camera even if its IP shifted
- *       since camera_ip was last persisted
- *    3. The IP persisted in StreamConfig by the last stream start —
- *       the cold-start fallback
- *  The PTU-designated node is never a camera target: an RTSP request
- *  to the pan-tilt unit opens a session that can never preroll and
- *  wedges the pipeline in a stall loop. A session pick or stale
- *  persisted camera_ip that lands on the PTU holder is skipped so the
- *  chain falls through to the real CAM instead (field failure:
- *  Start Stream targeted the PTU after a row click).
- *  Returns null if none of these resolve — Start Stream surfaces a
- *  "select a CAM" toast in that case. */
-export function getActiveCamIp(): string | null {
-  const ptuIp = findDeviceIpByAlias("PTU");
-  const session = sessionCamIp.get();
-  if (session && session !== ptuIp) return session;
-  // A record holds one alias, so the CAM holder can never be the PTU.
-  const aliased = findDeviceIpByAlias("CAM");
+export function getActiveCamTarget(): DeviceTarget | null {
+  const session = sessionCamTarget.get();
+  if (session) {
+    // Hold missing selections instead of falling through to a replacement.
+    if (deviceList.resolveTarget(session)?.alias !== "PTU") return session;
+  }
+  const configured = state.config?.stream;
+  if (configured?.camera_mac) {
+    const target = { key: configured.camera_mac, expectedMac: configured.camera_mac };
+    if (deviceList.resolveTarget(target)?.alias !== "PTU") return target;
+  }
+  const aliased = targetByAlias("CAM");
   if (aliased) return aliased;
-  const configured = state.config?.stream.camera_ip || null;
-  return configured && configured !== ptuIp ? configured : null;
+  // Legacy IP-only settings can resolve only an explicit, unbound manual key.
+  const manual = deviceList.deviceByKey(`manual:${configured?.camera_ip ?? ""}`);
+  return manual && manual.alias !== "PTU" ? deviceList.targetFor(manual) : null;
 }
 
-/** The IP to use as the PTU target right now. PTU is alias-driven
- *  only — there's no per-session click override for it (the click on
- *  a node row is reserved for the CAM target). To switch PTU targets,
- *  re-assign the role from the node's dropdown. */
+export function getActiveCamIp(): string | null {
+  const ip = deviceList.endpointFor(getActiveCamTarget());
+  return ip && !ip.startsWith("169.254.") ? ip : null;
+}
+
+export function getActivePtuTarget(): DeviceTarget | null { return targetByAlias("PTU"); }
+
 export function getActivePtuIp(): string | null {
-  return findDeviceIpByAlias("PTU") ?? null;
+  const ip = deviceList.endpointFor(getActivePtuTarget());
+  return ip && !ip.startsWith("169.254.") ? ip : null;
 }
 
 // ── IP Configuration dialog ─────────────────────────────────────────

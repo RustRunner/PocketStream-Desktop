@@ -176,8 +176,15 @@ pub async fn add_manual_node(
     manager: State<'_, NetworkManager>,
     ip: String,
     alias: String,
+    expected_mac: Option<String>,
 ) -> Result<(), AppError> {
-    let node = validated_manual_node(ip, alias)?;
+    let mut node = validated_manual_node(ip, alias)?;
+    node.expected_mac = expected_mac
+        .map(|mac| {
+            crate::network::device_registry::canonical_mac(&mac)
+                .ok_or_else(|| AppError::Network("Invalid expected device MAC".into()))
+        })
+        .transpose()?;
     config.add_manual_node(node)?;
     // Reflect the new pin in the live registry so the Nodes panel
     // updates without a full mode-switch. hydrate_manual_nodes patches
@@ -198,7 +205,11 @@ fn validated_manual_node(ip: String, alias: String) -> Result<ManualNode, AppErr
             "CAM and PTU are assigned from the Nodes panel".into(),
         ));
     }
-    Ok(ManualNode { ip, alias })
+    Ok(ManualNode {
+        ip,
+        alias,
+        expected_mac: None,
+    })
 }
 
 #[tauri::command]
@@ -206,13 +217,24 @@ pub async fn remove_manual_node(
     config: State<'_, AppConfig>,
     manager: State<'_, NetworkManager>,
     ip: String,
+    expected_mac: Option<String>,
 ) -> Result<(), AppError> {
-    config.remove_manual_node(&ip)?;
-    // Drop the synthetic registry entry too. Real-MAC entries that the
-    // pin may have aliased stay in the registry — the user's "remove
-    // this row" intent only un-pins, not forget.
-    let synthetic_key = format!("manual:{}", ip);
-    if manager.registry().remove_by_mac(&synthetic_key) {
+    if !config.remove_manual_node(&ip, expected_mac.as_deref())? {
+        return Ok(());
+    }
+    let registry = manager.registry();
+    let key = expected_mac
+        .as_ref()
+        .and_then(|mac| {
+            registry
+                .snapshot()
+                .into_iter()
+                .find(|r| r.mac.eq_ignore_ascii_case(mac))
+                .map(|r| r.mac)
+        })
+        .unwrap_or_else(|| format!("manual:{}", ip));
+    config.remove_cached_device(&key)?;
+    if registry.remove_by_mac(&key) {
         if let Some(emitter) = manager.emitter().await {
             emitter.poke();
         }
@@ -234,6 +256,7 @@ pub async fn clear_manual_nodes(
     Ok(())
 }
 
+/// Diagnostic only: this legacy neighbor lookup never authorizes promotion.
 /// Look up the MAC at `ip`, bound to the wired path. Used by the
 /// cache-verify path to confirm a cached record at an IP is still the
 /// same physical device, not just *something else* with the same
@@ -302,52 +325,32 @@ pub async fn get_device_list(
     Ok(manager.registry().snapshot())
 }
 
-/// Apply the result of a successful port scan to the canonical registry.
-/// Updates the matching record's `open_ports` and flips its status to
-/// `Live`, then persists the change to `device_cache.toml` so cold-start
-/// hydration sees it. Emits a debounced `device-list-changed` event.
-///
-/// No-op if no record matches `ip` — discovery has to land first.
+/// Attach capability data to the requested identity, without promoting it.
 #[tauri::command]
 pub async fn report_scan_result(
     manager: State<'_, NetworkManager>,
     config: State<'_, AppConfig>,
-    app: tauri::AppHandle,
-    ip: String,
+    key: String,
     open_ports: Vec<u16>,
 ) -> Result<(), AppError> {
-    crate::validation::parse_camera_ip(&ip)?;
-    let fence = manager.sweep_fence();
-    // Manual has no discovery session yet. Keep its legacy capability path
-    // until S5a supplies the independent adapter-epoch presence fence.
-    let fence = (config.get_network_mode() != NetworkMode::StaticManual).then_some(&fence);
-    if fence.is_some_and(|f| f.is_stale()) {
-        return Ok(());
-    }
-    if !open_ports.is_empty() {
-        if let Some(fence) = fence {
-            manager
-                .note_positive_liveness_fenced(&app, ip.parse().unwrap(), fence)
-                .await;
-        }
-    }
-    if fence.is_some_and(|f| f.is_stale()) {
-        return Ok(());
-    }
     let registry = manager.registry();
-    if !registry.merge_scan_result_fenced(&ip, &open_ports, fence) {
+    let Some(record) = registry.snapshot().into_iter().find(|r| r.mac == key) else {
+        return Ok(());
+    };
+    crate::validation::parse_camera_ip(&record.ip)?;
+    let fence = manager.sweep_fence();
+    let fence = (config.get_network_mode() != NetworkMode::StaticManual).then_some(&fence);
+    if !registry.merge_scan_result_fenced(&key, &open_ports, fence) {
         return Ok(());
     }
-    for record in registry.snapshot().iter().filter(|r| r.ip == ip) {
-        persist_record_for_key(&registry, &config, &record.mac, fence)?;
-    }
+    persist_record_for_key(&registry, &config, &key, fence)?;
     if let Some(emitter) = manager.emitter().await {
         emitter.poke();
     }
     Ok(())
 }
 
-/// Set or clear the user-assigned alias for the device with this IP.
+/// Set or clear the user-assigned alias for this record key.
 /// Empty string clears. Assigning CAM or PTU demotes any previous
 /// holder (single-holder invariant), so more than one record can
 /// change. Every changed record is written through to the cache and
@@ -361,11 +364,11 @@ pub async fn report_scan_result(
 pub async fn set_device_alias(
     manager: State<'_, NetworkManager>,
     config: State<'_, AppConfig>,
-    ip: String,
+    key: String,
     alias: String,
 ) -> Result<Vec<DeviceRecord>, AppError> {
     let registry = manager.registry();
-    let changed = registry.set_alias(&ip, &alias);
+    let changed = registry.set_alias(&key, &alias);
     if !changed.is_empty() {
         crate::network::persist_alias_writethrough(&registry, &config, &changed);
         if let Some(emitter) = manager.emitter().await {
@@ -394,34 +397,6 @@ pub async fn set_device_status(
     Ok(())
 }
 
-/// Evict a phantom cached device whose targeted verify found no open
-/// ports. The backend enforces the exemptions: user-pinned entries
-/// (any alias, manual nodes, the persisted stream target) and Live
-/// (ARP-confirmed) devices are never removed, so the frontend can call
-/// this unconditionally on a failed verify and a pinned device is left
-/// to keep re-verifying.
-/// Returns true if a device was evicted, false if `ip` was exempt (kept)
-/// or not tracked — the frontend keeps re-verifying only the kept ones.
-#[tauri::command]
-pub async fn evict_phantom_device(
-    manager: State<'_, NetworkManager>,
-    config: State<'_, AppConfig>,
-    ip: String,
-) -> Result<bool, AppError> {
-    let pins = crate::network::device_registry::configured_pins(&config.get());
-    match manager.registry().evict_phantom(&ip, &pins) {
-        Some(mac) => {
-            config.remove_cached_device(&mac)?;
-            if let Some(emitter) = manager.emitter().await {
-                emitter.poke();
-            }
-            log::info!("Evicted phantom device {} ({})", ip, mac);
-            Ok(true)
-        }
-        None => Ok(false),
-    }
-}
-
 /// Drop a device from the registry and the on-disk cache. Used by the
 /// "forget this device" affordance in the offline-cache dialog.
 #[tauri::command]
@@ -430,6 +405,15 @@ pub async fn forget_device(
     config: State<'_, AppConfig>,
     mac: String,
 ) -> Result<(), AppError> {
+    // A verified manual pin shares the discovered identity; explicit forget
+    // removes that matching pin too, so a later hydration cannot resurrect it.
+    for node in config.get_manual_nodes().iter().filter(|n| {
+        n.expected_mac
+            .as_ref()
+            .is_some_and(|m| m.eq_ignore_ascii_case(&mac))
+    }) {
+        config.remove_manual_node(&node.ip, node.expected_mac.as_deref())?;
+    }
     if !manager.registry().forget(&mac) {
         return Ok(());
     }

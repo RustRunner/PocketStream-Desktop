@@ -5,7 +5,7 @@
 import * as api from "./tauri-api.ts";
 import { $, state, log, showToast } from "./state.ts";
 import { formatError } from "./errors.ts";
-import { getActiveCamIp, getActivePtuIp } from "./network.ts";
+import { getActiveCamIp, getActivePtuIp, getActiveCamTarget } from "./network.ts";
 import { selectedDevice } from "./store.ts";
 import * as deviceList from "./device-list.ts";
 
@@ -577,7 +577,7 @@ function setupZoomSlider(): void {
   // timeout. Until the record exists AND reports live, hold the push
   // and let the deviceList subscription below fire it the moment the
   // CAM flips live (also covers a camera that boots after the app).
-  let pendingRestoreIp: string | null = null;
+  let pendingRestoreKey: string | null = null;
 
   function applySavedZoom(): void {
     const ip = getCameraIp();
@@ -588,14 +588,13 @@ function setupZoomSlider(): void {
     // A missing record is held exactly like a non-live one: the restore
     // can run before the registry has hydrated its cache at all, which
     // is precisely the no-route window. Nothing legitimate is lost by
-    // holding — manually-entered IPs hydrate as Live records, so the
-    // only record-less state is "not discovered yet".
-    const record = deviceList.deviceByIp(ip);
+    // holding: manual and cached entries remain inactive until verified.
+    const record = deviceList.resolveTarget(getActiveCamTarget());
     if (!record || record.status !== "live") {
-      pendingRestoreIp = ip;
+      pendingRestoreKey = getActiveCamTarget()?.key ?? null;
       return;
     }
-    pendingRestoreIp = null;
+    pendingRestoreKey = null;
     // Don't pre-set lastSentPercent — we want request() below to fire
     // so the camera catches up to the slider. Quiet: this is a
     // background restore, not a user action.
@@ -603,13 +602,13 @@ function setupZoomSlider(): void {
   }
 
   deviceList.subscribe(() => {
-    if (!pendingRestoreIp) return;
-    const record = deviceList.deviceByIp(pendingRestoreIp);
+    if (!pendingRestoreKey) return;
+    const record = deviceList.deviceByKey(pendingRestoreKey);
     if (record?.status !== "live") return;
     // Re-check the selection — the user may have moved on while the
     // restore was pending; applySavedZoom re-derives everything.
-    if (getCameraIp() !== pendingRestoreIp) {
-      pendingRestoreIp = null;
+    if (getActiveCamTarget()?.key !== pendingRestoreKey) {
+      pendingRestoreKey = null;
       return;
     }
     applySavedZoom();
