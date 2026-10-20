@@ -119,8 +119,10 @@ export function escapeHtml(str: unknown): string {
 }
 
 export function showToast(message: string, isError = false): void {
-  // Write toast messages to the log file for diagnostics
+  // Routine status stays in diagnostics. Actionable errors still notify;
+  // the independent updater toast keeps its Install/Later actions.
   logToFile(isError ? "error" : "info", `toast: ${message}`);
+  if (!isError) return;
 
   // Never evict the update notification — it stays until the user acts on
   // it. Only clear a prior transient toast.
