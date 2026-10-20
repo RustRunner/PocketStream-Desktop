@@ -528,8 +528,8 @@ pub fn run() {
                                         // With the cable out, the start
                                         // pre-attaches the listener and then
                                         // reports the expected no-link error;
-                                        // discovery proper starts on the
-                                        // frontend's up-event.
+                                        // the backend watcher completes
+                                        // discovery when the link returns.
                                         Err(e) if !media_up => {
                                             log::info!(
                                                 "ARP discovery waiting for link-up: {}",

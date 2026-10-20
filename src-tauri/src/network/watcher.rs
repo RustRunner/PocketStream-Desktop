@@ -43,6 +43,9 @@ pub(crate) fn emit_selection(handle: &AppHandle, selection: &AdapterSelection) {
 pub(crate) async fn refresh(handle: &AppHandle) -> Result<(), crate::AppError> {
     let manager = handle.state::<NetworkManager>();
     let config = handle.state::<crate::config::AppConfig>();
+    // Complete a known adapter's link-up before a slow provider refresh.
+    // Unknown metadata/index changes still go through selection below.
+    manager.resume_discovery(&config, handle).await?;
     let previous = manager.adapter_selection_state().await;
     let mut selection = manager.get_adapter_selection(&config).await?;
     manager.update_presence_adapter(&selection, config.get_network_mode());
@@ -54,10 +57,55 @@ pub(crate) async fn refresh(handle: &AppHandle) -> Result<(), crate::AppError> {
         manager.start_selected_adapter(&config, handle).await;
         selection = manager.get_adapter_selection(&config).await?;
     }
+    retry_discovery(handle).await?;
     if serde_json::to_value(previous).ok() != serde_json::to_value(&selection).ok() {
         emit_selection(handle, &selection);
     }
     Ok(())
+}
+
+async fn retry_discovery(handle: &AppHandle) -> Result<(), crate::AppError> {
+    let manager = handle.state::<NetworkManager>();
+    let config = handle.state::<crate::config::AppConfig>();
+    if manager.resume_discovery(&config, handle).await? {
+        // Missing metadata or a changed index goes through the existing
+        // selection/restore path. The next tick completes capture/session setup.
+        let previous = manager.adapter_selection_state().await;
+        let selection = manager.get_adapter_selection(&config).await?;
+        if previous.selected_mac != selection.selected_mac
+            || previous.interface_index != selection.interface_index
+        {
+            manager.start_selected_adapter(&config, handle).await;
+        }
+        emit_selection(handle, &selection);
+    }
+    Ok(())
+}
+
+/// One existing watcher owns notifications and bounded pending-start retries.
+/// A failed provider/start does not require another native event to recover.
+#[cfg(any(target_os = "windows", test))]
+async fn watch_changes<F, Fut>(mut rx: tokio::sync::mpsc::UnboundedReceiver<()>, mut refresh: F)
+where
+    F: FnMut(bool) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    use std::time::Duration;
+    let period = Duration::from_secs(5);
+    let mut retry = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let changed = tokio::select! {
+            event = rx.recv() => { if event.is_none() { return; } true },
+            _ = retry.tick() => false,
+        };
+        if changed {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            while rx.try_recv().is_ok() {}
+        }
+        refresh(changed).await;
+        retry.reset(); // give a failed/slow attempt a full bounded pause
+    }
 }
 
 /// Interface enumeration goes through the manager, which strips pending
@@ -77,7 +125,6 @@ mod imp {
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::OnceLock;
-    use std::time::Duration;
 
     use tauri::AppHandle;
     use tokio::sync::mpsc;
@@ -207,28 +254,98 @@ mod imp {
         true
     }
 
-    async fn debounce_loop(mut rx: mpsc::UnboundedReceiver<()>, handle: AppHandle) {
-        loop {
-            if rx.recv().await.is_none() {
-                return;
+    async fn debounce_loop(rx: mpsc::UnboundedReceiver<()>, handle: AppHandle) {
+        super::watch_changes(rx, |changed| {
+            let handle = handle.clone();
+            async move {
+                let result = if changed {
+                    super::super::interface::invalidate_adapter_snapshot();
+                    super::refresh(&handle).await
+                } else {
+                    super::retry_discovery(&handle).await
+                };
+                if let Err(e) = result {
+                    log::warn!(
+                        "event=discovery_resume phase=failed retry_after_s=5 error={}",
+                        super::super::log_value(&e.to_string())
+                    );
+                }
             }
-
-            // Coalesce bursts — a link transition often fires several
-            // IP/interface notifications in quick succession.
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            while rx.try_recv().is_ok() {}
-
-            super::super::interface::invalidate_adapter_snapshot();
-            if let Err(e) = super::refresh(&handle).await {
-                log::debug!("Watcher selection refresh failed: {e}");
-            }
-        }
+        })
+        .await;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_discovery_retries_provider_and_attach_failures_without_events() {
+        use crate::network::{discovery_resume_action, DiscoveryResume};
+        use std::sync::{Arc, Mutex};
+        let iface = InterfaceInfo {
+            name: "Ethernet".into(),
+            display_name: "Ethernet".into(),
+            description: "ASIX".into(),
+            mac: "40:cd:3a:00:00:01".into(),
+            ips: vec![],
+            is_up: false,
+            is_ethernet: true,
+            is_wifi: false,
+            is_vpn: false,
+            is_virtual: false,
+        };
+        let initial = AdapterSelection {
+            selected_mac: Some(iface.mac.clone()),
+            interface_index: Some(7),
+            ..Default::default()
+        };
+        // provider attempts, start attempts, selection, active
+        let state = Arc::new(Mutex::new((0, 0, initial, false)));
+        let task_state = state.clone();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(watch_changes(rx, move |changed| {
+            assert!(!changed, "no native or frontend events were sent");
+            let state = task_state.clone();
+            let iface = iface.clone();
+            async move {
+                let mut s = state.lock().unwrap();
+                match discovery_resume_action(
+                    crate::config::NetworkMode::StaticAuto,
+                    true,
+                    s.3,
+                    s.2.selected_mac.as_deref(),
+                    &s.2,
+                    Some((7, true, vec![])),
+                    false,
+                ) {
+                    DiscoveryResume::RefreshSelection => {
+                        s.0 += 1;
+                        if s.0 == 2 {
+                            s.2.adapter = Some(iface);
+                        } // first query failed
+                    }
+                    DiscoveryResume::Start(_) => {
+                        s.1 += 1;
+                        if s.1 == 2 {
+                            s.3 = true;
+                        } // first attach failed
+                    }
+                    DiscoveryResume::Idle => {}
+                }
+            }
+        }));
+        tokio::task::yield_now().await;
+        for expected in [(1, 0), (2, 0), (2, 1), (2, 2), (2, 2)] {
+            tokio::time::advance(std::time::Duration::from_secs(5)).await;
+            tokio::task::yield_now().await;
+            let s = state.lock().unwrap();
+            assert_eq!((s.0, s.1), expected);
+        }
+        drop(tx);
+        task.await.unwrap();
+    }
 
     #[test]
     fn watcher_reports_selected_usb_or_unavailable_never_the_dock() {

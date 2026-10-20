@@ -374,12 +374,11 @@ function applyUpEvent(iface: InterfaceInfo, wasDown: boolean): void {
   if (wasDown) {
     // If we just came back from disconnected, re-render immediately
     // from the preserved state so the Nodes list snaps back, then
-    // kick off discovery to verify. Verification will dim/mark any
-    // devices that genuinely vanished during the downtime.
+    // let backend readiness resume discovery and verification independently
+    // of UI query/event ordering.
     renderArpDeviceList();
     resetDiscoveryStatus();
     onDiscoveryReconnect();
-    api.startArpDiscovery(iface.name).catch(() => {});
     // Restart the stream (and RTSP server) if they were running
     // before the disconnect. Fires in the background; failures
     // surface as toasts inside handleReconnect.

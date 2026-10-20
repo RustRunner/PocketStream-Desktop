@@ -164,11 +164,9 @@ static DATA_CB_PANIC_LOGGED: AtomicBool = AtomicBool::new(false);
 /// was saturated (a distinct-tuple flood or a slow registry). Never resets.
 static ARP_TASKS_DROPPED: AtomicU64 = AtomicU64::new(0);
 
-/// Count of ARP frames dropped because the sender IP is on a subnet owned
-/// exclusively by a non-Ethernet interface (WiFi/VPN). The capture backend
-/// is unscoped, so wireless ARP (the WiFi gateway and other wireless hosts)
-/// reaches the callback; discovery is wired-Ethernet only, so these are
-/// filtered before they can become nodes. Never resets.
+/// Legacy listener frames dropped by subnet when no verifier is installed.
+/// Activated discovery uses capture scope or fresh selected-interface proof,
+/// including on overlapping subnets. Never resets.
 static ARP_NONETH_DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Count of ARP frames dropped because the sender IP is one of the host's
@@ -238,8 +236,7 @@ pub fn tasks_dropped() -> u64 {
     ARP_TASKS_DROPPED.load(Ordering::Relaxed)
 }
 
-/// Total ARP frames dropped because the sender IP is on a non-Ethernet
-/// (WiFi/VPN) subnet — filtered out to keep discovery wired-Ethernet only.
+/// Total legacy frames dropped by the non-Ethernet subnet prefilter.
 pub fn noneth_dropped() -> u64 {
     ARP_NONETH_DROPPED.load(Ordering::Relaxed)
 }
@@ -560,7 +557,7 @@ impl DedupeLru {
 
 /// Verdict for a captured ARP sender: admit it as a peer, or drop it.
 /// When several drop conditions apply at once the precedence is
-/// prohibited address, non-wired subnet, self IP, then own MAC — all drop the
+/// prohibited address, legacy non-wired subnet, self IP, then own MAC — all drop the
 /// frame, so the order only decides which counter and log fire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SenderVerdict {
@@ -579,7 +576,11 @@ enum SenderVerdict {
 }
 
 /// Sender gate for the capture callback: scope discovery to the
-/// wired port's peers and reject the host's own traffic. An empty
+/// wired port's peers and reject the host's own traffic. On the verified path,
+/// topology cannot exclude a sender: MAC-scoped capture proves its interface,
+/// and all other observations require fresh verification on that interface.
+/// An overlapping or stale Wi-Fi prefix is not evidence against either path.
+/// On the legacy path, an empty
 /// `local_ips` or `excluded` disables that check (fail-open). A wired
 /// camera with a permitted address — on the Ethernet or a foreign subnet —
 /// matches none of the drop conditions. Prohibited drops are counted here,
@@ -591,12 +592,13 @@ fn classify_sender(
     local_ips: &HashSet<Ipv4Addr>,
     excluded: &[ipnetwork::Ipv4Network],
     counters: &SessionCounters,
+    has_verifier: bool,
 ) -> SenderVerdict {
     if crate::validation::prohibited_camera_ip(ip) {
         counters.note_prohibited_dropped();
         return SenderVerdict::DropProhibited;
     }
-    if excluded.iter().any(|net| net.contains(ip)) {
+    if !has_verifier && excluded.iter().any(|net| net.contains(ip)) {
         return SenderVerdict::DropNonWiredSubnet;
     }
     if local_ips.contains(&ip) {
@@ -796,12 +798,9 @@ unsafe fn data_cb_inner(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor
     let Some((op, mac, ip)) = extract_arp(frame, packet_type) else {
         return;
     };
-    // Gate discovery to the wired Ethernet port's peers. The capture
-    // backend is unscoped (only the in-driver EtherType=ARP constraint
-    // applies), so ARP from the WiFi side — the gateway, other wireless
-    // hosts, and this host's own WiFi NIC — reaches this callback and
-    // would otherwise become phantom nodes. Prohibited addresses, including
-    // APIPA, are rejected even if the local-IP/exclusion locks fail.
+    // Scope proof or fresh selected-interface verification owns admission.
+    // The subnet exclusion remains only for a legacy listener with no
+    // candidate verifier. Self/prohibited senders are rejected in every scope.
     // Snapshot the exclusion set first (brief lock; poison fails open to
     // "no filtering", the same tolerance as the local-IP set) so the two
     // locks are never held together.
@@ -811,7 +810,15 @@ unsafe fn data_cb_inner(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor
         .map(|v| v.clone())
         .unwrap_or_default();
     let verdict = match ctx.local_ips.lock() {
-        Ok(local) => classify_sender(ip, mac, ctx.own_mac, &local, &excluded, &ctx.counters),
+        Ok(local) => classify_sender(
+            ip,
+            mac,
+            ctx.own_mac,
+            &local,
+            &excluded,
+            &ctx.counters,
+            ctx.candidates.is_some(),
+        ),
         Err(_) => classify_sender(
             ip,
             mac,
@@ -819,6 +826,7 @@ unsafe fn data_cb_inner(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor
             &HashSet::new(),
             &excluded,
             &ctx.counters,
+            ctx.candidates.is_some(),
         ),
     };
     let reject = |reason| {
@@ -1939,7 +1947,15 @@ mod tests {
             "255.255.255.255",
         ] {
             assert_eq!(
-                classify_sender(ipv4(ip), OTHER_MAC, None, &HashSet::new(), &[], &counters),
+                classify_sender(
+                    ipv4(ip),
+                    OTHER_MAC,
+                    None,
+                    &HashSet::new(),
+                    &[],
+                    &counters,
+                    false
+                ),
                 SenderVerdict::DropProhibited
             );
         }
@@ -1978,10 +1994,69 @@ mod tests {
                 Some(WIRED_MAC),
                 &local,
                 &[],
-                &SessionCounters::default()
+                &SessionCounters::default(),
+                false
             ),
             SenderVerdict::DropSelfIp
         );
+    }
+
+    #[test]
+    fn verified_path_accepts_a_camera_even_with_a_stale_wifi_exclusion() {
+        let local = local_set(&["192.168.1.100", "192.168.1.73"]);
+        let excluded = ["192.168.1.0/24".parse().unwrap()];
+        let counters = SessionCounters::default();
+        assert_eq!(
+            classify_sender(
+                ipv4("192.168.1.204"),
+                OTHER_MAC,
+                Some(WIRED_MAC),
+                &local,
+                &excluded,
+                &counters,
+                true
+            ),
+            SenderVerdict::Accept
+        );
+        assert_eq!(
+            classify_sender(
+                ipv4("192.168.1.100"),
+                OTHER_MAC,
+                Some(WIRED_MAC),
+                &local,
+                &excluded,
+                &counters,
+                true
+            ),
+            SenderVerdict::DropSelfIp
+        );
+        assert_eq!(
+            classify_sender(
+                ipv4("192.168.1.204"),
+                WIRED_MAC,
+                Some(WIRED_MAC),
+                &local,
+                &excluded,
+                &counters,
+                true
+            ),
+            SenderVerdict::DropOwnMac
+        );
+        for has_verifier in [false, true] {
+            assert_eq!(
+                classify_sender(
+                    ipv4("169.254.10.2"),
+                    OTHER_MAC,
+                    Some(WIRED_MAC),
+                    &local,
+                    &excluded,
+                    &counters,
+                    has_verifier
+                ),
+                SenderVerdict::DropProhibited
+            );
+        }
+        assert_eq!(counters.snapshot().prohibited_dropped, 2);
     }
 
     #[test]
@@ -1997,7 +2072,8 @@ mod tests {
                 Some(WIRED_MAC),
                 &local,
                 &[],
-                &SessionCounters::default()
+                &SessionCounters::default(),
+                false
             ),
             SenderVerdict::DropOwnMac
         );
@@ -2013,7 +2089,8 @@ mod tests {
                 Some(WIRED_MAC),
                 &local_set(&["192.168.1.101"]),
                 &excluded,
-                &SessionCounters::default()
+                &SessionCounters::default(),
+                false
             ),
             SenderVerdict::DropNonWiredSubnet
         );
@@ -2032,7 +2109,8 @@ mod tests {
                 Some(WIRED_MAC),
                 &local,
                 &[],
-                &SessionCounters::default()
+                &SessionCounters::default(),
+                false
             ),
             SenderVerdict::Accept
         );
@@ -2043,7 +2121,8 @@ mod tests {
                 Some(WIRED_MAC),
                 &local,
                 &[],
-                &SessionCounters::default()
+                &SessionCounters::default(),
+                false
             ),
             SenderVerdict::Accept
         );
@@ -2060,7 +2139,8 @@ mod tests {
                 None,
                 &HashSet::new(),
                 &[],
-                &SessionCounters::default()
+                &SessionCounters::default(),
+                false
             ),
             SenderVerdict::Accept
         );
@@ -2078,7 +2158,8 @@ mod tests {
                 Some(WIRED_MAC),
                 &local_set(&["192.168.12.103"]),
                 &excluded,
-                &SessionCounters::default()
+                &SessionCounters::default(),
+                false
             ),
             SenderVerdict::DropNonWiredSubnet
         );
