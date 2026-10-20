@@ -89,15 +89,26 @@ impl CandidateIngress {
         now: Instant,
     ) {
         let mut entries = self.store.entries.lock().unwrap_or_else(|p| p.into_inner());
-        if fence.is_stale()
-            || self.interface_index == 0
-            || crate::validation::prohibited_camera_ip(ip)
-            || mac == [0; 6]
-            || mac[0] & 1 != 0
-            || mac == self.adapter_mac
-            || self.adapter_mac == [0; 6]
-            || self.adapter_mac[0] & 1 != 0
-        {
+        let reason = if fence.is_stale() {
+            Some("stale_fence")
+        } else if self.interface_index == 0 {
+            Some("missing_index")
+        } else if crate::validation::prohibited_camera_ip(ip) {
+            Some("prohibited_ip")
+        } else if mac == [0; 6] || mac[0] & 1 != 0 {
+            Some("invalid_peer_mac")
+        } else if mac == self.adapter_mac {
+            Some("own_mac")
+        } else if self.adapter_mac == [0; 6] || self.adapter_mac[0] & 1 != 0 {
+            Some("invalid_adapter_mac")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            if reason == "stale_fence" {
+                note_fence_drop("candidate");
+            }
+            note_candidate_rejection(reason, self.interface_index, self.adapter_mac, mac, ip);
             return;
         }
         entries.retain(|_, seen| now.saturating_duration_since(*seen) < CANDIDATE_TTL);
@@ -170,6 +181,52 @@ static ARP_SELF_IP_DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Prohibited sender addresses (including APIPA), rejected before merging.
 static ARP_PROHIBITED_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+static CANDIDATES_REJECTED: AtomicU64 = AtomicU64::new(0);
+static REJECTIONS_BY_REASON: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+fn note_candidate_rejection(
+    reason: &'static str,
+    index: u32,
+    adapter: [u8; 6],
+    mac: [u8; 6],
+    ip: Ipv4Addr,
+) {
+    CANDIDATES_REJECTED.fetch_add(1, Ordering::Relaxed);
+    let bucket = match reason {
+        "stale_fence" => 0,
+        "missing_index" => 1,
+        "prohibited_ip" => 2,
+        "invalid_peer_mac" => 3,
+        "own_mac" => 4,
+        "invalid_adapter_mac" => 5,
+        "self_ip" => 6,
+        _ => 7,
+    };
+    let count = REJECTIONS_BY_REASON[bucket].fetch_add(1, Ordering::Relaxed) + 1;
+    if count.is_power_of_two() {
+        log::debug!("event=candidate_rejected adapter_mac={} interface_index={} identity={} ip={} reason={} count={}",
+            format_mac(&adapter), index, format_mac(&mac), ip, reason, count);
+    }
+}
+
+static FENCE_DROPS: AtomicU64 = AtomicU64::new(0);
+static PROBES_STARTED: AtomicU64 = AtomicU64::new(0);
+static PROBES_ANSWERED: AtomicU64 = AtomicU64::new(0);
+static PROBES_FAILED: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn diagnostic_counts() -> String {
+    format!("probes_started={} probes_answered={} probes_failed={} candidates_rejected={} fence_drops={}",
+        PROBES_STARTED.load(Ordering::Relaxed), PROBES_ANSWERED.load(Ordering::Relaxed),
+        PROBES_FAILED.load(Ordering::Relaxed), CANDIDATES_REJECTED.load(Ordering::Relaxed), FENCE_DROPS.load(Ordering::Relaxed))
+}
+
+pub(crate) fn note_fence_drop(path: &'static str) {
+    let count = FENCE_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
+    if count.is_power_of_two() {
+        log::debug!("event=fence_drop path={} count={}", path, count);
+    }
+}
 
 pub fn prohibited_dropped() -> u64 {
     ARP_PROHIBITED_DROPPED.load(Ordering::Relaxed)
@@ -764,10 +821,25 @@ unsafe fn data_cb_inner(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor
             &ctx.counters,
         ),
     };
+    let reject = |reason| {
+        if let Some(ingress) = &ctx.candidates {
+            note_candidate_rejection(
+                reason,
+                ingress.interface_index,
+                ingress.adapter_mac,
+                mac,
+                ip,
+            );
+        }
+    };
     match verdict {
         SenderVerdict::Accept => {}
-        SenderVerdict::DropProhibited => return,
+        SenderVerdict::DropProhibited => {
+            reject("prohibited_ip");
+            return;
+        }
         SenderVerdict::DropNonWiredSubnet => {
+            reject("non_wired_subnet");
             ARP_NONETH_DROPPED.fetch_add(1, Ordering::Relaxed);
             if !ctx.noneth_logged.swap(true, Ordering::Relaxed) {
                 log::info!(
@@ -779,6 +851,7 @@ unsafe fn data_cb_inner(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor
             return;
         }
         SenderVerdict::DropSelfIp => {
+            reject("self_ip");
             ARP_SELF_IP_DROPPED.fetch_add(1, Ordering::Relaxed);
             ctx.counters.note_self_ip_dropped();
             if !ctx.selfip_logged.swap(true, Ordering::Relaxed) {
@@ -792,7 +865,10 @@ unsafe fn data_cb_inner(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor
         // Our own gratuitous ARP (emitted when we add a secondary IP);
         // it would otherwise land as a phantom peer that gets scanned
         // against our own IP and cached as a ghost node.
-        SenderVerdict::DropOwnMac => return,
+        SenderVerdict::DropOwnMac => {
+            reject("own_mac");
+            return;
+        }
     }
 
     // Liveness is recorded here, at parse-accept — a deduped or fenced
@@ -810,6 +886,7 @@ unsafe fn data_cb_inner(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor
     // session's shared registry. Checked here, before the spawn, so a stale
     // frame costs nothing.
     if ctx.fence.is_stale() {
+        note_fence_drop("capture_callback");
         return;
     }
 
@@ -882,6 +959,7 @@ async fn on_arp_seen(
     verified_by: Option<[u8; 6]>,
 ) {
     if fence.is_stale() {
+        note_fence_drop("capture_merge");
         return;
     }
     let ip_str = ip.to_string();
@@ -1218,7 +1296,7 @@ fn extract_arp(frame: &[u8], packet_type: u16) -> Option<(u16, [u8; 6], Ipv4Addr
     None
 }
 
-fn format_mac(mac: &[u8; 6]) -> String {
+pub(crate) fn format_mac(mac: &[u8; 6]) -> String {
     format!(
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
@@ -1235,22 +1313,44 @@ pub(crate) async fn fresh_resolve_mac(
     scratch: Ipv4Addr,
     interface_index: u32,
 ) -> Result<Option<String>, AppError> {
-    crate::validation::parse_camera_ip(&target.to_string())?;
-    #[cfg(target_os = "windows")]
-    {
-        tokio::task::spawn_blocking(move || {
-            resolve_neighbor_blocking(target, scratch, interface_index)
-        })
-        .await
-        .map_err(|e| AppError::Network(format!("ResolveIpNetEntry2 task failed to join: {e}")))?
+    PROBES_STARTED.fetch_add(1, Ordering::Relaxed);
+    let started = Instant::now();
+    let result = async {
+        crate::validation::parse_camera_ip(&target.to_string())?;
+        #[cfg(target_os = "windows")]
+        {
+            tokio::task::spawn_blocking(move || {
+                resolve_neighbor_blocking(target, scratch, interface_index)
+            })
+            .await
+            .map_err(|e| {
+                AppError::Network(format!("ResolveIpNetEntry2 task failed to join: {e}"))
+            })?
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (target, scratch, interface_index);
+            Err(AppError::Network(
+                "fresh ARP resolution is Windows-only".into(),
+            ))
+        }
     }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = (target, scratch, interface_index);
-        Err(AppError::Network(
-            "fresh ARP resolution is Windows-only".into(),
-        ))
+    .await;
+    if matches!(&result, Ok(Some(_))) {
+        PROBES_ANSWERED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        PROBES_FAILED.fetch_add(1, Ordering::Relaxed);
     }
+    log::debug!(
+        "event=arp_probe interface_index={} target={} source={} answered={} duration_ms={} {}",
+        interface_index,
+        target,
+        scratch,
+        matches!(&result, Ok(Some(_))),
+        started.elapsed().as_millis(),
+        diagnostic_counts()
+    );
+    result
 }
 
 #[cfg(target_os = "windows")]

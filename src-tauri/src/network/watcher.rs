@@ -218,6 +218,7 @@ mod imp {
             tokio::time::sleep(Duration::from_millis(300)).await;
             while rx.try_recv().is_ok() {}
 
+            super::super::interface::invalidate_adapter_snapshot();
             if let Err(e) = super::refresh(&handle).await {
                 log::debug!("Watcher selection refresh failed: {e}");
             }

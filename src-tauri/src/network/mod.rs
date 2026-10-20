@@ -26,12 +26,19 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 
+pub(crate) use arp::note_fence_drop;
 pub use arp::ArpDevice;
 pub use device_registry::{DeviceListEmitter, DeviceRecord, DeviceRegistry, DeviceStatus};
 pub use interface::InterfaceInfo;
 pub use scanner::ScanResult;
 
 use crate::error::AppError;
+
+/// Quote one non-secret diagnostic field; JSON escapes separators/control
+/// characters so a value cannot inject another key or a forged log line.
+pub(crate) fn log_value(value: &str) -> String {
+    serde_json::to_string(value).expect("string serialization")
+}
 
 // ── Hidden-window command helpers ────────────────────────────────────
 // On Windows, every `Command::new()` spawns a visible console window
@@ -293,6 +300,14 @@ struct CaptureSignal {
 
 impl CaptureSignal {
     fn activate(&mut self, params: &arp::ListenerParams, outcome: pktmon::ScopeOutcome) {
+        let scope = match &outcome {
+            pktmon::ScopeOutcome::SelectedInterface { .. } => "selected_interface",
+            pktmon::ScopeOutcome::ScopedByName { .. } => "scoped_by_name",
+            pktmon::ScopeOutcome::UnscopedFallback { .. } => "unscoped",
+        };
+        log::info!("event=capture_state adapter_mac={} interface_index={} scope={} source_id={:?} active=true",
+            log_value(&params.scope.mac.map(|m| arp::format_mac(&m)).unwrap_or_default()),
+            params.candidates.as_ref().map_or(0, |c| c.interface_index), scope, outcome.source_id());
         self.app = Some(params.app_handle.clone());
         self.state = CaptureState {
             active: true,
@@ -1205,7 +1220,8 @@ async fn attempt_adoption(
                 ),
             );
 
-            log::info!("Auto-adopted {} with IP {}", device_subnet, adopted_ip);
+            log::info!("event=binding_change adapter_mac={} interface_index={} subnet={} address={} desired=Present applied=true reason=adopted",
+                log_value(&ctx.adapter_mac), ctx.interface_index, log_value(device_subnet), adopted_ip);
 
             // One bounded pass after the new binding settles. Presence handles
             // later verification; a quiet adopted subnet is not swept repeatedly.
@@ -1464,6 +1480,9 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
         if self.ctx.fence.is_stale() {
             return Err(());
         }
+        log::debug!("event=identity_probe adapter_mac={} interface_index={} target={} source={} answered={} {}",
+            log_value(&self.ctx.adapter_mac), interface_index, target, scratch,
+            matches!(&resolved, Ok(Some(_))), arp::diagnostic_counts());
         match resolved {
             Ok(Some(mac)) => {
                 log::info!("{}: {} answered with {}", self.origin.label(), target, mac);
@@ -1841,6 +1860,18 @@ async fn watchdog_ladder(
         arp::noneth_dropped(),
         arp::self_ip_dropped(),
         arp::prohibited_dropped()
+    );
+    log::warn!(
+        "event=capture_exhausted adapter_mac={} interface_index={} cause=no_payload {}",
+        log_value(
+            &params
+                .scope
+                .mac
+                .map(|m| arp::format_mac(&m))
+                .unwrap_or_default()
+        ),
+        params.candidates.as_ref().map_or(0, |c| c.interface_index),
+        arp::diagnostic_counts()
     );
     let _ = params.app_handle.emit(
         "discovery-degraded",
@@ -2452,6 +2483,19 @@ impl NetworkManager {
             ));
         }
         let mut live = self.adopted_ips.lock().await;
+        let changed = self
+            .adopted_meta
+            .lock()
+            .map(|meta| meta.get(subnet) != Some(&row))
+            .unwrap_or(true);
+        if changed {
+            log::info!("event=binding_change adapter_mac={} interface_index={} subnet={} address={} desired={:?} applied={} error={} reason={}",
+                log_value(row.adapter_mac.as_deref().unwrap_or("unknown")),
+                row.adapter_mac.as_deref().and_then(interface::index_for_mac).unwrap_or(0),
+                log_value(subnet), log_value(row.address.as_deref().unwrap_or("unknown")),
+                row.desired, row.applied, row.last_error.is_some(),
+                if row.last_error.is_some() { "pending" } else if row.applied { "applied" } else { "removed" });
+        }
         if row.desired == crate::config::BindingDesired::Present
             && row.applied
             && row.last_error.is_none()
@@ -2629,6 +2673,14 @@ impl NetworkManager {
             .filter(|i| adapter_candidate(i))
             .cloned()
             .collect();
+        if previous.selected_mac != mac || previous.interface_index != index {
+            log::info!(
+                "event=adapter_selection adapter_mac={} interface_index={} available={}",
+                log_value(mac.as_deref().unwrap_or("unknown")),
+                index.unwrap_or(0),
+                adapter.is_some()
+            );
+        }
         let selection = AdapterSelection {
             selection_required: mac.is_none() && candidates.len() > 1,
             selected_mac: mac,
@@ -2853,6 +2905,7 @@ impl NetworkManager {
         };
         let results = scanner::scan(subnet, scope).await?;
         if fence.is_stale() || discovery.is_stale() {
+            arp::note_fence_drop("scan_results");
             return Ok(Vec::new());
         }
         let mut accepted = Vec::new();
@@ -3982,6 +4035,16 @@ impl NetworkManager {
         ip: &str,
     ) -> Result<(), AppError> {
         config.claim_binding(ip)?;
+        let adapter = config.get().selected_adapter_mac;
+        log::info!(
+            "event=binding_change adapter_mac={} interface_index={} address={} reason=manual_claim",
+            log_value(adapter.as_deref().unwrap_or("unknown")),
+            adapter
+                .as_deref()
+                .and_then(interface::index_for_mac)
+                .unwrap_or(0),
+            log_value(ip)
+        );
         let saved = config.get().adopted_meta;
         self.adopted_ips
             .lock()
@@ -4029,9 +4092,12 @@ impl NetworkManager {
         let _op = self.discovery_op.lock().await;
         let _pause = self.pause_addresses();
         let _address = self.address_work.lock().await;
-        self.selected_write_adapter(config, name).await?;
+        let iface = self.selected_write_adapter(config, name).await?;
         ip_config::get_dhcp_state(name).await?;
-        ip_config::remove_secondary_ip(name, ip).await
+        ip_config::remove_secondary_ip(name, ip).await?;
+        log::info!("event=binding_change adapter_mac={} interface_index={} address={} reason=manual_remove",
+            log_value(&iface.mac), interface::index_for_mac(&iface.mac).unwrap_or(0), log_value(ip));
+        Ok(())
     }
 
     async fn selected_write_adapter(
@@ -4412,6 +4478,8 @@ async fn run_presence_job(
         origin: ProbeOrigin::CacheProbe,
     };
     let proof = presence::verify(&mut io, &job, &snapshot).await?;
+    log::debug!("event=evidence adapter_mac={} interface_index={} identity={} ip={} evidence_age_ms={} origin=presence",
+        log_value(&adapter.mac), snapshot.index, log_value(&proof.mac), proof.ip, proof.at.elapsed().as_millis());
     let mutation_fence = ctx.address_fence.clone();
     drop(_address);
     let cache_app = app.clone();
@@ -4425,6 +4493,7 @@ async fn run_presence_job(
             || mutation_fence.is_stale()
             || proof.at.elapsed() >= presence::FRESHNESS
         {
+            arp::note_fence_drop("presence_commit");
             return None;
         }
         let registry = manager.registry();
@@ -4598,6 +4667,15 @@ fn merge_adopted_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_values_escape_field_and_line_injection() {
+        let value = "adapter \" name\nforged=true\r\t";
+        let quoted = log_value(value);
+        assert_eq!(serde_json::from_str::<String>(&quoted).unwrap(), value);
+        assert!(!quoted.contains('\n') && !quoted.contains('\r'));
+        assert!(quoted.contains("\\n") && quoted.contains("\\\""));
+    }
 
     #[test]
     fn adoption_events_distinguish_restore_and_carry_binding_ownership() {

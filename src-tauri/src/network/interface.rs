@@ -10,14 +10,162 @@ use crate::error::AppError;
 #[cfg(target_os = "windows")]
 static ADAPTER_QUERY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+const ADAPTER_QUERY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+const SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn adapter_timeout() -> AppError {
+    AppError::Network("Adapter enumeration timed out after 10s including queue wait; retry when the adapter provider recovers".into())
+}
+
 #[cfg(target_os = "windows")]
-async fn with_adapter_query_lock<T, F, Fut>(gate: &tokio::sync::Mutex<()>, query: F) -> T
+async fn with_adapter_query_lock<T, F, Fut>(
+    gate: &tokio::sync::Mutex<()>,
+    query: F,
+) -> Result<T, AppError>
 where
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = T>,
+    Fut: std::future::Future<Output = Result<T, AppError>>,
 {
-    let _query_guard = gate.lock().await;
-    query().await
+    tokio::time::timeout(ADAPTER_QUERY_DEADLINE, async {
+        let _query_guard = gate.lock().await;
+        query().await
+    })
+    .await
+    .map_err(|_| adapter_timeout())?
+}
+
+struct CachedAdapters {
+    at: tokio::time::Instant,
+    generation: u64,
+    adapters: Vec<InterfaceInfo>,
+}
+
+#[derive(Default)]
+struct AdapterSnapshot {
+    value: std::sync::Mutex<Option<CachedAdapters>>,
+    refresh: tokio::sync::Mutex<()>,
+    generation: std::sync::atomic::AtomicU64,
+    // The same snapshot holds source ownership. It is refreshed from IP Helper
+    // at the proof boundary; the metadata TTL never authorizes a stale source.
+    #[cfg(target_os = "windows")]
+    sources: std::sync::Mutex<Vec<(u32, std::net::Ipv4Addr)>>,
+}
+
+impl AdapterSnapshot {
+    fn cached(&self) -> Option<Vec<InterfaceInfo>> {
+        let value = self.value.lock().unwrap_or_else(|p| p.into_inner());
+        value
+            .as_ref()
+            .filter(|v| {
+                v.generation == self.generation.load(std::sync::atomic::Ordering::Acquire)
+                    && v.at.elapsed() < SNAPSHOT_TTL
+            })
+            .map(|v| v.adapters.clone())
+    }
+
+    fn invalidate(&self) {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        *self.value.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    async fn get<F, Fut>(&self, query: F) -> Result<Vec<InterfaceInfo>, AppError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Vec<InterfaceInfo>, AppError>>,
+    {
+        tokio::time::timeout(ADAPTER_QUERY_DEADLINE, async {
+            if let Some(value) = self.cached() {
+                return Ok(value);
+            }
+            let _refresh = self.refresh.lock().await;
+            if let Some(value) = self.cached() {
+                return Ok(value);
+            }
+            let generation = self.generation.load(std::sync::atomic::Ordering::Acquire);
+            let adapters = query().await?;
+            let mut value = self.value.lock().unwrap_or_else(|p| p.into_inner());
+            if generation != self.generation.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(AppError::Network(
+                    "Adapters changed during enumeration; retry".into(),
+                ));
+            }
+            *value = Some(CachedAdapters {
+                at: tokio::time::Instant::now(),
+                generation,
+                adapters: adapters.clone(),
+            });
+            Ok(adapters)
+        })
+        .await
+        .map_err(|_| adapter_timeout())?
+    }
+
+    #[cfg(target_os = "windows")]
+    fn source_matches(
+        &self,
+        index: u32,
+        source: std::net::Ipv4Addr,
+        fresh: Vec<(u32, std::net::Ipv4Addr)>,
+    ) -> bool {
+        let mut sources = self.sources.lock().unwrap_or_else(|p| p.into_inner());
+        *sources = fresh;
+        source_matches_index(index, source, sources.iter().copied())
+    }
+}
+
+static ADAPTER_SNAPSHOT: std::sync::LazyLock<AdapterSnapshot> =
+    std::sync::LazyLock::new(AdapterSnapshot::default);
+
+/// Native notifications invalidate before their debounced enumeration. Pollers
+/// share the result, including a valid empty result; failures never reuse stale data.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn invalidate_adapter_snapshot() {
+    ADAPTER_SNAPSHOT.invalidate();
+    *VALIDATED_NAMES.lock().unwrap_or_else(|p| p.into_inner()) = None;
+}
+
+async fn adapter_snapshot() -> Result<Vec<InterfaceInfo>, AppError> {
+    ADAPTER_SNAPSHOT
+        .get(|| async {
+            #[cfg(target_os = "windows")]
+            {
+                query_adapters_windows().await
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                list_all_pnet()
+            }
+        })
+        .await
+        .map(current_adapter_addresses)
+}
+
+/// Cached metadata never masks an address add/remove between notifications.
+#[allow(unused_mut)]
+fn current_adapter_addresses(mut adapters: Vec<InterfaceInfo>) -> Vec<InterfaceInfo> {
+    #[cfg(target_os = "windows")]
+    {
+        let current = local_adapters_iphelper();
+        for adapter in &mut adapters {
+            // MAC-less VPN/tunnel metadata still feeds subnet exclusions.
+            // It cannot be selected for Ethernet proof; preserve its query data.
+            if adapter.mac.is_empty() {
+                continue;
+            }
+            if let Some(native) = current
+                .iter()
+                .find(|n| !n.mac.is_empty() && n.mac.eq_ignore_ascii_case(&adapter.mac))
+            {
+                adapter.is_up = native.is_up;
+                adapter.ips = native.ips.clone();
+            } else {
+                adapter.is_up = false;
+                adapter.ips.clear();
+            }
+        }
+    }
+    adapters
 }
 
 /// How long a validated interface name stays trusted before the next
@@ -121,40 +269,35 @@ pub fn is_wired_ethernet(i: &InterfaceInfo) -> bool {
 
 /// List physical (non-VPN) network interfaces.
 pub async fn list_physical() -> Result<Vec<InterfaceInfo>, AppError> {
-    #[cfg(target_os = "windows")]
-    {
-        list_physical_windows().await
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        Ok(list_all_pnet()?.into_iter().filter(|i| !i.is_vpn).collect())
-    }
+    Ok(adapter_snapshot()
+        .await?
+        .into_iter()
+        .filter(|i| {
+            if cfg!(target_os = "windows") {
+                !i.is_virtual
+            } else {
+                !i.is_vpn
+            }
+        })
+        .collect())
 }
 
 /// List VPN interfaces only.
 pub async fn list_vpn() -> Result<Vec<InterfaceInfo>, AppError> {
-    #[cfg(target_os = "windows")]
-    {
-        list_vpn_windows().await
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        Ok(list_all_pnet()?.into_iter().filter(|i| i.is_vpn).collect())
-    }
+    Ok(adapter_snapshot()
+        .await?
+        .into_iter()
+        .filter(|i| i.is_vpn && (!cfg!(target_os = "windows") || i.is_virtual))
+        .collect())
 }
 
 /// List all network interfaces with their details (physical + VPN).
 pub async fn list_all() -> Result<Vec<InterfaceInfo>, AppError> {
-    #[cfg(target_os = "windows")]
-    {
-        let mut result = list_physical_windows().await?;
-        result.extend(list_vpn_windows().await?);
-        Ok(result)
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        list_all_pnet()
-    }
+    Ok(adapter_snapshot()
+        .await?
+        .into_iter()
+        .filter(|i| !cfg!(target_os = "windows") || !i.is_virtual || i.is_vpn)
+        .collect())
 }
 
 /// List every Up/Disconnected adapter — physical *and* virtual — in a
@@ -169,14 +312,7 @@ pub async fn list_all() -> Result<Vec<InterfaceInfo>, AppError> {
 /// command and the streaming display-IP fallback, neither of which should
 /// widen to advertise a virtual-switch NAT address.
 pub async fn list_all_adapters() -> Result<Vec<InterfaceInfo>, AppError> {
-    #[cfg(target_os = "windows")]
-    {
-        list_all_adapters_windows().await
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        list_all_pnet()
-    }
+    adapter_snapshot().await
 }
 
 #[cfg(target_os = "windows")]
@@ -348,27 +484,15 @@ async fn run_adapter_query(filter: &str) -> Result<String, AppError> {
         }} | ConvertTo-Json -Depth 3 -Compress"#,
         filter
     );
-    // Bounded so a hung PowerShell (broken WMI has been observed) can't
-    // wedge the calling worker indefinitely. kill_on_drop ensures the
-    // child is reaped if the timeout fires and drops the future.
-    // Keep the lock around process creation and collection. The timeout still
-    // bounds the active query, and dropping the guard wakes the next queued
-    // caller after every success, failure, or timeout.
+    // The deadline includes the shared provider-lock wait and drops/kills
+    // the child on expiry. The snapshot also bounds its refresh-lock wait.
     let output = with_adapter_query_lock(&ADAPTER_QUERY_LOCK, || async {
-        let fut = super::async_cmd("powershell")
+        super::async_cmd("powershell")
             .args(["-NoProfile", "-Command", &script])
             .kill_on_drop(true)
-            .output();
-        match tokio::time::timeout(std::time::Duration::from_secs(10), fut).await {
-            Ok(Ok(o)) => Ok(o),
-            Ok(Err(e)) => Err(AppError::Network(format!(
-                "Failed to run PowerShell: {}",
-                e
-            ))),
-            Err(_) => Err(AppError::Network(
-                "Adapter enumeration timed out after 10s (PowerShell/WMI may be hung)".into(),
-            )),
-        }
+            .output()
+            .await
+            .map_err(|e| AppError::Network(format!("Failed to run PowerShell: {e}")))
     })
     .await?;
 
@@ -419,49 +543,24 @@ fn enumeration_log_action(last: &mut Option<(String, u64)>, current: &str) -> Op
 }
 
 #[cfg(target_os = "windows")]
-async fn list_physical_windows() -> Result<Vec<InterfaceInfo>, AppError> {
-    let stdout = run_adapter_query("$_.Virtual -eq $false").await?;
+async fn query_adapters_windows() -> Result<Vec<InterfaceInfo>, AppError> {
+    let stdout = run_adapter_query("$true").await?;
     {
         let mut last = LAST_ENUM_LOG
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(suppressed) = enumeration_log_action(&mut last, &stdout) {
             if suppressed == 0 {
-                log::info!("Windows physical adapter enumeration: {}", stdout);
+                log::info!("Windows adapter enumeration: {}", stdout);
             } else {
                 log::info!(
-                    "Windows physical adapter enumeration (unchanged {} time(s) since last log): {}",
+                    "Windows adapter enumeration (unchanged {} time(s) since last log): {}",
                     suppressed,
                     stdout
                 );
             }
         }
     }
-    let adapters = parse_adapter_json(&stdout)?;
-    Ok(adapters.iter().map(|a| parse_adapter(a, false)).collect())
-}
-
-#[cfg(target_os = "windows")]
-async fn list_vpn_windows() -> Result<Vec<InterfaceInfo>, AppError> {
-    let stdout = run_adapter_query("$_.Virtual -eq $true").await?;
-    let adapters = parse_adapter_json(&stdout)?;
-    Ok(adapters
-        .iter()
-        .filter(|a| {
-            let desc = a["Description"].as_str().unwrap_or("");
-            is_vpn_adapter(desc)
-        })
-        .map(|a| parse_adapter(a, true))
-        .collect())
-}
-
-#[cfg(target_os = "windows")]
-async fn list_all_adapters_windows() -> Result<Vec<InterfaceInfo>, AppError> {
-    // `$true` splices into the shared filter as `(...) -and $true`, i.e. no
-    // adapter-level filtering beyond the Up/Disconnected status gate — every
-    // adapter, physical or virtual. `parse_adapter(a, false)` then lets the
-    // description decide VPN status and reads `is_virtual` from `Virtual`.
-    let stdout = run_adapter_query("$true").await?;
     let adapters = parse_adapter_json(&stdout)?;
     Ok(adapters.iter().map(|a| parse_adapter(a, false)).collect())
 }
@@ -671,16 +770,19 @@ fn source_matches_index(
 
 #[cfg(target_os = "windows")]
 pub(crate) fn source_matches_interface(index: u32, source: std::net::Ipv4Addr) -> bool {
-    source_matches_index(
+    ADAPTER_SNAPSHOT.source_matches(
         index,
         source,
-        local_adapters_iphelper().into_iter().flat_map(|adapter| {
-            let index = adapter.index;
-            adapter
-                .ips
-                .into_iter()
-                .filter_map(move |ip| ip.address.parse().ok().map(|address| (index, address)))
-        }),
+        local_adapters_iphelper()
+            .into_iter()
+            .flat_map(|adapter| {
+                let index = adapter.index;
+                adapter
+                    .ips
+                    .into_iter()
+                    .filter_map(move |ip| ip.address.parse().ok().map(|address| (index, address)))
+            })
+            .collect(),
     )
 }
 
@@ -771,6 +873,103 @@ pub async fn get_by_name(name: &str) -> Result<InterfaceInfo, AppError> {
 mod tests {
     use super::*;
 
+    #[tokio::test(start_paused = true)]
+    async fn snapshot_ttl_coalesces_callers_and_caches_empty_success() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cache = AdapterSnapshot::default();
+        let calls = AtomicUsize::new(0);
+        let query = || async {
+            calls.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            Ok(vec![])
+        };
+        let (first, second) = tokio::join!(cache.get(query), cache.get(query));
+        assert!(first.unwrap().is_empty() && second.unwrap().is_empty());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        tokio::time::advance(SNAPSHOT_TTL - std::time::Duration::from_secs(1)).await;
+        cache.get(query).await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "cache hits must not extend the TTL"
+        );
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        cache.get(query).await.unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn snapshot_refresh_wait_has_total_deadline_without_starting_query() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let cache = std::sync::Arc::new(AdapterSnapshot::default());
+        let entered = std::sync::Arc::new(AtomicBool::new(false));
+        let held = cache.refresh.lock().await;
+        let caller_cache = cache.clone();
+        let called = entered.clone();
+        let caller = tokio::spawn(async move {
+            caller_cache
+                .get(|| async {
+                    called.store(true, Ordering::Relaxed);
+                    Ok(vec![])
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(ADAPTER_QUERY_DEADLINE).await;
+        assert!(caller
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("including queue wait"));
+        assert!(!entered.load(Ordering::Relaxed));
+        drop(held);
+        assert!(cache.get(|| async { Ok(vec![]) }).await.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn invalidation_rejects_inflight_snapshot_and_errors_never_reuse_stale_success() {
+        let cache = std::sync::Arc::new(AdapterSnapshot::default());
+        let caller_cache = cache.clone();
+        let caller = tokio::spawn(async move {
+            caller_cache
+                .get(|| async {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    Ok(vec![])
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+        cache.invalidate();
+        assert!(caller
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("changed during enumeration"));
+        assert!(cache.cached().is_none());
+        cache.get(|| async { Ok(vec![]) }).await.unwrap();
+        tokio::time::advance(SNAPSHOT_TTL).await;
+        assert!(cache
+            .get(|| async { Err(AppError::Network("provider failed".into())) })
+            .await
+            .is_err());
+        assert!(cache.cached().is_none());
+        assert!(cache.get(|| async { Ok(vec![]) }).await.is_ok());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn source_snapshot_requires_fresh_unique_ownership_after_removal_or_move() {
+        let cache = AdapterSnapshot::default();
+        let ip = "192.0.2.1".parse().unwrap();
+        assert!(cache.source_matches(7, ip, vec![(7, ip)]));
+        assert!(!cache.source_matches(7, ip, vec![]));
+        assert!(!cache.source_matches(7, ip, vec![(8, ip)]));
+        assert!(!cache.source_matches(7, ip, vec![(7, ip), (8, ip)]));
+        assert!(cache.source_matches(8, ip, vec![(8, ip)]));
+    }
+
     #[test]
     fn source_must_belong_uniquely_to_the_selected_index() {
         let wired = "192.168.1.101".parse().unwrap();
@@ -807,6 +1006,19 @@ mod tests {
             is_vpn,
             is_virtual,
         }
+    }
+
+    #[test]
+    fn native_overlay_preserves_macless_vpn_addresses_for_exclusion() {
+        let mut vpn = flags_iface(true, false, true, true);
+        vpn.ips.push(IpInfo {
+            address: "10.8.0.2".into(),
+            prefix: 24,
+            subnet: "10.8.0.0/24".into(),
+        });
+        let actual = current_adapter_addresses(vec![vpn]);
+        assert!(actual[0].is_up && actual[0].is_vpn);
+        assert_eq!(actual[0].ips[0].address, "10.8.0.2");
     }
 
     #[test]
@@ -908,8 +1120,10 @@ mod tests {
                     peak.fetch_max(current, Ordering::SeqCst);
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
                 })
-                .await;
+                .await
+                .unwrap();
             }
 
             let gate = tokio::sync::Mutex::new(());
@@ -922,6 +1136,69 @@ mod tests {
             );
 
             assert_eq!(peak.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn adapter_deadline_includes_wait_before_query_and_preserves_gate() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let gate = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+            let held = gate.lock().await;
+            let entered = std::sync::Arc::new(AtomicBool::new(false));
+            let g = gate.clone();
+            let called = entered.clone();
+            let caller = tokio::spawn(async move {
+                with_adapter_query_lock(&g, || async {
+                    called.store(true, Ordering::Relaxed);
+                    Ok(())
+                })
+                .await
+            });
+            tokio::task::yield_now().await;
+            tokio::time::advance(ADAPTER_QUERY_DEADLINE).await;
+            assert!(caller
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("including queue wait"));
+            assert!(!entered.load(Ordering::Relaxed));
+            drop(held);
+            assert!(with_adapter_query_lock(&gate, || async { Ok(()) })
+                .await
+                .is_ok());
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn adapter_wait_and_query_share_one_deadline_and_cancel_running_work() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            struct Cancelled(std::sync::Arc<AtomicBool>);
+            impl Drop for Cancelled {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Relaxed);
+                }
+            }
+            let gate = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+            let held = gate.lock().await;
+            let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+            let g = gate.clone();
+            let c = cancelled.clone();
+            let start = tokio::time::Instant::now();
+            let caller = tokio::spawn(async move {
+                with_adapter_query_lock(&g, || async {
+                    let _cancelled = Cancelled(c);
+                    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+                    Ok(())
+                })
+                .await
+            });
+            tokio::task::yield_now().await;
+            tokio::time::advance(std::time::Duration::from_secs(6)).await;
+            drop(held);
+            tokio::task::yield_now().await;
+            assert!(caller.await.unwrap().is_err());
+            assert_eq!(start.elapsed(), ADAPTER_QUERY_DEADLINE);
+            assert!(cancelled.load(Ordering::Relaxed));
+            assert!(gate.try_lock().is_ok());
         }
 
         #[test]

@@ -65,6 +65,52 @@ pub struct DeviceRecord {
     pub last_seen: String,
 }
 
+fn node_transition_line(
+    record: &DeviceRecord,
+    from: Option<DeviceStatus>,
+    to: DeviceStatus,
+    reason: &str,
+    index: u32,
+) -> String {
+    let age = record
+        .last_verified_at
+        .as_deref()
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+        .map(|at| {
+            (chrono::Utc::now() - at.with_timezone(&chrono::Utc))
+                .num_milliseconds()
+                .max(0)
+                .to_string()
+        })
+        .unwrap_or_else(|| "unknown".into());
+    format!("event=node_transition identity={} adapter_mac={} interface_index={} from={} to={} reason={} evidence_age_ms={} evidence_clock=wall",
+        super::log_value(&record.mac), super::log_value(record.verified_by_mac.as_deref().unwrap_or("unknown")), index,
+        serde_json::to_string(&from).unwrap(), serde_json::to_string(&to).unwrap(), super::log_value(reason), age)
+}
+
+fn trace_status(
+    record: &DeviceRecord,
+    from: Option<DeviceStatus>,
+    to: DeviceStatus,
+    reason: &'static str,
+) {
+    if log::log_enabled!(log::Level::Info) {
+        let index = record
+            .verified_by_mac
+            .as_deref()
+            .and_then(super::interface::index_for_mac)
+            .unwrap_or(0);
+        log::info!("{}", node_transition_line(record, from, to, reason, index));
+    }
+}
+
+fn change_status(record: &mut DeviceRecord, to: DeviceStatus, reason: &'static str) {
+    if record.status != to {
+        trace_status(record, Some(record.status), to, reason);
+        record.status = to;
+    }
+}
+
 /// Owns the canonical `mac → DeviceRecord` map. Mutators return a bool
 /// indicating whether anything actually changed, so callers can skip
 /// emitting redundant `device-list-changed` events for no-op writes.
@@ -181,7 +227,7 @@ impl DeviceRegistry {
             map.insert(
                 key.clone(),
                 DeviceRecord {
-                    mac: key,
+                    mac: key.clone(),
                     ip: entry.ip.clone(),
                     subnet: entry.subnet.clone(),
                     open_ports: entry.open_ports.clone(),
@@ -192,6 +238,12 @@ impl DeviceRegistry {
                     verified_by_mac: entry.verified_by_mac.clone(),
                     last_verified_at: entry.last_verified_at.clone(),
                 },
+            );
+            trace_status(
+                &map[&key],
+                None,
+                DeviceStatus::CachedOnly,
+                "cache_hydration",
             );
         }
         MergeResult {
@@ -225,7 +277,7 @@ impl DeviceRegistry {
                 DeviceRecord {
                     verified_by_mac: None,
                     last_verified_at: None,
-                    mac: key,
+                    mac: key.clone(),
                     ip: node.ip.clone(),
                     subnet,
                     open_ports: vec![],
@@ -235,6 +287,7 @@ impl DeviceRegistry {
                     last_seen: now,
                 },
             );
+            trace_status(&map[&key], None, DeviceStatus::Offline, "manual_hydration");
             changed = true;
         }
         changed
@@ -258,6 +311,9 @@ impl DeviceRegistry {
             || !self.proof_allowed(adapter)
             || Self::has_newer_proof(&map, device, verified_at)
         {
+            if fence.is_stale() {
+                super::note_fence_drop("registry_manual");
+            }
             return MergeResult::default();
         }
         let expected = node.expected_mac.as_deref().unwrap_or(&device.mac);
@@ -267,7 +323,11 @@ impl DeviceRegistry {
         if !same {
             if let Some(old) = map.get_mut(&expected_key) {
                 result.changed |= old.status != DeviceStatus::OfflineDifferentDevice;
-                old.status = DeviceStatus::OfflineDifferentDevice;
+                change_status(
+                    old,
+                    DeviceStatus::OfflineDifferentDevice,
+                    "different_device_at_address",
+                );
             }
             return result;
         }
@@ -304,7 +364,7 @@ impl DeviceRegistry {
         {
             return MergeResult::default();
         }
-        Self::merge_arp_locked(&mut self.lock(), device)
+        Self::merge_arp_locked(&mut self.lock(), device, true)
     }
 
     pub(crate) fn merge_arp_fenced(
@@ -322,7 +382,7 @@ impl DeviceRegistry {
         {
             return MergeResult::default();
         }
-        Self::merge_arp_locked(&mut map, device)
+        Self::merge_arp_locked(&mut map, device, true)
     }
 
     // Wired by S5a's verifier, never by the legacy observation path.
@@ -342,6 +402,9 @@ impl DeviceRegistry {
             || !self.proof_allowed(adapter)
             || Self::has_newer_proof(&map, device, verified_at)
         {
+            if fence.is_stale() {
+                super::note_fence_drop("registry_verified");
+            }
             return MergeResult::default();
         }
         self.merge_verified_locked(&mut map, device, adapter, verified_at)
@@ -365,7 +428,8 @@ impl DeviceRegistry {
         adapter: &str,
         verified_at: &str,
     ) -> MergeResult {
-        let mut result = Self::merge_arp_locked(map, device);
+        let is_new = record_key_for_mac(map, &device.mac).is_none();
+        let mut result = Self::merge_arp_locked(map, device, false);
         let key = record_key_for_mac(map, &device.mac).expect("merged record");
         let record = map.get_mut(&key).unwrap();
         let adapter = canonical_mac(adapter).expect("validated adapter");
@@ -374,7 +438,10 @@ impl DeviceRegistry {
             || record.status != DeviceStatus::Live;
         record.verified_by_mac = Some(adapter);
         record.last_verified_at = Some(verified_at.into());
-        record.status = DeviceStatus::Live;
+        change_status(record, DeviceStatus::Live, "fresh_verification");
+        if is_new {
+            trace_status(record, None, DeviceStatus::Live, "fresh_verification");
+        }
         self.evidence
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -388,6 +455,7 @@ impl DeviceRegistry {
     fn merge_arp_locked(
         map: &mut HashMap<String, DeviceRecord>,
         device: &ArpDevice,
+        promote_legacy: bool,
     ) -> MergeResult {
         let key = record_key_for_mac(map, &device.mac).unwrap_or_else(|| device.mac.clone());
         let mut retired = false;
@@ -396,7 +464,11 @@ impl DeviceRegistry {
             .filter(|r| r.ip == device.ip && r.mac != key)
         {
             if other.status != DeviceStatus::Offline {
-                other.status = DeviceStatus::Offline;
+                change_status(
+                    other,
+                    DeviceStatus::Offline,
+                    "different_identity_at_address",
+                );
                 retired = true;
             }
         }
@@ -418,13 +490,17 @@ impl DeviceRegistry {
                     existing.last_seen = device.last_seen.clone();
                     changed = true;
                 }
-                if matches!(
-                    existing.status,
-                    DeviceStatus::CachedOnly
-                        | DeviceStatus::OfflineNonWiredSubnet
-                        | DeviceStatus::OfflineHostOwnedIp
-                ) {
-                    existing.status = DeviceStatus::Live;
+                // Verified callers attach the verifying adapter before the
+                // single final promotion/log in merge_verified_locked.
+                if promote_legacy
+                    && matches!(
+                        existing.status,
+                        DeviceStatus::CachedOnly
+                            | DeviceStatus::OfflineNonWiredSubnet
+                            | DeviceStatus::OfflineHostOwnedIp
+                    )
+                {
+                    change_status(existing, DeviceStatus::Live, "verified_observation");
                     changed = true;
                 }
                 changed
@@ -542,7 +618,7 @@ impl DeviceRegistry {
             if record.status == DeviceStatus::OfflineAmbiguousRole
                 && !ambiguous.contains(&record.alias.as_str())
             {
-                record.status = DeviceStatus::Offline;
+                change_status(record, DeviceStatus::Offline, "role_resolved");
                 changed.push(record.mac.clone());
             }
         }
@@ -566,7 +642,7 @@ impl DeviceRegistry {
             );
             for record in map.values_mut().filter(|r| r.alias == role) {
                 if record.status != DeviceStatus::OfflineAmbiguousRole {
-                    record.status = DeviceStatus::OfflineAmbiguousRole;
+                    change_status(record, DeviceStatus::OfflineAmbiguousRole, "ambiguous_role");
                     changed.push(record.mac.clone());
                 }
             }
@@ -583,7 +659,7 @@ impl DeviceRegistry {
         let mut map = self.lock();
         match map.get_mut(mac) {
             Some(record) if record.status != status => {
-                record.status = status;
+                change_status(record, status, "status_request");
                 true
             }
             _ => false,
@@ -655,7 +731,7 @@ impl DeviceRegistry {
             if record.status == DeviceStatus::Live
                 && deadlines.get(&record.mac).is_none_or(|t| now >= *t)
             {
-                record.status = DeviceStatus::Offline;
+                change_status(record, DeviceStatus::Offline, "evidence_expired");
                 changed = true;
             }
         }
@@ -671,7 +747,7 @@ impl DeviceRegistry {
             .clear();
         let mut changed = false;
         for record in map.values_mut().filter(|r| r.status == DeviceStatus::Live) {
-            record.status = DeviceStatus::Offline;
+            change_status(record, DeviceStatus::Offline, "adapter_epoch_expired");
             changed = true;
         }
         changed
@@ -842,6 +918,40 @@ mod tests {
             alias: alias.into(),
             last_seen: "2026-04-26T00:00:00Z".into(),
         }
+    }
+
+    #[test]
+    fn node_transition_fields_have_identity_states_reason_and_no_alias_or_endpoint_secrets() {
+        let registry = DeviceRegistry::new();
+        registry.hydrate_from_cache(&[cached(
+            "aa:bb:cc:dd:ee:01",
+            "192.0.2.1",
+            "192.0.2.0/24",
+            vec![],
+            "rtsp://secret:password@camera/private",
+        )]);
+        let record = &registry.snapshot()[0];
+        let line = node_transition_line(
+            record,
+            Some(DeviceStatus::Live),
+            DeviceStatus::Offline,
+            "evidence_expired",
+            7,
+        );
+        for field in [
+            "event=node_transition",
+            "identity=\"aa:bb:cc:dd:ee:01\"",
+            "interface_index=7",
+            "from=\"live\"",
+            "to=\"offline\"",
+            "reason=\"evidence_expired\"",
+            "evidence_age_ms=unknown",
+        ] {
+            assert!(line.contains(field), "{line}");
+        }
+        assert!(
+            !line.contains("secret") && !line.contains("password") && !line.contains("rtsp://")
+        );
     }
 
     #[test]
