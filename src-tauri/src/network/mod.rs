@@ -372,6 +372,9 @@ pub(crate) fn listener_action(
     if !has_listener {
         return ListenerAction::Attach;
     }
+    if !current.active.load(Ordering::Acquire) {
+        return ListenerAction::Replace("capture inactive");
+    }
     if current.iface_name != desired_iface || current.mac != desired_mac {
         return ListenerAction::Replace("adapter changed");
     }
@@ -385,6 +388,18 @@ pub(crate) fn listener_action(
             ListenerAction::Replace("data source changed")
         }
         _ => ListenerAction::Keep,
+    }
+}
+
+/// DHCP already captures; enabling adoption does not need a new listener.
+fn mode_keeps_capture(from: crate::config::NetworkMode, to: crate::config::NetworkMode) -> bool {
+    from == crate::config::NetworkMode::Dhcp && to == crate::config::NetworkMode::StaticAuto
+}
+
+fn mode_capture_action(action: ListenerAction, preserve: bool) -> ListenerAction {
+    match (action, preserve) {
+        (ListenerAction::Replace("retry scoped attach"), true) => ListenerAction::Keep,
+        _ => action,
     }
 }
 
@@ -2242,11 +2257,17 @@ impl NetworkManager {
                     .map_err(|_| AppError::Network("Invalid gateway".into()))?;
             }
         }
-        let pause = self.pause_addresses();
-        // Stops the legacy worker and discards its DHCP cache on every Apply.
-        self.stop_locked().await;
-        let address = self.address_work.lock().await;
         let old_mode = config.get_network_mode();
+        let preserve_capture = mode_keeps_capture(old_mode, request.mode);
+        let pause = self.pause_addresses();
+        // Every Apply cancels the session/address work. DHCP -> Auto keeps
+        // the listener that is already hearing the camera's link-up burst.
+        if preserve_capture {
+            self.stop_session_locked().await;
+        } else {
+            self.stop_locked().await;
+        }
+        let address = self.address_work.lock().await;
         let result = async {
             // An unreadable DHCP state never permits an address write.
             ip_config::get_dhcp_state(&iface.name).await?;
@@ -2314,7 +2335,7 @@ impl NetworkManager {
         self.hydrate_manual_nodes(config).await;
         if mode != NetworkMode::StaticManual && crate::is_discovery_available() {
             if let Err(e) = self
-                .start_arp_discovery_locked(&iface.name, config, app.clone())
+                .start_arp_discovery_body(&iface.name, config, app.clone(), false, preserve_capture)
                 .await
             {
                 log::warn!("Discovery restart after mode transition: {}", e);
@@ -2968,7 +2989,7 @@ impl NetworkManager {
         app: tauri::AppHandle,
     ) -> Result<(), AppError> {
         let _op = self.discovery_op.lock().await;
-        self.start_arp_discovery_body(interface, config, app, true)
+        self.start_arp_discovery_body(interface, config, app, true, false)
             .await
     }
 
@@ -2984,6 +3005,7 @@ impl NetworkManager {
         own_mac: Option<[u8; 6]>,
         iface_is_up: bool,
         base_params: &arp::ListenerParams,
+        preserve_capture: bool,
     ) -> Result<arp::ActivationRx, AppError> {
         let has_listener = self.arp_listener_handle.lock().await.is_some();
         let same_adapter = {
@@ -3020,7 +3042,10 @@ impl NetworkManager {
         };
         let action = {
             let identity = self.capture_identity.lock().await;
-            listener_action(identity.as_ref(), has_listener, iface_name, own_mac, live)
+            mode_capture_action(
+                listener_action(identity.as_ref(), has_listener, iface_name, own_mac, live),
+                preserve_capture,
+            )
         };
 
         let retained_outcome = self.capture_signal.lock().await.state.outcome.clone();
@@ -3138,7 +3163,7 @@ impl NetworkManager {
         config: &crate::config::AppConfig,
         app_handle: tauri::AppHandle,
     ) -> Result<(), AppError> {
-        self.start_arp_discovery_body(interface_display_name, config, app_handle, false)
+        self.start_arp_discovery_body(interface_display_name, config, app_handle, false, false)
             .await
     }
 
@@ -3148,6 +3173,7 @@ impl NetworkManager {
         config: &crate::config::AppConfig,
         app_handle: tauri::AppHandle,
         refresh: bool,
+        preserve_capture: bool,
     ) -> Result<(), AppError> {
         // Authoritative mode gate, read under the discovery op lock:
         // set_network_mode persists the mode before apply_mode_change
@@ -3317,6 +3343,7 @@ impl NetworkManager {
                 own_mac,
                 iface_info.is_up,
                 &listener_params,
+                preserve_capture,
             )
             .await?;
 
@@ -5025,6 +5052,55 @@ mod tests {
             source_id,
             active: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    #[test]
+    fn dhcp_to_auto_preserves_only_valid_capture_and_other_modes_restart() {
+        use crate::config::NetworkMode::{Dhcp, StaticAuto, StaticManual};
+        for from in [Dhcp, StaticAuto, StaticManual] {
+            for to in [Dhcp, StaticAuto, StaticManual] {
+                assert_eq!(
+                    mode_keeps_capture(from, to),
+                    from == Dhcp && to == StaticAuto
+                );
+            }
+        }
+        let current = identity(None);
+        let decide = |current: Option<&CaptureIdentity>, has_handle| {
+            mode_capture_action(
+                listener_action(
+                    current,
+                    has_handle,
+                    "Ethernet",
+                    identity(None).mac,
+                    LiveSourceId::Enumerated(42),
+                ),
+                true,
+            )
+        };
+        assert_eq!(decide(Some(&current), true), ListenerAction::Keep);
+        assert_eq!(decide(Some(&current), false), ListenerAction::Attach);
+        assert_eq!(decide(None, false), ListenerAction::Attach);
+        let changed = identity(Some(41));
+        assert_eq!(
+            decide(Some(&changed), true),
+            ListenerAction::Replace("data source changed")
+        );
+        let mut other = identity(None);
+        other.iface_name = "Dock".into();
+        assert_eq!(
+            decide(Some(&other), true),
+            ListenerAction::Replace("adapter changed")
+        );
+        current.active.store(false, Ordering::Release);
+        assert_eq!(
+            decide(Some(&current), true),
+            ListenerAction::Replace("capture inactive")
+        );
+        assert_eq!(
+            mode_capture_action(ListenerAction::Replace("retry scoped attach"), false),
+            ListenerAction::Replace("retry scoped attach")
+        );
     }
 
     #[test]

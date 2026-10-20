@@ -38,6 +38,7 @@ let hostMode: NetworkMode | null = null;
 let adapterSelection: AdapterSelection | null = null;
 let interfaceRefresh = 0;
 let selectingAdapter = false;
+let onDiscoveryReconnect = () => {};
 /** Presentation only, empty at launch and never persisted. */
 export const sessionAdoptedSubnets = new Set<string>();
 let bindingRefresh = 0;
@@ -226,7 +227,8 @@ function isDownEvent(iface: InterfaceInfo): boolean {
   return !iface.ips.some((ip) => !isApipa(ip.address));
 }
 
-export function setupInterfaceWatcher(): void {
+export function setupInterfaceWatcher(onReconnect: () => void = () => {}): void {
+  onDiscoveryReconnect = onReconnect;
   api.onEvent<AdapterSelection>("adapter-selection-changed", (selection) => {
     ++interfaceRefresh;
     rememberAdapterSelection(selection);
@@ -381,6 +383,7 @@ function applyUpEvent(iface: InterfaceInfo, wasDown: boolean): void {
     // devices that genuinely vanished during the downtime.
     renderArpDeviceList();
     resetDiscoveryStatus();
+    onDiscoveryReconnect();
     api.startArpDiscovery(iface.name).catch(() => {});
     // Restart the stream (and RTSP server) if they were running
     // before the disconnect. Fires in the background; failures
@@ -573,7 +576,9 @@ async function loadAdapterChoices(): Promise<void> {
   if (field) field.style.display = dialogInterfaces.length > 1 ? "" : "none";
 }
 
-export function setupIpConfigDialog(): void {
+export function setupIpConfigDialog(
+  onModeApplied: (previous: NetworkMode | null, next: NetworkMode) => void = () => {},
+): void {
   const dialog = $<HTMLDialogElement>("#ip-config-dialog");
 
   // ── Open dialog ──────────────────────────────────────────────────
@@ -654,6 +659,7 @@ export function setupIpConfigDialog(): void {
     if (mode !== "dhcp" && (!ip || !subnet_mask)) {
       showToast("Fill in address and mask", true); return;
     }
+    const previousMode = state.config?.network_mode ?? null;
     const request = {
       name, mode, ip, subnet_mask,
       gateway: mode === "dhcp" ? null : $<HTMLInputElement>("#static-gateway").value.trim() || null,
@@ -670,6 +676,7 @@ export function setupIpConfigDialog(): void {
       if (state.config) state.config.network_mode = reply.mode;
       showToast(reply.mode === "dhcp" ? "Switched to DHCP; saved bindings are pending" : "Static configuration applied");
       dialog.close();
+      onModeApplied(previousMode, reply.mode);
       await refreshInterfaces();
     } catch (e) {
       showToast("Failed: " + formatError(e), true);
