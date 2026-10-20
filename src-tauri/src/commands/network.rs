@@ -18,9 +18,14 @@ pub async fn scan_network(
     // clean error instead of whatever scanner::scan() would emit
     // mid-iteration. Also reject subnets too wide to scan before any
     // scanning machinery spins up.
-    let (_, prefix) = parse_cidr(&subnet)?;
+    let (ip, prefix) = parse_cidr(&subnet)?;
     crate::network::scanner::check_scan_size(prefix)?;
-    manager.scan_subnet(&subnet, &config).await
+    let network =
+        ipnetwork::Ipv4Network::new(ip, prefix).map_err(|e| AppError::Network(e.to_string()))?;
+    // Equivalent CIDRs share the manager's dedupe key, fence and TCP budget.
+    manager
+        .scan_subnet(&format!("{}/{}", network.network(), prefix), &config)
+        .await
 }
 
 #[tauri::command]
@@ -325,13 +330,20 @@ pub async fn start_arp_discovery(
     config: State<'_, AppConfig>,
     app: tauri::AppHandle,
     interface: String,
+    refresh: Option<bool>,
 ) -> Result<(), AppError> {
     if !crate::is_discovery_available() {
         return Err(AppError::DiscoveryUnavailable(
             "Packet capture is not available on this Windows build".into(),
         ));
     }
-    manager.start_arp_discovery(&interface, &config, app).await
+    if refresh.unwrap_or(false) {
+        manager
+            .refresh_arp_discovery(&interface, &config, app)
+            .await
+    } else {
+        manager.start_arp_discovery(&interface, &config, app).await
+    }
 }
 
 #[tauri::command]

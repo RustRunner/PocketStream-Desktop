@@ -216,6 +216,13 @@ impl SweepFence {
         !self.active.load(Ordering::Relaxed)
             || self.generation != self.current.load(Ordering::Relaxed)
     }
+
+    /// Atomic fences also cancel queued work without waiting for a permit.
+    pub(crate) async fn cancelled(&self) {
+        while !self.is_stale() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
 }
 
 /// What the persistent capture listener is currently bound to.
@@ -590,6 +597,7 @@ pub struct ModeTransitionReply {
 
 pub struct NetworkManager {
     active_scans: Arc<std::sync::Mutex<HashSet<String>>>,
+    solicitations: tokio::sync::watch::Sender<Option<Solicitation>>,
     arp_devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
     adopted_ips: Arc<Mutex<HashMap<String, Ipv4Addr>>>,
     arp_listener_handle: Arc<Mutex<Option<arp::ArpListenerHandle>>>,
@@ -844,7 +852,29 @@ fn keep_prohibited_history_inactive(registry: &DeviceRegistry) -> bool {
     changed
 }
 
-/// Provoke ARP on the known subnets, then merge the OS neighbor table.
+/// Retained secondary addresses are never startup sweep sources. Deduplicate
+/// by /24, matching the bounded ICMP pass; Refresh includes actual adopted IPs.
+fn select_sweep_ips(
+    ips: &[interface::IpInfo],
+    retained: &HashSet<Ipv4Addr>,
+    refresh: bool,
+) -> Vec<String> {
+    let mut subnets = HashSet::new();
+    ips.iter()
+        .filter_map(|info| {
+            let ip: Ipv4Addr = info.address.parse().ok()?;
+            if crate::validation::prohibited_camera_ip(ip) || (!refresh && retained.contains(&ip)) {
+                return None;
+            }
+            let octets = ip.octets();
+            subnets
+                .insert([octets[0], octets[1], octets[2]])
+                .then(|| ip.to_string())
+        })
+        .collect()
+}
+
+/// Provoke ARP on the selected subnets, then merge the OS neighbor table.
 /// Fence-checked throughout. Shared by discovery start (spawned after a
 /// short delay so the capture attach lands first) and the capture-restart
 /// ladder, which re-provokes so a fresh session has traffic to prove
@@ -853,8 +883,8 @@ async fn provoke_sweep(params: &arp::ListenerParams, sweep_ips: &[String]) {
     if params.fence.is_stale() {
         return;
     }
-    log::info!("Ping sweeping known subnets to populate ARP");
-    ping_sweep_subnets(sweep_ips).await;
+    log::info!("Ping sweeping selected subnets to populate ARP");
+    ping_sweep_subnets(sweep_ips, &params.fence, &params.app_handle).await;
 
     // One brief-lock snapshot for the whole merge pass (never lock per
     // entry); a poisoned lock degrades to an empty set, which filters
@@ -870,11 +900,8 @@ async fn provoke_sweep(params: &arp::ListenerParams, sweep_ips: &[String]) {
         .map(|v| v.clone())
         .unwrap_or_default();
 
-    // Merge the OS neighbor table for EVERY local/adopted IP, not just
-    // the first — a neighbor learned via an adopted secondary subnet
-    // would otherwise be missed at boot (in-session sweeps cover it
-    // post-adoption, but not the cold-start merge). The map dedup makes
-    // the extra queries harmless.
+    // Neighbor observations from the selected pass still enter through the
+    // fenced candidate path. Known retained devices use targeted presence.
     for sweep_iface_ip in sweep_ips {
         if params.fence.is_stale() {
             break;
@@ -1180,23 +1207,8 @@ async fn attempt_adoption(
 
             log::info!("Auto-adopted {} with IP {}", device_subnet, adopted_ip);
 
-            // Kick active-discovery passes on the newly-adopted /24.
-            // Without this, only the device that triggered the adoption
-            // is in arpDevices — passive hosts on the same subnet
-            // (cameras idle on their control port, etc.) never ARP on
-            // their own and stay invisible until the user manually
-            // refreshes.
-            //
-            // Multiple staggered passes cover three issues that
-            // routinely break a single-shot sweep on Windows:
-            //   1. The newly-bound secondary IP isn't fully usable for
-            //      ~1–3s after netsh returns — the first ping via
-            //      `-S adopted_ip` can silently fail during that window.
-            //   2. If the /24 also overlaps WiFi, the route metric may
-            //      settle unpredictably and later passes catch what an
-            //      early pass missed.
-            //   3. Devices behind a slow switch / PoE injector sometimes
-            //      drop the first ARP broadcast.
+            // One bounded pass after the new binding settles. Presence handles
+            // later verification; a quiet adopted subnet is not swept repeatedly.
             let sweep_ip = adopted_ip.to_string();
             let sweep_devices = ctx.devices.clone();
             let sweep_registry = ctx.registry.clone();
@@ -1206,41 +1218,26 @@ async fn attempt_adoption(
             let sweep_candidates = ctx.candidates.clone();
             let sweep_local = ctx.local_ips.clone();
             tokio::spawn(async move {
-                let passes: [u64; 3] = [1500, 5000, 12000];
-                for (i, delay_ms) in passes.iter().enumerate() {
-                    tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
-                    // A restart/stop during the staggered delays means
-                    // this belongs to a dead session — stop pinging and
-                    // merging.
-                    if sweep_fence.is_stale() {
-                        break;
-                    }
-                    log::info!(
-                        "Post-adoption sweep pass {}/{} on {}",
-                        i + 1,
-                        passes.len(),
-                        sweep_ip
-                    );
-                    ping_sweep_subnets(std::slice::from_ref(&sweep_ip)).await;
-                    // The adopted subnet is on the Ethernet interface, so
-                    // no non-Ethernet exclusion applies to this
-                    // post-adoption merge. The self-IP filter still does
-                    // — snapshot per pass (the passes span ~12 s).
-                    let local_snapshot: HashSet<Ipv4Addr> =
-                        sweep_local.lock().map(|s| s.clone()).unwrap_or_default();
-                    merge_arp_table(
-                        sweep_devices.clone(),
-                        sweep_registry.clone(),
-                        sweep_emitter.clone(),
-                        sweep_handle.clone(),
-                        &sweep_ip,
-                        &[],
-                        &local_snapshot,
-                        &sweep_fence,
-                        sweep_candidates.as_ref(),
-                    )
-                    .await;
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                if sweep_fence.is_stale() {
+                    return;
                 }
+                ping_sweep_subnets(std::slice::from_ref(&sweep_ip), &sweep_fence, &sweep_handle)
+                    .await;
+                let local_snapshot: HashSet<Ipv4Addr> =
+                    sweep_local.lock().map(|s| s.clone()).unwrap_or_default();
+                merge_arp_table(
+                    sweep_devices.clone(),
+                    sweep_registry.clone(),
+                    sweep_emitter.clone(),
+                    sweep_handle.clone(),
+                    &sweep_ip,
+                    &[],
+                    &local_snapshot,
+                    &sweep_fence,
+                    sweep_candidates.as_ref(),
+                )
+                .await;
             });
 
             AdoptionAttemptOutcome::Adopted
@@ -1427,6 +1424,7 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
         scratch: Ipv4Addr,
         interface_index: u32,
     ) -> Result<Option<String>, ()> {
+        use tauri::Manager;
         if interface_index != self.ctx.interface_index || self.ctx.fence.is_stale() {
             return Err(());
         }
@@ -1442,6 +1440,14 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
         .await
         .map_err(|_| ())?
         .map_err(|_| ())?;
+        if self.ctx.fence.is_stale() {
+            return Err(());
+        }
+        self.ctx
+            .app_handle
+            .state::<NetworkManager>()
+            .note_solicitation(&self.ctx.fence)
+            .await;
         if self.ctx.fence.is_stale() {
             return Err(());
         }
@@ -1511,24 +1517,50 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
     }
 }
 
-/// One watchdog checkpoint window: sleep `window`, then read the
-/// session counters against `baseline`. `None` means shutdown was
-/// signalled mid-sleep. On completion returns the end snapshot (the
-/// next window's baseline) plus the payload and self deltas.
+#[derive(Clone, Copy)]
+struct Solicitation {
+    generation: u64,
+    at: tokio::time::Instant,
+    baseline: arp::CounterSnapshot,
+}
+
+/// No window runs until traffic was solicited in this capture attempt.
+/// Retain the pre-send baseline even if scheduling delays the watchdog.
 async fn watch_window(
     counters: &arp::SessionCounters,
-    baseline: arp::CounterSnapshot,
+    solicitations: &mut tokio::sync::watch::Receiver<Option<Solicitation>>,
+    generation: u64,
+    after: Option<tokio::time::Instant>,
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
     window: std::time::Duration,
-) -> Option<(arp::CounterSnapshot, u64, u64)> {
+) -> Option<(u64, u64)> {
+    let solicitation = loop {
+        if !solicitations.has_changed().ok()? {
+            tokio::select! {
+                biased;
+                _ = shutdown_rx.changed() => return None,
+                changed = solicitations.changed() => { changed.ok()?; }
+            }
+        }
+        let value = *solicitations.borrow_and_update();
+        if let Some(value) =
+            value.filter(|s| s.generation == generation && after.is_none_or(|at| s.at >= at))
+        {
+            break value;
+        }
+    };
     tokio::select! {
+        biased;
         _ = shutdown_rx.changed() => return None,
-        _ = tokio::time::sleep(window) => {}
+        _ = tokio::time::sleep_until(solicitation.at + window) => {}
     }
     let now = counters.snapshot();
-    let payload_delta = now.frames_seen.saturating_sub(baseline.frames_seen);
-    let self_delta = now.self_ip_dropped.saturating_sub(baseline.self_ip_dropped);
-    Some((now, payload_delta, self_delta))
+    Some((
+        now.frames_seen
+            .saturating_sub(solicitation.baseline.frames_seen),
+        now.self_ip_dropped
+            .saturating_sub(solicitation.baseline.self_ip_dropped),
+    ))
 }
 
 /// Capture-health watchdog with a bounded self-heal ladder.
@@ -1555,17 +1587,20 @@ async fn watchdog_ladder(
     listener_slot: Arc<Mutex<Option<arp::ArpListenerHandle>>>,
     prior_joins: arp::PriorCaptureJoins,
     capture_identity: Arc<Mutex<Option<CaptureIdentity>>>,
-    mut activation_rx: arp::ActivationRx,
+    activation: (
+        arp::ActivationRx,
+        tokio::sync::watch::Receiver<Option<Solicitation>>,
+    ),
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     use tauri::{Emitter, Manager};
+    let (mut activation_rx, mut solicitations) = activation;
     let capture_signal = params
         .app_handle
         .state::<NetworkManager>()
         .capture_signal
         .clone();
-    // Longer than the 500 ms sweep-start delay plus the sweep itself, so
-    // a healthy backend has time to deliver frames.
+    // The deadline starts at the solicitation, not at activation.
     const INITIAL_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
     const POLL: std::time::Duration = std::time::Duration::from_secs(2);
     const MAX_WATCH: std::time::Duration = std::time::Duration::from_secs(300);
@@ -1578,13 +1613,7 @@ async fn watchdog_ladder(
         // activation is the Rebaseline arm, so any other verdict ends
         // the run and the count never goes stale.
         let mut quiet_windows: u32 = 0;
-        // Rolling checkpoint baseline — written on activation before
-        // first use, re-anchored at each window end.
-        let mut baseline = arp::CounterSnapshot {
-            frames_seen: 0,
-            self_ip_dropped: 0,
-            prohibited_dropped: 0,
-        };
+        let mut window_after = (restarts_used > 0).then(tokio::time::Instant::now);
         let activation = tokio::select! {
             _ = shutdown_rx.changed() => None,
             outcome = tokio::time::timeout(arp::CAPTURE_ACTIVATION_TIMEOUT, activation_rx) => {
@@ -1606,25 +1635,25 @@ async fn watchdog_ladder(
                 match current_session_counters(&listener_slot).await {
                     None => arp::AttemptEvent::ShutdownSignalled, // stop already took the handle
                     Some(counters) => {
-                        // Baseline before the sweep, sweep before the
-                        // window: the sweep's own ARP must land inside
-                        // the measured window, otherwise a deaf-Rx
-                        // session reads as a quiet wire and the watchdog
-                        // holds instead of restarting.
-                        baseline = counters.snapshot();
-                        // Re-provoke on restarts — the initial session's
-                        // sweep was already spawned by the start path —
-                        // so the fresh session has traffic to prove
-                        // itself.
+                        // Initial start schedules the native pass. Restarts
+                        // provoke only native subnets; otherwise wait for ARP
+                        // presence/cache verification or explicit Refresh.
                         if restarts_used > 0 {
                             provoke_sweep(&params, &sweep_ips).await;
                         }
-                        match watch_window(&counters, baseline, &mut shutdown_rx, INITIAL_WINDOW)
-                            .await
+                        match watch_window(
+                            &counters,
+                            &mut solicitations,
+                            params.fence.generation,
+                            window_after,
+                            &mut shutdown_rx,
+                            INITIAL_WINDOW,
+                        )
+                        .await
                         {
                             None => arp::AttemptEvent::ShutdownSignalled,
-                            Some((end, payload_delta, self_delta)) => {
-                                baseline = end;
+                            Some((payload_delta, self_delta)) => {
+                                window_after = Some(tokio::time::Instant::now());
                                 last_self_delta = self_delta;
                                 arp::AttemptEvent::Verdict(arp::capture_health(
                                     payload_delta,
@@ -1696,15 +1725,23 @@ async fn watchdog_ladder(
                             }
                         }
                     }
-                    // Fresh baseline, same session, another window.
+                    // Another window requires a fresh solicitation in this session.
                     let Some(counters) = current_session_counters(&listener_slot).await else {
                         return; // stop already took the handle
                     };
-                    match watch_window(&counters, baseline, &mut shutdown_rx, INITIAL_WINDOW).await
+                    match watch_window(
+                        &counters,
+                        &mut solicitations,
+                        params.fence.generation,
+                        window_after,
+                        &mut shutdown_rx,
+                        INITIAL_WINDOW,
+                    )
+                    .await
                     {
                         None => return, // shutdown mid-window — a stop wins
-                        Some((end, payload_delta, self_delta)) => {
-                            baseline = end;
+                        Some((payload_delta, self_delta)) => {
+                            window_after = Some(tokio::time::Instant::now());
                             last_self_delta = self_delta;
                             event = arp::AttemptEvent::Verdict(arp::capture_health(
                                 payload_delta,
@@ -1838,6 +1875,7 @@ impl NetworkManager {
     pub fn new() -> Self {
         Self {
             active_scans: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            solicitations: tokio::sync::watch::channel(None).0,
             arp_devices: Arc::new(Mutex::new(HashMap::new())),
             adopted_ips: Arc::new(Mutex::new(HashMap::new())),
             arp_listener_handle: Arc::new(Mutex::new(None)),
@@ -2033,6 +2071,22 @@ impl NetworkManager {
             self.discovery_generation.clone(),
             self.discovery_active.clone(),
         )
+    }
+
+    async fn note_solicitation(&self, work: &SweepFence) {
+        let fence = self.sweep_fence();
+        if work.is_stale() || fence.is_stale() {
+            return;
+        }
+        if let Some(counters) = current_session_counters(&self.arp_listener_handle).await {
+            if !work.is_stale() && !fence.is_stale() {
+                self.solicitations.send_replace(Some(Solicitation {
+                    generation: fence.generation,
+                    at: tokio::time::Instant::now(),
+                    baseline: counters.snapshot(),
+                }));
+            }
+        }
     }
 
     pub fn registry(&self) -> Arc<DeviceRegistry> {
@@ -2786,16 +2840,19 @@ impl NetworkManager {
             })
             .filter_map(|r| r.ip.parse().ok().map(|ip| (ip, r.mac)))
             .collect();
+        let discovery = self.sweep_fence();
+        if discovery.is_stale() {
+            return Err(AppError::Network("Discovery session unavailable".into()));
+        }
         let scope = scanner::ScanScope {
             index,
             fence: Some(fence.clone()),
+            session: Some(discovery.clone()),
             ips: adapter.ips,
             identities,
         };
-        let discovery = self.sweep_fence();
-        let discovery = (!discovery.is_stale()).then_some(discovery);
         let results = scanner::scan(subnet, scope).await?;
-        if fence.is_stale() || discovery.as_ref().is_some_and(SweepFence::is_stale) {
+        if fence.is_stale() || discovery.is_stale() {
             return Ok(Vec::new());
         }
         let mut accepted = Vec::new();
@@ -2812,7 +2869,7 @@ impl NetworkManager {
                 continue;
             };
             if fence.is_stale()
-                || discovery.as_ref().is_some_and(SweepFence::is_stale)
+                || discovery.is_stale()
                 || path.index != result.interface_index
                 || Some(path.source.to_string()) != result.source
             {
@@ -2848,6 +2905,17 @@ impl NetworkManager {
     ) -> Result<(), AppError> {
         let _op = self.discovery_op.lock().await;
         self.start_arp_discovery_locked(interface_display_name, config, app_handle)
+            .await
+    }
+
+    pub async fn refresh_arp_discovery(
+        &self,
+        interface: &str,
+        config: &crate::config::AppConfig,
+        app: tauri::AppHandle,
+    ) -> Result<(), AppError> {
+        let _op = self.discovery_op.lock().await;
+        self.start_arp_discovery_body(interface, config, app, true)
             .await
     }
 
@@ -3017,6 +3085,17 @@ impl NetworkManager {
         config: &crate::config::AppConfig,
         app_handle: tauri::AppHandle,
     ) -> Result<(), AppError> {
+        self.start_arp_discovery_body(interface_display_name, config, app_handle, false)
+            .await
+    }
+
+    async fn start_arp_discovery_body(
+        &self,
+        interface_display_name: &str,
+        config: &crate::config::AppConfig,
+        app_handle: tauri::AppHandle,
+        refresh: bool,
+    ) -> Result<(), AppError> {
         // Authoritative mode gate, read under the discovery op lock:
         // set_network_mode persists the mode before apply_mode_change
         // serializes on the op, so a start queued behind an Auto→Manual
@@ -3060,6 +3139,20 @@ impl NetworkManager {
             )));
         }
         let known_ips: Vec<String> = iface_info.ips.iter().map(|ip| ip.address.clone()).collect();
+        let settings = config.get();
+        let retained: HashSet<Ipv4Addr> = settings
+            .adopted_subnets
+            .values()
+            .chain(
+                settings
+                    .adopted_meta
+                    .values()
+                    .filter_map(|m| m.address.as_ref()),
+            )
+            .filter_map(|ip| ip.parse().ok())
+            .collect();
+        let native_sweep_ips = select_sweep_ips(&iface_info.ips, &retained, false);
+        let sweep_ips = select_sweep_ips(&iface_info.ips, &retained, refresh);
         let own_mac = parse_mac_bytes(&iface_info.mac);
         let interface_index = interface::index_for_mac(&iface_info.mac).ok_or_else(|| {
             AppError::Network(format!(
@@ -3224,17 +3317,12 @@ impl NetworkManager {
         let iface_name = interface_display_name.to_string();
         let app_handle_for_adopt = app_handle.clone();
 
-        // Ping sweep known subnets to provoke ARP traffic so the capture
-        // listener sees all devices, then read the OS ARP table to catch
-        // cached entries that didn't generate new ARP packets on the wire.
+        // Startup sweeps only native /24s. Explicit Refresh also includes
+        // actually bound adopted /24s, through the same session fence.
         let sweep_params = listener_params.clone();
-        let sweep_ips = known_ips.clone();
+        let solicitations = self.solicitations.subscribe();
         tokio::spawn(async move {
-            // Small delay so the watchdog's baseline snapshot lands
-            // before the sweep's self-traffic — kept on every start
-            // path, including a retained listener, so a checkpoint
-            // window can never misread the sweep as pre-baseline noise.
-            // Also gives a freshly attached session time to start.
+            // Give a freshly attached capture time to start.
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             provoke_sweep(&sweep_params, &sweep_ips).await;
         });
@@ -3247,11 +3335,11 @@ impl NetworkManager {
         let (watchdog_shutdown, watchdog_shutdown_rx) = tokio::sync::watch::channel(false);
         let watchdog = tokio::spawn(watchdog_ladder(
             listener_params.clone(),
-            known_ips.clone(),
+            native_sweep_ips,
             self.arp_listener_handle.clone(),
             self.prior_capture_joins.clone(),
             self.capture_identity.clone(),
-            activation_rx,
+            (activation_rx, solicitations),
             watchdog_shutdown_rx,
         ));
         *self.discovery_watchdog_handle.lock().await = Some(WatchdogHandle {
@@ -4095,45 +4183,75 @@ async fn get_interface_ips(name: &str) -> Vec<Ipv4Addr> {
 /// 192.168.1.0/24 on both Ethernet-camera-network and home WiFi) can
 /// silently route out the wrong NIC — the Ethernet capture listener
 /// never sees the replies and passive devices on that subnet stay invisible.
-async fn ping_sweep_subnets(interface_ips: &[String]) {
+async fn ping_sweep_subnets(interface_ips: &[String], fence: &SweepFence, app: &tauri::AppHandle) {
+    use tauri::Manager;
     use tokio::sync::Semaphore;
     use tokio::task::JoinSet;
 
-    // Cap concurrent ping.exe spawns. Without this we were spawning all
-    // 254 pings per interface IP simultaneously — on a USB Ethernet
-    // adapter (notably ASIX AX88179) that burst was saturating the NIC
-    // / Windows socket stack at exactly the moment a parallel stream
-    // restart was trying to complete its RTSP DESCRIBE handshake, and
-    // the camera would time out before the SDP exchange finished,
-    // leaving the GStreamer pipeline stuck at Paused→Playing forever.
-    // 32 is well under typical Windows ephemeral-port and process
-    // pressure thresholds while still draining a /24 in ~1.5 s.
+    // ICMP has a separate process bound; it never takes TCP scan permits.
     const MAX_CONCURRENT_PINGS: usize = 32;
     let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_PINGS));
     let mut join_set = JoinSet::new();
-
+    let manager = app.state::<NetworkManager>();
+    let Some((_, index, adapter_fence)) = manager.probe_scope() else {
+        return;
+    };
+    let mut solicited = false;
     for ip_str in interface_ips {
-        if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
-            let o = ip.octets();
-            for last in 1..=254 {
-                let target = format!("{}.{}.{}.{}", o[0], o[1], o[2], last);
-                let source = ip_str.clone();
-                let sem = sem.clone();
-                join_set.spawn(async move {
-                    let _permit = match sem.acquire().await {
-                        Ok(p) => p,
-                        Err(_) => return,
-                    };
-                    let _ = async_cmd("ping")
-                        .args(["-n", "1", "-w", "200", "-S", &source, &target])
-                        .output()
-                        .await;
-                });
+        let Ok(ip) = ip_str.parse::<Ipv4Addr>() else {
+            continue;
+        };
+        if crate::validation::prohibited_camera_ip(ip) {
+            continue;
+        }
+        let o = ip.octets();
+        for last in 1..=254 {
+            let permit = tokio::select! {
+                biased;
+                _ = fence.cancelled() => return,
+                _ = adapter_fence.cancelled() => return,
+                permit = sem.clone().acquire_owned() => match permit { Ok(p) => p, Err(_) => return },
+            };
+            #[cfg(windows)]
+            if !interface::source_matches_interface(index, ip) {
+                break;
             }
+            let target = Ipv4Addr::new(o[0], o[1], o[2], last);
+            if interface_ips
+                .iter()
+                .any(|local| local == &target.to_string())
+                || route::egress_index(target).ok() != Some(index)
+            {
+                continue;
+            }
+            if !solicited {
+                manager.note_solicitation(fence).await;
+                solicited = true;
+            }
+            if fence.is_stale() || adapter_fence.is_stale() {
+                return;
+            }
+            let source = ip_str.clone();
+            join_set.spawn(async move {
+                let _permit = permit;
+                let mut command = async_cmd("ping");
+                command.kill_on_drop(true);
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    command
+                        .args(["-n", "1", "-w", "200", "-S", &source, &target.to_string()])
+                        .output(),
+                )
+                .await;
+            });
         }
     }
-
-    while join_set.join_next().await.is_some() {}
+    tokio::select! {
+        biased;
+        _ = fence.cancelled() => {},
+        _ = adapter_fence.cancelled() => {},
+        _ = async { while join_set.join_next().await.is_some() {} } => {},
+    }
     log::info!("Ping sweep complete");
 }
 
@@ -5186,6 +5304,115 @@ mod tests {
             ),
             BindingAction::Hold("selected adapter unavailable".into(), false)
         );
+    }
+
+    #[test]
+    fn startup_sweeps_native_once_refresh_includes_three_retained_subnets() {
+        let ips = vec![
+            ip_info("192.168.1.2", 24),
+            ip_info("192.168.1.3", 24),
+            ip_info("10.1.1.253", 24),
+            ip_info("10.2.2.253", 24),
+            ip_info("10.3.3.253", 24),
+            ip_info("169.254.1.2", 16),
+        ];
+        let retained = [ip("10.1.1.253"), ip("10.2.2.253"), ip("10.3.3.253")]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            select_sweep_ips(&ips, &retained, false),
+            vec!["192.168.1.2"]
+        );
+        assert_eq!(
+            select_sweep_ips(&ips, &retained, true),
+            vec!["192.168.1.2", "10.1.1.253", "10.2.2.253", "10.3.3.253"]
+        );
+        assert!(select_sweep_ips(&ips[2..], &retained, false).is_empty());
+        assert!(select_sweep_ips(&[], &retained, true).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_waits_for_solicitation_and_rejects_old_attempts() {
+        use std::time::Duration;
+        let counters = Arc::new(arp::SessionCounters::default());
+        let (tx, mut rx) = tokio::sync::watch::channel(None);
+        let (shutdown, mut stop) = tokio::sync::watch::channel(false);
+        let after = tokio::time::Instant::now();
+        let make = |generation, at| Solicitation {
+            generation,
+            at,
+            baseline: counters.snapshot(),
+        };
+        let c = counters.clone();
+        let watch = tokio::spawn(async move {
+            watch_window(
+                &c,
+                &mut rx,
+                2,
+                Some(after),
+                &mut stop,
+                Duration::from_secs(10),
+            )
+            .await
+        });
+        tokio::time::advance(Duration::from_secs(300)).await;
+        assert!(!watch.is_finished(), "idle time cannot start a window");
+        tx.send_replace(Some(make(1, tokio::time::Instant::now())));
+        tokio::task::yield_now().await;
+        tx.send_replace(Some(make(2, after - Duration::from_secs(1))));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert!(
+            !watch.is_finished(),
+            "old session/capture attempt cannot arm it"
+        );
+        tx.send_replace(Some(make(2, tokio::time::Instant::now())));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(9)).await;
+        assert!(!watch.is_finished());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(watch.await.unwrap(), Some((0, 0)));
+        drop(shutdown);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_preserves_pre_send_baseline_and_idle_shutdown_wins() {
+        let counters = arp::SessionCounters::default();
+        let (tx, mut rx) = tokio::sync::watch::channel(None);
+        let (shutdown, mut stop) = tokio::sync::watch::channel(false);
+        let at = tokio::time::Instant::now();
+        tx.send_replace(Some(Solicitation {
+            generation: 1,
+            at,
+            baseline: counters.snapshot(),
+        }));
+        tokio::time::advance(std::time::Duration::from_secs(9)).await;
+        // A delayed watchdog still expires ten seconds after the send.
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            watch_window(
+                &counters,
+                &mut rx,
+                1,
+                None,
+                &mut stop,
+                std::time::Duration::from_secs(10)
+            )
+            .await,
+            Some((0, 0))
+        );
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(1));
+        shutdown.send(true).unwrap();
+        assert!(watch_window(
+            &counters,
+            &mut rx,
+            1,
+            None,
+            &mut stop,
+            std::time::Duration::from_secs(10)
+        )
+        .await
+        .is_none());
     }
 
     // ── wired source selection for MAC verification ───────────────
