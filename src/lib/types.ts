@@ -122,6 +122,13 @@ export interface Credentials {
  *  preserves it across saves and the UI reads adoption state via
  *  `get_adoption_state` instead. */
 export interface AdoptedMeta {
+  adapter_mac?: string | null;
+  prefix?: number | null;
+  address?: string | null;
+  desired?: "present" | "removed";
+  applied?: boolean;
+  last_error?: string | null;
+
   /** RFC3339 wall time the subnet was adopted. */
   adopted_at: string | null;
   /** RFC3339 wall time of the last positive device evidence, or null. */
@@ -231,6 +238,13 @@ export interface ArpDevicePayload {
  *  (see Rust `AdoptedMetaView`). `stale` is computed backend-side from
  *  the same policy the removal pass uses; the frontend only renders. */
 export interface AdoptedMetaView {
+  adapter_mac?: string | null;
+  prefix?: number | null;
+  address?: string | null;
+  desired?: "present" | "removed";
+  applied?: boolean;
+  last_error?: string | null;
+
   /** RFC3339; null for entries recorded before metadata existed. */
   adopted_at: string | null;
   /** RFC3339; null until positive device evidence arrives. */
@@ -338,3 +352,17 @@ export type LicenseDocumentId =
   | "libpng"
   | "libjpeg-turbo"
   | "bzip2";
+
+/** One fenced OS/config mode transition. A warning reply changes nothing. */
+export interface ModeTransition {
+  name: string;
+  mode: NetworkMode;
+  ip: string | null;
+  subnet_mask: string | null;
+  gateway: string | null;
+  confirmed: boolean;
+}
+export interface ModeTransitionReply {
+  warning: string | null;
+  mode: NetworkMode;
+}

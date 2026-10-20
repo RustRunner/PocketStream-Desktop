@@ -595,8 +595,7 @@ export function setupIpConfigDialog(): void {
     await showModalWithVideo(dialog);
 
     try {
-      await loadAdapterChoices();
-      populateDialogFields();
+      await reloadDialogInterfaces();
       await syncModeFromInterface();
     } catch (_) {
       select.innerHTML = '<option value="">Failed to load</option>';
@@ -656,66 +655,40 @@ export function setupIpConfigDialog(): void {
   $<HTMLButtonElement>("#ip-config-cancel").addEventListener("click", () => dialog.close());
 
   // ── Apply ────────────────────────────────────────────────────────
-  // Three-mode branching:
-  //   DHCP            → setDhcp + setNetworkMode("dhcp")
-  //   Static-Auto     → setStaticIp + setNetworkMode("static_auto")
-  //   Static-Manual   → setStaticIp + setNetworkMode("static_manual")
-  // The OS-level change goes first so the new mode applies against a
-  // settled adapter (auto-adopt loop reads current IPs to decide
-  // rescue vs pause).
   $<HTMLButtonElement>("#ip-config-apply").addEventListener("click", async () => {
     if (selectingAdapter) return;
-    const iface = $<HTMLSelectElement>("#static-iface").value;
-    if (!iface) {
-      showToast("Select an interface", true);
-      return;
+    const name = $<HTMLSelectElement>("#static-iface").value;
+    const mode = readSelectedMode();
+    if (!name) { showToast("Select an interface", true); return; }
+    const ip = mode === "dhcp" ? null : $<HTMLInputElement>("#static-ip").value.trim();
+    const subnet_mask = mode === "dhcp" ? null : $<HTMLInputElement>("#static-mask").value.trim();
+    if (mode !== "dhcp" && (!ip || !subnet_mask)) {
+      showToast("Fill in address and mask", true); return;
     }
-
+    const request = {
+      name, mode, ip, subnet_mask,
+      gateway: mode === "dhcp" ? null : $<HTMLInputElement>("#static-gateway").value.trim() || null,
+      confirmed: false,
+    };
     const spinner = $<HTMLElement>("#ip-config-spinner");
-    const selectedMode = readSelectedMode();
-
-    if (selectedMode === "dhcp") {
-      spinner.style.display = "";
-      try {
-        await api.setDhcp(iface);
-        await api.setNetworkMode("dhcp");
-        if (state.config) state.config.network_mode = "dhcp";
-        showToast("Switched to DHCP");
-        dialog.close();
-        await refreshInterfaces();
-      } catch (e) {
-        showToast("Failed: " + formatError(e), true);
-      }
-      spinner.style.display = "none";
-      return;
-    }
-
-    // Both Static-Auto and Static-Manual need a host primary IP — same
-    // form, same OS call. The difference is the program mode that gets
-    // saved afterward (which drives ARP/auto-adopt/pinger behavior).
-    const ip = $<HTMLInputElement>("#static-ip").value.trim();
-    const mask = $<HTMLInputElement>("#static-mask").value.trim();
-    const gw = $<HTMLInputElement>("#static-gateway").value.trim() || null;
-    if (!ip || !mask) {
-      showToast("Fill in address and mask", true);
-      return;
-    }
     spinner.style.display = "";
     try {
-      await api.setStaticIp(iface, ip, mask, gw);
-      await api.setNetworkMode(selectedMode);
-      if (state.config) state.config.network_mode = selectedMode;
-      showToast(
-        selectedMode === "static_manual"
-          ? "Switched to Static — Manual"
-          : "Primary IP updated"
-      );
+      let reply = await api.setNetworkMode(request);
+      if (reply.warning) {
+        if (!window.confirm(reply.warning)) return;
+        reply = await api.setNetworkMode({ ...request, confirmed: true });
+      }
+      if (state.config) state.config.network_mode = reply.mode;
+      showToast(reply.mode === "dhcp" ? "Switched to DHCP; saved bindings are pending" : "Static configuration applied");
       dialog.close();
       await refreshInterfaces();
     } catch (e) {
       showToast("Failed: " + formatError(e), true);
+      await reloadDialogInterfaces();
+      await syncModeFromInterface();
+    } finally {
+      spinner.style.display = "none";
     }
-    spinner.style.display = "none";
   });
 }
 
@@ -741,7 +714,8 @@ async function syncModeFromInterface(): Promise<void> {
   const name = $<HTMLSelectElement>("#static-iface").value;
   if (!name) return;
   try {
-    const mode = await api.getNetworkMode();
+    const savedMode = await api.getNetworkMode();
+    const mode = await api.getDhcpState(name) ? "dhcp" : savedMode === "dhcp" ? "static_auto" : savedMode;
     $<HTMLInputElement>("#ip-mode-dhcp").checked = mode === "dhcp";
     $<HTMLInputElement>("#ip-mode-static-auto").checked = mode === "static_auto";
     $<HTMLInputElement>("#ip-mode-static-manual").checked = mode === "static_manual";
@@ -755,18 +729,13 @@ async function syncModeFromInterface(): Promise<void> {
 function populateDialogFields(): void {
   const name = $<HTMLSelectElement>("#static-iface").value;
   const iface = dialogInterfaces.find((i) => i.name === name);
-  if (!iface) return;
+  if (!iface) { renderSecondaryIps(undefined, undefined); return; }
 
-  // Find the first non-auto-adopted, non-APIPA IP as primary. APIPA is
-  // never used as a fallback — when the adapter has only APIPA (DHCP
-  // failed to acquire a real lease) the field is left empty so the user
-  // types fresh against the `192.168.1.100` placeholder. Seeding the
-  // APIPA value would invite a partial-edit collision that yields a
-  // hybrid like `169.168.1.100` and writes it as a static primary.
-  const adoptedIps = new Set(adoptedSubnets.values());
-  const primary =
-    iface.ips.find((ip) => !adoptedIps.has(ip.address) && !isApipa(ip.address)) ||
-    iface.ips.find((ip) => !isApipa(ip.address));
+  // Multiple unmanaged addresses have ambiguous ownership. Require an
+  // explicit address instead of treating enumeration order as primary.
+  const savedIps = new Set([...adoptionMeta.values()].map((m) => m.address));
+  const native = iface.ips.filter((ip) => !savedIps.has(ip.address) && !isApipa(ip.address));
+  const primary = native.length === 1 ? native[0] : undefined;
   $<HTMLInputElement>("#static-ip").value = primary ? primary.address : "";
   $<HTMLInputElement>("#static-mask").value = primary ? prefixToMask(primary.prefix) : "255.255.255.0";
   // Left blank intentionally. The snapshot carries no gateway to seed it
@@ -779,117 +748,42 @@ function populateDialogFields(): void {
   renderSecondaryIps(iface, primary);
 }
 
-/** Render the secondary IP list with remove buttons. */
-function renderSecondaryIps(
-  iface: InterfaceInfo,
-  primary: { address: string } | undefined
-): void {
+/** Merge observed secondaries with durable pending/failed removal intent. */
+function renderSecondaryIps(iface: InterfaceInfo | undefined, primary: { address: string } | undefined): void {
   const list = $("#secondary-ip-list");
-  const secondaries = iface.ips.filter((ip) => !primary || ip.address !== primary.address);
-
-  if (secondaries.length === 0) {
-    list.innerHTML = '<p class="placeholder-text" style="padding:8px">No secondary IPs</p>';
-    return;
-  }
-
-  // Only the specific IPs we auto-adopted carry the "(auto)" badge.
-  // adoptedSubnets is keyed by subnet → IP we added on that subnet; a
-  // user-set static IP on the same /24 is a different value and must
-  // not get tagged "auto" just because the subnet is in the map.
-  const adoptedIpSet = new Set(adoptedSubnets.values());
-  // Reverse map for the lifecycle metadata lookup: adopted IP → subnet
-  // (the metadata mirror is keyed by subnet, rows render by IP).
-  const ipToSubnet = new Map(
-    [...adoptedSubnets].map(([subnet, ip]) => [ip, subnet])
-  );
-  list.innerHTML = secondaries
-    .map((ip) => {
-      const isAuto = adoptedIpSet.has(ip.address);
-      let badge = isAuto ? '<span class="badge-auto">(auto)</span>' : "";
-      let tooltip = "";
-      if (isAuto) {
-        // Stale flag and tooltip come from the backend's adoption
-        // snapshot — the same policy that decides removal, so the
-        // badge can't disagree with what the reaper would do.
-        const subnet = ipToSubnet.get(ip.address);
-        const meta = subnet ? adoptionMeta.get(subnet) : undefined;
-        if (meta) {
-          tooltip = meta.last_device_seen
-            ? `last device seen: ${new Date(meta.last_device_seen).toLocaleString()}`
-            : "no device seen this session";
-          if (meta.stale) {
-            badge += ' <span class="badge-stale">stale</span>';
-          }
-        }
-      }
-      const addrEsc = escapeHtml(ip.address);
-      const cidrEsc = escapeHtml(`${ip.address}/${ip.prefix}`);
-      const titleAttr = tooltip ? ` title="${escapeHtml(tooltip)}"` : "";
-      return `<div class="secondary-ip-item">
-        <span${titleAttr}>${cidrEsc} ${badge}</span>
-        <button class="btn-remove-ip" data-remove-sec-ip="${addrEsc}" title="Remove">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
-        </button>
-      </div>`;
-    })
-    .join("");
-
-  // Wire remove buttons
-  list
-    .querySelectorAll<HTMLButtonElement>("[data-remove-sec-ip]")
-    .forEach((btn) => {
-      btn.addEventListener("click", async () => {
-        if (selectingAdapter) return;
-        const ip = btn.dataset["removeSecIp"];
-        if (!ip) return;
-        const ifaceName = $<HTMLSelectElement>("#static-iface").value;
-        const spinner = $<HTMLElement>("#ip-config-spinner");
-        spinner.style.display = "";
-        try {
-          // An auto-adopted address must go through the adoption
-          // removal path: the generic secondary-IP delete only unbinds
-          // the OS address, leaving the backend adoption and its config
-          // entry intact — the row silently returned on the next
-          // launch's restore. Generic removal stays for user-owned
-          // secondaries, which have no backend registration.
-          let adoptedSubnet: string | null = null;
-          for (const [subnet, adoptedIp] of adoptedSubnets) {
-            if (adoptedIp === ip) {
-              adoptedSubnet = subnet;
-              break;
-            }
-          }
-          if (!adoptedSubnet) {
-            // The live map can be empty while the row's IP is still a
-            // persisted adoption: a disconnected cold start restores
-            // nothing, yet an unclean shutdown leaves the address bound.
-            // Those rows must also route through the adoption-aware
-            // removal, or the config entry survives and the adoption
-            // resurrects on the next connected launch.
-            const configured = await api.getConfiguredAdoptions();
-            for (const [subnet, adoptedIp] of Object.entries(configured)) {
-              if (adoptedIp === ip) {
-                adoptedSubnet = subnet;
-                break;
-              }
-            }
-          }
-          if (adoptedSubnet) {
-            await api.removeAdoptedSubnet(adoptedSubnet, ifaceName);
-            adoptedSubnets.delete(adoptedSubnet);
-            // The host card renders adopted rows too — keep it in step.
-            renderSubnetList();
-          } else {
-            await api.removeSecondaryIp(ifaceName, ip);
-          }
-          showToast(`Removed ${ip}`);
-          await reloadDialogInterfaces();
-        } catch (e) {
-          showToast("Failed: " + formatError(e), true);
-        }
+  const rows = new Map((iface?.ips ?? []).filter((ip) => ip.address !== primary?.address)
+    .map((ip) => [ip.address, ip.prefix]));
+  const saved = new Map([...adoptionMeta].filter(([, m]) => m.address &&
+    (m.desired !== "removed" || m.applied || m.last_error)).map(([subnet, m]) => [m.address!, { subnet, meta: m }]));
+  for (const [address, { meta }] of saved) rows.set(address, meta.prefix ?? 24);
+  list.innerHTML = rows.size ? [...rows].map(([address, prefix]) => {
+    const binding = saved.get(address);
+    const m = binding?.meta;
+    const status = m ? (m.desired === "removed" ? "pending removal" : m.applied ? "applied" : "pending") : "ownership unknown";
+    const reason = m?.last_error ? ` — ${m.last_error}` : m && !m.adapter_mac ? " — adapter ownership awaiting reconciliation" : "";
+    return `<div class="secondary-ip-item"><span>${escapeHtml(`${address}/${prefix} — ${status}${reason}`)}</span>
+      ${binding ? `<button class="btn-remove-ip" data-remove-binding="${escapeHtml(binding.subnet)}" title="Remove ${escapeHtml(`${address}/${prefix}`)}">Remove</button>` : ""}</div>`;
+  }).join("") : '<p class="placeholder-text" style="padding:8px">No secondary IPs</p>';
+  list.querySelectorAll<HTMLButtonElement>("[data-remove-binding]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      if (selectingAdapter) return;
+      const subnet = btn.dataset["removeBinding"];
+      const m = subnet ? adoptionMeta.get(subnet) : undefined;
+      if (!subnet || !m?.address) return;
+      if (!window.confirm(`Remove ${m.address}/${m.prefix ?? "?"} from its saved adapter? Nodes on ${subnet} may share this host address and lose connectivity. Device history is retained.`)) return;
+      const spinner = $<HTMLElement>("#ip-config-spinner");
+      spinner.style.display = "";
+      try {
+        await api.removeAdoptedSubnet(subnet, iface?.name);
+        showToast(`Removed ${m.address}`);
+      } catch (e) {
+        showToast("Failed: " + formatError(e), true);
+      } finally {
+        await reloadDialogInterfaces();
         spinner.style.display = "none";
-      });
+      }
     });
+  });
 }
 
 /** Re-pull interfaces into the IP-config dialog when it's open. Used
@@ -905,6 +799,11 @@ export async function refreshIpDialogIfOpen(): Promise<void> {
 async function reloadDialogInterfaces(): Promise<void> {
   try {
     await loadAdapterChoices();
+    const snapshot = await api.getAdoptionState();
+    adoptedSubnets.clear();
+    adoptionMeta.clear();
+    for (const [subnet, ip] of Object.entries(snapshot.adopted_subnets)) adoptedSubnets.set(subnet, ip);
+    for (const [subnet, meta] of Object.entries(snapshot.meta)) adoptionMeta.set(subnet, meta);
     populateDialogFields();
     // Also refresh the host card
     await refreshInterfaces();

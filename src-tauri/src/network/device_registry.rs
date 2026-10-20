@@ -11,14 +11,18 @@
 //! not emit events on its own; emission is the responsibility of the
 //! caller (NetworkManager) so it can debounce / batch.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{AppSettings, CachedDevice, ManualNode};
+#[cfg(test)]
+use crate::config::AppSettings;
+use crate::config::{CachedDevice, ManualNode};
 use crate::network::ArpDevice;
 
 /// User-visible reachability status of a device record.
@@ -75,6 +79,7 @@ pub struct DeviceRegistry {
 /// CAM can be selected for streaming without ever receiving an alias —
 /// that config entry is just as much a statement of user intent as a
 /// label.
+#[cfg(test)]
 pub fn configured_pins(settings: &AppSettings) -> HashSet<String> {
     let mut pins: HashSet<String> = settings.manual_nodes.iter().map(|n| n.ip.clone()).collect();
     if !settings.stream.camera_ip.is_empty() {
@@ -89,6 +94,7 @@ pub fn configured_pins(settings: &AppSettings) -> HashSet<String> {
 /// this so protection can't drift between them. Deliberately excludes
 /// transient reachability (`Live` and friends) — a status guard
 /// belongs to the individual removal path, not to identity.
+#[cfg(test)]
 pub fn is_user_pinned(key: &str, alias: &str, ip: &str, configured_pins: &HashSet<String>) -> bool {
     key.starts_with("manual:") || !alias.is_empty() || configured_pins.contains(ip)
 }
@@ -500,6 +506,7 @@ impl DeviceRegistry {
     /// subnet" without exposing the key map — the `manual:` key prefix
     /// only exists on the map keys, not in the records a `snapshot()`
     /// returns.
+    #[cfg(test)]
     pub fn user_pinned_ips(&self, configured_pins: &HashSet<String>) -> Vec<std::net::Ipv4Addr> {
         let map = self.lock();
         map.iter()
