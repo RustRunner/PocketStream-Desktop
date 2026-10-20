@@ -616,7 +616,6 @@ function setupQrDialog(): void {
 // (1Hz internal ticker plus an immediate refresh after every command-
 // side mutation). Frontend subscribes once at startup; no polling.
 
-let lastPlaybackReason: string | null = null;
 let lastRecordingReport: string | null = null;
 
 /** Subscribe to backend stream-status push events. Call once at app
@@ -703,16 +702,14 @@ function showStreamLost(status: StreamStatus): void {
   const reason = status.playback_fault?.reason;
   const phase = status.playback_state === "failed" ? "Playback failed" : status.playback_state === "starting" ? "Connecting" : "Recovering";
   const retry = status.playback_next_retry_secs === null ? "" : ` — retry in ${status.playback_next_retry_secs}s`;
-  overlay.querySelector<HTMLElement>(".playback-reason")!.textContent = `${phase}${reason ? `: ${reason}` : ""}${retry}`;
+  const message = status.playback_state === "recovering" && reason
+    ? reason : `${phase}${reason ? `: ${reason}` : ""}`;
+  overlay.querySelector<HTMLElement>(".playback-reason")!.textContent = `${message}${retry}`;
   overlay.classList.add("visible");
-  if (reason && reason !== lastPlaybackReason) showToast("Stream lost — " + reason, true);
-  if (reason) lastPlaybackReason = reason;
 }
 
 function hideStreamLost(): void {
   state.streamLost = false;
-  if (state.isStreaming && lastPlaybackReason) showToast("Stream recovered");
-  lastPlaybackReason = null;
   void syncVideoVisibility();
   $("#video-area").querySelector(".stream-lost-overlay")?.classList.remove("visible");
 }

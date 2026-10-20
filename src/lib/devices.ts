@@ -372,17 +372,11 @@ export function setupArpListeners(): void {
   // Quiet-network watchdog signals. Diagnostic only — the backend never
   // flips discovery availability on silence, so this is a heads-up that a
   // provoked ping sweep drew no ARP frames (dead subnet, or capture not
-  // delivering). At most one degraded toast per discovery session.
+  // delivering). Keep this in diagnostics and the existing panel state.
   api.onEvent<DiscoveryDegradedPayload>("discovery-degraded", (data) => {
     const drops =
       data.missed_packets > 0 ? ` (ring drops: ${data.missed_packets})` : "";
     log(`Discovery degraded: ${data.reason}${drops}`);
-    // Capture can be quiet while the backend verifier proves a node.
-    // Suppress the toast when the panel already shows an Active row.
-    const anyActive = visibleDevices(deviceList.getDevices()).some((r) => r.status === "live");
-    if (!anyActive) {
-      showToast("No devices responding to discovery yet", true);
-    }
     // If the only thing keeping the startup spinner alive is the grace
     // hold, a dead capture channel means there's nothing left to wait
     // for — unwind just the hold; every other spinner state keeps its
@@ -422,7 +416,6 @@ export function setupArpListeners(): void {
   api.onEvent<AdoptionFailedPayload>("adoption-failed", (data) => {
     // Diagnostic only — the adopt loop retries with backoff on its own.
     log(`Auto-adopt failed for ${data.subnet}: ${data.error}`);
-    showToast(`Couldn't join ${data.subnet} — will retry`, true);
   });
 
   // Removal does not erase backend tombstones; refresh their final status.
@@ -434,11 +427,6 @@ export function setupArpListeners(): void {
     renderSubnetList();
     void refreshIpDialogIfOpen();
     void refreshHostBindings();
-    // Manual removals already toast from their click handler; only a
-    // background reap needs to tell the user something happened.
-    if (data.reason === "stale_apipa") {
-      showToast(`Removed stale adoption ${data.subnet} — no device seen there`);
-    }
   });
 
   // Initial hydration / scan kickoff is orchestrated from main.js

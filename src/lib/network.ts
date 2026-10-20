@@ -124,7 +124,7 @@ export async function refreshInterfaces(): Promise<void> {
       $("#iface-name").textContent = eth.display_name || eth.name;
       await refreshHostMode();
       renderSubnetList();
-      // Recovery — reset the dedup so the next failure toasts again.
+      // Recovery — reset diagnostic throttling for the next outage.
       lastAdapterWarningAt = 0;
     } else if (eth) {
       // Adapter is known to Windows but has no IP. Treat this the same
@@ -153,11 +153,10 @@ export async function refreshInterfaces(): Promise<void> {
   }
 }
 
-// ── No-Ethernet toast dedup ─────────────────────────────────────────
+// ── No-Ethernet diagnostic throttling ──────────────────────────────
 // refreshInterfaces can fire rapidly (startup + manual refresh + watcher
-// events arriving during a disconnect), so rate-limit the toast to at
-// most once per window. Reset to 0 on a successful enumeration so the
-// next failure re-toasts.
+// events arriving during a disconnect). The Host card and launch modal
+// cover the visible state; keep only a throttled diagnostic here.
 
 const NO_ETHERNET_COOLDOWN_MS = 15000;
 let lastAdapterWarningAt = 0;
@@ -166,13 +165,12 @@ export function warnNoEthernet(): void {
   const now = Date.now();
   if (now - lastAdapterWarningAt < NO_ETHERNET_COOLDOWN_MS) return;
   lastAdapterWarningAt = now;
-  showToast(
+  log(
     adapterSelection?.selection_required
       ? "Choose the camera's Ethernet adapter in Configure"
       : adapterSelection?.selected_mac && (!adapterSelection.adapter || adapterSelection.interface_index === null)
         ? unavailableAdapterLabel()
-        : "No Ethernet detected — check Ethernet connection and/or reset Ethernet adapter",
-    true
+        : "No Ethernet detected — check Ethernet connection and/or reset Ethernet adapter"
   );
 }
 
@@ -348,7 +346,7 @@ function applyDownEvent(iface: InterfaceInfo): void {
 function applyUpEvent(iface: InterfaceInfo, wasDown: boolean): void {
   state.activeInterface = iface;
   $("#iface-name").textContent = iface.display_name || iface.name;
-  // Recovery — reset the toast dedup so a future failure re-toasts.
+  // Recovery — reset diagnostic throttling for the next outage.
   lastAdapterWarningAt = 0;
   // Refresh the subnet list since adopted IPs may have appeared
   // (load_adopted_from_config completing during cold start triggers
@@ -380,8 +378,8 @@ function applyUpEvent(iface: InterfaceInfo, wasDown: boolean): void {
     resetDiscoveryStatus();
     onDiscoveryReconnect();
     // Restart the stream (and RTSP server) if they were running
-    // before the disconnect. Fires in the background; failures
-    // surface as toasts inside handleReconnect.
+    // before the disconnect. Failures are logged; the backend status
+    // owns the persistent playback error and retry controls.
     handleReconnect().catch((e: unknown) =>
       log(`Auto-resume: ${formatError(e)}`)
     );
