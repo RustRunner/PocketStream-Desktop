@@ -86,7 +86,12 @@ struct Transaction {
     reason: Option<String>,
 }
 impl Transaction {
-    fn reply(self, manager: &NetworkManager, pending: &HashSet<String>) -> AddressReply {
+    fn reply(
+        self,
+        manager: &NetworkManager,
+        config: &AppConfig,
+        pending: &HashSet<String>,
+    ) -> AddressReply {
         let (selection, identity, dhcp) = if let Some(snapshot) = &self.observed {
             let mut iface = snapshot.iface.clone();
             iface.ips.retain(|ip| !pending.contains(&ip.address));
@@ -136,6 +141,12 @@ impl Transaction {
                 None,
             )
         });
+        log::info!(
+            "event=address_outcome operation={} outcome={:?} reason={}",
+            self.trace.id,
+            self.outcome,
+            log_value(self.reason.as_deref().unwrap_or("none"))
+        );
         AddressReply {
             operation: self.trace.id,
             outcome: self.outcome,
@@ -149,7 +160,7 @@ impl Transaction {
                 binding,
                 address: self.address.clone(),
                 prefix: self.prefix,
-                mode: self.mode,
+                mode: config.get().network_mode,
             },
         }
     }
@@ -196,7 +207,7 @@ impl NetworkManager {
             tx.outcome = AddressOutcome::Busy;
             tx.reason = Some("Waiting for current network operation; try again".into());
             tx.observation_error = tx.reason.clone();
-            return tx.reply(self, &HashSet::new());
+            return tx.reply(self, config, &HashSet::new());
         };
         tx.trace.phase("admission");
         let result = match self.validate_operation_context(config, &tx, &fence) {
@@ -224,14 +235,7 @@ impl NetworkManager {
         if tx.outcome == AddressOutcome::Success {
             tx.trace.succeeded();
         }
-        log::info!(
-            "event=address_outcome operation={} outcome={:?} reason={}",
-            tx.trace.id,
-            tx.outcome,
-            log_value(tx.reason.as_deref().unwrap_or("none"))
-        );
-        tx.mode = config.get().network_mode;
-        tx.reply(self, &self.pending_ip_strings().await)
+        tx.reply(self, config, &self.pending_ip_strings().await)
     }
 
     async fn run_address_operation(
@@ -982,12 +986,14 @@ mod tests {
         };
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(8)).await;
+        c.settings.lock().unwrap().network_mode = NetworkMode::Dhcp;
         drop(held_op);
         tokio::task::yield_now().await;
         assert!(!m.address_active.load(Ordering::Acquire));
         tokio::time::advance(Duration::from_secs(2)).await;
         let reply = task.await.unwrap();
         assert_eq!(reply.outcome, AddressOutcome::Busy);
+        assert_eq!(reply.view.mode, NetworkMode::Dhcp);
         assert!(m.address_active.load(Ordering::Acquire));
         drop(held_address);
         tokio::time::advance(Duration::from_secs(30)).await;
