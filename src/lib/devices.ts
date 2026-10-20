@@ -50,6 +50,7 @@ import type {
   AdoptionFailedPayload,
   ArpDevicePayload,
   CaptureState,
+  NetworkMode,
   DeviceRecord,
   DiscoveryDegradedPayload,
   DiscoveryRecoveredPayload,
@@ -74,6 +75,48 @@ export let captureState: CaptureState = {
   adapter_name: null,
   outcome: null,
 };
+
+type CaptureSubscriber = (next: CaptureState) => void;
+const captureSubscribers = new Set<CaptureSubscriber>();
+let captureSubscription: Promise<() => void> | null = null;
+let captureRevision = 0;
+let captureFetch = 0;
+
+function updateCaptureState(next: CaptureState): void {
+  captureState = next;
+  captureRevision++;
+  for (const subscriber of captureSubscribers) subscriber(next);
+}
+
+export function subscribeCaptureState(subscriber: CaptureSubscriber): () => void {
+  captureSubscribers.add(subscriber);
+  return () => { captureSubscribers.delete(subscriber); };
+}
+
+/** Subscribe before every fetch; an event or newer query wins a stale reply. */
+export async function refreshCaptureState(): Promise<CaptureState> {
+  captureSubscription ??= api.onEvent<CaptureState>("capture-active", updateCaptureState)
+    .catch((error: unknown) => { captureSubscription = null; throw error; });
+  await captureSubscription;
+  const request = ++captureFetch;
+  const revision = captureRevision;
+  const current = await api.getCaptureState();
+  if (current && request === captureFetch && revision === captureRevision) updateCaptureState(current);
+  return captureState;
+}
+
+export type ListeningNoticeTrigger = "launch" | "mode_from_manual" | "mode_from_dhcp"
+  | "refresh" | "reconnect" | "watchdog" | null;
+
+/** Pure eligibility rule; only launch and a real change to Auto may arm it. */
+export function listeningNoticeAdapter(
+  mode: NetworkMode | undefined, discoveryAvailable: boolean,
+  trigger: ListeningNoticeTrigger, capture: CaptureState,
+): string | null {
+  return mode === "static_auto" && discoveryAvailable && capture.active && capture.outcome !== null
+    && (trigger === "launch" || trigger === "mode_from_manual" || trigger === "mode_from_dhcp")
+    ? capture.adapter_name : null;
+}
 
 let pendingScans = 0;
 
@@ -265,16 +308,7 @@ export function resetDiscoveryStatus(): void {
 // ── ARP event listeners ─────────────────────────────────────────────
 
 export function setupArpListeners(): void {
-  // Subscribe before fetching: startup may activate before the webview
-  // loads. An event received during the fetch wins over its older reply.
-  let receivedCaptureEvent = false;
-  void api.onEvent<CaptureState>("capture-active", (next) => {
-    receivedCaptureEvent = true;
-    captureState = next;
-  }).then(async () => {
-    const current = await api.getCaptureState();
-    if (current && !receivedCaptureEvent) captureState = current;
-  }).catch((e) => log(`Failed to load capture state: ${formatError(e)}`));
+  void refreshCaptureState().catch((e) => log(`Failed to load capture state: ${formatError(e)}`));
 
   // Re-render whenever the backend pushes a new snapshot.
   let scanReadyKeys = new Set<string>();
