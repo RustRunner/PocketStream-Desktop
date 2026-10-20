@@ -737,7 +737,7 @@ async function handleRoleSelection(
     recordKey === key ? alias !== role : alias === role;
   const lostCams = devices.filter((r) => r.alias === "CAM" && losesRole(r.mac, "CAM"));
   const lostPtus = devices.filter((r) => r.alias === "PTU" && losesRole(r.mac, "PTU"));
-  for (const outgoing of lostPtus) haltPtuUnit(outgoing.ip);
+  for (const outgoing of lostPtus) haltPtuUnit(outgoing.ip, deviceList.targetFor(outgoing));
 
   function detachCamera(recordKey: string): void {
     if (sessionCamTarget.get()?.key === recordKey) sessionCamTarget.set(null);

@@ -5,8 +5,8 @@
 import * as api from "./tauri-api.ts";
 import { $, state, log, showToast } from "./state.ts";
 import { formatError } from "./errors.ts";
-import { getActiveCamIp, getActivePtuIp, getActiveCamTarget } from "./network.ts";
-import { selectedDevice } from "./store.ts";
+import { getActiveCamIp, getActivePtuIp, getActiveCamTarget, getActivePtuTarget } from "./network.ts";
+import { selectedDevice, type DeviceTarget } from "./store.ts";
 import * as deviceList from "./device-list.ts";
 
 // ── Local PTU state ─────────────────────────────────────────────────
@@ -52,12 +52,9 @@ function getPtuIp(): string | null {
 // ── PTU command FIFO ────────────────────────────────────────────────
 // Every PTU HTTP send goes through this queue, so exactly one request
 // is in flight and commands reach the unit in the order they were
-// issued. Without it, a quick D-pad tap could deliver stop before move
-// (the move used to wait behind a speed-limit query while the stop
-// fired immediately) and the PTU would drive at full speed until the
-// next command. One global queue is enough: only one PTU is active at
-// a time (alias-driven), and the target IP is resolved at dequeue so a
-// PTU re-alias mid-queue sends to the current unit.
+// issued. Without it, a quick D-pad tap could deliver stop before move.
+// Each entry keeps its original key, expected MAC and endpoint, so
+// reassigning PTU cannot redirect delayed work to the new holder.
 
 interface QueuedPtuCmd {
   /** Command string, or a thunk evaluated at dequeue time — used by
@@ -71,10 +68,9 @@ interface QueuedPtuCmd {
    *  happened. */
   stillWanted?: () => boolean;
   /** Explicit target for entries that must reach a specific unit
-   *  regardless of the current alias state (the farewell halt) —
-   *  dequeue-time resolution would otherwise drop them once the alias
-   *  is cleared, or worse, send them to the new holder. */
+   *  regardless of the current alias state (the farewell halt). */
   targetIp?: string;
+  target?: DeviceTarget;
 }
 
 const ptuQueue: QueuedPtuCmd[] = [];
@@ -82,7 +78,7 @@ let ptuDraining = false;
 
 function enqueuePtuCmd(
   cmd: string | (() => string),
-  opts?: { stillWanted?: () => boolean; targetIp?: string }
+  opts?: { stillWanted?: () => boolean; targetIp?: string; target?: DeviceTarget }
 ): Promise<Record<string, string> | null> {
   return new Promise((resolve, reject) => {
     ptuQueue.push({
@@ -90,7 +86,8 @@ function enqueuePtuCmd(
       resolve,
       reject,
       stillWanted: opts?.stillWanted,
-      targetIp: opts?.targetIp,
+      targetIp: opts?.targetIp ?? deviceList.endpointFor(opts?.target ?? getActivePtuTarget()) ?? undefined,
+      target: opts?.target ?? getActivePtuTarget() ?? undefined,
     });
     if (!ptuDraining) {
       ptuDraining = true;
@@ -106,14 +103,15 @@ async function drainPtuQueue(): Promise<void> {
       item.resolve(null);
       continue;
     }
-    const ip = item.targetIp ?? getPtuIp();
-    if (!ip) {
+    const target = item.target;
+    const ip = item.targetIp;
+    if (!ip || !target) {
       item.resolve(null);
       continue;
     }
     const cmdStr = typeof item.cmd === "function" ? item.cmd() : item.cmd;
     try {
-      item.resolve(await api.ptuSend(ip, cmdStr));
+      item.resolve(await api.ptuSend(ip, cmdStr, target));
     } catch (e) {
       item.reject(e);
     }
@@ -143,12 +141,12 @@ function purgePtuQueue(): void {
  *  never blocked; a failed halt retries once, then surfaces loudly —
  *  a possibly-still-moving PTU is the one physical-safety event in
  *  role reassignment. */
-export function haltPtuUnit(ip: string): void {
+export function haltPtuUnit(ip: string, target: DeviceTarget): void {
   purgePtuQueue();
   void (async () => {
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        await enqueuePtuCmd("PS=0&TS=0", { targetIp: ip });
+        await enqueuePtuCmd("PS=0&TS=0", { targetIp: ip, target });
         return;
       } catch (e) {
         if (attempt === 0) continue;
@@ -446,9 +444,8 @@ let zoomErrorToasted = false;
 /** `quiet` marks a background push (saved-position restore): failures
  *  log but never toast — a toast about an action the user didn't take
  *  is noise. User-initiated sends (drag, preset recall) keep toasting. */
-async function sendZoomPosition(percent: number, quiet: boolean): Promise<void> {
-  const ip = getCameraIp();
-  if (!ip) {
+async function sendZoomPosition(percent: number, quiet: boolean, target: DeviceTarget | null, ip: string | null): Promise<void> {
+  if (!ip || !target) {
     if (!quiet && !zoomErrorToasted) {
       showToast("Select a CAM IP to use zoom", true);
       zoomErrorToasted = true;
@@ -458,7 +455,7 @@ async function sendZoomPosition(percent: number, quiet: boolean): Promise<void> 
   const position = Math.round((percent / 100) * ZOOM_MAX);
   log(`Zoom: ${percent}% (${position}) ip=${ip}${quiet ? " (restore)" : ""}`);
   try {
-    await api.controlCgiZoomDirect(ip, position);
+    await api.controlCgiZoomDirect(ip, position, target);
     zoomErrorToasted = false;
   } catch (e) {
     log(`Zoom failed: ${formatError(e)}`);
@@ -489,16 +486,17 @@ function setupZoomSlider(): void {
   // transients.
   const MIN_GAP_MS = 100;
   let inFlight = false;
-  let queued: { percent: number; quiet: boolean } | null = null;
-  let lastSentPercent: number | null = null;
+  let queued: { percent: number; quiet: boolean; target: DeviceTarget | null; ip: string | null } | null = null;
+  let lastSent: string | null = null;
 
   async function drain(): Promise<void> {
     while (queued !== null) {
       const target = queued;
       queued = null;
-      if (target.percent === lastSentPercent) continue;
-      lastSentPercent = target.percent;
-      await sendZoomPosition(target.percent, target.quiet);
+      const stamp = `${target.target?.key}:${target.ip}:${target.percent}`;
+      if (stamp === lastSent) continue;
+      lastSent = stamp;
+      await sendZoomPosition(target.percent, target.quiet, target.target, target.ip);
       if (queued !== null) {
         await new Promise((r) => setTimeout(r, MIN_GAP_MS));
       }
@@ -510,7 +508,8 @@ function setupZoomSlider(): void {
   // supersedes a queued quiet restore — the failure toast then belongs
   // to the value the user actually asked for.
   function request(percent: number, quiet = false): void {
-    queued = { percent, quiet };
+    const target = getActiveCamTarget();
+    queued = { percent, quiet, target, ip: deviceList.endpointFor(target) };
     if (inFlight) return;
     inFlight = true;
     drain();

@@ -16,6 +16,7 @@ use gstreamer_rtsp_server::prelude::*;
 
 use crate::config::{AppSettings, StreamProtocol};
 use crate::error::AppError;
+use crate::network::route::{CameraTarget, ReadyPath};
 
 /// Apply the required receive policy to an `rtspsrc` that is constrained to
 /// TCP transport.  `set_property` panics for a missing or mismatched property,
@@ -126,6 +127,7 @@ fn publish_status_if_changed(tx: &watch::Sender<StreamStatus>, snapshot: StreamS
 }
 
 pub struct StreamManager {
+    app_handle: std::sync::Mutex<Option<tauri::AppHandle>>,
     state: Arc<Mutex<StreamState>>,
     video_hwnd: Arc<std::sync::atomic::AtomicIsize>,
     status_tx: Arc<watch::Sender<StreamStatus>>,
@@ -164,6 +166,10 @@ enum SourceMode {
 }
 
 struct StreamState {
+    playback_target: Option<CameraTarget>,
+    rtsp_target: Option<CameraTarget>,
+    /// S9 consumes this failed tick check as a fault. S6 only records/logs it.
+    readiness_failure: Option<String>,
     playback: Option<Arc<PlaybackPipeline>>,
     rtsp_server: Option<RtspRestreamer>,
     rtsp_desired: bool,
@@ -190,6 +196,7 @@ struct RelaySupervisorContext {
     relay_wake: Arc<Notify>,
     relay_event_tx: RelayEventSender,
     app_handle: tauri::AppHandle,
+    rtsp_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl StreamManager {
@@ -197,7 +204,11 @@ impl StreamManager {
         let (status_tx, _) = watch::channel(StreamStatus::idle());
         let (relay_event_tx, relay_event_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
+            app_handle: std::sync::Mutex::new(None),
             state: Arc::new(Mutex::new(StreamState {
+                playback_target: None,
+                rtsp_target: None,
+                readiness_failure: None,
                 playback: None,
                 rtsp_server: None,
                 rtsp_desired: false,
@@ -273,6 +284,18 @@ impl StreamManager {
         settings: &AppSettings,
         window_handle: Option<usize>,
     ) -> Result<(), AppError> {
+        let start_epoch = self
+            .playback_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        let handle = self
+            .app_handle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let mut target = stream_target(settings);
+        if let Some(path) = preflight_target(handle.as_ref(), target.as_ref()).await? {
+            target = Some(path.target);
+        }
         // GStreamer init runs in a background thread at startup; block here
         // until it's ready (usually instant, only slow on first cold launch).
         crate::ensure_gstreamer()?;
@@ -280,9 +303,6 @@ impl StreamManager {
         // Capture the stop epoch before any slow work. stop_playback bumps
         // it unconditionally, so if it changes before we store the new
         // pipeline a stop raced us and must win (see the storage step below).
-        let start_epoch = self
-            .playback_epoch
-            .load(std::sync::atomic::Ordering::Acquire);
 
         // Take the old pipeline (and any recording state) out under the
         // lock; do the slow GStreamer teardown outside it — same
@@ -344,6 +364,7 @@ impl StreamManager {
             }
         }
 
+        preflight_target(handle.as_ref(), target.as_ref()).await?;
         let pipeline = match settings.stream.protocol {
             StreamProtocol::Udp => {
                 log::info!("Starting UDP playback on port {}", settings.stream.udp_port);
@@ -365,6 +386,9 @@ impl StreamManager {
             }
         };
 
+        // A final check follows teardown/build waits; no connection is attempted
+        // unless current route and expected identity still pass.
+        preflight_target(handle.as_ref(), target.as_ref()).await?;
         pipeline.play()?;
 
         // Second lock acquisition (take-old above, store-new here). A stop
@@ -392,6 +416,8 @@ impl StreamManager {
                     "Playback start was superseded by a stop".into(),
                 ));
             }
+            state.playback_target = target;
+            state.readiness_failure = None;
             state.playback = Some(Arc::new(pipeline));
             state.start_time = Some(std::time::Instant::now());
             state.playback_source = Some(match settings.stream.protocol {
@@ -426,6 +452,8 @@ impl StreamManager {
             let rec_path = state.recording_path.take();
             state.start_time = None;
             state.playback_source = None;
+            state.playback_target = None;
+            state.readiness_failure = None;
             (pb, was_recording, rec_path)
         };
 
@@ -501,12 +529,14 @@ impl StreamManager {
         health: Arc<RelayRuntimeHealth>,
         event_tx: RelayEventSender,
         recovering: bool,
+        upstream_ready: Option<rtsp_server::UpstreamReady>,
     ) -> (u64, Result<RtspRestreamer, RtspBuildFailure>) {
         let server_instance = health.begin_server_instance(recovering);
         let runtime = RtspRuntimeContext {
             health,
             event_tx,
             server_instance,
+            upstream_ready,
         };
         let result = match &spec.source {
             ResolvedSource::Udp { port } => RtspRestreamer::start_from_udp(
@@ -535,6 +565,15 @@ impl StreamManager {
         adopted: &std::collections::HashSet<String>,
     ) -> Result<RtspServerInfo, AppError> {
         let start_epoch = self.rtsp_epoch.load(std::sync::atomic::Ordering::Acquire);
+        let handle = self
+            .app_handle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let mut target = stream_target(settings);
+        if let Some(path) = preflight_target(handle.as_ref(), target.as_ref()).await? {
+            target = Some(path.target);
+        }
         let spec = Self::resolve_rtsp_start_spec(settings, adopted).await?;
         if self.rtsp_epoch.load(std::sync::atomic::Ordering::Acquire) != start_epoch {
             return Err(AppError::Stream(
@@ -573,7 +612,7 @@ impl StreamManager {
                     .as_ref()
                     .is_some_and(RtspRestreamer::loop_alive),
             );
-            if healthy_noop {
+            if healthy_noop && state.rtsp_target == target {
                 log::info!("RTSP explicit Start resolved to the healthy current endpoint; no-op");
                 return Ok(info);
             }
@@ -597,6 +636,7 @@ impl StreamManager {
             ));
             state.rtsp_desired = true;
             state.rtsp_spec = Some(spec.clone());
+            state.rtsp_target = target.clone();
             state.rtsp_health = Some(health.clone());
             state.rtsp_intent_epoch = Some(start_epoch);
             state.rtsp_start_time = Some(std::time::Instant::now());
@@ -665,8 +705,29 @@ impl StreamManager {
             return Err(error);
         }
 
-        let (server_instance, built) =
-            Self::build_rtsp_restreamer(&spec, health.clone(), self.relay_event_tx.clone(), false);
+        if let Err(error) = preflight_target(handle.as_ref(), target.as_ref()).await {
+            health.mark_resolution_failed(error.to_string());
+            let _ = self
+                .relay_event_tx
+                .send(RelaySupervisorEvent::RetryRequested { server_generation });
+            drop(_lifecycle);
+            self.refresh_status().await;
+            return Err(error);
+        }
+        let (server_instance, built) = Self::build_rtsp_restreamer(
+            &spec,
+            health.clone(),
+            self.relay_event_tx.clone(),
+            false,
+            relay_preflight(
+                handle.clone(),
+                target.clone(),
+                self.rtsp_epoch.clone(),
+                start_epoch,
+                self.rtsp_generation.clone(),
+                server_generation,
+            ),
+        );
         let server = match built {
             Ok(server) => server,
             Err(failure) => {
@@ -742,6 +803,7 @@ impl StreamManager {
             if stops_desired {
                 state.rtsp_desired = false;
                 state.rtsp_spec = None;
+                state.rtsp_target = None;
                 state.rtsp_health = None;
                 state.rtsp_intent_epoch = None;
                 state.rtsp_start_time = None;
@@ -792,6 +854,7 @@ impl StreamManager {
     /// tokio runtime is bound to the current thread; a bare `tokio::spawn`
     /// here panics with "no reactor running."
     pub fn start_status_emitter(&self, handle: tauri::AppHandle) {
+        *self.app_handle.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle.clone());
         let relay_events = self
             .relay_event_rx
             .lock()
@@ -806,6 +869,7 @@ impl StreamManager {
                 relay_wake: self.relay_wake.clone(),
                 relay_event_tx: self.relay_event_tx.clone(),
                 app_handle: handle.clone(),
+                rtsp_generation: self.rtsp_generation.clone(),
             };
             tauri::async_runtime::spawn(run_relay_supervisor(relay_events, supervisor));
         } else {
@@ -814,11 +878,31 @@ impl StreamManager {
 
         let state_for_tick = self.state.clone();
         let tx_for_tick = self.status_tx.clone();
+        let handle_for_tick = handle.clone();
         tauri::async_runtime::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
+                let target = {
+                    let state = state_for_tick.lock().await;
+                    state.playback.as_ref().and(state.playback_target.clone())
+                };
+                let failure = preflight_target(Some(&handle_for_tick), target.as_ref())
+                    .await
+                    .err()
+                    .map(|e| e.to_string());
+                {
+                    let mut state = state_for_tick.lock().await;
+                    if state.playback_target == target && state.readiness_failure != failure {
+                        if let Some(reason) = &failure {
+                            log::warn!(
+                                "Playback readiness re-check failed (S9 action dormant): {reason}"
+                            );
+                        }
+                        state.readiness_failure = failure;
+                    }
+                }
                 let snap = compute_status(&state_for_tick).await;
                 publish_status_if_changed(tx_for_tick.as_ref(), snap);
             }
@@ -1027,6 +1111,63 @@ impl StreamManager {
             )
             .is_ok()
     }
+}
+
+fn stream_target(settings: &AppSettings) -> Option<CameraTarget> {
+    (settings.stream.protocol == StreamProtocol::Rtsp).then(|| CameraTarget {
+        key: settings
+            .stream
+            .camera_mac
+            .clone()
+            .unwrap_or_else(|| format!("manual:{}", settings.stream.camera_ip)),
+        expected_mac: settings.stream.camera_mac.clone(),
+        ip: settings.stream.camera_ip.clone(),
+    })
+}
+
+async fn preflight_target(
+    handle: Option<&tauri::AppHandle>,
+    target: Option<&CameraTarget>,
+) -> Result<Option<ReadyPath>, AppError> {
+    use tauri::Manager;
+    let Some(target) = target else {
+        return Ok(None);
+    }; // UDP is exempt
+    let handle =
+        handle.ok_or_else(|| AppError::Stream("Ethernet readiness service unavailable".into()))?;
+    handle
+        .state::<crate::network::NetworkManager>()
+        .camera_ready(target, &handle.state::<crate::config::AppConfig>())
+        .await
+        .map(Some)
+}
+
+fn relay_preflight(
+    handle: Option<tauri::AppHandle>,
+    target: Option<CameraTarget>,
+    epoch: Arc<std::sync::atomic::AtomicU64>,
+    expected_epoch: u64,
+    generation: Arc<std::sync::atomic::AtomicU64>,
+    expected_generation: u64,
+) -> Option<rtsp_server::UpstreamReady> {
+    use tauri::Manager;
+    let target = target?; // UDP has no camera gate
+    Some(Arc::new(move || {
+        if epoch.load(std::sync::atomic::Ordering::Acquire) != expected_epoch
+            || generation.load(std::sync::atomic::Ordering::Acquire) != expected_generation
+        {
+            return Err(AppError::Stream(
+                "Relay connection superseded by Stop or a newer Start".into(),
+            ));
+        }
+        let handle = handle
+            .as_ref()
+            .ok_or_else(|| AppError::Stream("Readiness service unavailable".into()))?;
+        handle
+            .state::<crate::network::NetworkManager>()
+            .camera_ready_now(&target, &handle.state::<crate::config::AppConfig>())
+            .map(|_| ())
+    }))
 }
 
 fn resolved_start_is_healthy_noop(
@@ -1363,11 +1504,36 @@ async fn recover_relay_generation(
             continue;
         }
 
+        let target = ctx.state.lock().await.rtsp_target.clone();
+        if let Err(error) = preflight_target(Some(&ctx.app_handle), target.as_ref()).await {
+            health.mark_resolution_failed(error.to_string());
+            drop(_lifecycle);
+            publish_relay_status(ctx).await;
+            continue;
+        }
+        if !relay_is_current(
+            &ctx.state,
+            &ctx.rtsp_epoch,
+            expected_epoch,
+            server_generation,
+        )
+        .await
+        {
+            return;
+        }
         let (server_instance, result) = StreamManager::build_rtsp_restreamer(
             &build_spec,
             health.clone(),
             ctx.relay_event_tx.clone(),
             true,
+            relay_preflight(
+                Some(ctx.app_handle.clone()),
+                target,
+                ctx.rtsp_epoch.clone(),
+                expected_epoch,
+                ctx.rtsp_generation.clone(),
+                server_generation,
+            ),
         );
         let server = match result {
             Ok(server) => server,
@@ -1593,6 +1759,22 @@ mod tests {
 
     fn adopted_set(addrs: &[&str]) -> std::collections::HashSet<String> {
         addrs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn udp_bypasses_camera_mac_route_and_service_gate() {
+        let mut settings = AppSettings::default();
+        settings.stream.protocol = StreamProtocol::Udp;
+        settings.stream.camera_ip = "169.254.1.204".into();
+        assert!(stream_target(&settings).is_none());
+        assert!(preflight_target(None, stream_target(&settings).as_ref())
+            .await
+            .unwrap()
+            .is_none());
+        settings.stream.protocol = StreamProtocol::Rtsp;
+        assert!(preflight_target(None, stream_target(&settings).as_ref())
+            .await
+            .is_err());
     }
 
     #[test]

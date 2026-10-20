@@ -10,6 +10,7 @@ use crate::validation::parse_cidr;
 #[tauri::command]
 pub async fn scan_network(
     manager: State<'_, NetworkManager>,
+    config: State<'_, AppConfig>,
     subnet: String,
 ) -> Result<Vec<ScanResult>, AppError> {
     // Reject malformed CIDR at the boundary so the active-scans
@@ -19,7 +20,7 @@ pub async fn scan_network(
     // scanning machinery spins up.
     let (_, prefix) = parse_cidr(&subnet)?;
     crate::network::scanner::check_scan_size(prefix)?;
-    manager.scan_subnet(&subnet).await
+    manager.scan_subnet(&subnet, &config).await
 }
 
 #[tauri::command]
@@ -333,20 +334,10 @@ pub async fn report_scan_result(
     key: String,
     open_ports: Vec<u16>,
 ) -> Result<(), AppError> {
-    let registry = manager.registry();
-    let Some(record) = registry.snapshot().into_iter().find(|r| r.mac == key) else {
-        return Ok(());
-    };
-    crate::validation::parse_camera_ip(&record.ip)?;
-    let fence = manager.sweep_fence();
-    let fence = (config.get_network_mode() != NetworkMode::StaticManual).then_some(&fence);
-    if !registry.merge_scan_result_fenced(&key, &open_ports, fence) {
-        return Ok(());
-    }
-    persist_record_for_key(&registry, &config, &key, fence)?;
-    if let Some(emitter) = manager.emitter().await {
-        emitter.poke();
-    }
+    // Results are now committed at scan completion with their original
+    // adapter epoch, source and identity. A later frontend echo has lost
+    // that provenance and cannot write capabilities into any record.
+    let _ = (manager, config, key, open_ports);
     Ok(())
 }
 
@@ -420,26 +411,6 @@ pub async fn forget_device(
     config.remove_cached_device(&mac)?;
     if let Some(emitter) = manager.emitter().await {
         emitter.poke();
-    }
-    Ok(())
-}
-
-/// Cache by identity, including verified zero-port records. Unverified
-/// legacy port-bearing writes remain compatible until S5a activation.
-fn persist_record_for_key(
-    registry: &crate::network::DeviceRegistry,
-    config: &AppConfig,
-    key: &str,
-    fence: Option<&crate::network::SweepFence>,
-) -> Result<(), AppError> {
-    if fence.is_some_and(|f| f.is_stale()) {
-        return Ok(());
-    }
-    if let Some(record) = registry.cache_record(key) {
-        if fence.is_some_and(|f| f.is_stale()) {
-            return Ok(());
-        }
-        config.upsert_cached_device_fenced(record, fence)?;
     }
     Ok(())
 }

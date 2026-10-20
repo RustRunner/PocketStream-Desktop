@@ -5,6 +5,7 @@ use tauri::State;
 
 use crate::config::AppConfig;
 use crate::error::AppError;
+use crate::network::{route::CameraTarget, NetworkManager};
 use crate::validation::{parse_camera_ip, parse_camera_url_host};
 
 /// Open a discovered device's web UI in the system browser.
@@ -39,15 +40,16 @@ pub async fn open_device_browser(ip: String) -> Result<(), AppError> {
 #[tauri::command]
 pub async fn ptu_send(
     ptu: State<'_, crate::camera::flir_ptu::PtuController>,
-    ip: String,
+    target: CameraTarget,
+    manager: State<'_, NetworkManager>,
+    config: State<'_, AppConfig>,
     cmd: String,
 ) -> Result<std::collections::HashMap<String, String>, AppError> {
-    let addr = parse_camera_ip(&ip)?;
-    let base_url = format!("http://{}", addr);
+    parse_camera_ip(&target.ip)?;
     // Route through the backend controller: serializes all PTU sends at
     // the trust boundary (no frontend path can interleave) and enforces
     // velocity mode on speed commands.
-    ptu.send(&base_url, &cmd).await
+    ptu.send(&manager, &config, &target, &cmd).await
 }
 
 // ── ONVIF / generic PTZ (stubs — return Err until implemented) ─────
@@ -99,12 +101,14 @@ pub async fn ptz_set_preset(camera_url: String, preset: u32, name: String) -> Re
 
 #[tauri::command]
 pub async fn sony_cgi_zoom(
-    ip: String,
+    target: CameraTarget,
+    manager: State<'_, NetworkManager>,
+    config: State<'_, AppConfig>,
     zoom_speed: i32,
     username: String,
     password: String,
 ) -> Result<(), AppError> {
-    let addr = parse_camera_ip(&ip)?;
+    let addr = parse_camera_ip(&target.ip)?;
 
     let url = if zoom_speed == 0 {
         format!(
@@ -121,7 +125,8 @@ pub async fn sony_cgi_zoom(
 
     log::info!("Sony CGI zoom: speed={} → {}", zoom_speed, url);
 
-    let client = crate::camera::flir_ptu::client()?;
+    let path = manager.camera_ready(&target, &config).await?;
+    let client = crate::camera::flir_ptu::client(&path)?;
     let mut req = client.get(&url);
     if !username.is_empty() {
         req = req.basic_auth(&username, Some(&password));
@@ -151,8 +156,13 @@ pub async fn sony_cgi_zoom(
 /// raw integer the web UI emits — 0 = Wide end, 31424 = Telephoto end for
 /// this hardware. The frontend maps its 0–100% slider into that range.
 #[tauri::command]
-pub async fn control_cgi_zoom_direct(ip: String, position: i32) -> Result<(), AppError> {
-    let addr = parse_camera_ip(&ip)?;
+pub async fn control_cgi_zoom_direct(
+    target: CameraTarget,
+    manager: State<'_, NetworkManager>,
+    config: State<'_, AppConfig>,
+    position: i32,
+) -> Result<(), AppError> {
+    let addr = parse_camera_ip(&target.ip)?;
     let url = format!("http://{}/cgi-bin/control.cgi", addr);
     let command = format!("zoom_direct {}", position);
     let form = [
@@ -169,12 +179,15 @@ pub async fn control_cgi_zoom_direct(ip: String, position: i32) -> Result<(), Ap
     // time to become available again. HTTP error responses (4xx/5xx)
     // aren't retried — those indicate the camera actually answered and
     // rejected us, so retrying would just hammer it.
-    let client = crate::camera::flir_ptu::client()?;
     let mut last_err: Option<reqwest::Error> = None;
+    let mut target = target;
     for attempt in 0..2 {
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
+        let path = manager.camera_ready(&target, &config).await?;
+        target = path.target.clone(); // freeze a legacy manual binding for every retry
+        let client = crate::camera::flir_ptu::client(&path)?;
         match client
             .post(&url)
             .header("X-Requested-With", "XMLHttpRequest")
@@ -211,10 +224,13 @@ pub async fn control_cgi_zoom_direct(ip: String, position: i32) -> Result<(), Ap
 /// out which endpoint carries the current zoom position on this model so
 /// we can wire up launch-time slider sync.
 #[tauri::command]
-pub async fn control_cgi_probe_status(ip: String) -> Result<String, AppError> {
-    let addr = parse_camera_ip(&ip)?;
+pub async fn control_cgi_probe_status(
+    target: CameraTarget,
+    manager: State<'_, NetworkManager>,
+    config: State<'_, AppConfig>,
+) -> Result<String, AppError> {
+    let addr = parse_camera_ip(&target.ip)?;
     let url = format!("http://{}/cgi-bin/control.cgi", addr);
-    let client = crate::camera::flir_ptu::client()?;
 
     // Small menu of queries the firmware might answer. The first one that
     // returns an integer in the 0..~31500 range is almost certainly the
@@ -246,6 +262,7 @@ pub async fn control_cgi_probe_status(ip: String) -> Result<String, AppError> {
     ];
 
     let mut out = String::new();
+    let mut target = target;
     for form in probes {
         let body_summary = form
             .iter()
@@ -253,6 +270,9 @@ pub async fn control_cgi_probe_status(ip: String) -> Result<String, AppError> {
             .collect::<Vec<_>>()
             .join("&");
 
+        let path = manager.camera_ready(&target, &config).await?;
+        target = path.target.clone();
+        let client = crate::camera::flir_ptu::client(&path)?;
         let resp = client
             .post(&url)
             .header("X-Requested-With", "XMLHttpRequest")
