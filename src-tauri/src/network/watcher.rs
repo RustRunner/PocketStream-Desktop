@@ -45,6 +45,7 @@ pub(crate) async fn refresh(handle: &AppHandle) -> Result<(), crate::AppError> {
     let config = handle.state::<crate::config::AppConfig>();
     let previous = manager.adapter_selection_state().await;
     let mut selection = manager.get_adapter_selection(&config).await?;
+    manager.update_presence_adapter(&selection, config.get_network_mode());
     if (previous.selected_mac != selection.selected_mac
         || previous.interface_index != selection.interface_index)
         && selection.adapter.is_some()

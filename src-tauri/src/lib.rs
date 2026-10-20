@@ -491,15 +491,9 @@ pub fn run() {
                 let mode = config.get_network_mode();
                 log::info!("Network mode: {:?}", mode);
 
-                // Static-Manual replaces the cache + ARP world entirely:
-                // the Nodes panel reflects only the user's pinned list.
-                // Hydrating the cache here would surface ghost entries
-                // from the last Auto session.
-                if mode == config::NetworkMode::StaticManual {
-                    manager.hydrate_manual_nodes(&config).await;
-                } else {
-                    manager.hydrate_device_registry(&config).await;
-                }
+                manager.hydrate_device_registry(&config).await;
+                manager.hydrate_manual_nodes(&config).await;
+                manager.start_presence(handle.clone()).await;
                 manager.load_adopted_from_config(&config, &handle).await;
 
                 match manager.get_adapter_selection(&config).await {
@@ -601,6 +595,7 @@ pub fn run() {
             if let tauri::RunEvent::ExitRequested { .. } = event {
                 let manager: tauri::State<'_, network::NetworkManager> = app_handle.state();
                 let _ = tauri::async_runtime::block_on(async {
+                    manager.stop_presence().await;
                     manager.stop_ping_dot().await;
                     tokio::time::timeout(
                         std::time::Duration::from_secs(5),

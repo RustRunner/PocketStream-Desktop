@@ -221,7 +221,7 @@ pub(crate) async fn run_pass<I: ProbeIo>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn record(mac: &str, ip: &str, stored_subnet: &str) -> CachedDevice {
@@ -322,26 +322,26 @@ mod tests {
     // ── pass engine (mock ProbeIo) ───────────────────────────────────
 
     #[derive(Default)]
-    struct MockProbeIo {
-        interface_index: u32,
-        source_index: u32,
-        resolved_indices: Vec<u32>,
-        fence: Option<super::super::SweepFence>,
-        retire_at: Option<(&'static str, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
+    pub(crate) struct MockProbeIo {
+        pub(crate) interface_index: u32,
+        pub(crate) source_index: u32,
+        pub(crate) resolved_indices: Vec<u32>,
+        pub(crate) fence: Option<super::super::SweepFence>,
+        pub(crate) retire_at: Option<(&'static str, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
         /// (target, result-mac). Missing target ⇒ no answer; the literal
         /// mac "FLUSH-FAIL" scripts an `Err(())`.
-        answers: std::collections::HashMap<Ipv4Addr, String>,
-        resolve_delay: Duration,
-        fail_bind: bool,
+        pub(crate) answers: std::collections::HashMap<Ipv4Addr, String>,
+        pub(crate) resolve_delay: Duration,
+        pub(crate) fail_bind: bool,
         /// `shutdown()` reports true once `events.len() >= n`.
-        shutdown_at_event: Option<usize>,
-        adopt_returns: bool,
-        events: Vec<String>,
-        bound: Vec<Ipv4Addr>,
+        pub(crate) shutdown_at_event: Option<usize>,
+        pub(crate) adopt_returns: bool,
+        pub(crate) events: Vec<String>,
+        pub(crate) bound: Vec<Ipv4Addr>,
     }
 
     impl MockProbeIo {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 adopt_returns: true,
                 interface_index: 7,

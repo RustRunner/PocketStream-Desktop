@@ -115,6 +115,7 @@ function debounceScan(): void {
 /** Scan every device the backend currently knows about that's on a
  *  routable subnet and we haven't scanned this session. */
 function scanAllRoutableDevices(): void {
+  if (state.config?.network_mode === "static_manual") return;
   const toScan: DeviceRecord[] = [];
   for (const record of deviceList.getDevices()) {
     if (!isIpScanned(record.ip) && hasRouteToSubnet(record.subnet)) {
@@ -286,7 +287,14 @@ export function setupArpListeners(): void {
   }).catch((e) => log(`Failed to load capture state: ${formatError(e)}`));
 
   // Re-render whenever the backend pushes a new snapshot.
-  deviceList.subscribe(renderArpDeviceList);
+  let scanReadyKeys = new Set<string>();
+  deviceList.subscribe((snapshot) => {
+    renderArpDeviceList();
+    const ready = snapshot.filter((r) => r.status === "live" && hasRouteToSubnet(r.subnet));
+    const newPeer = ready.some((r) => !scanReadyKeys.has(r.mac) && !isIpScanned(r.ip));
+    scanReadyKeys = new Set(ready.map((r) => r.mac));
+    if (newPeer && state.config?.network_mode !== "static_manual") debounceScan();
+  });
 
   // Only show a spinner when the link is actually up. A stale
   // disconnected adapter (state.activeInterface set, but ips=[]) would
@@ -427,6 +435,10 @@ export function setupArpListeners(): void {
  *  backend has already given us (cached entries from cold start, or
  *  ARP discoveries we missed before subscribing). */
 export async function loadExistingArpState(): Promise<void> {
+  if (state.config?.network_mode === "static_manual") {
+    setDiscoveryPhase("idle");
+    return;
+  }
   if (!isInterfaceConnected()) {
     setDiscoveryPhase("idle");
     return;
@@ -447,7 +459,6 @@ export async function loadExistingArpState(): Promise<void> {
     // registry. Cached-only records on routable subnets get a fast
     // verify pass; everything else falls through to the regular
     // scan-all path.
-    verifyCachedRoutableDevices();
 
     if (deviceList.getDevices().length > 0) {
       scanAllRoutableDevices();
@@ -459,127 +470,16 @@ export async function loadExistingArpState(): Promise<void> {
   }
 }
 
-// ── Cache verification ─────────────────────────────────────────────
-// For cached-only records on currently-routable subnets, run a fast
-// targeted scan to confirm they're still reachable. Three attempts
-// handles devices (notably the FLIR PTU) that need an extra moment
-// to respond on a freshly bound secondary IP. Worst case before
-// flagging offline: ~5s (1.5s + 3s + ~1s scans).
-
-const VERIFY_MAX_ATTEMPTS = 3;
-const VERIFY_RETRY_DELAY_MS = 1500;
-
-/** How long to wait before re-verifying a device that's currently
- *  flagged offline. Without this, a device that failed the startup
- *  verify race (e.g., a brief ping-sweep saturation during cold
- *  start) stays flagged offline forever — the isIpScanned guard
- *  would normally block any future scan anyway, so we also clear
- *  that on offline-set. */
-const OFFLINE_RETRY_INTERVAL_MS = 60_000;
-const offlineRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
-
-function verifyCachedRoutableDevices(): void {
-  for (const record of deviceList.getDevices()) {
-    if (record.status !== "cached_only") continue;
-    if (!hasRouteToSubnet(record.subnet)) continue;
-    if (isIpScanned(record.ip)) continue;
-    fastVerifyCachedDevice(record.mac, record.ip);
-  }
-}
-
-/** Schedule a periodic re-verify for an offline device so the status
- *  self-heals once the device responds again (without requiring the
- *  user to click the Nodes refresh button). Replaces any previously
- *  pending retry for the same MAC. */
-function scheduleOfflineRetry(mac: string, ip: string): void {
-  const existing = offlineRetryTimers.get(mac);
-  if (existing) clearTimeout(existing);
-  const timer = setTimeout(() => {
-    offlineRetryTimers.delete(mac);
-    const record = deviceList.getDevices().find((r) => r.mac === mac);
-    // Bail if the device went away (forgot), is no longer offline
-    // (something else verified it), or the subnet is no longer
-    // routable (Ethernet down / subnet dropped).
-    if (!record || record.status !== "offline") return;
-    if (!hasRouteToSubnet(record.subnet)) return;
-    fastVerifyCachedDevice(mac, ip);
-  }, OFFLINE_RETRY_INTERVAL_MS);
-  offlineRetryTimers.set(mac, timer);
-}
-
-async function fastVerifyCachedDevice(
-  mac: string,
-  ip: string,
-  attempt = 0
-): Promise<void> {
-  if (attempt === 0) {
-    markIpScanned(ip);
-    // Flip to verifying so the UI shows the badge through retries.
-    api.setDeviceStatus(mac, "verifying").catch((e: unknown) => {
-      log(`set verifying status failed for ${ip}: ${formatError(e)}`);
-    });
-  }
-
-  let verified = false;
-  try {
-    const results = await api.scanNetwork(`${ip}/32`);
-    if (results) {
-      for (const r of results) {
-        if (r.ip === ip && r.reachable && r.open_ports.length > 0) {
-          // Identity check: a successful port scan only proves *some
-          // host* answers at this IP. To claim our cached record is
-          // still live, the responder's MAC must also match — otherwise
-          // a different device that happens to occupy this IP today
-          // would resurrect the record as a false-positive Live.
-          const liveMac = await api.resolveMac(ip);
-          if (liveMac && liveMac.toLowerCase() === mac.toLowerCase()) {
-            // Diagnostic comparison only; capability data never promotes presence.
-            await api.reportScanResult(mac, r.open_ports);
-            verified = true;
-          } else {
-            log(
-              `Cache verify: identity mismatch at ${ip} — expected ${mac}, found ${liveMac ?? "no ARP"}`
-            );
-          }
-        }
-      }
-    }
-  } catch (e) {
-    log(`Cache verify failed for ${ip} (attempt ${attempt + 1}): ${formatError(e)}`);
-  }
-
-  if (verified) {
-    return;
-  }
-  if (attempt + 1 < VERIFY_MAX_ATTEMPTS) {
-    // Hold the verifying badge through the retry — flipping to offline
-    // just to flip back would be jarring.
-    setTimeout(
-      () => fastVerifyCachedDevice(mac, ip, attempt + 1),
-      VERIFY_RETRY_DELAY_MS
-    );
-  } else {
-    // Final attempt failed — flag offline so the UI can dim it and
-    // the user knows clicking it may not work right now. Clear the
-    // scanned flag so future scans CAN retry this IP (without this,
-    // isIpScanned blocks every later attempt and the device stays
-    // offline forever even after it comes back), and schedule a
-    // periodic re-verify so the status self-heals when conditions
-    // improve.
-    markIpScanned(ip, /* clear */ true);
-    api.setDeviceStatus(mac, "offline").catch((e: unknown) => {
-      log(`set offline status failed for ${ip}: ${formatError(e)}`);
-    });
-    scheduleOfflineRetry(mac, ip);
-  }
-}
-
 // ── Port scanning ───────────────────────────────────────────────────
 
 const MAX_SCAN_RETRIES = 2;
 const RETRY_DELAY_MS = 4000;
 
 async function scanDevicePorts(mac: string, ip: string, attempt = 0): Promise<void> {
+  if (state.config?.network_mode === "static_manual") {
+    if (attempt > 0) pendingScans--;
+    return;
+  }
   if (attempt === 0 && isIpScanned(ip)) return;
   markIpScanned(ip);
   if (attempt === 0) pendingScans++;
