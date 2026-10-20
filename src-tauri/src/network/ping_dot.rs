@@ -1,19 +1,16 @@
-//! Periodic ICMP probe that drives the green/red reachability dot in
-//! the Nodes panel.
+//! Selected-Ethernet ICMP diagnostics. Node dots use backend presence;
+//! these results never promote a record or stamp positive evidence.
 //!
 //! Pings every IP in the device registry on a 30 s cadence, with a
 //! 100 ms stagger between probes so the pinger doesn't burst the
 //! adapter (especially relevant on the ASIX AX88179 — see comment in
 //! `mod.rs::ping_sweep_subnets`).
 //!
-//! On startup the first pass runs immediately, so the dots resolve
-//! within ~1-2 s of the app reaching steady state rather than waiting
-//! a full interval. Emits `device-ping-result` events the frontend
-//! subscribes to for live dot updates.
+//! The first pass runs immediately and emits attributed diagnostic
+//! `device-ping-result` events for verified records only.
 //!
 //! Runs in every mode (Static-Manual, Static-Auto, DHCP). The pinger
-//! doesn't care which subsystem populated the registry — ARP, cache,
-//! or manual-node hydration are all equally valid sources.
+//! declines records without fresh selected-adapter identity and source.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,6 +20,8 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::network::{async_cmd, DeviceRegistry};
+
+static APP: std::sync::OnceLock<AppHandle> = std::sync::OnceLock::new();
 
 /// Cadence between full registry sweeps once steady state is reached.
 const PING_INTERVAL: Duration = Duration::from_secs(30);
@@ -50,6 +49,7 @@ impl PingDotHandle {
 /// Spawn the pinger task. Returns a handle so the caller (typically
 /// `NetworkManager`) can stop it on shutdown or mode change.
 pub fn start(app_handle: AppHandle, registry: Arc<DeviceRegistry>) -> PingDotHandle {
+    APP.get_or_init(|| app_handle.clone());
     let (cancel_tx, mut cancel_rx) = watch::channel(false);
 
     let task = tokio::spawn(async move {
@@ -73,38 +73,47 @@ pub fn start(app_handle: AppHandle, registry: Arc<DeviceRegistry>) -> PingDotHan
             // valid IPv4 addresses go to ping.exe — a garbage string (from
             // a corrupted cache row) would otherwise trigger a DNS lookup
             // and a false dot.
-            let ips: Vec<String> = registry
+            let rows: Vec<_> = registry
                 .snapshot()
                 .into_iter()
-                .map(|d| d.ip)
-                .filter(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())
+                .filter(|d| d.ip.parse::<std::net::Ipv4Addr>().is_ok())
                 .collect();
 
-            for ip in ips {
+            for row in rows {
                 if *cancel_rx.borrow() {
                     return;
                 }
                 let ah = app_handle.clone();
-                let target = ip.clone();
                 tokio::spawn(async move {
-                    let reachable = probe(&target).await;
-                    // A real echo reply is positive device evidence for
-                    // the adoption lifecycle: a quiet-but-reachable
-                    // camera may never ARP on its own, but these
-                    // periodic probes keep proving it exists. Timeouts
-                    // and unreachable verdicts stamp nothing.
-                    if reachable {
-                        if let Ok(parsed) = target.parse::<std::net::Ipv4Addr>() {
-                            use tauri::Manager;
-                            let manager: tauri::State<'_, crate::network::NetworkManager> =
-                                ah.state();
-                            manager.note_positive_liveness(&ah, parsed).await;
-                        }
+                    use tauri::Manager;
+                    let manager = ah.state::<crate::network::NetworkManager>();
+                    let config = ah.state::<crate::config::AppConfig>();
+                    let target = super::route::CameraTarget {
+                        key: row.mac.clone(),
+                        expected_mac: Some(row.mac),
+                        ip: row.ip,
+                    };
+                    let Ok(path) = manager.camera_ready(&target, &config).await else {
+                        return;
+                    };
+                    let reachable = probe_bound(&target.ip, path.source).await;
+                    let Ok(current) = manager.camera_ready(&target, &config).await else {
+                        return;
+                    };
+                    if path.fence.is_stale()
+                        || current.source != path.source
+                        || current.index != path.index
+                    {
+                        return;
                     }
+                    // Reachability only. No registry or positive-presence write.
                     let _ = ah.emit(
                         "device-ping-result",
                         serde_json::json!({
-                            "ip": target,
+                            "ip": target.ip,
+                            "key": target.key,
+                            "interface_index": path.index,
+                            "source": path.source.to_string(),
                             "reachable": reachable,
                         }),
                     );
@@ -138,9 +147,39 @@ pub fn start(app_handle: AppHandle, registry: Arc<DeviceRegistry>) -> PingDotHan
 /// Only real echo replies carry a `TTL=` field, and localized Windows
 /// keeps that token untranslated, so it's the discriminator.
 pub(crate) async fn probe(ip: &str) -> bool {
+    // The existing stall diagnostic has only an endpoint. Keep that API,
+    // but decline unless selected-adapter context and an applied source
+    // exist. Its result is diagnostic only, never a record/presence write.
+    use tauri::Manager;
+    let Ok(target) = crate::validation::parse_camera_ip(ip) else {
+        return false;
+    };
+    let Some(app) = APP.get() else {
+        return false;
+    };
+    let manager = app.state::<super::NetworkManager>();
+    let Some((adapter, index, fence)) = manager.probe_scope() else {
+        return false;
+    };
+    let Some(source) = super::select_wired_source(target, &Default::default(), &adapter.ips) else {
+        return false;
+    };
+    if super::route::egress_index(target).ok() != Some(index) {
+        return false;
+    }
+    #[cfg(windows)]
+    if !super::interface::source_matches_interface(index, source) {
+        return false;
+    }
+    let reachable = probe_bound(ip, source).await;
+    reachable && !fence.is_stale() && super::route::egress_index(target).ok() == Some(index)
+}
+
+async fn probe_bound(ip: &str, source: std::net::Ipv4Addr) -> bool {
     let timeout = PING_TIMEOUT_MS.to_string();
+    let source = source.to_string();
     let output = async_cmd("ping")
-        .args(["-n", "1", "-w", &timeout, ip])
+        .args(["-n", "1", "-w", &timeout, "-S", &source, ip])
         .output()
         .await;
 

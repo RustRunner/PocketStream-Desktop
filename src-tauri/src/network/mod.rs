@@ -16,6 +16,7 @@ pub(crate) mod presence;
 // only from the Windows startup block, so it reads as dead on Linux.
 pub mod pktmon;
 pub mod reaper;
+pub mod route;
 pub mod scanner;
 pub mod watcher;
 
@@ -1808,18 +1809,6 @@ impl NetworkManager {
         }
     }
 
-    /// Record positive evidence (accepted ARP frame, successful targeted
-    /// scan, successful ping) that a device exists on `ip`'s subnet.
-    /// Cheap no-op unless that subnet is adopted. Metadata reaches disk
-    /// at most once per `META_FLUSH_INTERVAL` from here; adoption and
-    /// removal writes flush immediately through their own saves.
-    // Compatibility for the legacy reachability dot. S6 removes ping-based
-    // liveness; capture/scan callers already carry their scheduled fence.
-    pub(crate) async fn note_positive_liveness(&self, app: &tauri::AppHandle, ip: Ipv4Addr) {
-        self.note_positive_liveness_fenced(app, ip, &self.sweep_fence())
-            .await;
-    }
-
     pub(crate) async fn note_positive_liveness_fenced(
         &self,
         _app: &tauri::AppHandle,
@@ -2701,7 +2690,106 @@ impl NetworkManager {
         interface::get_by_name(name).await
     }
 
-    pub async fn scan_subnet(&self, subnet: &str) -> Result<Vec<ScanResult>, AppError> {
+    /// Current selected-adapter addresses from IP Helper, never the saved map.
+    fn probe_scope(&self) -> Option<(InterfaceInfo, u32, SweepFence)> {
+        let snapshot = self.presence.snapshot();
+        let mut adapter = snapshot.adapter?;
+        if snapshot.fence.is_stale() || interface::index_for_mac(&adapter.mac)? != snapshot.index {
+            return None;
+        }
+        let (up, ips) = interface::quick_status_by_mac(&adapter.mac)?;
+        if !up {
+            return None;
+        }
+        adapter.ips = ips;
+        let pending = self.pending_ips.try_lock().ok()?;
+        adapter
+            .ips
+            .retain(|ip| !pending.iter().any(|p| p.ip.to_string() == ip.address));
+        Some((adapter, snapshot.index, snapshot.fence))
+    }
+
+    pub(crate) async fn camera_ready(
+        &self,
+        target: &route::CameraTarget,
+        config: &crate::config::AppConfig,
+    ) -> Result<route::ReadyPath, AppError> {
+        self.camera_ready_now(target, config)
+    }
+
+    /// Native/in-memory checks only; callable on the relay's GLib threads.
+    pub(crate) fn camera_ready_now(
+        &self,
+        target: &route::CameraTarget,
+        config: &crate::config::AppConfig,
+    ) -> Result<route::ReadyPath, AppError> {
+        if self.presence.tick(&self.device_registry) {
+            if let Ok(emitter) = self.device_emitter.try_lock() {
+                if let Some(emitter) = emitter.as_ref() {
+                    emitter.poke();
+                }
+            } else {
+                let slot = self.device_emitter.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Some(emitter) = slot.lock().await.as_ref() {
+                        emitter.poke();
+                    }
+                });
+            }
+        }
+        let mut target = target.clone();
+        // A legacy manual key follows only its persisted first-verification
+        // binding. An IP match is never a substitute for an expected MAC.
+        if target.key.starts_with("manual:") {
+            let node = config.get_manual_nodes().into_iter().find(|n| {
+                crate::config::manual_node_key(n) == target.key
+                    || format!("manual:{}", n.ip) == target.key
+            });
+            if let Some(expected) = node.and_then(|n| n.expected_mac) {
+                if target
+                    .expected_mac
+                    .as_ref()
+                    .is_some_and(|m| !m.eq_ignore_ascii_case(&expected))
+                {
+                    return Err(AppError::Network("Manual expected identity changed".into()));
+                }
+                target.key = expected.clone();
+                target.expected_mac = Some(expected);
+            }
+        }
+        let (adapter, index, fence) = self
+            .probe_scope()
+            .ok_or_else(|| AppError::Network("Selected Ethernet adapter unavailable".into()))?;
+        let ip = crate::validation::parse_camera_ip(&target.ip)?;
+        let source = route::check_ready(
+            &target,
+            Some(&adapter),
+            index,
+            &self.device_registry.snapshot(),
+            route::egress_index(ip).ok(),
+        )?;
+        #[cfg(windows)]
+        if !interface::source_matches_interface(index, source) {
+            return Err(AppError::Network(
+                "Ethernet source address is absent or ambiguous".into(),
+            ));
+        }
+        if fence.is_stale() {
+            return Err(AppError::Network("Ethernet adapter changed".into()));
+        }
+        Ok(route::ReadyPath {
+            target,
+            source,
+            index,
+            fence,
+        })
+    }
+
+    pub async fn scan_subnet(
+        &self,
+        subnet: &str,
+        config: &crate::config::AppConfig,
+    ) -> Result<Vec<ScanResult>, AppError> {
         // RAII guard: the subnet is removed from the active set on drop —
         // normal return OR a cancelled future — so a cancellation at the
         // scan await below can't wedge the subnet as "scan in progress"
@@ -2719,7 +2807,74 @@ impl NetworkManager {
                 subnet: subnet.to_string(),
             }
         };
-        scanner::scan(subnet).await
+        if config.get_network_mode() == crate::config::NetworkMode::StaticManual {
+            return Err(AppError::Network(
+                "Port scanning is disabled in Static-Manual".into(),
+            ));
+        }
+        let (adapter, index, fence) = self
+            .probe_scope()
+            .ok_or_else(|| AppError::Network("Selected Ethernet adapter unavailable".into()))?;
+        self.device_registry
+            .expire_evidence(tokio::time::Instant::now());
+        let identities = self
+            .device_registry
+            .snapshot()
+            .into_iter()
+            .filter(|r| {
+                r.status == DeviceStatus::Live
+                    && r.verified_by_mac
+                        .as_ref()
+                        .is_some_and(|m| m.eq_ignore_ascii_case(&adapter.mac))
+            })
+            .filter_map(|r| r.ip.parse().ok().map(|ip| (ip, r.mac)))
+            .collect();
+        let scope = scanner::ScanScope {
+            index,
+            fence: Some(fence.clone()),
+            ips: adapter.ips,
+            identities,
+        };
+        let discovery = self.sweep_fence();
+        let discovery = (!discovery.is_stale()).then_some(discovery);
+        let results = scanner::scan(subnet, scope).await?;
+        if fence.is_stale() || discovery.as_ref().is_some_and(SweepFence::is_stale) {
+            return Ok(Vec::new());
+        }
+        let mut accepted = Vec::new();
+        for result in results {
+            let Some(key) = result.key.as_ref() else {
+                continue;
+            };
+            let target = route::CameraTarget {
+                key: key.clone(),
+                expected_mac: Some(key.clone()),
+                ip: result.ip.clone(),
+            };
+            let Ok(path) = self.camera_ready(&target, config).await else {
+                continue;
+            };
+            if fence.is_stale()
+                || discovery.as_ref().is_some_and(SweepFence::is_stale)
+                || path.index != result.interface_index
+                || Some(path.source.to_string()) != result.source
+            {
+                continue;
+            }
+            if self
+                .device_registry
+                .merge_scan_result_fenced(key, &result.open_ports, Some(&fence))
+            {
+                if let Some(row) = self.device_registry.cache_record(key) {
+                    config.upsert_cached_device_fenced(row, Some(&fence))?;
+                }
+                if let Some(emitter) = self.emitter().await {
+                    emitter.poke();
+                }
+            }
+            accepted.push(result);
+        }
+        Ok(accepted)
     }
 
     /// Start ARP discovery (PacketMonitor capture) on the Ethernet

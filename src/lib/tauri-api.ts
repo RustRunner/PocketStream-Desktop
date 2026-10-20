@@ -12,6 +12,8 @@
  * relevant interface in `types.ts`.
  */
 
+import type { DeviceTarget } from "./store.ts";
+
 import type {
   AdapterSelection,
   AdoptionSnapshot,
@@ -306,9 +308,10 @@ export async function stopRecording(): Promise<string> {
 
 export async function ptuSend(
   ip: string,
-  cmd: string
+  cmd: string,
+  target: DeviceTarget
 ): Promise<Record<string, string>> {
-  return await invoke<Record<string, string>>("ptu_send", { ip, cmd });
+  return await invoke<Record<string, string>>("ptu_send", { target: { ip, key: target.key, expected_mac: target.expectedMac }, cmd });
 }
 
 /** Open a discovered device's web UI in the system browser. Backend
@@ -364,20 +367,22 @@ export async function sonyCgiZoom(
   ip: string,
   zoomSpeed: number,
   username: string,
-  password: string
+  password: string,
+  target: DeviceTarget
 ): Promise<void> {
-  return await invoke("sony_cgi_zoom", { ip, zoomSpeed, username, password });
+  return await invoke("sony_cgi_zoom", { target: { ip, key: target.key, expected_mac: target.expectedMac }, zoomSpeed, username, password });
 }
 
 export async function controlCgiZoomDirect(
   ip: string,
-  position: number
+  position: number,
+  target: DeviceTarget
 ): Promise<void> {
-  return await invoke("control_cgi_zoom_direct", { ip, position });
+  return await invoke("control_cgi_zoom_direct", { target: { ip, key: target.key, expected_mac: target.expectedMac }, position });
 }
 
-export async function controlCgiProbeStatus(ip: string): Promise<string> {
-  return await invoke<string>("control_cgi_probe_status", { ip });
+export async function controlCgiProbeStatus(ip: string, target: DeviceTarget): Promise<string> {
+  return await invoke<string>("control_cgi_probe_status", { target: { ip, key: target.key, expected_mac: target.expectedMac } });
 }
 
 export async function setZoomPosition(
