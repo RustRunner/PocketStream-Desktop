@@ -9,7 +9,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:ptu": "node --test tests/ptu-workflow.test.cjs"
   },
   "dependencies": {
     "qrcode": "^1.5.4"
