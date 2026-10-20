@@ -40,10 +40,6 @@ import {
   syncRtspStartButton,
   syncVideoVisibility,
   showModalWithVideo,
-  createVideoWindowSynced,
-  beginPipelineSwitch,
-  endPipelineSwitch,
-  updateStreamUI,
   updateMuteButton,
 } from "./lib/streaming.ts";
 import { setupPtzControls } from "./lib/ptz.ts";
@@ -314,28 +310,14 @@ async function applyPathChange(): Promise<void> {
   // Only restart if there's actually a stream to switch. If the user
   // hasn't started one yet, the new path is queued for the next
   // Start Stream click via state.config.stream.rtsp_path.
-  if (!state.isStreaming || state.streamLost) return;
+  if (!state.isStreaming) return;
 
-  // Suppress the drop detector across the deliberate stop→start: on a
-  // camera with slow RTSP setup the switch spans several status ticks
-  // whose playing=false would otherwise trip the stream-lost teardown
-  // against the pipeline this very switch just started.
-  beginPipelineSwitch();
   try {
-    await api.stopStream();
-    const bounds = getVideoAreaBounds();
-    const handle = await createVideoWindowSynced(bounds);
-    await api.startStream(handle);
+    // The backend supersedes the prior source and retains the existing HWND.
+    await api.startStream();
     showToast("Switched to " + newPath);
   } catch (e) {
-    // The old pipeline is gone and the new one failed to start —
-    // reflect the stopped reality instead of leaving the UI claiming a
-    // live stream that no longer exists.
-    state.isStreaming = false;
-    updateStreamUI();
     showToast("Failed to switch path: " + formatError(e), true);
-  } finally {
-    endPipelineSwitch();
   }
 }
 

@@ -173,6 +173,14 @@ export type RelayState =
 
 export interface StreamStatus {
   playing: boolean;
+  playback_desired: boolean;
+  playback_state: "stopped" | "starting" | "playing" | "recovering" | "failed";
+  playback_fault: { kind: "bus_error" | "eos" | "first_frame_timeout" | "frame_stall" | "device_loss" | "configuration";
+    domain: string | null; code: number | null; reason: string; retryable: boolean } | null;
+  playback_recovery_attempt: number;
+  playback_next_retry_secs: number | null;
+  recording_report: string | null;
+  recording_finalized_path: string | null;
   /** True only while the listener loop is alive and bound. */
   rtsp_server_running: boolean;
   /** User intent; remains true while backend recovery replaces a listener. */

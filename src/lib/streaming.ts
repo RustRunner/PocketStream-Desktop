@@ -5,10 +5,10 @@
 import QRCode from "qrcode";
 import * as api from "./tauri-api.ts";
 import { $, state, log, showToast, formatUptime } from "./state.ts";
-import { sessionCamTarget, type DeviceTarget } from "./store.ts";
+import type { DeviceTarget } from "./store.ts";
 import * as deviceList from "./device-list.ts";
 import { formatError } from "./errors.ts";
-import { getActiveCamIp, getActivePtuIp, getActiveCamTarget } from "./network.ts";
+import { getActiveCamTarget } from "./network.ts";
 import type { StreamStatus } from "./types.ts";
 
 /** Full RTSP URL (with token) — stored for QR code generation */
@@ -146,6 +146,7 @@ let audioCodec: string | null = null;
 
 /** Identity of the playback the user intends to keep, including recovery. */
 let activePlaybackTarget: DeviceTarget | null = null;
+let playbackRequest = 0;
 
 export function getActivePlaybackTarget(): DeviceTarget | null { return activePlaybackTarget; }
 
@@ -164,26 +165,22 @@ async function persistPlaybackTarget(target: DeviceTarget): Promise<void> {
 
 /** Stop the stream and reset every piece of frontend stream state.
  *  Flags flip before the async stop so an in-flight status event
- *  can't race a false "Stream Lost"; the resume snapshot drops so a
+ *  can't race a false "Stream Lost"; the playback request is cancelled so a
  *  stopped stream never auto-resumes on a later reconnect; and the
  *  recording indicator resets — the backend finalizes an in-progress
  *  recording (EOS flush) inside the stop itself. Idempotent: safe
  *  when nothing is streaming, and safe mid-start (the backend
  *  playback epoch makes a late start observe the stop). */
 export async function stopStreamNow(message = "Stream stopped"): Promise<void> {
+  playbackRequest++;
   state.isStreaming = false;
   state.streamLost = false;
-  resumeSnapshot = null;
   activePlaybackTarget = null;
   hideStreamLost();
   state.isRecording = false;
   $("#btn-record").classList.remove("recording");
   try {
-    // A loss-triggered teardown may already own the old pipeline. Still
-    // issue this stop so a manual Stop wins against a recovery start that
-    // has just passed its guard, but do not let the user start again until
-    // the original teardown has drained too.
-    await Promise.all([api.stopStream(), waitForStreamLossTeardown()]);
+    await api.stopStream();
     updateStreamUI();
     showToast(message);
   } catch (e) {
@@ -202,8 +199,10 @@ export function setupStreamControls(): void {
         await stopStreamNow();
       } else {
         try {
-          const target = getActiveCamTarget();
-          if (!target) {
+          const request = ++playbackRequest;
+          const udp = state.config?.stream.protocol === "udp";
+          const target = udp ? null : getActiveCamTarget();
+          if (!udp && !target) {
             showToast("Pick a node first (click it in the Nodes panel)", true);
             return;
           }
@@ -211,14 +210,22 @@ export function setupStreamControls(): void {
           // concurrent teardown (role change) can observe and cancel
           // this start.
           activePlaybackTarget = target;
-          await persistPlaybackTarget(target);
+          if (target) await persistPlaybackTarget(target);
+          if (request !== playbackRequest) return;
           const bounds = getVideoAreaBounds();
           // createVideoWindowSynced hides the born-visible child if a
           // dialog is open, so it can't cover one before startStream
           // returns. A second sync after the flags flip reveals it.
+          state.isStreaming = true;
+          state.streamLost = true;
+          updateStreamUI();
           const handle = await createVideoWindowSynced(bounds);
+          if (request !== playbackRequest) {
+            await api.stopStream().catch(() => {});
+            return;
+          }
           await api.startStream(handle);
-          if (activePlaybackTarget !== target) {
+          if (request !== playbackRequest) {
             // A teardown landed while the start was in flight (the
             // backend playback epoch already observed its stop) —
             // make sure this just-started pipeline and its video
@@ -230,10 +237,12 @@ export function setupStreamControls(): void {
           state.isStreaming = true;
           updateStreamUI();
           syncVideoVisibility();
-          notPlayingStreak = 0;
-          showToast("Stream started");
+          showToast("Playback requested");
         } catch (e) {
           activePlaybackTarget = null;
+          state.isStreaming = false;
+          hideStreamLost();
+          updateStreamUI();
           showToast("Stream failed: " + formatError(e), true);
         }
       }
@@ -505,7 +514,7 @@ function updateRtspUI(displayUrl: string | null, status?: StreamStatus): void {
         statusEl.className = "status-value status-warning";
         break;
       case "failed":
-        statusEl.textContent = "Degraded / Reconnecting";
+        statusEl.textContent = "Failed";
         statusEl.className = "status-value status-warning";
         break;
       default:
@@ -590,76 +599,8 @@ function setupQrDialog(): void {
 // (1Hz internal ticker plus an immediate refresh after every command-
 // side mutation). Frontend subscribes once at startup; no polling.
 
-// Require the backend to report `playing=false` across N consecutive
-// status events before declaring the stream lost. A single blip
-// (transient state transition, RTCP jitter, GStreamer bus race)
-// self-heals on the next event and shouldn't nuke an otherwise-healthy
-// stream. The backend ticks at 1Hz, so this is ~3 seconds.
-const DROP_THRESHOLD_EVENTS = 3;
-let notPlayingStreak = 0;
-
-// Latched across a deliberate stop→start pipeline switch (path change):
-// the status events emitted while the new pipeline spins up legitimately
-// report playing=false, and on a camera with slow RTSP setup they would
-// accumulate past DROP_THRESHOLD_EVENTS and tear down the just-started
-// preview pipeline. Only the preview drop-detection block honors the latch;
-// relay status rendering remains independent.
-let pipelineSwitchInProgress = false;
-
-/** Suppress the drop detector for the duration of a deliberate
- *  stop→start pipeline switch. Pair with endPipelineSwitch() in a
- *  finally block so a failed switch can't leave the detector off. */
-export function beginPipelineSwitch(): void {
-  pipelineSwitchInProgress = true;
-  notPlayingStreak = 0;
-}
-
-export function endPipelineSwitch(): void {
-  pipelineSwitchInProgress = false;
-  notPlayingStreak = 0;
-}
-
-// ── Stall auto-recovery ─────────────────────────────────────────────
-//
-// When health_check reports "Stream stalled — no frames for Ns" the
-// pipeline is sitting on a TCP socket the OS still thinks is alive
-// (default Windows keepalive is 2 hours). Manually clicking
-// stop/start would fix it but the user shouldn't have to babysit a
-// long-running camera. Auto-restart with backoff: try immediately,
-// then 60s, then 60s. After three failed attempts fall through to
-// the manual "Stream Lost" UX so we don't loop on a genuinely broken
-// camera.
-const STALL_RETRY_SCHEDULE_MS = [0, 60_000, 60_000];
-let stallRetryIndex = 0;
-let stallRetryTimer: ReturnType<typeof setTimeout> | null = null;
-// `showStreamLost` starts teardown without blocking the status-event
-// handler. Every restart path must await this exact work rather than issue
-// a second stop: overlapping Tauri commands can finish out of order, and a
-// late stop can otherwise clear/stop the replacement pipeline or leave its
-// native video HWND untracked.
-let streamLossTeardown: Promise<void> | null = null;
-function isStallError(msg: string | null | undefined): boolean {
-  return !!msg && msg.toLowerCase().includes("stalled");
-}
-
-function trackStreamLossTeardown(tasks: Promise<void>[]): void {
-  // If an earlier loss teardown somehow still exists, include it in the
-  // fence as well. A replacement must never start while any older stop can
-  // still arrive late.
-  const previous = streamLossTeardown;
-  const teardown = Promise.all(previous ? [previous, ...tasks] : tasks).then(
-    () => undefined
-  );
-  streamLossTeardown = teardown;
-  void teardown.then(() => {
-    if (streamLossTeardown === teardown) streamLossTeardown = null;
-  });
-}
-
-async function waitForStreamLossTeardown(): Promise<void> {
-  const teardown = streamLossTeardown;
-  if (teardown) await teardown;
-}
+let lastPlaybackReason: string | null = null;
+let lastRecordingReport: string | null = null;
 
 /** Subscribe to backend stream-status push events. Call once at app
  *  startup. Replaces the old setInterval(pollStatus, 1000). */
@@ -694,255 +635,69 @@ function handleStatus(status: StreamStatus | null): void {
     updateMuteButton();
   }
 
-  // Detect stream drop — backend says not playing but we think we're
-  // streaming. Skipped while a deliberate pipeline switch is in
-  // progress; those events are the switch itself, not a drop.
-  if (!pipelineSwitchInProgress) {
-    if (state.isStreaming && !status.playing) {
-      notPlayingStreak++;
-      if (notPlayingStreak >= DROP_THRESHOLD_EVENTS) {
-        showStreamLost(status.error);
-      }
-    } else if (state.isStreaming && status.playing) {
-      if (notPlayingStreak > 0) {
-        log(`Stream recovered after ${notPlayingStreak} bad event(s)`);
-      }
-      notPlayingStreak = 0;
-      hideStreamLost();
-    }
-  }
+  state.isStreaming = status.playback_desired;
+  state.isRecording = status.recording;
+  $("#btn-record").classList.toggle("recording", status.recording);
+  const recordingReport = status.recording_report
+    ? `${status.recording_report}${status.recording_finalized_path ? `: ${status.recording_finalized_path}` : ""}` : null;
+  if (recordingReport && recordingReport !== lastRecordingReport) showToast(recordingReport, true);
+  lastRecordingReport = recordingReport;
+  if (status.playback_desired && status.playback_state !== "playing") showStreamLost(status);
+  else hideStreamLost();
+  updateStreamUI();
 }
 
-interface ResumeSnapshot {
-  camera: DeviceTarget | null;
-  ptuIp: string | null;
-  wasRtspDesired: boolean;
-}
-
-/** Stream state captured at the moment of a hard network disconnect,
- *  so we can re-start the stream and explicitly re-resolve a desired relay as
- *  soon as the link comes back. Cleared on manual stop or after a
- *  successful resume. */
-let resumeSnapshot: ResumeSnapshot | null = null;
-
-/** Called by the interface watcher when it detects a physical unplug /
- *  APIPA-only state. Bypasses the poll debounce so the user gets
- *  immediate "Stream Lost..." feedback instead of waiting for GStreamer
- *  to time out. Captures what was running so handleReconnect() can
- *  put it back together on replug. */
+/** Compatibility hook for the NIC UI; backend readiness owns fault detection. */
 export function handleHardDisconnect(reason: string): void {
-  if (state.isStreaming && !state.streamLost) {
-    resumeSnapshot = {
-      // The playback identity, not getActiveCamIp(): the CAM
-      // designation can have moved to another node since this stream
-      // started, and a resume must bring back what was playing.
-      camera: activePlaybackTarget ?? getActiveCamTarget(),
-      ptuIp: getActivePtuIp(),
-      wasRtspDesired: state.isRtspDesired,
-    };
-    log(`Stream lost on network disconnect: ${reason}`);
-    showStreamLost(reason);
-  }
+  log(`Ethernet unavailable: ${reason}`);
 }
 
-/** Called by the interface watcher on reconnect (wasDown=true).
- *  Restores dropdown selections and restarts the stream + RTSP server
- *  if they were running before the disconnect. */
+/** Reassert existing backend intent, preserving its exact source and identity. */
 export async function handleReconnect(): Promise<void> {
-  if (!resumeSnapshot) return;
-  const snap = resumeSnapshot;
-  resumeSnapshot = null;
-
-  // Give Windows + auto-adopt a moment to finish re-binding IPs and
-  // routes before we try to open a socket to the camera. Two seconds
-  // is long enough to catch most settling but short enough to feel
-  // responsive when the user's waiting for the stream to come back.
-  await new Promise((r) => setTimeout(r, 2000));
-
-  // showStreamLost tears playback down in the background. Do not create its
-  // replacement until that exact stop command has fully drained.
-  await waitForStreamLossTeardown();
-
-  // The user may have hit Stop during that grace window — a manual
-  // stop clears both flags, and resuming anyway would override their
-  // decision (same guard attemptStallRecovery uses).
-  if (!state.isStreaming || !state.streamLost) return;
-
-  // Restore the session CAM target so getActiveCamIp resolves the same
-  // camera identity that was streaming before the disconnect. Each start
-  // submits that expected MAC and its current endpoint together. PTU remains
-  // alias-driven; no recovery ownership changes until S9.
-  if (snap.camera) {
-    sessionCamTarget.set(snap.camera);
-  }
-
-  if (!snap.camera) return;
-
-  // Re-claim the playback identity before the start awaits — a role
-  // change during the resume window compares against this.
-  activePlaybackTarget = snap.camera;
-
-  try {
-    await persistPlaybackTarget(snap.camera);
-    const bounds = getVideoAreaBounds();
-    const handle = await createVideoWindowSynced(bounds);
-    await api.startStream(handle);
-    state.isStreaming = true;
-    state.streamLost = false;
-    hideStreamLost();
-    updateStreamUI();
-    notPlayingStreak = 0;
-    showToast("Stream resumed");
-
-    // A hard reconnect may have changed host addresses. Re-submit the desired
-    // relay as an explicit Start: the backend no-ops an identical healthy
-    // endpoint and supersedes recovery when resolution actually changed.
-    if (snap.wasRtspDesired && state.isRtspDesired) {
-      try {
-        const info = await api.startRtspServer();
-        state.isRtspDesired = true;
-        rtspFullUrl = info.rtsp_url;
-        updateRtspUI(info.display_url);
-      } catch (e) {
-        log(`RTSP auto-resume failed: ${formatError(e)}`);
-        showToast("Stream back — RTSP server failed to resume", true);
-      }
-    }
-  } catch (e) {
-    log(`Stream auto-resume failed: ${formatError(e)}`);
-    showToast("Auto-resume failed — restart stream manually", true);
-  }
+  if (!state.isStreaming) return;
+  try { await api.reassertPlayback(); }
+  catch (e) { log(`Playback readiness wake failed: ${formatError(e)}`); }
 }
 
-function showStreamLost(errorMsg: string | null | undefined): void {
-  if (state.streamLost) return;
+/** Render only. Submission and handshake never hide this overlay. */
+function showStreamLost(status: StreamStatus): void {
   state.streamLost = true;
-  notPlayingStreak = 0;
-
-  // Hide stale video frame and show overlay. Overlay defaults to
-  // display:none via CSS; the .visible class is what reveals it.
-  syncVideoVisibility();
+  void syncVideoVisibility();
   const area = $("#video-area");
   let overlay = area.querySelector<HTMLDivElement>(".stream-lost-overlay");
   if (!overlay) {
     overlay = document.createElement("div");
     overlay.className = "stream-lost-overlay";
-    overlay.textContent = "Stream Lost...";
+    overlay.style.cssText = "flex-direction: column; gap: 16px; padding: 24px; text-align: center";
+    const label = document.createElement("span");
+    label.className = "playback-reason";
+    const retry = document.createElement("button");
+    retry.className = "outlined-btn";
+    retry.textContent = "Retry";
+    retry.addEventListener("click", async () => {
+      retry.disabled = true;
+      try { await api.retryPlayback(); }
+      catch (e) { showToast("Retry failed: " + formatError(e), true); }
+      finally { retry.disabled = false; }
+    });
+    overlay.append(label, retry);
     area.appendChild(overlay);
   }
+  const reason = status.playback_fault?.reason;
+  const phase = status.playback_state === "failed" ? "Playback failed" : status.playback_state === "starting" ? "Connecting" : "Recovering";
+  const retry = status.playback_next_retry_secs === null ? "" : ` — retry in ${status.playback_next_retry_secs}s`;
+  overlay.querySelector<HTMLElement>(".playback-reason")!.textContent = `${phase}${reason ? `: ${reason}` : ""}${retry}`;
   overlay.classList.add("visible");
-
-  // Reset preview only. Relay health and recovery belong to the backend and
-  // remain independent of a preview-only failure.
-  const teardownTasks: Promise<void>[] = [
-    api.stopStream().catch((e) => {
-      log(`Stream-loss playback teardown failed: ${formatError(e)}`);
-    }),
-  ];
-  trackStreamLossTeardown(teardownTasks);
-  // Deliberately leave state.isStreaming = true: the user's intent is
-  // still "I want to stream", the connection just failed. Keeps the
-  // button labelled "Stop Stream" so clicking it means "give up", not
-  // "start fresh". The status-event subscriber keeps running so
-  // recovery is detected on the next push.
-  state.isRecording = false;
-  $("#btn-record").classList.remove("recording");
-  updateStreamUI();
-
-  // Show the actual GStreamer error if available
-  const reason = errorMsg || "connection dropped";
-  showToast("Stream lost — " + reason, true);
-
-  if (isStallError(errorMsg)) {
-    scheduleStallRecovery();
-  }
+  if (reason && reason !== lastPlaybackReason) showToast("Stream lost — " + reason, true);
+  if (reason) lastPlaybackReason = reason;
 }
 
 function hideStreamLost(): void {
   state.streamLost = false;
-  // Reset the drop-detection streak: during the lost window the status
-  // listener kept counting every `playing=false` event (often 10+),
-  // which would otherwise instantly re-fire showStreamLost on the
-  // next event after handleReconnect resets the lost state — faster
-  // than the newly-started pipeline can reach Playing.
-  notPlayingStreak = 0;
-  // Stream is healthy again — reset the auto-recovery counter and
-  // cancel any pending retry. This also covers the "user manually
-  // stopped" case indirectly: the next status event with playing=true
-  // can't happen if state.isStreaming is false, but if the user
-  // restarts and the previous run had retries pending, those should
-  // not carry over.
-  stallRetryIndex = 0;
-  if (stallRetryTimer) {
-    clearTimeout(stallRetryTimer);
-    stallRetryTimer = null;
-  }
-  // syncVideoVisibility leaves the video hidden if a dialog is open —
-  // dialog close handler will sync again and reveal it then.
-  syncVideoVisibility();
-  const overlay = $("#video-area").querySelector(".stream-lost-overlay");
-  if (overlay) overlay.classList.remove("visible");
-}
-
-function scheduleStallRecovery(): void {
-  if (stallRetryIndex >= STALL_RETRY_SCHEDULE_MS.length) {
-    log(
-      `Stall recovery exhausted after ${STALL_RETRY_SCHEDULE_MS.length} attempts; manual restart required`
-    );
-    return;
-  }
-  const delay = STALL_RETRY_SCHEDULE_MS[stallRetryIndex]!;
-  const attempt = stallRetryIndex + 1;
-  stallRetryIndex++;
-  log(
-    `Scheduling stall recovery attempt ${attempt}/${STALL_RETRY_SCHEDULE_MS.length} in ${delay}ms`
-  );
-  if (stallRetryTimer) clearTimeout(stallRetryTimer);
-  stallRetryTimer = setTimeout(attemptStallRecovery, delay);
-}
-
-async function attemptStallRecovery(): Promise<void> {
-  stallRetryTimer = null;
-  // User may have manually stopped or the watcher path may have
-  // taken over — bail without consuming another retry slot.
-  if (!state.isStreaming || !state.streamLost) return;
-
-  try {
-    await waitForStreamLossTeardown();
-
-    // Stop may have been clicked, or the interface-watcher reconnect path
-    // may have taken ownership, while teardown was draining.
-    if (!state.isStreaming || !state.streamLost) return;
-
-    const target = activePlaybackTarget ?? getActiveCamTarget();
-    if (!target) {
-      log("Stall recovery: no camera identity available, aborting");
-      return;
-    }
-    activePlaybackTarget = target;
-    await persistPlaybackTarget(target);
-
-    log("Stall recovery: restarting pipeline");
-    const bounds = getVideoAreaBounds();
-    const handle = await createVideoWindowSynced(bounds);
-    await api.startStream(handle);
-    log("Stall recovery: stream restart submitted");
-    // startStream returns when set_state(Playing) was REQUESTED, not
-    // when the pipeline actually reaches Playing. Set a watchdog that
-    // schedules another retry if the new pipeline doesn't recover
-    // within 30s. Cleared by hideStreamLost on success (status event
-    // with playing=true) or by manual stop.
-    stallRetryTimer = setTimeout(() => {
-      stallRetryTimer = null;
-      if (state.isStreaming && state.streamLost) {
-        log("Stall recovery: restart did not reach Playing within 30s");
-        scheduleStallRecovery();
-      }
-    }, 30_000);
-  } catch (e) {
-    log(`Stall recovery attempt failed: ${formatError(e)}`);
-    scheduleStallRecovery();
-  }
+  if (state.isStreaming && lastPlaybackReason) showToast("Stream recovered");
+  lastPlaybackReason = null;
+  void syncVideoVisibility();
+  $("#video-area").querySelector(".stream-lost-overlay")?.classList.remove("visible");
 }
 
 // ── Video resize handler ────────────────────────────────────────────

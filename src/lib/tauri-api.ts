@@ -261,6 +261,14 @@ export async function startStream(
   });
 }
 
+export async function retryPlayback(): Promise<void> {
+  return await invoke("retry_playback", { manual: true });
+}
+
+export async function reassertPlayback(): Promise<void> {
+  return await invoke("retry_playback", { manual: false });
+}
+
 export async function stopStream(): Promise<void> {
   return await invoke("stop_stream");
 }
