@@ -1,4 +1,4 @@
-# Reliability work after v0.6.6
+# v0.6.7 camera test build
 
 This local reliability checkpoint has software verification and a Windows application build. Physical camera, adapter, installer and resource qualification remains pending; it is not a hardware-qualified release.
 
