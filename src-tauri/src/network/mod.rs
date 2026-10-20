@@ -459,6 +459,9 @@ impl Drop for AddressPause {
 
 #[derive(Debug, PartialEq, Eq)]
 enum BindingAction {
+    /// No current observation: retain the last known applied state, but exclude
+    /// the binding from live routes until observation succeeds.
+    Unavailable(String),
     Hold(String, bool),
     Observed(bool),
     Add(Ipv4Addr, u8),
@@ -558,6 +561,9 @@ where
 {
     row.last_error = None;
     match action {
+        BindingAction::Unavailable(reason) => {
+            row.last_error = Some(reason);
+        }
         BindingAction::Hold(reason, applied) => {
             row.applied = applied;
             row.last_error = Some(reason);
@@ -2557,16 +2563,25 @@ impl NetworkManager {
     async fn reconcile_bindings_locked(&self, config: &crate::config::AppConfig) {
         let settings = config.get();
         let adapters = interface::list_all_adapters().await;
+        let mut observation_error = adapters
+            .as_ref()
+            .err()
+            .map(|error| format!("adapter enumeration failed: {error}"));
         let mut selected = adapters
             .as_ref()
             .ok()
             .and_then(|list| pick_adapter(list, settings.selected_adapter_mac.as_deref()).cloned());
         if let Some(iface) = &mut selected {
             if let Some((up, ips)) = interface::quick_status_by_mac(&iface.mac) {
-                iface.is_up = up && interface::index_for_mac(&iface.mac).is_some();
+                let has_index = interface::index_for_mac(&iface.mac).is_some();
+                iface.is_up = up && has_index;
                 iface.ips = ips;
+                if !has_index {
+                    observation_error = Some("selected adapter index unavailable".into());
+                }
             } else {
                 iface.is_up = false;
+                observation_error = Some("selected adapter observation unavailable".into());
             }
         }
         let dhcp = match &selected {
@@ -2589,8 +2604,8 @@ impl NetworkManager {
                 &dhcp,
                 &ghosts,
             );
-            if let Err(error) = &adapters {
-                action = BindingAction::Hold(format!("adapter enumeration failed: {error}"), false);
+            if let Some(error) = &observation_error {
+                action = BindingAction::Unavailable(error.clone());
             } else if row.desired == crate::config::BindingDesired::Present
                 && settings.adopted_subnets.get(&subnet) != row.address.as_ref()
             {
@@ -4968,6 +4983,63 @@ mod tests {
             *ops.writes.lock().unwrap(),
             vec![(false, ip("172.31.169.253"))]
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn failed_unbind_and_native_observation_failure_retain_applied_until_observed_absent() {
+        let ops = BindingOps {
+            fail_remove: true,
+            ..Default::default()
+        };
+        let iface = saved_adapter(&["172.31.169.253", "192.168.1.20"]);
+        let mut row = saved_binding("172.31.169.253");
+        row.desired = crate::config::BindingDesired::Removed;
+        row = apply_binding(
+            &ops,
+            row,
+            BindingAction::Remove(ip("172.31.169.253")),
+            Some(&iface),
+            || async {
+                interface::failed_native_snapshot(vec![iface.clone()])
+                    .map(|mut rows| rows.remove(0).ips)
+            },
+        )
+        .await;
+        assert!(
+            row.applied,
+            "an unavailable observation cannot prove removal"
+        );
+        assert!(row
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("injected OS rejection"));
+        assert_eq!(row.desired, crate::config::BindingDesired::Removed);
+        assert_eq!(
+            *ops.writes.lock().unwrap(),
+            vec![(false, ip("172.31.169.253"))]
+        );
+
+        // Repeated failure on the next reconciliation must not erase that fact.
+        row = apply_binding(
+            &ops,
+            row,
+            BindingAction::Unavailable("native observation unavailable".into()),
+            None,
+            || async { panic!("unavailable observations must not write") },
+        )
+        .await;
+        assert!(row.applied && row.last_error.is_some());
+        row = apply_binding(
+            &ops,
+            row,
+            BindingAction::Remove(ip("172.31.169.253")),
+            Some(&iface),
+            || async { Ok(vec![]) },
+        )
+        .await;
+        assert!(!row.applied, "a valid empty observation proves absence");
     }
 
     #[tokio::test]

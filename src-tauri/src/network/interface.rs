@@ -138,34 +138,47 @@ async fn adapter_snapshot() -> Result<Vec<InterfaceInfo>, AppError> {
             }
         })
         .await
-        .map(current_adapter_addresses)
+        .and_then(current_adapter_addresses)
 }
 
 /// Cached metadata never masks an address add/remove between notifications.
-#[allow(unused_mut)]
-fn current_adapter_addresses(mut adapters: Vec<InterfaceInfo>) -> Vec<InterfaceInfo> {
+fn current_adapter_addresses(adapters: Vec<InterfaceInfo>) -> Result<Vec<InterfaceInfo>, AppError> {
     #[cfg(target_os = "windows")]
     {
-        let current = local_adapters_iphelper();
-        for adapter in &mut adapters {
-            // MAC-less VPN/tunnel metadata still feeds subnet exclusions.
-            // It cannot be selected for Ethernet proof; preserve its query data.
-            if adapter.mac.is_empty() {
-                continue;
-            }
-            if let Some(native) = current
-                .iter()
-                .find(|n| !n.mac.is_empty() && n.mac.eq_ignore_ascii_case(&adapter.mac))
-            {
-                adapter.is_up = native.is_up;
-                adapter.ips = native.ips.clone();
-            } else {
-                adapter.is_up = false;
-                adapter.ips.clear();
-            }
+        overlay_adapter_addresses(adapters, local_adapters_iphelper())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(adapters)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn overlay_adapter_addresses(
+    mut adapters: Vec<InterfaceInfo>,
+    current: Result<Vec<WinAdapter>, AppError>,
+) -> Result<Vec<InterfaceInfo>, AppError> {
+    // An unavailable native snapshot is not evidence that addresses vanished.
+    // In particular, static Apply must not replace addresses it cannot restore.
+    let current = current?;
+    for adapter in &mut adapters {
+        // MAC-less VPN/tunnel metadata still feeds subnet exclusions.
+        // It cannot be selected for Ethernet proof; preserve its query data.
+        if adapter.mac.is_empty() {
+            continue;
+        }
+        if let Some(native) = current
+            .iter()
+            .find(|n| !n.mac.is_empty() && n.mac.eq_ignore_ascii_case(&adapter.mac))
+        {
+            adapter.is_up = native.is_up;
+            adapter.ips = native.ips.clone();
+        } else {
+            adapter.is_up = false;
+            adapter.ips.clear();
         }
     }
-    adapters
+    Ok(adapters)
 }
 
 /// How long a validated interface name stays trusted before the next
@@ -639,21 +652,34 @@ struct WinAdapter {
 /// API), so the first pnet interface call would abort the process with the
 /// delay-load "module not found" exception (0xC06D007E) — which is exactly
 /// what happened on the first subnet adoption of a run. IP Helper carries no
-/// such import. Failures return an empty list (fail-open).
+/// such import. Failures remain errors, distinct from a valid empty snapshot.
 #[cfg(target_os = "windows")]
-fn local_adapters_iphelper() -> Vec<WinAdapter> {
-    use windows_sys::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
+fn local_adapters_iphelper() -> Result<Vec<WinAdapter>, AppError> {
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
-        GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH,
+        GAA_FLAG_SKIP_MULTICAST,
     };
+    use windows_sys::Win32::Networking::WinSock::AF_INET;
+
+    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    local_adapters_iphelper_with(|buffer, size| unsafe {
+        GetAdaptersAddresses(AF_INET as u32, flags, std::ptr::null(), buffer, size)
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn local_adapters_iphelper_with(
+    mut query: impl FnMut(
+        *mut windows_sys::Win32::NetworkManagement::IpHelper::IP_ADAPTER_ADDRESSES_LH,
+        &mut u32,
+    ) -> u32,
+) -> Result<Vec<WinAdapter>, AppError> {
+    use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_NO_DATA};
+    use windows_sys::Win32::NetworkManagement::IpHelper::IP_ADAPTER_ADDRESSES_LH;
     use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKADDR_IN};
 
     // IF_OPER_STATUS value IfOperStatusUp — the adapter is operational.
     const IF_OPER_STATUS_UP: i32 = 1;
-
-    let family = AF_INET as u32;
-    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
 
     // Start at the 15 KB Microsoft recommends and grow on overflow. Back the
     // buffer with u64 so it meets the 8-byte alignment the adapter structs
@@ -664,22 +690,18 @@ fn local_adapters_iphelper() -> Vec<WinAdapter> {
     for _ in 0..4 {
         buf.clear();
         buf.resize((size as usize).div_ceil(8), 0);
-        ret = unsafe {
-            GetAdaptersAddresses(
-                family,
-                flags,
-                std::ptr::null(),
-                buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
-                &mut size,
-            )
-        };
+        ret = query(buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH, &mut size);
         if ret != ERROR_BUFFER_OVERFLOW {
             break;
         }
     }
+    if ret == ERROR_NO_DATA {
+        return Ok(Vec::new());
+    }
     if ret != 0 {
-        log::debug!("GetAdaptersAddresses failed with code {}", ret);
-        return Vec::new();
+        return Err(AppError::Network(format!(
+            "GetAdaptersAddresses failed with code {ret}"
+        )));
     }
 
     let mut adapters = Vec::new();
@@ -729,7 +751,7 @@ fn local_adapters_iphelper() -> Vec<WinAdapter> {
         });
         cur = ad.Next;
     }
-    adapters
+    Ok(adapters)
 }
 
 /// One native snapshot for the selected MAC's index and media state. Duplicate
@@ -738,6 +760,7 @@ pub(crate) fn quick_link_by_mac(mac: &str) -> Option<(u32, bool)> {
     let target = mac.replace('-', ":");
     #[cfg(target_os = "windows")]
     let matches: Vec<_> = local_adapters_iphelper()
+        .ok()?
         .into_iter()
         .filter(|a| !a.mac.is_empty() && a.mac.eq_ignore_ascii_case(&target))
         .map(|a| (a.index, a.is_up))
@@ -762,6 +785,7 @@ pub(crate) fn index_for_mac(mac: &str) -> Option<u32> {
     let target = mac.replace('-', ":");
     #[cfg(target_os = "windows")]
     let indices: Vec<u32> = local_adapters_iphelper()
+        .ok()?
         .into_iter()
         .filter(|a| !a.mac.is_empty() && a.mac.eq_ignore_ascii_case(&target))
         .map(|a| a.index)
@@ -799,6 +823,7 @@ pub(crate) fn source_matches_interface(index: u32, source: std::net::Ipv4Addr) -
         index,
         source,
         local_adapters_iphelper()
+            .unwrap_or_default()
             .into_iter()
             .flat_map(|adapter| {
                 let index = adapter.index;
@@ -822,6 +847,7 @@ pub(crate) fn source_matches_interface(index: u32, source: std::net::Ipv4Addr) -
 pub fn quick_status_by_mac(mac: &str) -> Option<(bool, Vec<IpInfo>)> {
     let target = mac.to_lowercase();
     local_adapters_iphelper()
+        .ok()?
         .into_iter()
         .find(|a| a.mac.to_lowercase() == target)
         .map(|a| (a.is_up, a.ips))
@@ -866,6 +892,7 @@ pub fn quick_status_by_mac(mac: &str) -> Option<(bool, Vec<IpInfo>)> {
 #[cfg(target_os = "windows")]
 pub fn all_local_ipv4() -> Vec<std::net::Ipv4Addr> {
     local_adapters_iphelper()
+        .unwrap_or_default()
         .iter()
         .flat_map(|a| &a.ips)
         .filter_map(|ip| ip.address.parse::<std::net::Ipv4Addr>().ok())
@@ -894,9 +921,63 @@ pub async fn get_by_name(name: &str) -> Result<InterfaceInfo, AppError> {
         .ok_or_else(|| AppError::Network(format!("Interface '{}' not found", name)))
 }
 
+/// Exercise the native error conversion and metadata overlay together, without
+/// querying or mutating the host's adapters.
+#[cfg(all(test, target_os = "windows"))]
+pub(super) fn failed_native_snapshot(
+    metadata: Vec<InterfaceInfo>,
+) -> Result<Vec<InterfaceInfo>, AppError> {
+    use windows_sys::Win32::Foundation::ERROR_NOT_ENOUGH_MEMORY;
+    overlay_adapter_addresses(
+        metadata,
+        local_adapters_iphelper_with(|_, _| ERROR_NOT_ENOUGH_MEMORY),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn native_failure_is_not_an_empty_snapshot_even_with_cached_metadata() {
+        let snapshot = AdapterSnapshot::default();
+        let mut iface = flags_iface(true, true, false, false);
+        iface.mac = "40:cd:3a:00:00:01".into();
+        iface.ips.push(IpInfo {
+            address: "192.0.2.20".into(),
+            prefix: 24,
+            subnet: "192.0.2.0/24".into(),
+        });
+        let metadata = snapshot.get(|| async { Ok(vec![iface]) }).await.unwrap();
+        let error = failed_native_snapshot(metadata).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("GetAdaptersAddresses failed with code 8"));
+        let cached = snapshot
+            .get(|| async { panic!("metadata should still be cached") })
+            .await
+            .unwrap();
+        assert!(failed_native_snapshot(cached.clone()).is_err());
+
+        // A successful observation of no addresses is still usable.
+        let native =
+            local_adapters_iphelper_with(|_, _| windows_sys::Win32::Foundation::ERROR_NO_DATA);
+        let empty = overlay_adapter_addresses(cached.clone(), native).unwrap();
+        assert!(!empty[0].is_up && empty[0].ips.is_empty());
+        // Recovery must overlay fresh native addresses, not cached ones.
+        let recovered = overlay_adapter_addresses(
+            cached,
+            Ok(vec![WinAdapter {
+                index: 7,
+                mac: "40:cd:3a:00:00:01".into(),
+                is_up: true,
+                ips: vec![],
+            }]),
+        )
+        .unwrap();
+        assert!(recovered[0].is_up && recovered[0].ips.is_empty());
+    }
 
     #[cfg(windows)]
     #[tokio::test(start_paused = true)]
@@ -1096,7 +1177,10 @@ mod tests {
             prefix: 24,
             subnet: "10.8.0.0/24".into(),
         });
-        let actual = current_adapter_addresses(vec![vpn]);
+        #[cfg(target_os = "windows")]
+        let actual = overlay_adapter_addresses(vec![vpn], Ok(vec![])).unwrap();
+        #[cfg(not(target_os = "windows"))]
+        let actual = current_adapter_addresses(vec![vpn]).unwrap();
         assert!(actual[0].is_up && actual[0].is_vpn);
         assert_eq!(actual[0].ips[0].address, "10.8.0.2");
     }

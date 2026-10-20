@@ -46,11 +46,45 @@ async fn assign_windows(
     subnet_mask: &str,
     gateway: Option<&str>,
 ) -> Result<(), AppError> {
+    assign_windows_with(&WindowsIpOps, interface, ip, subnet_mask, gateway).await
+}
+
+#[cfg(target_os = "windows")]
+trait StaticIpOps {
+    async fn snapshot(&self, interface: &str) -> Result<super::interface::InterfaceInfo, AppError>;
+    async fn gateway(&self, interface: &str) -> Result<Option<String>, AppError>;
+    async fn command(&self, args: &[&str]) -> Result<String, AppError>;
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsIpOps;
+
+#[cfg(target_os = "windows")]
+impl StaticIpOps for WindowsIpOps {
+    async fn snapshot(&self, interface: &str) -> Result<super::interface::InterfaceInfo, AppError> {
+        super::interface::get_by_name(interface).await
+    }
+    async fn gateway(&self, interface: &str) -> Result<Option<String>, AppError> {
+        current_default_gateway(interface).await
+    }
+    async fn command(&self, args: &[&str]) -> Result<String, AppError> {
+        run_command("netsh", args).await
+    }
+}
+
+#[cfg(target_os = "windows")]
+async fn assign_windows_with(
+    ops: &impl StaticIpOps,
+    interface: &str,
+    ip: &str,
+    subnet_mask: &str,
+    gateway: Option<&str>,
+) -> Result<(), AppError> {
     // Snapshot BEFORE the set. Propagate a snapshot failure instead of
     // treating it as an empty adapter: the old unwrap_or_default() would
     // then re-add nothing, silently wiping every secondary (including the
     // adopted rescue IP) when the set below replaces all addresses.
-    let info = super::interface::get_by_name(interface).await?;
+    let info = ops.snapshot(interface).await?;
 
     // Snapshot every address immediately before the set, including external
     // additions since the dialog opened. Only the explicitly chosen IP changes.
@@ -68,7 +102,7 @@ async fn assign_windows(
     // with it off-subnet connectivity. Look the current one up and
     // feed it back in. An explicit gateway from the caller still wins.
     let preserved_gw: Option<String> = if gateway.is_none() {
-        current_default_gateway(interface).await?
+        ops.gateway(interface).await?
     } else {
         None
     };
@@ -88,7 +122,7 @@ async fn assign_windows(
     if let Some(gw) = effective_gw {
         args.push(gw);
     }
-    run_command("netsh", &args).await?;
+    ops.command(&args).await?;
 
     // Drain every restore even after an error. No detached task may keep
     // changing addresses after the transition releases its serialization lock.
@@ -96,9 +130,8 @@ async fn assign_windows(
     for sec in &to_restore {
         let mask = prefix_to_mask(sec.prefix);
         let name_arg = format!("name={}", interface);
-        if let Err(error) = run_command(
-            "netsh",
-            &[
+        if let Err(error) = ops
+            .command(&[
                 "interface",
                 "ip",
                 "add",
@@ -106,9 +139,8 @@ async fn assign_windows(
                 &name_arg,
                 &sec.address,
                 &mask,
-            ],
-        )
-        .await
+            ])
+            .await
         {
             first_error.get_or_insert(error);
         }
@@ -521,6 +553,109 @@ pub async fn remove_secondary_ip(interface: &str, ip: &str) -> Result<(), AppErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    struct StaticOps {
+        metadata: super::super::interface::InterfaceInfo,
+        native_fails: bool,
+        commands: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    #[cfg(target_os = "windows")]
+    impl StaticIpOps for StaticOps {
+        async fn snapshot(
+            &self,
+            _: &str,
+        ) -> Result<super::super::interface::InterfaceInfo, AppError> {
+            if self.native_fails {
+                super::super::interface::failed_native_snapshot(vec![self.metadata.clone()])
+                    .map(|mut rows| rows.remove(0))
+            } else {
+                Ok(self.metadata.clone())
+            }
+        }
+        async fn gateway(&self, _: &str) -> Result<Option<String>, AppError> {
+            Ok(Some("192.0.2.1".into()))
+        }
+        async fn command(&self, args: &[&str]) -> Result<String, AppError> {
+            self.commands
+                .lock()
+                .unwrap()
+                .push(args.iter().map(|s| s.to_string()).collect());
+            Ok(String::new())
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn static_apply_requires_native_snapshot_before_replacing_addresses() {
+        use super::super::interface::{InterfaceInfo, IpInfo};
+        for native_fails in [true, false] {
+            let ops = StaticOps {
+                metadata: InterfaceInfo {
+                    name: "Ethernet".into(),
+                    display_name: "Ethernet".into(),
+                    description: String::new(),
+                    mac: "40:cd:3a:00:00:01".into(),
+                    is_up: true,
+                    is_ethernet: true,
+                    is_wifi: false,
+                    is_vpn: false,
+                    is_virtual: false,
+                    ips: ["192.0.2.20", "198.51.100.99"]
+                        .into_iter()
+                        .map(|address| IpInfo {
+                            address: address.into(),
+                            prefix: 24,
+                            subnet: String::new(),
+                        })
+                        .collect(),
+                },
+                native_fails,
+                commands: Default::default(),
+            };
+            let result =
+                assign_windows_with(&ops, "Ethernet", "192.0.2.20", "255.255.255.0", None).await;
+            let commands = ops.commands.lock().unwrap();
+            if native_fails {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("GetAdaptersAddresses failed"));
+                assert!(
+                    commands.is_empty(),
+                    "unknown addresses must prevent netsh set"
+                );
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    *commands,
+                    vec![
+                        vec![
+                            "interface",
+                            "ip",
+                            "set",
+                            "address",
+                            "Ethernet",
+                            "static",
+                            "192.0.2.20",
+                            "255.255.255.0",
+                            "192.0.2.1"
+                        ],
+                        vec![
+                            "interface",
+                            "ip",
+                            "add",
+                            "address",
+                            "name=Ethernet",
+                            "198.51.100.99",
+                            "255.255.255.0"
+                        ],
+                    ]
+                );
+            }
+        }
+    }
 
     #[test]
     fn unknown_dhcp_output_never_authorizes_a_static_write() {
