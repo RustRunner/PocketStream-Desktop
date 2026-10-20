@@ -161,6 +161,16 @@ pub enum BindingDesired {
     Removed,
 }
 
+/// Exact write-ahead ownership of an uncommitted OS address. Backend-owned;
+/// cleared atomically when a binding commits or the user claims the address.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PendingAddress {
+    pub adapter_mac: String,
+    pub address: String,
+    pub prefix: u8,
+}
+
 /// Backfill legacy metadata without discarding detached removal intent.
 pub fn align_adopted_meta(
     adopted: &HashMap<String, String>,
@@ -220,6 +230,8 @@ pub struct AppSettings {
     /// deliberately not) stored.
     #[serde(default)]
     pub adopted_meta: HashMap<String, AdoptedMeta>,
+    #[serde(default)]
+    pub pending_addresses: Vec<PendingAddress>,
     /// Last zoom slider position (0–100 %) per camera IP.
     /// Restored on launch so the slider doesn't reset to Wide when the
     /// camera is still pointed at the last-set zoom. Stored as percent
@@ -262,6 +274,7 @@ impl Default for AppSettings {
             },
             adopted_subnets: HashMap::new(),
             adopted_meta: HashMap::new(),
+            pending_addresses: Vec::new(),
             zoom_positions: HashMap::new(),
             network_mode: NetworkMode::default(),
             manual_nodes: Vec::new(),
@@ -322,6 +335,71 @@ fn update_cached_alias_in_place(cache: &mut [CachedDevice], mac: &str, alias: &s
 }
 
 impl AppConfig {
+    #[cfg(test)]
+    pub(crate) fn temporary_test_config(settings: AppSettings) -> Self {
+        Self {
+            settings: Mutex::new(settings),
+            cache: Mutex::new(vec![]),
+            startup_notices: Mutex::new(vec![]),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_temporary_test_binding(
+        &self,
+        subnet: &str,
+        row: AdoptedMeta,
+    ) -> Result<(), crate::AppError> {
+        self.set_binding_with(subnet, row, |_| Ok(()))
+    }
+
+    pub(crate) fn reserve_temporary_with(
+        &self,
+        row: PendingAddress,
+        persist: impl FnOnce(&AppSettings) -> Result<(), crate::AppError>,
+    ) -> Result<(), crate::AppError> {
+        self.change_settings_with(
+            |s| {
+                let owner = crate::network::device_registry::canonical_mac(&row.adapter_mac);
+                if owner.is_none()
+                    || owner
+                        != s.selected_adapter_mac
+                            .as_deref()
+                            .and_then(crate::network::device_registry::canonical_mac)
+                    || s.network_mode != NetworkMode::StaticAuto
+                    || row.prefix != 24
+                    || crate::validation::parse_camera_ip(&row.address).is_err()
+                    || s.adopted_meta
+                        .values()
+                        .any(|m| m.address.as_ref() == Some(&row.address))
+                    || s.pending_addresses
+                        .iter()
+                        .any(|p| p.adapter_mac == row.adapter_mac && p.address == row.address)
+                {
+                    return Err(crate::AppError::Network(
+                        "Temporary address ownership unavailable or already reserved".into(),
+                    ));
+                }
+                s.pending_addresses.push(row);
+                Ok(())
+            },
+            persist,
+        )
+    }
+
+    pub(crate) fn forget_temporary_with(
+        &self,
+        row: &PendingAddress,
+        persist: impl FnOnce(&AppSettings) -> Result<(), crate::AppError>,
+    ) -> Result<(), crate::AppError> {
+        self.change_settings_with(
+            |s| {
+                s.pending_addresses.retain(|p| p != row);
+                Ok(())
+            },
+            persist,
+        )
+    }
     pub fn load_or_default() -> Self {
         let mut notices = Vec::new();
         let mut settings = load_from_disk(&mut notices).unwrap_or_default();
@@ -499,6 +577,14 @@ impl AppConfig {
                         .entry(subnet.to_string())
                         .or_insert_with(|| address.clone());
                 }
+                if row.desired == BindingDesired::Present && row.applied && row.last_error.is_none()
+                {
+                    s.pending_addresses.retain(|p| {
+                        Some(&p.adapter_mac) != row.adapter_mac.as_ref()
+                            || Some(&p.address) != row.address.as_ref()
+                            || Some(p.prefix) != row.prefix
+                    });
+                }
                 s.adopted_meta.insert(subnet.to_string(), row);
                 Ok(())
             },
@@ -517,6 +603,13 @@ impl AppConfig {
     ) -> Result<(), crate::AppError> {
         self.change_settings_with(
             |s| {
+                s.pending_addresses.retain(|p| {
+                    p.address != address
+                        || crate::network::device_registry::canonical_mac(&p.adapter_mac)
+                            != s.selected_adapter_mac
+                                .as_deref()
+                                .and_then(crate::network::device_registry::canonical_mac)
+                });
                 let keys: Vec<_> = s
                     .adopted_meta
                     .iter()
@@ -1215,7 +1308,7 @@ fn decrypt_field(field: &str, key: &[u8], label: &str) -> String {
     }
 }
 
-fn save_to_disk(settings: &AppSettings) -> Result<(), crate::AppError> {
+pub(crate) fn save_to_disk(settings: &AppSettings) -> Result<(), crate::AppError> {
     let dir = config_dir();
     fs::create_dir_all(&dir).map_err(|e| crate::AppError::Config(e.to_string()))?;
 
@@ -1796,6 +1889,7 @@ password = ""
             },
             adopted_subnets: std::collections::HashMap::new(),
             adopted_meta: std::collections::HashMap::new(),
+            pending_addresses: Vec::new(),
             zoom_positions: std::collections::HashMap::new(),
             network_mode: NetworkMode::default(),
             manual_nodes: Vec::new(),
@@ -1966,6 +2060,73 @@ password = ""
             cache: Mutex::new(vec![]),
             startup_notices: Mutex::new(vec![]),
         }
+    }
+
+    #[test]
+    fn temporary_claim_commit_and_user_saves_preserve_write_order_and_legacy_defaults() {
+        let config = AppConfig::temporary_test_config(AppSettings {
+            selected_adapter_mac: Some("40:CD:3A:00:00:01".into()),
+            network_mode: NetworkMode::StaticAuto,
+            ..Default::default()
+        });
+        let pending = PendingAddress {
+            adapter_mac: "40:cd:3a:00:00:01".into(),
+            address: "172.31.169.100".into(),
+            prefix: 24,
+        };
+        config
+            .reserve_temporary_with(pending.clone(), |_| Ok(()))
+            .unwrap();
+        let mut settings = config.get();
+        settings.merge_user_fields(AppSettings::default());
+        assert_eq!(settings.pending_addresses, vec![pending.clone()]);
+        assert!(config
+            .claim_binding_with(&pending.address, |_| Err(crate::AppError::Network(
+                "save failed".into()
+            )))
+            .is_err());
+        assert_eq!(config.get().pending_addresses, vec![pending.clone()]);
+        config
+            .claim_binding_with(&pending.address, |_| Ok(()))
+            .unwrap();
+        assert!(config.get().pending_addresses.is_empty());
+        config
+            .reserve_temporary_with(pending.clone(), |_| Ok(()))
+            .unwrap();
+        let row = AdoptedMeta {
+            adapter_mac: Some(pending.adapter_mac.clone()),
+            address: Some(pending.address.clone()),
+            prefix: Some(24),
+            applied: true,
+            ..Default::default()
+        };
+        assert!(config
+            .set_binding_with("172.31.169.0/24", row.clone(), |_| Err(
+                crate::AppError::Network("save failed".into())
+            ))
+            .is_err());
+        assert_eq!(config.get().pending_addresses, vec![pending]);
+        assert!(config.get().adopted_subnets.is_empty());
+        config
+            .set_binding_with("172.31.169.0/24", row, |saved| {
+                assert!(saved.pending_addresses.is_empty());
+                assert_eq!(
+                    saved
+                        .adopted_subnets
+                        .get("172.31.169.0/24")
+                        .map(String::as_str),
+                    Some("172.31.169.100")
+                );
+                Ok(())
+            })
+            .unwrap();
+        let legacy = toml::to_string(&AppSettings::default())
+            .unwrap()
+            .replace("pending_addresses = []\n", "");
+        assert!(toml::from_str::<AppSettings>(&legacy)
+            .unwrap()
+            .pending_addresses
+            .is_empty());
     }
 
     #[test]
