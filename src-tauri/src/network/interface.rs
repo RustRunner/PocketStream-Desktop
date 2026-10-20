@@ -732,6 +732,31 @@ fn local_adapters_iphelper() -> Vec<WinAdapter> {
     adapters
 }
 
+/// One native snapshot for the selected MAC's index and media state. Duplicate
+/// MACs and enumeration failure are unavailable; never substitute another NIC.
+pub(crate) fn quick_link_by_mac(mac: &str) -> Option<(u32, bool)> {
+    let target = mac.replace('-', ":");
+    #[cfg(target_os = "windows")]
+    let matches: Vec<_> = local_adapters_iphelper()
+        .into_iter()
+        .filter(|a| !a.mac.is_empty() && a.mac.eq_ignore_ascii_case(&target))
+        .map(|a| (a.index, a.is_up))
+        .collect();
+    #[cfg(not(target_os = "windows"))]
+    let matches: Vec<_> = pnet::datalink::interfaces()
+        .into_iter()
+        .filter(|a| {
+            a.mac
+                .is_some_and(|m| m.to_string().eq_ignore_ascii_case(&target))
+        })
+        .map(|a| (a.index, a.is_up()))
+        .collect();
+    match matches.as_slice() {
+        [state] if state.0 != 0 => Some(*state),
+        _ => None,
+    }
+}
+
 /// Resolve the current adapter's IPv4 index without spawning PowerShell.
 pub(crate) fn index_for_mac(mac: &str) -> Option<u32> {
     let target = mac.replace('-', ":");
@@ -872,6 +897,61 @@ pub async fn get_by_name(name: &str) -> Result<InterfaceInfo, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[tokio::test(start_paused = true)]
+    async fn native_link_expiry_runs_while_provider_and_discovery_locks_are_held() {
+        use super::super::{AdapterSelection, DeviceRegistry, DeviceStatus, NetworkManager};
+        use crate::config::NetworkMode;
+        let manager = NetworkManager::new();
+        let iface = InterfaceInfo {
+            name: "USB".into(),
+            display_name: "USB".into(),
+            description: "ASIX".into(),
+            mac: "40:cd:3a:00:00:01".into(),
+            ips: vec![],
+            is_up: true,
+            is_ethernet: true,
+            is_wifi: false,
+            is_vpn: false,
+            is_virtual: false,
+        };
+        let selection = AdapterSelection {
+            selected_mac: Some(iface.mac.clone()),
+            adapter: Some(iface.clone()),
+            interface_index: Some(7),
+            ..Default::default()
+        };
+        manager.presence.update(&selection, NetworkMode::Dhcp);
+        let fence = manager.presence.snapshot().fence;
+        let device = super::super::ArpDevice {
+            mac: "aa:bb:cc:dd:ee:02".into(),
+            ip: "192.0.2.20".into(),
+            subnet: "192.0.2.0/24".into(),
+            first_seen: "now".into(),
+            last_seen: "now".into(),
+        };
+        let registry: std::sync::Arc<DeviceRegistry> = manager.registry();
+        registry.merge_verified(&device, &iface.mac, "2026-10-20T00:00:00Z", &fence);
+        let _provider = ADAPTER_QUERY_LOCK.lock().await;
+        let _discovery = manager.discovery_op.lock().await;
+        let provider_wait = with_adapter_query_lock(&ADAPTER_QUERY_LOCK, || async { Ok(()) });
+        let discovery_wait = manager.discovery_op.lock();
+        tokio::pin!(provider_wait, discovery_wait);
+        manager.presence.observe_link(|_| Some((7, false)));
+        for _ in 0..9 {
+            tokio::select! {
+                _ = &mut provider_wait => panic!("provider wait unexpectedly completed"),
+                _ = &mut discovery_wait => panic!("discovery wait unexpectedly completed"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+            }
+            manager.presence.observe_link(|_| Some((7, false)));
+            manager.presence.tick(&registry);
+        }
+        assert_eq!(registry.snapshot()[0].status, DeviceStatus::Offline);
+        assert!(fence.is_stale());
+        assert_eq!(registry.snapshot().len(), 1);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn snapshot_ttl_coalesces_callers_and_caches_empty_success() {

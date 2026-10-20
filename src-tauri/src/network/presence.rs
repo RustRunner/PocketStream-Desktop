@@ -65,8 +65,37 @@ fn up(selection: &AdapterSelection) -> bool {
 }
 
 impl Control {
+    pub(crate) fn update_native(
+        &self,
+        selection: &AdapterSelection,
+        mode: NetworkMode,
+        read: impl FnOnce(&str) -> Option<(u32, bool)>,
+    ) {
+        let mut current = selection.clone();
+        if let Some(mac) = current.selected_mac.as_deref() {
+            let (index, is_up) = read(mac).unwrap_or((0, false));
+            current.interface_index = (index != 0).then_some(index);
+            if let Some(adapter) = &mut current.adapter {
+                adapter.is_up = is_up && index != 0;
+            }
+        }
+        self.update(&current, mode);
+    }
+
     pub fn update(&self, selection: &AdapterSelection, mode: NetworkMode) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if self.update_locked(&mut state, selection, mode) {
+            drop(state);
+            self.wake.notify_one();
+        }
+    }
+
+    fn update_locked(
+        &self,
+        state: &mut State,
+        selection: &AdapterSelection,
+        mode: NetworkMode,
+    ) -> bool {
         let identity_changed = state.selection.selected_mac != selection.selected_mac
             || state.selection.interface_index != selection.interface_index;
         let was_up = up(&state.selection);
@@ -77,7 +106,7 @@ impl Control {
             || serde_json::to_value(&state.selection.adapter).ok()
                 != serde_json::to_value(&selection.adapter).ok();
         if !changed {
-            return;
+            return false;
         }
         if identity_changed || state.mode != mode || was_up != is_up {
             self.epoch.fetch_add(1, Ordering::AcqRel);
@@ -92,8 +121,37 @@ impl Control {
         state.selection = selection.clone();
         state.mode = mode;
         state.revision += 1;
+        true
+    }
+
+    /// Native link/index observation must not wait for provider enumeration or
+    /// discovery/address locks. Preserve metadata/filtered IPs from the watcher.
+    pub(crate) fn observe_link(
+        &self,
+        read: impl FnOnce(&str) -> Option<(u32, bool)>,
+    ) -> Option<AdapterSelection> {
+        let (mut selection, revision) = {
+            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            (state.selection.clone(), state.revision)
+        };
+        let mac = selection.selected_mac.as_deref()?;
+        let (index, is_up) = read(mac).unwrap_or((0, false));
+        selection.interface_index = (index != 0).then_some(index);
+        if let Some(adapter) = &mut selection.adapter {
+            adapter.is_up = is_up && index != 0;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        // A concurrent explicit selection/mode update wins this native read.
+        if state.revision != revision {
+            return None;
+        }
+        let mode = state.mode;
+        if !self.update_locked(&mut state, &selection, mode) {
+            return None;
+        }
         drop(state);
         self.wake.notify_one();
+        Some(selection)
     }
 
     pub fn bootstrap(&self) {
@@ -350,6 +408,64 @@ mod tests {
         io.answers
             .insert("192.168.1.204".parse().unwrap(), "aa:bb:cc:dd:ee:02".into());
         io
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_link_hold_is_not_extended_by_polls_or_stale_provider_updates() {
+        let r = known();
+        let c = Control::default();
+        let selected = selection(7, true);
+        c.update(&selected, NetworkMode::Dhcp);
+        let snapshot = c.snapshot();
+        let job = Clock::default()
+            .next(&snapshot, &r.snapshot(), &[])
+            .unwrap();
+        promote(
+            &r,
+            &verify(&mut io(), &job, &snapshot).await.unwrap(),
+            &snapshot,
+        );
+        assert!(c
+            .observe_link(|mac| {
+                assert_eq!(mac, selected.selected_mac.as_deref().unwrap());
+                Some((7, false))
+            })
+            .is_some());
+        assert!(snapshot.fence.is_stale());
+        for _ in 0..8 {
+            tokio::time::advance(Duration::from_millis(250)).await;
+            assert!(c.observe_link(|_| Some((7, false))).is_none());
+            c.update_native(&selected, NetworkMode::Dhcp, |_| Some((7, false)));
+            c.tick(&r);
+        }
+        assert_eq!(r.snapshot()[0].status, DeviceStatus::Offline);
+        assert_eq!(r.snapshot().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_link_short_bounce_and_new_selection_cannot_revive_old_work() {
+        let c = Control::default();
+        c.update(&selection(7, true), NetworkMode::Dhcp);
+        let old = c.snapshot().fence;
+        c.observe_link(|_| Some((7, false)));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        c.observe_link(|_| Some((7, true)));
+        assert!(old.is_stale());
+        assert!(c.state.lock().unwrap().expire_at.is_none());
+        assert!(c
+            .observe_link(|_| {
+                c.update(&selection(8, true), NetworkMode::Dhcp);
+                None
+            })
+            .is_none());
+        assert_eq!(c.snapshot().index, 8);
+        let missing = c.observe_link(|_| None).unwrap();
+        assert_eq!(missing.interface_index, None);
+        assert!(c.snapshot().adapter.is_none());
+        let unselected = Control::default();
+        assert!(unselected
+            .observe_link(|_| panic!("no selected adapter"))
+            .is_none());
     }
     fn promote(r: &DeviceRegistry, proof: &Proof, snapshot: &Snapshot) {
         let device = super::super::ArpDevice {
