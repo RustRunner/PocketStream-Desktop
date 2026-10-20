@@ -1232,6 +1232,8 @@ async fn expected_device_wake(app: Option<&tauri::AppHandle>) {
 }
 
 async fn run_playback_supervisor(ctx: PlaybackSupervisorContext) {
+    let mut logged = None;
+    let mut recovery_started = None;
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -1240,6 +1242,50 @@ async fn run_playback_supervisor(ctx: PlaybackSupervisorContext) {
             _ = wait_playback_ready(&ctx.wake, expected_device_wake(ctx.app.as_ref())) => {},
         }
         playback_step(&ctx).await;
+        {
+            let s = ctx.state.lock().await;
+            if let Some(health) = &s.playback_health {
+                let snapshot = health.snapshot();
+                let cause = snapshot.fault.as_ref().map(|fault| fault.kind);
+                let key = (
+                    s.playback_intent_epoch,
+                    snapshot.state,
+                    snapshot.attempt,
+                    cause,
+                );
+                if logged != Some(key) {
+                    if logged.as_ref().is_some_and(
+                        |old: &(Option<u64>, PlaybackState, u32, Option<PlaybackFaultKind>)| {
+                            old.0 != key.0
+                        },
+                    ) {
+                        recovery_started = None;
+                    }
+                    if matches!(
+                        snapshot.state,
+                        PlaybackState::Recovering | PlaybackState::Failed
+                    ) {
+                        recovery_started.get_or_insert_with(tokio::time::Instant::now);
+                    }
+                    let duration = recovery_started.map_or(0, |at| at.elapsed().as_millis());
+                    let (mac, index) = s
+                        .playback_adapter
+                        .as_ref()
+                        .map(|(m, i)| (m.as_deref().unwrap_or("unknown"), i.unwrap_or(0)))
+                        .unwrap_or(("unknown", 0));
+                    log::info!("event=playback_recovery adapter_mac={} interface_index={} state={} cause={} attempt={} duration_ms={}",
+                        crate::network::log_value(mac), index, serde_json::to_string(&snapshot.state).unwrap(),
+                        serde_json::to_string(&cause).unwrap(), snapshot.attempt, duration);
+                    if matches!(
+                        snapshot.state,
+                        PlaybackState::Playing | PlaybackState::Stopped
+                    ) {
+                        recovery_started = None;
+                    }
+                    logged = Some(key);
+                }
+            }
+        }
         publish_playback_status(&ctx).await;
     }
 }
@@ -1405,6 +1451,11 @@ async fn playback_step(ctx: &PlaybackSupervisorContext) {
         return;
     }
     let generation = health.begin_attempt();
+    log::debug!(
+        "event=playback_attempt generation={} attempt={}",
+        generation,
+        health.snapshot().attempt
+    );
     let path = match preflight_target(ctx.app.as_ref(), target.as_ref()).await {
         Ok(path) => path,
         Err(e) => {
@@ -1724,7 +1775,13 @@ async fn run_relay_supervisor(mut events: RelayEventReceiver, ctx: RelaySupervis
                     continue;
                 }
                 publish_relay_status(&ctx).await;
-                recover_relay_generation(&ctx, expected_epoch, generation).await;
+                recover_relay_generation(
+                    &ctx,
+                    expected_epoch,
+                    generation,
+                    event.fault.kind.as_str(),
+                )
+                .await;
             }
             RelaySupervisorEvent::RetryRequested { server_generation } => {
                 let Some((expected_epoch, health)) =
@@ -1735,7 +1792,8 @@ async fn run_relay_supervisor(mut events: RelayEventReceiver, ctx: RelaySupervis
                 if health.snapshot().state != RelayState::Failed {
                     continue;
                 }
-                recover_relay_generation(&ctx, expected_epoch, server_generation).await;
+                recover_relay_generation(&ctx, expected_epoch, server_generation, "explicit_retry")
+                    .await;
             }
         }
     }
@@ -1752,7 +1810,10 @@ async fn recover_relay_generation(
     ctx: &RelaySupervisorContext,
     expected_epoch: u64,
     server_generation: u64,
+    cause: &'static str,
 ) {
+    use tauri::Manager;
+    let recovery_started = tokio::time::Instant::now();
     // Retire and fully release the failed listener before applying backoff.
     // The lifecycle gate is also the Stop completion barrier.
     {
@@ -1810,7 +1871,15 @@ async fn recover_relay_generation(
             return;
         }
 
-        let (_attempt, delay) = health.schedule_recovery_attempt();
+        let (attempt, delay) = health.schedule_recovery_attempt();
+        let selection = ctx
+            .app_handle
+            .state::<crate::network::NetworkManager>()
+            .adapter_selection_state()
+            .await;
+        log::info!("event=relay_recovery adapter_mac={} interface_index={} generation={} cause={} attempt={} phase=backoff delay_ms={} duration_ms={}",
+            crate::network::log_value(selection.selected_mac.as_deref().unwrap_or("unknown")), selection.interface_index.unwrap_or(0),
+            server_generation, cause, attempt, delay.as_millis(), recovery_started.elapsed().as_millis());
         publish_relay_status(ctx).await;
         if !wait_relay_backoff(
             &ctx.state,
@@ -1983,9 +2052,12 @@ async fn recover_relay_generation(
             }
         }
         if let Some(stale) = candidate {
+            crate::network::note_fence_drop("relay_listener");
             stale.shutdown().await;
             return;
         }
+        log::info!("event=relay_recovery generation={} cause={} attempt={} phase=listener_ready duration_ms={}",
+            server_generation, cause, attempt, recovery_started.elapsed().as_millis());
 
         drop(_lifecycle);
         publish_relay_status(ctx).await;
