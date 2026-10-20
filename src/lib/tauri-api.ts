@@ -176,8 +176,8 @@ export async function getCaptureState(): Promise<CaptureState> {
   return await invoke<CaptureState>("get_capture_state");
 }
 
-export async function startArpDiscovery(iface: string): Promise<void> {
-  return await invoke("start_arp_discovery", { interface: iface });
+export async function startArpDiscovery(iface: string, refresh = false): Promise<void> {
+  return await invoke("start_arp_discovery", { interface: iface, refresh });
 }
 
 // ── Device Registry (canonical device list) ─────────────────────────

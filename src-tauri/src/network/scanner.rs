@@ -26,6 +26,7 @@ pub struct ScanResult {
 pub(crate) struct ScanScope {
     pub index: u32,
     pub fence: Option<super::SweepFence>,
+    pub session: Option<super::SweepFence>,
     pub ips: Vec<super::interface::IpInfo>,
     pub identities: std::collections::HashMap<Ipv4Addr, String>,
 }
@@ -43,15 +44,11 @@ const PROBE_PORTS: &[u16] = &[
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Maximum simultaneous TCP connect attempts across the whole scan.
-///
-/// Bounds the total in-flight count regardless of how many hosts or
-/// ports are involved. Without this, a /24 × 7 PROBE_PORTS could fan
-/// out to 1778 concurrent connects, enough to saturate slower links
-/// or trip IDS heuristics. The previous implementation only bounded
-/// per-host parallelism, which still allowed 64 hosts × 7 ports = 448
-/// concurrent connects at peak.
+/// One process-wide budget across concurrent scans, including /32 IPC calls.
+/// Presence uses ARP and never waits on this TCP-only budget.
 const MAX_CONCURRENT_CONNECTS: usize = 64;
+static CONNECT_BUDGET: std::sync::LazyLock<Arc<Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTS)));
 
 /// Largest subnet a single scan will enumerate: 4096 addresses (≈ /20).
 /// Bounds memory and task count against a `/8` interface subnet
@@ -106,7 +103,25 @@ pub(crate) async fn scan(subnet: &str, scope: ScanScope) -> Result<Vec<ScanResul
     // re-parses the subnet independently, so enforce the cap here as well.
     check_scan_size(network.prefix())?;
 
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTS));
+    let fence = scope.fence.clone();
+    let session = scope.session.clone();
+    tokio::select! {
+        biased;
+        _ = cancelled(fence.as_ref()) => Ok(Vec::new()),
+        _ = cancelled(session.as_ref()) => Ok(Vec::new()),
+        results = scan_hosts(network, scope) => Ok(results),
+    }
+}
+
+async fn cancelled(fence: Option<&super::SweepFence>) {
+    match fence {
+        Some(fence) => fence.cancelled().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn scan_hosts(network: ipnetwork::Ipv4Network, scope: ScanScope) -> Vec<ScanResult> {
+    let semaphore = CONNECT_BUDGET.clone();
     let mut results = Vec::new();
     let mut join_set = JoinSet::new();
 
@@ -166,7 +181,7 @@ pub(crate) async fn scan(subnet: &str, scope: ScanScope) -> Result<Vec<ScanResul
     }
 
     results.sort_by_key(|r| r.ip.parse::<IpAddr>().ok());
-    Ok(results)
+    results
 }
 
 /// Probe `ip` against an arbitrary port list. Split out from `probe_host`
@@ -196,7 +211,11 @@ async fn probe_host_at(
             // closed in production, so `acquire` only fails if the
             // runtime is shutting down — in which case skipping the
             // probe is the right thing to do.
-            let _permit = sem.acquire().await.ok()?;
+            let _permit = tokio::select! {
+                biased;
+                _ = cancelled(fence.as_ref()) => return None,
+                permit = sem.acquire() => permit.ok()?,
+            };
             if fence.as_ref().is_some_and(super::SweepFence::is_stale) {
                 return None;
             }
@@ -214,9 +233,13 @@ async fn probe_host_at(
             }
             let socket = TcpSocket::new_v4().ok()?;
             socket.bind(SocketAddr::new(IpAddr::V4(source), 0)).ok()?;
-            match tokio::time::timeout(CONNECT_TIMEOUT, socket.connect(addr)).await {
-                Ok(Ok(_)) => Some(port),
-                _ => None,
+            // Queue time is not part of the connect timeout.
+            tokio::select! {
+                biased;
+                _ = cancelled(fence.as_ref()) => None,
+                result = tokio::time::timeout(CONNECT_TIMEOUT, socket.connect(addr)) => {
+                    result.ok()?.ok().map(|_| port)
+                }
             }
         });
     }
@@ -280,8 +303,15 @@ mod tests {
         });
         tokio::task::yield_now().await;
         epoch.store(2, Ordering::Release);
+        // Cancellation must finish while the budget is still exhausted.
+        assert!(
+            !tokio::time::timeout(Duration::from_millis(250), probe)
+                .await
+                .unwrap()
+                .unwrap()
+                .reachable
+        );
         drop(held);
-        assert!(!probe.await.unwrap().reachable);
         assert!(
             tokio::time::timeout(Duration::from_millis(30), listener.accept())
                 .await
@@ -379,27 +409,89 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_host_at_serialises_under_single_permit_semaphore() {
-        // Smoke test that the semaphore wiring works: with only one
-        // permit, three connects must all succeed sequentially. This
-        // catches a regression where the permit isn't acquired before
-        // the connect (which would silently fan out unbounded again).
-        let (_a, port_a) = bind_loopback().await;
-        let (_b, port_b) = bind_loopback().await;
-        let (_c, port_c) = bind_loopback().await;
+    async fn two_callers_share_single_permit_and_queue_time_is_not_connect_time() {
+        let (listener, port) = bind_loopback().await;
         let sem = Arc::new(Semaphore::new(1));
-        let result = probe_host_at(
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            Some(Ipv4Addr::LOCALHOST),
-            loopback_index(),
-            Some("loopback-fixture".into()),
-            &[port_a, port_b, port_c],
-            sem,
-            None,
-        )
-        .await;
-        assert!(result.reachable);
-        assert_eq!(result.open_ports.len(), 3);
+        let held = sem.clone().acquire_owned().await.unwrap();
+        let mut callers = JoinSet::new();
+        for _ in 0..2 {
+            let sem = sem.clone();
+            callers.spawn(async move {
+                probe_host_at(
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    Some(Ipv4Addr::LOCALHOST),
+                    loopback_index(),
+                    None,
+                    &[port],
+                    sem,
+                    None,
+                )
+                .await
+            });
+        }
+        // Both callers must remain queued beyond the two-second connect
+        // timeout. Neither can create a socket while the permit is held.
+        tokio::time::sleep(CONNECT_TIMEOUT + Duration::from_millis(50)).await;
+        assert!(callers.try_join_next().is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
+        drop(held);
+        while let Some(result) = callers.join_next().await {
+            assert_eq!(result.unwrap().open_ports, vec![port]);
+        }
+        assert_eq!(sem.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn process_budget_blocks_two_callers_until_retired_work_leaves_queue() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let (listener, port) = bind_loopback().await;
+        let held = CONNECT_BUDGET
+            .clone()
+            .acquire_many_owned(MAX_CONCURRENT_CONNECTS as u32)
+            .await
+            .unwrap();
+        let epoch = Arc::new(AtomicU64::new(1));
+        let fence =
+            super::super::SweepFence::new(1, epoch.clone(), Arc::new(AtomicBool::new(true)));
+        let mut probes = JoinSet::new();
+        for _ in 0..2 {
+            let fence = fence.clone();
+            probes.spawn(async move {
+                probe_host_at(
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    Some(Ipv4Addr::LOCALHOST),
+                    loopback_index(),
+                    None,
+                    &[port],
+                    CONNECT_BUDGET.clone(),
+                    Some(fence),
+                )
+                .await
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(probes.try_join_next().is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
+        epoch.store(2, Ordering::Release);
+        // Obsolete work must leave the process queue without a permit release.
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while let Some(result) = probes.join_next().await {
+                assert!(!result.unwrap().reachable);
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(CONNECT_BUDGET.available_permits(), 0);
+        drop(held);
+        assert_eq!(CONNECT_BUDGET.available_permits(), MAX_CONCURRENT_CONNECTS);
     }
 
     #[tokio::test]
