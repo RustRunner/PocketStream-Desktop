@@ -582,17 +582,14 @@ pub fn run() {
             std::process::exit(1);
         })
         .run(|app_handle, event| {
-            // Graceful-shutdown cleanup: remove every secondary IP that
-            // auto-adopt added during this session, so they don't survive
-            // across restarts and accumulate on the user's adapter when
-            // moving between sites. After a hard crash this won't run;
-            // the leftover IPs are recovered into in-memory state by
-            // `load_adopted_from_config` on the next startup and cleaned
-            // up by the next graceful exit (self-healing on one cycle).
+            // Graceful shutdown cleans only tracked scratch/uncommitted
+            // addresses. Durable temporary ownership allows another cleanup
+            // attempt after a crash or failed removal. Committed host
+            // bindings stay in Windows/config until explicitly removed.
             //
-            // Bounded at 5 s total so a stalled netsh can't hang the
-            // process. block_on is safe here — the event loop is already
-            // exiting and there's no UI to keep responsive.
+            // Address cleanup is bounded at 5 s; streaming shutdown has
+            // its own 5 s wait. block_on is safe here — the event loop is
+            // already exiting and there's no UI to keep responsive.
             if let tauri::RunEvent::ExitRequested { .. } = event {
                 let stream: tauri::State<'_, streaming::StreamManager> = app_handle.state();
                 let _ = tauri::async_runtime::block_on(async {
