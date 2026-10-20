@@ -146,7 +146,13 @@ mod imp {
         std::sync::RwLock::new(None);
     static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-    fn wake() {
+    // One queued wake plus a bounded dirty bitset; notifications during an
+    // outstanding refresh remain armed for its trailing pass.
+    static DIRTY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    fn wake(kind: u8) {
+        if DIRTY.fetch_or(kind, Ordering::AcqRel) != 0 {
+            return;
+        }
         if let Ok(guard) = SENDER.read() {
             if let Some(tx) = guard.as_ref() {
                 let _ = tx.send(());
@@ -170,7 +176,7 @@ mod imp {
         _row: *const MIB_IPINTERFACE_ROW,
         _ty: MIB_NOTIFICATION_TYPE,
     ) {
-        wake();
+        wake(2);
     }
 
     unsafe extern "system" fn address_cb(
@@ -178,7 +184,7 @@ mod imp {
         _row: *const MIB_UNICASTIPADDRESS_ROW,
         _ty: MIB_NOTIFICATION_TYPE,
     ) {
-        wake();
+        wake(1);
     }
 
     pub fn start(handle: AppHandle) -> bool {
@@ -194,6 +200,7 @@ mod imp {
         }
 
         let (tx, rx) = mpsc::unbounded_channel();
+        DIRTY.store(0, Ordering::Release);
         // Overwrite any sender a prior failed attempt left behind.
         if let Ok(mut guard) = SENDER.write() {
             *guard = Some(tx);
@@ -259,8 +266,13 @@ mod imp {
             let handle = handle.clone();
             async move {
                 let result = if changed {
-                    super::super::interface::invalidate_adapter_snapshot();
-                    super::refresh(&handle).await
+                    let _kinds = DIRTY.swap(0, Ordering::AcqRel);
+                    // Both callback kinds can accompany an IP write. Only a
+                    // changed native identity/topology retires qualification.
+                    match super::super::interface::notification_topology_changed().await {
+                        Ok(_) => super::refresh(&handle).await,
+                        Err(error) => Err(error),
+                    }
                 } else {
                     super::retry_discovery(&handle).await
                 };

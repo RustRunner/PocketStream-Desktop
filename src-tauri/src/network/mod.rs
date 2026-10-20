@@ -704,6 +704,7 @@ pub struct ModeTransitionReply {
 }
 
 pub struct NetworkManager {
+    address_io: Arc<dyn interface::AddressIo>,
     active_scans: Arc<std::sync::Mutex<HashSet<String>>>,
     solicitations: tokio::sync::watch::Sender<Option<Solicitation>>,
     arp_devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
@@ -2007,9 +2008,213 @@ async fn watchdog_ladder(
     }
 }
 
+impl interface::AddressIo for interface::RealAddressIo {
+    fn native(&self) -> interface::AddressFuture<'_, Vec<interface::NativeAdapter>> {
+        Box::pin(async {
+            tokio::task::spawn_blocking(|| {
+                #[cfg(windows)]
+                {
+                    interface::local_adapters_iphelper()
+                }
+                #[cfg(not(windows))]
+                {
+                    Err(AppError::Network(
+                        "Native adapter reads require Windows".into(),
+                    ))
+                }
+            })
+            .await
+            .map_err(|e| AppError::Network(format!("Native adapter read failed: {e}")))?
+        })
+    }
+    fn add<'a>(
+        &'a self,
+        adapter: &'a interface::NativeAdapter,
+        ip: &'a str,
+        mask: &'a str,
+    ) -> interface::AddressFuture<'a, ()> {
+        Box::pin(ip_config::add_native_address(adapter, ip, mask))
+    }
+    fn remove<'a>(
+        &'a self,
+        adapter: &'a interface::NativeAdapter,
+        ip: &'a str,
+    ) -> interface::AddressFuture<'a, ()> {
+        Box::pin(ip_config::remove_native_address(adapter, ip))
+    }
+    fn persist_intent(
+        &self,
+        config: &crate::config::AppConfig,
+        subnet: &str,
+        row: crate::config::AdoptedMeta,
+    ) -> Result<(), AppError> {
+        config.set_binding(subnet, row)
+    }
+}
+
+static ADDRESS_REQUEST: AtomicU64 = AtomicU64::new(0);
+struct AddressTrace {
+    id: u64,
+    started: std::time::Instant,
+    phase_at: StdMutex<std::time::Instant>,
+    native: AtomicU64,
+    provider: AtomicU64,
+    success: AtomicBool,
+}
+impl AddressTrace {
+    fn new(action: &str, address: &str) -> Self {
+        let now = std::time::Instant::now();
+        let value = Self {
+            id: ADDRESS_REQUEST.fetch_add(1, Ordering::Relaxed) + 1,
+            started: now,
+            phase_at: StdMutex::new(now),
+            native: AtomicU64::new(0),
+            provider: AtomicU64::new(0),
+            success: AtomicBool::new(false),
+        };
+        log::info!(
+            "event=address_operation operation={} action={} address={} phase=request",
+            value.id,
+            action,
+            log_value(address)
+        );
+        value
+    }
+    fn phase(&self, phase: &str) {
+        let mut at = self.phase_at.lock().unwrap_or_else(|p| p.into_inner());
+        log::info!("event=address_operation operation={} phase={} elapsed_ms={} phase_ms={} native_calls={} provider_calls={}",
+            self.id, phase, self.started.elapsed().as_millis(), at.elapsed().as_millis(),
+            self.native.load(Ordering::Relaxed),
+            self.provider.load(Ordering::Relaxed));
+        *at = std::time::Instant::now();
+    }
+    fn native_call(&self) {
+        self.native.fetch_add(1, Ordering::Relaxed);
+    }
+    fn provider_call(&self) {
+        self.provider.fetch_add(1, Ordering::Relaxed);
+    }
+    fn identity(&self, snapshot: &interface::OperationSnapshot, prefix: Option<u8>) {
+        log::info!("event=address_operation operation={} adapter_guid={} adapter_mac={} interface_index={} alias={} prefix={}",
+            self.id, log_value(&snapshot.selected.guid), log_value(&snapshot.selected.mac), snapshot.selected.index,
+            log_value(&snapshot.selected.alias), prefix.map_or_else(|| "unknown".into(), |p| p.to_string()));
+    }
+    fn succeeded(&self) {
+        self.success.store(true, Ordering::Relaxed);
+    }
+}
+impl Drop for AddressTrace {
+    fn drop(&mut self) {
+        self.phase("reply");
+        log::info!(
+            "event=address_operation operation={} outcome={}",
+            self.id,
+            if self.success.load(Ordering::Relaxed) {
+                "success"
+            } else {
+                "pending_or_failed"
+            }
+        );
+    }
+}
+
+struct AddressOps<'a>(
+    &'a dyn interface::AddressIo,
+    Option<&'a interface::NativeAdapter>,
+);
+impl auto_adopt::AdoptOps for AddressOps<'_> {
+    async fn observe(&self, alias: &str) -> Result<InterfaceInfo, AppError> {
+        let all = interface::read_native_with(self.0).await?;
+        let native = interface::native_by_alias(&all, alias)?;
+        self.0
+            .descriptor(native)
+            .ok_or_else(|| AppError::Network("Adapter requires qualification".into()))
+    }
+    async fn add(&self, alias: &str, ip: Ipv4Addr, mask: &str) -> Result<(), AppError> {
+        let adapter = self
+            .1
+            .filter(|a| a.alias == alias)
+            .ok_or_else(|| AppError::Network("Address writer has no validated adapter".into()))?;
+        self.0.add(adapter, &ip.to_string(), mask).await
+    }
+    async fn remove(&self, alias: &str, ip: Ipv4Addr) -> Result<(), AppError> {
+        let owned;
+        let adapter = if let Some(adapter) = self.1 {
+            adapter
+        } else {
+            owned = interface::read_native_with(self.0).await?;
+            let native = interface::native_by_alias(&owned, alias)?;
+            if self
+                .0
+                .descriptor(native)
+                .filter(interface::is_wired_physical)
+                .is_none()
+            {
+                return Err(AppError::Network("Adapter requires qualification".into()));
+            }
+            native
+        };
+        if adapter.alias != alias {
+            return Err(AppError::Network("Adapter alias changed".into()));
+        }
+        self.0.remove(adapter, &ip.to_string()).await
+    }
+    async fn probe(&self, _: Ipv4Addr, _: Option<Ipv4Addr>) -> bool {
+        true
+    }
+}
+
 impl NetworkManager {
+    #[cfg(test)]
+    fn with_address_io(io: Arc<dyn interface::AddressIo>) -> Self {
+        Self {
+            address_io: io,
+            ..Self::new()
+        }
+    }
+
+    async fn operation_snapshot(
+        &self,
+        config: &crate::config::AppConfig,
+    ) -> Result<interface::OperationSnapshot, AppError> {
+        let mac = config
+            .get()
+            .selected_adapter_mac
+            .ok_or_else(|| AppError::Network("Select an Ethernet adapter".into()))?;
+        interface::operation_snapshot(self.address_io.as_ref(), &mac).await
+    }
+    async fn operation_snapshot_traced(
+        &self,
+        config: &crate::config::AppConfig,
+        trace: Option<&AddressTrace>,
+    ) -> Result<interface::OperationSnapshot, AppError> {
+        let mac = config
+            .get()
+            .selected_adapter_mac
+            .ok_or_else(|| AppError::Network("Select an Ethernet adapter".into()))?;
+        interface::operation_snapshot_traced(self.address_io.as_ref(), &mac, trace).await
+    }
+    async fn observe_operation_traced(
+        &self,
+        before: &interface::OperationSnapshot,
+        trace: Option<&AddressTrace>,
+    ) -> Result<interface::OperationSnapshot, AppError> {
+        if let Some(t) = trace {
+            t.native_call();
+        }
+        let all = interface::read_native_with(self.address_io.as_ref()).await?;
+        let after =
+            interface::snapshot_from_native(self.address_io.as_ref(), &before.selected.mac, all)?;
+        if before.selected.identity() != after.selected.identity() {
+            return Err(AppError::Network(
+                "Selected adapter changed during operation".into(),
+            ));
+        }
+        Ok(after)
+    }
     pub fn new() -> Self {
         Self {
+            address_io: Arc::new(interface::RealAddressIo),
             active_scans: Arc::new(std::sync::Mutex::new(HashSet::new())),
             solicitations: tokio::sync::watch::channel(None).0,
             arp_devices: Arc::new(Mutex::new(HashMap::new())),
@@ -2596,7 +2801,7 @@ impl NetworkManager {
         subnet: &str,
         mut row: crate::config::AdoptedMeta,
     ) {
-        if let Err(e) = config.set_binding(subnet, row.clone()) {
+        if let Err(e) = self.address_io.persist_binding(config, subnet, row.clone()) {
             row.last_error = Some(format!(
                 "{}; status save failed: {}",
                 row.last_error.as_deref().unwrap_or("OS state observed"),
@@ -2612,7 +2817,7 @@ impl NetworkManager {
         if changed {
             log::info!("event=binding_change adapter_mac={} interface_index={} subnet={} address={} desired={:?} applied={} error={} reason={}",
                 log_value(row.adapter_mac.as_deref().unwrap_or("unknown")),
-                row.adapter_mac.as_deref().and_then(interface::index_for_mac).unwrap_or(0),
+                self.adapter_selection.lock().await.interface_index.unwrap_or(0),
                 log_value(subnet), log_value(row.address.as_deref().unwrap_or("unknown")),
                 row.desired, row.applied, row.last_error.is_some(),
                 if row.last_error.is_some() { "pending" } else if row.applied { "applied" } else { "removed" });
@@ -2633,76 +2838,63 @@ impl NetworkManager {
     }
 
     async fn reconcile_bindings_locked(&self, config: &crate::config::AppConfig) {
+        self.reconcile_bindings_traced(config, None).await;
+    }
+    async fn reconcile_bindings_traced(
+        &self,
+        config: &crate::config::AppConfig,
+        trace: Option<&AddressTrace>,
+    ) {
         let settings = config.get();
-        let adapters = interface::list_all_adapters().await;
-        let mut observation_error = adapters
-            .as_ref()
-            .err()
-            .map(|error| format!("adapter enumeration failed: {error}"));
-        let mut selected = adapters
-            .as_ref()
-            .ok()
-            .and_then(|list| pick_adapter(list, settings.selected_adapter_mac.as_deref()).cloned());
-        if let Some(iface) = &mut selected {
-            if let Some((up, ips)) = interface::quick_status_by_mac(&iface.mac) {
-                let has_index = interface::index_for_mac(&iface.mac).is_some();
-                iface.is_up = up && has_index;
-                iface.ips = ips;
-                if !has_index {
-                    observation_error = Some("selected adapter index unavailable".into());
-                }
-            } else {
-                iface.is_up = false;
-                observation_error = Some("selected adapter observation unavailable".into());
-            }
+        let snapshot = self.operation_snapshot_traced(config, trace).await;
+        if let Some(t) = trace {
+            t.phase("preflight");
         }
-        let dhcp = match &selected {
-            Some(iface) => ip_config::get_dhcp_state(&iface.name)
-                .await
-                .map_err(|e| e.to_string()),
-            None => Err("selected adapter unavailable".into()),
-        };
-        let ghosts = adapters
-            .as_ref()
-            .map(|list| ghost::non_wired_networks_of(list))
-            .unwrap_or_default();
-        self.adopted_ips.lock().await.clear();
+        let ops = AddressOps(
+            self.address_io.as_ref(),
+            snapshot.as_ref().ok().map(|s| &s.selected),
+        );
         for (subnet, row) in settings.adopted_meta {
-            let mut action = binding_action(
-                &subnet,
-                &row,
-                selected.as_ref(),
-                settings.network_mode,
-                &dhcp,
-                &ghosts,
-            );
-            if let Some(error) = &observation_error {
-                action = BindingAction::Unavailable(error.clone());
-            } else if row.desired == crate::config::BindingDesired::Present
+            if let (Some(t), Ok(snapshot)) = (trace, &snapshot) {
+                t.identity(snapshot, row.prefix);
+            }
+            let action = match &snapshot {
+                Ok(snapshot) => binding_action(
+                    &subnet,
+                    &row,
+                    Some(&snapshot.iface),
+                    settings.network_mode,
+                    &Ok(snapshot.selected.dhcp),
+                    &interface::native_conflicts(snapshot, self.address_io.as_ref()),
+                ),
+                Err(error) => BindingAction::Unavailable(error.to_string()),
+            };
+            let action = if row.desired == crate::config::BindingDesired::Present
                 && settings.adopted_subnets.get(&subnet) != row.address.as_ref()
             {
-                action = BindingAction::Hold(
-                    "saved routing address and metadata disagree".into(),
-                    false,
-                );
-            }
-            let iface = selected.as_ref();
-            let row = apply_binding(&auto_adopt::RealAdoptOps, row, action, iface, || async {
-                match iface {
-                    Some(iface) => interface::get_by_name(&iface.name).await.and_then(|i| {
-                        if adapter_mac(&i.mac) == adapter_mac(&iface.mac) {
-                            Ok(i.ips)
-                        } else {
-                            Err(AppError::Network(
-                                "selected adapter changed during reconciliation".into(),
-                            ))
-                        }
-                    }),
-                    None => Err(AppError::Network("selected adapter unavailable".into())),
+                BindingAction::Hold("saved routing address and metadata disagree".into(), false)
+            } else {
+                action
+            };
+            let iface = snapshot.as_ref().ok().map(|s| &s.iface);
+            let row = apply_binding(&ops, row, action, iface, || async {
+                if let Some(t) = trace {
+                    t.phase("os_command");
                 }
+                let before = snapshot
+                    .as_ref()
+                    .map_err(|e| AppError::Network(e.to_string()))?;
+                let after = self.observe_operation_traced(before, trace).await?;
+                if let Some(t) = trace {
+                    t.phase("observation");
+                }
+                Ok(after.selected.ips)
             })
             .await;
             self.publish_binding(config, &subnet, row).await;
+            if let Some(t) = trace {
+                t.phase("status_save");
+            }
         }
     }
 
@@ -2730,11 +2922,42 @@ impl NetworkManager {
         self.adapter_selection.lock().await.clone()
     }
 
+    async fn native_interfaces(
+        &self,
+        selected_mac: Option<&str>,
+    ) -> Result<Vec<InterfaceInfo>, AppError> {
+        let Some(mac) = selected_mac else {
+            return self.list_interfaces().await;
+        };
+        let mut all = interface::read_native_with(self.address_io.as_ref()).await?;
+        if let Ok(selected) = interface::select_native(&all, mac) {
+            if self.address_io.descriptor(selected).is_none() {
+                let before = selected.identity();
+                self.address_io.qualify().await?;
+                all = interface::read_native_with(self.address_io.as_ref()).await?;
+                if interface::select_native(&all, mac)?.identity() != before {
+                    return Err(AppError::Network(
+                        "Adapter changed during qualification".into(),
+                    ));
+                }
+            }
+        }
+        let mut views: Vec<_> = all
+            .iter()
+            .filter_map(|n| self.address_io.descriptor(n))
+            .collect();
+        let pending = self.pending_ip_strings().await;
+        views = strip_pending_ips(views, &pending);
+        Ok(views)
+    }
+
     pub async fn get_adapter_selection(
         &self,
         config: &crate::config::AppConfig,
     ) -> Result<AdapterSelection, AppError> {
-        let list = self.list_interfaces().await?;
+        let list = self
+            .native_interfaces(config.get().selected_adapter_mac.as_deref())
+            .await?;
         self.resolve_adapter_selection(config, &list).await
     }
 
@@ -4250,7 +4473,7 @@ impl NetworkManager {
         config: &crate::config::AppConfig,
         ip: &str,
     ) -> Result<(), AppError> {
-        config.claim_binding(ip)?;
+        self.address_io.claim(config, ip)?;
         self.pending_ips
             .lock()
             .await
@@ -4259,9 +4482,10 @@ impl NetworkManager {
         log::info!(
             "event=binding_change adapter_mac={} interface_index={} address={} reason=manual_claim",
             log_value(adapter.as_deref().unwrap_or("unknown")),
-            adapter
-                .as_deref()
-                .and_then(interface::index_for_mac)
+            self.adapter_selection
+                .lock()
+                .await
+                .interface_index
                 .unwrap_or(0),
             log_value(ip)
         );
@@ -4283,24 +4507,60 @@ impl NetworkManager {
         ip: &str,
         mask: &str,
     ) -> Result<(), AppError> {
+        let trace = AddressTrace::new("add", ip);
         let _op = self.discovery_op.lock().await;
         let _pause = self.pause_addresses();
         let _address = self.address_work.lock().await;
-        let iface = self.selected_write_adapter(config, name).await?;
+        trace.phase("admission");
+        let snapshot = self.operation_snapshot_traced(config, Some(&trace)).await?;
+        trace.phase("preflight");
+        if snapshot.iface.name != name || !snapshot.iface.is_up {
+            return Err(AppError::Network(
+                "Selected Ethernet adapter unavailable or changed".into(),
+            ));
+        }
         let prefix = ip_config::mask_to_prefix(mask)?;
-        if let Some(existing) = iface.ips.iter().find(|a| a.address == ip) {
+        trace.identity(&snapshot, Some(prefix));
+        ip.parse::<Ipv4Addr>()
+            .map_err(|_| AppError::Network("Invalid IPv4 address".into()))?;
+        if snapshot.all.iter().any(|a| {
+            a.identity() != snapshot.selected.identity() && a.ips.iter().any(|i| i.address == ip)
+        }) {
+            return Err(AppError::Network(
+                "Address is already assigned to another local adapter".into(),
+            ));
+        }
+        if snapshot.selected.dhcp || config.get_network_mode() == crate::config::NetworkMode::Dhcp {
+            return Err(AppError::Network("adapter is DHCP".into()));
+        }
+        if let Some(existing) = snapshot.iface.ips.iter().find(|a| a.address == ip) {
             if existing.prefix != prefix {
                 return Err(AppError::Network(
                     "Address exists with a different prefix".into(),
                 ));
             }
-            if ip_config::get_dhcp_state(name).await? {
-                return Err(AppError::Network("adapter is DHCP".into()));
-            }
         } else {
-            ip_config::add_secondary_ip(name, ip, mask).await?;
+            self.address_io.add(&snapshot.selected, ip, mask).await?;
         }
-        self.claim_binding_locked(config, ip).await
+        trace.phase("os_command");
+        let after = self
+            .observe_operation_traced(&snapshot, Some(&trace))
+            .await?;
+        trace.phase("observation");
+        if !after
+            .selected
+            .ips
+            .iter()
+            .any(|a| a.address == ip && a.prefix == prefix)
+        {
+            return Err(AppError::Network(
+                "Windows has not confirmed the requested address".into(),
+            ));
+        }
+        self.claim_binding_locked(config, ip).await?;
+        trace.phase("status_save");
+        trace.succeeded();
+        Ok(())
     }
 
     pub async fn remove_manual_address(
@@ -4309,14 +4569,41 @@ impl NetworkManager {
         name: &str,
         ip: &str,
     ) -> Result<(), AppError> {
+        let trace = AddressTrace::new("remove_manual", ip);
         let _op = self.discovery_op.lock().await;
         let _pause = self.pause_addresses();
         let _address = self.address_work.lock().await;
-        let iface = self.selected_write_adapter(config, name).await?;
-        ip_config::get_dhcp_state(name).await?;
-        ip_config::remove_secondary_ip(name, ip).await?;
-        log::info!("event=binding_change adapter_mac={} interface_index={} address={} reason=manual_remove",
-            log_value(&iface.mac), interface::index_for_mac(&iface.mac).unwrap_or(0), log_value(ip));
+        trace.phase("admission");
+        let snapshot = self.operation_snapshot_traced(config, Some(&trace)).await?;
+        trace.phase("preflight");
+        trace.identity(
+            &snapshot,
+            snapshot
+                .selected
+                .ips
+                .iter()
+                .find(|i| i.address == ip)
+                .map(|i| i.prefix),
+        );
+        if snapshot.iface.name != name || !snapshot.iface.is_up {
+            return Err(AppError::Network(
+                "Selected Ethernet adapter unavailable or changed".into(),
+            ));
+        }
+        if snapshot.iface.ips.iter().any(|a| a.address == ip) {
+            self.address_io.remove(&snapshot.selected, ip).await?;
+        }
+        trace.phase("os_command");
+        let after = self
+            .observe_operation_traced(&snapshot, Some(&trace))
+            .await?;
+        trace.phase("observation");
+        if after.selected.ips.iter().any(|a| a.address == ip) {
+            return Err(AppError::Network(
+                "Windows has not confirmed address removal".into(),
+            ));
+        }
+        trace.succeeded();
         Ok(())
     }
 
@@ -4325,16 +4612,13 @@ impl NetworkManager {
         config: &crate::config::AppConfig,
         name: &str,
     ) -> Result<InterfaceInfo, AppError> {
-        let list = self.list_interfaces().await?;
-        let settings = config.get();
-        pick_adapter(&list, settings.selected_adapter_mac.as_deref())
-            .filter(|iface| {
-                iface.name == name && iface.is_up && interface::index_for_mac(&iface.mac).is_some()
-            })
-            .cloned()
-            .ok_or_else(|| {
-                AppError::Network("Selected Ethernet adapter unavailable or changed".into())
-            })
+        let snapshot = self.operation_snapshot(config).await?;
+        if snapshot.iface.name != name || !snapshot.iface.is_up {
+            return Err(AppError::Network(
+                "Selected Ethernet adapter unavailable or changed".into(),
+            ));
+        }
+        Ok(snapshot.iface)
     }
 
     pub async fn remove_adopted_subnet(
@@ -4343,9 +4627,11 @@ impl NetworkManager {
         subnet: &str,
         _iface_hint: Option<&str>,
     ) -> Result<Ipv4Addr, AppError> {
+        let trace = AddressTrace::new("remove_managed", subnet);
         let _op = self.discovery_op.lock().await;
         let _pause = self.pause_addresses();
         let _address = self.address_work.lock().await;
+        trace.phase("admission");
         let settings = config.get();
         let mut row = settings
             .adopted_meta
@@ -4365,13 +4651,15 @@ impl NetworkManager {
         }
         let row = pending_binding_removal(row);
         // The only entry point to an OS removal: failure here changes nothing.
-        config.set_binding(subnet, row.clone())?;
+        self.address_io
+            .persist_intent(config, subnet, row.clone())?;
+        trace.phase("intent_save");
         self.adopted_ips.lock().await.remove(subnet);
         if let Ok(mut meta) = self.adopted_meta.lock() {
             meta.insert(subnet.to_string(), row);
         }
         self.reconcile_temporary_locked(config).await;
-        self.reconcile_bindings_locked(config).await;
+        self.reconcile_bindings_traced(config, Some(&trace)).await;
         self.presence.bootstrap();
         let row = self
             .adopted_meta
@@ -4388,6 +4676,7 @@ impl NetworkManager {
                 row.last_error.as_deref().unwrap_or("address still applied")
             )));
         }
+        trace.succeeded();
         Ok(ip)
     }
 
@@ -4405,10 +4694,13 @@ impl NetworkManager {
         if saved.is_empty() {
             return;
         }
-        let adapters = match interface::list_all_adapters().await {
-            Ok(list) => list,
+        let adapters = match interface::read_native_with(self.address_io.as_ref()).await {
+            Ok(list) => list
+                .iter()
+                .filter_map(|n| self.address_io.descriptor(n))
+                .collect::<Vec<_>>(),
             Err(e) => {
-                log::warn!("Temporary address cleanup waiting for adapter enumeration: {e}");
+                log::warn!("Temporary cleanup waiting for native state: {e}");
                 return;
             }
         };
@@ -4450,7 +4742,7 @@ impl NetworkManager {
             let ops = auto_adopt::PendingAdoptOps::new(
                 config,
                 &row.adapter_mac,
-                auto_adopt::RealAdoptOps,
+                AddressOps(self.address_io.as_ref(), None),
             );
             if let Err(e) = ops.remove(&iface.name, ip).await {
                 log::warn!(
@@ -5288,6 +5580,159 @@ mod tests {
         }
         async fn probe(&self, _: Ipv4Addr, _: Option<Ipv4Addr>) -> bool {
             false
+        }
+    }
+
+    #[tokio::test]
+    async fn sp1_native_identity_change_after_write_never_claims_success() {
+        use interface::address_test_io::FakeAddressIo;
+        let io = FakeAddressIo::new(&["192.0.2.20"]);
+        io.replace_after_write.store(true, Ordering::Relaxed);
+        let manager = NetworkManager::with_address_io(io.clone());
+        let mut settings = crate::config::AppSettings {
+            selected_adapter_mac: Some("40:cd:3a:00:00:01".into()),
+            ..Default::default()
+        };
+        let mut row = saved_binding("192.0.2.20");
+        row.applied = true;
+        settings
+            .adopted_subnets
+            .insert("192.0.2.0/24".into(), "192.0.2.20".into());
+        settings.adopted_meta.insert("192.0.2.0/24".into(), row);
+        let config = crate::config::AppConfig::temporary_test_config(settings);
+        assert!(manager
+            .remove_adopted_subnet(&config, "192.0.2.0/24", None)
+            .await
+            .is_err());
+        assert_eq!(io.writes.lock().unwrap().len(), 1);
+        assert!(config.get().adopted_meta["192.0.2.0/24"]
+            .last_error
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn sp1_manual_operation_unknown_identity_or_dhcp_never_writes() {
+        use interface::address_test_io::FakeAddressIo;
+        for case in 0..9 {
+            let io = FakeAddressIo::new(&["192.0.2.10"]);
+            let mut settings = crate::config::AppSettings {
+                selected_adapter_mac: Some("40:cd:3a:00:00:01".into()),
+                ..Default::default()
+            };
+            {
+                let mut table = io.table.lock().unwrap();
+                match case {
+                    0 => table.clear(),
+                    1 => {
+                        let duplicate = table[0].clone();
+                        table.push(duplicate);
+                    }
+                    2 => table[0].index = 0,
+                    3 => table[0].guid = "replacement-guid".into(),
+                    4 => table[0].alias = "renamed".into(),
+                    5 => table[0].mac = "40:cd:3a:00:00:02".into(),
+                    6 => table[0].dhcp = true,
+                    7 => settings.network_mode = crate::config::NetworkMode::Dhcp,
+                    _ => io.fail_read.store(true, Ordering::Relaxed),
+                }
+            }
+            let manager = NetworkManager::with_address_io(io.clone());
+            let config = crate::config::AppConfig::temporary_test_config(settings);
+            assert!(manager
+                .add_manual_address(&config, "Ethernet", "192.0.2.20", "255.255.255.0")
+                .await
+                .is_err());
+            assert!(io.writes.lock().unwrap().is_empty());
+            assert!(io.saves.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn sp1_real_delete_preserves_native_failure_and_command_error_evidence() {
+        use interface::address_test_io::{Effect, FakeAddressIo};
+        for (effect, native_failure) in [
+            (Effect::Unchanged, false),
+            (Effect::ErrorAfter, false),
+            (Effect::TimeoutAfter, false),
+            (Effect::Apply, true),
+        ] {
+            let io = FakeAddressIo::new(&["192.0.2.20"]);
+            *io.effect.lock().unwrap() = effect;
+            io.fail_read.store(native_failure, Ordering::Relaxed);
+            let manager = NetworkManager::with_address_io(io.clone());
+            let mut settings = crate::config::AppSettings {
+                selected_adapter_mac: Some("40:cd:3a:00:00:01".into()),
+                ..Default::default()
+            };
+            let mut row = saved_binding("192.0.2.20");
+            row.applied = true;
+            settings
+                .adopted_subnets
+                .insert("192.0.2.0/24".into(), "192.0.2.20".into());
+            settings.adopted_meta.insert("192.0.2.0/24".into(), row);
+            let config = crate::config::AppConfig::temporary_test_config(settings);
+            assert!(manager
+                .remove_adopted_subnet(&config, "192.0.2.0/24", None)
+                .await
+                .is_err());
+            assert_eq!(
+                io.writes.lock().unwrap().len(),
+                usize::from(!native_failure)
+            );
+            let row = &config.get().adopted_meta["192.0.2.0/24"];
+            assert_eq!(row.desired, crate::config::BindingDesired::Removed);
+            assert!(row.last_error.is_some());
+            if native_failure {
+                assert!(row.applied);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sp02_real_delete_uses_native_proof_despite_both_callbacks_and_provider_timeout() {
+        use interface::address_test_io::FakeAddressIo;
+        for legacy in [true, false] {
+            let io = FakeAddressIo::new(&["192.0.2.10", "192.0.2.20"]);
+            io.legacy_callbacks.store(legacy, Ordering::Relaxed);
+            io.external_address.store(true, Ordering::Relaxed);
+            let manager = NetworkManager::with_address_io(io.clone());
+            let mut settings = crate::config::AppSettings {
+                selected_adapter_mac: Some("40:cd:3a:00:00:01".into()),
+                ..Default::default()
+            };
+            let mut row = saved_binding("192.0.2.20");
+            row.applied = true;
+            settings
+                .adopted_subnets
+                .insert("192.0.2.0/24".into(), "192.0.2.20".into());
+            settings.adopted_meta.insert("192.0.2.0/24".into(), row);
+            let config = crate::config::AppConfig::temporary_test_config(settings);
+            let result = manager
+                .remove_adopted_subnet(&config, "192.0.2.0/24", Some("Ethernet"))
+                .await;
+            assert_eq!(
+                result.is_err(),
+                legacy,
+                "legacy invalidation reproduces the false pending result"
+            );
+            assert_eq!(
+                *io.writes.lock().unwrap(),
+                vec![(false, "192.0.2.20".into())]
+            );
+            assert_eq!(
+                io.providers.load(Ordering::Relaxed),
+                0,
+                "expired TTL must not force a provider read"
+            );
+            let table = io.table.lock().unwrap();
+            assert!(!table[0].ips.iter().any(|i| i.address == "192.0.2.20"));
+            assert!(table[0].ips.iter().any(|i| i.address == "192.0.2.77"));
+            let row = &config.get().adopted_meta["192.0.2.0/24"];
+            assert_eq!(row.desired, crate::config::BindingDesired::Removed);
+            assert_eq!(row.last_error.is_some(), legacy);
+            if !legacy {
+                assert!(!row.applied);
+            }
         }
     }
 
