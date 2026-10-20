@@ -176,16 +176,11 @@ export function warnNoEthernet(): void {
   );
 }
 
-/** True if `address` is in the APIPA range (169.254.0.0/16). Windows
- *  assigns these as a fallback when DHCP fails — they technically count
- *  as "an IP" but linger as a secondary on the adapter after DHCP
- *  recovers (Windows doesn't auto-clean them). Used to hide them from
- *  the host subnet list and dropdowns where they'd just be confusing
- *  selectable entries that can't carry usable host-originated traffic.
- *
- *  NOTE: discovered *devices* in 169.254.x.x are NOT filtered — some
- *  cameras (FLIR in particular) fall back to APIPA on DHCP failure
- *  and the auto-adopt path is the user's recovery route. */
+/** True if `address` is in the APIPA range (169.254.0.0/16).
+ *  Exclude APIPA from usable host choices; saved host addresses remain
+ *  stored. All APIPA Nodes, including historical rows, are hidden by
+ *  device-state.ts. APIPA cameras require vendor-side configuration;
+ *  discovery never adopts their subnet or attempts an APIPA rescue. */
 export function isApipa(address: string): boolean {
   return address.startsWith("169.254.");
 }
