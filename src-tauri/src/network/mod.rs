@@ -2307,8 +2307,7 @@ impl NetworkManager {
         // Even partial OS/config failure is followed by a fresh observation.
         self.reconcile_bindings_locked(config).await;
         let mode = config.get_network_mode();
-        self.presence
-            .update(&self.adapter_selection_state().await, mode);
+        self.update_presence_adapter(&self.adapter_selection_state().await, mode);
         self.presence.tick(&self.device_registry);
         drop(address);
         drop(pause);
@@ -2367,6 +2366,9 @@ impl NetworkManager {
                 if control.stopped() {
                     break;
                 }
+                if let Some(selection) = control.observe_link(interface::quick_link_by_mac) {
+                    watcher::emit_selection(&app, &selection);
+                }
                 if control.tick(&registry) {
                     emitter.poke();
                 }
@@ -2378,7 +2380,12 @@ impl NetworkManager {
                     loop {
                         tokio::select! {
                             biased;
-                            _ = tick.tick() => { if control.tick(&registry) { emitter.poke(); } }
+                            _ = tick.tick() => {
+                                if let Some(selection) = control.observe_link(interface::quick_link_by_mac) {
+                                    watcher::emit_selection(&app, &selection);
+                                }
+                                if control.tick(&registry) { emitter.poke(); }
+                            }
                             result = &mut work => { if let Some(key) = result { clock.verified(&key); } break; }
                             _ = control.wake.notified() => { if control.tick(&registry) { emitter.poke(); } }
                         }
@@ -2395,7 +2402,8 @@ impl NetworkManager {
         selection: &AdapterSelection,
         mode: crate::config::NetworkMode,
     ) {
-        self.presence.update(selection, mode);
+        self.presence
+            .update_native(selection, mode, interface::quick_link_by_mac);
     }
 
     pub(crate) async fn stop_presence(&self) {
@@ -2672,8 +2680,7 @@ impl NetworkManager {
             interface_index: index,
             ..Default::default()
         };
-        self.presence
-            .update(&pending_selection, config.get_network_mode());
+        self.update_presence_adapter(&pending_selection, config.get_network_mode());
         self.presence.tick(&self.device_registry);
         if previous.selected_mac != mac || previous.interface_index != index {
             if let Some(identity) = self.capture_identity.lock().await.as_ref() {
