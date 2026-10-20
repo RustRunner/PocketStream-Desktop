@@ -85,6 +85,15 @@ let captureFetch = 0;
 function updateCaptureState(next: CaptureState): void {
   captureState = next;
   captureRevision++;
+  const indicator = $("#capture-scope-status");
+  const outcome = next.active ? next.outcome : null;
+  const message = outcome?.scope === "scoped_by_name"
+    ? "Discovery degraded: capture matched by name. Devices require Ethernet verification."
+    : outcome?.scope === "unscoped_fallback"
+      ? `Discovery degraded: unscoped capture (${outcome.reason}). Devices require Ethernet verification.`
+      : "";
+  indicator.textContent = message;
+  indicator.hidden = !message;
   for (const subscriber of captureSubscribers) subscriber(next);
 }
 
