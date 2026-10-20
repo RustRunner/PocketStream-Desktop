@@ -5,9 +5,10 @@
 //! 2. Optionally recorded to MP4
 //! 3. Snapshot-captured via an appsink
 
+use super::relay::{PlaybackFault, PlaybackFaultKind, PlaybackHealth};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use tokio::time::{Duration, Instant};
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -30,52 +31,12 @@ use crate::error::AppError;
 /// ~5s end-to-end instead of ~10s.
 const STALL_THRESHOLD: Duration = Duration::from_secs(3);
 
-/// How long the pipeline can sit at `current=Paused, pending=Playing`
-/// before `health_check` declares the stream stalled. Catches the
-/// failure mode where rtspsrc errors during SDP/SETUP (e.g., a
-/// DESCRIBE timeout caused by a concurrent ping-sweep saturating the
-/// USB Ethernet adapter): the bus error gets popped once on the
-/// following health_check tick, but the pipeline state stays at
-/// Paused indefinitely and the buffer-arrival watchdog never fires
-/// because Playing was never reached. 10s is comfortably longer than
-/// a normal RTSP handshake on a healthy network while still tripping
-/// well before the user notices.
-const PAUSED_STALL_THRESHOLD: Duration = Duration::from_secs(10);
-
 /// A live playback pipeline with tee for recording/screenshots.
 pub struct PlaybackPipeline {
     pub pipeline: gst::Pipeline,
     pub appsink: gst_app::AppSink,
-    /// Updated by a buffer probe on the tee's sink pad on every decoded
-    /// frame. Stays `None` until the first buffer arrives so the
-    /// watchdog doesn't misfire during caps negotiation — pipelines
-    /// that never reach Playing are already covered by the existing
-    /// `playing=false` path in `health_check`.
-    last_buffer_at: Arc<Mutex<Option<Instant>>>,
-    /// First `Instant` we observed `current=Paused && pending=Playing`
-    /// in the current stuck-state window. Cleared whenever the
-    /// pipeline leaves that state (reaches Playing, or transitions
-    /// somewhere unexpected). Used to time out a pipeline that
-    /// silently fails to complete its Paused→Playing transition —
-    /// the buffer-arrival watchdog can't catch that case because
-    /// it gates on `current=Playing`.
-    paused_pending_play_at: Arc<Mutex<Option<Instant>>>,
-    /// Camera IP for the stall diagnostic ping. None for UDP receive,
-    /// where there's no single peer to probe.
-    camera_ip: Option<String>,
-    /// Set when a diagnostic ping has already been issued for the
-    /// current stall window. Cleared by the buffer pad probe when
-    /// frames resume, so each fresh stall gets its own ping log.
-    /// Distinguishes camera-side stalls (ping succeeds) from
-    /// network/adapter stalls (ping fails) without the user having to
-    /// guess.
-    stall_diag_sent: Arc<Mutex<bool>>,
-    /// First bus error seen on this pipeline, latched. Bus reads are
-    /// destructive (`pop_filtered`), so without the latch the real
-    /// error is visible for exactly one status tick and every later
-    /// tick degrades to a generic "stalled"/not-playing verdict.
-    /// Cleared on `play()` so a restarted pipeline reports fresh state.
-    first_error: Arc<Mutex<Option<String>>>,
+    health: Arc<PlaybackHealth>,
+    generation: u64,
     /// True once the audio playback branch is linked and state-synced.
     /// Written by the pad-added handler on rtspsrc's streaming thread,
     /// read by the status snapshot. Dies with the pipeline instance,
@@ -93,6 +54,11 @@ pub struct PlaybackPipeline {
 }
 
 impl PlaybackPipeline {
+    #[cfg(test)]
+    pub(super) fn test_headless(health: Arc<PlaybackHealth>, generation: u64) -> Self {
+        gst::init().unwrap();
+        Self::from_pipeline_str("videotestsrc is-live=true ! video/x-raw,width=64,height=48,framerate=15/1 ! tee name=t t. ! queue ! fakesink sync=false t. ! queue ! videoconvert ! video/x-raw,format=RGB ! appsink name=snap drop=true max-buffers=1 sync=false", None, health, generation).unwrap()
+    }
     /// Create a playback pipeline for an RTSP source.
     /// `window_handle`: if Some, render into that HWND via VideoOverlay.
     #[allow(clippy::too_many_arguments)]
@@ -101,7 +67,8 @@ impl PlaybackPipeline {
         latency_ms: u32,
         use_tcp: bool,
         window_handle: Option<usize>,
-        camera_ip: Option<String>,
+        health: Arc<PlaybackHealth>,
+        generation: u64,
         username: &str,
         password: &str,
         audio_muted: bool,
@@ -133,7 +100,7 @@ impl PlaybackPipeline {
             proto = protocols,
         );
 
-        let result = Self::from_pipeline_str(&pipeline_str, window_handle, camera_ip)?;
+        let result = Self::from_pipeline_str(&pipeline_str, window_handle, health, generation)?;
 
         // Set the URL via property (not pipeline-string interpolation) so
         // crafted RTSP paths/credentials can't inject GStreamer syntax.
@@ -186,7 +153,12 @@ impl PlaybackPipeline {
     }
 
     /// Create a playback pipeline for a UDP source.
-    pub fn new_udp(port: u16, window_handle: Option<usize>) -> Result<Self, AppError> {
+    pub fn new_udp(
+        port: u16,
+        window_handle: Option<usize>,
+        health: Arc<PlaybackHealth>,
+        generation: u64,
+    ) -> Result<Self, AppError> {
         let pipeline_str = format!(
             concat!(
                 "udpsrc port={port} ",
@@ -201,28 +173,50 @@ impl PlaybackPipeline {
             port = port,
         );
 
-        Self::from_pipeline_str(&pipeline_str, window_handle, None)
+        Self::from_pipeline_str(&pipeline_str, window_handle, health, generation)
     }
 
     fn from_pipeline_str(
         pipeline_str: &str,
         window_handle: Option<usize>,
-        camera_ip: Option<String>,
+        health: Arc<PlaybackHealth>,
+        generation: u64,
     ) -> Result<Self, AppError> {
         let pipeline = gst::parse::launch(pipeline_str)
             .map_err(|e| AppError::Stream(format!("Pipeline parse error: {}", e)))?
             .downcast::<gst::Pipeline>()
             .map_err(|_| AppError::Stream("Failed to cast to Pipeline".into()))?;
 
-        // If a window handle is provided, intercept the "prepare-window-handle"
-        // bus message so GStreamer renders into our child HWND instead of
-        // creating its own top-level window.
-        if let Some(handle) = window_handle {
-            let bus = pipeline
-                .bus()
-                .ok_or_else(|| AppError::Stream("Pipeline has no bus".into()))?;
-
-            bus.set_sync_handler(move |_, msg| {
+        let bus = pipeline
+            .bus()
+            .ok_or_else(|| AppError::Stream("Pipeline has no bus".into()))?;
+        let health_for_bus = health.clone();
+        bus.set_sync_handler(move |_, msg| {
+            match msg.view() {
+                gst::MessageView::Error(err) => {
+                    let raw = super::StreamManager::redact_url(&err.error().to_string());
+                    let debug = err
+                        .debug()
+                        .map(|d| super::StreamManager::redact_url(&d))
+                        .unwrap_or_default();
+                    let fault = super::classify::bus_fault(
+                        &err.error(),
+                        friendly_rtsp_error(&raw, &debug),
+                        err.details()
+                            .and_then(|d| d.get::<u32>("rtsp-status-code").ok()),
+                        &debug,
+                    );
+                    health_for_bus.record_fault(generation, fault);
+                }
+                gst::MessageView::Eos(..) => {
+                    health_for_bus.record_fault(
+                        generation,
+                        PlaybackFault::new(PlaybackFaultKind::Eos, "End of stream", true),
+                    );
+                }
+                _ => {}
+            }
+            if let Some(handle) = window_handle {
                 if msg
                     .structure()
                     .is_some_and(|s| s.name() == "prepare-window-handle")
@@ -234,21 +228,11 @@ impl PlaybackPipeline {
                         unsafe {
                             overlay.set_window_handle(handle);
                         }
-                        log::info!(
-                            "VideoOverlay: set window handle 0x{:X} on {}",
-                            handle,
-                            msg.src().map(|s| s.name().to_string()).unwrap_or_default()
-                        );
                     }
                 }
-                gst::BusSyncReply::Pass
-            });
-
-            log::info!(
-                "Bus sync handler installed for window handle 0x{:X}",
-                handle
-            );
-        }
+            }
+            gst::BusSyncReply::Pass
+        });
 
         let appsink = pipeline
             .by_name("snap")
@@ -256,45 +240,22 @@ impl PlaybackPipeline {
             .downcast::<gst_app::AppSink>()
             .map_err(|_| AppError::Stream("Failed to cast to AppSink".into()))?;
 
-        // Stall watchdog: probe the tee's sink pad so every decoded
-        // buffer ticks `last_buffer_at`. The probe runs on a streaming
-        // thread; the mutex is uncontended at frame rate. Tee sink
-        // (rather than appsink) is the right tap point — appsink has
-        // `drop=true max-buffers=1` and a leaky upstream queue, so
-        // most frames never reach it; the tee input sees them all.
-        let last_buffer_at = Arc::new(Mutex::new(None::<Instant>));
         let tee = pipeline
             .by_name("t")
-            .ok_or_else(|| AppError::Stream("tee 't' not found in pipeline".into()))?;
-        let tee_sink = tee
+            .ok_or_else(|| AppError::Stream("tee missing".into()))?;
+        let pad = tee
             .static_pad("sink")
-            .ok_or_else(|| AppError::Stream("tee sink pad missing".into()))?;
-        let stall_diag_sent = Arc::new(Mutex::new(false));
-        let last_buffer_for_probe = last_buffer_at.clone();
-        let stall_diag_for_probe = stall_diag_sent.clone();
-        tee_sink.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
-            if let Ok(mut guard) = last_buffer_for_probe.lock() {
-                *guard = Some(Instant::now());
-            }
-            // Frames are arriving — any active stall window is over.
-            // Reset the diagnostic flag so the next stall (if any)
-            // logs its own ping result.
-            if let Ok(mut guard) = stall_diag_for_probe.lock() {
-                if *guard {
-                    *guard = false;
-                }
-            }
+            .ok_or_else(|| AppError::Stream("tee sink missing".into()))?;
+        let health_for_probe = health.clone();
+        pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            health_for_probe.observe_buffer(generation, Instant::now());
             gst::PadProbeReturn::Ok
         });
-
         Ok(Self {
             pipeline,
             appsink,
-            last_buffer_at,
-            paused_pending_play_at: Arc::new(Mutex::new(None::<Instant>)),
-            camera_ip,
-            stall_diag_sent,
-            first_error: Arc::new(Mutex::new(None)),
+            health,
+            generation,
             audio_present: Arc::new(AtomicBool::new(false)),
             audio_codec: Arc::new(Mutex::new(None)),
             desired_mute: Arc::new(AtomicBool::new(false)),
@@ -330,9 +291,8 @@ impl PlaybackPipeline {
 
     /// Start playback.
     pub fn play(&self) -> Result<(), AppError> {
-        if let Ok(mut g) = self.first_error.lock() {
-            *g = None;
-        }
+        self.health
+            .pipeline_started(self.generation, Instant::now());
         self.pipeline
             .set_state(gst::State::Playing)
             .map_err(|e| AppError::Stream(format!("Failed to start playback: {}", e)))?;
@@ -340,161 +300,12 @@ impl PlaybackPipeline {
         Ok(())
     }
 
-    /// Check if the pipeline is still actively playing.
-    /// Returns Ok(true) if healthy, Ok(false) if not playing yet,
-    /// or Err(message) with a user-friendly error description.
-    pub fn health_check(&self) -> Result<bool, String> {
-        // Always check bus first — errors may arrive before or after
-        // the state transitions away from Playing. Error and debug text
-        // are redacted BEFORE any logging or storage: rtspsrc debug
-        // payloads can replay the input URL including `user:pass@`.
-        if let Some(bus) = self.pipeline.bus() {
-            if let Some(msg) = bus.pop_filtered(&[gst::MessageType::Error, gst::MessageType::Eos]) {
-                if let gst::MessageView::Error(err) = msg.view() {
-                    let raw = super::StreamManager::redact_url(&err.error().to_string());
-                    let debug = err
-                        .debug()
-                        .map(|d| super::StreamManager::redact_url(&d))
-                        .unwrap_or_default();
-                    log::warn!("Stream bus error: {} | debug: {}", raw, debug);
-                    return Err(self.latch_error(friendly_rtsp_error(&raw, &debug)));
-                }
-                log::warn!("Stream bus EOS received");
-                return Err(self.latch_error("End of stream".into()));
-            }
+    /// Structured first-fault latch and monotonic frame deadlines.
+    pub fn health_check(&self) -> Result<bool, PlaybackFault> {
+        if let Some(fault) = self.health.watchdog(Instant::now(), STALL_THRESHOLD) {
+            return Err(fault);
         }
-
-        // A previously-latched bus error beats any generic verdict the
-        // state inspection below would produce — bus reads are
-        // destructive, so this is the only way the real error survives
-        // past its own tick.
-        if let Ok(g) = self.first_error.lock() {
-            if let Some(e) = g.as_ref() {
-                return Err(e.clone());
-            }
-        }
-
-        let (_, current, pending) = self.pipeline.state(gst::ClockTime::from_mseconds(0));
-        let playing = current == gst::State::Playing;
-
-        if playing {
-            // Pipeline reached Playing — clear stuck-Paused tracking
-            // so a future failed transition starts fresh.
-            if let Ok(mut g) = self.paused_pending_play_at.lock() {
-                *g = None;
-            }
-            // Buffer-arrival watchdog. Skipped while `last_buffer_at`
-            // is None (haven't decoded a frame yet) so slow caps
-            // negotiation doesn't trip it.
-            if let Ok(guard) = self.last_buffer_at.lock() {
-                if let Some(last) = *guard {
-                    let elapsed = last.elapsed();
-                    if elapsed >= STALL_THRESHOLD {
-                        log::warn!(
-                            "Stream stalled: pipeline Playing but no buffers for {:.1}s",
-                            elapsed.as_secs_f32()
-                        );
-                        self.maybe_fire_stall_diag_ping();
-                        return Err(format!(
-                            "Stream stalled — no frames for {}s",
-                            elapsed.as_secs()
-                        ));
-                    }
-                }
-            }
-        } else if current == gst::State::Paused && pending == gst::State::Playing {
-            // Stuck-Paused watchdog. rtspsrc may have errored during
-            // SDP/SETUP — the bus error was popped above on whichever
-            // tick happened to catch it, but the pipeline state stays
-            // at Paused indefinitely afterward. Without this we'd
-            // spam `not playing` warnings forever and never trigger
-            // stall recovery (the buffer-arrival watchdog can't fire
-            // because Playing was never reached).
-            //
-            // The `stalled` keyword in the returned error routes to
-            // `isStallError` on the frontend, which schedules the
-            // existing stall-recovery flow.
-            let elapsed = match self.paused_pending_play_at.lock() {
-                Ok(mut g) => g.get_or_insert_with(Instant::now).elapsed(),
-                Err(_) => Duration::ZERO,
-            };
-            if elapsed >= PAUSED_STALL_THRESHOLD {
-                log::warn!(
-                    "Stream stalled: stuck Paused→Playing for {:.1}s",
-                    elapsed.as_secs_f32()
-                );
-                return Err(format!(
-                    "Stream stalled — pipeline stuck transitioning to Playing for {}s",
-                    elapsed.as_secs()
-                ));
-            }
-            log::warn!(
-                "Stream health_check: not playing (current={:?}, pending={:?})",
-                current,
-                pending
-            );
-        } else {
-            // Some other non-Playing state (Null/Ready/transitioning
-            // elsewhere) — clear stuck-Paused tracking so the watchdog
-            // only counts continuous time spent stuck specifically at
-            // Paused→Playing.
-            if let Ok(mut g) = self.paused_pending_play_at.lock() {
-                *g = None;
-            }
-            log::warn!(
-                "Stream health_check: not playing (current={:?}, pending={:?})",
-                current,
-                pending
-            );
-        }
-        Ok(playing)
-    }
-
-    /// Latch the first error seen on this pipeline (later ones keep the
-    /// original — the first is the root cause) and return the message
-    /// for immediate use.
-    fn latch_error(&self, msg: String) -> String {
-        if let Ok(mut g) = self.first_error.lock() {
-            if let Some(existing) = g.as_ref() {
-                return existing.clone();
-            }
-            *g = Some(msg.clone());
-        }
-        msg
-    }
-
-    /// Fire a one-shot ICMP probe at the camera IP if we haven't
-    /// already pinged for the current stall window. Result goes to
-    /// the log so a successful ping (camera reachable, stream pause is
-    /// RTSP/camera-side) is distinguishable from a failed ping (path
-    /// loss, USB-Ethernet hiccup, cable). Each fresh stall gets a
-    /// fresh ping — the buffer pad probe clears the flag when frames
-    /// resume.
-    fn maybe_fire_stall_diag_ping(&self) {
-        let Some(ip) = self.camera_ip.clone() else {
-            return;
-        };
-        let Ok(mut guard) = self.stall_diag_sent.lock() else {
-            return;
-        };
-        if *guard {
-            return;
-        }
-        *guard = true;
-        tokio::spawn(async move {
-            let reachable = crate::network::ping_dot::probe(&ip).await;
-            if reachable {
-                log::warn!(
-                    "Stall diagnostic: {} responds to ICMP — stall is RTSP/camera-side, not network",
-                    ip
-                );
-            } else {
-                log::warn!(
-                    "Stall diagnostic: {} unreachable (ICMP timeout) — stall is network/adapter-side",
-                    ip
-                );
-            }
-        });
+        Ok(self.health.snapshot().state == super::relay::PlaybackState::Playing)
     }
 
     /// Stop and clean up.
@@ -1058,6 +869,64 @@ pub(super) fn friendly_rtsp_error(error: &str, debug: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::friendly_rtsp_error;
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_covers_both_paused_handshake_and_playing_without_buffers() {
+        use super::*;
+        gst::init().unwrap();
+        for live in [false, true] {
+            let h = Arc::new(PlaybackHealth::new());
+            let g = h.begin_attempt();
+            let source = format!("appsrc is-live={live} ! tee name=t t. ! queue ! fakesink async=false t. ! queue ! appsink name=snap async={}", !live);
+            let p = PlaybackPipeline::from_pipeline_str(&source, None, h.clone(), g).unwrap();
+            p.play().unwrap();
+            let (_, current, pending) = p.pipeline.state(gst::ClockTime::from_mseconds(100));
+            if live {
+                assert_eq!(current, gst::State::Playing);
+            } else {
+                assert_ne!(current, gst::State::Playing);
+                assert_eq!(pending, gst::State::Playing);
+            }
+            assert!(!p.health_check().unwrap());
+            tokio::time::advance(super::super::relay::FIRST_BUFFER_TIMEOUT).await;
+            assert_eq!(
+                p.health_check().unwrap_err().kind,
+                PlaybackFaultKind::FirstFrameTimeout
+            );
+            p.stop().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn real_bus_fault_is_typed_latched_and_rejects_late_buffers() {
+        use super::*;
+        gst::init().unwrap();
+        for (code, retryable) in [
+            (gst::ResourceError::Read, true),
+            (gst::ResourceError::NotAuthorized, false),
+            (gst::ResourceError::NotFound, false),
+        ] {
+            let h = Arc::new(PlaybackHealth::new());
+            let g = h.begin_attempt();
+            let p = PlaybackPipeline::from_pipeline_str("appsrc is-live=true ! tee name=t t. ! fakesink async=false t. ! appsink name=snap async=false", None, h.clone(), g).unwrap();
+            p.play().unwrap();
+            p.pipeline
+                .post_message(
+                    gst::message::Error::builder(code, "opaque localized message")
+                        .debug("rtsp://admin:secret@192.0.2.1/live")
+                        .build(),
+                )
+                .unwrap();
+            let first = p.health_check().unwrap_err();
+            assert_eq!(first.kind, PlaybackFaultKind::BusError);
+            assert_eq!(first.retryable, retryable);
+            assert!(!first.reason.contains("secret"));
+            p.pipeline.post_message(gst::message::Eos::new()).unwrap();
+            assert_eq!(p.health_check().unwrap_err(), first);
+            assert!(!h.observe_buffer(g, Instant::now()));
+            p.stop().unwrap();
+        }
+    }
 
     // Each pinned message is what the user sees in a toast — changing the
     // contract requires deliberately updating the expectation, not silently

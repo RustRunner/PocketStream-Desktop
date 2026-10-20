@@ -433,6 +433,7 @@ pub fn run() {
             // Streaming
             commands::start_stream,
             commands::stop_stream,
+            commands::retry_playback,
             commands::set_audio_muted,
             commands::start_rtsp_server,
             commands::stop_rtsp_server,
@@ -593,6 +594,12 @@ pub fn run() {
             // process. block_on is safe here — the event loop is already
             // exiting and there's no UI to keep responsive.
             if let tauri::RunEvent::ExitRequested { .. } = event {
+                let stream: tauri::State<'_, streaming::StreamManager> = app_handle.state();
+                let _ = tauri::async_runtime::block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        let _ = tokio::join!(stream.stop_playback(), stream.stop_rtsp_server());
+                    }).await
+                });
                 let manager: tauri::State<'_, network::NetworkManager> = app_handle.state();
                 let _ = tauri::async_runtime::block_on(async {
                     manager.stop_presence().await;

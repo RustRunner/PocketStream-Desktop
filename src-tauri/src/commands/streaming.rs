@@ -63,6 +63,18 @@ pub async fn stop_stream(
     Ok(())
 }
 
+/// Retry existing desired playback; never choose a replacement by address.
+#[tauri::command]
+pub async fn retry_playback(
+    stream: State<'_, StreamManager>,
+    config: State<'_, AppConfig>,
+    manual: Option<bool>,
+) -> Result<(), AppError> {
+    stream
+        .retry_playback(manual.unwrap_or(true), Some(config.get()))
+        .await
+}
+
 #[tauri::command]
 pub async fn set_audio_muted(
     stream: State<'_, StreamManager>,
