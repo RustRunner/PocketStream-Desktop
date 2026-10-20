@@ -197,6 +197,17 @@ pub trait AdoptOps {
 /// adoption future takes its child process with it.
 pub struct RealAdoptOps;
 
+fn temporary_observation(
+    mut current: super::InterfaceInfo,
+    native: Option<(bool, Vec<super::interface::IpInfo>)>,
+) -> Result<super::InterfaceInfo, AppError> {
+    let (is_up, ips) = native
+        .ok_or_else(|| AppError::Network("Temporary adapter observation unavailable".into()))?;
+    current.is_up = is_up;
+    current.ips = ips;
+    Ok(current)
+}
+
 impl AdoptOps for RealAdoptOps {
     async fn observe(&self, iface: &str) -> Result<super::InterfaceInfo, AppError> {
         let current = super::interface::get_by_name(iface).await?;
@@ -205,7 +216,8 @@ impl AdoptOps for RealAdoptOps {
                 "Temporary adapter index is unavailable or ambiguous".into(),
             ));
         }
-        Ok(current)
+        let native = super::interface::quick_status_by_mac(&current.mac);
+        temporary_observation(current, native)
     }
     async fn add(&self, iface: &str, ip: Ipv4Addr, mask: &str) -> Result<(), AppError> {
         ip_config::add_secondary_ip(iface, &ip.to_string(), mask).await
@@ -585,12 +597,16 @@ mod tests {
     #[derive(Clone, Default)]
     struct CrashOps {
         addresses: Arc<std::sync::Mutex<Vec<super::super::interface::IpInfo>>>,
+        fail_observe: Arc<std::sync::atomic::AtomicBool>,
         fail_after_add: Arc<std::sync::atomic::AtomicBool>,
         fail_remove: Arc<std::sync::atomic::AtomicBool>,
         writes: Arc<std::sync::Mutex<Vec<&'static str>>>,
     }
     impl AdoptOps for CrashOps {
         async fn observe(&self, iface: &str) -> Result<super::super::InterfaceInfo, AppError> {
+            if self.fail_observe.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(AppError::Network("native observation unavailable".into()));
+            }
             Ok(super::super::InterfaceInfo {
                 name: iface.into(),
                 display_name: iface.into(),
@@ -648,6 +664,45 @@ mod tests {
             ops: ops.clone(),
             persist: no_save,
         }
+    }
+
+    #[tokio::test]
+    async fn temporary_native_observation_requires_success_and_replaces_metadata_addresses() {
+        let os = CrashOps::default();
+        let metadata = os.observe("USB").await.unwrap();
+        assert!(temporary_observation(metadata.clone(), None).is_err());
+        let ip = super::super::interface::IpInfo {
+            address: "172.31.169.254".into(),
+            prefix: 24,
+            subnet: "172.31.169.0/24".into(),
+        };
+        let current = temporary_observation(metadata, Some((false, vec![ip]))).unwrap();
+        assert!(!current.is_up);
+        assert_eq!(current.ips[0].address, "172.31.169.254");
+        assert_eq!(current.ips[0].prefix, 24);
+    }
+
+    #[tokio::test]
+    async fn temporary_observation_failure_retains_memory_and_durable_ownership() {
+        let config = temporary_config();
+        let os = CrashOps::default();
+        let pending = new_pending();
+        let ip = "172.31.169.254".parse().unwrap();
+        let ops = tracked(&config, &os);
+        bind_scratch(&ops, &pending, "USB", ip, 1).await.unwrap();
+        os.fail_observe
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        release_scratch(&ops, &pending, "USB", ip, 1).await;
+        assert_eq!(pending.lock().await.len(), 1);
+        assert_eq!(config.get().pending_addresses.len(), 1);
+        assert_eq!(os.addresses.lock().unwrap().len(), 1);
+        assert_eq!(os.writes.lock().unwrap().as_slice(), ["add"]);
+        os.fail_observe
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        release_scratch(&ops, &pending, "USB", ip, 1).await;
+        assert!(pending.lock().await.is_empty());
+        assert!(config.get().pending_addresses.is_empty());
+        assert!(os.addresses.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
