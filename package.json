@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "typecheck": "tsc --noEmit",
-    "test:ptu": "node --test tests/ptu-workflow.test.cjs"
+    "test:ptu": "node --test tests/ptu-workflow.test.cjs",
+    "test:network-addresses": "node --test tests/network-address-workflow.test.cjs"
   },
   "dependencies": {
     "qrcode": "^1.5.4"

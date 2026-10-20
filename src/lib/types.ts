@@ -267,6 +267,24 @@ export interface AdoptionSnapshot {
   meta: Record<string, AdoptedMetaView>;
 }
 
+/** An observation returned by one serialized address operation; not a version. */
+export interface AddressReply {
+  operation: number;
+  outcome: "success" | "pending" | "failed" | "busy";
+  reason: string | null;
+  view: {
+    selection: AdapterSelection;
+    identity: { guid: string; index: number; mac: string; alias: string } | null;
+    dhcp: boolean | null;
+    observation_error: string | null;
+    subnet: string | null;
+    binding: AdoptedMetaView | null;
+    address: string;
+    prefix: number | null;
+    mode: NetworkMode;
+  };
+}
+
 /** Payload for the `subnet-adopted` event emitted by the network
  *  manager when a foreign-subnet auto-adoption completes or a
  *  persisted adoption is restored at startup. The wire field is

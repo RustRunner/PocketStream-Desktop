@@ -12,6 +12,9 @@ static ADAPTER_QUERY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_ne
 
 const ADAPTER_QUERY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 const SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) static NATIVE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static PROVIDER_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 fn adapter_timeout() -> AppError {
     AppError::Network("Adapter enumeration timed out after 10s including queue wait; retry when the adapter provider recovers".into())
@@ -45,6 +48,8 @@ struct AdapterSnapshot {
     value: std::sync::Mutex<Option<CachedAdapters>>,
     refresh: tokio::sync::Mutex<()>,
     generation: std::sync::atomic::AtomicU64,
+    qualified: std::sync::Mutex<Vec<(NativeIdentity, InterfaceInfo)>>,
+    topology: std::sync::Mutex<Vec<NativeIdentity>>,
     // The same snapshot holds source ownership. It is refreshed from IP Helper
     // at the proof boundary; the metadata TTL never authorizes a stale source.
     #[cfg(target_os = "windows")]
@@ -67,6 +72,10 @@ impl AdapterSnapshot {
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         *self.value.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        self.qualified
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
     }
 
     async fn get<F, Fut>(&self, query: F) -> Result<Vec<InterfaceInfo>, AppError>
@@ -156,7 +165,7 @@ fn current_adapter_addresses(adapters: Vec<InterfaceInfo>) -> Result<Vec<Interfa
 #[cfg(target_os = "windows")]
 fn overlay_adapter_addresses(
     mut adapters: Vec<InterfaceInfo>,
-    current: Result<Vec<WinAdapter>, AppError>,
+    current: Result<Vec<NativeAdapter>, AppError>,
 ) -> Result<Vec<InterfaceInfo>, AppError> {
     // An unavailable native snapshot is not evidence that addresses vanished.
     // In particular, static Apply must not replace addresses it cannot restore.
@@ -185,6 +194,7 @@ fn overlay_adapter_addresses(
 /// `validate_interface_name` re-enumerates. Bounds staleness (an adapter
 /// removed within the window still validates) while keeping the 2 s
 /// auto-adopt loop from spawning PowerShell twice per cycle forever.
+#[cfg_attr(windows, allow(dead_code))]
 const VALIDATION_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Names validated within [`VALIDATION_TTL`], with the time they were
@@ -194,6 +204,7 @@ static VALIDATED_NAMES: std::sync::Mutex<
     Option<std::collections::HashMap<String, std::time::Instant>>,
 > = std::sync::Mutex::new(None);
 
+#[cfg_attr(windows, allow(dead_code))]
 fn recently_validated(name: &str) -> bool {
     let guard = VALIDATED_NAMES.lock();
     let map = match guard {
@@ -205,6 +216,7 @@ fn recently_validated(name: &str) -> bool {
         .is_some_and(|t| t.elapsed() < VALIDATION_TTL)
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn remember_validated(name: &str) {
     let mut guard = match VALIDATED_NAMES.lock() {
         Ok(g) => g,
@@ -219,29 +231,35 @@ fn remember_validated(name: &str) {
 /// loop don't re-run the adapter enumeration on every call. Consolidates
 /// the two former per-module copies of this check.
 pub async fn validate_interface_name(name: &str) -> Result<(), AppError> {
-    if recently_validated(name) {
-        return Ok(());
-    }
-    let known = list_physical().await?;
-    if known.iter().any(|iface| iface.name == name) {
-        remember_validated(name);
+    #[cfg(windows)]
+    {
+        native_by_alias(&read_native().await?, name)?;
         Ok(())
-    } else {
-        Err(AppError::Network(format!(
-            "Unknown network interface: {}",
-            name
-        )))
+    }
+    #[cfg(not(windows))]
+    {
+        if recently_validated(name) {
+            return Ok(());
+        }
+        if list_physical().await?.iter().any(|i| i.name == name) {
+            remember_validated(name);
+            Ok(())
+        } else {
+            Err(AppError::Network(format!(
+                "Unknown network interface: {name}"
+            )))
+        }
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct IpInfo {
     pub address: String,
     pub prefix: u8,
     pub subnet: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct InterfaceInfo {
     pub name: String,
     pub display_name: String,
@@ -469,6 +487,7 @@ fn parse_adapter(a: &serde_json::Value, force_vpn: bool) -> InterfaceInfo {
 
 #[cfg(target_os = "windows")]
 async fn run_adapter_query(filter: &str) -> Result<String, AppError> {
+    PROVIDER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // Include both Up and Disconnected adapters. Disconnected adapters are
     // surfaced in the UI as "detected but no link" so users can click
     // Reset to provoke a driver re-probe — the workaround for the Windows
@@ -480,6 +499,8 @@ async fn run_adapter_query(filter: &str) -> Result<String, AppError> {
             $ips = @(Get-NetIPAddress -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue)
             [PSCustomObject]@{{
                 Name = $adapter.Name
+                Guid = [string]$adapter.InterfaceGuid
+                Index = $adapter.ifIndex
                 Description = $adapter.InterfaceDescription
                 MacAddress = $adapter.MacAddress
                 MediaType = $adapter.MediaType
@@ -555,8 +576,26 @@ fn enumeration_log_action(last: &mut Option<(String, u64)>, current: &str) -> Op
     }
 }
 
+#[cfg(windows)]
+fn qualified_descriptor(json: &serde_json::Value, native: &NativeAdapter) -> Option<InterfaceInfo> {
+    if !json["Virtual"].is_boolean() || !json["MediaType"].is_string() {
+        return None;
+    }
+    let info = parse_adapter(json, false);
+    (native.alias == info.name
+        && native.mac.eq_ignore_ascii_case(&info.mac)
+        && json["Index"].as_u64() == Some(native.index as u64)
+        && json["Guid"]
+            .as_str()
+            .is_some_and(|guid| guid_key(guid) == guid_key(&native.guid)))
+    .then_some(info)
+}
+
 #[cfg(target_os = "windows")]
 async fn query_adapters_windows() -> Result<Vec<InterfaceInfo>, AppError> {
+    let generation = ADAPTER_SNAPSHOT
+        .generation
+        .load(std::sync::atomic::Ordering::Acquire);
     let stdout = run_adapter_query("$true").await?;
     {
         let mut last = LAST_ENUM_LOG
@@ -575,6 +614,29 @@ async fn query_adapters_windows() -> Result<Vec<InterfaceInfo>, AppError> {
         }
     }
     let adapters = parse_adapter_json(&stdout)?;
+    let native = read_native().await?;
+    let qualified = native
+        .iter()
+        .flat_map(|adapter| {
+            adapters.iter().filter_map(|json| {
+                qualified_descriptor(json, adapter).map(|info| (adapter.identity(), info))
+            })
+        })
+        .collect();
+    if generation
+        == ADAPTER_SNAPSHOT
+            .generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    {
+        *ADAPTER_SNAPSHOT
+            .qualified
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = qualified;
+        *ADAPTER_SNAPSHOT
+            .topology
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = topology(&native);
+    }
     Ok(adapters.iter().map(|a| parse_adapter(a, false)).collect())
 }
 
@@ -628,18 +690,268 @@ fn list_all_pnet() -> Result<Vec<InterfaceInfo>, AppError> {
     Ok(result)
 }
 
+pub(crate) type AddressFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, AppError>> + Send + 'a>>;
+
+/// One object-safe OS seam; NetworkManager remains non-generic.
+pub(crate) trait AddressIo: Send + Sync {
+    fn native(&self) -> AddressFuture<'_, Vec<NativeAdapter>>;
+    fn add<'a>(
+        &'a self,
+        adapter: &'a NativeAdapter,
+        ip: &'a str,
+        mask: &'a str,
+    ) -> AddressFuture<'a, ()>;
+    fn remove<'a>(&'a self, adapter: &'a NativeAdapter, ip: &'a str) -> AddressFuture<'a, ()>;
+    fn persist_intent(
+        &self,
+        config: &crate::config::AppConfig,
+        subnet: &str,
+        row: crate::config::AdoptedMeta,
+    ) -> Result<(), AppError> {
+        self.persist_binding(config, subnet, row)
+    }
+    fn persist_binding(
+        &self,
+        config: &crate::config::AppConfig,
+        subnet: &str,
+        row: crate::config::AdoptedMeta,
+    ) -> Result<(), AppError> {
+        config.set_binding(subnet, row)
+    }
+    fn claim(&self, config: &crate::config::AppConfig, ip: &str) -> Result<(), AppError> {
+        config.claim_binding(ip)
+    }
+    fn descriptor(&self, native: &NativeAdapter) -> Option<InterfaceInfo> {
+        ADAPTER_SNAPSHOT
+            .qualified
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|(id, _)| *id == native.identity())
+            .map(|(_, info)| native.overlay(info))
+    }
+    fn qualify(&self) -> AddressFuture<'_, ()> {
+        Box::pin(async {
+            invalidate_adapter_snapshot();
+            adapter_snapshot().await.map(|_| ())
+        })
+    }
+}
+
+pub(crate) struct RealAddressIo;
+
+/// Single timeout for all operation native reads; a dropped late result has no
+/// continuation capable of writing. Production native calls run off the executor.
+pub(crate) async fn read_native_with(io: &dyn AddressIo) -> Result<Vec<NativeAdapter>, AppError> {
+    NATIVE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tokio::time::timeout(std::time::Duration::from_secs(2), io.native())
+        .await
+        .map_err(|_| AppError::Network("Native adapter observation timed out after 2s".into()))?
+}
+pub(crate) async fn read_native() -> Result<Vec<NativeAdapter>, AppError> {
+    read_native_with(&RealAddressIo).await
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub(crate) struct NativeIdentity {
+    pub guid: String,
+    pub index: u32,
+    pub mac: String,
+    pub alias: String,
+}
+fn guid_key(guid: &str) -> String {
+    guid.trim_matches(['{', '}']).to_ascii_lowercase()
+}
+impl NativeAdapter {
+    pub(crate) fn identity(&self) -> NativeIdentity {
+        NativeIdentity {
+            guid: guid_key(&self.guid),
+            index: self.index,
+            mac: self.mac.replace('-', ":").to_ascii_lowercase(),
+            alias: self.alias.clone(),
+        }
+    }
+    pub(crate) fn overlay(&self, info: &InterfaceInfo) -> InterfaceInfo {
+        InterfaceInfo {
+            name: self.alias.clone(),
+            display_name: self.alias.clone(),
+            mac: self.mac.clone(),
+            is_up: self.is_up,
+            ips: self.ips.clone(),
+            ..info.clone()
+        }
+    }
+}
+fn topology(adapters: &[NativeAdapter]) -> Vec<NativeIdentity> {
+    let mut ids: Vec<_> = adapters.iter().map(NativeAdapter::identity).collect();
+    ids.sort();
+    ids
+}
+pub(crate) fn native_by_alias<'a>(
+    adapters: &'a [NativeAdapter],
+    alias: &str,
+) -> Result<&'a NativeAdapter, AppError> {
+    let matches: Vec<_> = adapters.iter().filter(|a| a.alias == alias).collect();
+    match matches.as_slice() {
+        [adapter] if !alias.is_empty() && adapter.index != 0 => Ok(adapter),
+        [] => Err(AppError::Network(format!(
+            "Unknown network interface: {alias}"
+        ))),
+        _ => Err(AppError::Network(
+            "Native adapter alias/index is ambiguous or unavailable".into(),
+        )),
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct OperationSnapshot {
+    pub selected: NativeAdapter,
+    pub all: Vec<NativeAdapter>,
+    pub iface: InterfaceInfo,
+    pub candidates: Vec<InterfaceInfo>,
+}
+pub(crate) fn select_native<'a>(
+    all: &'a [NativeAdapter],
+    mac: &str,
+) -> Result<&'a NativeAdapter, AppError> {
+    let mac = mac.replace('-', ":").to_ascii_lowercase();
+    let matches: Vec<_> = all
+        .iter()
+        .filter(|a| !a.mac.is_empty() && a.identity().mac == mac)
+        .collect();
+    match matches.as_slice() {
+        [] => Err(AppError::Network(
+            "Selected Ethernet adapter unavailable".into(),
+        )),
+        [a] if a.index != 0
+            && !a.guid.is_empty()
+            && !a.alias.is_empty()
+            && all
+                .iter()
+                .filter(|n| {
+                    n.index == a.index
+                        || n.alias == a.alias
+                        || guid_key(&n.guid) == guid_key(&a.guid)
+                })
+                .count()
+                == 1 =>
+        {
+            Ok(a)
+        }
+        _ => Err(AppError::Network(
+            "Native adapter identity/index is missing or ambiguous".into(),
+        )),
+    }
+}
+pub(crate) async fn operation_snapshot(
+    io: &dyn AddressIo,
+    mac: &str,
+) -> Result<OperationSnapshot, AppError> {
+    operation_snapshot_traced(io, mac, None).await
+}
+pub(super) async fn operation_snapshot_traced(
+    io: &dyn AddressIo,
+    mac: &str,
+    trace: Option<&super::AddressTrace>,
+) -> Result<OperationSnapshot, AppError> {
+    if let Some(t) = trace {
+        t.native_call();
+    }
+    let mut all = read_native_with(io).await?;
+    let before = select_native(&all, mac)?.identity();
+    if io.descriptor(select_native(&all, mac)?).is_none() {
+        if let Some(t) = trace {
+            t.provider_call();
+        }
+        io.qualify().await?;
+        if let Some(t) = trace {
+            t.native_call();
+        }
+        all = read_native_with(io).await?;
+        if select_native(&all, mac)?.identity() != before {
+            return Err(AppError::Network(
+                "Adapter changed during qualification; retry".into(),
+            ));
+        }
+    }
+    snapshot_from_native(io, mac, all)
+}
+pub(crate) fn snapshot_from_native(
+    io: &dyn AddressIo,
+    mac: &str,
+    all: Vec<NativeAdapter>,
+) -> Result<OperationSnapshot, AppError> {
+    let selected = select_native(&all, mac)?.clone();
+    let iface = io
+        .descriptor(&selected)
+        .filter(is_wired_physical)
+        .ok_or_else(|| {
+            AppError::Network("Selected adapter requires physical Ethernet qualification".into())
+        })?;
+    let candidates = all
+        .iter()
+        .filter_map(|a| io.descriptor(a))
+        .filter(is_wired_physical)
+        .collect();
+    Ok(OperationSnapshot {
+        selected,
+        all,
+        iface,
+        candidates,
+    })
+}
+
+/// Native observations include unclassified and MAC-less adapters. They remain
+/// conservative collision inputs, even when no descriptor can be published.
+pub(crate) fn native_conflicts(
+    snapshot: &OperationSnapshot,
+    io: &dyn AddressIo,
+) -> Vec<ipnetwork::Ipv4Network> {
+    snapshot
+        .all
+        .iter()
+        .filter(|a| a.identity() != snapshot.selected.identity())
+        .filter(|a| io.descriptor(a).is_none_or(|i| !is_wired_physical(&i)))
+        .flat_map(|a| &a.ips)
+        .filter_map(|ip| {
+            ip.address
+                .parse()
+                .ok()
+                .and_then(|address| ipnetwork::Ipv4Network::new(address, ip.prefix).ok())
+        })
+        .collect()
+}
+
+pub(crate) async fn notification_topology_changed() -> Result<bool, AppError> {
+    let all = read_native().await?;
+    Ok(observe_topology(&ADAPTER_SNAPSHOT, &all))
+}
+fn observe_topology(cache: &AdapterSnapshot, all: &[NativeAdapter]) -> bool {
+    let next = topology(all);
+    let changed = *cache.topology.lock().unwrap_or_else(|p| p.into_inner()) != next;
+    if changed {
+        cache.invalidate();
+        *cache.topology.lock().unwrap_or_else(|p| p.into_inner()) = next;
+    }
+    changed
+}
+
 /// A local adapter's MAC, up-state, and IPv4 addresses as read from the IP
 /// Helper API. Backs [`quick_status_by_mac`] and [`all_local_ipv4`] on
 /// Windows without touching pnet.
-#[cfg(target_os = "windows")]
-struct WinAdapter {
-    index: u32,
+#[derive(Debug, Clone, Default, Serialize)]
+pub(crate) struct NativeAdapter {
+    pub index: u32,
+    pub guid: String,
+    pub alias: String,
+    pub dhcp: bool,
     /// Colon-separated, matching the format `parse_adapter` produces, so
     /// callers can compare MACs regardless of which enumeration path built
     /// the value they hold.
-    mac: String,
-    is_up: bool,
-    ips: Vec<IpInfo>,
+    pub mac: String,
+    pub is_up: bool,
+    pub ips: Vec<IpInfo>,
 }
 
 /// Enumerate every local adapter's MAC, up-state, and IPv4 addresses via the
@@ -654,7 +966,7 @@ struct WinAdapter {
 /// what happened on the first subnet adoption of a run. IP Helper carries no
 /// such import. Failures remain errors, distinct from a valid empty snapshot.
 #[cfg(target_os = "windows")]
-fn local_adapters_iphelper() -> Result<Vec<WinAdapter>, AppError> {
+pub(super) fn local_adapters_iphelper() -> Result<Vec<NativeAdapter>, AppError> {
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
         GAA_FLAG_SKIP_MULTICAST,
@@ -673,7 +985,7 @@ fn local_adapters_iphelper_with(
         *mut windows_sys::Win32::NetworkManagement::IpHelper::IP_ADAPTER_ADDRESSES_LH,
         &mut u32,
     ) -> u32,
-) -> Result<Vec<WinAdapter>, AppError> {
+) -> Result<Vec<NativeAdapter>, AppError> {
     use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_NO_DATA};
     use windows_sys::Win32::NetworkManagement::IpHelper::IP_ADAPTER_ADDRESSES_LH;
     use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKADDR_IN};
@@ -743,8 +1055,29 @@ fn local_adapters_iphelper_with(
             ua = u.Next;
         }
 
-        adapters.push(WinAdapter {
+        adapters.push(NativeAdapter {
             index: unsafe { ad.Anonymous1.Anonymous.IfIndex },
+            guid: if ad.AdapterName.is_null() {
+                String::new()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(ad.AdapterName.cast()) }
+                    .to_string_lossy()
+                    .into_owned()
+            },
+            alias: if ad.FriendlyName.is_null() {
+                String::new()
+            } else {
+                let mut len = 0;
+                while len < 32768 && unsafe { *ad.FriendlyName.add(len) } != 0 {
+                    len += 1;
+                }
+                String::from_utf16_lossy(unsafe {
+                    std::slice::from_raw_parts(ad.FriendlyName, len)
+                })
+            },
+            dhcp: unsafe { ad.Anonymous2.Flags }
+                & windows_sys::Win32::NetworkManagement::IpHelper::IP_ADAPTER_DHCP_ENABLED
+                != 0,
             mac,
             is_up,
             ips,
@@ -752,6 +1085,10 @@ fn local_adapters_iphelper_with(
         cur = ad.Next;
     }
     Ok(adapters)
+}
+
+pub(crate) async fn native_dhcp_state(alias: &str) -> Result<bool, AppError> {
+    Ok(native_by_alias(&read_native().await?, alias)?.dhcp)
 }
 
 /// One native snapshot for the selected MAC's index and media state. Duplicate
@@ -915,10 +1252,39 @@ pub fn all_local_ipv4() -> Vec<std::net::Ipv4Addr> {
 
 /// Get info for a specific interface by name.
 pub async fn get_by_name(name: &str) -> Result<InterfaceInfo, AppError> {
-    let all = list_all().await?;
-    all.into_iter()
-        .find(|i| i.name == name)
-        .ok_or_else(|| AppError::Network(format!("Interface '{}' not found", name)))
+    #[cfg(windows)]
+    {
+        let all = read_native().await?;
+        let native = native_by_alias(&all, name).map_err(|e| {
+            if all.iter().all(|n| n.alias != name) {
+                AppError::Network(format!("Interface '{name}' not found"))
+            } else {
+                e
+            }
+        })?;
+        if let Some(info) = RealAddressIo.descriptor(native) {
+            return Ok(info);
+        }
+        RealAddressIo.qualify().await?;
+        let fresh = read_native().await?;
+        let current = native_by_alias(&fresh, name)?;
+        if current.identity() != native.identity() {
+            return Err(AppError::Network(
+                "Adapter changed during qualification".into(),
+            ));
+        }
+        RealAddressIo.descriptor(current).ok_or_else(|| {
+            AppError::Network(format!("Interface '{name}' not found or unqualified"))
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        list_all()
+            .await?
+            .into_iter()
+            .find(|i| i.name == name)
+            .ok_or_else(|| AppError::Network(format!("Interface '{name}' not found")))
+    }
 }
 
 /// Exercise the native error conversion and metadata overlay together, without
@@ -935,8 +1301,330 @@ pub(super) fn failed_native_snapshot(
 }
 
 #[cfg(test)]
+pub(super) mod address_test_io {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+    #[derive(Clone, Copy, Default)]
+    pub enum Effect {
+        #[default]
+        Apply,
+        Unchanged,
+        ErrorAfter,
+        TimeoutAfter,
+    }
+    pub struct FakeAddressIo {
+        pub table: Mutex<Vec<NativeAdapter>>,
+        cache: AdapterSnapshot,
+        pub reads: AtomicUsize,
+        pub providers: AtomicUsize,
+        pub writes: Mutex<Vec<(bool, String)>>,
+        pub saves: Mutex<Vec<String>>,
+        pub fail_read: AtomicBool,
+        pub fail_read_at: AtomicUsize,
+        pub fail_save_at: AtomicUsize,
+        pub delay: Mutex<std::time::Duration>,
+        pub effect: Mutex<Effect>,
+        pub legacy_callbacks: AtomicBool,
+        pub external_address: AtomicBool,
+        pub replace_after_write: AtomicBool,
+        pub post_delay: Mutex<std::time::Duration>,
+    }
+    impl FakeAddressIo {
+        pub fn new(ips: &[&str]) -> Arc<Self> {
+            let native = NativeAdapter {
+                guid: "guid-a".into(),
+                index: 7,
+                alias: "Ethernet".into(),
+                mac: "40:cd:3a:00:00:01".into(),
+                is_up: true,
+                dhcp: false,
+                ips: ips
+                    .iter()
+                    .map(|address| IpInfo {
+                        address: (*address).into(),
+                        prefix: 24,
+                        subnet: "192.0.2.0/24".into(),
+                    })
+                    .collect(),
+            };
+            let iface = InterfaceInfo {
+                name: native.alias.clone(),
+                display_name: native.alias.clone(),
+                description: "qualified physical Ethernet".into(),
+                mac: native.mac.clone(),
+                is_up: true,
+                ips: vec![],
+                is_ethernet: true,
+                is_wifi: false,
+                is_vpn: false,
+                is_virtual: false,
+            };
+            let cache = AdapterSnapshot::default();
+            *cache.qualified.lock().unwrap() = vec![(native.identity(), iface.clone())];
+            *cache.topology.lock().unwrap() = topology(std::slice::from_ref(&native));
+            *cache.value.lock().unwrap() = Some(CachedAdapters {
+                at: tokio::time::Instant::now() - SNAPSHOT_TTL - std::time::Duration::from_secs(1),
+                generation: 0,
+                adapters: vec![iface],
+            });
+            Arc::new(Self {
+                table: Mutex::new(vec![native]),
+                cache,
+                reads: AtomicUsize::new(0),
+                providers: AtomicUsize::new(0),
+                writes: Mutex::new(vec![]),
+                saves: Mutex::new(vec![]),
+                fail_read: AtomicBool::new(false),
+                fail_read_at: AtomicUsize::new(0),
+                fail_save_at: AtomicUsize::new(0),
+                delay: Mutex::new(std::time::Duration::ZERO),
+                effect: Mutex::new(Effect::Apply),
+                legacy_callbacks: AtomicBool::new(false),
+                external_address: AtomicBool::new(false),
+                replace_after_write: AtomicBool::new(false),
+                post_delay: Mutex::new(std::time::Duration::ZERO),
+            })
+        }
+        pub fn callbacks(&self) {
+            for _ in 0..12 {
+                // both callback kinds, plus an external concurrent IP change
+                if self.legacy_callbacks.load(Ordering::Relaxed) {
+                    self.cache.invalidate();
+                } else {
+                    observe_topology(&self.cache, &self.table.lock().unwrap());
+                }
+            }
+        }
+        fn write(&self, add: bool, adapter: &NativeAdapter, ip: &str) -> Result<(), AppError> {
+            self.writes.lock().unwrap().push((add, ip.into()));
+            let effect = *self.effect.lock().unwrap();
+            if !matches!(effect, Effect::Unchanged) {
+                let mut table = self.table.lock().unwrap();
+                let current = table
+                    .iter_mut()
+                    .find(|n| n.identity() == adapter.identity())
+                    .ok_or_else(|| AppError::Network("fake adapter changed before write".into()))?;
+                current.ips.retain(|a| a.address != ip);
+                if add {
+                    current.ips.push(IpInfo {
+                        address: ip.into(),
+                        prefix: 24,
+                        subnet: "192.0.2.0/24".into(),
+                    });
+                }
+                if self.external_address.load(Ordering::Relaxed)
+                    && !current.ips.iter().any(|i| i.address == "192.0.2.77")
+                {
+                    current.ips.push(IpInfo {
+                        address: "192.0.2.77".into(),
+                        prefix: 24,
+                        subnet: "192.0.2.0/24".into(),
+                    });
+                }
+            }
+            if self.replace_after_write.load(Ordering::Relaxed) {
+                self.table.lock().unwrap()[0].index += 1;
+            }
+            *self.delay.lock().unwrap() = *self.post_delay.lock().unwrap();
+            self.callbacks();
+            match effect {
+                Effect::ErrorAfter => Err(AppError::Network(
+                    "injected command failure after effect".into(),
+                )),
+                Effect::TimeoutAfter => Err(AppError::Network(
+                    "injected command timed out after effect".into(),
+                )),
+                _ => Ok(()),
+            }
+        }
+    }
+    impl AddressIo for FakeAddressIo {
+        fn native(&self) -> AddressFuture<'_, Vec<NativeAdapter>> {
+            let read = self.reads.fetch_add(1, Ordering::Relaxed) + 1;
+            let fail = self.fail_read.load(Ordering::Relaxed)
+                || self.fail_read_at.load(Ordering::Relaxed) == read;
+            let delay = *self.delay.lock().unwrap();
+            let rows = self.table.lock().unwrap().clone();
+            Box::pin(async move {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                if fail {
+                    Err(AppError::Network(
+                        "injected native observation unavailable".into(),
+                    ))
+                } else {
+                    Ok(rows)
+                }
+            })
+        }
+        fn add<'a>(
+            &'a self,
+            adapter: &'a NativeAdapter,
+            ip: &'a str,
+            _: &'a str,
+        ) -> AddressFuture<'a, ()> {
+            Box::pin(async move { self.write(true, adapter, ip) })
+        }
+        fn remove<'a>(&'a self, adapter: &'a NativeAdapter, ip: &'a str) -> AddressFuture<'a, ()> {
+            Box::pin(async move { self.write(false, adapter, ip) })
+        }
+        fn descriptor(&self, native: &NativeAdapter) -> Option<InterfaceInfo> {
+            self.cache
+                .qualified
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(id, _)| *id == native.identity())
+                .map(|(_, i)| native.overlay(i))
+        }
+        fn qualify(&self) -> AddressFuture<'_, ()> {
+            self.providers.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async {
+                Err(AppError::Network(
+                    "injected delayed provider timeout".into(),
+                ))
+            })
+        }
+        fn persist_binding(
+            &self,
+            config: &crate::config::AppConfig,
+            subnet: &str,
+            row: crate::config::AdoptedMeta,
+        ) -> Result<(), AppError> {
+            let mut saves = self.saves.lock().unwrap();
+            let count = saves.len() + 1;
+            if self.fail_save_at.load(Ordering::Relaxed) == count {
+                return Err(AppError::Config("injected persistence failure".into()));
+            }
+            saves.push(subnet.into());
+            let mut settings = config.settings.lock().unwrap();
+            if row.desired == crate::config::BindingDesired::Removed {
+                settings.adopted_subnets.remove(subnet);
+            }
+            settings.adopted_meta.insert(subnet.into(), row);
+            Ok(())
+        }
+        fn claim(&self, config: &crate::config::AppConfig, ip: &str) -> Result<(), AppError> {
+            let mut settings = config.settings.lock().unwrap();
+            let removed: Vec<_> = settings
+                .adopted_meta
+                .iter()
+                .filter(|(_, r)| r.address.as_deref() == Some(ip))
+                .map(|(k, _)| k.clone())
+                .collect();
+            for subnet in removed {
+                settings.adopted_meta.remove(&subnet);
+                settings.adopted_subnets.remove(&subnet);
+            }
+            settings.pending_addresses.retain(|r| r.address != ip);
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn sp_qualification_requires_native_guid_alias_index_and_known_classification() {
+        let io = address_test_io::FakeAddressIo::new(&[]);
+        let native = io.table.lock().unwrap()[0].clone();
+        let json = serde_json::json!({"Name":"Ethernet", "MacAddress":native.mac,
+            "Guid":"guid-a", "Index":7, "MediaType":"802.3", "Virtual":false});
+        assert!(is_wired_physical(
+            &qualified_descriptor(&json, &native).unwrap()
+        ));
+        for key in ["Virtual", "MediaType", "Guid", "Index", "Name"] {
+            let mut unknown = json.clone();
+            unknown.as_object_mut().unwrap().remove(key);
+            assert!(qualified_descriptor(&unknown, &native).is_none());
+        }
+        let mut virtual_json = json.clone();
+        virtual_json["Virtual"] = serde_json::json!(true);
+        assert!(!is_wired_physical(
+            &qualified_descriptor(&virtual_json, &native).unwrap()
+        ));
+        let mut replaced = native.clone();
+        replaced.guid = "other-guid".into();
+        assert!(qualified_descriptor(&json, &replaced).is_none());
+    }
+
+    #[tokio::test]
+    async fn sp_native_snapshot_uses_expired_qualification_but_fresh_addresses_and_dhcp() {
+        let io = address_test_io::FakeAddressIo::new(&["192.0.2.10"]);
+        io.table.lock().unwrap()[0].dhcp = true;
+        let s = operation_snapshot(io.as_ref(), "40:cd:3a:00:00:01")
+            .await
+            .unwrap();
+        assert_eq!(s.iface.ips[0].address, "192.0.2.10");
+        assert!(s.selected.dhcp);
+        assert_eq!(io.providers.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(native_by_alias(&s.all, "old alias").is_err());
+        let mut duplicate = s.all.clone();
+        duplicate.push(s.selected.clone());
+        assert!(select_native(&duplicate, &s.selected.mac).is_err());
+        for kind in 0..4 {
+            let mut changed = s.selected.clone();
+            match kind {
+                0 => changed.guid = "new-guid".into(),
+                1 => changed.alias = "renamed".into(),
+                2 => changed.index = 8,
+                _ => changed.index = 0,
+            }
+            assert!(io.descriptor(&changed).is_none());
+            assert!(
+                snapshot_from_native(io.as_ref(), &changed.mac.clone(), vec![changed]).is_err()
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sp_native_flags_and_alias_are_read_from_windows_sys_059_union() {
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_DHCP_ENABLED,
+        };
+        let alias: Vec<u16> = "Ethernet".encode_utf16().chain(Some(0)).collect();
+        let guid = std::ffi::CString::new("{native-guid}").unwrap();
+        for flag in [0, IP_ADAPTER_DHCP_ENABLED] {
+            let mut raw: IP_ADAPTER_ADDRESSES_LH = unsafe { std::mem::zeroed() };
+            raw.Anonymous1.Anonymous.IfIndex = 7;
+            raw.Anonymous2.Flags = flag;
+            raw.FriendlyName = alias.as_ptr().cast_mut();
+            raw.AdapterName = guid.as_ptr().cast_mut().cast();
+            let rows = local_adapters_iphelper_with(|buffer, _| {
+                unsafe {
+                    *buffer = raw;
+                }
+                0
+            })
+            .unwrap();
+            assert_eq!(rows[0].guid, "{native-guid}");
+            assert_eq!(native_by_alias(&rows, "Ethernet").unwrap().dhcp, flag != 0);
+            let mut duplicate = rows.clone();
+            duplicate.push(rows[0].clone());
+            assert!(native_by_alias(&duplicate, "Ethernet").is_err());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sp_native_read_timeout_has_no_late_write_continuation() {
+        let io = address_test_io::FakeAddressIo::new(&[]);
+        *io.delay.lock().unwrap() = std::time::Duration::from_secs(3);
+        assert!(read_native_with(io.as_ref())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("2s"));
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        assert!(io.writes.lock().unwrap().is_empty());
+    }
 
     #[cfg(target_os = "windows")]
     #[tokio::test]
@@ -968,11 +1656,12 @@ mod tests {
         // Recovery must overlay fresh native addresses, not cached ones.
         let recovered = overlay_adapter_addresses(
             cached,
-            Ok(vec![WinAdapter {
+            Ok(vec![NativeAdapter {
                 index: 7,
                 mac: "40:cd:3a:00:00:01".into(),
                 is_up: true,
                 ips: vec![],
+                ..Default::default()
             }]),
         )
         .unwrap();

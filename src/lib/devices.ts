@@ -29,8 +29,8 @@ import {
 import {
   renderSubnetList,
   isInterfaceConnected,
-  refreshIpDialogIfOpen,
   refreshHostBindings,
+  refreshNetworkEvent,
   sessionAdoptedSubnets,
 } from "./network.ts";
 import {
@@ -410,7 +410,7 @@ export function setupArpListeners(): void {
     }
     // Reset the settle timer — netsh needs time to activate the IP
     debounceScan();
-    void refreshHostBindings();
+    refreshNetworkEvent();
   });
 
   api.onEvent<AdoptionFailedPayload>("adoption-failed", (data) => {
@@ -425,8 +425,7 @@ export function setupArpListeners(): void {
     sessionAdoptedSubnets.delete(data.subnet);
     adoptionMeta.delete(data.subnet);
     renderSubnetList();
-    void refreshIpDialogIfOpen();
-    void refreshHostBindings();
+    refreshNetworkEvent();
   });
 
   // Initial hydration / scan kickoff is orchestrated from main.js

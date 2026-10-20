@@ -16,6 +16,7 @@ import type { DeviceTarget } from "./store.ts";
 
 import type {
   AdapterSelection,
+  AddressReply,
   AdoptionSnapshot,
   ModeTransition,
   ModeTransitionReply,
@@ -127,11 +128,11 @@ export async function addSecondaryIp(
   name: string,
   ip: string,
   subnetMask: string
-): Promise<void> {
+): Promise<AddressReply> {
   return await invoke("add_secondary_ip", { name, ip, subnetMask });
 }
 
-export async function removeSecondaryIp(name: string, ip: string): Promise<void> {
+export async function removeSecondaryIp(name: string, ip: string): Promise<AddressReply> {
   return await invoke("remove_secondary_ip", { name, ip });
 }
 
@@ -227,7 +228,7 @@ export async function getConfiguredAdoptions(): Promise<Record<string, string>> 
 
 /** Save removal intent before unbinding the exact saved address on its
  *  owning adapter. Failure remains pending and is retried on adapter return. */
-export async function removeAdoptedSubnet(subnet: string, ifaceHint?: string): Promise<void> {
+export async function removeAdoptedSubnet(subnet: string, ifaceHint?: string): Promise<AddressReply> {
   return await invoke("remove_adopted_subnet", { subnet, ifaceHint });
 }
 

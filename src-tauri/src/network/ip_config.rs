@@ -466,37 +466,9 @@ async fn set_dhcp_windows(interface: &str) -> Result<(), AppError> {
 /// Read whether the interface is currently in DHCP mode for IPv4. No admin
 /// required. Called by the dialog at open time to position the mode toggle.
 pub async fn get_dhcp_state(interface: &str) -> Result<bool, AppError> {
-    super::interface::validate_interface_name(interface).await?;
-
     #[cfg(target_os = "windows")]
     {
-        let escaped = interface.replace('\'', "''");
-        let script = format!(
-            "(Get-NetIPInterface -InterfaceAlias '{}' -AddressFamily IPv4 -ErrorAction Stop).Dhcp",
-            escaped
-        );
-        // This also runs inside the auto-adopt loop, so an unbounded
-        // PowerShell hang would stall adoption indefinitely and leak the
-        // child when the loop is torn down. kill_on_drop plus a 10s bound
-        // turn a hang into an ordinary error instead.
-        let fut = super::async_cmd("powershell")
-            .args(["-NoProfile", "-Command", &script])
-            .kill_on_drop(true)
-            .output();
-        let output = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
-            .await
-            .map_err(|_| AppError::Network("Get-NetIPInterface timed out after 10s".into()))?
-            .map_err(|e| AppError::Network(format!("Failed to read DHCP state: {}", e)))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(AppError::Network(format!(
-                "Get-NetIPInterface failed: {}",
-                stderr.trim()
-            )));
-        }
-
-        parse_dhcp_state(&String::from_utf8_lossy(&output.stdout))
+        super::interface::native_dhcp_state(interface).await
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -508,7 +480,7 @@ pub async fn get_dhcp_state(interface: &str) -> Result<bool, AppError> {
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(test)]
 fn parse_dhcp_state(output: &str) -> Result<bool, AppError> {
     match output.trim().to_ascii_lowercase().as_str() {
         "enabled" => Ok(true),
@@ -520,6 +492,71 @@ fn parse_dhcp_state(output: &str) -> Result<bool, AppError> {
 }
 
 /// Remove a secondary IP address from an interface.
+/// Operation writers accept a just-validated native observation. The public
+/// legacy entry points retain their own native validation for other callers.
+pub(super) async fn add_native_address(
+    adapter: &super::interface::NativeAdapter,
+    ip: &str,
+    mask: &str,
+) -> Result<(), AppError> {
+    validate_ip(ip)?;
+    let prefix = mask_to_prefix(mask)?;
+    validate_native_writer(adapter)?;
+    if adapter.dhcp {
+        return Err(AppError::Network("adapter is DHCP".into()));
+    }
+    #[cfg(windows)]
+    {
+        let escaped = adapter.alias.replace('\'', "''");
+        let script = format!("New-NetIPAddress -InterfaceAlias '{escaped}' -IPAddress '{ip}' -PrefixLength {prefix} -ErrorAction Stop | Out-Null");
+        run_command_killable(
+            "powershell",
+            &["-NoProfile", "-Command", &script],
+            IP_CMD_TIMEOUT,
+        )
+        .await?;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = prefix;
+        return Err(AppError::Network("Native writes require Windows".into()));
+    }
+    #[cfg(windows)]
+    {
+        Ok(())
+    }
+}
+fn validate_native_writer(adapter: &super::interface::NativeAdapter) -> Result<(), AppError> {
+    if !adapter.is_up || adapter.index == 0 || adapter.guid.is_empty() || adapter.alias.is_empty() {
+        return Err(AppError::Network(
+            "Selected adapter unavailable or unqualified".into(),
+        ));
+    }
+    Ok(())
+}
+pub(super) async fn remove_native_address(
+    adapter: &super::interface::NativeAdapter,
+    ip: &str,
+) -> Result<(), AppError> {
+    validate_ip(ip)?;
+    validate_native_writer(adapter)?;
+    #[cfg(windows)]
+    {
+        let name = format!("name={}", adapter.alias);
+        run_command_killable(
+            "netsh",
+            &["interface", "ip", "delete", "address", &name, ip],
+            IP_CMD_TIMEOUT,
+        )
+        .await?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        Err(AppError::Network("Native writes require Windows".into()))
+    }
+}
+
 pub async fn remove_secondary_ip(interface: &str, ip: &str) -> Result<(), AppError> {
     super::interface::validate_interface_name(interface).await?;
     validate_ip(ip)?;

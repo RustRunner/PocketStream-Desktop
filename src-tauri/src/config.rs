@@ -553,14 +553,42 @@ impl AppConfig {
         self.set_binding_with(subnet, row, save_to_disk)
     }
 
+    pub fn set_binding_intent(
+        &self,
+        subnet: &str,
+        row: AdoptedMeta,
+    ) -> Result<(), crate::AppError> {
+        self.set_binding_for_operation_with(subnet, row, true, save_to_disk)
+    }
     fn set_binding_with(
         &self,
         subnet: &str,
         row: AdoptedMeta,
         persist: impl FnOnce(&AppSettings) -> Result<(), crate::AppError>,
     ) -> Result<(), crate::AppError> {
-        self.change_settings_with(
+        self.set_binding_for_operation_with(subnet, row, false, persist)
+    }
+
+    pub(crate) fn set_binding_for_operation_with(
+        &self,
+        subnet: &str,
+        row: AdoptedMeta,
+        force_intent: bool,
+        persist: impl FnOnce(&AppSettings) -> Result<(), crate::AppError>,
+    ) -> Result<(), crate::AppError> {
+        self.change_settings_if_with(
             |s| {
+                let needs_handover = row.desired == BindingDesired::Present
+                    && row.applied
+                    && row.last_error.is_none()
+                    && s.pending_addresses.iter().any(|p| {
+                        Some(&p.adapter_mac) == row.adapter_mac.as_ref()
+                            && Some(&p.address) == row.address.as_ref()
+                            && Some(p.prefix) == row.prefix
+                    });
+                if !force_intent && s.adopted_meta.get(subnet) == Some(&row) && !needs_handover {
+                    return Ok(((), false));
+                }
                 if row.desired == BindingDesired::Present
                     && s.adopted_meta
                         .get(subnet)
@@ -586,7 +614,7 @@ impl AppConfig {
                     });
                 }
                 s.adopted_meta.insert(subnet.to_string(), row);
-                Ok(())
+                Ok(((), true))
             },
             persist,
         )
@@ -596,7 +624,7 @@ impl AppConfig {
         self.claim_binding_with(address, save_to_disk)
     }
 
-    fn claim_binding_with(
+    pub(crate) fn claim_binding_with(
         &self,
         address: &str,
         persist: impl FnOnce(&AppSettings) -> Result<(), crate::AppError>,
@@ -640,12 +668,21 @@ impl AppConfig {
         change: impl FnOnce(&mut AppSettings) -> Result<T, crate::AppError>,
         persist: impl FnOnce(&AppSettings) -> Result<(), crate::AppError>,
     ) -> Result<T, crate::AppError> {
+        self.change_settings_if_with(|s| change(s).map(|value| (value, true)), persist)
+    }
+    fn change_settings_if_with<T>(
+        &self,
+        change: impl FnOnce(&mut AppSettings) -> Result<(T, bool), crate::AppError>,
+        persist: impl FnOnce(&AppSettings) -> Result<(), crate::AppError>,
+    ) -> Result<T, crate::AppError> {
         let _save = CONFIG_SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
         let mut next = settings.clone();
-        let result = change(&mut next)?;
-        persist(&next)?;
-        *settings = next;
+        let (result, changed) = change(&mut next)?;
+        if changed {
+            persist(&next)?;
+            *settings = next;
+        }
         Ok(result)
     }
 
@@ -2124,6 +2161,71 @@ password = ""
             .unwrap()
             .pending_addresses
             .is_empty());
+    }
+
+    #[test]
+    fn sp_status_equality_skips_atomic_save_but_repeated_intent_is_a_barrier() {
+        let config = AppConfig::temporary_test_config(AppSettings::default());
+        let mut row = AdoptedMeta {
+            address: Some("192.0.2.20".into()),
+            prefix: Some(24),
+            adapter_mac: Some("40:cd:3a:00:00:01".into()),
+            ..Default::default()
+        };
+        let count = std::cell::Cell::new(0);
+        let persist = |_: &AppSettings| {
+            count.set(count.get() + 1);
+            Ok(())
+        };
+        config
+            .set_binding_with("192.0.2.0/24", row.clone(), persist)
+            .unwrap();
+        config
+            .set_binding_with("192.0.2.0/24", row.clone(), |_| {
+                panic!("equal status must not fsync")
+            })
+            .unwrap();
+        assert_eq!(count.get(), 1);
+        config.settings.lock().unwrap().stream.camera_ip = "keep-current-user-setting".into();
+        row.applied = true;
+        config
+            .set_binding_with("192.0.2.0/24", row.clone(), persist)
+            .unwrap();
+        assert_eq!(config.get().stream.camera_ip, "keep-current-user-setting");
+        row.last_error = Some("temporary failure".into());
+        config
+            .set_binding_with("192.0.2.0/24", row.clone(), persist)
+            .unwrap();
+        config
+            .settings
+            .lock()
+            .unwrap()
+            .pending_addresses
+            .push(PendingAddress {
+                adapter_mac: row.adapter_mac.clone().unwrap(),
+                address: row.address.clone().unwrap(),
+                prefix: 24,
+            });
+        config
+            .set_binding_with("192.0.2.0/24", row.clone(), |_| {
+                panic!("equal failed status cannot retire ownership or save")
+            })
+            .unwrap();
+        assert_eq!(config.get().pending_addresses.len(), 1);
+        row.desired = BindingDesired::Removed;
+        row.last_error = Some("Removal awaiting Windows confirmation".into());
+        for _ in 0..2 {
+            config
+                .set_binding_for_operation_with("192.0.2.0/24", row.clone(), true, persist)
+                .unwrap();
+        }
+        assert_eq!(
+            count.get(),
+            5,
+            "each new removal crosses the durability barrier"
+        );
+        assert!(!config.get().adopted_subnets.contains_key("192.0.2.0/24"));
+        assert_eq!(config.get().adopted_meta["192.0.2.0/24"], row);
     }
 
     #[test]

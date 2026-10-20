@@ -114,10 +114,17 @@ pub async fn add_secondary_ip(
     name: String,
     ip: String,
     subnet_mask: String,
-) -> Result<(), AppError> {
-    manager
-        .add_manual_address(&config, &name, &ip, &subnet_mask)
-        .await
+) -> Result<crate::network::manual_address::AddressReply, AppError> {
+    Ok(manager
+        .address_operation(
+            &config,
+            crate::network::manual_address::AddressRequest::Add {
+                name,
+                ip,
+                mask: subnet_mask,
+            },
+        )
+        .await)
 }
 
 #[tauri::command]
@@ -126,20 +133,13 @@ pub async fn remove_secondary_ip(
     config: State<'_, AppConfig>,
     name: String,
     ip: String,
-) -> Result<(), AppError> {
-    if let Some((subnet, _)) = config
-        .get()
-        .adopted_meta
-        .iter()
-        .find(|(_, row)| row.address.as_deref() == Some(ip.as_str()))
-    {
-        manager
-            .remove_adopted_subnet(&config, subnet, Some(&name))
-            .await
-            .map(|_| ())
-    } else {
-        manager.remove_manual_address(&config, &name, &ip).await
-    }
+) -> Result<crate::network::manual_address::AddressReply, AppError> {
+    Ok(manager
+        .address_operation(
+            &config,
+            crate::network::manual_address::AddressRequest::RemoveManual { name, ip },
+        )
+        .await)
 }
 
 #[tauri::command]
@@ -470,22 +470,21 @@ pub async fn remove_adopted_subnet(
     app: tauri::AppHandle,
     subnet: String,
     iface_hint: Option<String>,
-) -> Result<(), AppError> {
-    // The manager persists exact removal intent before changing the adapter.
-    let ip = manager
-        .remove_adopted_subnet(&config, &subnet, iface_hint.as_deref())
-        .await?;
-    // Emit success only after the requested OS removal is confirmed.
-    use tauri::Emitter;
-    let _ = app.emit(
-        "subnet-removed",
-        serde_json::json!({
-            "subnet": subnet,
-            "adopted_ip": ip.to_string(),
-            "reason": "manual",
-        }),
-    );
-    Ok(())
+) -> Result<crate::network::manual_address::AddressReply, AppError> {
+    let reply = manager
+        .address_operation(
+            &config,
+            crate::network::manual_address::AddressRequest::RemoveSaved {
+                subnet: subnet.clone(),
+                hint: iface_hint,
+            },
+        )
+        .await;
+    if reply.outcome == crate::network::manual_address::AddressOutcome::Success {
+        use tauri::Emitter;
+        let _ = app.emit("subnet-removed", serde_json::json!({"subnet": subnet, "adopted_ip": reply.view.address, "reason": "manual"}));
+    }
+    Ok(reply)
 }
 
 /// Persisted adoption entries (subnet -> IP) straight from config, for
