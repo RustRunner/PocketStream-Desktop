@@ -612,7 +612,6 @@ export function renderArpDeviceList(): void {
       // are attribute-safe, so the data-* attributes are covered too.
       const ipEsc = escapeHtml(r.ip);
       const portsEsc = escapeHtml(ports.join(", "));
-      const presence = presenceLabel(r);
 
       // The node's name doubles as the role dropdown face: a synthetic
       // first option carries the current display name (selected +
@@ -632,9 +631,6 @@ export function renderArpDeviceList(): void {
           <div class="device-detail-row">
             <a class="device-ip" href="#" data-browse="${ipEsc}" title="Open in browser">${ipEsc}</a>
             <span class="device-ports">${portsEsc}</span>
-          </div>
-          <div class="device-detail-row">
-            <span class="device-ports">${escapeHtml(presence)}</span>
           </div>
         </div>`;
     }

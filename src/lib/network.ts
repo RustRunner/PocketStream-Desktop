@@ -486,24 +486,16 @@ export function renderSubnetList(): void {
     rows.set(key, { address, prefix, subnet, observed: rows.get(key)?.observed ?? false, meta });
   }
   const normalizeMac = (mac: string | null | undefined) => mac?.replaceAll("-", ":").toLowerCase();
-  const usable = !!state.activeInterface?.is_up;
   subnetList.innerHTML = [...rows.values()].sort((a, b) =>
     a.address.localeCompare(b.address) || (a.prefix ?? -1) - (b.prefix ?? -1)
   ).map(({ address, prefix, subnet, observed, meta }) => {
     const ownerKnown = /^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/i.test(normalizeMac(meta?.adapter_mac) ?? "") && prefix !== null && prefix >= 0 && prefix <= 32;
     const mismatch = observed && normalizeMac(meta?.adapter_mac) !== normalizeMac(state.activeInterface?.mac);
     const managed = ownerKnown && !mismatch && meta?.desired === "present";
-    const applied = usable && observed && (!meta || (meta.applied === true && !mismatch));
-    const badge = managed && applied && sessionAdoptedSubnets.has(subnet);
-    const availability = !usable || /^(adapter is DHCP|saved mode is DHCP|adapter mismatch|selected adapter unavailable)/.test(meta?.last_error ?? "");
-    const status = meta?.desired === "removed" ? "pending removal" : applied ? "applied" : meta?.last_error && !availability ? "failed" : "pending";
-    const reason = [meta?.last_error || (!usable ? "selected adapter unavailable" : meta && !observed ? "address not observed on selected adapter" : ""),
-      !meta || !ownerKnown || mismatch ? "ownership ambiguous — use Configure" : ""].filter(Boolean).join("; ");
     const cidr = `${address}/${prefix ?? "?"}`;
     const remove = managed ? `<button class="btn-remove-ip" data-remove-adopted="${escapeHtml(subnet)}" title="Remove saved ${escapeHtml(cidr)} from ${escapeHtml(meta!.adapter_mac!)}"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg></button>` : "";
-    return `<div class="status-row subnet-row${badge ? " subnet-row-auto" : ""}" data-subnet="${escapeHtml(subnet)}">
-      <span class="status-label">IP:</span><span class="auto-ip-group">${badge ? '<span class="badge-auto">(auto)</span>' : ""}<span class="status-value">${escapeHtml(cidr)}</span></span>
-      <span class="muted">${escapeHtml(`${status}${reason ? ` — ${reason}` : ""}`)}</span>${remove}</div>`;
+    return `<div class="status-row subnet-row" data-subnet="${escapeHtml(subnet)}">
+      <span class="status-label">IP:</span><span class="auto-ip-group"><span class="status-value">${escapeHtml(cidr)}</span></span>${remove}</div>`;
   }).join("");
 }
 
