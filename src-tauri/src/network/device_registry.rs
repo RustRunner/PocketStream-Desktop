@@ -66,6 +66,8 @@ pub struct DeviceRecord {
 /// emitting redundant `device-list-changed` events for no-op writes.
 pub struct DeviceRegistry {
     devices: Mutex<HashMap<String, DeviceRecord>>,
+    evidence: Mutex<HashMap<String, tokio::time::Instant>>,
+    verification_scope: Mutex<Option<Option<String>>>,
 }
 
 /// The set of user-configured pinned IPs: every manual node plus the
@@ -103,6 +105,8 @@ impl DeviceRegistry {
     pub fn new() -> Self {
         Self {
             devices: Mutex::new(HashMap::new()),
+            evidence: Mutex::new(HashMap::new()),
+            verification_scope: Mutex::new(None),
         }
     }
 
@@ -110,6 +114,7 @@ impl DeviceRegistry {
     /// of truth flips (e.g., Static-Auto → Static-Manual replaces the
     /// cache+ARP set with the user's pinned list). Returns true if
     /// anything was actually removed.
+    #[cfg(test)]
     pub fn clear(&self) -> bool {
         let mut map = self.lock();
         let had_entries = !map.is_empty();
@@ -243,13 +248,16 @@ impl DeviceRegistry {
             return MergeResult::default();
         }
         let mut map = self.lock();
-        if fence.is_stale() {
+        if fence.is_stale()
+            || !self.proof_allowed(adapter)
+            || Self::has_newer_proof(&map, device, verified_at)
+        {
             return MergeResult::default();
         }
         let expected = node.expected_mac.as_deref().unwrap_or(&device.mac);
         let expected_key = record_key_for_mac(&map, expected).unwrap_or_else(|| expected.into());
         let same = same_mac(expected, &device.mac);
-        let mut result = Self::merge_verified_locked(&mut map, device, adapter, verified_at);
+        let mut result = self.merge_verified_locked(&mut map, device, adapter, verified_at);
         if !same {
             if let Some(old) = map.get_mut(&expected_key) {
                 result.changed |= old.status != DeviceStatus::OfflineDifferentDevice;
@@ -282,6 +290,14 @@ impl DeviceRegistry {
     /// the legacy verify path until S5a activation.
     #[allow(dead_code)] // Legacy mutator remains available until S5a.
     pub fn merge_arp(&self, device: &ArpDevice) -> MergeResult {
+        if self
+            .verification_scope
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
+        {
+            return MergeResult::default();
+        }
         Self::merge_arp_locked(&mut self.lock(), device)
     }
 
@@ -291,7 +307,13 @@ impl DeviceRegistry {
         fence: &super::SweepFence,
     ) -> MergeResult {
         let mut map = self.lock();
-        if fence.is_stale() {
+        if fence.is_stale()
+            || self
+                .verification_scope
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_some()
+        {
             return MergeResult::default();
         }
         Self::merge_arp_locked(&mut map, device)
@@ -310,10 +332,13 @@ impl DeviceRegistry {
             return MergeResult::default();
         }
         let mut map = self.lock();
-        if fence.is_stale() {
+        if fence.is_stale()
+            || !self.proof_allowed(adapter)
+            || Self::has_newer_proof(&map, device, verified_at)
+        {
             return MergeResult::default();
         }
-        Self::merge_verified_locked(&mut map, device, adapter, verified_at)
+        self.merge_verified_locked(&mut map, device, adapter, verified_at)
     }
 
     pub(crate) fn verification_valid(device: &ArpDevice, adapter: &str, verified_at: &str) -> bool {
@@ -328,6 +353,7 @@ impl DeviceRegistry {
     }
 
     fn merge_verified_locked(
+        &self,
         map: &mut HashMap<String, DeviceRecord>,
         device: &ArpDevice,
         adapter: &str,
@@ -343,6 +369,13 @@ impl DeviceRegistry {
         record.verified_by_mac = Some(adapter);
         record.last_verified_at = Some(verified_at.into());
         record.status = DeviceStatus::Live;
+        self.evidence
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(
+                record.mac.clone(),
+                tokio::time::Instant::now() + super::presence::FRESHNESS,
+            );
         result
     }
 
@@ -537,6 +570,9 @@ impl DeviceRegistry {
 
     /// Set the status for the device with this MAC.
     pub fn set_status(&self, mac: &str, status: DeviceStatus) -> bool {
+        if status == DeviceStatus::Live {
+            return false;
+        }
         let mut map = self.lock();
         match map.get_mut(mac) {
             Some(record) if record.status != status => {
@@ -545,6 +581,93 @@ impl DeviceRegistry {
             }
             _ => false,
         }
+    }
+
+    pub(crate) fn set_verification_scope(&self, adapter: Option<&str>) {
+        *self
+            .verification_scope
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(adapter.and_then(canonical_mac));
+    }
+
+    fn has_newer_proof(map: &HashMap<String, DeviceRecord>, device: &ArpDevice, at: &str) -> bool {
+        let Ok(incoming) = chrono::DateTime::parse_from_rfc3339(at) else {
+            return true;
+        };
+        map.values()
+            .filter(|r| {
+                r.status == DeviceStatus::Live
+                    && (same_mac(&r.mac, &device.mac) || r.ip == device.ip)
+            })
+            .filter_map(|r| {
+                r.last_verified_at
+                    .as_ref()
+                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            })
+            .any(|existing| existing > incoming)
+    }
+
+    fn proof_allowed(&self, adapter: &str) -> bool {
+        match &*self
+            .verification_scope
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+        {
+            None => true, // standalone registry tests; setup installs the scope
+            Some(Some(expected)) => canonical_mac(adapter).as_ref() == Some(expected),
+            Some(None) => false,
+        }
+    }
+
+    pub(crate) fn remember_verified_at(
+        &self,
+        mac: &str,
+        wall: &str,
+        at: tokio::time::Instant,
+        fence: &super::SweepFence,
+    ) {
+        let map = self.lock();
+        if fence.is_stale() {
+            return;
+        }
+        if let Some(key) = record_key_for_mac(&map, mac)
+            .filter(|k| map[k].last_verified_at.as_deref() == Some(wall))
+        {
+            self.evidence
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(key, at + super::presence::FRESHNESS);
+        }
+    }
+
+    pub(crate) fn expire_evidence(&self, now: tokio::time::Instant) -> bool {
+        let mut map = self.lock();
+        let mut deadlines = self.evidence.lock().unwrap_or_else(|p| p.into_inner());
+        let mut changed = false;
+        for record in map.values_mut() {
+            if record.status == DeviceStatus::Live
+                && deadlines.get(&record.mac).is_none_or(|t| now >= *t)
+            {
+                record.status = DeviceStatus::Offline;
+                changed = true;
+            }
+        }
+        deadlines.retain(|key, time| map.contains_key(key) && now < *time);
+        changed
+    }
+
+    pub(crate) fn expire_all(&self) -> bool {
+        let mut map = self.lock();
+        self.evidence
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        let mut changed = false;
+        for record in map.values_mut().filter(|r| r.status == DeviceStatus::Live) {
+            record.status = DeviceStatus::Offline;
+            changed = true;
+        }
+        changed
     }
 
     /// Drop the record for this MAC entirely.
