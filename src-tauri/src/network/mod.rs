@@ -542,7 +542,7 @@ fn binding_action(
 ) -> BindingAction {
     use crate::config::{BindingDesired, NetworkMode};
     let Some(iface) = iface.filter(|i| i.is_up) else {
-        return BindingAction::Hold("selected adapter unavailable".into(), false);
+        return BindingAction::Unavailable("selected adapter unavailable".into());
     };
     if row
         .adapter_mac
@@ -616,6 +616,15 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<Vec<interface::IpInfo>, AppError>>,
 {
+    // An outage is not a new removal failure after absence was confirmed.
+    // Fresh observations on adapter return still recheck the tombstone.
+    if matches!(action, BindingAction::Unavailable(_))
+        && row.desired == crate::config::BindingDesired::Removed
+        && !row.applied
+        && row.last_error.is_none()
+    {
+        return row;
+    }
     row.last_error = None;
     match action {
         BindingAction::Unavailable(reason) => {
@@ -5277,6 +5286,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_removal_stays_complete_through_unavailable_observations() {
+        let ops = BindingOps::default();
+        let mut down = saved_adapter(&[]);
+        down.is_up = false;
+        let mut row = saved_binding("172.26.95.99");
+        row.desired = crate::config::BindingDesired::Removed;
+        row.applied = false;
+        for mode in [
+            crate::config::NetworkMode::StaticAuto,
+            crate::config::NetworkMode::StaticManual,
+            crate::config::NetworkMode::Dhcp,
+        ] {
+            for iface in [None, Some(&down)] {
+                let action = binding_action(
+                    "172.26.95.0/24",
+                    &row,
+                    iface,
+                    mode,
+                    &Err("adapter disconnected".into()),
+                    &[],
+                );
+                row = apply_binding(&ops, row, action, iface, || async {
+                    panic!("unavailable adapter must not mutate addresses")
+                })
+                .await;
+                assert!(
+                    !row.applied && row.last_error.is_none(),
+                    "a completed removal must not become pending on disconnect"
+                );
+                row = apply_binding(
+                    &ops,
+                    row,
+                    BindingAction::Unavailable("provider query failed".into()),
+                    iface,
+                    || async { panic!("failed provider must not mutate addresses") },
+                )
+                .await;
+                assert!(!row.applied && row.last_error.is_none());
+                assert_eq!(row.desired, crate::config::BindingDesired::Removed);
+                assert_eq!(row.address.as_deref(), Some("172.26.95.99"));
+            }
+        }
+        assert!(ops.writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unavailable_adapter_does_not_complete_a_pending_removal() {
+        let ops = BindingOps::default();
+        for (applied, error) in [(true, None), (false, Some("remove failed".into()))] {
+            let mut row = saved_binding("172.26.95.99");
+            row.desired = crate::config::BindingDesired::Removed;
+            row.applied = applied;
+            row.last_error = error;
+            let action = binding_action(
+                "172.26.95.0/24",
+                &row,
+                None,
+                crate::config::NetworkMode::StaticAuto,
+                &Ok(false),
+                &[],
+            );
+            let row = apply_binding(&ops, row, action, None, || async {
+                panic!("unavailable adapter cannot prove successful removal")
+            })
+            .await;
+            assert_eq!(row.applied, applied, "preserve the last actual observation");
+            assert!(
+                row.last_error.is_some(),
+                "real pending removal stays visible"
+            );
+            assert_eq!(row.desired, crate::config::BindingDesired::Removed);
+        }
+        assert!(ops.writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn completed_removal_is_rechecked_if_the_address_reappears() {
+        let ops = BindingOps::default();
+        let iface = saved_adapter(&["172.26.95.99", "192.168.1.100"]);
+        let mut row = saved_binding("172.26.95.99");
+        row.desired = crate::config::BindingDesired::Removed;
+        row.applied = false;
+        let action = binding_action(
+            "172.26.95.0/24",
+            &row,
+            Some(&iface),
+            crate::config::NetworkMode::StaticAuto,
+            &Ok(false),
+            &[],
+        );
+        assert_eq!(action, BindingAction::Remove(ip("172.26.95.99")));
+        let row = apply_binding(&ops, row, action, Some(&iface), || async {
+            Ok(saved_adapter(&["192.168.1.100"]).ips)
+        })
+        .await;
+        assert!(!row.applied && row.last_error.is_none());
+        assert_eq!(row.desired, crate::config::BindingDesired::Removed);
+        assert_eq!(
+            *ops.writes.lock().unwrap(),
+            vec![(false, ip("172.26.95.99"))]
+        );
+    }
+
+    #[tokio::test]
     async fn dhcp_restore_skips_add_and_static_reapplies_without_restart() {
         let ops = BindingOps::default();
         let mut row = saved_binding("172.31.169.253");
@@ -6024,7 +6137,7 @@ mod tests {
                 &Ok(false),
                 &[]
             ),
-            BindingAction::Hold("selected adapter unavailable".into(), false)
+            BindingAction::Unavailable("selected adapter unavailable".into())
         );
     }
 
