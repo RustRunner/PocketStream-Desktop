@@ -29,7 +29,7 @@ import {
   captureState,
   refreshCaptureState,
   subscribeCaptureState,
-  listeningNoticeAdapter,
+  listeningNoticeReady,
   type ListeningNoticeTrigger,
 } from "./lib/devices.ts";
 import { setupCacheDialog } from "./lib/device-cache.ts";
@@ -148,7 +148,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 // ── Capture listening notice ───────────────────────────────────────
 
 let pendingListeningNotice: ListeningNoticeTrigger = null;
-let openingListeningNotice = false;
+let openingListeningNotice: ListeningNoticeTrigger = null;
 let waitingForNoticeState = false;
 let listeningNoticeRequest = 0;
 
@@ -166,7 +166,8 @@ function setupListeningNotice(): void {
     considerListeningNotice();
   });
   subscribeCaptureState(() => {
-    if (openingListeningNotice && (!captureState.active || !captureState.outcome)) cancelListeningNotice();
+    if (openingListeningNotice && openingListeningNotice !== "launch"
+        && (!captureState.active || !captureState.outcome)) cancelListeningNotice();
     considerListeningNotice();
   });
   void refreshCaptureState().catch((e) => log(`Failed to load capture state: ${formatError(e)}`));
@@ -176,15 +177,18 @@ function armListeningNotice(trigger: ListeningNoticeTrigger, useCurrent: boolean
   cancelListeningNotice();
   const request = listeningNoticeRequest;
   pendingListeningNotice = state.config?.network_mode === "static_auto" ? trigger : null;
-  waitingForNoticeState = !useCurrent;
-  if (useCurrent) considerListeningNotice();
+  waitingForNoticeState = trigger !== "launch" && !useCurrent;
+  if (useCurrent || trigger === "launch") considerListeningNotice();
+  // Launch instructions must paint before adapter enumeration or capture.
+  // The background state subscription still reports discovery readiness.
+  if (trigger === "launch") return;
   void refreshCaptureState().then(() => {
     if (request !== listeningNoticeRequest) return;
     waitingForNoticeState = false;
     considerListeningNotice();
     // A mode Apply already awaited its initial attach. A failed attach
     // must not leave a prompt armed for a later recovery restart.
-    if (trigger !== "launch" && !captureState.active) cancelListeningNotice();
+    if (!captureState.active) cancelListeningNotice();
   }).catch((e) => {
     if (request === listeningNoticeRequest) cancelListeningNotice();
     log(`Failed to load capture state: ${formatError(e)}`);
@@ -200,20 +204,25 @@ function listeningNoticeModeApplied(previous: NetworkMode | null, next: NetworkM
 }
 
 function considerListeningNotice(): void {
-  const adapter = listeningNoticeAdapter(state.config?.network_mode,
+  const ready = listeningNoticeReady(state.config?.network_mode,
     captureState.active && captureState.outcome !== null, pendingListeningNotice, captureState);
   const dialog = $<HTMLDialogElement>("#listening-notice-dialog");
-  if (!adapter || waitingForNoticeState || openingListeningNotice || dialog.open) return;
+  if (!ready || waitingForNoticeState || openingListeningNotice || dialog.open) return;
+  const trigger = pendingListeningNotice;
+  const launch = trigger === "launch";
+  const adapter = captureState.adapter_name;
   const selected = state.activeInterface;
-  $("#listening-notice-adapter").textContent = selected?.name === adapter ? selected.display_name || adapter : adapter;
+  $("#listening-notice-title").textContent = launch
+    ? "Static–Auto device discovery"
+    : `PocketStream is now listening for devices on "${selected?.name === adapter ? selected.display_name || adapter : adapter}".`;
   pendingListeningNotice = null;
-  openingListeningNotice = true;
+  openingListeningNotice = trigger;
   const request = listeningNoticeRequest;
   void showModalWithVideo(dialog, () => request === listeningNoticeRequest
-    && state.config?.network_mode === "static_auto" && captureState.active
-    && captureState.outcome !== null && captureState.adapter_name === adapter)
+    && state.config?.network_mode === "static_auto" && (launch || (captureState.active
+    && captureState.outcome !== null && captureState.adapter_name === adapter)), !launch)
     .catch((e) => log(`Failed to open listening notice: ${formatError(e)}`))
-    .finally(() => { openingListeningNotice = false; considerListeningNotice(); });
+    .finally(() => { openingListeningNotice = null; considerListeningNotice(); });
 }
 
 // ── Auto-updater ───────────────────────────────────────────────────

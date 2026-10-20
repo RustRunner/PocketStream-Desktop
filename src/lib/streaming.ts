@@ -100,14 +100,17 @@ export async function createVideoWindowSynced(bounds: {
  * when no other modal is open. Safe to call when another modal is
  * already open (counter handles nesting). `canOpen` rechecks a cancelable
  * request after video IPC; cancellation releases the reservation too.
+ * A launch notice may skip the IPC wait before any video window exists.
  */
 export async function showModalWithVideo(
   dialog: HTMLDialogElement, canOpen: () => boolean = () => true,
+  waitForVideo = true,
 ): Promise<void> {
   openModalCount++;
   let opened = false;
   try {
-    await syncVideoVisibility();
+    const visibility = syncVideoVisibility();
+    if (waitForVideo) await visibility;
     if (!canOpen()) return;
     dialog.showModal();
     dialog.addEventListener(
