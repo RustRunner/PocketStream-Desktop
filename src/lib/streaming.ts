@@ -98,20 +98,34 @@ export async function createVideoWindowSynced(bounds: {
  *
  * Auto-decrements the counter on `close` so the video can come back
  * when no other modal is open. Safe to call when another modal is
- * already open (counter handles nesting).
+ * already open (counter handles nesting). `canOpen` rechecks a cancelable
+ * request after video IPC; cancellation releases the reservation too.
  */
-export async function showModalWithVideo(dialog: HTMLDialogElement): Promise<void> {
+export async function showModalWithVideo(
+  dialog: HTMLDialogElement, canOpen: () => boolean = () => true,
+): Promise<void> {
   openModalCount++;
-  await syncVideoVisibility();
-  dialog.showModal();
-  dialog.addEventListener(
-    "close",
-    () => {
+  let opened = false;
+  try {
+    await syncVideoVisibility();
+    if (!canOpen()) return;
+    dialog.showModal();
+    dialog.addEventListener(
+      "close",
+      () => {
+        openModalCount = Math.max(0, openModalCount - 1);
+        void syncVideoVisibility();
+      },
+      { once: true }
+    );
+    opened = true;
+  } finally {
+    // Cancellation or a failed show must also release the video reservation.
+    if (!opened) {
       openModalCount = Math.max(0, openModalCount - 1);
-      syncVideoVisibility();
-    },
-    { once: true }
-  );
+      await syncVideoVisibility();
+    }
+  }
 }
 
 // ── Stream controls ─────────────────────────────────────────────────
