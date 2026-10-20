@@ -7,6 +7,7 @@ pub mod firewall;
 pub mod ghost;
 pub mod interface;
 pub mod ip_config;
+pub mod manual_address;
 pub mod ping_dot;
 pub(crate) mod presence;
 // Cross-platform compilable (libloading + extern "system" types build
@@ -2048,7 +2049,7 @@ impl interface::AddressIo for interface::RealAddressIo {
         subnet: &str,
         row: crate::config::AdoptedMeta,
     ) -> Result<(), AppError> {
-        config.set_binding(subnet, row)
+        config.set_binding_intent(subnet, row)
     }
 }
 
@@ -2116,6 +2117,12 @@ impl Drop for AddressTrace {
             }
         );
     }
+}
+
+struct BindingContext<'a> {
+    snapshot: &'a Result<interface::OperationSnapshot, AppError>,
+    mode: crate::config::NetworkMode,
+    trace: Option<&'a AddressTrace>,
 }
 
 struct AddressOps<'a>(
@@ -2594,7 +2601,7 @@ impl NetworkManager {
                 .as_deref()
                 .filter(|_| request.mode != NetworkMode::Dhcp)
             {
-                self.claim_binding_locked(config, ip).await?;
+                self.claim_binding_locked(config, ip, &request.name).await?;
             }
             Ok(())
         }
@@ -2800,7 +2807,7 @@ impl NetworkManager {
         config: &crate::config::AppConfig,
         subnet: &str,
         mut row: crate::config::AdoptedMeta,
-    ) {
+    ) -> crate::config::AdoptedMeta {
         if let Err(e) = self.address_io.persist_binding(config, subnet, row.clone()) {
             row.last_error = Some(format!(
                 "{}; status save failed: {}",
@@ -2833,8 +2840,9 @@ impl NetworkManager {
             live.remove(subnet);
         }
         if let Ok(mut meta) = self.adopted_meta.lock() {
-            meta.insert(subnet.to_string(), row);
+            meta.insert(subnet.to_string(), row.clone());
         }
+        row
     }
 
     async fn reconcile_bindings_locked(&self, config: &crate::config::AppConfig) {
@@ -2850,52 +2858,77 @@ impl NetworkManager {
         if let Some(t) = trace {
             t.phase("preflight");
         }
+        for (subnet, row) in settings.adopted_meta {
+            let context = BindingContext {
+                snapshot: &snapshot,
+                mode: settings.network_mode,
+                trace,
+            };
+            self.reconcile_binding_row(config, &subnet, row, context, || async {
+                let before = snapshot
+                    .as_ref()
+                    .map_err(|e| AppError::Network(e.to_string()))?;
+                Ok(self
+                    .observe_operation_traced(before, trace)
+                    .await?
+                    .selected
+                    .ips)
+            })
+            .await;
+        }
+    }
+
+    async fn reconcile_binding_row<F, Fut>(
+        &self,
+        config: &crate::config::AppConfig,
+        subnet: &str,
+        row: crate::config::AdoptedMeta,
+        context: BindingContext<'_>,
+        observe: F,
+    ) -> crate::config::AdoptedMeta
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Vec<interface::IpInfo>, AppError>>,
+    {
+        let BindingContext {
+            snapshot,
+            mode,
+            trace,
+        } = context;
+        if let (Some(t), Ok(snapshot)) = (trace, snapshot) {
+            t.identity(snapshot, row.prefix);
+        }
+        let mut action = match snapshot {
+            Ok(snapshot) => binding_action(
+                subnet,
+                &row,
+                Some(&snapshot.iface),
+                mode,
+                &Ok(snapshot.selected.dhcp),
+                &interface::native_conflicts(snapshot, self.address_io.as_ref()),
+            ),
+            Err(error) => BindingAction::Unavailable(error.to_string()),
+        };
+        if row.desired == crate::config::BindingDesired::Present
+            && config.get().adopted_subnets.get(subnet) != row.address.as_ref()
+        {
+            action =
+                BindingAction::Hold("saved routing address and metadata disagree".into(), false);
+        }
         let ops = AddressOps(
             self.address_io.as_ref(),
             snapshot.as_ref().ok().map(|s| &s.selected),
         );
-        for (subnet, row) in settings.adopted_meta {
-            if let (Some(t), Ok(snapshot)) = (trace, &snapshot) {
-                t.identity(snapshot, row.prefix);
-            }
-            let action = match &snapshot {
-                Ok(snapshot) => binding_action(
-                    &subnet,
-                    &row,
-                    Some(&snapshot.iface),
-                    settings.network_mode,
-                    &Ok(snapshot.selected.dhcp),
-                    &interface::native_conflicts(snapshot, self.address_io.as_ref()),
-                ),
-                Err(error) => BindingAction::Unavailable(error.to_string()),
-            };
-            let action = if row.desired == crate::config::BindingDesired::Present
-                && settings.adopted_subnets.get(&subnet) != row.address.as_ref()
-            {
-                BindingAction::Hold("saved routing address and metadata disagree".into(), false)
-            } else {
-                action
-            };
-            let iface = snapshot.as_ref().ok().map(|s| &s.iface);
-            let row = apply_binding(&ops, row, action, iface, || async {
-                if let Some(t) = trace {
-                    t.phase("os_command");
-                }
-                let before = snapshot
-                    .as_ref()
-                    .map_err(|e| AppError::Network(e.to_string()))?;
-                let after = self.observe_operation_traced(before, trace).await?;
-                if let Some(t) = trace {
-                    t.phase("observation");
-                }
-                Ok(after.selected.ips)
-            })
-            .await;
-            self.publish_binding(config, &subnet, row).await;
-            if let Some(t) = trace {
-                t.phase("status_save");
-            }
+        let iface = snapshot.as_ref().ok().map(|s| &s.iface);
+        let row = apply_binding(&ops, row, action, iface, observe).await;
+        if let Some(t) = trace {
+            t.phase("observation");
         }
+        let row = self.publish_binding(config, subnet, row).await;
+        if let Some(t) = trace {
+            t.phase("status_save");
+        }
+        row
     }
 
     /// Routes contain only bindings both desired and last observed applied.
@@ -4472,12 +4505,14 @@ impl NetworkManager {
         &self,
         config: &crate::config::AppConfig,
         ip: &str,
+        alias: &str,
     ) -> Result<(), AppError> {
+        let before = config.get().adopted_meta;
         self.address_io.claim(config, ip)?;
         self.pending_ips
             .lock()
             .await
-            .retain(|entry| entry.ip.to_string() != ip);
+            .retain(|entry| entry.ip.to_string() != ip || entry.iface != alias);
         let adapter = config.get().selected_adapter_mac;
         log::info!(
             "event=binding_change adapter_mac={} interface_index={} address={} reason=manual_claim",
@@ -4490,16 +4525,22 @@ impl NetworkManager {
             log_value(ip)
         );
         let saved = config.get().adopted_meta;
+        let claimed: HashSet<_> = before
+            .keys()
+            .filter(|key| !saved.contains_key(*key))
+            .cloned()
+            .collect();
         self.adopted_ips
             .lock()
             .await
-            .retain(|_, value| value.to_string() != ip);
+            .retain(|key, _| !claimed.contains(key));
         if let Ok(mut meta) = self.adopted_meta.lock() {
-            meta.retain(|key, _| saved.contains_key(key));
+            meta.retain(|key, _| !claimed.contains(key));
         }
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn add_manual_address(
         &self,
         config: &crate::config::AppConfig,
@@ -4507,106 +4548,17 @@ impl NetworkManager {
         ip: &str,
         mask: &str,
     ) -> Result<(), AppError> {
-        let trace = AddressTrace::new("add", ip);
-        let _op = self.discovery_op.lock().await;
-        let _pause = self.pause_addresses();
-        let _address = self.address_work.lock().await;
-        trace.phase("admission");
-        let snapshot = self.operation_snapshot_traced(config, Some(&trace)).await?;
-        trace.phase("preflight");
-        if snapshot.iface.name != name || !snapshot.iface.is_up {
-            return Err(AppError::Network(
-                "Selected Ethernet adapter unavailable or changed".into(),
-            ));
-        }
-        let prefix = ip_config::mask_to_prefix(mask)?;
-        trace.identity(&snapshot, Some(prefix));
-        ip.parse::<Ipv4Addr>()
-            .map_err(|_| AppError::Network("Invalid IPv4 address".into()))?;
-        if snapshot.all.iter().any(|a| {
-            a.identity() != snapshot.selected.identity() && a.ips.iter().any(|i| i.address == ip)
-        }) {
-            return Err(AppError::Network(
-                "Address is already assigned to another local adapter".into(),
-            ));
-        }
-        if snapshot.selected.dhcp || config.get_network_mode() == crate::config::NetworkMode::Dhcp {
-            return Err(AppError::Network("adapter is DHCP".into()));
-        }
-        if let Some(existing) = snapshot.iface.ips.iter().find(|a| a.address == ip) {
-            if existing.prefix != prefix {
-                return Err(AppError::Network(
-                    "Address exists with a different prefix".into(),
-                ));
-            }
-        } else {
-            self.address_io.add(&snapshot.selected, ip, mask).await?;
-        }
-        trace.phase("os_command");
-        let after = self
-            .observe_operation_traced(&snapshot, Some(&trace))
-            .await?;
-        trace.phase("observation");
-        if !after
-            .selected
-            .ips
-            .iter()
-            .any(|a| a.address == ip && a.prefix == prefix)
-        {
-            return Err(AppError::Network(
-                "Windows has not confirmed the requested address".into(),
-            ));
-        }
-        self.claim_binding_locked(config, ip).await?;
-        trace.phase("status_save");
-        trace.succeeded();
-        Ok(())
+        self.address_operation(
+            config,
+            manual_address::AddressRequest::Add {
+                name: name.into(),
+                ip: ip.into(),
+                mask: mask.into(),
+            },
+        )
+        .await
+        .legacy_result()
     }
-
-    pub async fn remove_manual_address(
-        &self,
-        config: &crate::config::AppConfig,
-        name: &str,
-        ip: &str,
-    ) -> Result<(), AppError> {
-        let trace = AddressTrace::new("remove_manual", ip);
-        let _op = self.discovery_op.lock().await;
-        let _pause = self.pause_addresses();
-        let _address = self.address_work.lock().await;
-        trace.phase("admission");
-        let snapshot = self.operation_snapshot_traced(config, Some(&trace)).await?;
-        trace.phase("preflight");
-        trace.identity(
-            &snapshot,
-            snapshot
-                .selected
-                .ips
-                .iter()
-                .find(|i| i.address == ip)
-                .map(|i| i.prefix),
-        );
-        if snapshot.iface.name != name || !snapshot.iface.is_up {
-            return Err(AppError::Network(
-                "Selected Ethernet adapter unavailable or changed".into(),
-            ));
-        }
-        if snapshot.iface.ips.iter().any(|a| a.address == ip) {
-            self.address_io.remove(&snapshot.selected, ip).await?;
-        }
-        trace.phase("os_command");
-        let after = self
-            .observe_operation_traced(&snapshot, Some(&trace))
-            .await?;
-        trace.phase("observation");
-        if after.selected.ips.iter().any(|a| a.address == ip) {
-            return Err(AppError::Network(
-                "Windows has not confirmed address removal".into(),
-            ));
-        }
-        trace.succeeded();
-        Ok(())
-    }
-
     async fn selected_write_adapter(
         &self,
         config: &crate::config::AppConfig,
@@ -4621,63 +4573,29 @@ impl NetworkManager {
         Ok(snapshot.iface)
     }
 
+    #[cfg(test)]
     pub async fn remove_adopted_subnet(
         &self,
         config: &crate::config::AppConfig,
         subnet: &str,
-        _iface_hint: Option<&str>,
+        iface_hint: Option<&str>,
     ) -> Result<Ipv4Addr, AppError> {
-        let trace = AddressTrace::new("remove_managed", subnet);
-        let _op = self.discovery_op.lock().await;
-        let _pause = self.pause_addresses();
-        let _address = self.address_work.lock().await;
-        trace.phase("admission");
-        let settings = config.get();
-        let mut row = settings
-            .adopted_meta
-            .get(subnet)
-            .cloned()
-            .ok_or_else(|| AppError::Network("Unknown saved binding".into()))?;
-        let ip = row
+        let reply = self
+            .address_operation(
+                config,
+                manual_address::AddressRequest::RemoveSaved {
+                    subnet: subnet.into(),
+                    hint: iface_hint.map(str::to_owned),
+                },
+            )
+            .await;
+        let address = reply
+            .view
             .address
-            .as_ref()
-            .and_then(|a| a.parse::<Ipv4Addr>().ok())
-            .ok_or_else(|| AppError::Network("Saved binding has an invalid address".into()))?;
-        row.adapter_mac = row.adapter_mac.or(settings.selected_adapter_mac);
-        if row.adapter_mac.is_none() || row.prefix.is_none() {
-            return Err(AppError::Network(
-                "Binding ownership or prefix is unknown; no OS change made".into(),
-            ));
-        }
-        let row = pending_binding_removal(row);
-        // The only entry point to an OS removal: failure here changes nothing.
-        self.address_io
-            .persist_intent(config, subnet, row.clone())?;
-        trace.phase("intent_save");
-        self.adopted_ips.lock().await.remove(subnet);
-        if let Ok(mut meta) = self.adopted_meta.lock() {
-            meta.insert(subnet.to_string(), row);
-        }
-        self.reconcile_temporary_locked(config).await;
-        self.reconcile_bindings_traced(config, Some(&trace)).await;
-        self.presence.bootstrap();
-        let row = self
-            .adopted_meta
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(subnet)
-            .cloned()
-            .unwrap();
-        if row.applied || row.last_error.is_some() {
-            return Err(AppError::Network(format!(
-                "Removal saved; pending removal of {}/{}: {}",
-                ip,
-                row.prefix.unwrap_or(24),
-                row.last_error.as_deref().unwrap_or("address still applied")
-            )));
-        }
-        trace.succeeded();
-        Ok(ip)
+            .parse()
+            .map_err(|_| AppError::Network("Invalid saved address".into()));
+        reply.legacy_result()?;
+        address
     }
 
     /// Only scratch and uncommitted final adds belong to shutdown cleanup.
