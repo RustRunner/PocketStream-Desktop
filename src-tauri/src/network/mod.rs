@@ -475,6 +475,63 @@ fn binding_link_changed(previous: &AdapterSelection, current: &AdapterSelection)
             != current.adapter.as_ref().is_some_and(|i| i.is_up)
 }
 
+#[derive(Debug)]
+enum DiscoveryResume {
+    Idle,
+    RefreshSelection,
+    Start(InterfaceInfo),
+}
+
+/// Cached metadata identifies the selected physical port; native reads supply
+/// current link/index/addresses. Neither UI state nor a Wi-Fi prefix is authority.
+fn discovery_resume_action(
+    mode: crate::config::NetworkMode,
+    available: bool,
+    session_active: bool,
+    selected_mac: Option<&str>,
+    selection: &AdapterSelection,
+    native: Option<(u32, bool, Vec<interface::IpInfo>)>,
+    capture_active: bool,
+) -> DiscoveryResume {
+    if mode == crate::config::NetworkMode::StaticManual || !available {
+        return DiscoveryResume::Idle;
+    }
+    if selected_mac.is_none() && selection.selection_required {
+        return DiscoveryResume::Idle;
+    }
+    let selected = selected_mac.and_then(adapter_mac);
+    if selected.is_none() || selected != selection.selected_mac.as_deref().and_then(adapter_mac) {
+        return DiscoveryResume::RefreshSelection;
+    }
+    let Some((index, up, ips)) = native else {
+        return if selection.adapter.is_some() {
+            DiscoveryResume::RefreshSelection
+        } else {
+            DiscoveryResume::Idle
+        };
+    };
+    let Some(iface) = selection
+        .adapter
+        .as_ref()
+        .filter(|i| interface::is_wired_physical(i) && adapter_mac(&i.mac) == selected)
+    else {
+        return DiscoveryResume::RefreshSelection;
+    };
+    if index == 0 || selection.interface_index != Some(index) {
+        return DiscoveryResume::RefreshSelection;
+    }
+    if session_active {
+        return DiscoveryResume::Idle; // healthy only while the native identity still matches
+    }
+    if !up && capture_active {
+        return DiscoveryResume::Idle; // already listening for the link-up burst
+    }
+    let mut iface = iface.clone();
+    iface.is_up = up;
+    iface.ips = ips;
+    DiscoveryResume::Start(iface)
+}
+
 fn binding_action(
     subnet: &str,
     row: &crate::config::AdoptedMeta,
@@ -657,8 +714,8 @@ pub struct NetworkManager {
     /// each adopt-loop pass), so a listener retained across sessions
     /// keeps an accurate self-filter.
     local_ips: Arc<StdMutex<HashSet<Ipv4Addr>>>,
-    /// Subnets owned exclusively by non-wired interfaces. Shared with
-    /// the capture callback and recomputed at every discovery start.
+    /// Legacy listener exclusions. Activated discovery clears these and
+    /// uses selected-interface scope/verification even on overlapping subnets.
     excluded_subnets: Arc<StdMutex<Vec<ipnetwork::Ipv4Network>>>,
     auto_adopt_handle: Arc<Mutex<Option<AutoAdoptHandle>>>,
     /// Secondary IPs the auto-adopt loop has bound but not yet handed over
@@ -2796,6 +2853,65 @@ impl NetworkManager {
         }
     }
 
+    /// Complete a pre-attach or retry a failed start without UI participation.
+    /// True requests the watcher's normal metadata/identity refresh path.
+    pub(crate) async fn resume_discovery(
+        &self,
+        config: &crate::config::AppConfig,
+        app: &tauri::AppHandle,
+    ) -> Result<bool, AppError> {
+        let Ok(_op) = self.discovery_op.try_lock() else {
+            return Ok(false); // a start, stop or mode transition already owns it
+        };
+        let settings = config.get();
+        if settings.network_mode == crate::config::NetworkMode::StaticManual
+            || !crate::is_discovery_available()
+            || self.presence.stopped()
+        {
+            return Ok(false);
+        }
+        let mut selection = self.adapter_selection_state().await;
+        let native = settings.selected_adapter_mac.as_deref().and_then(|mac| {
+            let (index, link_up) = interface::quick_link_by_mac(mac)?;
+            let (up, ips) = interface::quick_status_by_mac(mac)?;
+            Some((index, link_up && up, ips))
+        });
+        let action = discovery_resume_action(
+            settings.network_mode,
+            crate::is_discovery_available(),
+            self.discovery_active.load(Ordering::Acquire),
+            settings.selected_adapter_mac.as_deref(),
+            &selection,
+            native,
+            self.capture_signal.lock().await.state.active,
+        );
+        match action {
+            DiscoveryResume::Idle => Ok(false),
+            DiscoveryResume::RefreshSelection => Ok(true),
+            DiscoveryResume::Start(mut iface) => {
+                let pending = self.pending_ip_strings().await;
+                iface.ips.retain(|ip| !pending.contains(&ip.address));
+                let up = iface.is_up;
+                log::info!("event=discovery_resume adapter_mac={} interface_index={} phase=start link_up={}",
+                    log_value(&iface.mac), selection.interface_index.unwrap_or(0), up);
+                selection.adapter = Some(iface);
+                self.update_presence_adapter(&selection, settings.network_mode);
+                let result = self
+                    .start_selected_discovery_locked(selection, config, app.clone(), false, true)
+                    .await;
+                if let Err(error) = result {
+                    if up || !self.capture_signal.lock().await.state.active {
+                        return Err(error);
+                    }
+                    log::info!("event=discovery_resume phase=waiting_for_link");
+                } else {
+                    log::info!("event=discovery_resume phase=ready");
+                }
+                Ok(false)
+            }
+        }
+    }
+
     /// String forms of every pending (scratch or not-yet-handed-over)
     /// address, for filtering UI-facing interface enumerations.
     pub(crate) async fn pending_ip_strings(&self) -> HashSet<String> {
@@ -3213,11 +3329,8 @@ impl NetworkManager {
         preserve_capture: bool,
     ) -> Result<(), AppError> {
         // Authoritative mode gate, read under the discovery op lock:
-        // set_network_mode persists the mode before apply_mode_change
-        // serializes on the op, so a start queued behind an Auto→Manual
-        // transition observes Manual here. The frontend fires this on
-        // every reconnect regardless of mode (and swallows the error),
-        // so this is the enforcement point. DHCP mode runs discovery
+        // a start queued behind an Auto→Manual transition observes Manual
+        // here. DHCP mode runs discovery
         // exactly like Static-Auto; only Static-Manual is refused.
         if config.get_network_mode() == crate::config::NetworkMode::StaticManual {
             return Err(AppError::Network(
@@ -3227,12 +3340,43 @@ impl NetworkManager {
 
         let list = self.list_interfaces().await?;
         let selection = self.resolve_adapter_locked(config, &list).await?;
-        let iface_info = selection.adapter.ok_or_else(|| AppError::Network("Selected Ethernet adapter unavailable; select an adapter in Configure when multiple candidates exist".into()))?;
+        let iface_info = selection.adapter.as_ref().ok_or_else(|| AppError::Network("Selected Ethernet adapter unavailable; select an adapter in Configure when multiple candidates exist".into()))?;
         if iface_info.name != interface_display_name || selection.interface_index.is_none() {
             return Err(AppError::Network(
                 "Discovery target does not match the selected Ethernet adapter".into(),
             ));
         }
+
+        self.start_selected_discovery_locked(
+            selection,
+            config,
+            app_handle,
+            refresh,
+            preserve_capture,
+        )
+        .await
+    }
+
+    /// Caller holds discovery_op and has resolved the selected MAC/index.
+    /// Readiness retries use native addresses with validated cached metadata,
+    /// rather than repeating the slow provider query after a link-up burst.
+    async fn start_selected_discovery_locked(
+        &self,
+        selection: AdapterSelection,
+        config: &crate::config::AppConfig,
+        app_handle: tauri::AppHandle,
+        refresh: bool,
+        preserve_capture: bool,
+    ) -> Result<(), AppError> {
+        if config.get_network_mode() == crate::config::NetworkMode::StaticManual {
+            return Err(AppError::Network(
+                "ARP discovery does not run in Static-Manual mode".into(),
+            ));
+        }
+        let iface_info = selection
+            .adapter
+            .ok_or_else(|| AppError::Network("Selected Ethernet adapter unavailable".into()))?;
+        let interface_display_name = iface_info.name.as_str();
 
         // Session-only teardown: a capture listener that is still valid
         // for this adapter is retained and re-evaluated below.
@@ -3299,25 +3443,11 @@ impl NetworkManager {
         }
         let local_ips = self.local_ips.clone();
 
-        // Scope discovery to the wired Ethernet port. The capture backend
-        // is unscoped, so enumerate the subnets owned exclusively by
-        // non-wired interfaces (WiFi/VPN/virtual) and drop ARP for any peer
-        // on them. Prohibited addresses, including APIPA, are rejected
-        // independently by the capture sender gate.
-        let excluded_subnets = ghost::non_wired_interface_networks().await;
-        if excluded_subnets.is_empty() {
-            log::info!("Discovery: no non-wired subnets to exclude");
-        } else {
-            log::info!(
-                "Discovery excluding non-wired (WiFi/VPN/virtual) subnets: {:?}",
-                excluded_subnets
-            );
-        }
-        // Manager-owned shared value: the capture callback reads it per
-        // frame, so a retained listener picks up the refreshed
-        // exclusions without a re-attach.
+        // Activated discovery uses scope proof or fresh selected-interface
+        // resolution, never subnet exclusion as an identity boundary. This
+        // also avoids a second slow provider query before capture can listen.
         if let Ok(mut shared) = self.excluded_subnets.lock() {
-            *shared = excluded_subnets;
+            shared.clear();
         }
 
         let registry = self.device_registry.clone();
@@ -3790,44 +3920,46 @@ impl NetworkManager {
                         }
                     }
 
-                    // Structural-ghost guard: never adopt a subnet owned by an
-                    // up non-wired local interface (WiFi/VPN/virtual), even if
-                    // its ARP reached the unscoped capture. Only candidates
-                    // that already cleared known/adopted/native/cooldown get
-                    // here — i.e. rarely — so the enumeration cost is bounded
-                    // by the two TTLs.
-                    if let Some(until) = ghost_until.get(&device_subnet) {
-                        if std::time::Instant::now() < *until {
+                    if ctx.candidates.is_none() {
+                        // Legacy structural-ghost guard: avoid a subnet owned by an
+                        // up non-wired local interface (WiFi/VPN/virtual), even if
+                        // its ARP reached the unscoped capture. Only candidates
+                        // that already cleared known/adopted/native/cooldown get
+                        // here — i.e. rarely — so the enumeration cost is bounded
+                        // by the two TTLs.
+                        if let Some(until) = ghost_until.get(&device_subnet) {
+                            if std::time::Instant::now() < *until {
+                                continue;
+                            }
+                        }
+                        let ghosts_fresh = cached_ghosts
+                            .as_ref()
+                            .map(|(_, t)| t.elapsed() < GHOST_NETS_TTL)
+                            .unwrap_or(false);
+                        if !ghosts_fresh {
+                            let nets = ghost::non_wired_interface_networks().await;
+                            cached_ghosts = Some((nets, std::time::Instant::now()));
+                        }
+                        let ghost_nets: &[ipnetwork::Ipv4Network] = cached_ghosts
+                            .as_ref()
+                            .map(|(n, _)| n.as_slice())
+                            .unwrap_or(&[]);
+                        if ghost::is_structural_ghost_ip(device_ip, ghost_nets)
+                            || ghost::is_structural_ghost_adoption(&device_subnet, ghost_nets)
+                        {
+                            log::info!(
+                                "Skipping ghost subnet {} (owned by non-wired local interface)",
+                                device_subnet
+                            );
+                            // TTL only — never poison the permanent `known_subnets`
+                            // set, so the subnet is adoptable again after one
+                            // recheck once WiFi/VPN/virtual goes down.
+                            ghost_until.insert(
+                                device_subnet.clone(),
+                                std::time::Instant::now() + GHOST_SUBNET_RECHECK,
+                            );
                             continue;
                         }
-                    }
-                    let ghosts_fresh = cached_ghosts
-                        .as_ref()
-                        .map(|(_, t)| t.elapsed() < GHOST_NETS_TTL)
-                        .unwrap_or(false);
-                    if !ghosts_fresh {
-                        let nets = ghost::non_wired_interface_networks().await;
-                        cached_ghosts = Some((nets, std::time::Instant::now()));
-                    }
-                    let ghost_nets: &[ipnetwork::Ipv4Network] = cached_ghosts
-                        .as_ref()
-                        .map(|(n, _)| n.as_slice())
-                        .unwrap_or(&[]);
-                    if ghost::is_structural_ghost_ip(device_ip, ghost_nets)
-                        || ghost::is_structural_ghost_adoption(&device_subnet, ghost_nets)
-                    {
-                        log::info!(
-                            "Skipping ghost subnet {} (owned by non-wired local interface)",
-                            device_subnet
-                        );
-                        // TTL only — never poison the permanent `known_subnets`
-                        // set, so the subnet is adoptable again after one
-                        // recheck once WiFi/VPN/virtual goes down.
-                        ghost_until.insert(
-                            device_subnet.clone(),
-                            std::time::Instant::now() + GHOST_SUBNET_RECHECK,
-                        );
-                        continue;
                     }
 
                     // All structural gates cleared — now require a second
@@ -4583,14 +4715,9 @@ async fn run_presence_job(
     if own_ips.contains(&job.ip) {
         return None;
     }
-    if job.source.is_none()
-        && ghost::non_wired_interface_networks()
-            .await
-            .iter()
-            .any(|net| net.contains(job.ip))
-    {
-        return None;
-    }
+    // Even a prefix also used by Wi-Fi may contain an Ethernet peer.
+    // Foreign candidates still require mode-gated scratch work and fresh
+    // selected-index resolution below; a Wi-Fi-only sender cannot promote.
     let emitter = manager.emitter().await?;
     let ctx = AdoptionCtx {
         iface_name: adapter.name.clone(),
@@ -4765,7 +4892,7 @@ fn import_neighbors(
         }
         if crate::validation::prohibited_camera_ip(ip)
             || local_ips.contains(&ip)
-            || excluded.iter().any(|net| net.contains(ip))
+            || (candidates.is_none() && excluded.iter().any(|net| net.contains(ip)))
         {
             continue;
         }
@@ -4812,6 +4939,271 @@ fn merge_adopted_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn discovery_selection(up: bool) -> AdapterSelection {
+        let mut iface = saved_adapter(&["192.168.1.100"]);
+        iface.is_up = up;
+        AdapterSelection {
+            selected_mac: Some(iface.mac.clone()),
+            adapter: Some(iface),
+            interface_index: Some(7),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn discovery_completes_pre_attach_on_native_up_without_an_identity_change() {
+        let selection = discovery_selection(false);
+        let ips = saved_adapter(&["192.168.1.100"]).ips;
+        let decide = |up, capture| {
+            discovery_resume_action(
+                crate::config::NetworkMode::StaticAuto,
+                true,
+                false,
+                selection.selected_mac.as_deref(),
+                &selection,
+                Some((7, up, ips.clone())),
+                capture,
+            )
+        };
+        assert!(matches!(decide(false, true), DiscoveryResume::Idle));
+        assert!(matches!(decide(false, false), DiscoveryResume::Start(i) if !i.is_up));
+        assert!(
+            matches!(decide(true, true), DiscoveryResume::Start(i) if i.is_up && i.ips[0].address == "192.168.1.100")
+        );
+        // A rejected start never marks the session active, so the same native
+        // state remains eligible on the next timer without another event.
+        assert!(matches!(decide(true, true), DiscoveryResume::Start(_)));
+    }
+
+    #[test]
+    fn discovery_retry_preserves_mode_identity_and_healthy_session_gates() {
+        use crate::config::NetworkMode::{StaticAuto, StaticManual};
+        let selection = discovery_selection(true);
+        let native = Some((7, true, selection.adapter.as_ref().unwrap().ips.clone()));
+        for (mode, available, active) in [
+            (StaticManual, true, false),
+            (StaticAuto, false, false),
+            (StaticAuto, true, true),
+        ] {
+            assert!(matches!(
+                discovery_resume_action(
+                    mode,
+                    available,
+                    active,
+                    selection.selected_mac.as_deref(),
+                    &selection,
+                    native.clone(),
+                    true
+                ),
+                DiscoveryResume::Idle
+            ));
+        }
+        for active in [false, true] {
+            assert!(matches!(
+                discovery_resume_action(
+                    StaticAuto,
+                    true,
+                    active,
+                    selection.selected_mac.as_deref(),
+                    &selection,
+                    Some((8, true, vec![])),
+                    true
+                ),
+                DiscoveryResume::RefreshSelection
+            ));
+        }
+        assert!(matches!(
+            discovery_resume_action(
+                StaticAuto,
+                true,
+                false,
+                Some("40:cd:3a:00:00:02"),
+                &selection,
+                native,
+                true
+            ),
+            DiscoveryResume::RefreshSelection
+        ));
+        let mut absent = selection.clone();
+        absent.adapter = None;
+        absent.interface_index = None;
+        assert!(matches!(
+            discovery_resume_action(
+                StaticAuto,
+                true,
+                false,
+                absent.selected_mac.as_deref(),
+                &absent,
+                None,
+                false
+            ),
+            DiscoveryResume::Idle
+        ));
+        assert!(matches!(
+            discovery_resume_action(
+                StaticAuto,
+                true,
+                false,
+                absent.selected_mac.as_deref(),
+                &absent,
+                Some((7, true, vec![])),
+                false
+            ),
+            DiscoveryResume::RefreshSelection
+        ));
+        absent.selected_mac = None;
+        absent.selection_required = true;
+        assert!(matches!(
+            discovery_resume_action(StaticAuto, true, false, None, &absent, None, false),
+            DiscoveryResume::Idle
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_prefix_neighbors_require_fresh_ethernet_proof_and_never_persist_wifi() {
+        use cache_probe::tests::MockProbeIo;
+        let manager = NetworkManager::new();
+        let selection = discovery_selection(true);
+        manager
+            .presence
+            .update(&selection, crate::config::NetworkMode::StaticAuto);
+        manager.presence.tick(&manager.registry());
+        let snapshot = manager.presence.snapshot();
+        let ingress = manager
+            .candidate_ingress(
+                7,
+                parse_mac_bytes(selection.selected_mac.as_deref().unwrap()),
+            )
+            .unwrap();
+        let camera = "192.168.1.204".parse().unwrap();
+        let wifi = "192.168.1.1".parse().unwrap();
+        let peer = "40:cd:3a:03:8f:3f";
+        let mut legacy = HashMap::new();
+        let local = ["192.168.1.100".parse().unwrap()].into_iter().collect();
+        let excluded = ["192.168.1.0/24".parse().unwrap()];
+        let imported = import_neighbors(
+            vec![
+                (camera, peer.into()),
+                (wifi, "aa:bb:cc:dd:ee:04".into()),
+                ("169.254.10.2".parse().unwrap(), peer.into()),
+                ("192.168.1.100".parse().unwrap(), peer.into()),
+            ],
+            &mut legacy,
+            &excluded,
+            &local,
+            &snapshot.fence,
+            Some(&ingress),
+        );
+        assert!(imported.is_empty() && legacy.is_empty());
+        assert!(manager.registry().snapshot().is_empty());
+        let candidates = manager.candidates.snapshot(std::time::Instant::now());
+        assert_eq!(candidates.len(), 2);
+        import_neighbors(
+            vec![("192.168.1.205".parse().unwrap(), peer.into())],
+            &mut legacy,
+            &excluded,
+            &local,
+            &fence(1, 2, true),
+            Some(&ingress),
+        );
+        assert_eq!(manager.candidates.count(std::time::Instant::now()), 2);
+        let mut clock = presence::Clock::default();
+        let mut io = MockProbeIo::new();
+        io.answers.insert(camera, peer.into());
+        for _ in 0..2 {
+            let job = clock
+                .next(&snapshot, &manager.registry().snapshot(), &candidates)
+                .unwrap();
+            assert_eq!(job.source, Some("192.168.1.100".parse().unwrap()));
+            if let Some(proof) = presence::verify(&mut io, &job, &snapshot).await {
+                let device = ArpDevice {
+                    ip: proof.ip.to_string(),
+                    mac: proof.mac.clone(),
+                    subnet: subnet_key_for(proof.ip),
+                    first_seen: proof.wall.clone(),
+                    last_seen: proof.wall.clone(),
+                };
+                manager.registry().merge_verified(
+                    &device,
+                    selection.selected_mac.as_deref().unwrap(),
+                    &proof.wall,
+                    &snapshot.fence,
+                );
+                clock.verified(&proof.mac);
+            }
+        }
+        assert_eq!(io.resolved_indices, [7, 7]);
+        assert!(!io.events.iter().any(|e| e.starts_with("bind")));
+        let records = manager.registry().snapshot();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].ip, camera.to_string());
+        assert_eq!(records[0].status, DeviceStatus::Live);
+        assert!(manager.registry().cache_record(peer).is_some());
+        assert!(manager
+            .registry()
+            .cache_record("aa:bb:cc:dd:ee:04")
+            .is_none());
+        // A successful response attributed to the wrong source/index is also
+        // insufficient; it cannot rescue the Wi-Fi observation.
+        io.source_index = 8;
+        io.answers.insert(wifi, "aa:bb:cc:dd:ee:04".into());
+        let job = presence::Job {
+            key: None,
+            ip: wifi,
+            source: Some("192.168.1.100".parse().unwrap()),
+        };
+        assert!(presence::verify(&mut io, &job, &snapshot).await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn foreign_shared_prefix_candidates_require_auto_mode_and_fresh_proof() {
+        use crate::config::NetworkMode::{Dhcp, StaticAuto, StaticManual};
+        use cache_probe::tests::MockProbeIo;
+        for mode in [StaticAuto, Dhcp, StaticManual] {
+            let manager = NetworkManager::new();
+            let mut selection = discovery_selection(true);
+            selection.adapter.as_mut().unwrap().ips = saved_adapter(&["10.3.1.10"]).ips;
+            manager.presence.update(&selection, mode);
+            manager.presence.tick(&manager.registry());
+            let snapshot = manager.presence.snapshot();
+            let ingress = manager
+                .candidate_ingress(
+                    7,
+                    parse_mac_bytes(selection.selected_mac.as_deref().unwrap()),
+                )
+                .unwrap();
+            let camera = "192.168.1.204".parse().unwrap();
+            let peer = "40:cd:3a:03:8f:3f";
+            import_neighbors(
+                vec![(camera, peer.into())],
+                &mut HashMap::new(),
+                &["192.168.1.0/24".parse().unwrap()],
+                &HashSet::new(),
+                &snapshot.fence,
+                Some(&ingress),
+            );
+            let candidates = manager.candidates.snapshot(std::time::Instant::now());
+            let job = presence::Clock::default().next(&snapshot, &[], &candidates);
+            if mode != StaticAuto {
+                assert!(job.is_none());
+                continue;
+            }
+            let job = job.unwrap();
+            assert_eq!(job.source, None);
+            let mut io = MockProbeIo::new();
+            assert!(presence::verify(&mut io, &job, &snapshot).await.is_none());
+            assert!(io.bound.is_empty());
+            assert!(!io.events.iter().any(|event| event.starts_with("adopt")));
+            assert!(manager.registry().snapshot().is_empty());
+            io.answers.insert(camera, peer.into());
+            let proof = presence::verify(&mut io, &job, &snapshot).await.unwrap();
+            assert_eq!(proof.mac, peer);
+            assert_eq!(io.resolved_indices, [7, 7]);
+            assert!(io.bound.is_empty());
+            assert!(io.events.iter().any(|event| event.starts_with("adopt")));
+        }
+    }
 
     #[test]
     fn diagnostic_values_escape_field_and_line_injection() {
