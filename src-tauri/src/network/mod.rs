@@ -2896,6 +2896,7 @@ impl NetworkManager {
                     log_value(&iface.mac), selection.interface_index.unwrap_or(0), up);
                 selection.adapter = Some(iface);
                 self.update_presence_adapter(&selection, settings.network_mode);
+                watcher::emit_selection(app, &selection);
                 let result = self
                     .start_selected_discovery_locked(selection, config, app.clone(), false, true)
                     .await;
