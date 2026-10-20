@@ -1450,9 +1450,7 @@ fn read_key() -> std::io::Result<Option<([u8; 32], bool)>> {
 /// Write the 32-byte key, DPAPI-wrapped on Windows, via `atomic_write`
 /// (the previous plain `fs::write` could leave a truncated key on a
 /// mid-write crash).
-fn write_key(key: &[u8; 32]) -> Result<(), crate::AppError> {
-    let path = key_path();
-
+fn write_key_to(path: &Path, key: &[u8; 32]) -> Result<(), crate::AppError> {
     let on_disk: Vec<u8> = {
         #[cfg(windows)]
         {
@@ -1466,7 +1464,7 @@ fn write_key(key: &[u8; 32]) -> Result<(), crate::AppError> {
         }
     };
 
-    atomic_write(&path, &on_disk).map_err(|e| crate::AppError::Config(e.to_string()))?;
+    atomic_write(path, &on_disk).map_err(|e| crate::AppError::Config(e.to_string()))?;
 
     // Restrict the key file to the current user. On Windows the DPAPI
     // wrap already binds it to the user account (and AppData inherits a
@@ -1475,7 +1473,7 @@ fn write_key(key: &[u8; 32]) -> Result<(), crate::AppError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = fs::set_permissions(&path, fs::Permissions::from_mode(0o600)) {
+        if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
             log::warn!("Failed to chmod 0600 on key file {}: {}", path.display(), e);
         }
     }
@@ -1484,13 +1482,17 @@ fn write_key(key: &[u8; 32]) -> Result<(), crate::AppError> {
 }
 
 fn get_or_create_key() -> Result<Vec<u8>, crate::AppError> {
-    match read_key() {
+    get_or_create_key_at(&key_path())
+}
+
+fn get_or_create_key_at(path: &Path) -> Result<Vec<u8>, crate::AppError> {
+    match read_key_from(path) {
         Ok(Some((key, needs_rewrap))) => {
             if needs_rewrap {
                 // Upgrade a legacy unprotected key to DPAPI in place. The
                 // key bytes are unchanged, so existing ciphertext stays
                 // valid; a failure is non-fatal (keep using the raw key).
-                if let Err(e) = write_key(&key) {
+                if let Err(e) = write_key_to(path, &key) {
                     log::warn!("Failed to upgrade encryption key to DPAPI: {}", e);
                 }
             }
@@ -1499,7 +1501,7 @@ fn get_or_create_key() -> Result<Vec<u8>, crate::AppError> {
         Ok(None) => {
             let mut key = [0u8; 32];
             rand::thread_rng().fill_bytes(&mut key);
-            write_key(&key)?;
+            write_key_to(path, &key)?;
             Ok(key.to_vec())
         }
         // Transient read failure — do NOT regenerate (that would orphan
@@ -1956,17 +1958,12 @@ password = ""
     // ── Key Management ──────────────────────────────────────────────
 
     #[test]
-    #[cfg_attr(not(target_os = "windows"), ignore)]
     fn get_or_create_key_returns_stable_32_bytes() {
-        // Uses the real config dir (%APPDATA%/PocketStream/.key), so length
-        // and stability are asserted in ONE test: as two separate tests
-        // they ran in parallel and raced to create the shared key file on
-        // a fresh machine, each overwriting the other's freshly-generated
-        // key (locally it passed only because the file already existed).
-        // Skipped on non-Windows where the config dir isn't present.
-        let k1 = get_or_create_key().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".key");
+        let k1 = get_or_create_key_at(&path).unwrap();
         assert_eq!(k1.len(), 32, "key should be 32 bytes");
-        let k2 = get_or_create_key().unwrap();
+        let k2 = get_or_create_key_at(&path).unwrap();
         assert_eq!(k1, k2, "same key should be returned on subsequent calls");
     }
 
