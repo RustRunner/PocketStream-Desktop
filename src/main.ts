@@ -165,7 +165,10 @@ function setupListeningNotice(): void {
     dialog.close();
     considerListeningNotice();
   });
-  subscribeCaptureState(() => considerListeningNotice());
+  subscribeCaptureState(() => {
+    if (openingListeningNotice && (!captureState.active || !captureState.outcome)) cancelListeningNotice();
+    considerListeningNotice();
+  });
   void refreshCaptureState().catch((e) => log(`Failed to load capture state: ${formatError(e)}`));
 }
 
@@ -205,8 +208,12 @@ function considerListeningNotice(): void {
   $("#listening-notice-adapter").textContent = selected?.name === adapter ? selected.display_name || adapter : adapter;
   pendingListeningNotice = null;
   openingListeningNotice = true;
-  void showModalWithVideo(dialog).catch((e) => log(`Failed to open listening notice: ${formatError(e)}`))
-    .finally(() => { openingListeningNotice = false; });
+  const request = listeningNoticeRequest;
+  void showModalWithVideo(dialog, () => request === listeningNoticeRequest
+    && state.config?.network_mode === "static_auto" && captureState.active
+    && captureState.outcome !== null && captureState.adapter_name === adapter)
+    .catch((e) => log(`Failed to open listening notice: ${formatError(e)}`))
+    .finally(() => { openingListeningNotice = false; considerListeningNotice(); });
 }
 
 // ── Auto-updater ───────────────────────────────────────────────────
