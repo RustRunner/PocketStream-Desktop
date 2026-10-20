@@ -1002,7 +1002,6 @@ struct AdoptionCtx {
     adapter_mac: String,
     interface_index: u32,
     candidates: Option<arp::CandidateIngress>,
-    ops: auto_adopt::RealAdoptOps,
     app_handle: tauri::AppHandle,
     adopted: Arc<Mutex<HashMap<String, Ipv4Addr>>>,
     pending_ips: auto_adopt::PendingIps,
@@ -1085,6 +1084,7 @@ async fn attempt_adoption(
     use tauri::Manager;
 
     let config = ctx.app_handle.state::<crate::config::AppConfig>();
+    let ops = auto_adopt::PendingAdoptOps::new(&config, &ctx.adapter_mac, auto_adopt::RealAdoptOps);
     if ctx.fence.is_stale()
         || ctx.address_fence.is_stale()
         || config.get().adopted_meta.contains_key(device_subnet)
@@ -1114,7 +1114,7 @@ async fn attempt_adoption(
     let outcome = tokio::time::timeout(
         ADOPT_MAX_TOTAL,
         auto_adopt::adopt_subnet(
-            &ctx.ops,
+            &ops,
             &ctx.iface_name,
             device_ip,
             current_ips,
@@ -1138,7 +1138,7 @@ async fn attempt_adoption(
                 ADOPT_MAX_TOTAL.as_secs(),
                 started.elapsed().as_secs()
             );
-            auto_adopt::reconcile_pending(&ctx.ops, &ctx.pending_ips, Some(adoption_id)).await;
+            auto_adopt::reconcile_pending(&ops, &ctx.pending_ips, Some(adoption_id)).await;
             let next_backoff = cooldowns
                 .get(device_subnet)
                 .map(|(_, b)| (*b * 2).min(COOLDOWN_MAX))
@@ -1160,7 +1160,7 @@ async fn attempt_adoption(
                     device_subnet,
                     adopted_ip
                 );
-                auto_adopt::reconcile_pending(&ctx.ops, &ctx.pending_ips, Some(adoption_id)).await;
+                auto_adopt::reconcile_pending(&ops, &ctx.pending_ips, Some(adoption_id)).await;
                 return AdoptionAttemptOutcome::ShutdownRace;
             }
             let adoption_wall = chrono::Utc::now().to_rfc3339();
@@ -1200,7 +1200,7 @@ async fn attempt_adoption(
             .await
             {
                 log::warn!("Adoption commit failed for {}: {}", device_subnet, e);
-                auto_adopt::reconcile_pending(&ctx.ops, &ctx.pending_ips, Some(adoption_id)).await;
+                auto_adopt::reconcile_pending(&ops, &ctx.pending_ips, Some(adoption_id)).await;
                 return AdoptionAttemptOutcome::Failed;
             }
             cooldowns.remove(device_subnet);
@@ -1289,7 +1289,7 @@ async fn attempt_adoption(
             // whose release failed; reconcile this id to catch that.
             // Cooldown instead of a permanent blacklist so a transient
             // failure is retried.
-            auto_adopt::reconcile_pending(&ctx.ops, &ctx.pending_ips, Some(adoption_id)).await;
+            auto_adopt::reconcile_pending(&ops, &ctx.pending_ips, Some(adoption_id)).await;
             let next_backoff = cooldowns
                 .get(device_subnet)
                 .map(|(_, b)| (*b * 2).min(COOLDOWN_MAX))
@@ -1381,6 +1381,11 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
     async fn bind_scratch(&mut self, subnet: &str, scratch: Ipv4Addr) -> bool {
         use tauri::Manager;
         let config = self.ctx.app_handle.state::<crate::config::AppConfig>();
+        let ops = auto_adopt::PendingAdoptOps::new(
+            &config,
+            &self.ctx.adapter_mac,
+            auto_adopt::RealAdoptOps,
+        );
         if self.shutdown()
             || self.ctx.address_fence.is_stale()
             || config.get().adopted_meta.contains_key(subnet)
@@ -1398,7 +1403,7 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
 
         let id = self.ctx.adoption_seq.fetch_add(1, Ordering::Relaxed) + 1;
         match auto_adopt::bind_scratch(
-            &self.ctx.ops,
+            &ops,
             &self.ctx.pending_ips,
             &self.ctx.iface_name,
             scratch,
@@ -1437,9 +1442,16 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
     }
 
     async fn release_scratch(&mut self, _subnet: &str, scratch: Ipv4Addr) {
+        use tauri::Manager;
+        let config = self.ctx.app_handle.state::<crate::config::AppConfig>();
+        let ops = auto_adopt::PendingAdoptOps::new(
+            &config,
+            &self.ctx.adapter_mac,
+            auto_adopt::RealAdoptOps,
+        );
         if let Some(id) = self.scratch_id.take() {
             auto_adopt::release_scratch(
-                &self.ctx.ops,
+                &ops,
                 &self.ctx.pending_ips,
                 &self.ctx.iface_name,
                 scratch,
@@ -2305,6 +2317,7 @@ impl NetworkManager {
         }
         .await;
         // Even partial OS/config failure is followed by a fresh observation.
+        self.reconcile_temporary_locked(config).await;
         self.reconcile_bindings_locked(config).await;
         let mode = config.get_network_mode();
         self.update_presence_adapter(&self.adapter_selection_state().await, mode);
@@ -2474,6 +2487,7 @@ impl NetworkManager {
         let _op = self.discovery_op.lock().await;
         let pause = self.pause_addresses();
         let _address = self.address_work.lock().await;
+        self.reconcile_temporary_locked(config).await;
         self.reconcile_bindings_locked(config).await;
         drop(_address);
         drop(pause);
@@ -2651,6 +2665,7 @@ impl NetworkManager {
         if binding_link_changed(&previous, &selection) {
             let _pause = self.pause_addresses();
             let _address = self.address_work.lock().await;
+            self.reconcile_temporary_locked(config).await;
             self.reconcile_bindings_locked(config).await;
             self.presence.bootstrap();
         }
@@ -3466,7 +3481,6 @@ impl NetworkManager {
                 adapter_mac: binding_mac,
                 interface_index,
                 candidates: candidates_for_adopt,
-                ops: auto_adopt::RealAdoptOps,
                 app_handle: app_handle_for_adopt.clone(),
                 adopted: adopted.clone(),
                 pending_ips: pending_ips.clone(),
@@ -3992,7 +4006,12 @@ impl NetworkManager {
         // but unrecorded — scratch probes and final adds that never reached
         // adopted_ips. Best-effort; failures are logged and retried next stop.
         if let Ok(_address) = self.address_work.try_lock() {
-            auto_adopt::reconcile_pending(&auto_adopt::RealAdoptOps, &self.pending_ips, None).await;
+            let app = self.capture_signal.lock().await.app.clone();
+            if let Some(app) = app {
+                use tauri::Manager;
+                self.reconcile_temporary_locked(&app.state::<crate::config::AppConfig>())
+                    .await;
+            }
         }
     }
 
@@ -4069,6 +4088,10 @@ impl NetworkManager {
         ip: &str,
     ) -> Result<(), AppError> {
         config.claim_binding(ip)?;
+        self.pending_ips
+            .lock()
+            .await
+            .retain(|entry| entry.ip.to_string() != ip);
         let adapter = config.get().selected_adapter_mac;
         log::info!(
             "event=binding_change adapter_mac={} interface_index={} address={} reason=manual_claim",
@@ -4184,6 +4207,7 @@ impl NetworkManager {
         if let Ok(mut meta) = self.adopted_meta.lock() {
             meta.insert(subnet.to_string(), row);
         }
+        self.reconcile_temporary_locked(config).await;
         self.reconcile_bindings_locked(config).await;
         self.presence.bootstrap();
         let row = self
@@ -4206,10 +4230,83 @@ impl NetworkManager {
 
     /// Only scratch and uncommitted final adds belong to shutdown cleanup.
     /// Committed addresses remain in Windows and in config, including APIPA.
-    pub async fn cleanup_adopted_ips(&self) {
-        self.cleanup_pending_with(&auto_adopt::RealAdoptOps).await;
+    pub async fn cleanup_adopted_ips(&self, config: &crate::config::AppConfig) {
+        let _pause = self.pause_addresses();
+        let _address = self.address_work.lock().await;
+        self.reconcile_temporary_locked(config).await;
     }
 
+    async fn reconcile_temporary_locked(&self, config: &crate::config::AppConfig) {
+        use auto_adopt::AdoptOps;
+        let saved = config.get().pending_addresses;
+        if saved.is_empty() {
+            return;
+        }
+        let adapters = match interface::list_all_adapters().await {
+            Ok(list) => list,
+            Err(e) => {
+                log::warn!("Temporary address cleanup waiting for adapter enumeration: {e}");
+                return;
+            }
+        };
+        for row in saved {
+            let Some(ip) = row
+                .address
+                .parse::<Ipv4Addr>()
+                .ok()
+                .filter(|ip| !crate::validation::prohibited_camera_ip(*ip))
+            else {
+                continue;
+            };
+            if row.prefix != 24 || adapter_mac(&row.adapter_mac).is_none() {
+                continue;
+            }
+            let owners: Vec<_> = adapters
+                .iter()
+                .filter(|a| {
+                    adapter_candidate(a) && adapter_mac(&a.mac) == adapter_mac(&row.adapter_mac)
+                })
+                .collect();
+            let [iface] = owners.as_slice() else {
+                continue;
+            };
+            if iface
+                .ips
+                .iter()
+                .any(|a| a.address == row.address && a.prefix == row.prefix)
+            {
+                let mut pending = self.pending_ips.lock().await;
+                if !pending.iter().any(|p| p.iface == iface.name && p.ip == ip) {
+                    pending.push(auto_adopt::PendingIp {
+                        iface: iface.name.clone(),
+                        ip,
+                        adoption_id: self.adoption_seq.fetch_add(1, Ordering::Relaxed) + 1,
+                    });
+                }
+            }
+            let ops = auto_adopt::PendingAdoptOps::new(
+                config,
+                &row.adapter_mac,
+                auto_adopt::RealAdoptOps,
+            );
+            if let Err(e) = ops.remove(&iface.name, ip).await {
+                log::warn!(
+                    "Temporary address {}/{} on {} cleanup pending: {}",
+                    ip,
+                    row.prefix,
+                    row.adapter_mac,
+                    e
+                );
+            }
+        }
+        let remaining = config.get().pending_addresses;
+        self.pending_ips
+            .lock()
+            .await
+            .retain(|p| remaining.iter().any(|r| r.address == p.ip.to_string()));
+    }
+
+    #[cfg(test)]
     async fn cleanup_pending_with<O: auto_adopt::AdoptOps>(&self, ops: &O) {
         let _pause = self.pause_addresses();
         let _address = self.address_work.lock().await;
@@ -4485,7 +4582,6 @@ async fn run_presence_job(
         adapter_mac: adapter.mac.clone(),
         interface_index: snapshot.index,
         candidates: manager.candidate_ingress(snapshot.index, parse_mac_bytes(&adapter.mac)),
-        ops: auto_adopt::RealAdoptOps,
         app_handle: app.clone(),
         adopted: manager.adopted_ips.clone(),
         pending_ips: manager.pending_ips.clone(),

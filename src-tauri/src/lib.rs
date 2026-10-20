@@ -606,7 +606,7 @@ pub fn run() {
                     manager.stop_ping_dot().await;
                     tokio::time::timeout(
                         std::time::Duration::from_secs(5),
-                        manager.cleanup_adopted_ips(),
+                        manager.cleanup_adopted_ips(&app_handle.state::<config::AppConfig>()),
                     )
                     .await
                 });
