@@ -4,9 +4,8 @@ use crate::error::AppError;
 
 /// Assign a static IP address to a network interface.
 ///
-/// `preserve_secondaries` are addresses (e.g. adopted rescue IPs) that
-/// must survive the set — the primary set wipes every address on the
-/// adapter, so any of these still present get re-added afterward.
+/// Preserve all other observed addresses: ownership cannot be inferred
+/// from enumeration order, and user-managed secondaries must survive Apply.
 ///
 /// Platform-specific implementation:
 /// - Windows: uses `netsh interface ip set address`
@@ -16,7 +15,6 @@ pub async fn assign_static_ip(
     ip: &str,
     subnet_mask: &str,
     gateway: Option<&str>,
-    preserve_secondaries: &[Ipv4Addr],
 ) -> Result<(), AppError> {
     super::interface::validate_interface_name(interface).await?;
     validate_ip(ip)?;
@@ -27,18 +25,16 @@ pub async fn assign_static_ip(
 
     #[cfg(target_os = "windows")]
     {
-        assign_windows(interface, ip, subnet_mask, gateway, preserve_secondaries).await
+        assign_windows(interface, ip, subnet_mask, gateway).await
     }
 
     #[cfg(target_os = "linux")]
     {
-        let _ = preserve_secondaries;
         assign_linux(interface, ip, subnet_mask, gateway).await
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
-        let _ = preserve_secondaries;
         Err(AppError::Network("Unsupported platform".into()))
     }
 }
@@ -49,7 +45,6 @@ async fn assign_windows(
     ip: &str,
     subnet_mask: &str,
     gateway: Option<&str>,
-    preserve_secondaries: &[Ipv4Addr],
 ) -> Result<(), AppError> {
     // Snapshot BEFORE the set. Propagate a snapshot failure instead of
     // treating it as an empty adapter: the old unwrap_or_default() would
@@ -57,22 +52,12 @@ async fn assign_windows(
     // adopted rescue IP) when the set below replaces all addresses.
     let info = super::interface::get_by_name(interface).await?;
 
-    // Choose which addresses to re-add by explicit membership in the
-    // preserve set — NOT by position. Enumeration order isn't guaranteed
-    // (so `.skip(1)` could re-add the real primary as a secondary), and
-    // PrefixOrigin marks adopted and user statics both Manual, so origin
-    // can't classify them either. The new primary is excluded.
+    // Snapshot every address immediately before the set, including external
+    // additions since the dialog opened. Only the explicitly chosen IP changes.
     let to_restore: Vec<super::interface::IpInfo> = info
         .ips
         .into_iter()
-        .filter(|sec| {
-            sec.address != ip
-                && sec
-                    .address
-                    .parse::<Ipv4Addr>()
-                    .map(|a| preserve_secondaries.contains(&a))
-                    .unwrap_or(false)
-        })
+        .filter(|sec| sec.address != ip)
         .collect();
 
     // Preserve the existing default gateway when the caller didn't
@@ -83,7 +68,7 @@ async fn assign_windows(
     // with it off-subnet connectivity. Look the current one up and
     // feed it back in. An explicit gateway from the caller still wins.
     let preserved_gw: Option<String> = if gateway.is_none() {
-        current_default_gateway(interface).await
+        current_default_gateway(interface).await?
     } else {
         None
     };
@@ -105,44 +90,42 @@ async fn assign_windows(
     }
     run_command("netsh", &args).await?;
 
-    // Re-add the preserved secondaries wiped by the set (in parallel).
-    // netsh add works here because the interface is now static.
-    let mut tasks = Vec::new();
+    // Drain every restore even after an error. No detached task may keep
+    // changing addresses after the transition releases its serialization lock.
+    let mut first_error = None;
     for sec in &to_restore {
         let mask = prefix_to_mask(sec.prefix);
-        let iface = interface.to_string();
-        let addr = sec.address.clone();
-        tasks.push(tokio::spawn(async move {
-            let name_arg = format!("name={}", iface);
-            if let Err(e) = run_command(
-                "netsh",
-                &["interface", "ip", "add", "address", &name_arg, &addr, &mask],
-            )
-            .await
-            {
-                log::warn!("Failed to restore secondary IP {}: {}", addr, e);
-            }
-        }));
+        let name_arg = format!("name={}", interface);
+        if let Err(error) = run_command(
+            "netsh",
+            &[
+                "interface",
+                "ip",
+                "add",
+                "address",
+                &name_arg,
+                &sec.address,
+                &mask,
+            ],
+        )
+        .await
+        {
+            first_error.get_or_insert(error);
+        }
     }
-    for task in tasks {
-        let _ = task.await;
-    }
-
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 /// The interface's current IPv4 default gateway, if it has one.
 ///
 /// Locale-invariant: `Get-NetRoute` yields the raw NextHop IP, so no
-/// text parsing against a localized `netsh`/`ipconfig` layout. Any
-/// failure (no route, hung shell, parse miss) returns None — the caller
-/// then simply sets the address without a gateway, matching the prior
-/// behavior.
+/// text parsing against localized output. A missing route is distinct
+/// from a failed query: failure must not silently clear an existing gateway.
 #[cfg(target_os = "windows")]
-async fn current_default_gateway(interface: &str) -> Option<String> {
+async fn current_default_gateway(interface: &str) -> Result<Option<String>, AppError> {
     let script = format!(
-        "Get-NetRoute -InterfaceAlias '{}' -DestinationPrefix '0.0.0.0/0' \
-         -AddressFamily IPv4 -ErrorAction SilentlyContinue | \
+        "$ErrorActionPreference='Stop'; Get-NetRoute -AddressFamily IPv4 -ErrorAction Stop | \
+         Where-Object {{ $_.InterfaceAlias -eq '{}' -and $_.DestinationPrefix -eq '0.0.0.0/0' }} | \
          Select-Object -ExpandProperty NextHop -First 1",
         interface.replace('\'', "''")
     );
@@ -152,22 +135,26 @@ async fn current_default_gateway(interface: &str) -> Option<String> {
         .output();
     let output = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
         .await
-        .ok()?
-        .ok()?;
+        .map_err(|_| AppError::Network("Default gateway query timed out".into()))?
+        .map_err(|e| AppError::Network(format!("Default gateway query failed: {e}")))?;
     if !output.status.success() {
-        return None;
+        return Err(AppError::Network(format!(
+            "Default gateway query failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
     }
     let gw = String::from_utf8_lossy(&output.stdout).trim().to_string();
     // A missing route yields empty output or the unspecified address.
     if gw.is_empty() || gw == "0.0.0.0" {
-        return None;
+        return Ok(None);
     }
-    gw.parse::<Ipv4Addr>().ok().map(|a| a.to_string())
+    gw.parse::<Ipv4Addr>()
+        .map(|a| Some(a.to_string()))
+        .map_err(|_| AppError::Network("Default gateway query returned an invalid address".into()))
 }
 
 /// Convert a CIDR prefix length to a dotted subnet mask.
-#[cfg(target_os = "windows")]
-fn prefix_to_mask(prefix: u8) -> String {
+pub(crate) fn prefix_to_mask(prefix: u8) -> String {
     // Both ends must be special-cased: `u32 << 32` (prefix 0) and
     // `u32 << (32 - prefix)` for prefix > 32 are shift overflows that
     // panic in debug and wrap in release.
@@ -281,26 +268,42 @@ fn validate_ip(ip: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-fn mask_to_prefix(mask: &str) -> Result<u8, AppError> {
+pub(crate) fn mask_to_prefix(mask: &str) -> Result<u8, AppError> {
     let addr: std::net::Ipv4Addr = mask
         .parse()
         .map_err(|_| AppError::Network(format!("Invalid subnet mask: {}", mask)))?;
     let bits: u32 = u32::from(addr);
-    Ok(bits.count_ones() as u8)
+    let prefix = bits.count_ones() as u8;
+    if bits
+        != if prefix == 0 {
+            0
+        } else {
+            u32::MAX << (32 - prefix)
+        }
+    {
+        return Err(AppError::Network("Subnet mask must be contiguous".into()));
+    }
+    Ok(prefix)
 }
 
 /// Add a secondary IP address to an interface (preserves existing IPs).
 ///
 /// Windows uses `New-NetIPAddress`, not `netsh interface ip add address`:
-/// netsh refuses to add an IP on a DHCP-enabled adapter, which is exactly
-/// the APIPA-rescue case (a camera dropped to 169.254/16 because DHCP
-/// failed), so the rescue silently never worked. New-NetIPAddress adds
-/// the address on DHCP and static interfaces alike.
+/// New-NetIPAddress disables DHCP when adding a static address, so every
+/// secondary add requires a fresh, successful static-state observation.
 pub async fn add_secondary_ip(interface: &str, ip: &str, mask: &str) -> Result<(), AppError> {
     super::interface::validate_interface_name(interface).await?;
     validate_ip(ip)?;
     validate_ip(mask)?;
     let prefix = mask_to_prefix(mask)?;
+    if !super::interface::get_by_name(interface).await?.is_up {
+        return Err(AppError::Network("selected adapter unavailable".into()));
+    }
+    if get_dhcp_state(interface).await? {
+        return Err(AppError::Network(
+            "adapter is DHCP; switch to a static mode before adding an address".into(),
+        ));
+    }
 
     #[cfg(target_os = "windows")]
     {
@@ -437,7 +440,7 @@ pub async fn get_dhcp_state(interface: &str) -> Result<bool, AppError> {
     {
         let escaped = interface.replace('\'', "''");
         let script = format!(
-            "(Get-NetIPInterface -InterfaceAlias '{}' -AddressFamily IPv4).Dhcp",
+            "(Get-NetIPInterface -InterfaceAlias '{}' -AddressFamily IPv4 -ErrorAction Stop).Dhcp",
             escaped
         );
         // This also runs inside the auto-adopt loop, so an unbounded
@@ -461,10 +464,7 @@ pub async fn get_dhcp_state(interface: &str) -> Result<bool, AppError> {
             )));
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .to_lowercase();
-        Ok(stdout == "enabled")
+        parse_dhcp_state(&String::from_utf8_lossy(&output.stdout))
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -473,6 +473,17 @@ pub async fn get_dhcp_state(interface: &str) -> Result<bool, AppError> {
         Err(AppError::Network(
             "DHCP state query is only implemented on Windows".into(),
         ))
+    }
+}
+
+#[cfg(any(windows, test))]
+fn parse_dhcp_state(output: &str) -> Result<bool, AppError> {
+    match output.trim().to_ascii_lowercase().as_str() {
+        "enabled" => Ok(true),
+        "disabled" => Ok(false),
+        _ => Err(AppError::Network(
+            "DHCP state query returned an unknown or ambiguous value".into(),
+        )),
     }
 }
 
@@ -510,6 +521,16 @@ pub async fn remove_secondary_ip(interface: &str, ip: &str) -> Result<(), AppErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_dhcp_output_never_authorizes_a_static_write() {
+        assert!(parse_dhcp_state(" Enabled\r\n").unwrap());
+        assert!(!parse_dhcp_state("Disabled").unwrap());
+        for output in ["", "unknown", "Enabled\nDisabled", "False"] {
+            assert!(parse_dhcp_state(output).is_err());
+        }
+        assert!(mask_to_prefix("255.0.255.0").is_err());
+    }
 
     // ── validate_ip ─────────────────────────────────────────────────
 

@@ -228,6 +228,7 @@ async fn pending_remove(pending: &PendingIps, iface: &str, ip: Ipv4Addr, adoptio
 /// is owned. Does NOT touch the OS — the IP stays bound. Removes only the
 /// exact `(iface, ip, adoption_id)` entry, so a still-pending scratch from a
 /// failed release under the same id is left for reconciliation.
+#[cfg(test)]
 pub async fn pending_handover(pending: &PendingIps, iface: &str, ip: Ipv4Addr, adoption_id: u64) {
     pending_remove(pending, iface, ip, adoption_id).await;
 }
@@ -444,12 +445,6 @@ pub async fn adopt_subnet<O: AdoptOps>(
             Err(e)
         }
     }
-}
-
-/// Remove a previously adopted secondary IP from the interface.
-pub async fn remove_adopted_ip(interface_name: &str, ip: &str) -> Result<(), AppError> {
-    log::info!("Removing adopted IP {} from {}", ip, interface_name);
-    ip_config::remove_secondary_ip(interface_name, ip).await
 }
 
 #[cfg(test)]

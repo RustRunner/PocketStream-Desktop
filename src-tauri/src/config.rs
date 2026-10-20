@@ -125,10 +125,8 @@ pub struct CachedDevice {
 /// Lifecycle metadata for one adopted subnet. Persisted as a map
 /// parallel to `adopted_subnets` (never a value-type change to that
 /// map, so configs written by older builds keep loading untouched).
-/// Display and history data only: nothing here is trusted for removal
-/// decisions — the APIPA boundary is re-derived from the subnet key on
-/// every decision so a stored flag can't drift from the subnet it
-/// describes, and wall time is never used to remove anything.
+/// Saved intent and the last observed OS state. Wall-clock liveness is
+/// informational; committed bindings are removed only by explicit user intent.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AdoptedMeta {
     /// RFC3339 wall time the subnet was adopted. For adoptions
@@ -141,30 +139,50 @@ pub struct AdoptedMeta {
     /// `None` until evidence arrives.
     #[serde(default)]
     pub last_device_seen: Option<String>,
+    #[serde(default)]
+    pub adapter_mac: Option<String>,
+    #[serde(default)]
+    pub prefix: Option<u8>,
+    #[serde(default)]
+    pub address: Option<String>,
+    #[serde(default)]
+    pub desired: BindingDesired,
+    #[serde(default)]
+    pub applied: bool,
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
-/// Align lifecycle metadata with the adopted map being persisted:
-/// drop metadata for subnets no longer present, backfill metadata for
-/// subnets that lack any (legacy configs, writers that recorded none)
-/// using `now_rfc3339` as the adoption time. Keeps the invariant that
-/// the two maps always describe the same subnets, whatever the caller
-/// passed.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingDesired {
+    #[default]
+    Present,
+    Removed,
+}
+
+/// Backfill legacy metadata without discarding detached removal intent.
 pub fn align_adopted_meta(
     adopted: &HashMap<String, String>,
     meta: &mut HashMap<String, AdoptedMeta>,
     now_rfc3339: &str,
 ) {
-    meta.retain(|subnet, _| adopted.contains_key(subnet));
-    for subnet in adopted.keys() {
-        meta.entry(subnet.clone()).or_insert_with(|| AdoptedMeta {
+    meta.retain(|subnet, row| {
+        adopted.contains_key(subnet) || row.desired == BindingDesired::Removed
+    });
+    for (subnet, address) in adopted {
+        let row = meta.entry(subnet.clone()).or_insert_with(|| AdoptedMeta {
             adopted_at: Some(now_rfc3339.to_string()),
-            last_device_seen: None,
+            ..Default::default()
         });
+        row.address.get_or_insert_with(|| address.clone());
+        if row.prefix.is_none() {
+            row.prefix = subnet.rsplit_once('/').and_then(|(_, p)| p.parse().ok());
+        }
     }
 }
 
-/// Remove exactly one subnet — and its metadata row — from an adoption
-/// map pair, leaving every other entry and its metadata untouched.
+/// Retire exactly one route, retaining its exact address and removal intent.
 /// Returns whether the subnet entry existed. Pure so the surgical
 /// contract is unit-testable.
 fn remove_adoption_entry(
@@ -172,8 +190,19 @@ fn remove_adoption_entry(
     meta: &mut HashMap<String, AdoptedMeta>,
     subnet: &str,
 ) -> bool {
-    meta.remove(subnet);
-    adopted.remove(subnet).is_some()
+    let address = adopted.remove(subnet);
+    if address.is_none() && !meta.contains_key(subnet) {
+        return false;
+    }
+    let row = meta.entry(subnet.to_string()).or_default();
+    if row.address.is_none() {
+        row.address = address;
+    }
+    if row.prefix.is_none() {
+        row.prefix = subnet.rsplit_once('/').and_then(|(_, p)| p.parse().ok());
+    }
+    row.desired = BindingDesired::Removed;
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -419,60 +448,112 @@ impl AppConfig {
         self.save()
     }
 
-    /// Replace the adopted-subnets map together with its lifecycle
-    /// metadata — one locked update, one save — so a crash can never
-    /// persist half a lifecycle transition. Field-scoped so the
-    /// background adopt/prune tasks can't revert a concurrent user save
-    /// of unrelated sections — a whole-struct get→mutate→update cycle
-    /// would race user settings saves in both directions (user edit
-    /// reverted, or a still-bound adopted subnet dropped). The two maps
-    /// are aligned before the write (stray metadata dropped, missing
-    /// metadata backfilled), so the persisted pair always describes the
-    /// same subnets regardless of caller bookkeeping.
-    pub fn update_adoption_state(
+    /// Liveness writes cannot change ownership, desired state, or saved addresses.
+    pub fn update_adoption_liveness(
         &self,
-        adopted: HashMap<String, String>,
-        mut meta: HashMap<String, AdoptedMeta>,
+        meta: HashMap<String, AdoptedMeta>,
     ) -> Result<(), crate::AppError> {
-        align_adopted_meta(&adopted, &mut meta, &chrono::Utc::now().to_rfc3339());
-        match self.settings.lock() {
-            Ok(mut guard) => {
-                guard.adopted_subnets = adopted;
-                guard.adopted_meta = meta;
-            }
-            Err(poisoned) => {
-                log::error!("Config mutex poisoned during update_adoption_state, recovering");
-                let mut guard = poisoned.into_inner();
-                guard.adopted_subnets = adopted;
-                guard.adopted_meta = meta;
-            }
-        }
-        self.save()
+        self.change_settings_with(
+            |s| {
+                for (subnet, incoming) in meta {
+                    if let Some(row) = s.adopted_meta.get_mut(&subnet) {
+                        if row.desired == BindingDesired::Present && row.address == incoming.address
+                        {
+                            row.last_device_seen = incoming.last_device_seen;
+                        }
+                    }
+                }
+                Ok(())
+            },
+            save_to_disk,
+        )
     }
 
-    /// Field-scoped like [`Self::update_adoption_state`], but surgical:
-    /// removes exactly `subnet` (and its metadata row) from the persisted
-    /// adoption state, preserving every other entry. For callers with no
-    /// live adoption state — rebuilding the persisted map from live
-    /// state would wipe the entries that never restored this session.
-    /// Saves only when the entry existed; returns whether it did.
-    pub fn remove_adopted_subnet_entry(&self, subnet: &str) -> Result<bool, crate::AppError> {
-        let removed = match self.settings.lock() {
-            Ok(mut guard) => {
-                let s = &mut *guard;
-                remove_adoption_entry(&mut s.adopted_subnets, &mut s.adopted_meta, subnet)
-            }
-            Err(poisoned) => {
-                log::error!("Config mutex poisoned during remove_adopted_subnet_entry, recovering");
-                let mut guard = poisoned.into_inner();
-                let s = &mut *guard;
-                remove_adoption_entry(&mut s.adopted_subnets, &mut s.adopted_meta, subnet)
-            }
-        };
-        if removed {
-            self.save()?;
-        }
-        Ok(removed)
+    /// Persist an observed binding state. Removed intent can only be cleared
+    /// by the explicit manual-claim path, never by a late probe or restore.
+    pub fn set_binding(&self, subnet: &str, row: AdoptedMeta) -> Result<(), crate::AppError> {
+        self.set_binding_with(subnet, row, save_to_disk)
+    }
+
+    fn set_binding_with(
+        &self,
+        subnet: &str,
+        row: AdoptedMeta,
+        persist: impl FnOnce(&AppSettings) -> Result<(), crate::AppError>,
+    ) -> Result<(), crate::AppError> {
+        self.change_settings_with(
+            |s| {
+                if row.desired == BindingDesired::Present
+                    && s.adopted_meta
+                        .get(subnet)
+                        .is_some_and(|m| m.desired == BindingDesired::Removed)
+                {
+                    return Err(crate::AppError::Network(
+                        "Binding was removed by the user".into(),
+                    ));
+                }
+                if row.desired == BindingDesired::Removed {
+                    remove_adoption_entry(&mut s.adopted_subnets, &mut s.adopted_meta, subnet);
+                } else if let Some(address) = &row.address {
+                    s.adopted_subnets
+                        .entry(subnet.to_string())
+                        .or_insert_with(|| address.clone());
+                }
+                s.adopted_meta.insert(subnet.to_string(), row);
+                Ok(())
+            },
+            persist,
+        )
+    }
+
+    pub fn claim_binding(&self, address: &str) -> Result<(), crate::AppError> {
+        self.claim_binding_with(address, save_to_disk)
+    }
+
+    fn claim_binding_with(
+        &self,
+        address: &str,
+        persist: impl FnOnce(&AppSettings) -> Result<(), crate::AppError>,
+    ) -> Result<(), crate::AppError> {
+        self.change_settings_with(
+            |s| {
+                let keys: Vec<_> = s
+                    .adopted_meta
+                    .iter()
+                    .filter(|(_, row)| {
+                        row.address.as_deref() == Some(address)
+                            && row.adapter_mac.as_ref().is_none_or(|owner| {
+                                s.selected_adapter_mac.as_ref().is_some_and(|selected| {
+                                    crate::network::device_registry::canonical_mac(owner)
+                                        == crate::network::device_registry::canonical_mac(selected)
+                                })
+                            })
+                    })
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                for key in keys {
+                    s.adopted_subnets.remove(&key);
+                    s.adopted_meta.remove(&key);
+                }
+                Ok(())
+            },
+            persist,
+        )
+    }
+
+    /// The same write-before-publish seam as manual-node identity binding.
+    fn change_settings_with<T>(
+        &self,
+        change: impl FnOnce(&mut AppSettings) -> Result<T, crate::AppError>,
+        persist: impl FnOnce(&AppSettings) -> Result<(), crate::AppError>,
+    ) -> Result<T, crate::AppError> {
+        let _save = CONFIG_SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+        let mut next = settings.clone();
+        let result = change(&mut next)?;
+        persist(&next)?;
+        *settings = next;
+        Ok(result)
     }
 
     /// Persist one zoom-slider position (clamped to 0–100). Field-scoped
@@ -534,14 +615,13 @@ impl AppConfig {
 
     /// Replace the network mode and persist.
     pub fn set_network_mode(&self, mode: NetworkMode) -> Result<(), crate::AppError> {
-        match self.settings.lock() {
-            Ok(mut guard) => guard.network_mode = mode,
-            Err(poisoned) => {
-                log::error!("Config mutex poisoned during set_network_mode, recovering");
-                poisoned.into_inner().network_mode = mode;
-            }
-        }
-        self.save()
+        self.change_settings_with(
+            |s| {
+                s.network_mode = mode;
+                Ok(())
+            },
+            save_to_disk,
+        )
     }
 
     /// Replace just the audio mute preference and persist.
@@ -1832,6 +1912,7 @@ password = ""
             AdoptedMeta {
                 adopted_at: Some("2026-07-16T00:20:37Z".into()),
                 last_device_seen: Some("2026-07-17T01:10:18Z".into()),
+                ..Default::default()
             },
         );
         meta.insert(
@@ -1839,6 +1920,7 @@ password = ""
             AdoptedMeta {
                 adopted_at: Some("2026-07-16T00:20:37Z".into()),
                 last_device_seen: None,
+                ..Default::default()
             },
         );
 
@@ -1854,7 +1936,12 @@ password = ""
             adopted.get("169.254.73.0/24"),
             Some(&"169.254.73.99".to_string())
         );
-        assert_eq!(meta.len(), 1);
+        assert_eq!(meta.len(), 2);
+        let removed = &meta["172.31.169.0/24"];
+        assert_eq!(removed.desired, BindingDesired::Removed);
+        assert_eq!(removed.address.as_deref(), Some("172.31.169.100"));
+        assert_eq!(removed.prefix, Some(24));
+        align_adopted_meta(&adopted, &mut meta, "later");
         assert_eq!(
             meta.get("169.254.73.0/24").unwrap().adopted_at.as_deref(),
             Some("2026-07-16T00:20:37Z")
@@ -1867,7 +1954,195 @@ password = ""
             "10.0.0.0/24"
         ));
         assert_eq!(adopted.len(), 1);
-        assert_eq!(meta.len(), 1);
+        assert_eq!(meta.len(), 2);
+    }
+
+    fn binding_test_config() -> AppConfig {
+        AppConfig {
+            settings: Mutex::new(AppSettings {
+                selected_adapter_mac: Some("40:cd:3a:00:00:01".into()),
+                ..Default::default()
+            }),
+            cache: Mutex::new(vec![]),
+            startup_notices: Mutex::new(vec![]),
+        }
+    }
+
+    #[test]
+    fn binding_removal_save_failure_precedes_os_write_and_restart_retains_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let config = binding_test_config();
+        let row = AdoptedMeta {
+            adapter_mac: Some("40:cd:3a:00:00:01".into()),
+            prefix: Some(24),
+            address: Some("172.31.169.99".into()),
+            applied: true,
+            adopted_at: Some("2026-10-20T00:00:00Z".into()),
+            ..Default::default()
+        };
+        let persist = |s: &AppSettings| {
+            atomic_write(&path, toml::to_string(s).unwrap().as_bytes()).map_err(crate::AppError::Io)
+        };
+        config
+            .set_binding_with("172.31.169.0/24", row.clone(), persist)
+            .unwrap();
+        let blocked = dir.path().join("not-a-directory");
+        fs::write(&blocked, b"block").unwrap();
+        let mut removed = row.clone();
+        removed.desired = BindingDesired::Removed;
+        let mut os_writes = 0;
+        if config
+            .set_binding_with("172.31.169.0/24", removed.clone(), |s| {
+                atomic_write(
+                    &blocked.join("config.toml"),
+                    toml::to_string(s).unwrap().as_bytes(),
+                )
+                .map_err(crate::AppError::Io)
+            })
+            .is_ok()
+        {
+            os_writes += 1;
+        }
+        assert_eq!(os_writes, 0);
+        assert_eq!(config.get().adopted_meta["172.31.169.0/24"], row);
+        config
+            .set_binding_with("172.31.169.0/24", removed.clone(), persist)
+            .unwrap();
+        // Restart after the intent save and before the OS unbind.
+        let mut restarted: AppSettings =
+            toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        align_adopted_meta(
+            &restarted.adopted_subnets,
+            &mut restarted.adopted_meta,
+            "later",
+        );
+        assert!(restarted.adopted_subnets.is_empty());
+        assert_eq!(restarted.adopted_meta["172.31.169.0/24"], removed);
+        assert!(config
+            .set_binding_with("172.31.169.0/24", row, |_| panic!(
+                "late adoption must not save"
+            ))
+            .is_err());
+        let mut edited = AppSettings::default();
+        edited.adopted_meta.clear();
+        restarted.merge_user_fields(edited);
+        assert_eq!(
+            restarted.adopted_meta["172.31.169.0/24"].desired,
+            BindingDesired::Removed
+        );
+        config
+            .change_settings_with(
+                |s| {
+                    s.selected_adapter_mac = Some("40:cd:3a:00:00:02".into());
+                    Ok(())
+                },
+                persist,
+            )
+            .unwrap();
+        config.claim_binding_with("172.31.169.99", persist).unwrap();
+        assert_eq!(
+            config.get().adopted_meta["172.31.169.0/24"].desired,
+            BindingDesired::Removed
+        );
+        config
+            .change_settings_with(
+                |s| {
+                    s.selected_adapter_mac = Some("40:cd:3a:00:00:01".into());
+                    Ok(())
+                },
+                persist,
+            )
+            .unwrap();
+        config.claim_binding_with("172.31.169.99", persist).unwrap();
+        assert!(config.get().adopted_meta.is_empty());
+    }
+
+    #[test]
+    fn mode_save_failure_does_not_publish_an_unpersisted_mode() {
+        let config = binding_test_config();
+        let before = config.get_network_mode();
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("not-a-directory");
+        fs::write(&blocked, b"block").unwrap();
+        assert!(config
+            .change_settings_with(
+                |s| {
+                    s.network_mode = NetworkMode::Dhcp;
+                    Ok(())
+                },
+                |s| atomic_write(
+                    &blocked.join("config.toml"),
+                    toml::to_string(s).unwrap().as_bytes()
+                )
+                .map_err(crate::AppError::Io)
+            )
+            .is_err());
+        assert_eq!(config.get_network_mode(), before);
+        let legacy: AdoptedMeta = toml::from_str("adopted_at='old'").unwrap();
+        assert_eq!(legacy.desired, BindingDesired::Present);
+        assert!(!legacy.applied && legacy.adapter_mac.is_none());
+    }
+
+    #[test]
+    fn durable_fields_round_trip_repeatedly_and_previous_metadata_schema_still_parses() {
+        #[derive(Deserialize)]
+        struct PreviousMeta {
+            adopted_at: Option<String>,
+            last_device_seen: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct PreviousSettings {
+            adopted_subnets: HashMap<String, String>,
+            adopted_meta: HashMap<String, PreviousMeta>,
+        }
+        let mut settings = AppSettings::default();
+        settings
+            .adopted_subnets
+            .insert("172.26.95.0/24".into(), "172.26.95.99".into());
+        settings.adopted_meta.insert(
+            "169.254.20.0/24".into(),
+            AdoptedMeta {
+                address: Some("169.254.20.99".into()),
+                prefix: Some(24),
+                adapter_mac: Some("40:cd:3a:00:00:01".into()),
+                desired: BindingDesired::Removed,
+                applied: true,
+                last_error: Some("OS rejected removal".into()),
+                adopted_at: Some("original timestamp".into()),
+                last_device_seen: Some("last seen".into()),
+            },
+        );
+        align_adopted_meta(
+            &settings.adopted_subnets,
+            &mut settings.adopted_meta,
+            "backfilled",
+        );
+        let original = settings.adopted_meta.clone();
+        for _ in 0..2 {
+            let encoded = toml::to_string(&settings).unwrap();
+            let previous: PreviousSettings = toml::from_str(&encoded).unwrap();
+            assert_eq!(previous.adopted_subnets, settings.adopted_subnets);
+            assert_eq!(
+                previous.adopted_meta["169.254.20.0/24"]
+                    .adopted_at
+                    .as_deref(),
+                Some("original timestamp")
+            );
+            assert_eq!(
+                previous.adopted_meta["169.254.20.0/24"]
+                    .last_device_seen
+                    .as_deref(),
+                Some("last seen")
+            );
+            settings = toml::from_str(&encoded).unwrap();
+            align_adopted_meta(
+                &settings.adopted_subnets,
+                &mut settings.adopted_meta,
+                "later load",
+            );
+            assert_eq!(settings.adopted_meta, original);
+        }
     }
 
     #[test]
@@ -2025,6 +2300,7 @@ password = ""
             AdoptedMeta {
                 adopted_at: Some("2026-07-16T10:29:13+00:00".into()),
                 last_device_seen: None,
+                ..Default::default()
             },
         );
         let toml_str = toml::to_string_pretty(&settings).unwrap();
@@ -2097,6 +2373,7 @@ password = ""
             AdoptedMeta {
                 adopted_at: Some("2026-07-01T00:00:00+00:00".into()),
                 last_device_seen: Some("2026-07-15T00:00:00+00:00".into()),
+                ..Default::default()
             },
         );
         align_adopted_meta(&adopted, &mut meta, "2026-07-16T00:00:00+00:00");

@@ -17,6 +17,8 @@ import type { DeviceTarget } from "./store.ts";
 import type {
   AdapterSelection,
   AdoptionSnapshot,
+  ModeTransition,
+  ModeTransitionReply,
   AppSettings,
   CaptureState,
   Credentials,
@@ -141,6 +143,10 @@ export async function setDhcp(name: string): Promise<void> {
   return await invoke("set_dhcp", { name });
 }
 
+export async function getDhcpState(name: string): Promise<boolean> {
+  return await invoke<boolean>("get_dhcp_state", { name });
+}
+
 /**
  * Look up the MAC currently bound to `ip` from the live ARP cache.
  * Returns null if the IP doesn't respond. Used by the cache verify
@@ -219,11 +225,8 @@ export async function getConfiguredAdoptions(): Promise<Record<string, string>> 
   return await invoke<Record<string, string>>("get_configured_adoptions");
 }
 
-/** Remove an auto-adopted subnet: unbinds its secondary IP (resolving the
- *  real owning adapter — `ifaceHint` is ordering only) and drops it from
- *  persisted config, even when no live adoption state exists this session.
- *  Rejects (with a backend message) if the subnet is neither adopted nor
- *  configured. */
+/** Save removal intent before unbinding the exact saved address on its
+ *  owning adapter. Failure remains pending and is retried on adapter return. */
 export async function removeAdoptedSubnet(subnet: string, ifaceHint?: string): Promise<void> {
   return await invoke("remove_adopted_subnet", { subnet, ifaceHint });
 }
@@ -398,8 +401,8 @@ export async function getNetworkMode(): Promise<NetworkMode> {
   return await invoke<NetworkMode>("get_network_mode");
 }
 
-export async function setNetworkMode(mode: NetworkMode): Promise<void> {
-  return await invoke("set_network_mode", { mode });
+export async function setNetworkMode(request: ModeTransition): Promise<ModeTransitionReply> {
+  return await invoke<ModeTransitionReply>("set_network_mode", { request });
 }
 
 export async function addManualNode(ip: string, alias: string, expectedMac: string | null = null): Promise<void> {

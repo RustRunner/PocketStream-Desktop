@@ -73,6 +73,7 @@ pub async fn get_interface_info(
 
 #[tauri::command]
 pub async fn set_static_ip(
+    app: tauri::AppHandle,
     manager: State<'_, NetworkManager>,
     config: State<'_, AppConfig>,
     name: String,
@@ -80,29 +81,25 @@ pub async fn set_static_ip(
     subnet_mask: String,
     gateway: Option<String>,
 ) -> Result<(), AppError> {
-    // Adopted rescue IPs must survive the primary set — pass them so the
-    // secondary re-add classifies by membership, not by enumeration order.
-    let preserve: Vec<std::net::Ipv4Addr> = manager
-        .get_adopted_ips()
+    let mode = match config.get_network_mode() {
+        NetworkMode::Dhcp => NetworkMode::StaticAuto,
+        mode => mode,
+    };
+    manager
+        .transition_mode(
+            app,
+            &config,
+            crate::network::ModeTransition {
+                name,
+                mode,
+                ip: Some(ip),
+                subnet_mask: Some(subnet_mask),
+                gateway,
+                confirmed: true,
+            },
+        )
         .await
-        .into_values()
-        .filter_map(|ip| ip.parse().ok())
-        .collect();
-    crate::network::ip_config::assign_static_ip(
-        &name,
-        &ip,
-        &subnet_mask,
-        gateway.as_deref(),
-        &preserve,
-    )
-    .await?;
-    // Manual ownership trumps auto-adopt: drop any registry entry for
-    // this IP so the "(auto)" badge stops shadowing a user-set IP, and
-    // persist the prune so the state survives a restart.
-    if manager.untrack_adopted_ip(&ip).await {
-        manager.save_adopted_to_config(&config).await;
-    }
-    Ok(())
+        .map(|_| ())
 }
 
 #[tauri::command]
@@ -113,21 +110,58 @@ pub async fn add_secondary_ip(
     ip: String,
     subnet_mask: String,
 ) -> Result<(), AppError> {
-    crate::network::ip_config::add_secondary_ip(&name, &ip, &subnet_mask).await?;
-    if manager.untrack_adopted_ip(&ip).await {
-        manager.save_adopted_to_config(&config).await;
+    manager
+        .add_manual_address(&config, &name, &ip, &subnet_mask)
+        .await
+}
+
+#[tauri::command]
+pub async fn remove_secondary_ip(
+    manager: State<'_, NetworkManager>,
+    config: State<'_, AppConfig>,
+    name: String,
+    ip: String,
+) -> Result<(), AppError> {
+    if let Some((subnet, _)) = config
+        .get()
+        .adopted_meta
+        .iter()
+        .find(|(_, row)| row.address.as_deref() == Some(ip.as_str()))
+    {
+        manager
+            .remove_adopted_subnet(&config, subnet, Some(&name))
+            .await
+            .map(|_| ())
+    } else {
+        manager.remove_manual_address(&config, &name, &ip).await
     }
-    Ok(())
 }
 
 #[tauri::command]
-pub async fn remove_secondary_ip(name: String, ip: String) -> Result<(), AppError> {
-    crate::network::ip_config::remove_secondary_ip(&name, &ip).await
-}
-
-#[tauri::command]
-pub async fn set_dhcp(name: String) -> Result<(), AppError> {
-    crate::network::ip_config::set_dhcp(&name).await
+pub async fn set_dhcp(
+    manager: State<'_, NetworkManager>,
+    config: State<'_, AppConfig>,
+    app: tauri::AppHandle,
+    name: String,
+) -> Result<(), AppError> {
+    let reply = manager
+        .transition_mode(
+            app,
+            &config,
+            crate::network::ModeTransition {
+                name,
+                mode: NetworkMode::Dhcp,
+                ip: None,
+                subnet_mask: None,
+                gateway: None,
+                confirmed: false,
+            },
+        )
+        .await?;
+    match reply.warning {
+        Some(warning) => Err(AppError::Network(warning)),
+        None => Ok(()),
+    }
 }
 
 #[tauri::command]
@@ -136,8 +170,7 @@ pub async fn get_dhcp_state(name: String) -> Result<bool, AppError> {
 }
 
 // ── Network Mode ────────────────────────────────────────────────────
-// The user's chosen mode drives which discovery subsystems run. Slice 1
-// just persists the value; the subsystem gating lands in slice 2.
+// One fenced OS/config transition is shared by every mode change.
 
 #[tauri::command]
 pub fn get_network_mode(config: State<'_, AppConfig>) -> NetworkMode {
@@ -149,16 +182,9 @@ pub async fn set_network_mode(
     config: State<'_, AppConfig>,
     manager: State<'_, NetworkManager>,
     app: tauri::AppHandle,
-    mode: NetworkMode,
-) -> Result<(), AppError> {
-    let old_mode = config.get_network_mode();
-    if old_mode == mode {
-        return Ok(());
-    }
-    config.set_network_mode(mode)?;
-    manager
-        .apply_mode_change(app, &config, old_mode, mode)
-        .await
+    request: crate::network::ModeTransition,
+) -> Result<crate::network::ModeTransitionReply, AppError> {
+    manager.transition_mode(app, &config, request).await
 }
 
 // ── Manual Nodes ────────────────────────────────────────────────────
@@ -433,15 +459,11 @@ pub async fn remove_adopted_subnet(
     subnet: String,
     iface_hint: Option<String>,
 ) -> Result<(), AppError> {
-    // The manager owns persistence for both routes: a snapshot-save for a
-    // live adoption, a surgical single-entry purge for a config-only one
-    // (a snapshot here would rebuild from empty live state and wipe every
-    // other adoption).
+    // The manager persists exact removal intent before changing the adapter.
     let ip = manager
         .remove_adopted_subnet(&config, &subnet, iface_hint.as_deref())
         .await?;
-    // Same event the lifecycle reaper emits, so every UI surface follows
-    // backend state through one listener whichever path removed the row.
+    // Emit success only after the requested OS removal is confirmed.
     use tauri::Emitter;
     let _ = app.emit(
         "subnet-removed",

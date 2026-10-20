@@ -383,6 +383,211 @@ impl Drop for ScanGuard {
     }
 }
 
+/// Invalidate in-flight address work before waiting for its serialization lock.
+/// Drop always resumes scheduling, including error exits.
+struct AddressPause {
+    generation: Arc<AtomicU64>,
+    active: Arc<AtomicBool>,
+}
+
+/// No await between durable commit and relinquishing the pending breadcrumb:
+/// cancellation cleanup must never mistake a committed IP for temporary work.
+async fn commit_pending_address(
+    pending: &auto_adopt::PendingIps,
+    iface: &str,
+    ip: Ipv4Addr,
+    id: u64,
+    commit: impl FnOnce() -> Result<(), AppError>,
+) -> Result<(), AppError> {
+    let mut pending = pending.lock().await;
+    commit()?;
+    pending.retain(|entry| !(entry.iface == iface && entry.ip == ip && entry.adoption_id == id));
+    Ok(())
+}
+
+impl AddressPause {
+    fn new(generation: Arc<AtomicU64>, active: Arc<AtomicBool>) -> Self {
+        active.store(false, Ordering::Release);
+        generation.fetch_add(1, Ordering::AcqRel);
+        Self { generation, active }
+    }
+}
+
+impl Drop for AddressPause {
+    fn drop(&mut self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.active.store(true, Ordering::Release);
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BindingAction {
+    Hold(String, bool),
+    Observed(bool),
+    Add(Ipv4Addr, u8),
+    Remove(Ipv4Addr),
+}
+
+fn binding_link_changed(previous: &AdapterSelection, current: &AdapterSelection) -> bool {
+    previous.selected_mac == current.selected_mac
+        && previous.interface_index == current.interface_index
+        && previous.adapter.as_ref().is_some_and(|i| i.is_up)
+            != current.adapter.as_ref().is_some_and(|i| i.is_up)
+}
+
+fn binding_action(
+    subnet: &str,
+    row: &crate::config::AdoptedMeta,
+    iface: Option<&InterfaceInfo>,
+    mode: crate::config::NetworkMode,
+    dhcp: &Result<bool, String>,
+    conflicts: &[ipnetwork::Ipv4Network],
+) -> BindingAction {
+    use crate::config::{BindingDesired, NetworkMode};
+    let Some(iface) = iface.filter(|i| i.is_up) else {
+        return BindingAction::Hold("selected adapter unavailable".into(), false);
+    };
+    if row
+        .adapter_mac
+        .as_ref()
+        .is_some_and(|mac| adapter_mac(mac) != adapter_mac(&iface.mac))
+    {
+        return BindingAction::Hold("adapter mismatch".into(), false);
+    }
+    let valid = subnet
+        .parse::<ipnetwork::Ipv4Network>()
+        .ok()
+        .and_then(|net| {
+            let ip = row.address.as_ref()?.parse::<Ipv4Addr>().ok()?;
+            let prefix = row.prefix?;
+            (prefix == net.prefix()
+                && net.contains(ip)
+                && ip != net.network()
+                && ip != net.broadcast()
+                && !ip.is_loopback()
+                && !ip.is_multicast()
+                && !ip.is_unspecified())
+            .then_some((ip, prefix))
+        });
+    let Some((ip, prefix)) = valid else {
+        return BindingAction::Hold("invalid saved address/prefix or subnet".into(), false);
+    };
+    let observed = iface.ips.iter().find(|a| a.address == ip.to_string());
+    if observed.is_some_and(|a| a.prefix != prefix) {
+        return BindingAction::Hold("address exists with a different prefix".into(), false);
+    }
+    let applied = observed.is_some();
+    let is_dhcp = match dhcp {
+        Ok(value) => *value,
+        Err(error) => {
+            return BindingAction::Hold(format!("DHCP state unavailable: {error}"), applied)
+        }
+    };
+    if row.desired == BindingDesired::Removed {
+        return if applied {
+            BindingAction::Remove(ip)
+        } else {
+            BindingAction::Observed(false)
+        };
+    }
+    if is_dhcp {
+        return BindingAction::Hold("adapter is DHCP".into(), false);
+    }
+    if mode == NetworkMode::Dhcp {
+        return BindingAction::Hold("saved mode is DHCP; adapter is static".into(), false);
+    }
+    if applied {
+        BindingAction::Observed(true)
+    } else if conflicts.iter().any(|net| net.contains(ip)) {
+        BindingAction::Hold("subnet conflicts with another local adapter".into(), false)
+    } else {
+        BindingAction::Add(ip, prefix)
+    }
+}
+
+/// The existing AdoptOps seam plus a fresh OS observation makes command
+/// failure and stale applied flags testable without touching a real adapter.
+async fn apply_binding<O, F, Fut>(
+    ops: &O,
+    mut row: crate::config::AdoptedMeta,
+    action: BindingAction,
+    iface: Option<&InterfaceInfo>,
+    observe: F,
+) -> crate::config::AdoptedMeta
+where
+    O: auto_adopt::AdoptOps,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<interface::IpInfo>, AppError>>,
+{
+    row.last_error = None;
+    match action {
+        BindingAction::Hold(reason, applied) => {
+            row.applied = applied;
+            row.last_error = Some(reason);
+        }
+        BindingAction::Observed(applied) => {
+            row.applied = applied;
+        }
+        action => {
+            let iface = iface.expect("write actions require a selected adapter");
+            let result = match action {
+                BindingAction::Add(ip, prefix) => {
+                    row.applied = false;
+                    ops.add(&iface.name, ip, &ip_config::prefix_to_mask(prefix))
+                        .await
+                }
+                BindingAction::Remove(ip) => {
+                    row.applied = true;
+                    ops.remove(&iface.name, ip).await
+                }
+                _ => unreachable!(),
+            };
+            let observed = observe().await;
+            row.applied = observed
+                .as_ref()
+                .map(|ips| {
+                    ips.iter().any(|a| {
+                        Some(a.address.as_str()) == row.address.as_deref()
+                            && Some(a.prefix) == row.prefix
+                    })
+                })
+                .unwrap_or(row.applied);
+            row.last_error = result
+                .err()
+                .map(|e| e.to_string())
+                .or_else(|| observed.err().map(|e| e.to_string()));
+            let wanted = row.desired == crate::config::BindingDesired::Present;
+            if row.last_error.is_none() && row.applied != wanted {
+                row.last_error = Some("OS did not apply the requested binding state".into());
+            }
+        }
+    }
+    if row.applied
+        && row.desired == crate::config::BindingDesired::Present
+        && row.last_error.is_none()
+    {
+        row.adapter_mac = iface.and_then(|i| adapter_mac(&i.mac));
+    }
+    row
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ModeTransition {
+    pub name: String,
+    pub mode: crate::config::NetworkMode,
+    pub ip: Option<String>,
+    pub subnet_mask: Option<String>,
+    pub gateway: Option<String>,
+    #[serde(default)]
+    pub confirmed: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ModeTransitionReply {
+    pub warning: Option<String>,
+    pub mode: crate::config::NetworkMode,
+}
+
 pub struct NetworkManager {
     active_scans: Arc<std::sync::Mutex<HashSet<String>>>,
     arp_devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
@@ -401,6 +606,8 @@ pub struct NetworkManager {
     presence: Arc<presence::Control>,
     presence_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     address_work: Arc<Mutex<()>>,
+    address_generation: Arc<AtomicU64>,
+    address_active: Arc<AtomicBool>,
     /// Every IPv4 currently assigned to any local adapter. Shared with
     /// the capture callback and refreshed at every discovery start (and
     /// each adopt-loop pass), so a listener retained across sessions
@@ -418,11 +625,6 @@ pub struct NetworkManager {
     /// Monotonic source of adoption ids: each adoption pass takes the next
     /// value to tag its `pending_ips` entries.
     adoption_seq: Arc<AtomicU64>,
-    /// Config entries whose startup re-add failed transiently (subnet -> ip).
-    /// Kept OUT of the live `adopted_ips` map (so the UI never badges an
-    /// unbound IP) but unioned into every persisted config snapshot so a
-    /// later in-session save doesn't delete them — they retry next startup.
-    pending_restore: Arc<Mutex<HashMap<String, Ipv4Addr>>>,
     /// Capture-health watchdog: restarts a provably deaf capture session
     /// (scoped retry, then forced-unscoped), and only when that ladder is
     /// exhausted emits `discovery-degraded`, then `discovery-recovered`
@@ -481,12 +683,15 @@ pub struct AdoptedMetaView {
     pub adopted_at: Option<String>,
     /// RFC3339; `None` until positive evidence arrives.
     pub last_device_seen: Option<String>,
-    /// Stale by the applicable evidence threshold (APIPA session
-    /// TTL/startup grace, non-APIPA 24 h wall badge). Derived without
-    /// the pin/rescue vetoes: an unprotected stale APIPA entry reaps
-    /// within a tick of crossing its threshold, so a row that stays
-    /// visible with this flag set is exactly the held/manual-only case.
+    /// Compatibility badge information; never authorizes removal of a
+    /// committed binding. Hosts badge presentation is handled in S8.
     pub stale: bool,
+    pub address: Option<String>,
+    pub prefix: Option<u8>,
+    pub adapter_mac: Option<String>,
+    pub desired: crate::config::BindingDesired,
+    pub applied: bool,
+    pub last_error: Option<String>,
 }
 
 /// Atomic snapshot of the adoption state for the frontend — the
@@ -513,9 +718,7 @@ fn badge_age(
         .ok()
 }
 
-/// Build the UI view of one adoption from the same verdict function
-/// the reap pass uses, so the badge and the removal policy cannot
-/// drift apart.
+/// Build the compatibility badge and durable binding status together.
 fn adoption_meta_view(
     subnet: &str,
     meta: Option<&crate::config::AdoptedMeta>,
@@ -535,6 +738,12 @@ fn adoption_meta_view(
         adopted_at: meta.and_then(|m| m.adopted_at.clone()),
         last_device_seen: meta.and_then(|m| m.last_device_seen.clone()),
         stale,
+        address: meta.and_then(|m| m.address.clone()),
+        prefix: meta.and_then(|m| m.prefix),
+        adapter_mac: meta.and_then(|m| m.adapter_mac.clone()),
+        desired: meta.map(|m| m.desired).unwrap_or_default(),
+        applied: meta.is_some_and(|m| m.applied),
+        last_error: meta.and_then(|m| m.last_error.clone()),
     }
 }
 
@@ -621,21 +830,6 @@ fn keep_prohibited_history_inactive(registry: &DeviceRegistry) -> bool {
     changed
 }
 
-/// Adapter guards for an automatic unbind, mirroring shutdown cleanup:
-/// never strip the adapter's primary address, and never leave it with
-/// zero IPv4 addresses (Windows often disables such an adapter — far
-/// worse than a stray secondary surviving another cycle). Returns the
-/// reason the unbind is blocked, or `None` when it may proceed.
-fn unbind_guard_blocks(ip: &str, adapter_ips: &[String]) -> Option<&'static str> {
-    if adapter_ips.first().map(String::as_str) == Some(ip) {
-        return Some("is the adapter's primary IP");
-    }
-    if adapter_ips.len() <= 1 && adapter_ips.iter().any(|a| a == ip) {
-        return Some("would leave the adapter with no other IPv4 address");
-    }
-    None
-}
-
 /// Provoke ARP on the known subnets, then merge the OS neighbor table.
 /// Fence-checked throughout. Shared by discovery start (spawned after a
 /// short delay so the capture attach lands first) and the capture-restart
@@ -708,33 +902,6 @@ async fn park_capture_handle(
     }
 }
 
-/// Which path a user-initiated adoption removal takes. Pure — the
-/// (live, pending-restore, config) membership triple fully determines
-/// the route, so the decision is unit-testable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RemovalRoute {
-    /// Live adoption state exists — the standard unbind + snapshot-save.
-    Live,
-    /// No live entry, but the subnet is persisted (directly, or held as
-    /// a pending restore): unbind wherever the IP is actually bound and
-    /// purge exactly that config entry.
-    ConfigOnly,
-    /// Held nowhere — the removal is an error.
-    Unknown,
-}
-
-fn classify_removal(in_live: bool, in_pending_restore: bool, in_config: bool) -> RemovalRoute {
-    if in_live {
-        RemovalRoute::Live
-    } else if in_pending_restore || in_config {
-        // A pending-restore entry is not live-bound, but every persisted
-        // snapshot unions it back in — the purge must drop both.
-        RemovalRoute::ConfigOnly
-    } else {
-        RemovalRoute::Unknown
-    }
-}
-
 /// Drop pending (scratch / not-yet-handed-over) addresses from an
 /// enumerated adapter list. Those are transient adoption machinery, not
 /// host addresses: rendering one as a host row, or letting its
@@ -755,81 +922,19 @@ pub(crate) fn strip_pending_ips(
     list
 }
 
-/// Names of the adapters currently binding `ip`. The caller's interface
-/// hint only orders the result (checked first) — a stale dialog
-/// selection must never decide where an unbind runs.
-fn adapters_binding_ip<'a>(
-    adapters: &'a [interface::InterfaceInfo],
-    ip: &str,
-    hint: Option<&str>,
-) -> Vec<&'a str> {
-    let mut owners: Vec<&str> = adapters
-        .iter()
-        .filter(|a| a.ips.iter().any(|i| i.address == ip))
-        .map(|a| a.name.as_str())
-        .collect();
-    if let Some(h) = hint {
-        if let Some(pos) = owners.iter().position(|n| *n == h) {
-            owners.swap(0, pos);
-        }
-    }
-    owners
-}
-
-/// Outcome of an owner-resolving unbind.
-#[derive(Debug, PartialEq, Eq)]
-enum UnbindOutcome {
-    /// The IP was bound and netsh removed it (from `adapter`, plus any
-    /// other adapter that also bound it).
-    Unbound { adapter: String },
-    /// The IP is bound on no enumerated adapter. Structured absence IS
-    /// success for a removal — never inferred from netsh output, which
-    /// is localized.
-    NotBound,
-}
-
-/// Unbind `ip` from whichever adapter(s) actually bind it, resolved by
-/// structured enumeration — a disconnected adapter still enumerates and
-/// can still be unbound. Any netsh failure propagates so the caller
-/// leaves persisted state intact for a retry.
-async fn unbind_ip_resolving_owner(
-    ip: Ipv4Addr,
-    hint: Option<&str>,
-) -> Result<UnbindOutcome, AppError> {
-    let adapters = interface::list_all_adapters().await?;
-    let ip_str = ip.to_string();
-    let owners = adapters_binding_ip(&adapters, &ip_str, hint);
-    if owners.len() > 1 {
-        log::warn!(
-            "Secondary IP {} is bound on {} adapters — removing it from all of them",
-            ip_str,
-            owners.len()
-        );
-    }
-    let mut removed_from: Option<String> = None;
-    for owner in owners {
-        ip_config::remove_secondary_ip(owner, &ip_str).await?;
-        removed_from.get_or_insert_with(|| owner.to_string());
-    }
-    Ok(match removed_from {
-        Some(adapter) => UnbindOutcome::Unbound { adapter },
-        None => UnbindOutcome::NotBound,
-    })
-}
-
 /// Long-lived clones the shared adoption tail needs, built once at
 /// adopt-task start from the clones the task already owns. Lets the
 /// broadcast dwell path and the cache probe drive one tail without a
 /// dozen-argument signature.
 struct AdoptionCtx {
     iface_name: String,
+    adapter_mac: String,
     interface_index: u32,
     candidates: Option<arp::CandidateIngress>,
     ops: auto_adopt::RealAdoptOps,
     app_handle: tauri::AppHandle,
     adopted: Arc<Mutex<HashMap<String, Ipv4Addr>>>,
     pending_ips: auto_adopt::PendingIps,
-    pending_restore: Arc<Mutex<HashMap<String, Ipv4Addr>>>,
     adoption_seq: Arc<AtomicU64>,
     liveness: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
     meta: Arc<std::sync::Mutex<HashMap<String, crate::config::AdoptedMeta>>>,
@@ -837,6 +942,7 @@ struct AdoptionCtx {
     registry: Arc<DeviceRegistry>,
     emitter: Arc<DeviceListEmitter>,
     fence: SweepFence,
+    address_fence: SweepFence,
     local_ips: Arc<std::sync::Mutex<HashSet<Ipv4Addr>>>,
 }
 
@@ -908,7 +1014,11 @@ async fn attempt_adoption(
     use tauri::Manager;
 
     let config = ctx.app_handle.state::<crate::config::AppConfig>();
-    if ctx.fence.is_stale() || config.get_network_mode() != crate::config::NetworkMode::StaticAuto {
+    if ctx.fence.is_stale()
+        || ctx.address_fence.is_stale()
+        || config.get().adopted_meta.contains_key(device_subnet)
+        || config.get_network_mode() != crate::config::NetworkMode::StaticAuto
+    {
         return AdoptionAttemptOutcome::NoOp;
     }
     if crate::validation::prohibited_camera_ip(device_ip) {
@@ -973,7 +1083,7 @@ async fn attempt_adoption(
             // roll the IP back and do NOT record — recording an IP the
             // stop path won't clean is worse than re-adopting on the
             // next start.
-            if *shutdown_rx.borrow() {
+            if *shutdown_rx.borrow() || ctx.fence.is_stale() || ctx.address_fence.is_stale() {
                 log::info!(
                     "Shutdown raced adoption of {} — rolling back {}",
                     device_subnet,
@@ -981,6 +1091,46 @@ async fn attempt_adoption(
                 );
                 auto_adopt::reconcile_pending(&ctx.ops, &ctx.pending_ips, Some(adoption_id)).await;
                 return AdoptionAttemptOutcome::ShutdownRace;
+            }
+            let adoption_wall = chrono::Utc::now().to_rfc3339();
+            let row = crate::config::AdoptedMeta {
+                adopted_at: Some(adoption_wall.clone()),
+                last_device_seen: Some(adoption_wall.clone()),
+                adapter_mac: adapter_mac(&ctx.adapter_mac),
+                address: Some(adopted_ip.to_string()),
+                prefix: Some(24),
+                applied: true,
+                ..Default::default()
+            };
+            // Commit before handover. A failed save leaves only this attempt's
+            // pending breadcrumb, which is rolled back without touching saved IPs.
+            if let Err(e) = commit_pending_address(
+                &ctx.pending_ips,
+                &ctx.iface_name,
+                adopted_ip,
+                adoption_id,
+                || {
+                    if ctx.fence.is_stale()
+                        || ctx.address_fence.is_stale()
+                        || config
+                            .get()
+                            .selected_adapter_mac
+                            .as_deref()
+                            .and_then(adapter_mac)
+                            != adapter_mac(&ctx.adapter_mac)
+                    {
+                        return Err(AppError::Network(
+                            "Adapter or address work changed before commit".into(),
+                        ));
+                    }
+                    config.set_binding(device_subnet, row.clone())
+                },
+            )
+            .await
+            {
+                log::warn!("Adoption commit failed for {}: {}", device_subnet, e);
+                auto_adopt::reconcile_pending(&ctx.ops, &ctx.pending_ips, Some(adoption_id)).await;
+                return AdoptionAttemptOutcome::Failed;
             }
             cooldowns.remove(device_subnet);
             ctx.adopted
@@ -990,28 +1140,12 @@ async fn attempt_adoption(
             // Fresh adoption: the triggering device was observed moments
             // ago, so seed the session liveness clock and the persisted
             // metadata together.
-            let adoption_wall = chrono::Utc::now().to_rfc3339();
             if let Ok(mut liveness) = ctx.liveness.lock() {
                 liveness.insert(device_subnet.to_string(), std::time::Instant::now());
             }
             if let Ok(mut meta) = ctx.meta.lock() {
-                meta.insert(
-                    device_subnet.to_string(),
-                    crate::config::AdoptedMeta {
-                        adopted_at: Some(adoption_wall.clone()),
-                        last_device_seen: Some(adoption_wall.clone()),
-                    },
-                );
+                meta.insert(device_subnet.to_string(), row);
             }
-            // Handover: the IP is recorded and owned now, so drop its
-            // pending breadcrumb (adapter untouched).
-            auto_adopt::pending_handover(
-                &ctx.pending_ips,
-                &ctx.iface_name,
-                adopted_ip,
-                adoption_id,
-            )
-            .await;
             known_subnets.insert(device_subnet.to_string());
 
             let _ = ctx.app_handle.emit(
@@ -1092,43 +1226,6 @@ async fn attempt_adoption(
                 }
             });
 
-            // Persist to config so the adoption survives a restart.
-            // Failure here is non-fatal (the IP is still bound to the
-            // interface for this session) but we want a log entry —
-            // silent loss leaves users debugging "where did my camera
-            // go?" after restart with no breadcrumb.
-            // This subnet is now live; drop any held-over restore for it
-            // so the persisted snapshot below reflects the live binding,
-            // not the stale hold.
-            ctx.pending_restore.lock().await.remove(device_subnet);
-            let live = ctx.adopted.lock().await.clone();
-            let pend = ctx.pending_restore.lock().await.clone();
-            let snapshot = merge_adopted_config(&live, &pend);
-            let meta_snapshot = ctx.meta.lock().map(|m| m.clone()).unwrap_or_default();
-            // Persist off the executor: update_adoption_state does a
-            // synchronous atomic_write + fsync (plus DPAPI on the
-            // credentials path) under a std lock, which would block a
-            // tokio worker across disk latency. Re-fetch the managed
-            // config inside so no borrow crosses the thread boundary.
-            let persist_handle = ctx.app_handle.clone();
-            let persisted = tokio::task::spawn_blocking(move || {
-                let config: tauri::State<'_, crate::config::AppConfig> = persist_handle.state();
-                config.update_adoption_state(snapshot, meta_snapshot)
-            })
-            .await;
-            match persisted {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => log::warn!(
-                    "Failed to persist adopted subnet {} to config: {}",
-                    device_subnet,
-                    e
-                ),
-                Err(e) => log::warn!(
-                    "Persist task for adopted subnet {} failed to join: {}",
-                    device_subnet,
-                    e
-                ),
-            }
             AdoptionAttemptOutcome::Adopted
         }
         Ok(Ok(None)) => {
@@ -1240,6 +1337,8 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
         use tauri::Manager;
         let config = self.ctx.app_handle.state::<crate::config::AppConfig>();
         if self.shutdown()
+            || self.ctx.address_fence.is_stale()
+            || config.get().adopted_meta.contains_key(subnet)
             || config.get_network_mode() != crate::config::NetworkMode::StaticAuto
             || !matches!(
                 ip_config::get_dhcp_state(&self.ctx.iface_name).await,
@@ -1391,7 +1490,7 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
     }
 
     fn shutdown(&self) -> bool {
-        *self.shutdown_rx.borrow() || self.ctx.fence.is_stale()
+        *self.shutdown_rx.borrow() || self.ctx.fence.is_stale() || self.ctx.address_fence.is_stale()
     }
 }
 
@@ -1732,12 +1831,13 @@ impl NetworkManager {
             presence: Arc::new(presence::Control::default()),
             presence_handle: Mutex::new(None),
             address_work: Arc::new(Mutex::new(())),
+            address_generation: Arc::new(AtomicU64::new(1)),
+            address_active: Arc::new(AtomicBool::new(true)),
             local_ips: Arc::new(StdMutex::new(HashSet::new())),
             excluded_subnets: Arc::new(StdMutex::new(Vec::new())),
             auto_adopt_handle: Arc::new(Mutex::new(None)),
             pending_ips: Arc::new(Mutex::new(Vec::new())),
             adoption_seq: Arc::new(AtomicU64::new(0)),
-            pending_restore: Arc::new(Mutex::new(HashMap::new())),
             discovery_watchdog_handle: Arc::new(Mutex::new(None)),
             interface_name: Arc::new(Mutex::new(None)),
             interface_index: Arc::new(Mutex::new(None)),
@@ -1762,18 +1862,7 @@ impl NetworkManager {
     /// plus per-subnet metadata views with staleness derived at call
     /// time from the same clocks the reap pass reads.
     pub async fn adoption_snapshot(&self) -> AdoptionSnapshot {
-        let adopted: HashMap<String, String> = self
-            .adopted_ips
-            .lock()
-            .await
-            .iter()
-            .map(|(k, v)| (k.clone(), v.to_string()))
-            .collect();
-        let meta_map = self
-            .adopted_meta
-            .lock()
-            .map(|m| m.clone())
-            .unwrap_or_default();
+        let (adopted, meta_map) = self.adopted_config_snapshot().await;
         let liveness = self
             .adoption_liveness
             .lock()
@@ -1787,7 +1876,7 @@ impl NetworkManager {
             .map(|t| t.elapsed())
             .unwrap_or_default();
         let wall_now = chrono::Utc::now();
-        let meta = adopted
+        let meta = meta_map
             .keys()
             .map(|subnet| {
                 let m = meta_map.get(subnet);
@@ -1853,13 +1942,8 @@ impl NetworkManager {
         }
     }
 
-    /// Persist the adoption pair (subnets ∪ pending restores, metadata)
-    /// through the atomic config writer, off the executor (the save is
-    /// an fsync under a std lock). Best-effort: a failure is logged and
-    /// the in-memory state stays authoritative for the next flush or
-    /// lifecycle save.
+    /// Persist liveness stamps only; late flushes cannot change saved intent.
     pub async fn flush_adoption_state(&self, app_handle: &tauri::AppHandle) {
-        let adopted = self.adopted_config_snapshot().await;
         let meta = self
             .adopted_meta
             .lock()
@@ -1869,32 +1953,13 @@ impl NetworkManager {
         let res = tokio::task::spawn_blocking(move || {
             use tauri::Manager;
             let config: tauri::State<'_, crate::config::AppConfig> = handle.state();
-            config.update_adoption_state(adopted, meta)
+            config.update_adoption_liveness(meta)
         })
         .await;
         match res {
             Ok(Ok(())) => {}
             Ok(Err(e)) => log::warn!("Failed to persist adoption metadata: {}", e),
             Err(e) => log::warn!("Adoption metadata persist task failed to join: {}", e),
-        }
-    }
-
-    /// Drop session liveness and in-memory metadata for subnets that
-    /// are no longer adopted. The next config save (aligned inside the
-    /// writer) drops their persisted metadata too.
-    fn forget_adoption_tracking(&self, subnets: &[String]) {
-        if subnets.is_empty() {
-            return;
-        }
-        if let Ok(mut liveness) = self.adoption_liveness.lock() {
-            for s in subnets {
-                liveness.remove(s);
-            }
-        }
-        if let Ok(mut meta) = self.adopted_meta.lock() {
-            for s in subnets {
-                meta.remove(s);
-            }
         }
     }
 
@@ -2039,97 +2104,127 @@ impl NetworkManager {
         }
     }
 
-    /// Apply a runtime mode change: swap the active subsystems and
-    /// rehydrate the registry to match what the new mode considers
-    /// the source of truth. The caller has already persisted the new
-    /// mode to config.
-    ///
-    /// Manual ↔ non-Manual transitions are the only ones that move
-    /// real machinery — Auto ↔ DHCP is handled implicitly by the
-    /// auto-adopt loop's per-iteration DHCP-state probe.
-    pub async fn apply_mode_change(
+    /// Warn, fence and drain address work, change OS/config, observe the
+    /// resulting state, then resume eligible work with a fresh DHCP cache.
+    pub async fn transition_mode(
         &self,
-        app_handle: tauri::AppHandle,
+        app: tauri::AppHandle,
         config: &crate::config::AppConfig,
-        old_mode: crate::config::NetworkMode,
-        new_mode: crate::config::NetworkMode,
-    ) -> Result<(), crate::error::AppError> {
+        request: ModeTransition,
+    ) -> Result<ModeTransitionReply, AppError> {
         use crate::config::NetworkMode;
-
-        if old_mode == new_mode {
-            return Ok(());
-        }
-        log::info!("Mode change: {:?} → {:?}", old_mode, new_mode);
-        self.presence
-            .update(&self.adapter_selection_state().await, new_mode);
-        self.presence.tick(&self.device_registry);
-
-        // Serialize against start/stop so a mode-change teardown/restart
-        // can't interleave with a concurrent discovery start.
         let _op = self.discovery_op.lock().await;
-
-        if new_mode == NetworkMode::StaticManual {
-            // Going INTO Manual: merge everything the Nodes panel is
-            // currently showing (real-MAC entries with at least one
-            // discovered open port) into manual_nodes. add_manual_node
-            // is IP-keyed so existing pins keep their state — the
-            // merge is additive, not replacing.
-            //
-            // Runs on every Auto→Manual transition so a user who runs
-            // discovery, switches to Manual, later flips back to Auto
-            // to find more devices, then returns to Manual gets the
-            // newly-discovered items merged in. If they don't want a
-            // pin, they delete it from the modal; if the underlying
-            // device is still on the broadcast domain a future
-            // round-trip will re-pin it.
-            let snapshot = self.device_registry.snapshot();
-            for record in snapshot {
-                if record.mac.starts_with("manual:") {
+        let iface = self.selected_write_adapter(config, &request.name).await?;
+        // The warning response precedes even cancellation or a config mutation.
+        if request.mode == NetworkMode::Dhcp && !request.confirmed {
+            return Ok(ModeTransitionReply {
+                warning: Some("Switching to DHCP removes manually configured addresses from this adapter. Saved managed secondaries will remain pending until a static mode returns. Continue?".into()),
+                mode: config.get_network_mode(),
+            });
+        }
+        if request.mode != NetworkMode::Dhcp {
+            let ip = request
+                .ip
+                .as_deref()
+                .ok_or_else(|| AppError::Network("Static address is required".into()))?;
+            ip.parse::<Ipv4Addr>()
+                .map_err(|_| AppError::Network("Invalid static address".into()))?;
+            ip_config::mask_to_prefix(
+                request
+                    .subnet_mask
+                    .as_deref()
+                    .ok_or_else(|| AppError::Network("Subnet mask is required".into()))?,
+            )?;
+            if let Some(gw) = &request.gateway {
+                gw.parse::<Ipv4Addr>()
+                    .map_err(|_| AppError::Network("Invalid gateway".into()))?;
+            }
+        }
+        let pause = self.pause_addresses();
+        // Stops the legacy worker and discards its DHCP cache on every Apply.
+        self.stop_locked().await;
+        let address = self.address_work.lock().await;
+        let old_mode = config.get_network_mode();
+        let result = async {
+            // An unreadable DHCP state never permits an address write.
+            ip_config::get_dhcp_state(&iface.name).await?;
+            // Refresh identity after waiting for in-flight scratch cleanup.
+            let current = self.selected_write_adapter(config, &request.name).await?;
+            if adapter_mac(&current.mac) != adapter_mac(&iface.mac) {
+                return Err(AppError::Network("Selected adapter changed".into()));
+            }
+            if request.mode == NetworkMode::Dhcp {
+                ip_config::set_dhcp(&iface.name).await?;
+            } else {
+                ip_config::assign_static_ip(
+                    &iface.name,
+                    request.ip.as_deref().unwrap(),
+                    request.subnet_mask.as_deref().unwrap(),
+                    request.gateway.as_deref(),
+                )
+                .await?;
+            }
+            let actual_dhcp = ip_config::get_dhcp_state(&iface.name).await?;
+            if actual_dhcp != (request.mode == NetworkMode::Dhcp) {
+                return Err(AppError::Network(
+                    "Windows did not apply the requested DHCP/static mode".into(),
+                ));
+            }
+            config.set_network_mode(request.mode)?;
+            if let Some(ip) = request
+                .ip
+                .as_deref()
+                .filter(|_| request.mode != NetworkMode::Dhcp)
+            {
+                self.claim_binding_locked(config, ip).await?;
+            }
+            Ok(())
+        }
+        .await;
+        // Even partial OS/config failure is followed by a fresh observation.
+        self.reconcile_bindings_locked(config).await;
+        let mode = config.get_network_mode();
+        self.presence
+            .update(&self.adapter_selection_state().await, mode);
+        self.presence.tick(&self.device_registry);
+        drop(address);
+        drop(pause);
+        if mode == NetworkMode::StaticManual && old_mode != mode {
+            for record in self.device_registry.snapshot() {
+                if record.mac.starts_with("manual:")
+                    || record.open_ports.is_empty()
+                    || record
+                        .ip
+                        .parse()
+                        .is_ok_and(crate::validation::prohibited_camera_ip)
+                {
                     continue;
                 }
-                if record.open_ports.is_empty() {
-                    continue;
-                }
-                let node = crate::config::ManualNode {
+                if let Err(e) = config.add_manual_node(crate::config::ManualNode {
                     expected_mac: device_registry::canonical_mac(&record.mac),
                     ip: record.ip,
                     alias: record.alias,
-                };
-                if let Err(e) = config.add_manual_node(node) {
-                    log::warn!("Failed to auto-pin discovered device: {}", e);
-                }
-            }
-            self.stop_locked().await;
-            self.hydrate_manual_nodes(config).await;
-        } else if old_mode == NetworkMode::StaticManual {
-            // Leaving Manual: drop manual hydrations, restore the
-            // cache, restart ARP discovery if an interface is known.
-            self.hydrate_manual_nodes(config).await;
-            if let Some(emitter) = self.device_emitter.lock().await.clone() {
-                emitter.poke();
-            }
-            if crate::is_discovery_available() {
-                let list = self.list_interfaces().await?;
-                let iface = self
-                    .resolve_adapter_locked(config, &list)
-                    .await?
-                    .adapter
-                    .map(|i| i.name);
-                if let Some(name) = iface {
-                    if let Err(e) = self
-                        .start_arp_discovery_locked(&name, config, app_handle.clone())
-                        .await
-                    {
-                        log::warn!("Failed to start ARP after mode change: {}", e);
-                    }
+                }) {
+                    log::warn!("Failed to auto-pin device: {}", e);
                 }
             }
         }
-
+        self.hydrate_manual_nodes(config).await;
+        if mode != NetworkMode::StaticManual && crate::is_discovery_available() {
+            if let Err(e) = self
+                .start_arp_discovery_locked(&iface.name, config, app.clone())
+                .await
+            {
+                log::warn!("Discovery restart after mode transition: {}", e);
+            }
+        }
         self.presence.bootstrap();
-        // Refresh the pinger so the next sweep targets the new set.
-        self.start_ping_dot(app_handle).await;
-        Ok(())
+        self.start_ping_dot(app).await;
+        result?;
+        Ok(ModeTransitionReply {
+            warning: None,
+            mode,
+        })
     }
 
     pub(crate) async fn start_presence(&self, app: tauri::AppHandle) {
@@ -2238,315 +2333,151 @@ impl NetworkManager {
         self.device_emitter.lock().await.clone()
     }
 
-    /// Load previously adopted subnets from config and verify they still
-    /// exist on the adapter. Re-add any that are missing.
-    ///
-    /// Entries whose subnet matches the adapter's native IPs are pruned —
-    /// they were either saved by mistake or the adapter's primary IP
-    /// changed to cover that subnet since the adoption.
-    ///
-    /// Concurrency: the `adopted_ips` mutex is held only for the synchronous
-    /// classify+insert phase (microseconds). The slow netsh re-add calls run
-    /// outside the lock — and in parallel — so IPC handlers querying the map
-    /// during cold start aren't blocked behind a sequence of 100–500ms netsh
-    /// invocations.
-    ///
-    /// `app_handle` is used to emit a `subnet-adopted` event for each
-    /// restored entry so the frontend can populate its `adoptedSubnets`
-    /// Map without racing the cold-start `getAdoptedSubnets` call. Without
-    /// this signal, the frontend would query the in-memory map BEFORE
-    /// Phase 1 completes (especially on slow Windows boxes where
-    /// `interface::list_physical()` takes 100–300 ms), find it empty, and
-    /// then never re-pull it — leaving restored IPs rendered as if they
-    /// were native (no `(auto)` badge, wrong sort order).
+    /// Reconcile durable intent from actual selected-adapter addresses. Never
+    /// prune malformed, unavailable, DHCP, or adapter-mismatched saved rows.
     pub async fn load_adopted_from_config(
         &self,
         config: &crate::config::AppConfig,
-        app_handle: &tauri::AppHandle,
+        app: &tauri::AppHandle,
     ) {
-        let settings = config.get();
-        if settings.adopted_subnets.is_empty() {
-            return;
-        }
-
-        // Serialize against discovery start/stop: a watcher-driven start
-        // must not spawn the auto-adopt loop while we're mid-restore (both
-        // mutate adopted_ips and bind secondary IPs), and vice versa.
         let _op = self.discovery_op.lock().await;
-
-        let iface = match self.list_interfaces().await {
-            Ok(list) => self
-                .resolve_adapter_locked(config, &list)
-                .await
-                .ok()
-                .and_then(|s| {
-                    s.adapter
-                        .filter(|i| i.is_up && !i.ips.is_empty() && s.interface_index.is_some())
-                }),
-            Err(_) => None,
-        };
-
-        let iface = match iface {
-            Some(i) => i,
-            None => {
-                log::info!("No active interface — skipping adopted subnet restore");
-                return;
-            }
-        };
-
-        // Structural-ghost networks owned by up, non-wired local interfaces
-        // (WiFi/VPN/virtual). Fails open to empty on an enumeration error, so
-        // a transient adapter-query failure just skips ghost pruning this
-        // boot rather than dropping legitimate adoptions.
-        let ghosts = ghost::non_wired_interface_networks().await;
-
-        // Build the set of /24 subnets the adapter already covers natively.
-        // "Native" means: an IP on the adapter that is NOT the result of a
-        // previous adoption. Without this filter, Windows' registry-backed
-        // persistence of adopted secondary IPs makes every adopted subnet
-        // look native on the next launch, and the pruning loop below would
-        // wipe the config on every reboot — collapsing the primary/adopted
-        // distinction in the UI.
-        let adopted_ip_strs: HashSet<&String> = settings.adopted_subnets.values().collect();
-        let native_subnets: HashSet<String> = iface
-            .ips
-            .iter()
-            .filter(|ip| !adopted_ip_strs.contains(&ip.address))
-            .filter_map(|ip| ip.address.parse::<Ipv4Addr>().ok())
-            .map(|ip| {
-                let o = ip.octets();
-                format!("{}.{}.{}.0/24", o[0], o[1], o[2])
-            })
-            .collect();
-
-        let current_ips: HashSet<String> = iface.ips.iter().map(|ip| ip.address.clone()).collect();
-
-        // ── Phase 1: classify (no live insert) ──
-        // Each surviving entry produces (subnet, ip_str, needs_netsh_add).
-        // Nothing is inserted into the live `adopted_ips` map here — an
-        // entry becomes live only once Phase 2 confirms it is bound, so the
-        // UI never badges an IP that isn't actually on the adapter.
-        let mut work_items: Vec<(String, String, bool)> = Vec::new();
-        let mut kept: HashMap<String, String> = HashMap::new();
-        let mut pruned = false;
-        // Ghost adoptions whose secondary IP is still bound on the adapter (a
-        // previous run crashed before shutdown cleanup) — unbound after the
-        // config persist below.
-        let mut ghost_bound: Vec<(String, String)> = Vec::new();
-        for (subnet, ip_str) in &settings.adopted_subnets {
-            match ghost::classify_adoption(subnet, ip_str, &native_subnets, &ghosts) {
-                ghost::AdoptionClass::PruneNative => {
-                    log::info!(
-                        "Pruning adopted subnet {} ({}) — adapter already covers it natively",
-                        subnet,
-                        ip_str,
-                    );
-                    pruned = true;
-                }
-                ghost::AdoptionClass::PruneGhost => {
-                    // Auto-heal a persisted WiFi/VPN/virtual-switch adoption:
-                    // drop it from config and never re-bind it.
-                    log::info!(
-                        "Pruning adopted subnet {} ({}) — owned by a non-wired local interface (WiFi/VPN/virtual)",
-                        subnet,
-                        ip_str,
-                    );
-                    pruned = true;
-                    // If the IP is still bound (a crash left it behind), queue
-                    // it for an explicit unbind after the config persist.
-                    if current_ips.contains(ip_str) {
-                        ghost_bound.push((subnet.clone(), ip_str.clone()));
-                    }
-                }
-                ghost::AdoptionClass::PruneInvalid => {
-                    // Unparseable IP — proven invalid, drop it from config.
-                    log::warn!("Dropping adopted subnet {} — invalid IP {}", subnet, ip_str);
-                    pruned = true;
-                }
-                ghost::AdoptionClass::Keep => {
-                    kept.insert(subnet.clone(), ip_str.clone());
-                    work_items.push((
-                        subnet.clone(),
-                        ip_str.clone(),
-                        !current_ips.contains(ip_str),
-                    ));
-                }
-            }
-        }
-
-        // Seed the in-memory metadata working copy for the surviving
-        // entries. Config load already backfilled legacy gaps, so every
-        // kept subnet has an entry; pruned subnets are dropped here and
-        // from the persisted map below.
-        if let Ok(mut meta) = self.adopted_meta.lock() {
-            *meta = settings
-                .adopted_meta
-                .iter()
-                .filter(|(subnet, _)| kept.contains_key(*subnet))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-        }
-
-        // Persist the pruned config (original − natively-covered − invalid),
-        // computed independently of which re-adds later succeed: a transient
-        // re-add failure must keep its config entry for a retry. Only write
-        // when something was actually dropped. Lifecycle metadata rides the
-        // same write: alignment inside the updater drops the pruned
-        // subnets' metadata and backfills legacy entries that never had
-        // any.
-        if pruned {
-            match config.update_adoption_state(kept, settings.adopted_meta.clone()) {
-                Ok(()) => log::info!("Saved pruned adopted subnets to config"),
-                Err(e) => log::warn!("Failed to persist pruned adopted subnets: {}", e),
-            }
-        }
-
-        // Crash-leftover cleanup: a ghost adoption whose secondary IP is
-        // still bound on the wired port (a prior run exited without cleanup)
-        // is unbound here so the port isn't left holding a WiFi/VPN address.
-        // Runs after the config persist so a failed unbind can't block the
-        // prune. Guards mirror shutdown cleanup: never strip the adapter's
-        // last IPv4 or its primary native address.
-        if !ghost_bound.is_empty() {
-            let primary_native: Option<&String> = iface
-                .ips
-                .iter()
-                .map(|ip| &ip.address)
-                .find(|addr| !adopted_ip_strs.contains(addr));
-            for (subnet, ip_str) in &ghost_bound {
-                if iface.ips.len() < 2 {
-                    log::warn!(
-                        "Skipping ghost unbind of {} ({}): would leave the adapter with no other IPv4 address",
-                        ip_str,
-                        subnet
-                    );
-                    continue;
-                }
-                if primary_native == Some(ip_str) {
-                    log::warn!(
-                        "Skipping ghost unbind of {} ({}): is the adapter's primary IP",
-                        ip_str,
-                        subnet
-                    );
-                    continue;
-                }
-                match auto_adopt::remove_adopted_ip(&iface.name, ip_str).await {
-                    Ok(()) => {
-                        log::info!("Unbound crash-leftover ghost IP {} ({})", ip_str, subnet)
-                    }
-                    Err(e) => log::warn!(
-                        "Failed to unbind crash-leftover ghost IP {} ({}): {}",
-                        ip_str,
-                        subnet,
-                        e
-                    ),
-                }
-            }
-        }
-
-        // ── Phase 2: netsh re-add in parallel, outside the lock ────
-        // Each task reports whether its IP is confirmed bound. Recording is
-        // done back here (not in the task) so the live map / pending_restore
-        // mutations and the success-only `subnet-adopted` emit happen in one
-        // place with `&self` in scope.
-        let mut tasks: tokio::task::JoinSet<(String, String, bool)> = tokio::task::JoinSet::new();
-        for (subnet, ip_str, needs_add) in work_items {
-            let iface_name = iface.name.clone();
-            tasks.spawn(async move {
-                let added_ok = if needs_add {
-                    log::info!("Re-adding missing adopted IP {} to {}", ip_str, iface_name);
-                    match ip_config::add_secondary_ip(&iface_name, &ip_str, "255.255.255.0").await {
-                        Ok(()) => true,
-                        Err(e) => {
-                            log::warn!(
-                                "Failed to re-add adopted IP {} ({}): {}",
-                                ip_str,
-                                subnet,
-                                e
-                            );
-                            false
-                        }
-                    }
-                } else {
-                    log::info!("Adopted IP {} already on adapter", ip_str);
-                    true
-                };
-                (subnet, ip_str, added_ok)
-            });
-        }
-
-        // Confirmed-bound entries go live and emit `subnet-adopted`; a
-        // transiently-failed re-add is held in `pending_restore` — not shown
-        // as a live route, but retried next startup and never dropped from
-        // config by an in-session save.
+        let pause = self.pause_addresses();
+        let _address = self.address_work.lock().await;
+        self.reconcile_bindings_locked(config).await;
+        drop(_address);
+        drop(pause);
+        self.presence.bootstrap();
         use tauri::Emitter;
-        while let Some(res) = tasks.join_next().await {
-            let (subnet, ip_str, added_ok) = match res {
-                Ok(t) => t,
-                Err(e) => {
-                    log::warn!("Adopted-restore task failed to join: {}", e);
-                    continue;
-                }
-            };
-            let ip: Ipv4Addr = match ip_str.parse() {
-                Ok(ip) => ip,
-                Err(_) => continue,
-            };
-            if added_ok {
-                self.adopted_ips.lock().await.insert(subnet.clone(), ip);
-                self.pending_restore.lock().await.remove(&subnet);
-                // A just-restored entry is never stale: its startup
-                // grace begins with the discovery session, and the
-                // badge is re-derived from the adoption snapshot
-                // whenever the UI re-pulls it.
-                let restored_meta = self
-                    .adopted_meta
-                    .lock()
-                    .ok()
-                    .and_then(|m| m.get(&subnet).cloned())
-                    .unwrap_or_default();
-                let _ = app_handle.emit(
-                    "subnet-adopted",
-                    serde_json::json!({
-                        "subnet": subnet,
-                        "adopted_ip": ip_str,
-                        "adopted_at": restored_meta.adopted_at,
-                        "last_device_seen": restored_meta.last_device_seen,
-                        "stale": false,
-                    }),
-                );
+        let snapshot = self.adoption_snapshot().await;
+        for (subnet, ip) in &snapshot.adopted_subnets {
+            let meta = &snapshot.meta[subnet];
+            let _ = app.emit(
+                "subnet-adopted",
+                serde_json::json!({
+                    "subnet": subnet, "adopted_ip": ip, "restored": true,
+                    "adopted_at": meta.adopted_at, "last_device_seen": meta.last_device_seen,
+                    "stale": false,
+                }),
+            );
+        }
+    }
+
+    fn address_fence(&self) -> SweepFence {
+        SweepFence::new(
+            self.address_generation.load(Ordering::Acquire),
+            self.address_generation.clone(),
+            self.address_active.clone(),
+        )
+    }
+
+    fn pause_addresses(&self) -> AddressPause {
+        AddressPause::new(self.address_generation.clone(), self.address_active.clone())
+    }
+
+    async fn publish_binding(
+        &self,
+        config: &crate::config::AppConfig,
+        subnet: &str,
+        mut row: crate::config::AdoptedMeta,
+    ) {
+        if let Err(e) = config.set_binding(subnet, row.clone()) {
+            row.last_error = Some(format!(
+                "{}; status save failed: {}",
+                row.last_error.as_deref().unwrap_or("OS state observed"),
+                e
+            ));
+        }
+        let mut live = self.adopted_ips.lock().await;
+        if row.desired == crate::config::BindingDesired::Present
+            && row.applied
+            && row.last_error.is_none()
+        {
+            if let Some(ip) = row.address.as_ref().and_then(|a| a.parse().ok()) {
+                live.insert(subnet.to_string(), ip);
+            }
+        } else {
+            live.remove(subnet);
+        }
+        if let Ok(mut meta) = self.adopted_meta.lock() {
+            meta.insert(subnet.to_string(), row);
+        }
+    }
+
+    async fn reconcile_bindings_locked(&self, config: &crate::config::AppConfig) {
+        let settings = config.get();
+        let adapters = interface::list_all_adapters().await;
+        let mut selected = adapters
+            .as_ref()
+            .ok()
+            .and_then(|list| pick_adapter(list, settings.selected_adapter_mac.as_deref()).cloned());
+        if let Some(iface) = &mut selected {
+            if let Some((up, ips)) = interface::quick_status_by_mac(&iface.mac) {
+                iface.is_up = up && interface::index_for_mac(&iface.mac).is_some();
+                iface.ips = ips;
             } else {
-                self.pending_restore.lock().await.insert(subnet.clone(), ip);
-                log::warn!(
-                    "Adopted restore held for retry: {} ({}) — re-add failed",
-                    subnet,
-                    ip_str
-                );
+                iface.is_up = false;
             }
         }
-    }
-
-    /// The config snapshot to persist: the live adopted map unioned with the
-    /// pending-restore holds (live wins on conflict). Persisting only the
-    /// live map would silently drop a transiently-failed restore.
-    async fn adopted_config_snapshot(&self) -> HashMap<String, String> {
-        let live = self.adopted_ips.lock().await.clone();
-        let pending = self.pending_restore.lock().await.clone();
-        merge_adopted_config(&live, &pending)
-    }
-
-    /// Save current adopted subnets and their lifecycle metadata to
-    /// config in one atomic write.
-    pub async fn save_adopted_to_config(&self, config: &crate::config::AppConfig) {
-        let adopted = self.adopted_config_snapshot().await;
-        let meta = self
-            .adopted_meta
-            .lock()
-            .map(|m| m.clone())
+        let dhcp = match &selected {
+            Some(iface) => ip_config::get_dhcp_state(&iface.name)
+                .await
+                .map_err(|e| e.to_string()),
+            None => Err("selected adapter unavailable".into()),
+        };
+        let ghosts = adapters
+            .as_ref()
+            .map(|list| ghost::non_wired_networks_of(list))
             .unwrap_or_default();
-        if let Err(e) = config.update_adoption_state(adopted, meta) {
-            log::warn!("Failed to save adopted subnets: {}", e);
+        self.adopted_ips.lock().await.clear();
+        for (subnet, row) in settings.adopted_meta {
+            let mut action = binding_action(
+                &subnet,
+                &row,
+                selected.as_ref(),
+                settings.network_mode,
+                &dhcp,
+                &ghosts,
+            );
+            if let Err(error) = &adapters {
+                action = BindingAction::Hold(format!("adapter enumeration failed: {error}"), false);
+            } else if row.desired == crate::config::BindingDesired::Present
+                && settings.adopted_subnets.get(&subnet) != row.address.as_ref()
+            {
+                action = BindingAction::Hold(
+                    "saved routing address and metadata disagree".into(),
+                    false,
+                );
+            }
+            let iface = selected.as_ref();
+            let row = apply_binding(&auto_adopt::RealAdoptOps, row, action, iface, || async {
+                match iface {
+                    Some(iface) => interface::get_by_name(&iface.name).await.and_then(|i| {
+                        if adapter_mac(&i.mac) == adapter_mac(&iface.mac) {
+                            Ok(i.ips)
+                        } else {
+                            Err(AppError::Network(
+                                "selected adapter changed during reconciliation".into(),
+                            ))
+                        }
+                    }),
+                    None => Err(AppError::Network("selected adapter unavailable".into())),
+                }
+            })
+            .await;
+            self.publish_binding(config, &subnet, row).await;
         }
+    }
+
+    /// Routes contain only bindings both desired and last observed applied.
+    async fn adopted_config_snapshot(
+        &self,
+    ) -> (
+        HashMap<String, String>,
+        HashMap<String, crate::config::AdoptedMeta>,
+    ) {
+        let live = self.adopted_ips.lock().await;
+        let meta = self.adopted_meta.lock().unwrap_or_else(|e| e.into_inner());
+        (merge_adopted_config(&live, &meta), meta.clone())
     }
 
     pub async fn list_interfaces(&self) -> Result<Vec<InterfaceInfo>, AppError> {
@@ -2575,7 +2506,18 @@ impl NetworkManager {
         list: &[InterfaceInfo],
     ) -> Result<AdapterSelection, AppError> {
         let _op = self.discovery_op.lock().await;
-        self.resolve_adapter_locked(config, list).await
+        let previous = self.adapter_selection_state().await;
+        let selection = self.resolve_adapter_locked(config, list).await?;
+        // A cable cycle commonly retains the same Windows interface index.
+        // Identity changes are restored by the watcher/start path; link-only
+        // changes still reconcile pending additions and removals here.
+        if binding_link_changed(&previous, &selection) {
+            let _pause = self.pause_addresses();
+            let _address = self.address_work.lock().await;
+            self.reconcile_bindings_locked(config).await;
+            self.presence.bootstrap();
+        }
+        Ok(selection)
     }
 
     async fn resolve_adapter_locked(
@@ -2610,8 +2552,13 @@ impl NetworkManager {
             }
             self.stop_locked().await;
             // Retire routes from the live map without losing saved bindings.
-            let prior = std::mem::take(&mut *self.adopted_ips.lock().await);
-            self.pending_restore.lock().await.extend(prior);
+            self.adopted_ips.lock().await.clear();
+            if let Ok(mut meta) = self.adopted_meta.lock() {
+                for row in meta.values_mut() {
+                    row.applied = false;
+                    row.last_error = Some("selected adapter unavailable".into());
+                }
+            }
         }
         let candidates: Vec<_> = list
             .iter()
@@ -3309,7 +3256,9 @@ impl NetworkManager {
         let registry_for_adopt = registry.clone();
         let emitter_for_adopt = emitter.clone();
         let fence_for_loop = fence.clone();
-        let pending_restore = self.pending_restore.clone();
+        let binding_mac = config.get().selected_adapter_mac.unwrap_or_default();
+        let address_generation = self.address_generation.clone();
+        let address_active = self.address_active.clone();
         let liveness_for_adopt = self.adoption_liveness.clone();
         let meta_for_adopt = self.adopted_meta.clone();
         // One session-start instant shared by the loop's reap pass and
@@ -3321,25 +3270,21 @@ impl NetworkManager {
             *started = Some(session_started);
         }
         let adopt_handle = tokio::spawn(async move {
-            // AdoptOps in scope: the reap pass calls the unbind through
-            // the same seam the adoption rollback paths use.
-            use auto_adopt::AdoptOps;
             use tauri::Emitter;
             use tauri::Manager;
             let mut shutdown_rx = shutdown_rx;
-            let ops = auto_adopt::RealAdoptOps;
             // The shared adoption tail's context — one bundle of the
             // clones this task already owns, used by both the broadcast
             // path below and the cache probe.
-            let ctx = AdoptionCtx {
+            let mut ctx = AdoptionCtx {
                 iface_name: iface_name.clone(),
+                adapter_mac: binding_mac,
                 interface_index,
                 candidates: candidates_for_adopt,
                 ops: auto_adopt::RealAdoptOps,
                 app_handle: app_handle_for_adopt.clone(),
                 adopted: adopted.clone(),
                 pending_ips: pending_ips.clone(),
-                pending_restore: pending_restore.clone(),
                 adoption_seq: adoption_seq.clone(),
                 liveness: liveness_for_adopt.clone(),
                 meta: meta_for_adopt.clone(),
@@ -3347,6 +3292,11 @@ impl NetworkManager {
                 registry: registry_for_adopt.clone(),
                 emitter: emitter_for_adopt.clone(),
                 fence: fence_for_loop.clone(),
+                address_fence: SweepFence::new(
+                    address_generation.load(Ordering::Acquire),
+                    address_generation.clone(),
+                    address_active.clone(),
+                ),
                 local_ips: local_ips.clone(),
             };
             // Cached-device probe: at most one pass per discovery
@@ -3361,15 +3311,6 @@ impl NetworkManager {
             // a single spurious frame (which sits in the persistent
             // device map forever) can no longer bind a secondary IP.
             let mut dwell = auto_adopt::DwellTracker::new();
-            // Failed or guard-blocked reaps back off here (60 s doubling
-            // to 10 min, like adoption failures) instead of retrying —
-            // and re-logging — every 2 s tick.
-            let mut reap_cooldowns: HashMap<String, (std::time::Instant, std::time::Duration)> =
-                HashMap::new();
-            // Unparseable adoption keys are warned about once, then left
-            // to the existing restore/manual-removal behavior.
-            let mut invalid_warned: HashSet<String> = HashSet::new();
-
             // Mark subnets we already have IPs on as known
             for ip_str in &known_ips {
                 if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
@@ -3420,7 +3361,15 @@ impl NetworkManager {
                 if *shutdown_rx.borrow() {
                     break;
                 }
+                ctx.address_fence = SweepFence::new(
+                    address_generation.load(Ordering::Acquire),
+                    address_generation.clone(),
+                    address_active.clone(),
+                );
                 let _address = address_work_for_adopt.lock().await;
+                if ctx.address_fence.is_stale() {
+                    continue;
+                }
                 if ctx.fence.is_stale() || *shutdown_rx.borrow() {
                     break;
                 }
@@ -3440,182 +3389,11 @@ impl NetworkManager {
                     }
                 }
 
-                // ── Adoption lifecycle pass ─────────────────────────────
-                // Runs every tick BEFORE the DHCP gate below: reaping is
-                // maintenance of existing bindings and must keep running
-                // while new adoption is paused — that is the common state
-                // in which a stale APIPA binding should disappear. The
-                // cheap no-veto verdict screens first; only a would-reap
-                // entry pays for the config/registry/interface reads.
-                let adopted_snapshot: HashMap<String, Ipv4Addr> = adopted.lock().await.clone();
-                for (reap_subnet, reap_ip) in &adopted_snapshot {
-                    let parsed = reaper::parse_subnet_key(reap_subnet);
-                    if parsed.is_none() {
-                        if invalid_warned.insert(reap_subnet.clone()) {
-                            log::warn!(
-                                "Adopted subnet key {} does not parse — never auto-removed, remove manually if stale",
-                                reap_subnet
-                            );
-                        }
-                        continue;
-                    }
-                    let last_positive_elapsed = liveness_for_adopt
-                        .lock()
-                        .ok()
-                        .and_then(|l| l.get(reap_subnet).map(|t| t.elapsed()));
-                    let base_input = reaper::LifecycleInput {
-                        subnet: parsed,
-                        last_positive_elapsed,
-                        session_elapsed: session_started.elapsed(),
-                        pinned: false,
-                        host_rescued: false,
-                        badge_age: None,
-                    };
-                    if reaper::lifecycle_verdict(&base_input) != reaper::ReapVerdict::Reap {
-                        continue;
-                    }
-                    if let Some(&(retry_at, _)) = reap_cooldowns.get(reap_subnet) {
-                        if std::time::Instant::now() < retry_at {
-                            continue;
-                        }
-                    }
-
-                    // TTL crossed and not cooling down — gather the veto
-                    // inputs. Pinned: any user-pinned device (alias,
-                    // manual node, configured stream target) inside the
-                    // subnet, whether or not it has a registry record.
-                    let pins = {
-                        let config: tauri::State<'_, crate::config::AppConfig> =
-                            app_handle_for_adopt.state();
-                        device_registry::configured_pins(&config.get())
-                    };
-                    let mut pinned_ips = registry_for_adopt.user_pinned_ips(&pins);
-                    pinned_ips.extend(pins.iter().filter_map(|p| p.parse::<Ipv4Addr>().ok()));
-                    let pinned = pinned_ips
-                        .iter()
-                        .any(|ip| &subnet_key_for(*ip) == reap_subnet);
-
-                    let verdict = reaper::lifecycle_verdict(&reaper::LifecycleInput {
-                        pinned,
-                        ..base_input
-                    });
-                    if verdict != reaper::ReapVerdict::Reap {
-                        // Vetoed: stale-but-held. The UI badges it from
-                        // the adoption snapshot; nothing to do here.
-                        continue;
-                    }
-
-                    // Adapter guards, mirroring shutdown cleanup. A
-                    // blocked reap arms the cooldown so the warning
-                    // doesn't repeat every 2 s.
-                    let adapter_ip_strs: Vec<String> = interface::get_by_name(&iface_name)
-                        .await
-                        .map(|i| i.ips.iter().map(|ip| ip.address.clone()).collect())
-                        .unwrap_or_default();
-                    if let Some(reason) =
-                        unbind_guard_blocks(&reap_ip.to_string(), &adapter_ip_strs)
-                    {
-                        log::warn!(
-                            "Holding reap of stale adoption {} ({}): {} — re-checking in {}s",
-                            reap_subnet,
-                            reap_ip,
-                            reason,
-                            COOLDOWN_INITIAL.as_secs()
-                        );
-                        reap_cooldowns.insert(
-                            reap_subnet.clone(),
-                            (
-                                std::time::Instant::now() + COOLDOWN_INITIAL,
-                                COOLDOWN_INITIAL,
-                            ),
-                        );
-                        continue;
-                    }
-
-                    // Unbind first; only a successful OS removal may drop
-                    // live state, so a failure can't strand a bound IP
-                    // the maps no longer know about.
-                    match ops.remove(&iface_name, *reap_ip).await {
-                        Ok(()) => {
-                            adopted.lock().await.remove(reap_subnet);
-                            pending_restore.lock().await.remove(reap_subnet);
-                            // Clear the loop-local traces too: a reaped
-                            // subnet must be able to re-adopt in this
-                            // session once a device really returns (the
-                            // dwell gate demands two fresh observations,
-                            // which is thrash protection enough).
-                            known_subnets.remove(reap_subnet);
-                            dwell.prune_subnet(reap_subnet);
-                            reap_cooldowns.remove(reap_subnet);
-                            if let Ok(mut liveness) = liveness_for_adopt.lock() {
-                                liveness.remove(reap_subnet);
-                            }
-                            if let Ok(mut meta) = meta_for_adopt.lock() {
-                                meta.remove(reap_subnet);
-                            }
-
-                            let live = adopted.lock().await.clone();
-                            let pend = pending_restore.lock().await.clone();
-                            let snapshot = merge_adopted_config(&live, &pend);
-                            let meta_snapshot =
-                                meta_for_adopt.lock().map(|m| m.clone()).unwrap_or_default();
-                            let persist_handle = app_handle_for_adopt.clone();
-                            let persisted = tokio::task::spawn_blocking(move || {
-                                let config: tauri::State<'_, crate::config::AppConfig> =
-                                    persist_handle.state();
-                                config.update_adoption_state(snapshot, meta_snapshot)
-                            })
-                            .await;
-                            match persisted {
-                                Ok(Ok(())) => {}
-                                Ok(Err(e)) => log::warn!(
-                                    "Failed to persist reap of {} to config: {}",
-                                    reap_subnet,
-                                    e
-                                ),
-                                Err(e) => log::warn!(
-                                    "Reap persist task for {} failed to join: {}",
-                                    reap_subnet,
-                                    e
-                                ),
-                            }
-
-                            let _ = app_handle_for_adopt.emit(
-                                "subnet-removed",
-                                serde_json::json!({
-                                    "subnet": reap_subnet,
-                                    "adopted_ip": reap_ip.to_string(),
-                                    "reason": "stale_apipa",
-                                }),
-                            );
-                            log::info!(
-                                "Reaped stale APIPA adoption {} ({}): no positive device evidence within the lifecycle window",
-                                reap_subnet,
-                                reap_ip
-                            );
-                        }
-                        Err(e) => {
-                            let next_backoff = reap_cooldowns
-                                .get(reap_subnet)
-                                .map(|(_, b)| (*b * 2).min(COOLDOWN_MAX))
-                                .unwrap_or(COOLDOWN_INITIAL);
-                            reap_cooldowns.insert(
-                                reap_subnet.clone(),
-                                (std::time::Instant::now() + next_backoff, next_backoff),
-                            );
-                            log::warn!(
-                                "Failed to unbind stale adoption {} ({}): {} — retrying in {}s",
-                                reap_subnet,
-                                reap_ip,
-                                e,
-                                next_backoff.as_secs()
-                            );
-                        }
-                    }
-                }
+                // Committed bindings, including APIPA, live until explicit deletion.
+                // Only PendingIps scratch/uncommitted entries are cleanup candidates.
 
                 // DHCP never adds an address, including in APIPA-only state.
-                // Failed DHCP-state reads retain their existing policy until S7.
+                // Failed DHCP-state reads pause all address changes.
                 let needs_refresh = cached_dhcp_state
                     .map(|(_, t)| t.elapsed() > DHCP_CACHE_TTL)
                     .unwrap_or(true);
@@ -3627,7 +3405,7 @@ impl NetworkManager {
                         }
                         Err(e) => {
                             log::debug!(
-                                "DHCP-state probe failed for {} ({}), allowing adoption",
+                                "DHCP-state probe failed for {} ({}), pausing adoption",
                                 iface_name,
                                 e
                             );
@@ -3635,12 +3413,12 @@ impl NetworkManager {
                             // as a success — otherwise a persistent probe
                             // failure re-spawns PowerShell every 2s instead
                             // of every 5s.
-                            cached_dhcp_state = Some((false, std::time::Instant::now()));
-                            false
+                            cached_dhcp_state = Some((true, std::time::Instant::now()));
+                            true
                         }
                     }
                 } else {
-                    cached_dhcp_state.map(|(d, _)| d).unwrap_or(false)
+                    cached_dhcp_state.map(|(d, _)| d).unwrap_or(true)
                 };
 
                 let current_ips = if is_dhcp {
@@ -3694,8 +3472,10 @@ impl NetworkManager {
                             .collect();
                         let adopted_keys: HashSet<String> =
                             adopted.lock().await.keys().cloned().collect();
-                        let pending_keys: HashSet<String> =
-                            pending_restore.lock().await.keys().cloned().collect();
+                        let pending_keys: HashSet<String> = meta_for_adopt
+                            .lock()
+                            .map(|m| m.keys().cloned().collect())
+                            .unwrap_or_default();
                         let ghost_nets = ghost::non_wired_interface_networks().await;
                         cached_ghosts = Some((ghost_nets.clone(), std::time::Instant::now()));
                         let candidates = cache_probe::derive_candidates(
@@ -4096,213 +3876,146 @@ impl NetworkManager {
         select_wired_source(target, &adopted, &info.ips).map(|source| (index, source))
     }
 
-    /// Forget that `ip` was auto-adopted. Used when the user manually
-    /// claims an IP via Apply / Add Secondary — once they've taken
-    /// ownership, the registry shouldn't keep tagging it as ours,
-    /// otherwise the "(auto)" badge stays on a user-set IP forever.
-    /// Returns true if any entry was removed.
-    pub async fn untrack_adopted_ip(&self, ip: &str) -> bool {
-        let removed: Vec<String> = {
-            let mut map = self.adopted_ips.lock().await;
-            let mut removed = Vec::new();
-            map.retain(|subnet, v| {
-                if v.to_string() == ip {
-                    removed.push(subnet.clone());
-                    false
-                } else {
-                    true
-                }
-            });
-            removed
-        };
-        self.forget_adoption_tracking(&removed);
-        !removed.is_empty()
+    /// Explicit Apply/Add Secondary transfers ownership to the user, including
+    /// clearing any tombstone for that exact address. Call under address_work.
+    async fn claim_binding_locked(
+        &self,
+        config: &crate::config::AppConfig,
+        ip: &str,
+    ) -> Result<(), AppError> {
+        config.claim_binding(ip)?;
+        let saved = config.get().adopted_meta;
+        self.adopted_ips
+            .lock()
+            .await
+            .retain(|_, value| value.to_string() != ip);
+        if let Ok(mut meta) = self.adopted_meta.lock() {
+            meta.retain(|key, _| saved.contains_key(key));
+        }
+        Ok(())
     }
 
-    /// Remove an adopted subnet however it is held: live adoption state,
-    /// or config-only — a disconnected cold start restores nothing, yet
-    /// after an unclean shutdown Windows keeps the secondary bound and
-    /// the config entry persists, so the row must still be removable
-    /// without resurrecting on the next connected launch.
-    ///
-    /// Serialized under `discovery_op` so an in-flight startup restore
-    /// cannot re-bind the address after the purge. Returns the unbound
-    /// IP so the caller can emit the removal event.
+    pub async fn add_manual_address(
+        &self,
+        config: &crate::config::AppConfig,
+        name: &str,
+        ip: &str,
+        mask: &str,
+    ) -> Result<(), AppError> {
+        let _op = self.discovery_op.lock().await;
+        let _pause = self.pause_addresses();
+        let _address = self.address_work.lock().await;
+        let iface = self.selected_write_adapter(config, name).await?;
+        let prefix = ip_config::mask_to_prefix(mask)?;
+        if let Some(existing) = iface.ips.iter().find(|a| a.address == ip) {
+            if existing.prefix != prefix {
+                return Err(AppError::Network(
+                    "Address exists with a different prefix".into(),
+                ));
+            }
+            if ip_config::get_dhcp_state(name).await? {
+                return Err(AppError::Network("adapter is DHCP".into()));
+            }
+        } else {
+            ip_config::add_secondary_ip(name, ip, mask).await?;
+        }
+        self.claim_binding_locked(config, ip).await
+    }
+
+    pub async fn remove_manual_address(
+        &self,
+        config: &crate::config::AppConfig,
+        name: &str,
+        ip: &str,
+    ) -> Result<(), AppError> {
+        let _op = self.discovery_op.lock().await;
+        let _pause = self.pause_addresses();
+        let _address = self.address_work.lock().await;
+        self.selected_write_adapter(config, name).await?;
+        ip_config::get_dhcp_state(name).await?;
+        ip_config::remove_secondary_ip(name, ip).await
+    }
+
+    async fn selected_write_adapter(
+        &self,
+        config: &crate::config::AppConfig,
+        name: &str,
+    ) -> Result<InterfaceInfo, AppError> {
+        let list = self.list_interfaces().await?;
+        let settings = config.get();
+        pick_adapter(&list, settings.selected_adapter_mac.as_deref())
+            .filter(|iface| {
+                iface.name == name && iface.is_up && interface::index_for_mac(&iface.mac).is_some()
+            })
+            .cloned()
+            .ok_or_else(|| {
+                AppError::Network("Selected Ethernet adapter unavailable or changed".into())
+            })
+    }
+
     pub async fn remove_adopted_subnet(
         &self,
         config: &crate::config::AppConfig,
         subnet: &str,
-        iface_hint: Option<&str>,
+        _iface_hint: Option<&str>,
     ) -> Result<Ipv4Addr, AppError> {
         let _op = self.discovery_op.lock().await;
-
-        let live_ip = { self.adopted_ips.lock().await.get(subnet).copied() };
-        let pending_ip = { self.pending_restore.lock().await.get(subnet).copied() };
-        // An unparseable persisted IP reads as absent here; the startup
-        // restore's classification prunes such entries itself.
-        let config_ip = config
-            .get()
-            .adopted_subnets
+        let _pause = self.pause_addresses();
+        let _address = self.address_work.lock().await;
+        let settings = config.get();
+        let mut row = settings
+            .adopted_meta
             .get(subnet)
-            .and_then(|s| s.parse::<Ipv4Addr>().ok());
-
-        match classify_removal(live_ip.is_some(), pending_ip.is_some(), config_ip.is_some()) {
-            RemovalRoute::Live => {
-                let iface_name = self
-                    .interface_name
-                    .lock()
-                    .await
-                    .clone()
-                    .ok_or_else(|| AppError::Network("No interface configured".into()))?;
-                let ip = live_ip.expect("live route implies a live entry");
-                // netsh delete first — a failed delete must not leave the
-                // IP on the interface while the map believes it's gone.
-                auto_adopt::remove_adopted_ip(&iface_name, &ip.to_string()).await?;
-                self.adopted_ips.lock().await.remove(subnet);
-                // A user removal also drops any held-over restore for
-                // this subnet so it isn't resurrected into config by the
-                // next save.
-                self.pending_restore.lock().await.remove(subnet);
-                self.forget_adoption_tracking(std::slice::from_ref(&subnet.to_string()));
-                // Snapshot-save under the same lifecycle lock, so a
-                // concurrent restore can't interleave between the map
-                // update and the persist.
-                self.save_adopted_to_config(config).await;
-                Ok(ip)
-            }
-            RemovalRoute::ConfigOnly => {
-                let ip = config_ip
-                    .or(pending_ip)
-                    .expect("config route implies a persisted entry");
-                match unbind_ip_resolving_owner(ip, iface_hint).await? {
-                    UnbindOutcome::Unbound { adapter } => {
-                        log::info!(
-                            "Removed config-only adopted IP {} from '{}' (subnet {})",
-                            ip,
-                            adapter,
-                            subnet
-                        );
-                    }
-                    UnbindOutcome::NotBound => {
-                        log::info!(
-                            "Config-only adopted IP {} is bound nowhere — purging the entry (subnet {})",
-                            ip,
-                            subnet
-                        );
-                    }
-                }
-                self.pending_restore.lock().await.remove(subnet);
-                self.forget_adoption_tracking(std::slice::from_ref(&subnet.to_string()));
-                // Surgical purge only. The snapshot-save would rebuild
-                // config from live ∪ pending-restore — both empty on a
-                // disconnected cold start — erasing every other adoption
-                // while removing this one.
-                config.remove_adopted_subnet_entry(subnet)?;
-                Ok(ip)
-            }
-            RemovalRoute::Unknown => Err(AppError::Network(format!(
-                "Subnet {} is not adopted (live or configured)",
-                subnet
-            ))),
+            .cloned()
+            .ok_or_else(|| AppError::Network("Unknown saved binding".into()))?;
+        let ip = row
+            .address
+            .as_ref()
+            .and_then(|a| a.parse::<Ipv4Addr>().ok())
+            .ok_or_else(|| AppError::Network("Saved binding has an invalid address".into()))?;
+        row.adapter_mac = row.adapter_mac.or(settings.selected_adapter_mac);
+        if row.adapter_mac.is_none() || row.prefix.is_none() {
+            return Err(AppError::Network(
+                "Binding ownership or prefix is unknown; no OS change made".into(),
+            ));
         }
+        row.desired = crate::config::BindingDesired::Removed;
+        // The only entry point to an OS removal: failure here changes nothing.
+        config.set_binding(subnet, row.clone())?;
+        self.adopted_ips.lock().await.remove(subnet);
+        if let Ok(mut meta) = self.adopted_meta.lock() {
+            meta.insert(subnet.to_string(), row);
+        }
+        self.reconcile_bindings_locked(config).await;
+        self.presence.bootstrap();
+        let row = self
+            .adopted_meta
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(subnet)
+            .cloned()
+            .unwrap();
+        if row.applied || row.last_error.is_some() {
+            return Err(AppError::Network(format!(
+                "Removal saved; pending removal of {}/{}: {}",
+                ip,
+                row.prefix.unwrap_or(24),
+                row.last_error.as_deref().unwrap_or("address still applied")
+            )));
+        }
+        Ok(ip)
     }
 
-    /// Remove every currently-adopted secondary IP from the OS interface.
-    ///
-    /// Called from the `RunEvent::ExitRequested` handler so adopted IPs
-    /// don't survive a graceful shutdown — they were added at runtime to
-    /// reach foreign subnets and shouldn't pollute the user's persistent
-    /// adapter config when PocketStream is closed.
-    ///
-    /// In-memory state and the on-disk `config.toml` are deliberately left
-    /// untouched: the next startup's `load_adopted_from_config` will see
-    /// the same entries and re-add the IPs (a fast no-op if they were
-    /// already restored, otherwise a normal netsh add). After a hard crash
-    /// (no graceful exit), the IPs persist on the interface; the next
-    /// startup recovers them into in-memory state and the next graceful
-    /// exit cleans them up. The system self-heals after one clean cycle.
-    ///
-    /// Cleanup runs in parallel with a per-call timeout so a stalled netsh
-    /// can't hang the shutdown indefinitely.
+    /// Only scratch and uncommitted final adds belong to shutdown cleanup.
+    /// Committed addresses remain in Windows and in config, including APIPA.
     pub async fn cleanup_adopted_ips(&self) {
-        let iface_name = match self.interface_name.lock().await.clone() {
-            Some(n) => n,
-            None => return,
-        };
+        self.cleanup_pending_with(&auto_adopt::RealAdoptOps).await;
+    }
 
-        let entries: Vec<(String, Ipv4Addr)> = {
-            let map = self.adopted_ips.lock().await;
-            map.iter().map(|(k, v)| (k.clone(), *v)).collect()
-        };
-
-        if entries.is_empty() {
-            return;
-        }
-
-        // Snapshot the adapter's current IPs and the primary so we can
-        // refuse to remove anything that would either orphan the adapter
-        // (last IP) or strip its primary IP. Defense-in-depth: even if
-        // adopted_ips somehow contains an entry that matches the primary
-        // (shouldn't happen, but guards against a future bug or a
-        // corrupted config), cleanup will skip it instead of disabling
-        // the user's network.
-        let current_iface = interface::get_by_name(&iface_name).await.ok();
-        let current_ip_set: HashSet<String> = current_iface
-            .as_ref()
-            .map(|i| i.ips.iter().map(|ip| ip.address.clone()).collect())
-            .unwrap_or_default();
-        let primary_ip: Option<String> = current_iface
-            .as_ref()
-            .and_then(|i| i.ips.first().map(|ip| ip.address.clone()));
-        let total_ip_count = current_ip_set.len();
-
-        log::info!(
-            "Removing {} adopted secondary IP(s) on shutdown (adapter has {} total)",
-            entries.len(),
-            total_ip_count
-        );
-
-        let mut tasks = tokio::task::JoinSet::new();
-        for (subnet, ip) in entries {
-            let ip_str = ip.to_string();
-
-            // Safety check 1: if removing this would leave the adapter
-            // with zero IPv4 addresses, refuse. The remove still works
-            // mechanically, but Windows often disables an adapter that
-            // has no IPv4 assignment, which is much worse than a stray
-            // secondary IP lingering for one more session.
-            if total_ip_count <= 1 && current_ip_set.contains(&ip_str) {
-                log::warn!(
-                    "Skipping cleanup of {} ({}): would leave adapter with zero IPv4 addresses",
-                    ip_str,
-                    subnet
-                );
-                continue;
-            }
-
-            // Safety check 2: never remove the primary. If something put
-            // the primary IP in adopted_ips by mistake, removing it would
-            // break the user's normal connectivity.
-            if primary_ip.as_deref() == Some(&ip_str) {
-                log::warn!(
-                    "Skipping cleanup of {} ({}): is the adapter's primary IP",
-                    ip_str,
-                    subnet
-                );
-                continue;
-            }
-
-            let iface = iface_name.clone();
-            tasks.spawn(async move {
-                match auto_adopt::remove_adopted_ip(&iface, &ip_str).await {
-                    Ok(()) => log::info!("Removed adopted IP {} ({})", ip_str, subnet),
-                    Err(e) => {
-                        log::warn!("Failed to remove adopted IP {} on shutdown: {}", ip_str, e)
-                    }
-                }
-            });
-        }
-        while tasks.join_next().await.is_some() {}
+    async fn cleanup_pending_with<O: auto_adopt::AdoptOps>(&self, ops: &O) {
+        let _pause = self.pause_addresses();
+        let _address = self.address_work.lock().await;
+        auto_adopt::reconcile_pending(ops, &self.pending_ips, None).await;
     }
 }
 
@@ -4514,12 +4227,16 @@ async fn run_presence_job(
     if snapshot.fence.is_stale() {
         return None;
     }
+    let address_fence = manager.address_fence();
+    if job.source.is_none() && address_fence.is_stale() {
+        return None;
+    }
     let _address = if job.source.is_none() {
         Some(manager.address_work.lock().await)
     } else {
         None
     };
-    if snapshot.fence.is_stale() {
+    if snapshot.fence.is_stale() || (job.source.is_none() && address_fence.is_stale()) {
         return None;
     }
     let own_ips: HashSet<_> = interface::all_local_ipv4().into_iter().collect();
@@ -4537,13 +4254,13 @@ async fn run_presence_job(
     let emitter = manager.emitter().await?;
     let ctx = AdoptionCtx {
         iface_name: adapter.name.clone(),
+        adapter_mac: adapter.mac.clone(),
         interface_index: snapshot.index,
         candidates: manager.candidate_ingress(snapshot.index, parse_mac_bytes(&adapter.mac)),
         ops: auto_adopt::RealAdoptOps,
         app_handle: app.clone(),
         adopted: manager.adopted_ips.clone(),
         pending_ips: manager.pending_ips.clone(),
-        pending_restore: manager.pending_restore.clone(),
         adoption_seq: manager.adoption_seq.clone(),
         liveness: manager.adoption_liveness.clone(),
         meta: manager.adopted_meta.clone(),
@@ -4551,6 +4268,7 @@ async fn run_presence_job(
         registry: manager.device_registry.clone(),
         emitter: emitter.clone(),
         fence: snapshot.fence.clone(),
+        address_fence,
         local_ips: manager.local_ips.clone(),
     };
     let mut cooldowns = HashMap::new();
@@ -4566,6 +4284,7 @@ async fn run_presence_job(
         origin: ProbeOrigin::CacheProbe,
     };
     let proof = presence::verify(&mut io, &job, &snapshot).await?;
+    let mutation_fence = ctx.address_fence.clone();
     drop(_address);
     let cache_app = app.clone();
     let fence = snapshot.fence.clone();
@@ -4574,7 +4293,10 @@ async fn run_presence_job(
     let key = tokio::task::spawn_blocking(move || {
         let manager = cache_app.state::<NetworkManager>();
         let config = cache_app.state::<crate::config::AppConfig>();
-        if commit_fence.is_stale() || proof.at.elapsed() >= presence::FRESHNESS {
+        if commit_fence.is_stale()
+            || mutation_fence.is_stale()
+            || proof.at.elapsed() >= presence::FRESHNESS
+        {
             return None;
         }
         let registry = manager.registry();
@@ -4612,7 +4334,7 @@ async fn run_presence_job(
         } else {
             registry.merge_verified(&device, &adapter_mac, &proof.wall, &commit_fence)
         };
-        if !result.changed || commit_fence.is_stale() {
+        if !result.changed || commit_fence.is_stale() || mutation_fence.is_stale() {
             return None;
         }
         registry.remember_verified_at(&proof.mac, &proof.wall, proof.at, &commit_fence);
@@ -4627,7 +4349,10 @@ async fn run_presence_job(
                 log::warn!("Presence cache write failed: {e}");
             }
         }
-        if commit_fence.is_stale() || proof.at.elapsed() >= presence::FRESHNESS {
+        if commit_fence.is_stale()
+            || mutation_fence.is_stale()
+            || proof.at.elapsed() >= presence::FRESHNESS
+        {
             return None;
         }
         let target = config.get().stream.camera_mac;
@@ -4724,28 +4449,307 @@ fn import_neighbors(
     collected
 }
 
-/// Merge the live adopted map with the pending-restore map for persistence.
-/// Live wins on a key conflict (a subnet that re-bound this session
-/// supersedes its held-over restore). Pending-restore entries — transient
-/// startup re-add failures — are retained so a wholesale config write does
-/// not delete them, letting the next startup retry.
+/// Pending and removed saved rows never become live routing sources.
 fn merge_adopted_config(
     live: &HashMap<String, Ipv4Addr>,
-    pending: &HashMap<String, Ipv4Addr>,
+    meta: &HashMap<String, crate::config::AdoptedMeta>,
 ) -> HashMap<String, String> {
-    let mut out: HashMap<String, String> = pending
-        .iter()
-        .map(|(k, v)| (k.clone(), v.to_string()))
-        .collect();
-    for (k, v) in live {
-        out.insert(k.clone(), v.to_string());
-    }
-    out
+    live.iter()
+        .filter(|(key, ip)| {
+            meta.get(*key).is_some_and(|row| {
+                row.desired == crate::config::BindingDesired::Present
+                    && row.applied
+                    && row.address.as_deref() == Some(ip.to_string().as_str())
+                    && row.last_error.is_none()
+            })
+        })
+        .map(|(key, ip)| (key.clone(), ip.to_string()))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn saved_binding(address: &str) -> crate::config::AdoptedMeta {
+        crate::config::AdoptedMeta {
+            adapter_mac: Some("40:cd:3a:00:00:01".into()),
+            address: Some(address.into()),
+            prefix: Some(24),
+            ..Default::default()
+        }
+    }
+
+    fn saved_adapter(ips: &[&str]) -> InterfaceInfo {
+        let mut iface = adapter("Ethernet", ips);
+        iface.mac = "40:cd:3a:00:00:01".into();
+        iface
+    }
+
+    #[derive(Default)]
+    struct BindingOps {
+        writes: StdMutex<Vec<(bool, Ipv4Addr)>>,
+        fail_remove: bool,
+    }
+
+    impl auto_adopt::AdoptOps for BindingOps {
+        async fn add(&self, _: &str, ip: Ipv4Addr, _: &str) -> Result<(), AppError> {
+            self.writes.lock().unwrap().push((true, ip));
+            Ok(())
+        }
+        async fn remove(&self, _: &str, ip: Ipv4Addr) -> Result<(), AppError> {
+            self.writes.lock().unwrap().push((false, ip));
+            if self.fail_remove {
+                Err(AppError::Network("injected OS rejection".into()))
+            } else {
+                Ok(())
+            }
+        }
+        async fn probe(&self, _: Ipv4Addr, _: Option<Ipv4Addr>) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn dhcp_restore_skips_add_and_static_reapplies_without_restart() {
+        let ops = BindingOps::default();
+        let mut row = saved_binding("172.31.169.253");
+        row.applied = true; // stale persisted flag
+        let iface = saved_adapter(&["192.168.1.20"]);
+        let action = binding_action(
+            "172.31.169.0/24",
+            &row,
+            Some(&iface),
+            crate::config::NetworkMode::Dhcp,
+            &Ok(true),
+            &[],
+        );
+        row = apply_binding(&ops, row, action, Some(&iface), || async {
+            panic!("hold must not mutate or re-observe")
+        })
+        .await;
+        assert!(!row.applied);
+        assert_eq!(row.last_error.as_deref(), Some("adapter is DHCP"));
+        assert!(ops.writes.lock().unwrap().is_empty());
+        let action = binding_action(
+            "172.31.169.0/24",
+            &row,
+            Some(&iface),
+            crate::config::NetworkMode::StaticManual,
+            &Ok(false),
+            &[],
+        );
+        row = apply_binding(&ops, row, action, Some(&iface), || async {
+            Ok(vec![ip_info("172.31.169.253", 24)])
+        })
+        .await;
+        assert!(row.applied && row.last_error.is_none());
+        assert_eq!(
+            *ops.writes.lock().unwrap(),
+            vec![(true, ip("172.31.169.253"))]
+        );
+    }
+
+    #[tokio::test]
+    async fn dhcp_query_failure_and_invalid_entry_never_write() {
+        let ops = BindingOps::default();
+        let iface = saved_adapter(&["192.168.1.20"]);
+        for (subnet, dhcp) in [
+            ("172.31.169.0/24", Err("query timed out".into())),
+            ("malformed", Ok(false)),
+        ] {
+            let row = saved_binding("172.31.169.253");
+            let action = binding_action(
+                subnet,
+                &row,
+                Some(&iface),
+                crate::config::NetworkMode::StaticAuto,
+                &dhcp,
+                &[],
+            );
+            let row = apply_binding(&ops, row, action, Some(&iface), || async {
+                panic!("invalid/query-failed entries must not write")
+            })
+            .await;
+            assert!(!row.applied && row.last_error.is_some());
+        }
+        assert!(ops.writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_unbind_retains_removed_intent_applied_address_and_error() {
+        let ops = BindingOps {
+            fail_remove: true,
+            ..Default::default()
+        };
+        let iface = saved_adapter(&["172.31.169.253", "192.168.1.20"]);
+        let mut row = saved_binding("172.31.169.253");
+        row.desired = crate::config::BindingDesired::Removed;
+        let action = binding_action(
+            "172.31.169.0/24",
+            &row,
+            Some(&iface),
+            crate::config::NetworkMode::StaticAuto,
+            &Ok(false),
+            &[],
+        );
+        row = apply_binding(&ops, row, action, Some(&iface), || async {
+            Ok(iface.ips.clone())
+        })
+        .await;
+        assert!(
+            row.applied
+                && row
+                    .last_error
+                    .as_ref()
+                    .unwrap()
+                    .contains("injected OS rejection")
+        );
+        assert_eq!(row.desired, crate::config::BindingDesired::Removed);
+        assert_eq!(
+            *ops.writes.lock().unwrap(),
+            vec![(false, ip("172.31.169.253"))]
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_ownership_is_recorded_only_after_observed_success() {
+        let ops = BindingOps::default();
+        let iface = saved_adapter(&["192.168.1.20"]);
+        let mut row = saved_binding("172.31.169.253");
+        row.adapter_mac = None;
+        let row = apply_binding(
+            &ops,
+            row,
+            BindingAction::Add(ip("172.31.169.253"), 24),
+            Some(&iface),
+            || async { Ok(vec![ip_info("172.31.169.253", 24)]) },
+        )
+        .await;
+        assert_eq!(row.adapter_mac, adapter_mac(&iface.mac));
+        assert!(row.applied && row.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn transition_fences_inflight_adoption_before_commit() {
+        let manager = NetworkManager::new();
+        let old = manager.address_fence();
+        let pending = manager.pending_ips.clone();
+        let ops = BindingOps::default();
+        let worker = manager.address_work.lock().await;
+        auto_adopt::bind_scratch(&ops, &pending, "Ethernet", ip("172.31.169.254"), 1)
+            .await
+            .unwrap();
+        let pause = manager.pause_addresses();
+        assert!(
+            commit_pending_address(&pending, "Ethernet", ip("172.31.169.254"), 1, || {
+                if old.is_stale() {
+                    Err(AppError::Network("work was cancelled".into()))
+                } else {
+                    panic!("an invalidated adoption must not commit")
+                }
+            })
+            .await
+            .is_err()
+        );
+        assert_eq!(pending.lock().await.len(), 1);
+        auto_adopt::reconcile_pending(&ops, &pending, Some(1)).await;
+        drop(worker);
+        let _transition = manager.address_work.lock().await;
+        assert!(pending.lock().await.is_empty());
+        assert_eq!(
+            *ops.writes.lock().unwrap(),
+            vec![(true, ip("172.31.169.254")), (false, ip("172.31.169.254"))]
+        );
+        drop(pause);
+        assert!(old.is_stale());
+        assert!(!manager.address_fence().is_stale());
+    }
+
+    #[tokio::test]
+    async fn committed_handover_and_exit_cleanup_preserve_saved_apipa_and_plain_ips() {
+        let manager = NetworkManager::new();
+        let ops = BindingOps::default();
+        let committed = ip("169.254.20.99");
+        let plain = ip("172.31.169.253");
+        manager.adopted_ips.lock().await.extend([
+            ("169.254.20.0/24".into(), committed),
+            ("172.31.169.0/24".into(), plain),
+        ]);
+        auto_adopt::bind_scratch(&ops, &manager.pending_ips, "Ethernet", committed, 1)
+            .await
+            .unwrap();
+        commit_pending_address(&manager.pending_ips, "Ethernet", committed, 1, || Ok(()))
+            .await
+            .unwrap();
+        auto_adopt::bind_scratch(
+            &ops,
+            &manager.pending_ips,
+            "Ethernet",
+            ip("172.31.170.254"),
+            2,
+        )
+        .await
+        .unwrap();
+        manager.cleanup_pending_with(&ops).await;
+        assert!(manager.pending_ips.lock().await.is_empty());
+        assert_eq!(manager.adopted_ips.lock().await.len(), 2);
+        let removed: Vec<_> = ops
+            .writes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(add, _)| !add)
+            .map(|(_, ip)| *ip)
+            .collect();
+        assert_eq!(removed, vec![ip("172.31.170.254")]);
+    }
+
+    #[test]
+    fn link_return_reconciles_even_when_windows_index_does_not_change() {
+        let mut down = AdapterSelection {
+            selected_mac: Some("40:cd:3a:00:00:01".into()),
+            interface_index: Some(12),
+            adapter: Some(saved_adapter(&[])),
+            ..Default::default()
+        };
+        down.adapter.as_mut().unwrap().is_up = false;
+        let mut up = down.clone();
+        up.adapter.as_mut().unwrap().is_up = true;
+        assert!(binding_link_changed(&down, &up));
+        assert!(binding_link_changed(&up, &down));
+        assert!(!binding_link_changed(&up, &up));
+        up.interface_index = Some(20);
+        assert!(!binding_link_changed(&down, &up)); // identity-return path is the watcher
+    }
+
+    #[test]
+    fn failed_mode_save_keeps_binding_status_truthful_when_os_and_saved_mode_differ() {
+        let row = saved_binding("172.31.169.253");
+        let iface = saved_adapter(&["192.168.1.20"]);
+        assert_eq!(
+            binding_action(
+                "172.31.169.0/24",
+                &row,
+                Some(&iface),
+                crate::config::NetworkMode::StaticAuto,
+                &Ok(true),
+                &[]
+            ),
+            BindingAction::Hold("adapter is DHCP".into(), false)
+        );
+        assert_eq!(
+            binding_action(
+                "172.31.169.0/24",
+                &row,
+                Some(&iface),
+                crate::config::NetworkMode::Dhcp,
+                &Ok(false),
+                &[]
+            ),
+            BindingAction::Hold("saved mode is DHCP; adapter is static".into(), false)
+        );
+    }
 
     fn fence(generation: u64, current: u64, active: bool) -> SweepFence {
         SweepFence::new(
@@ -4931,27 +4935,33 @@ mod tests {
     // ── adoption-removal routing ──────────────────────────────────
 
     #[test]
-    fn removal_route_classification() {
-        // Live wins whether or not the entry is also persisted.
-        assert_eq!(classify_removal(true, false, true), RemovalRoute::Live);
-        assert_eq!(classify_removal(true, true, true), RemovalRoute::Live);
-        assert_eq!(classify_removal(true, false, false), RemovalRoute::Live);
-        // Persisted-only — including a pending restore that never bound —
-        // routes to the config-aware path.
+    fn removed_binding_is_unbound_only_on_its_adapter() {
+        let mut row = saved_binding("172.31.169.253");
+        row.desired = crate::config::BindingDesired::Removed;
+        let iface = saved_adapter(&["172.31.169.253", "192.168.1.20"]);
         assert_eq!(
-            classify_removal(false, false, true),
-            RemovalRoute::ConfigOnly
+            binding_action(
+                "172.31.169.0/24",
+                &row,
+                Some(&iface),
+                crate::config::NetworkMode::StaticAuto,
+                &Ok(false),
+                &[]
+            ),
+            BindingAction::Remove(ip("172.31.169.253"))
         );
+        let absent = saved_adapter(&["192.168.1.20"]);
         assert_eq!(
-            classify_removal(false, true, false),
-            RemovalRoute::ConfigOnly
+            binding_action(
+                "172.31.169.0/24",
+                &row,
+                Some(&absent),
+                crate::config::NetworkMode::StaticAuto,
+                &Ok(false),
+                &[]
+            ),
+            BindingAction::Observed(false)
         );
-        assert_eq!(
-            classify_removal(false, true, true),
-            RemovalRoute::ConfigOnly
-        );
-        // Held nowhere is an error, not a silent success.
-        assert_eq!(classify_removal(false, false, false), RemovalRoute::Unknown);
     }
 
     // ── probe origin → adoption evidence ──────────────────────────
@@ -5074,22 +5084,39 @@ mod tests {
     }
 
     #[test]
-    fn adapters_binding_ip_resolves_true_owner_over_hint() {
-        // A stale dialog selection must not decide where the unbind runs.
-        let adapters = vec![
-            adapter("Ethernet", &["192.168.1.20"]),
-            adapter("Ethernet 2", &["172.31.169.253"]),
-        ];
-        let owners = adapters_binding_ip(&adapters, "172.31.169.253", Some("Ethernet"));
-        assert_eq!(owners, vec!["Ethernet 2"]);
+    fn binding_on_another_adapter_is_pending_even_if_address_matches() {
+        let mut row = saved_binding("172.31.169.253");
+        row.adapter_mac = Some("40:cd:3a:00:00:02".into());
+        let iface = saved_adapter(&["172.31.169.253"]);
+        assert_eq!(
+            binding_action(
+                "172.31.169.0/24",
+                &row,
+                Some(&iface),
+                crate::config::NetworkMode::StaticAuto,
+                &Ok(false),
+                &[]
+            ),
+            BindingAction::Hold("adapter mismatch".into(), false)
+        );
     }
 
     #[test]
-    fn adapters_binding_ip_bound_nowhere_is_empty() {
-        // Structured absence — the caller treats this as success without
-        // ever parsing netsh output.
-        let adapters = vec![adapter("Ethernet", &["192.168.1.20"])];
-        assert!(adapters_binding_ip(&adapters, "172.31.169.253", Some("Ethernet")).is_empty());
+    fn stale_applied_flag_does_not_suppress_restore() {
+        let mut row = saved_binding("172.31.169.253");
+        row.applied = true;
+        let iface = saved_adapter(&["192.168.1.20"]);
+        assert_eq!(
+            binding_action(
+                "172.31.169.0/24",
+                &row,
+                Some(&iface),
+                crate::config::NetworkMode::StaticAuto,
+                &Ok(false),
+                &[]
+            ),
+            BindingAction::Add(ip("172.31.169.253"), 24)
+        );
     }
 
     #[test]
@@ -5114,13 +5141,19 @@ mod tests {
     }
 
     #[test]
-    fn adapters_binding_ip_hint_orders_multiple_owners() {
-        let adapters = vec![
-            adapter("Ethernet", &["172.31.169.253"]),
-            adapter("Ethernet 2", &["172.31.169.253"]),
-        ];
-        let owners = adapters_binding_ip(&adapters, "172.31.169.253", Some("Ethernet 2"));
-        assert_eq!(owners, vec!["Ethernet 2", "Ethernet"]);
+    fn unavailable_binding_never_moves_to_a_different_adapter() {
+        let row = saved_binding("172.31.169.253");
+        assert_eq!(
+            binding_action(
+                "172.31.169.0/24",
+                &row,
+                None,
+                crate::config::NetworkMode::StaticAuto,
+                &Ok(false),
+                &[]
+            ),
+            BindingAction::Hold("selected adapter unavailable".into(), false)
+        );
     }
 
     // ── wired source selection for MAC verification ───────────────
@@ -5329,6 +5362,7 @@ mod tests {
         let seen = crate::config::AdoptedMeta {
             adopted_at: Some("2026-07-10T12:00:00+00:00".into()),
             last_device_seen: Some("2026-07-16T11:00:00+00:00".into()),
+            ..Default::default()
         };
         assert_eq!(
             badge_age(Some(&seen), now),
@@ -5339,6 +5373,7 @@ mod tests {
         let never = crate::config::AdoptedMeta {
             adopted_at: Some("2026-07-16T10:00:00+00:00".into()),
             last_device_seen: None,
+            ..Default::default()
         };
         assert_eq!(
             badge_age(Some(&never), now),
@@ -5351,11 +5386,13 @@ mod tests {
         let garbage = crate::config::AdoptedMeta {
             adopted_at: Some("yesterday-ish".into()),
             last_device_seen: None,
+            ..Default::default()
         };
         assert_eq!(badge_age(Some(&garbage), now), None);
         let future = crate::config::AdoptedMeta {
             adopted_at: Some("2026-07-17T00:00:00+00:00".into()),
             last_device_seen: None,
+            ..Default::default()
         };
         assert_eq!(badge_age(Some(&future), now), None);
     }
@@ -5385,6 +5422,7 @@ mod tests {
         let meta = crate::config::AdoptedMeta {
             adopted_at: Some("2026-07-01T00:00:00+00:00".into()),
             last_device_seen: Some("2026-07-15T00:00:00+00:00".into()),
+            ..Default::default()
         };
         let v = adoption_meta_view("172.31.169.0/24", Some(&meta), None, min(1), None);
         assert_eq!(v.adopted_at.as_deref(), Some("2026-07-01T00:00:00+00:00"));
@@ -5434,57 +5472,46 @@ mod tests {
     }
 
     #[test]
-    fn unbind_guards_block_primary_and_last_address_only() {
-        let ips = vec![
-            "192.168.12.64".to_string(),
-            "169.254.168.102".to_string(),
-            "172.31.169.102".to_string(),
-        ];
-        // A secondary among several: no block.
-        assert_eq!(unbind_guard_blocks("169.254.168.102", &ips), None);
-        // The primary (first) address is always blocked.
-        assert!(unbind_guard_blocks("192.168.12.64", &ips).is_some());
-        // The adapter's only address is blocked.
-        let sole = vec!["169.254.168.102".to_string()];
-        assert!(unbind_guard_blocks("169.254.168.102", &sole).is_some());
-        // An address the adapter no longer holds: nothing to guard.
-        assert_eq!(unbind_guard_blocks("169.254.43.102", &ips), None);
+    fn removal_checks_exact_prefix_instead_of_enumeration_order() {
+        let mut row = saved_binding("172.31.169.253");
+        row.desired = crate::config::BindingDesired::Removed;
+        let mut iface = saved_adapter(&["172.31.169.253", "192.168.1.20"]);
+        iface.ips[0].prefix = 16;
+        assert_eq!(
+            binding_action(
+                "172.31.169.0/24",
+                &row,
+                Some(&iface),
+                crate::config::NetworkMode::StaticAuto,
+                &Ok(false),
+                &[]
+            ),
+            BindingAction::Hold("address exists with a different prefix".into(), false)
+        );
     }
 
     #[test]
-    fn merge_keeps_pending_restore_entries() {
-        // The core Fix 4 invariant: a transiently-failed restore held in
-        // pending_restore survives a persist derived from the live map.
+    fn routes_exclude_removed_and_pending_saved_bindings() {
         let mut live = HashMap::new();
         live.insert("10.0.0.0/24".to_string(), Ipv4Addr::new(10, 0, 0, 100));
-        let mut pending = HashMap::new();
-        pending.insert("10.9.0.0/24".to_string(), Ipv4Addr::new(10, 9, 0, 100));
-        let out = merge_adopted_config(&live, &pending);
-        assert_eq!(
-            out.get("10.0.0.0/24").map(String::as_str),
-            Some("10.0.0.100")
-        );
-        assert_eq!(
-            out.get("10.9.0.0/24").map(String::as_str),
-            Some("10.9.0.100")
-        );
-        assert_eq!(out.len(), 2);
+        let mut meta = HashMap::from([("10.0.0.0/24".into(), saved_binding("10.0.0.100"))]);
+        assert!(merge_adopted_config(&live, &meta).is_empty());
+        let row = meta.get_mut("10.0.0.0/24").unwrap();
+        row.applied = true;
+        assert_eq!(merge_adopted_config(&live, &meta).len(), 1);
+        meta.get_mut("10.0.0.0/24").unwrap().desired = crate::config::BindingDesired::Removed;
+        assert!(merge_adopted_config(&live, &meta).is_empty());
+        assert_eq!(meta.len(), 1);
     }
 
     #[test]
-    fn merge_live_wins_on_conflict() {
-        // If a subnet is both live and pending (shouldn't normally persist,
-        // but be safe), the confirmed live binding wins.
+    fn routes_require_the_exact_saved_address() {
         let mut live = HashMap::new();
         live.insert("10.0.0.0/24".to_string(), Ipv4Addr::new(10, 0, 0, 100));
-        let mut pending = HashMap::new();
-        pending.insert("10.0.0.0/24".to_string(), Ipv4Addr::new(10, 0, 0, 200));
-        let out = merge_adopted_config(&live, &pending);
-        assert_eq!(
-            out.get("10.0.0.0/24").map(String::as_str),
-            Some("10.0.0.100")
-        );
-        assert_eq!(out.len(), 1);
+        let mut row = saved_binding("10.0.0.200");
+        row.applied = true;
+        let meta = HashMap::from([("10.0.0.0/24".into(), row)]);
+        assert!(merge_adopted_config(&live, &meta).is_empty());
     }
 
     #[test]
