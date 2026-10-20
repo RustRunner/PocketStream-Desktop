@@ -1639,6 +1639,7 @@ mod tests {
         AppSettings {
             selected_adapter_mac: None,
             stream: StreamConfig {
+                camera_mac: None,
                 protocol,
                 rtsp_port: 554,
                 rtsp_path: "/live".into(),

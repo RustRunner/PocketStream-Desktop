@@ -19,8 +19,9 @@
  */
 
 import * as api from "./tauri-api.ts";
-import { log } from "./state.ts";
+import { log, state } from "./state.ts";
 import { formatError } from "./errors.ts";
+import { selectedDevice, sessionCamTarget, type DeviceTarget } from "./store.ts";
 import type { DeviceRecord } from "./types.ts";
 
 // ── Subscribe/notify accessor ─────────────────────────────────────
@@ -34,6 +35,7 @@ function setSnapshot(next: unknown): void {
   // Reference equality is enough — backend always sends a fresh array.
   if (value === next) return;
   value = Array.isArray(next) ? (next as DeviceRecord[]) : [];
+  void followManualBinding();
   for (const cb of subscribers) {
     try {
       cb(value);
@@ -60,16 +62,52 @@ export function subscribe(callback: Subscriber): () => void {
 
 // ── Lookup helpers (read-only views over the snapshot) ───────────
 
-/** Find a record by IP. Returns undefined if not present. */
-export function deviceByIp(ip: string | null | undefined): DeviceRecord | undefined {
-  if (!ip) return undefined;
-  return value.find((r) => r.ip === ip);
+/** Keys are MAC identities or the original manual key, never IPs. */
+export function deviceByKey(key: string | null | undefined): DeviceRecord | undefined {
+  if (!key) return undefined;
+  return value.find((r) => r.mac.toLowerCase() === key.toLowerCase());
 }
 
-/** Find a record by MAC. Returns undefined if not present. */
-export function deviceByMac(mac: string | null | undefined): DeviceRecord | undefined {
-  if (!mac) return undefined;
-  return value.find((r) => r.mac === mac);
+export const deviceByMac = deviceByKey;
+
+export function targetFor(record: DeviceRecord): DeviceTarget {
+  return { key: record.mac, expectedMac: record.mac.startsWith("manual:") ? null : record.mac };
+}
+
+/** A missing selected identity never resolves to another record at its address. */
+export function resolveTarget(target: DeviceTarget | null): DeviceRecord | undefined {
+  if (!target) return undefined;
+  const bound = target.key.startsWith("manual:")
+    ? state.config?.manual_nodes.find((n) => `manual:${n.ip}` === target.key)?.expected_mac
+    : null;
+  const expected = target.expectedMac ?? bound;
+  const record = deviceByKey(expected ?? target.key);
+  if (!record) return undefined;
+  if (expected && record.mac.toLowerCase() !== expected.toLowerCase()) return undefined;
+  return record;
+}
+
+/** Follow a manual key only through the MAC saved by the backend after
+ *  fresh proof. Never infer the binding from another record at its IP. */
+async function followManualBinding(): Promise<void> {
+  const pending = [selectedDevice, sessionCamTarget].map((store) => ({ store, target: store.get() }))
+    .filter(({ target }) => target?.key.startsWith("manual:") && !deviceByKey(target.key));
+  if (!pending.length) return;
+  try {
+    const config = await api.getConfig();
+    if (state.config) state.config.manual_nodes = config.manual_nodes;
+    for (const { store, target } of pending) {
+      if (!target || store.get() !== target) continue;
+      const record = resolveTarget(target);
+      if (record) store.set(targetFor(record));
+    }
+  } catch (e) {
+    log(`manual identity refresh failed: ${formatError(e)}`);
+  }
+}
+
+export function endpointFor(target: DeviceTarget | null): string | null {
+  return resolveTarget(target)?.ip ?? null;
 }
 
 /** Group records by subnet, preserving the registry's sort order. */
@@ -94,18 +132,18 @@ export function devicesBySubnet(): Map<string, DeviceRecord[]> {
  *  out of order. */
 let aliasWriteTail: Promise<void> = Promise.resolve();
 
-export function setAlias(ip: string, alias: string): Promise<void> {
+export function setAlias(key: string, alias: string): Promise<void> {
   const write = aliasWriteTail.then(async () => {
-    const snapshot = await api.setDeviceAlias(ip, alias);
+    const snapshot = await api.setDeviceAlias(key, alias);
     setSnapshot(snapshot);
 
-    // `set_alias` deliberately leaves an unknown IP untouched so a stale
+    // `set_alias` deliberately leaves an unknown key untouched so a stale
     // UI action cannot demote the real CAM/PTU holder. Treat that safe
     // backend no-op as an actionable UI error after reconciling the stale
     // row away, rather than reporting success that did not apply.
-    const applied = snapshot.some((record) => record.ip === ip && record.alias === alias);
+    const applied = snapshot.some((record) => record.mac === key && record.alias === alias);
     if (!applied) {
-      throw new Error(`Device ${ip} is no longer available; refresh Nodes and try again`);
+      throw new Error(`Device ${key} is no longer available; refresh Nodes and try again`);
     }
   });
 

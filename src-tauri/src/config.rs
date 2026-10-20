@@ -35,6 +35,8 @@ pub struct StreamConfig {
     pub udp_port: u16,
     /// Camera IP address (discovered or manual)
     pub camera_ip: String,
+    #[serde(default)]
+    pub camera_mac: Option<String>,
     /// Whether audio playback is muted. `false` by default — audio
     /// plays when a stream carries a supported track. `serde(default)`
     /// migrates config files that predate the field.
@@ -90,6 +92,8 @@ pub enum NetworkMode {
 /// toggles so users can flip Auto → Manual → Auto without losing pins.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ManualNode {
+    #[serde(default)]
+    pub expected_mac: Option<String>,
     pub ip: String,
     #[serde(default)]
     pub alias: String,
@@ -209,6 +213,7 @@ impl Default for AppSettings {
         Self {
             selected_adapter_mac: None,
             stream: StreamConfig {
+                camera_mac: None,
                 protocol: StreamProtocol::Rtsp,
                 rtsp_port: 554,
                 rtsp_path: "/z3-1.sdp".into(),
@@ -573,7 +578,19 @@ impl AppConfig {
             }
         };
         if let Some(existing) = guard.manual_nodes.iter_mut().find(|n| n.ip == node.ip) {
+            if existing.expected_mac.is_some()
+                && node.expected_mac.is_some()
+                && existing.expected_mac != node.expected_mac
+            {
+                return Err(crate::AppError::Network(
+                    "different device at this address; remove the old pin before reassigning"
+                        .into(),
+                ));
+            }
             existing.alias = node.alias;
+            if existing.expected_mac.is_none() {
+                existing.expected_mac = node.expected_mac;
+            }
         } else {
             guard.manual_nodes.push(node);
         }
@@ -587,7 +604,11 @@ impl AppConfig {
     /// already matches. Used by the role single-holder enforcement to
     /// write demotions through to config — a registry-only demotion
     /// would resurrect on the next manual-node hydration.
-    pub fn update_manual_node_alias(&self, ip: &str, alias: &str) -> Result<bool, crate::AppError> {
+    pub fn update_manual_node_alias(
+        &self,
+        key: &str,
+        alias: &str,
+    ) -> Result<bool, crate::AppError> {
         let changed = {
             let mut guard = match self.settings.lock() {
                 Ok(g) => g,
@@ -598,7 +619,11 @@ impl AppConfig {
                     poisoned.into_inner()
                 }
             };
-            match guard.manual_nodes.iter_mut().find(|n| n.ip == ip) {
+            match guard
+                .manual_nodes
+                .iter_mut()
+                .find(|n| manual_node_key(n).eq_ignore_ascii_case(key))
+            {
                 Some(node) if node.alias != alias => {
                     node.alias = alias.to_string();
                     true
@@ -612,27 +637,68 @@ impl AppConfig {
         Ok(changed)
     }
 
-    /// Remove a manual node by IP. No-op if the IP isn't pinned.
-    pub fn remove_manual_node(&self, ip: &str) -> Result<(), crate::AppError> {
-        let removed = match self.settings.lock() {
-            Ok(mut guard) => {
-                let before = guard.manual_nodes.len();
-                guard.manual_nodes.retain(|n| n.ip != ip);
-                before != guard.manual_nodes.len()
-            }
-            Err(poisoned) => {
-                log::error!("Config mutex poisoned during remove_manual_node, recovering");
-                let mut guard = poisoned.into_inner();
-                let before = guard.manual_nodes.len();
-                guard.manual_nodes.retain(|n| n.ip != ip);
-                before != guard.manual_nodes.len()
-            }
-        };
-        if removed {
-            self.save()
-        } else {
-            Ok(())
+    /// Persist first-verification identity before the registry can promote it.
+    #[allow(dead_code)] // S5a's presence task consumes this transaction.
+    pub(crate) fn bind_manual_node(
+        &self,
+        ip: &str,
+        mac: &str,
+        fence: &crate::network::SweepFence,
+    ) -> Result<ManualNode, crate::AppError> {
+        self.bind_manual_node_with(ip, mac, fence, save_to_disk)
+    }
+
+    fn bind_manual_node_with(
+        &self,
+        ip: &str,
+        mac: &str,
+        fence: &crate::network::SweepFence,
+        save: impl FnOnce(&AppSettings) -> Result<(), crate::AppError>,
+    ) -> Result<ManualNode, crate::AppError> {
+        let mac = crate::network::device_registry::canonical_mac(mac)
+            .ok_or_else(|| crate::AppError::Network("Invalid device MAC".into()))?;
+        let _save = CONFIG_SAVE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut settings = self.settings.lock().unwrap_or_else(|p| p.into_inner());
+        if fence.is_stale() {
+            return Err(crate::AppError::Network("verification retired".into()));
         }
+        let mut next = settings.clone();
+        let node = next
+            .manual_nodes
+            .iter_mut()
+            .find(|n| n.ip == ip)
+            .ok_or_else(|| crate::AppError::Network("manual node no longer exists".into()))?;
+        let changed = bind_manual_identity(node, &mac);
+        let bound = node.clone();
+        if changed {
+            save(&next)?;
+            *settings = next;
+            log::info!(
+                "Manual node {} bound on first fresh verification to {}",
+                ip,
+                mac
+            );
+        }
+        Ok(bound)
+    }
+
+    /// Compare the expected identity too, so a stale removal cannot delete a new pin.
+    pub fn remove_manual_node(
+        &self,
+        ip: &str,
+        expected_mac: Option<&str>,
+    ) -> Result<bool, crate::AppError> {
+        let _save = CONFIG_SAVE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut settings = self.settings.lock().unwrap_or_else(|p| p.into_inner());
+        let mut next = settings.clone();
+        next.manual_nodes
+            .retain(|n| n.ip != ip || !same_expected_mac(n.expected_mac.as_deref(), expected_mac));
+        if next.manual_nodes.len() == settings.manual_nodes.len() {
+            return Ok(false);
+        }
+        save_to_disk(&next)?;
+        *settings = next;
+        Ok(true)
     }
 
     /// Drop every pinned manual node.
@@ -762,6 +828,28 @@ fn upsert_cache_record(
     } else {
         cache.push(device);
     }
+    true
+}
+
+pub(crate) fn manual_node_key(node: &ManualNode) -> String {
+    node.expected_mac
+        .clone()
+        .unwrap_or_else(|| format!("manual:{}", node.ip))
+}
+
+fn same_expected_mac(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        _ => false,
+    }
+}
+
+fn bind_manual_identity(node: &mut ManualNode, mac: &str) -> bool {
+    if node.expected_mac.is_some() {
+        return false;
+    }
+    node.expected_mac = Some(mac.into());
     true
 }
 
@@ -1608,6 +1696,7 @@ password = ""
         let settings = AppSettings {
             selected_adapter_mac: None,
             stream: StreamConfig {
+                camera_mac: None,
                 protocol: StreamProtocol::Udp,
                 rtsp_port: 8554,
                 rtsp_path: "/cam1".into(),
@@ -1842,6 +1931,7 @@ password = ""
     fn merge_user_fields_preserves_manual_nodes() {
         let mut current = AppSettings::default();
         current.manual_nodes.push(ManualNode {
+            expected_mac: None,
             ip: "192.168.1.50".into(),
             alias: "CAM".into(),
         });
@@ -1880,10 +1970,12 @@ password = ""
     fn manual_node_toml_roundtrip() {
         let mut settings = AppSettings::default();
         settings.manual_nodes.push(ManualNode {
+            expected_mac: None,
             ip: "192.168.1.202".into(),
             alias: "PTU".into(),
         });
         settings.manual_nodes.push(ManualNode {
+            expected_mac: None,
             ip: "10.13.248.55".into(),
             alias: String::new(),
         });
@@ -2484,5 +2576,102 @@ last_seen='old'"#,
         )
         .unwrap();
         assert!(legacy.verified_by_mac.is_none() && legacy.last_verified_at.is_none());
+    }
+
+    #[test]
+    fn first_manual_verification_is_saved_once_and_survives_restart() {
+        let mut settings = AppSettings::default();
+        settings.manual_nodes.push(ManualNode {
+            ip: "192.168.1.204".into(),
+            alias: "CAM".into(),
+            expected_mac: None,
+        });
+        let config = AppConfig {
+            settings: Mutex::new(settings),
+            cache: Mutex::new(vec![]),
+            startup_notices: Mutex::new(vec![]),
+        };
+        let fence = crate::network::SweepFence::new(
+            1,
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        config
+            .bind_manual_node_with("192.168.1.204", "aa:bb:cc:dd:ee:02", &fence, |s| {
+                std::fs::write(&path, toml::to_string(s).unwrap()).unwrap();
+                Ok(())
+            })
+            .unwrap();
+        let disk: AppSettings = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            disk.manual_nodes[0].expected_mac.as_deref(),
+            Some("aa:bb:cc:dd:ee:02")
+        );
+        let bound = config
+            .bind_manual_node_with("192.168.1.204", "aa:bb:cc:dd:ee:04", &fence, |_| {
+                panic!("replacement must not rebind or save")
+            })
+            .unwrap();
+        assert_eq!(bound.expected_mac, disk.manual_nodes[0].expected_mac);
+        assert_eq!(config.get_manual_nodes(), disk.manual_nodes);
+    }
+
+    #[test]
+    fn failed_or_retired_manual_binding_does_not_publish_the_identity() {
+        let mut settings = AppSettings::default();
+        settings.manual_nodes.push(ManualNode {
+            ip: "192.168.1.204".into(),
+            alias: "".into(),
+            expected_mac: None,
+        });
+        let config = AppConfig {
+            settings: Mutex::new(settings),
+            cache: Mutex::new(vec![]),
+            startup_notices: Mutex::new(vec![]),
+        };
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let fence = crate::network::SweepFence::new(
+            1,
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            active.clone(),
+        );
+        assert!(config
+            .bind_manual_node_with("192.168.1.204", "aa:bb:cc:dd:ee:02", &fence, |_| Err(
+                crate::AppError::Network("save failed".into())
+            ))
+            .is_err());
+        assert!(config.get_manual_nodes()[0].expected_mac.is_none());
+        active.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(config
+            .bind_manual_node_with("192.168.1.204", "aa:bb:cc:dd:ee:02", &fence, |_| panic!(
+                "retired proof must not save"
+            ))
+            .is_err());
+        assert!(config.get_manual_nodes()[0].expected_mac.is_none());
+    }
+
+    #[test]
+    fn target_fields_default_and_round_trip_with_user_settings() {
+        let legacy = toml::to_string(&AppSettings::default()).unwrap();
+        let mut settings: AppSettings = toml::from_str(&legacy).unwrap();
+        assert!(settings.stream.camera_mac.is_none());
+        let node: ManualNode = toml::from_str("ip='192.168.1.204'\nalias='CAM'").unwrap();
+        assert!(node.expected_mac.is_none());
+        settings.stream.camera_ip = node.ip.clone();
+        settings.stream.camera_mac = Some("aa:bb:cc:dd:ee:02".into());
+        settings.manual_nodes.push(node);
+        let stream: StreamConfig =
+            toml::from_str(&toml::to_string(&settings.stream).unwrap()).unwrap();
+        let incoming = AppSettings {
+            stream,
+            ..Default::default()
+        };
+        settings.merge_user_fields(incoming);
+        let disk: AppSettings = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(disk.stream.camera_mac.as_deref(), Some("aa:bb:cc:dd:ee:02"));
+        assert_eq!(disk.stream.camera_ip, "192.168.1.204");
+        assert_eq!(disk.manual_nodes.len(), 1);
     }
 }

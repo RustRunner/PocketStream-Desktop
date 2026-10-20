@@ -5,9 +5,10 @@
 import QRCode from "qrcode";
 import * as api from "./tauri-api.ts";
 import { $, state, log, showToast, formatUptime } from "./state.ts";
-import { sessionCamIp } from "./store.ts";
+import { sessionCamTarget, type DeviceTarget } from "./store.ts";
+import * as deviceList from "./device-list.ts";
 import { formatError } from "./errors.ts";
-import { getActiveCamIp, getActivePtuIp } from "./network.ts";
+import { getActiveCamIp, getActivePtuIp, getActiveCamTarget } from "./network.ts";
 import type { StreamStatus } from "./types.ts";
 
 /** Full RTSP URL (with token) — stored for QR code generation */
@@ -143,20 +144,22 @@ let muteToggleBusy = false;
 let audioPresent = false;
 let audioCodec: string | null = null;
 
-/** IP of the pipeline the user currently intends to be streaming.
- *  Set before the start awaits begin at every start site (manual
- *  start, auto-resume, stall recovery), so it covers the window where
- *  `isStreaming` is still false during startup, and it persists
- *  through the stream-lost overlay — the intent survives a drop.
- *  Cleared on stop and on a failed manual start.
- *
- *  This — not the persisted `camera_ip`, which is also rewritten by
- *  CAM designation while an unrelated stream keeps playing — is the
- *  identity that teardown logic must compare against. */
-let activePlaybackIp: string | null = null;
+/** Identity of the playback the user intends to keep, including recovery. */
+let activePlaybackTarget: DeviceTarget | null = null;
 
-export function getActivePlaybackIp(): string | null {
-  return activePlaybackIp;
+export function getActivePlaybackTarget(): DeviceTarget | null { return activePlaybackTarget; }
+
+/** Every start preserves the intended MAC beside the current endpoint.
+ *  The route/freshness readiness gate is added by S6. */
+async function persistPlaybackTarget(target: DeviceTarget): Promise<void> {
+  const record = deviceList.resolveTarget(target);
+  if (!record || record.alias === "PTU" || record.ip.startsWith("169.254.")) {
+    throw new Error("Selected device is unavailable; select a node before starting");
+  }
+  if (!state.config) throw new Error("Stream settings are not loaded");
+  state.config.stream.camera_ip = record.ip;
+  state.config.stream.camera_mac = deviceList.targetFor(record).expectedMac;
+  await api.updateStreamSettings(state.config.stream);
 }
 
 /** Stop the stream and reset every piece of frontend stream state.
@@ -171,7 +174,7 @@ export async function stopStreamNow(message = "Stream stopped"): Promise<void> {
   state.isStreaming = false;
   state.streamLost = false;
   resumeSnapshot = null;
-  activePlaybackIp = null;
+  activePlaybackTarget = null;
   hideStreamLost();
   state.isRecording = false;
   $("#btn-record").classList.remove("recording");
@@ -199,26 +202,23 @@ export function setupStreamControls(): void {
         await stopStreamNow();
       } else {
         try {
-          const selectedIp = getActiveCamIp();
-          if (!selectedIp) {
+          const target = getActiveCamTarget();
+          if (!target) {
             showToast("Pick a node first (click it in the Nodes panel)", true);
             return;
           }
           // Claim the playback identity before the slow awaits so a
           // concurrent teardown (role change) can observe and cancel
           // this start.
-          activePlaybackIp = selectedIp;
-          if (state.config) {
-            state.config.stream.camera_ip = selectedIp;
-            await api.updateStreamSettings(state.config.stream);
-          }
+          activePlaybackTarget = target;
+          await persistPlaybackTarget(target);
           const bounds = getVideoAreaBounds();
           // createVideoWindowSynced hides the born-visible child if a
           // dialog is open, so it can't cover one before startStream
           // returns. A second sync after the flags flip reveals it.
           const handle = await createVideoWindowSynced(bounds);
           await api.startStream(handle);
-          if (activePlaybackIp !== selectedIp) {
+          if (activePlaybackTarget !== target) {
             // A teardown landed while the start was in flight (the
             // backend playback epoch already observed its stop) —
             // make sure this just-started pipeline and its video
@@ -233,7 +233,7 @@ export function setupStreamControls(): void {
           notPlayingStreak = 0;
           showToast("Stream started");
         } catch (e) {
-          activePlaybackIp = null;
+          activePlaybackTarget = null;
           showToast("Stream failed: " + formatError(e), true);
         }
       }
@@ -431,6 +431,11 @@ export function setupRtspControls(): void {
         // VPN options are still being populated asynchronously and the
         // select can briefly read empty; writing that back would wipe
         // the saved interface.
+        const target = getActiveCamTarget();
+        if (state.config?.stream.protocol !== "udp") {
+          if (!target) throw new Error("Pick a node before starting the RTSP server");
+          await persistPlaybackTarget(target);
+        }
         const info = await api.startRtspServer();
         state.isRtspDesired = true;
         rtspFullUrl = info.rtsp_url;
@@ -709,7 +714,7 @@ function handleStatus(status: StreamStatus | null): void {
 }
 
 interface ResumeSnapshot {
-  cameraIp: string | null;
+  camera: DeviceTarget | null;
   ptuIp: string | null;
   wasRtspDesired: boolean;
 }
@@ -731,7 +736,7 @@ export function handleHardDisconnect(reason: string): void {
       // The playback identity, not getActiveCamIp(): the CAM
       // designation can have moved to another node since this stream
       // started, and a resume must bring back what was playing.
-      cameraIp: activePlaybackIp ?? getActiveCamIp(),
+      camera: activePlaybackTarget ?? getActiveCamTarget(),
       ptuIp: getActivePtuIp(),
       wasRtspDesired: state.isRtspDesired,
     };
@@ -764,22 +769,21 @@ export async function handleReconnect(): Promise<void> {
   if (!state.isStreaming || !state.streamLost) return;
 
   // Restore the session CAM target so getActiveCamIp resolves the same
-  // camera that was streaming before the disconnect. Session state, not
-  // state.config — a resume is not a persistence event, and writing
-  // config here would leak into the next Save Settings. PTU is
-  // alias-driven, which survives across the disconnect since aliases
-  // live in the registry/cache.
-  if (snap.cameraIp) {
-    sessionCamIp.set(snap.cameraIp);
+  // camera identity that was streaming before the disconnect. Each start
+  // submits that expected MAC and its current endpoint together. PTU remains
+  // alias-driven; no recovery ownership changes until S9.
+  if (snap.camera) {
+    sessionCamTarget.set(snap.camera);
   }
 
-  if (!snap.cameraIp) return;
+  if (!snap.camera) return;
 
   // Re-claim the playback identity before the start awaits — a role
   // change during the resume window compares against this.
-  activePlaybackIp = snap.cameraIp;
+  activePlaybackTarget = snap.camera;
 
   try {
+    await persistPlaybackTarget(snap.camera);
     const bounds = getVideoAreaBounds();
     const handle = await createVideoWindowSynced(bounds);
     await api.startStream(handle);
@@ -910,12 +914,13 @@ async function attemptStallRecovery(): Promise<void> {
     // may have taken ownership, while teardown was draining.
     if (!state.isStreaming || !state.streamLost) return;
 
-    const cameraIp = getActiveCamIp();
-    if (!cameraIp) {
-      log("Stall recovery: no camera IP available, aborting");
+    const target = activePlaybackTarget ?? getActiveCamTarget();
+    if (!target) {
+      log("Stall recovery: no camera identity available, aborting");
       return;
     }
-    activePlaybackIp = cameraIp;
+    activePlaybackTarget = target;
+    await persistPlaybackTarget(target);
 
     log("Stall recovery: restarting pipeline");
     const bounds = getVideoAreaBounds();

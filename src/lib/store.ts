@@ -53,24 +53,14 @@ function makeAccessor<T>(initial: T): Accessor<T> {
   };
 }
 
-/**
- * IP of the device currently selected in the camera dropdown / device
- * list. `null` when nothing is selected. Mutated from devices.js (item
- * click) and network.js (dropdown change); read by the render path to
- * decide which list item gets the .selected class.
- */
-export const selectedDevice: Accessor<string | null> = makeAccessor<string | null>(null);
+/** Stable device choice; the address is resolved only when an endpoint is needed. */
+export interface DeviceTarget {
+  key: string;
+  expectedMac: string | null;
+}
 
-/**
- * The camera IP designated as the stream target for this session — set
- * by a node click, by aliasing a device CAM, or by a reconnect resume
- * restoring the pre-disconnect target. Deliberately separate from
- * `selectedDevice`: that accessor carries UI side effects (Nodes-panel
- * highlight, saved-zoom restore) its writers opt into, whereas this is
- * a plain value the resume path can set without triggering them. Never
- * written to `state.config` — Save Settings builds its payload from
- * there, so a session pick would otherwise leak to disk on the next
- * unrelated save. The only writers of the persisted camera_ip are
- * stream start and explicit CAM aliasing.
- */
-export const sessionCamIp: Accessor<string | null> = makeAccessor<string | null>(null);
+/** UI selection, including highlight and zoom-restore subscriptions. */
+export const selectedDevice = makeAccessor<DeviceTarget | null>(null);
+
+/** Session camera intent. Persisted only by stream start or explicit CAM assignment. */
+export const sessionCamTarget = makeAccessor<DeviceTarget | null>(null);

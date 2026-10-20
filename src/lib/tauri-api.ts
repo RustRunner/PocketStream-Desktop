@@ -142,7 +142,7 @@ export async function setDhcp(name: string): Promise<void> {
 /**
  * Look up the MAC currently bound to `ip` from the live ARP cache.
  * Returns null if the IP doesn't respond. Used by the cache verify
- * path to confirm the responder at a cached IP is the same physical
+ * diagnostic path to compare the responder at a cached IP is the same physical
  * device (matching MAC), not an unrelated host that happens to share
  * the address today.
  */
@@ -179,14 +179,14 @@ export async function getDeviceList(): Promise<DeviceRecord[]> {
 }
 
 export async function reportScanResult(
-  ip: string,
+  key: string,
   openPorts: number[]
 ): Promise<void> {
-  return await invoke("report_scan_result", { ip, openPorts });
+  return await invoke("report_scan_result", { key, openPorts });
 }
 
-export async function setDeviceAlias(ip: string, alias: string): Promise<DeviceRecord[]> {
-  return await invoke<DeviceRecord[]>("set_device_alias", { ip, alias });
+export async function setDeviceAlias(key: string, alias: string): Promise<DeviceRecord[]> {
+  return await invoke<DeviceRecord[]>("set_device_alias", { key, alias });
 }
 
 export async function setDeviceStatus(
@@ -198,14 +198,6 @@ export async function setDeviceStatus(
 
 export async function forgetDevice(mac: string): Promise<void> {
   return await invoke("forget_device", { mac });
-}
-
-/** Evict a phantom cached device (targeted verify found no open ports).
- *  The backend no-ops for aliased CAM/PTU, manual, and Live entries, so
- *  this is safe to call unconditionally on a failed verify. Returns true
- *  if a device was actually removed. */
-export async function evictPhantomDevice(ip: string): Promise<boolean> {
-  return await invoke<boolean>("evict_phantom_device", { ip });
 }
 
 /** Atomic adoption snapshot: routing map + per-subnet lifecycle
@@ -405,12 +397,12 @@ export async function setNetworkMode(mode: NetworkMode): Promise<void> {
   return await invoke("set_network_mode", { mode });
 }
 
-export async function addManualNode(ip: string, alias: string): Promise<void> {
-  return await invoke("add_manual_node", { ip, alias });
+export async function addManualNode(ip: string, alias: string, expectedMac: string | null = null): Promise<void> {
+  return await invoke("add_manual_node", { ip, alias, expectedMac });
 }
 
-export async function removeManualNode(ip: string): Promise<void> {
-  return await invoke("remove_manual_node", { ip });
+export async function removeManualNode(ip: string, expectedMac: string | null): Promise<void> {
+  return await invoke("remove_manual_node", { ip, expectedMac });
 }
 
 export async function clearManualNodes(): Promise<void> {

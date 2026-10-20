@@ -21,6 +21,7 @@ interface NodeEntry {
   subnet: string;
   alias: string;
   isManual: boolean;
+  expectedMac: string | null;
 }
 
 /** Render the current node list into the dialog. Called on open and
@@ -45,7 +46,8 @@ function renderDialogList(): void {
     ip: r.ip,
     subnet: r.subnet,
     alias: r.alias || "",
-    isManual: r.mac.startsWith("manual:"),
+    isManual: r.mac.startsWith("manual:") || !!state.config?.manual_nodes.some((n) => n.expected_mac?.toLowerCase() === r.mac.toLowerCase()),
+    expectedMac: state.config?.manual_nodes.find((n) => n.expected_mac?.toLowerCase() === r.mac.toLowerCase())?.expected_mac ?? null,
   }));
   entries.sort((a, b) => {
     if (a.subnet !== b.subnet) return a.subnet.localeCompare(b.subnet);
@@ -99,7 +101,7 @@ function renderDialogList(): void {
         const manual = btn.dataset["manual"] === "1";
         try {
           if (manual && ip) {
-            await api.removeManualNode(ip);
+            await api.removeManualNode(ip, entries.find((e) => e.mac === mac)?.expectedMac ?? null);
           } else if (mac) {
             await api.forgetDevice(mac);
           }
@@ -126,6 +128,7 @@ async function openCacheDialog(): Promise<void> {
   $<HTMLInputElement>("#add-node-ip").value = "";
   $<HTMLInputElement>("#add-node-alias").value = "";
 
+  if (state.config) state.config.manual_nodes = (await api.getConfig()).manual_nodes;
   renderDialogList();
   if (dialog.open) dialog.close();
   await showModalWithVideo(dialog);
@@ -205,12 +208,13 @@ async function clearAll(): Promise<void> {
   const targets = deviceList.getDevices().map((r) => ({
     mac: r.mac,
     ip: r.ip,
-    isManual: r.mac.startsWith("manual:"),
+    isManual: r.mac.startsWith("manual:") || !!state.config?.manual_nodes.some((n) => n.expected_mac?.toLowerCase() === r.mac.toLowerCase()),
+    expectedMac: state.config?.manual_nodes.find((n) => n.expected_mac?.toLowerCase() === r.mac.toLowerCase())?.expected_mac ?? null,
   }));
   for (const t of targets) {
     try {
       if (t.isManual) {
-        await api.removeManualNode(t.ip);
+        await api.removeManualNode(t.ip, t.expectedMac);
       } else {
         await api.forgetDevice(t.mac);
       }

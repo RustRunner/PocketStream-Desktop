@@ -66,35 +66,24 @@ pub(crate) fn async_cmd(program: &str) -> tokio::process::Command {
 pub(crate) fn persist_alias_writethrough(
     registry: &DeviceRegistry,
     config: &crate::config::AppConfig,
-    ips: &[String],
+    keys: &[String],
 ) {
-    let snapshot = registry.snapshot();
-    for ip in ips {
-        let Some(record) = snapshot.iter().find(|r| r.ip == *ip) else {
+    for key in keys {
+        let snapshot = registry.snapshot();
+        let Some(record) = snapshot.iter().find(|r| r.mac == *key) else {
             continue;
         };
-        if !record.open_ports.is_empty() {
-            if let Err(e) = config.upsert_cached_device(crate::config::CachedDevice {
-                verified_by_mac: record.verified_by_mac.clone(),
-                last_verified_at: record.last_verified_at.clone(),
-                mac: record.mac.clone(),
-                ip: record.ip.clone(),
-                subnet: record.subnet.clone(),
-                open_ports: record.open_ports.clone(),
-                alias: record.alias.clone(),
-                last_seen: record.last_seen.clone(),
-            }) {
-                log::warn!("Failed to persist alias change for {} to cache: {}", ip, e);
-            }
-        } else if let Err(e) = config.update_cached_device_alias(&record.mac, &record.alias) {
-            log::warn!("Failed to persist alias change for {} to cache: {}", ip, e);
+        let cached = registry.cache_record(key);
+        let saved = if let Some(cached) = cached {
+            config.upsert_cached_device(cached).map(|()| true)
+        } else {
+            config.update_cached_device_alias(key, &record.alias)
+        };
+        if let Err(e) = saved {
+            log::warn!("Failed to persist alias for {}: {}", key, e);
         }
-        if let Err(e) = config.update_manual_node_alias(ip, &record.alias) {
-            log::warn!(
-                "Failed to write alias change for {} to manual nodes: {}",
-                ip,
-                e
-            );
+        if let Err(e) = config.update_manual_node_alias(key, &record.alias) {
+            log::warn!("Failed to persist manual alias for {}: {}", key, e);
         }
     }
 }
@@ -1893,15 +1882,13 @@ impl NetworkManager {
         let local_ips: HashSet<Ipv4Addr> = interface::all_local_ipv4().into_iter().collect();
         hydrate_retained_history(&self.device_registry, cached, &ghosts, &local_ips);
 
-        // Legacy cache files can hold CAM/PTU on more than one row.
-        // Repair to a single holder per role now that all rows are in,
-        // and write the demotions back so they don't return next launch.
-        let camera_ip = config.get().stream.camera_ip;
+        // Keep conflicting legacy role identities for explicit reassignment.
+        let camera_key = config.get().stream.camera_mac;
         let demoted = self
             .device_registry
-            .normalize_role_duplicates(Some(&camera_ip));
+            .normalize_role_duplicates(camera_key.as_deref());
         if !demoted.is_empty() {
-            log::info!("Demoted duplicate role alias on {}", demoted.join(", "));
+            log::info!("Ambiguous role identities: {}", demoted.join(", "));
             persist_alias_writethrough(&self.device_registry, config, &demoted);
         }
 
@@ -1923,6 +1910,38 @@ impl NetworkManager {
 
     pub fn registry(&self) -> Arc<DeviceRegistry> {
         self.device_registry.clone()
+    }
+
+    /// S5a calls this only after fresh selected-adapter verification. Persist
+    /// the first manual binding before exposing it as a verified identity.
+    #[allow(dead_code)]
+    pub(crate) fn merge_manual_verified(
+        &self,
+        config: &crate::config::AppConfig,
+        ip: &str,
+        device: &ArpDevice,
+        adapter: &str,
+        verified_at: &str,
+        fence: &SweepFence,
+    ) -> Result<device_registry::MergeResult, AppError> {
+        if ip != device.ip
+            || fence.is_stale()
+            || !DeviceRegistry::verification_valid(device, adapter, verified_at)
+        {
+            return Ok(device_registry::MergeResult::default());
+        }
+        let mac = device_registry::canonical_mac(&device.mac).expect("validated MAC");
+        let node = config.bind_manual_node(ip, &mac, fence)?;
+        let mut result =
+            self.device_registry
+                .merge_manual_verified(&node, device, adapter, verified_at, fence);
+        if !fence.is_stale() {
+            result.changed |= !self
+                .device_registry
+                .normalize_role_duplicates(None)
+                .is_empty();
+        }
+        Ok(result)
     }
 
     /// Create the device-list emitter if not already initialized. Safe
@@ -1959,10 +1978,10 @@ impl NetworkManager {
         // collides with a discovered holder. Enforce the single-holder
         // invariant and write demotions back (registry + config), so a
         // mode toggle can't resurrect a duplicate.
-        let camera_ip = config.get().stream.camera_ip;
+        let camera_key = config.get().stream.camera_mac;
         let demoted = self
             .device_registry
-            .normalize_role_duplicates(Some(&camera_ip));
+            .normalize_role_duplicates(camera_key.as_deref());
         if !demoted.is_empty() {
             persist_alias_writethrough(&self.device_registry, config, &demoted);
         }
@@ -2019,10 +2038,11 @@ impl NetworkManager {
                 if record.mac.starts_with("manual:") {
                     continue;
                 }
-                if record.open_ports.is_empty() {
+                if record.open_ports.is_empty() && record.last_verified_at.is_none() {
                     continue;
                 }
                 let node = crate::config::ManualNode {
+                    expected_mac: device_registry::canonical_mac(&record.mac),
                     ip: record.ip,
                     alias: record.alias,
                 };
@@ -4930,15 +4950,17 @@ mod tests {
         let registry = DeviceRegistry::new();
         registry.hydrate_manual_nodes(&[
             crate::config::ManualNode {
+                expected_mac: None,
                 ip: "169.254.20.7".into(),
                 alias: "bench PTU".into(),
             },
             crate::config::ManualNode {
+                expected_mac: None,
                 ip: "192.168.1.204".into(),
                 alias: "camera".into(),
             },
         ]);
-        assert!(keep_prohibited_history_inactive(&registry));
+        assert!(!keep_prohibited_history_inactive(&registry));
         let records = registry.snapshot();
         assert_eq!(records.len(), 2);
         let historical = records.iter().find(|r| r.ip == "169.254.20.7").unwrap();
@@ -5090,7 +5112,11 @@ mod tests {
             records.iter().find(|r| r.mac == "AA:02").unwrap().status,
             DeviceStatus::OfflineHostOwnedIp
         );
-        assert!(!registry.merge_scan_result("10.0.0.2", &[80]));
-        assert!(!registry.merge_scan_result("192.168.1.101", &[80]));
+        assert!(registry.merge_scan_result("AA:01", &[80]));
+        assert!(registry.merge_scan_result("AA:02", &[80]));
+        assert!(registry.snapshot().iter().all(|r| matches!(
+            r.status,
+            DeviceStatus::OfflineNonWiredSubnet | DeviceStatus::OfflineHostOwnedIp
+        )));
     }
 }
