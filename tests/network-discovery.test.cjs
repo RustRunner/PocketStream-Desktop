@@ -40,8 +40,29 @@ function fixture(mode = "static_auto") {
   }).outputText, { exports, require(name) { assert(name in deps, name); return deps[name]; } });
   exports.setupInterfaceWatcher(() => calls.cancelNotice++);
   events.get("adapter-selection-changed")(selection);
-  return { api, exports, state, iface, calls, up: () => events.get("interface-status-changed")(iface) };
+  return { api, exports, state, iface, calls, up: () => events.get("interface-status-changed")(iface),
+    publishNative: () => {
+      events.get("adapter-selection-changed")(selection);
+      events.get("interface-status-changed")(iface);
+    },
+  };
 }
+
+test("Native recovery replaces stale APIPA state and fences a pending provider failure", async () => {
+  const f = fixture();
+  f.state.activeInterface = { ...f.iface, is_up: false,
+    ips: [{ address: "169.254.10.2", prefix: 16, subnet: "169.254.0.0/16" }] };
+  let rejectQuery;
+  f.api.getAdapterSelection = () => new Promise((resolve, reject) => { rejectQuery = reject; });
+  const pending = f.exports.refreshInterfaces();
+  f.publishNative();
+  rejectQuery(Error("older provider query timed out"));
+  await pending; await flush();
+  assert.equal(f.state.activeInterface.ips[0].address, "192.168.1.100");
+  assert.equal(f.state.activeInterface.is_up, true);
+  assert.equal(f.calls.reconnect, 1);
+  assert.equal(f.calls.discovery, 0);
+});
 
 for (const mode of ["static_auto", "dhcp", "static_manual"]) {
   test(`Reconnect in ${mode} preserves stream desire while backend owns discovery`, async () => {
