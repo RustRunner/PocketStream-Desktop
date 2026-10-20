@@ -299,9 +299,8 @@ function applyDownEvent(iface: InterfaceInfo): void {
     handleHardDisconnect("Ethernet disconnected");
     state.activeInterface = null;
     $("#iface-name").textContent = unavailableAdapterLabel();
-    // Preserve the backend's DeviceRegistry across a "no adapter"
-    // blip so a quick replug restores the UI without waiting for a
-    // full re-scan. renderArpDeviceList self-hides when not connected.
+    // History stays visible. Backend expiry owns each row's status,
+    // including the stable-down hold; this event only updates host UI.
     renderArpDeviceList();
     renderSubnetList();
     hideDiscoveryStatus();
@@ -313,10 +312,8 @@ function applyDownEvent(iface: InterfaceInfo): void {
   handleHardDisconnect("Ethernet disconnected");
   $("#iface-name").textContent =
     (iface.display_name || iface.name) + " (Disconnected)";
-  // Preserve the backend's DeviceRegistry — a quick replug of the
-  // same cable should restore the Nodes list instantly instead of
-  // waiting 6+ seconds for ARP + port scan to rediscover what was
-  // there. renderArpDeviceList returns early when the link is down.
+  // Render retained history even without a usable host address.
+  // The backend owns verification, expiry and inactive reasons.
   renderArpDeviceList();
   renderSubnetList();
   // Hide the Nodes-card spinner — no link means no discovery to wait on.

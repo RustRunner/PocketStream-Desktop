@@ -12,7 +12,6 @@
  * Concerns that live here (not in the backend):
  *   - The discovery phase spinner machine (UX, not data)
  *   - Settle-debounced scan trigger (UX policy)
- *   - Cache verification retry policy (UX policy)
  *   - The DOM rendering itself
  *   - Role dropdown UI (CAM / PTU / Clear per node)
  */
@@ -37,6 +36,7 @@ import {
   hasRouteToSubnet,
   isIpScanned,
   markIpScanned,
+  presenceLabel,
   visibleDevices,
 } from "./device-state.ts";
 import * as deviceList from "./device-list.ts";
@@ -48,7 +48,6 @@ import type {
   AdoptionFailedPayload,
   ArpDevicePayload,
   CaptureState,
-  DevicePingResultPayload,
   DeviceRecord,
   DiscoveryDegradedPayload,
   DiscoveryRecoveredPayload,
@@ -76,24 +75,13 @@ export let captureState: CaptureState = {
 
 let pendingScans = 0;
 
-// ── ICMP reachability dots ──────────────────────────────────────────
-// IP → latest ping result. Missing entry = no probe yet (gray dot).
-// The backend pinger publishes `device-ping-result` events; we treat
-// the latest value per IP as the source of truth for the dot.
-const pingResults = new Map<string, boolean>();
-
-/** Render a status dot for a device's IP based on the latest ping
- *  result. Gray if no probe has come back yet, green if reachable,
- *  red if the last probe failed. */
-function renderReachabilityDot(ip: string): string {
-  const result = pingResults.get(ip);
-  if (result === undefined) {
-    return '<span class="device-dot dot-pending" title="Checking reachability..."></span>';
-  }
-  if (result) {
-    return '<span class="device-dot dot-green" title="Reachable"></span>';
-  }
-  return '<span class="device-dot dot-red" title="No response on last probe"></span>';
+/** The dot and text use the same backend presence status. ICMP and
+ *  open ports never change either indicator. */
+function renderPresenceDot(record: DeviceRecord): string {
+  const color = record.status === "live" ? "dot-green"
+    : record.status === "verifying" || record.status === "cached_only" ? "dot-pending"
+    : "dot-red";
+  return `<span class="device-dot ${color}" title="${escapeHtml(presenceLabel(record))}"></span>`;
 }
 
 // ── Debounced scan trigger ─────────────────────────────────────────
@@ -329,17 +317,6 @@ export function setupArpListeners(): void {
     }
   });
 
-  api.onEvent<DevicePingResultPayload>("device-ping-result", (data) => {
-    const prev = pingResults.get(data.ip);
-    pingResults.set(data.ip, data.reachable);
-    // Only re-render when the dot color would change. ICMP results
-    // are inherently noisy; redrawing every device row twice per
-    // minute regardless of change would be a wasted render.
-    if (prev !== data.reachable) {
-      renderArpDeviceList();
-    }
-  });
-
   // Quiet-network watchdog signals. Diagnostic only — the backend never
   // flips discovery availability on silence, so this is a heads-up that a
   // provoked ping sweep drew no ARP frames (dead subnet, or capture not
@@ -348,17 +325,10 @@ export function setupArpListeners(): void {
     const drops =
       data.missed_packets > 0 ? ` (ring drops: ${data.missed_packets})` : "";
     log(`Discovery degraded: ${data.reason}${drops}`);
-    // The watchdog sees only the ARP capture channel — not ICMP, and
-    // not the OS ARP-table merge that backstops it at sweep end. When
-    // the panel already shows a reachable node (cached device with a
-    // green ping dot, or a Live record), a "no devices" toast
-    // contradicts what the user is looking at. Keep the log line for
-    // diagnosing real capture regressions; toast only when the panel
-    // is as empty as the capture channel.
-    const anyReachable =
-      [...pingResults.values()].some(Boolean) ||
-      deviceList.getDevices().some((r) => r.status === "live");
-    if (!anyReachable) {
+    // Capture can be quiet while the backend verifier proves a node.
+    // Suppress the toast when the panel already shows an Active row.
+    const anyActive = visibleDevices(deviceList.getDevices()).some((r) => r.status === "live");
+    if (!anyActive) {
       showToast("No devices responding to discovery yet", true);
     }
     // If the only thing keeping the startup spinner alive is the grace
@@ -455,10 +425,7 @@ export async function loadExistingArpState(): Promise<void> {
     }
     if (entries.length > 0) renderSubnetList();
 
-    // Kick verification + scanning for whatever's already in the
-    // registry. Cached-only records on routable subnets get a fast
-    // verify pass; everything else falls through to the regular
-    // scan-all path.
+    // Presence is owned by the backend. Scan only for capabilities.
 
     if (deviceList.getDevices().length > 0) {
       scanAllRoutableDevices();
@@ -542,7 +509,7 @@ async function scanDevicePorts(mac: string, ip: string, attempt = 0): Promise<vo
 // ── Device list rendering ───────────────────────────────────────────
 
 // Render deferral while a role menu is open: the list is rebuilt
-// wholesale via innerHTML on every snapshot and on ping-dot flips,
+// wholesale via innerHTML on every snapshot,
 // and that teardown would close an open <select> popup mid-pick.
 // While one is open, renders queue behind a flag and flush on close.
 let roleMenuOpen = false;
@@ -564,21 +531,10 @@ export function renderArpDeviceList(): void {
   }
   const list = $("#device-list");
 
-  // While disconnected, render nothing — the records may still be in
-  // the backend's registry (preserved deliberately so a replug restores
-  // them fast), but they're unreachable right now. Returning early
-  // keeps the card empty without having to drop the state.
-  if (!isInterfaceConnected()) {
-    list.innerHTML = "";
-    return;
-  }
-
-  // Shared visibility filter (panel-strict): drops the host's own IPs,
-  // cached-only rows on unroutable subnets, own-MAC ghosts, and any
-  // non-manual entry without an open port. The Add/Remove Nodes dialog
-  // uses the same helper without the strict flag.
+  // Keep the same history as the manager dialog, including disconnected
+  // and zero-port records. The backend owns inactive topology reasons.
   const bySubnet = new Map<string, DeviceRecord[]>();
-  for (const record of visibleDevices(deviceList.getDevices(), /* panelStrict */ true)) {
+  for (const record of visibleDevices(deviceList.getDevices())) {
     const bucket = bySubnet.get(record.subnet);
     if (bucket) {
       bucket.push(record);
@@ -612,18 +568,14 @@ export function renderArpDeviceList(): void {
       const classes = ["device-item"];
       if (selectedDevice.get()?.key === r.mac) classes.push("selected");
 
-      // ICMP-result dot replaces the old verifying/offline/cached
-      // badges — one signal, three colors. Missing entry = no probe
-      // yet (gray); the pinger fills it in within seconds.
-      const dot = renderReachabilityDot(r.ip);
+      const dot = renderPresenceDot(r);
 
       // Escape backend-sourced strings before they hit innerHTML — same
       // treatment device-cache.ts gives these fields. escapeHtml quotes
       // are attribute-safe, so the data-* attributes are covered too.
       const ipEsc = escapeHtml(r.ip);
       const portsEsc = escapeHtml(ports.join(", "));
-      const identityReason = r.status === "offline_different_device" ? "different device at this address"
-        : r.status === "offline_ambiguous_role" ? "ambiguous role; reassign explicitly" : "";
+      const presence = presenceLabel(r);
 
       // The node's name doubles as the role dropdown face: a synthetic
       // first option carries the current display name (selected +
@@ -643,7 +595,9 @@ export function renderArpDeviceList(): void {
           <div class="device-detail-row">
             <a class="device-ip" href="#" data-browse="${ipEsc}" title="Open in browser">${ipEsc}</a>
             <span class="device-ports">${portsEsc}</span>
-            <span>${escapeHtml(identityReason)}</span>
+          </div>
+          <div class="device-detail-row">
+            <span class="device-ports">${escapeHtml(presence)}</span>
           </div>
         </div>`;
     }
@@ -654,7 +608,7 @@ export function renderArpDeviceList(): void {
   if (!html) {
     // Keep the list empty while either ARP discovery is still running
     // (no devices yet, but they may show up) OR a port scan is still
-    // in flight (devices exist but haven't qualified for display yet).
+    // in flight and no records have arrived yet.
     // Only show "No devices found." once both have settled.
     if (pendingScans > 0 || isDiscoveryActive()) return;
     list.innerHTML = '<p class="placeholder-text">No devices found.</p>';
