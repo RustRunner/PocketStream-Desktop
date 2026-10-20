@@ -289,12 +289,24 @@ impl RtspRestreamer {
                             .map(|d| super::redact_relay_text(&d, &mount_for_messages))
                             .unwrap_or_default();
                         let friendly = super::rtsp_client::friendly_rtsp_error(&raw, &debug);
-                        let reason = super::redact_relay_text(&friendly, &mount_for_messages);
+                        let fault = super::classify::bus_fault(
+                            &error.error(),
+                            friendly,
+                            error
+                                .details()
+                                .and_then(|d| d.get::<u32>("rtsp-status-code").ok()),
+                            &debug,
+                        );
+                        let reason = super::redact_relay_text(&fault.reason, &mount_for_messages);
                         log::warn!("RTSP relay media error: {} | debug: {}", raw, debug);
                         health_for_messages.record_media_fault(
                             server_instance,
                             media_generation,
-                            RelayFaultKind::GstError,
+                            if fault.retryable {
+                                RelayFaultKind::GstError
+                            } else {
+                                RelayFaultKind::PermanentGstError
+                            },
                             reason,
                         )
                     }
