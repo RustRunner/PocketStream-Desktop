@@ -532,6 +532,12 @@ fn discovery_resume_action(
     DiscoveryResume::Start(iface)
 }
 
+fn pending_binding_removal(mut row: crate::config::AdoptedMeta) -> crate::config::AdoptedMeta {
+    row.desired = crate::config::BindingDesired::Removed;
+    row.last_error = Some("Removal awaiting Windows confirmation".into());
+    row
+}
+
 fn binding_action(
     subnet: &str,
     row: &crate::config::AdoptedMeta,
@@ -4357,7 +4363,7 @@ impl NetworkManager {
                 "Binding ownership or prefix is unknown; no OS change made".into(),
             ));
         }
-        row.desired = crate::config::BindingDesired::Removed;
+        let row = pending_binding_removal(row);
         // The only entry point to an OS removal: failure here changes nothing.
         config.set_binding(subnet, row.clone())?;
         self.adopted_ips.lock().await.remove(subnet);
@@ -5283,6 +5289,52 @@ mod tests {
         async fn probe(&self, _: Ipv4Addr, _: Option<Ipv4Addr>) -> bool {
             false
         }
+    }
+
+    #[tokio::test]
+    async fn newly_requested_removal_waits_for_windows_confirmation() {
+        let ops = BindingOps::default();
+        for was_applied in [false, true] {
+            let mut row = saved_binding("172.26.95.99");
+            row.applied = was_applied;
+            let row = pending_binding_removal(row);
+            let action = binding_action(
+                "172.26.95.0/24",
+                &row,
+                None,
+                crate::config::NetworkMode::StaticAuto,
+                &Ok(false),
+                &[],
+            );
+            let row = apply_binding(&ops, row, action, None, || async {
+                panic!("unavailable Windows state cannot confirm deletion")
+            })
+            .await;
+            assert_eq!(row.applied, was_applied);
+            assert!(
+                row.last_error.is_some(),
+                "new removal stays pending even if applied was false"
+            );
+            assert_eq!(row.desired, crate::config::BindingDesired::Removed);
+
+            let iface = saved_adapter(&["192.168.1.100"]);
+            let action = binding_action(
+                "172.26.95.0/24",
+                &row,
+                Some(&iface),
+                crate::config::NetworkMode::StaticAuto,
+                &Ok(false),
+                &[],
+            );
+            assert_eq!(action, BindingAction::Observed(false));
+            let row = apply_binding(&ops, row, action, Some(&iface), || async {
+                panic!("an observed absence needs no write")
+            })
+            .await;
+            assert!(!row.applied && row.last_error.is_none());
+            assert_eq!(row.desired, crate::config::BindingDesired::Removed);
+        }
+        assert!(ops.writes.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
