@@ -118,13 +118,13 @@ export type ListeningNoticeTrigger = "launch" | "mode_from_manual" | "mode_from_
   | "refresh" | "reconnect" | "watchdog" | null;
 
 /** Pure eligibility rule; only launch and a real change to Auto may arm it. */
-export function listeningNoticeAdapter(
+export function listeningNoticeReady(
   mode: NetworkMode | undefined, discoveryAvailable: boolean,
   trigger: ListeningNoticeTrigger, capture: CaptureState,
-): string | null {
-  return mode === "static_auto" && discoveryAvailable && capture.active && capture.outcome !== null
-    && (trigger === "launch" || trigger === "mode_from_manual" || trigger === "mode_from_dhcp")
-    ? capture.adapter_name : null;
+): boolean {
+  return mode === "static_auto" && (trigger === "launch" || (discoveryAvailable
+    && capture.active && capture.outcome !== null && capture.adapter_name !== null
+    && (trigger === "mode_from_manual" || trigger === "mode_from_dhcp")));
 }
 
 let pendingScans = 0;
