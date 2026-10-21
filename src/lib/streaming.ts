@@ -675,7 +675,9 @@ export async function handleReconnect(): Promise<void> {
   catch (e) { log(`Playback readiness wake failed: ${formatError(e)}`); }
 }
 
-/** Render only. Submission and handshake never hide this overlay. */
+let recoveryDotsStartedAt: number | null = null;
+
+/** The existing status tick drives the dots; recovery remains backend-owned. */
 function showStreamLost(status: StreamStatus): void {
   state.streamLost = true;
   void syncVideoVisibility();
@@ -687,29 +689,24 @@ function showStreamLost(status: StreamStatus): void {
     overlay.style.cssText = "flex-direction: column; gap: 16px; padding: 24px; text-align: center";
     const label = document.createElement("span");
     label.className = "playback-reason";
-    const retry = document.createElement("button");
-    retry.className = "outlined-btn";
-    retry.textContent = "Retry";
-    retry.addEventListener("click", async () => {
-      retry.disabled = true;
-      try { await api.retryPlayback(); }
-      catch (e) { showToast("Retry failed: " + formatError(e), true); }
-      finally { retry.disabled = false; }
-    });
-    overlay.append(label, retry);
+    overlay.append(label);
     area.appendChild(overlay);
   }
   const reason = status.playback_fault?.reason;
   const recovering = status.playback_state === "recovering"
     || (status.playback_state === "starting" && status.playback_fault !== null);
+  if (recovering) recoveryDotsStartedAt ??= Date.now();
+  else recoveryDotsStartedAt = null;
+  const dots = ".".repeat(1 + Math.floor((Date.now() - (recoveryDotsStartedAt ?? Date.now())) / 1000) % 3);
   const message = recovering
-    ? `Network Error: Check link. Retrying in ${status.playback_next_retry_secs ?? 0}s…`
+    ? `Network Error: Check link. Retrying${dots}`
     : status.playback_state === "failed" ? `Playback failed${reason ? `: ${reason}` : ""}` : "Connecting";
   overlay.querySelector<HTMLElement>(".playback-reason")!.textContent = message;
   overlay.classList.add("visible");
 }
 
 function hideStreamLost(): void {
+  recoveryDotsStartedAt = null;
   state.streamLost = false;
   void syncVideoVisibility();
   $("#video-area").querySelector(".stream-lost-overlay")?.classList.remove("visible");

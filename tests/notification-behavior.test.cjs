@@ -130,41 +130,46 @@ function status(overrides = {}) {
     recording_report: null, ...overrides };
 }
 
-test("Drop/recovery uses only the persistent reason and preserves Retry/countdown/video state", async () => {
+test("Recovery shows one message with cycling dots, no button/countdown/toast, and preserves video state", async () => {
   const f = fixture(); let retries = 0;
   f.api.retryPlayback = async () => { retries++; };
   f.streaming.startStatusListener();
   const publish = f.events.get("stream-status"); publish(status()); await flush();
   const overlay = f.$("#video-area").querySelector(".stream-lost-overlay");
   assert.equal(overlay.querySelector(".playback-reason").textContent,
-    "Network Error: Check link. Retrying in 24s…");
+    "Network Error: Check link. Retrying.");
   assert.equal(f.toast(), null); assert(overlay.classList.contains("visible"));
   assert.equal(f.visibility.at(-1), false);
-  await overlay.querySelector("button").fire("click");
-  assert.equal(retries, 1); assert(overlay.classList.contains("visible"));
+  assert.equal(overlay.querySelector("button"), null);
+  assert.equal(retries, 0); assert(overlay.classList.contains("visible"));
+  for (const dots of ["..", "...", "."]) {
+    f.advance(1000); publish(status());
+    assert.equal(overlay.querySelector(".playback-reason").textContent, `Network Error: Check link. Retrying${dots}`);
+  }
   publish(status({ playback_next_retry_secs: 0 }));
-  assert.equal(overlay.querySelector(".playback-reason").textContent, "Network Error: Check link. Retrying in 0s…");
+  assert.equal(overlay.querySelector(".playback-reason").textContent, "Network Error: Check link. Retrying.");
   publish(status({ playback_state: "starting", playback_next_retry_secs: null }));
-  assert.equal(overlay.querySelector(".playback-reason").textContent, "Network Error: Check link. Retrying in 0s…");
+  assert.equal(overlay.querySelector(".playback-reason").textContent, "Network Error: Check link. Retrying.");
   assert.equal(overlay.children.filter(c => c.tag === "span").length, 1);
   publish(status({ playback_state: "playing", playback_fault: null, playback_next_retry_secs: null }));
   await flush(); assert.equal(f.toast(), null); assert(!overlay.classList.contains("visible"));
   assert.equal(f.visibility.at(-1), true);
+  f.advance(2000); publish(status());
+  assert.equal(overlay.querySelector(".playback-reason").textContent, "Network Error: Check link. Retrying.", "new outage starts at one dot");
 });
 
-test("Connecting/failure/fallback labels and actionable Retry failure remain", async () => {
+test("Connecting and permanent failure labels remain without a manual Retry button", async () => {
   const f = fixture(); f.streaming.startStatusListener();
   const publish = f.events.get("stream-status");
   for (const [playback_state, playback_fault, expected] of [
     ["starting", null, "Connecting"], ["failed", { reason: "Invalid credentials" }, "Playback failed: Invalid credentials"],
-    ["recovering", null, "Network Error: Check link. Retrying in 0s…"],
+    ["recovering", null, "Network Error: Check link. Retrying."],
   ]) {
     publish(status({ playback_state, playback_fault, playback_next_retry_secs: null }));
     assert.equal(f.$("#video-area").querySelector(".playback-reason").textContent, expected);
+    assert.equal(f.$("#video-area").querySelector("button"), null);
   }
-  f.api.retryPlayback = async () => { throw Error("request rejected"); };
-  await f.$("#video-area").querySelector("button").fire("click");
-  assert.match(f.toast().textContent, /Retry failed:.*request rejected/);
+  assert.equal(f.toast(), null);
 });
 
 test("Recording interruption reports remain actionable and deduplicated", () => {
