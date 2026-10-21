@@ -126,14 +126,8 @@ impl AdapterSnapshot {
 static ADAPTER_SNAPSHOT: std::sync::LazyLock<AdapterSnapshot> =
     std::sync::LazyLock::new(AdapterSnapshot::default);
 
-/// Native notifications invalidate before their debounced enumeration. Pollers
-/// share the result, including a valid empty result; failures never reuse stale data.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-pub(crate) fn invalidate_adapter_snapshot() {
-    ADAPTER_SNAPSHOT.invalidate();
-    *VALIDATED_NAMES.lock().unwrap_or_else(|p| p.into_inner()) = None;
-}
-
+/// Enumeration and qualification share in-flight work and the existing TTL.
+/// Native identity/topology changes retire it; failures never reuse stale data.
 async fn adapter_snapshot() -> Result<Vec<InterfaceInfo>, AppError> {
     // Establish identity before get() captures its generation. The first
     // notification must not invalidate its own cold metadata enumeration.
@@ -739,10 +733,9 @@ pub(crate) trait AddressIo: Send + Sync {
             .map(|(_, info)| native.overlay(info))
     }
     fn qualify(&self) -> AddressFuture<'_, ()> {
-        Box::pin(async {
-            invalidate_adapter_snapshot();
-            adapter_snapshot().await.map(|_| ())
-        })
+        // A cold caller joins the query already running for startup, display
+        // or the watcher instead of cancelling its metadata generation.
+        Box::pin(async { adapter_snapshot().await.map(|_| ()) })
     }
 }
 
@@ -1847,8 +1840,11 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             Ok(vec![])
         };
-        let (first, second) = tokio::join!(cache.get(query), cache.get(query));
-        assert!(first.unwrap().is_empty() && second.unwrap().is_empty());
+        let (first, second, third) =
+            tokio::join!(cache.get(query), cache.get(query), cache.get(query));
+        assert!(
+            first.unwrap().is_empty() && second.unwrap().is_empty() && third.unwrap().is_empty()
+        );
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         tokio::time::advance(SNAPSHOT_TTL - std::time::Duration::from_secs(1)).await;
         cache.get(query).await.unwrap();
