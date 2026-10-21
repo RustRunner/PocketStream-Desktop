@@ -219,6 +219,10 @@ fn remove_adoption_entry(
 pub struct AppSettings {
     #[serde(default)]
     pub selected_adapter_mac: Option<String>,
+    /// Explicit primary IPv4 CIDR per adapter MAC. Empty means the user removed
+    /// the primary; an absent entry is legacy/unknown, never enumeration order.
+    #[serde(default)]
+    pub primary_addresses: HashMap<String, String>,
     pub stream: StreamConfig,
     pub rtsp_server: RtspServerConfig,
     pub credentials: Credentials,
@@ -253,6 +257,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             selected_adapter_mac: None,
+            primary_addresses: HashMap::new(),
             stream: StreamConfig {
                 camera_mac: None,
                 protocol: StreamProtocol::Rtsp,
@@ -751,6 +756,30 @@ impl AppConfig {
                 Ok(())
             },
             save_to_disk,
+        )
+    }
+
+    pub(crate) fn set_primary_address(&self, mac: &str, cidr: &str) -> Result<(), crate::AppError> {
+        self.set_primary_address_with(mac, cidr, save_to_disk)
+    }
+
+    pub(crate) fn set_primary_address_with(
+        &self,
+        mac: &str,
+        cidr: &str,
+        persist: impl FnOnce(&AppSettings) -> Result<(), crate::AppError>,
+    ) -> Result<(), crate::AppError> {
+        let mac = crate::network::device_registry::canonical_mac(mac)
+            .ok_or_else(|| crate::AppError::Config("Invalid primary adapter MAC".into()))?;
+        if !cidr.is_empty() {
+            crate::validation::parse_cidr(cidr)?;
+        }
+        self.change_settings_with(
+            |s| {
+                s.primary_addresses.insert(mac, cidr.into());
+                Ok(())
+            },
+            persist,
         )
     }
 
@@ -1907,6 +1936,7 @@ password = ""
     fn settings_toml_with_populated_fields() {
         let settings = AppSettings {
             selected_adapter_mac: None,
+            primary_addresses: HashMap::new(),
             stream: StreamConfig {
                 camera_mac: None,
                 protocol: StreamProtocol::Udp,
@@ -1941,6 +1971,32 @@ password = ""
         assert!(parsed.rtsp_server.enabled);
         assert_eq!(parsed.credentials.username, "admin");
         assert!(parsed.stream.audio_muted);
+    }
+
+    #[test]
+    fn explicit_primary_roundtrip_is_backend_owned_and_failed_save_does_not_publish() {
+        let config = AppConfig::temporary_test_config(AppSettings::default());
+        config
+            .set_primary_address_with("40-CD-3A-00-00-01", "192.0.2.10/24", |_| Ok(()))
+            .unwrap();
+        assert!(config
+            .set_primary_address_with("40:cd:3a:00:00:01", "198.51.100.10/24", |_| Err(
+                crate::AppError::Config("save failed".into())
+            ))
+            .is_err());
+        assert_eq!(
+            config.get().primary_addresses["40:cd:3a:00:00:01"],
+            "192.0.2.10/24"
+        );
+        let mut saved = config.get();
+        saved.merge_user_fields(AppSettings::default());
+        let encoded = toml::to_string(&saved).unwrap();
+        let decoded: AppSettings = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.primary_addresses, saved.primary_addresses);
+        let mut old = toml::Value::try_from(&saved).unwrap();
+        old.as_table_mut().unwrap().remove("primary_addresses");
+        let legacy: AppSettings = old.try_into().unwrap();
+        assert!(legacy.primary_addresses.is_empty());
     }
 
     #[test]

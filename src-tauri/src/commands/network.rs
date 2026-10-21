@@ -107,6 +107,7 @@ pub async fn set_static_ip(
                 ip: Some(ip),
                 subnet_mask: Some(subnet_mask),
                 gateway,
+                previous_address: None,
                 confirmed: true,
             },
         )
@@ -140,11 +141,16 @@ pub async fn remove_secondary_ip(
     config: State<'_, AppConfig>,
     name: String,
     ip: String,
+    primary: Option<bool>,
 ) -> Result<crate::network::manual_address::AddressReply, AppError> {
     Ok(manager
         .address_operation(
             &config,
-            crate::network::manual_address::AddressRequest::RemoveManual { name, ip },
+            if primary.unwrap_or(false) {
+                crate::network::manual_address::AddressRequest::RemovePrimary { name, ip }
+            } else {
+                crate::network::manual_address::AddressRequest::RemoveManual { name, ip }
+            },
         )
         .await)
 }
@@ -166,6 +172,7 @@ pub async fn set_dhcp(
                 ip: None,
                 subnet_mask: None,
                 gateway: None,
+                previous_address: None,
                 confirmed: false,
             },
         )

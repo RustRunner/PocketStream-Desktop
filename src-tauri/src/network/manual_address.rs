@@ -1,7 +1,7 @@
 //! Serialized manual address transactions. Metadata and native reads stay
 //! separate; the reply is an observation, not an ordering/version protocol.
 use super::*;
-use crate::config::{AdoptedMeta, AppConfig, NetworkMode};
+use crate::config::{AdoptedMeta, AppConfig, BindingDesired, NetworkMode};
 use interface::OperationSnapshot;
 use serde::Serialize;
 use std::time::Duration;
@@ -29,6 +29,10 @@ pub enum AddressRequest {
         name: String,
         ip: String,
     },
+    RemovePrimary {
+        name: String,
+        ip: String,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -50,6 +54,7 @@ pub struct AddressView {
     pub address: String,
     pub prefix: Option<u8>,
     pub mode: NetworkMode,
+    pub primary_address: Option<String>,
 }
 #[derive(Debug, Serialize)]
 pub struct AddressReply {
@@ -161,6 +166,10 @@ impl Transaction {
                 address: self.address.clone(),
                 prefix: self.prefix,
                 mode: config.get().network_mode,
+                primary_address: self
+                    .mac
+                    .as_ref()
+                    .and_then(|mac| config.get().primary_addresses.get(mac).cloned()),
             },
         }
     }
@@ -174,9 +183,13 @@ impl NetworkManager {
         config: &AppConfig,
         request: AddressRequest,
     ) -> AddressReply {
+        let removing = !matches!(&request, AddressRequest::Add { .. });
+        let primary_removal = matches!(&request, AddressRequest::RemovePrimary { .. });
         let (action, address) = match &request {
             AddressRequest::Add { ip, .. } => ("add", ip.clone()),
-            AddressRequest::RemoveManual { ip, .. } => ("remove_manual", ip.clone()),
+            AddressRequest::RemoveManual { ip, .. } | AddressRequest::RemovePrimary { ip, .. } => {
+                ("remove_manual", ip.clone())
+            }
             AddressRequest::RemoveSaved { subnet, .. } => ("remove_managed", subnet.clone()),
         };
         let fence = self.presence.snapshot().fence;
@@ -232,6 +245,23 @@ impl NetworkManager {
             }
             tx.reason = Some(reason);
         }
+        if tx.outcome == AddressOutcome::Success
+            && removing
+            && (primary_removal
+                || config
+                    .get()
+                    .primary_addresses
+                    .get(tx.mac.as_deref().unwrap_or(""))
+                    .is_some_and(|cidr| cidr.split('/').next() == Some(tx.address.as_str())))
+        {
+            if let Err(error) =
+                self.address_io
+                    .persist_primary(config, tx.mac.as_deref().unwrap(), "")
+            {
+                tx.outcome = AddressOutcome::Failed;
+                tx.reason = Some(error.to_string());
+            }
+        }
         if tx.outcome == AddressOutcome::Success {
             tx.trace.succeeded();
         }
@@ -273,7 +303,8 @@ impl NetworkManager {
                 }
                 (true, Some(name), Some(mask))
             }
-            AddressRequest::RemoveManual { name, ip } => {
+            AddressRequest::RemoveManual { name, ip }
+            | AddressRequest::RemovePrimary { name, ip } => {
                 ip.parse::<Ipv4Addr>()
                     .map_err(|_| AppError::Network("Invalid IPv4 address".into()))?;
                 tx.address = ip;
@@ -322,6 +353,11 @@ impl NetworkManager {
                         "Saved address ownership or prefix is unknown; no OS change made".into(),
                     ));
                 }
+                if tx.prefix.is_some_and(|prefix| row.prefix != Some(prefix)) {
+                    return Err(AppError::Network(
+                        "Previous primary prefix changed; no removal made".into(),
+                    ));
+                }
                 tx.prefix = row.prefix;
                 let row = pending_binding_removal(row);
                 let saved = self.address_io.persist_intent(config, subnet, row.clone());
@@ -350,7 +386,7 @@ impl NetworkManager {
         let before = before?;
         tx.trace.identity(&before, tx.prefix);
         self.validate_operation_context(config, tx, fence)?;
-        if !before.selected.is_up
+        if (add && !before.selected.is_up)
             || alias
                 .as_ref()
                 .is_some_and(|name| *name != before.selected.alias)
@@ -396,6 +432,35 @@ impl NetworkManager {
         }
         if !add && tx.subnet.is_some() {
             return self.remove_saved_operation(config, before, fence, tx).await;
+        }
+        // Explicit removal of an unmanaged address must not be undone by a
+        // later automatic adoption. Use the existing subnet tombstone when
+        // it does not belong to another address; never overwrite another row.
+        if !add {
+            if let Some(prefix) = tx.prefix {
+                let subnet = ipnetwork::Ipv4Network::new(tx.address.parse().unwrap(), prefix)
+                    .map_err(|e| AppError::Network(e.to_string()))?
+                    .network();
+                let key = format!("{subnet}/{prefix}");
+                if !settings.adopted_meta.contains_key(&key) {
+                    let row = pending_binding_removal(AdoptedMeta {
+                        adapter_mac: tx.mac.clone(),
+                        address: Some(tx.address.clone()),
+                        prefix: Some(prefix),
+                        applied: existing.is_some(),
+                        ..Default::default()
+                    });
+                    self.address_io.persist_intent(config, &key, row.clone())?;
+                    tx.intent_saved = true;
+                    tx.subnet = Some(key.clone());
+                    tx.row = Some(row.clone());
+                    self.adopted_meta
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(key, row);
+                    return self.remove_saved_operation(config, before, fence, tx).await;
+                }
+            }
         }
         tx.trace.phase("os_command_start");
         let command = if add && existing.is_none() {
@@ -459,6 +524,180 @@ impl NetworkManager {
                         .unwrap_or_else(|| error.to_string()),
                 );
             }
+        }
+        Ok(())
+    }
+
+    /// Resolve the exact prior primary; multiple legacy addresses require an
+    /// explicit choice. This is checked before the mode writer changes Windows.
+    pub(super) fn primary_to_replace(
+        &self,
+        config: &AppConfig,
+        before: &OperationSnapshot,
+        request: &ModeTransition,
+    ) -> Result<Option<interface::IpInfo>, AppError> {
+        let settings = config.get();
+        let saved = settings
+            .primary_addresses
+            .get(&before.selected.identity().mac);
+        if request.ip.as_ref().is_some_and(|ip| {
+            before.all.iter().any(|a| {
+                a.identity() != before.selected.identity() && a.ips.iter().any(|i| &i.address == ip)
+            })
+        }) {
+            return Err(AppError::Network(
+                "Primary address is assigned to another local adapter".into(),
+            ));
+        }
+        let choice = request
+            .previous_address
+            .as_ref()
+            .or(saved.filter(|s| !s.is_empty()));
+        if let Some(cidr) = choice {
+            let (ip, prefix) = crate::validation::parse_cidr(cidr)?;
+            if let Some(found) = before
+                .selected
+                .ips
+                .iter()
+                .find(|a| a.address == ip.to_string())
+            {
+                if found.prefix != prefix {
+                    return Err(AppError::Network(
+                        "Primary prefix changed; reopen Configure".into(),
+                    ));
+                }
+                let owners: Vec<_> = settings
+                    .adopted_meta
+                    .values()
+                    .filter(|r| r.address.as_deref() == Some(found.address.as_str()))
+                    .collect();
+                if owners.len() > 1
+                    || owners.iter().any(|r| {
+                        r.prefix != Some(prefix)
+                            || r.adapter_mac.as_deref().and_then(adapter_mac)
+                                != Some(before.selected.identity().mac.clone())
+                    })
+                {
+                    return Err(AppError::Network(
+                        "Previous primary ownership is unknown or changed".into(),
+                    ));
+                }
+                return Ok(Some(found.clone()));
+            }
+            // A successful native snapshot proves this exact old address is
+            // already absent. Create the new primary without deleting another.
+            return Ok(None);
+        }
+        if saved.is_some_and(|s| s.is_empty()) {
+            return Ok(None);
+        }
+        let usable: Vec<_> = before
+            .selected
+            .ips
+            .iter()
+            .filter(|a| !a.address.starts_with("169.254."))
+            .collect();
+        let manual: Vec<_> = usable
+            .iter()
+            .filter(|a| {
+                !settings.adopted_meta.values().any(|r| {
+                    r.address.as_ref() == Some(&a.address) && r.desired == BindingDesired::Present
+                })
+            })
+            .collect();
+        if manual.len() == 1 {
+            return Ok(Some((**manual[0]).clone()));
+        }
+        if usable.len() == 1 {
+            return Ok(Some(usable[0].clone()));
+        }
+        if usable.is_empty() {
+            return Ok(None);
+        }
+        Err(AppError::Network(
+            "Select the address to replace in Configure".into(),
+        ))
+    }
+
+    /// The mode writer first establishes the new address while preserving old
+    /// addresses. Only an observed new primary permits retiring the old tuple.
+    pub(super) async fn finish_primary_change(
+        &self,
+        config: &AppConfig,
+        before: &OperationSnapshot,
+        request: &ModeTransition,
+        previous: Option<interface::IpInfo>,
+    ) -> Result<(), AppError> {
+        let after = self.operation_snapshot(config).await?;
+        let ip = request
+            .ip
+            .as_deref()
+            .ok_or_else(|| AppError::Network("Primary address required".into()))?;
+        let prefix = ip_config::mask_to_prefix(request.subnet_mask.as_deref().unwrap_or(""))?;
+        if after.selected.identity() != before.selected.identity()
+            || after.selected.dhcp
+            || !after
+                .selected
+                .ips
+                .iter()
+                .any(|a| a.address == ip && a.prefix == prefix)
+        {
+            return Err(AppError::Network(
+                "Windows has not confirmed the new primary address".into(),
+            ));
+        }
+        let mac = after.selected.identity().mac;
+        // Durable manual ownership of the observed new address must succeed
+        // before the old primary can be removed, including pending ownership.
+        self.claim_binding_locked(config, ip, &after.selected.alias)
+            .await?;
+        self.address_io
+            .persist_primary(config, &mac, &format!("{ip}/{prefix}"))?;
+        let Some(previous) = previous.filter(|a| a.address != ip) else {
+            return Ok(());
+        };
+        // Reuse the exact same intent-save, native verification and targeted
+        // removal path as the modal. The caller already holds both locks.
+        let fence = self.presence.snapshot().fence;
+        let mut tx = Transaction {
+            trace: AddressTrace::new("replace_primary", &previous.address),
+            mac: Some(mac),
+            mode: config.get_network_mode(),
+            address: previous.address.clone(),
+            prefix: Some(previous.prefix),
+            subnet: None,
+            row: None,
+            observed: None,
+            observation_error: None,
+            intent_saved: false,
+            outcome: AddressOutcome::Failed,
+            reason: None,
+        };
+        let result = self
+            .run_address_operation(
+                config,
+                AddressRequest::RemoveManual {
+                    name: after.selected.alias,
+                    ip: previous.address,
+                },
+                &fence,
+                &mut tx,
+            )
+            .await;
+        if let Err(error) = result {
+            if tx.intent_saved {
+                if let (Some(subnet), Some(mut row)) = (tx.subnet.as_deref(), tx.row.clone()) {
+                    row.last_error = Some(error.to_string());
+                    self.publish_binding(config, subnet, row).await;
+                }
+            }
+            return Err(error);
+        }
+        if tx.outcome != AddressOutcome::Success {
+            return Err(AppError::Network(
+                tx.reason
+                    .unwrap_or_else(|| "Primary replacement remains pending".into()),
+            ));
         }
         Ok(())
     }
@@ -683,6 +922,9 @@ mod tests {
         fn claim(&self, c: &AppConfig, ip: &str) -> Result<(), AppError> {
             c.claim_binding_with(ip, |_| self.persist("claim", ip))
         }
+        fn persist_primary(&self, c: &AppConfig, mac: &str, cidr: &str) -> Result<(), AppError> {
+            c.set_primary_address_with(mac, cidr, |_| self.persist("primary", cidr))
+        }
     }
     const TARGET: &str = "192.0.2.0/24";
     const IP: &str = "192.0.2.20";
@@ -734,6 +976,253 @@ mod tests {
             subnet: TARGET.into(),
             hint: Some("Ethernet".into()),
         }
+    }
+
+    fn primary_request(previous: Option<&str>) -> ModeTransition {
+        ModeTransition {
+            name: "Ethernet".into(),
+            mode: NetworkMode::StaticAuto,
+            ip: Some("198.51.100.10".into()),
+            subnet_mask: Some("255.255.255.0".into()),
+            gateway: None,
+            previous_address: previous.map(str::to_owned),
+            confirmed: false,
+        }
+    }
+    fn establish_new_primary(io: &TestIo) {
+        io.os.table.lock().unwrap()[0].ips.push(interface::IpInfo {
+            address: "198.51.100.10".into(),
+            prefix: 24,
+            subnet: "198.51.100.0/24".into(),
+        });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn primary_replacement_removes_only_the_explicit_old_tuple_in_both_orders() {
+        for old in ["192.0.2.10", IP] {
+            for reverse in [false, true] {
+                let (m, c, io) = fixture(1);
+                if reverse {
+                    io.os.table.lock().unwrap()[0].ips.reverse();
+                }
+                let before = m.operation_snapshot(&c).await.unwrap();
+                let request = primary_request(Some(&format!("{old}/24")));
+                let previous = m.primary_to_replace(&c, &before, &request).unwrap();
+                establish_new_primary(&io);
+                m.finish_primary_change(&c, &before, &request, previous)
+                    .await
+                    .unwrap();
+                assert_eq!(*io.os.writes.lock().unwrap(), vec![(false, old.into())]);
+                assert!(io.os.table.lock().unwrap()[0]
+                    .ips
+                    .iter()
+                    .any(|i| i.address == "198.51.100.10"));
+                assert_eq!(
+                    c.get().primary_addresses["40:cd:3a:00:00:01"],
+                    "198.51.100.10/24"
+                );
+                if old == IP {
+                    assert_eq!(
+                        c.get().adopted_meta[TARGET].desired,
+                        BindingDesired::Removed
+                    );
+                } else {
+                    assert_eq!(
+                        c.get().adopted_meta[TARGET].desired,
+                        BindingDesired::Present
+                    );
+                }
+                let snapshot = m.operation_snapshot(&c).await.unwrap();
+                let mut next = primary_request(None);
+                next.ip = Some("203.0.113.10".into());
+                assert_eq!(
+                    m.primary_to_replace(&c, &snapshot, &next)
+                        .unwrap()
+                        .unwrap()
+                        .address,
+                    "198.51.100.10"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unknown_or_unestablished_primary_never_removes_the_old_address() {
+        for fail_native in [false, true] {
+            let (m, c, io) = fixture(1);
+            let before = m.operation_snapshot(&c).await.unwrap();
+            let request = primary_request(Some("192.0.2.10/24"));
+            let previous = m.primary_to_replace(&c, &before, &request).unwrap();
+            io.os.fail_read.store(fail_native, Ordering::Relaxed);
+            assert!(m
+                .finish_primary_change(&c, &before, &request, previous)
+                .await
+                .is_err());
+            assert!(io.os.writes.lock().unwrap().is_empty());
+            assert!(c.get().primary_addresses.is_empty());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn primary_replacement_save_errors_and_failed_deletes_are_not_success() {
+        for case in 0..7 {
+            let (m, c, io) = fixture(1);
+            let before = m.operation_snapshot(&c).await.unwrap();
+            let request = primary_request(Some(&format!("{IP}/24")));
+            let previous = m.primary_to_replace(&c, &before, &request).unwrap();
+            establish_new_primary(&io);
+            match case {
+                0..=3 => io.fail_save.store(case + 1, Ordering::Relaxed),
+                4 => *io.os.effect.lock().unwrap() = Effect::Unchanged,
+                5 => *io.os.effect.lock().unwrap() = Effect::ErrorAfter,
+                _ => *io.os.effect.lock().unwrap() = Effect::TimeoutAfter,
+            }
+            assert!(
+                m.finish_primary_change(&c, &before, &request, previous)
+                    .await
+                    .is_err(),
+                "case {case}"
+            );
+            assert_eq!(
+                io.os.writes.lock().unwrap().len(),
+                usize::from(case >= 3),
+                "case {case}"
+            );
+            if case >= 3 {
+                assert_eq!(
+                    c.get().adopted_meta[TARGET].desired,
+                    BindingDesired::Removed
+                );
+            }
+            assert!(io.os.table.lock().unwrap()[0]
+                .ips
+                .iter()
+                .any(|i| i.address == "198.51.100.10"));
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_ambiguous_primary_requires_a_choice_and_prefix_change_is_refused() {
+        let (m, c, io) = fixture(0);
+        let before = m.operation_snapshot(&c).await.unwrap();
+        assert!(m
+            .primary_to_replace(&c, &before, &primary_request(None))
+            .is_err());
+        assert!(m
+            .primary_to_replace(&c, &before, &primary_request(Some("192.0.2.10/25")))
+            .is_err());
+        assert!(io.os.writes.lock().unwrap().is_empty());
+        let mut conflicting = before.clone();
+        let mut other = before.selected.clone();
+        other.mac = "40:cd:3a:00:00:02".into();
+        other.guid = "other".into();
+        other.index = 8;
+        other.ips.push(interface::IpInfo {
+            address: "198.51.100.10".into(),
+            prefix: 24,
+            subnet: "198.51.100.0/24".into(),
+        });
+        conflicting.all.push(other);
+        assert!(m
+            .primary_to_replace(&c, &conflicting, &primary_request(Some("192.0.2.10/24")))
+            .is_err());
+        c.settings.lock().unwrap().adopted_meta.insert(
+            TARGET.into(),
+            AdoptedMeta {
+                address: Some("192.0.2.10".into()),
+                prefix: Some(24),
+                adapter_mac: None,
+                ..Default::default()
+            },
+        );
+        assert!(m
+            .primary_to_replace(&c, &before, &primary_request(Some("192.0.2.10/24")))
+            .is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn explicit_removal_works_on_present_disconnected_adapter_and_keeps_intent() {
+        for managed in [false, true] {
+            let (m, c, io) = fixture(usize::from(managed));
+            io.os.table.lock().unwrap()[0].is_up = false;
+            if managed {
+                c.settings
+                    .lock()
+                    .unwrap()
+                    .primary_addresses
+                    .insert("40:cd:3a:00:00:01".into(), format!("{IP}/24"));
+            }
+            let reply = m
+                .address_operation(
+                    &c,
+                    if managed {
+                        AddressRequest::RemoveManual {
+                            name: "Ethernet".into(),
+                            ip: IP.into(),
+                        }
+                    } else {
+                        AddressRequest::RemovePrimary {
+                            name: "Ethernet".into(),
+                            ip: IP.into(),
+                        }
+                    },
+                )
+                .await;
+            assert_eq!(reply.outcome, AddressOutcome::Success);
+            assert_eq!(reply.view.primary_address.as_deref(), Some(""));
+            assert_eq!(*io.os.writes.lock().unwrap(), vec![(false, IP.into())]);
+            let row = &c.get().adopted_meta[TARGET];
+            assert_eq!(row.desired, BindingDesired::Removed);
+            assert!(!row.applied);
+            let events = io.events.lock().unwrap();
+            assert!(
+                events
+                    .iter()
+                    .position(|x| x == &format!("intent:{TARGET}"))
+                    .unwrap()
+                    < events
+                        .iter()
+                        .position(|x| x == &format!("remove:{IP}"))
+                        .unwrap()
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_primary_clear_reports_absence_without_false_success_and_can_retry() {
+        let (m, c, io) = fixture(0);
+        io.fail_save.store(3, Ordering::Relaxed);
+        let reply = m
+            .address_operation(
+                &c,
+                AddressRequest::RemovePrimary {
+                    name: "Ethernet".into(),
+                    ip: IP.into(),
+                },
+            )
+            .await;
+        assert_eq!(reply.outcome, AddressOutcome::Failed);
+        assert!(!reply
+            .view
+            .selection
+            .adapter
+            .unwrap()
+            .ips
+            .iter()
+            .any(|i| i.address == IP));
+        assert!(c.get().primary_addresses.is_empty());
+        let retry = m
+            .address_operation(
+                &c,
+                AddressRequest::RemovePrimary {
+                    name: "Ethernet".into(),
+                    ip: IP.into(),
+                },
+            )
+            .await;
+        assert_eq!(retry.outcome, AddressOutcome::Success);
+        assert_eq!(retry.view.primary_address.as_deref(), Some(""));
+        assert_eq!(io.os.writes.lock().unwrap().len(), 1);
     }
     fn addition() -> AddressRequest {
         AddressRequest::Add {

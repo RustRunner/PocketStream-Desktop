@@ -456,6 +456,10 @@
         <div id="ip-static-section">
           <!-- Primary IP -->
           <h3 class="ip-section-label">Primary IP</h3>
+          <div class="input-field" id="primary-existing-field" style="display:none">
+            <label for="primary-existing-ip">Address to replace</label>
+            <select id="primary-existing-ip"></select>
+          </div>
           <div class="ip-row-fields">
             <div class="input-field" style="flex:2">
               <label for="static-ip">Address</label>
@@ -470,6 +474,7 @@
             <label for="static-gateway">Gateway (optional)</label>
             <input type="text" id="static-gateway" placeholder="192.168.1.1" />
           </div>
+          <button type="button" class="text-btn" id="btn-remove-primary-ip" style="display:none">Remove primary IP</button>
 
           <!-- Secondary IPs -->
           <h3 class="ip-section-label">Secondary IPs</h3>
