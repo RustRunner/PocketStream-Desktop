@@ -5,7 +5,7 @@ const vm = require('node:vm');
 const { test } = require('node:test');
 const ts = require('typescript');
 const source = fs.readFileSync(path.join(__dirname, '../src/lib/network.ts'), 'utf8');
-const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
+const compiled = ts.transpileModule(source + '\nexports.renderSelectionForTest = selection => { applySelection(selection); renderNetwork(); };', { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
 const flush = async () => { for(let i=0;i<40;i++) await Promise.resolve(); };
 const deferred = () => { let resolve,reject; const promise=new Promise((a,b)=>{resolve=a;reject=b;});return {promise,resolve,reject}; };
 const IP='192.0.2.20', SUBNET='192.0.2.0/24', MAC='40:cd:3a:00:00:01';
@@ -72,7 +72,10 @@ function fixture() {
   return {exports,api,events,$,calls,pending,feedback,removals,transitions,additions,ui,state,selection,iface,adoptionMeta,adoptedSubnets,reply,
     failRender(){throwRender=true;},
     runTimers(ms){timers.forEach((timer,index)=>{if(timer?.ms===ms){timers[index]=null;timer.fn();}});},
-    async hostRemove(){const btn=$('#subnet-list').buttons[0];assert(btn);return $('#subnet-list').fire('click',{target:btn});},
+    async modalRemove(){
+      if(!$('#ip-config-dialog').open){$('#ip-config-dialog').open=true;exports.renderSelectionForTest(selection);}
+      const btn=$('#secondary-ip-list').buttons.find(b=>b.dataset.removeBinding===SUBNET);assert(btn);return btn.fire('click');
+    },
     setSelection(next){events.get('adapter-selection-changed')(next);},
   };
 }
@@ -82,6 +85,26 @@ test('IP Configuration has one Close action and no Cancel or Apply action',()=>{
   const dialog=html.match(/<dialog id="ip-config-dialog"[\s\S]*?<\/dialog>/)[0];
   assert.match(dialog,/id="ip-config-close">Close<\/button>/);
   assert(!/ip-config-(cancel|apply)/.test(dialog));
+});
+
+test('Host card has no delete control while Configure retains exact-address Remove controls',async()=>{
+  const f=fixture();await f.$('#btn-ip-config').fire('click');
+  assert.equal(f.$('#subnet-list').buttons.length,0);
+  assert(!/data-remove|btn-remove|<button/.test(f.$('#subnet-list').innerHTML));
+  assert(f.$('#secondary-ip-list').buttons.some(b=>b.dataset.removeBinding===SUBNET));
+});
+
+test('Fresh adoption shows the green auto badge; restored, pending and ended attachments stay plain',async()=>{
+  const f=fixture();await f.exports.refreshInterfaces();
+  assert(!f.$('#subnet-list').innerHTML.includes('badge-auto'),'restored binding is plain');
+  f.exports.sessionAdoptedSubnets.add(SUBNET);f.exports.renderSubnetList();
+  assert(f.$('#subnet-list').innerHTML.includes('<span class="badge-auto">auto</span>'));
+  const meta=f.adoptionMeta.get(SUBNET);meta.applied=false;f.exports.renderSubnetList();
+  assert(!f.$('#subnet-list').innerHTML.includes('badge-auto'),'pending is not applied');
+  meta.applied=true;f.state.activeInterface={...f.iface,is_up:false};
+  f.exports.sessionAdoptedSubnets.clear();f.exports.renderSubnetList();
+  assert(!f.$('#subnet-list').innerHTML.includes('badge-auto'),'attachment badge expires');
+  assert(f.$('#subnet-list').innerHTML.includes(IP),'saved address remains visible');
 });
 
 test('Closing an unchanged ambiguous or disconnected adapter does not write network settings',async()=>{
@@ -380,16 +403,16 @@ test('SP10 double Add click acknowledges synchronously, disables both panels and
   const first=f.$('#btn-add-sec-ip').fire('click');const second=f.$('#btn-add-sec-ip').fire('click');
   assert.equal(f.calls.writes,1);assert.equal(f.$('#ip-config-spinner').style.display,'');
   assert.equal(f.$('#static-iface').disabled,true);assert.equal(f.$('#ip-mode-static-auto').disabled,true);
-  assert.equal(f.$('#subnet-list').buttons[0].disabled,true);assert.equal(f.$('#host-title').style.pointerEvents,'none');
+  assert.equal(f.$('#ip-mode-static-auto').disabled,true);assert.equal(f.$('#host-title').style.pointerEvents,'none');
   const added=f.reply();added.view.selection=f.selection;added.view.binding=null;
   f.pending[0].resolve(added);await first;await second;
   assert.equal(f.$('#btn-add-sec-ip').disabled,false);assert.equal(f.$('#ip-config-spinner').style.display,'none');
   assert.equal(f.calls.selection,0);assert.equal(f.calls.bindings,0);assert.equal(f.calls.dhcp,0);
 });
 
-test('SP10/SP11 Host removal paints Host and open dialog from one reply with zero follow-up reads',async()=>{
+test('SP10/SP11 Modal removal paints Host and open dialog from one reply with zero follow-up reads',async()=>{
   const f=fixture();await f.$('#btn-ip-config').fire('click');
-  const before={...f.calls};const pending=f.hostRemove();await flush();
+  const before={...f.calls};const pending=f.modalRemove();await flush();
   assert.equal(f.calls.writes,1);assert.equal(f.$('#btn-add-sec-ip').disabled,true);
   f.pending[0].resolve(f.reply());await pending;await flush();
   assert(!f.state.activeInterface.ips.some(i=>i.address===IP));
@@ -399,7 +422,7 @@ test('SP10/SP11 Host removal paints Host and open dialog from one reply with zer
 });
 
 test('SP10 adapter A/B/A retires the old success even when the final MAC matches',async()=>{
-  const f=fixture();const pending=f.hostRemove();await flush();
+  const f=fixture();const pending=f.modalRemove();await flush();
   f.setSelection({...f.selection,selected_mac:'40:cd:3a:00:00:02',interface_index:8});f.setSelection(f.selection);
   f.pending[0].resolve(f.reply());await pending;await flush();
   assert.equal(f.feedback.length,0,'no stale success');assert.equal(f.adoptionMeta.get(SUBNET).desired,'present');
@@ -407,7 +430,7 @@ test('SP10 adapter A/B/A retires the old success even when the final MAC matches
 });
 
 for(const kind of ['IPC','render'])test(`SP10 ${kind} failure always releases controls and shows actionable feedback`,async()=>{
-  const f=fixture();const pending=f.hostRemove();await flush();
+  const f=fixture();const pending=f.modalRemove();await flush();
   if(kind==='IPC')f.pending[0].reject(Error('injected IPC failure'));
   else {f.failRender();f.pending[0].resolve(f.reply());}
   await pending;await flush();assert.equal(f.$('#btn-add-sec-ip').disabled,false);assert.equal(f.$('#ip-mode-static-auto').disabled,false);
@@ -415,7 +438,7 @@ for(const kind of ['IPC','render'])test(`SP10 ${kind} failure always releases co
 });
 
 test('SP10 close/reopen does not abandon a running removal or resurrect an older dialog fetch',async()=>{
-  const f=fixture();await f.$('#btn-ip-config').fire('click');const pending=f.hostRemove();await flush();
+  const f=fixture();await f.$('#btn-ip-config').fire('click');const pending=f.modalRemove();await flush();
   await f.$('#ip-config-close').fire('click');assert.equal(f.$('#ip-config-dialog').open,false);
   await f.$('#btn-ip-config').fire('click');assert.equal(f.$('#ip-config-dialog').open,true);
   // Reopen queued one ordinary refresh, not another write. Make its actual read match Windows.
@@ -439,7 +462,7 @@ test('SP11 overlapping ordinary refresh calls share one flight and at most one t
 test('SP11 older fetch result and failure cannot overwrite a mutation reply or report operation failure',async()=>{
   for(const reject of [false,true]) {
     const f=fixture(),old=deferred();f.api.getAdapterSelection=()=>{f.calls.selection++;return old.promise;};
-    const read=f.exports.refreshInterfaces(),pending=f.hostRemove();await flush();
+    const read=f.exports.refreshInterfaces(),pending=f.modalRemove();await flush();
     f.pending[0].resolve(f.reply());await pending;await flush();
     if(reject)old.reject(Error('old provider failure'));else old.resolve(f.selection);
     await read;await flush();assert(!f.state.activeInterface.ips.some(i=>i.address===IP));
@@ -449,7 +472,7 @@ test('SP11 older fetch result and failure cannot overwrite a mutation reply or r
 });
 
 test('SP11 callback burst during a mutation defers one native refresh and cannot overwrite its reply',async()=>{
-  const f=fixture();const pending=f.hostRemove();await flush();const result=f.reply();
+  const f=fixture();const pending=f.modalRemove();await flush();const result=f.reply();
   f.api.getAdapterSelection=async()=>{f.calls.selection++;return result.view.selection;};
   f.api.getAdoptionState=async()=>{f.calls.bindings++;return {adopted_subnets:{},meta:{[SUBNET]:result.view.binding}};};
   for(let i=0;i<20;i++){f.setSelection(f.selection);f.events.get('interface-status-changed')(f.iface);}
@@ -458,14 +481,14 @@ test('SP11 callback burst during a mutation defers one native refresh and cannot
 });
 
 test('SP10 unknown observation retains last known addresses and pending row without false success',async()=>{
-  const f=fixture();const pending=f.hostRemove();await flush();const result=f.reply({outcome:'pending',reason:'Verification failed'});
+  const f=fixture();const pending=f.modalRemove();await flush();const result=f.reply({outcome:'pending',reason:'Verification failed'});
   result.view.observation_error='Native unavailable';result.view.selection={...f.selection,adapter:null,interface_index:null};result.view.binding.applied=true;result.view.binding.last_error='Verification failed';
   f.pending[0].resolve(result);await pending;await flush();assert(f.state.activeInterface.ips.some(i=>i.address===IP));
   assert.equal(f.adoptionMeta.get(SUBNET).applied,true);assert.equal(f.feedback.at(-1).error,true);
 });
 
 test('SP11 stale post-reply events trigger one current read and cannot repaint old IPs',async()=>{
-  const f=fixture();const pending=f.hostRemove();await flush();f.pending[0].resolve(f.reply());await pending;await flush();
+  const f=fixture();const pending=f.modalRemove();await flush();f.pending[0].resolve(f.reply());await pending;await flush();
   const fresh=deferred();f.api.getAdapterSelection=()=>{f.calls.selection++;return fresh.promise;};
   f.api.getAdoptionState=async()=>({adopted_subnets:{},meta:{[SUBNET]:f.reply().view.binding}});
   for(let i=0;i<12;i++){f.setSelection(f.selection);f.events.get('interface-status-changed')(f.iface);}
@@ -478,7 +501,7 @@ test('SP10 close/reopen retires old dialog-open continuations and pending fetche
   f.api.getAdapterSelection=()=>{f.calls.selection++;return f.calls.selection===1?old.promise:current.promise;};
   const first=f.$('#btn-ip-config').fire('click');await flush();await f.$('#ip-config-close').fire('click');
   const second=f.$('#btn-ip-config').fire('click');await flush();
-  const pending=f.hostRemove();await flush();const result=f.reply();f.pending[0].resolve(result);await pending;await flush();
+  const pending=f.modalRemove();await flush();const result=f.reply();f.pending[0].resolve(result);await pending;await flush();
   f.api.getAdoptionState=async()=>({adopted_subnets:{},meta:{[SUBNET]:result.view.binding}});
   old.resolve(f.selection);await first;await second;await flush();
   assert(!f.state.activeInterface.ips.some(i=>i.address===IP));

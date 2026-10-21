@@ -470,29 +470,8 @@ export function renderModeBadge(): void {
   });
 }
 
-// Wired once — `#subnet-list` is a stable container whose innerHTML is
-// rebuilt on every renderSubnetList call, so a single delegated click
-// listener survives re-renders without stacking duplicates.
-let subnetRemoveWired = false;
-
-/** The backend persists exact removal intent before touching the adapter. */
-async function handleRemoveAdopted(subnet: string, btn: HTMLButtonElement): Promise<void> {
-  if (addressBusy || selectingAdapter) return;
-  const meta = adoptionMeta.get(subnet);
-  if (!meta?.address || !window.confirm(`Remove ${meta.address}/${meta.prefix ?? "?"} from saved adapter ${meta.adapter_mac ?? "unknown"}? Nodes on ${subnet} may share this host address and lose connectivity. History is retained.`)) return;
-  await mutateAddress("Removing address…", () => api.removeAdoptedSubnet(subnet), btn);
-}
-
 export function renderSubnetList(): void {
   const subnetList = $("#subnet-list");
-  if (!subnetRemoveWired) {
-    subnetRemoveWired = true;
-    subnetList.addEventListener("click", (e) => {
-      const btn = (e.target as HTMLElement).closest<HTMLButtonElement>("[data-remove-adopted]");
-      const subnet = btn?.dataset["removeAdopted"];
-      if (btn && subnet) void handleRemoveAdopted(subnet, btn);
-    });
-  }
   renderModeBadge();
   type HostRow = { address: string; prefix: number | null; subnet: string; observed: boolean; meta?: import("./types.ts").AdoptedMetaView };
   const rows = new Map<string, HostRow>();
@@ -516,9 +495,10 @@ export function renderSubnetList(): void {
     const mismatch = observed && normalizeMac(meta?.adapter_mac) !== normalizeMac(state.activeInterface?.mac);
     const managed = ownerKnown && !mismatch && meta?.desired === "present";
     const cidr = `${address}/${prefix ?? "?"}`;
-    const remove = managed ? `<button class="btn-remove-ip" data-remove-adopted="${escapeHtml(subnet)}" title="Remove saved ${escapeHtml(cidr)} from ${escapeHtml(meta!.adapter_mac!)}"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg></button>` : "";
+    const badge = managed && observed && meta?.applied && sessionAdoptedSubnets.has(subnet)
+      ? '<span class="badge-auto">auto</span>' : "";
     return `<div class="status-row subnet-row" data-subnet="${escapeHtml(subnet)}">
-      <span class="status-label">IP:</span><span class="auto-ip-group"><span class="status-value">${escapeHtml(cidr)}</span></span>${remove}</div>`;
+      <span class="status-label">IP:</span><span class="auto-ip-group"><span class="status-value">${escapeHtml(cidr)}</span>${badge}</span></div>`;
   }).join("");
   lockAddressControls();
 }
@@ -592,7 +572,7 @@ function renderAdapterChoices(): void {
   if (field) field.style.display = dialogInterfaces.length > 1 ? "" : "none";
 }
 
-const addressControlSelector = "#static-iface, #btn-add-sec-ip, #static-ip, #static-mask, #static-gateway, #add-sec-ip, #add-sec-mask, #ip-mode-dhcp, #ip-mode-static-auto, #ip-mode-static-manual, #reset-adapter-confirm, [data-remove-adopted], [data-remove-binding], [data-remove-ip]";
+const addressControlSelector = "#static-iface, #btn-add-sec-ip, #static-ip, #static-mask, #static-gateway, #add-sec-ip, #add-sec-mask, #ip-mode-dhcp, #ip-mode-static-auto, #ip-mode-static-manual, #reset-adapter-confirm, [data-remove-binding], [data-remove-ip]";
 function lockAddressControls(): void {
   if (!addressBusy && !dialogSaving) return;
   document.querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLSelectElement>(addressControlSelector).forEach((el) => {
