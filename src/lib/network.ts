@@ -82,11 +82,16 @@ function applySelection(selection: AdapterSelection): void {
   const eth = selection.interface_index !== null ? selection.adapter : null;
   state.activeInterface = eth;
   if (!eth?.is_up) sessionAdoptedSubnets.clear();
+  renderInterfaceName();
+  if (eth && !isDownEvent(eth)) lastAdapterWarningAt = 0;
+  else warnNoEthernet();
+}
+
+function renderInterfaceName(): void {
+  const eth = state.activeInterface;
   $("#iface-name").textContent = eth
     ? (eth.display_name || eth.name) + (isDownEvent(eth) ? " (Disconnected)" : "")
     : unavailableAdapterLabel();
-  if (eth && !isDownEvent(eth)) lastAdapterWarningAt = 0;
-  else warnNoEthernet();
 }
 
 function rememberAdapterSelection(next: AdapterSelection): void {
@@ -158,9 +163,11 @@ export function refreshInterfaces(): Promise<void> {
     } catch (e) {
       if (request !== interfaceRefresh || bindings !== bindingRefresh) return;
       log(`Failed to list interfaces: ${formatError(e)}`);
-      // A metadata error cannot erase a previously verified native view.
-      if (!isInterfaceConnected()) state.activeInterface = null;
-      $("#iface-name").textContent = "Error";
+      // A failed refresh is not evidence of adapter removal. Keep the last
+      // native view, including a disconnected adapter and its observed IPs.
+      if (state.activeInterface) renderInterfaceName();
+      else if (adapterSelection) applySelection(adapterSelection);
+      else $("#iface-name").textContent = "Error";
       renderNetwork();
       warnNoEthernet();
     }
@@ -255,6 +262,7 @@ export function setupInterfaceWatcher(onReconnect: () => void = () => {}): void 
     // A query can cause an unchanged status event. Fetching again for that
     // event feeds the same query back into itself, especially with link down.
     if (JSON.stringify(iface) === JSON.stringify(state.activeInterface)) return;
+    ++interfaceRefresh;
     // A queued callback describes an earlier observation. After a reply, use
     // a fresh shared read rather than repainting its payload over verified IPs.
     if (verifiedAddressView) { refreshNetworkEvent(); return; }
@@ -563,7 +571,13 @@ export function getActivePtuIp(): string | null {
 
 /** Interfaces loaded when dialog opens — used by add/remove handlers. */
 let dialogInterfaces: InterfaceInfo[] = [];
-let dialogSession: object | null = null;
+let dialogSession: { primaryEdited: boolean; modeEdited: boolean; primary: string; mode: NetworkMode } | null = null;
+let dialogSaving = false;
+
+function primaryFields(): string {
+  return ["#static-ip", "#static-mask", "#static-gateway"]
+    .map((id) => $<HTMLInputElement>(id).value.trim()).join("\n");
+}
 
 function renderAdapterChoices(): void {
   const selection = adapterSelection;
@@ -578,14 +592,20 @@ function renderAdapterChoices(): void {
   if (field) field.style.display = dialogInterfaces.length > 1 ? "" : "none";
 }
 
-const addressControlSelector = "#static-iface, #btn-add-sec-ip, #ip-config-apply, #ip-mode-dhcp, #ip-mode-static-auto, #ip-mode-static-manual, #reset-adapter-confirm, [data-remove-adopted], [data-remove-binding], [data-remove-ip]";
+const addressControlSelector = "#static-iface, #btn-add-sec-ip, #static-ip, #static-mask, #static-gateway, #add-sec-ip, #add-sec-mask, #ip-mode-dhcp, #ip-mode-static-auto, #ip-mode-static-manual, #reset-adapter-confirm, [data-remove-adopted], [data-remove-binding], [data-remove-ip]";
 function lockAddressControls(): void {
-  if (!addressBusy) return;
+  if (!addressBusy && !dialogSaving) return;
   document.querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLSelectElement>(addressControlSelector).forEach((el) => {
     if (!disabledControls.has(el)) disabledControls.set(el, el.disabled);
     el.disabled = true;
   });
   $("#host-title").style.pointerEvents = "none";
+}
+
+function unlockAddressControls(pointerEvents: string): void {
+  disabledControls.forEach((disabled, el) => { el.disabled = disabled; });
+  disabledControls.clear();
+  $("#host-title").style.pointerEvents = pointerEvents;
 }
 
 /** Apply only this operation's row and its observed adapter, without IPC. */
@@ -606,17 +626,18 @@ function applyAddressReply(reply: AddressReply): void {
   if (!view.observation_error) { applySelection(view.selection); verifiedAddressView = true; }
   else log(`Address observation unavailable: ${view.observation_error}`);
   renderNetwork();
-  if ($<HTMLDialogElement>("#ip-config-dialog").open && view.dhcp !== null) {
+  if ($<HTMLDialogElement>("#ip-config-dialog").open && !dialogSession?.modeEdited && view.dhcp !== null) {
     const mode = view.dhcp ? "dhcp" : view.mode === "dhcp" ? "static_auto" : view.mode;
     $<HTMLInputElement>("#ip-mode-dhcp").checked = mode === "dhcp";
     $<HTMLInputElement>("#ip-mode-static-auto").checked = mode === "static_auto";
     $<HTMLInputElement>("#ip-mode-static-manual").checked = mode === "static_manual";
+    if (dialogSession) dialogSession.mode = mode;
     updateModeVisibility();
   }
 }
 
-async function mutateAddress(progress: string, invoke: () => Promise<AddressReply>, button?: HTMLButtonElement): Promise<void> {
-  if (addressBusy || selectingAdapter) return;
+async function mutateAddress(progress: string, invoke: () => Promise<AddressReply>, button?: HTMLButtonElement): Promise<boolean> {
+  if (addressBusy || selectingAdapter || dialogSaving) return false;
   const operation = { retired: false };
   addressBusy = operation;
   ++interfaceRefresh; ++bindingRefresh;
@@ -634,17 +655,17 @@ async function mutateAddress(progress: string, invoke: () => Promise<AddressRepl
     log(`Address request acknowledged in ${(performance.now() - started).toFixed(1)}ms`);
     const reply = await invoke();
     log(`Address operation ${reply.operation} IPC returned in ${(performance.now() - started).toFixed(1)}ms`);
-    if (operation.retired) { log("Address reply retired after adapter change"); return; }
+    if (operation.retired) { log("Address reply retired after adapter change"); return false; }
     applyAddressReply(reply);
     log(`Address operation ${reply.operation} rendered in ${(performance.now() - started).toFixed(1)}ms`);
     showToast(reply.reason ?? (reply.outcome === "success" ? "Address updated" : "Address operation pending"), reply.outcome !== "success");
+    return reply.outcome === "success" && !reply.view.observation_error;
   } catch (e) {
     showToast("Failed: " + formatError(e), true);
+    return false;
   } finally {
     addressBusy = null;
-    disabledControls.forEach((disabled, el) => { el.disabled = disabled; });
-    disabledControls.clear();
-    $("#host-title").style.pointerEvents = hostPointer;
+    unlockAddressControls(hostPointer);
     spinner.style.display = "none";
     spinner.textContent = "";
     spinner.className = spinnerClass;
@@ -658,13 +679,18 @@ export function setupIpConfigDialog(
   onModeApplied: (previous: NetworkMode | null, next: NetworkMode) => void = () => {},
 ): void {
   const dialog = $<HTMLDialogElement>("#ip-config-dialog");
+  const closeButton = $<HTMLButtonElement>("#ip-config-close");
+  let closing = false;
 
   dialog.addEventListener("close", () => { dialogSession = null; ++interfaceRefresh; ++bindingRefresh; });
 
   // ── Open dialog ──────────────────────────────────────────────────
   $<HTMLButtonElement>("#btn-ip-config").addEventListener("click", async () => {
-    const session = {};
+    if (closing || dialog.open) return;
+    const session = { primaryEdited: false, modeEdited: false, primary: primaryFields(),
+      mode: hostMode ?? state.config?.network_mode ?? "static_auto" };
     dialogSession = session;
+    $<HTMLInputElement>("#add-sec-ip").value = "";
     const select = $<HTMLSelectElement>("#static-iface");
     select.innerHTML = '<option value="">Loading…</option>';
 
@@ -691,7 +717,7 @@ export function setupIpConfigDialog(
   $<HTMLSelectElement>("#static-iface").addEventListener("change", async () => {
     const select = $<HTMLSelectElement>("#static-iface");
     const iface = dialogInterfaces.find((i) => i.name === select.value);
-    if (!iface || selectingAdapter || addressBusy) return;
+    if (!iface || selectingAdapter || addressBusy || dialogSaving) return;
     selectingAdapter = true;
     select.disabled = true;
     try {
@@ -707,38 +733,62 @@ export function setupIpConfigDialog(
     }
   });
 
-  // Mode toggle: hide/show the static-only fields. Applying happens via
-  // the existing Apply button — see branch below.
-  $<HTMLInputElement>("#ip-mode-dhcp").addEventListener("change", updateModeVisibility);
-  $<HTMLInputElement>("#ip-mode-static-auto").addEventListener("change", updateModeVisibility);
-  $<HTMLInputElement>("#ip-mode-static-manual").addEventListener("change", updateModeVisibility);
+  // Native refreshes may update the rows while open, but must not erase edits.
+  for (const id of ["#static-ip", "#static-mask", "#static-gateway"]) {
+    $<HTMLInputElement>(id).addEventListener("input", () => {
+      if (dialogSession) dialogSession.primaryEdited = primaryFields() !== dialogSession.primary;
+    });
+  }
+  for (const id of ["#ip-mode-dhcp", "#ip-mode-static-auto", "#ip-mode-static-manual"]) {
+    $<HTMLInputElement>(id).addEventListener("change", () => {
+      if (dialogSession) dialogSession.modeEdited = readSelectedMode() !== dialogSession.mode;
+      updateModeVisibility();
+    });
+  }
 
   // ── Add secondary IP ─────────────────────────────────────────────
-  $<HTMLButtonElement>("#btn-add-sec-ip").addEventListener("click", async () => {
-    if (selectingAdapter || addressBusy) return;
+  async function addDialogAddress(): Promise<boolean> {
+    if (selectingAdapter || addressBusy || dialogSaving) return false;
     const iface = $<HTMLSelectElement>("#static-iface").value;
     const ip = $<HTMLInputElement>("#add-sec-ip").value.trim();
     const mask = $<HTMLInputElement>("#add-sec-mask").value.trim();
+    const session = dialogSession;
     if (!iface || !ip || !mask) {
       showToast("Enter an IP and mask", true);
-      return;
+      return false;
     }
-    await mutateAddress("Adding address…", () => api.addSecondaryIp(iface, ip, mask));
-  });
+    const saved = await mutateAddress("Adding address…", () => api.addSecondaryIp(iface, ip, mask));
+    if (saved && dialogSession === session && $<HTMLInputElement>("#add-sec-ip").value.trim() === ip
+        && $<HTMLInputElement>("#add-sec-mask").value.trim() === mask) {
+      $<HTMLInputElement>("#add-sec-ip").value = "";
+    }
+    return saved;
+  }
+  $<HTMLButtonElement>("#btn-add-sec-ip").addEventListener("click", () => addDialogAddress());
 
-  // ── Cancel ───────────────────────────────────────────────────────
-  $<HTMLButtonElement>("#ip-config-cancel").addEventListener("click", () => { dialogSession = null; ++interfaceRefresh; ++bindingRefresh; dialog.close(); });
-
-  // ── Apply ────────────────────────────────────────────────────────
-  $<HTMLButtonElement>("#ip-config-apply").addEventListener("click", async () => {
-    if (selectingAdapter || addressBusy) return;
+  // Close and Escape share one save path. Only user edits trigger writes;
+  // merely opening a disconnected/ambiguous adapter needs no primary IP.
+  async function saveAndClose(): Promise<void> {
+    if (closing || selectingAdapter || !dialog.open) return;
+    const session = dialogSession;
+    const modeEdited = session?.primaryEdited || session?.modeEdited;
+    const secondaryEntered = !!$<HTMLInputElement>("#add-sec-ip").value.trim();
+    if (!modeEdited && !secondaryEntered) { dialog.close(); return; }
+    if (addressBusy) { showToast("Wait for the address operation to finish", true); return; }
     const name = $<HTMLSelectElement>("#static-iface").value;
+    const selectedMac = adapterSelection?.selected_mac;
     const mode = readSelectedMode();
     if (!name) { showToast("Select an interface", true); return; }
     const ip = mode === "dhcp" ? null : $<HTMLInputElement>("#static-ip").value.trim();
     const subnet_mask = mode === "dhcp" ? null : $<HTMLInputElement>("#static-mask").value.trim();
-    if (mode !== "dhcp" && (!ip || !subnet_mask)) {
+    if (modeEdited && mode !== "dhcp" && (!ip || !subnet_mask)) {
       showToast("Fill in address and mask", true); return;
+    }
+    if (secondaryEntered && !$<HTMLInputElement>("#add-sec-mask").value.trim()) {
+      showToast("Enter an IP and mask", true); return;
+    }
+    if (secondaryEntered && mode === "dhcp") {
+      showToast("Select a static mode to add a secondary IP", true); return;
     }
     const previousMode = state.config?.network_mode ?? null;
     const request = {
@@ -747,26 +797,45 @@ export function setupIpConfigDialog(
       confirmed: false,
     };
     const spinner = $<HTMLElement>("#ip-config-spinner");
-    spinner.style.display = "";
+    const hostPointer = $("#host-title").style.pointerEvents;
+    closing = true;
+    closeButton.disabled = true;
     try {
-      let reply = await api.setNetworkMode(request);
-      if (reply.warning) {
-        if (!window.confirm(reply.warning)) return;
-        reply = await api.setNetworkMode({ ...request, confirmed: true });
+      if (modeEdited) {
+        dialogSaving = true;
+        lockAddressControls();
+        spinner.style.display = "";
+        let reply = await api.setNetworkMode(request);
+        if (reply.warning) {
+          if (!window.confirm(reply.warning)) return;
+          reply = await api.setNetworkMode({ ...request, confirmed: true });
+        }
+        if (reply.warning) { showToast(reply.warning, true); return; }
+        if (state.config) state.config.network_mode = reply.mode;
+        if (session) { session.primaryEdited = false; session.modeEdited = false; session.mode = reply.mode; }
+        onModeApplied(previousMode, reply.mode);
+        await refreshInterfaces();
+        dialogSaving = false;
+        unlockAddressControls(hostPointer);
       }
-      if (state.config) state.config.network_mode = reply.mode;
-      showToast(reply.mode === "dhcp" ? "Switched to DHCP; saved bindings are pending" : "Static configuration applied");
+      if (dialogSession !== session || !dialog.open) return;
+      if (adapterSelection?.selected_mac !== selectedMac) {
+        showToast("Ethernet adapter changed; review the configuration before closing", true); return;
+      }
+      if (secondaryEntered && !await addDialogAddress()) return;
       dialog.close();
-      onModeApplied(previousMode, reply.mode);
-      await refreshInterfaces();
     } catch (e) {
       showToast("Failed: " + formatError(e), true);
-      await reloadDialogInterfaces();
-      await syncModeFromInterface();
     } finally {
+      dialogSaving = false;
+      closing = false;
+      closeButton.disabled = false;
+      unlockAddressControls(hostPointer);
       spinner.style.display = "none";
     }
-  });
+  }
+  closeButton.addEventListener("click", saveAndClose);
+  dialog.addEventListener("cancel", (event) => { event.preventDefault(); void saveAndClose(); });
 }
 
 /** Read the dialog's currently-selected mode radio. */
@@ -794,11 +863,12 @@ async function syncModeFromInterface(): Promise<void> {
     const request = interfaceRefresh;
     const savedMode = hostMode ?? state.config?.network_mode ?? "static_auto";
     const dhcp = await api.getDhcpState(name);
-    if (request !== interfaceRefresh || addressBusy || !$<HTMLDialogElement>("#ip-config-dialog").open) return;
+    if (request !== interfaceRefresh || addressBusy || dialogSession?.modeEdited || !$<HTMLDialogElement>("#ip-config-dialog").open) return;
     const mode = dhcp ? "dhcp" : savedMode === "dhcp" ? "static_auto" : savedMode;
     $<HTMLInputElement>("#ip-mode-dhcp").checked = mode === "dhcp";
     $<HTMLInputElement>("#ip-mode-static-auto").checked = mode === "static_auto";
     $<HTMLInputElement>("#ip-mode-static-manual").checked = mode === "static_manual";
+    if (dialogSession) dialogSession.mode = mode;
   } catch (_) {
     // Leave the radio at its current position on error.
   }
@@ -816,13 +886,16 @@ function populateDialogFields(): void {
   const savedIps = new Set([...adoptionMeta.values()].map((m) => m.address));
   const native = iface.ips.filter((ip) => !savedIps.has(ip.address) && !isApipa(ip.address));
   const primary = native.length === 1 ? native[0] : undefined;
-  $<HTMLInputElement>("#static-ip").value = primary ? primary.address : "";
-  $<HTMLInputElement>("#static-mask").value = primary ? prefixToMask(primary.prefix) : "255.255.255.0";
   // Left blank intentionally. The snapshot carries no gateway to seed it
-  // with, but a blank gateway on Apply no longer wipes the configured
+  // with, but a blank gateway on save no longer wipes the configured
   // one — the backend preserves the existing default gateway when this
   // field is empty. Type a value here only to change it.
-  $<HTMLInputElement>("#static-gateway").value = "";
+  if (!dialogSession?.primaryEdited) {
+    $<HTMLInputElement>("#static-ip").value = primary ? primary.address : "";
+    $<HTMLInputElement>("#static-mask").value = primary ? prefixToMask(primary.prefix) : "255.255.255.0";
+    $<HTMLInputElement>("#static-gateway").value = "";
+    if (dialogSession) dialogSession.primary = primaryFields();
+  }
 
   // Secondary = all IPs except the primary
   renderSecondaryIps(iface, primary);
@@ -846,7 +919,7 @@ function renderSecondaryIps(iface: InterfaceInfo | undefined, primary: { address
   }).join("") : '<p class="placeholder-text" style="padding:8px">No secondary IPs</p>';
   list.querySelectorAll<HTMLButtonElement>("[data-remove-binding], [data-remove-ip]").forEach((btn) => {
     btn.addEventListener("click", async () => {
-      if (selectingAdapter || addressBusy) return;
+      if (selectingAdapter || addressBusy || dialogSaving) return;
       const subnet = btn.dataset["removeBinding"];
       const ip = btn.dataset["removeIp"];
       if (!subnet && ip && iface) {
