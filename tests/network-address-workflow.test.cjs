@@ -10,8 +10,8 @@ const flush = async () => { for(let i=0;i<40;i++) await Promise.resolve(); };
 const deferred = () => { let resolve,reject; const promise=new Promise((a,b)=>{resolve=a;reject=b;});return {promise,resolve,reject}; };
 const IP='192.0.2.20', SUBNET='192.0.2.0/24', MAC='40:cd:3a:00:00:01';
 function fixture() {
-  const events=new Map(), elements=new Map(), calls={selection:0,bindings:0,mode:0,dhcp:0,writes:0}, feedback=[], removals=[];
-  let now=0, throwRender=false;
+  const events=new Map(), elements=new Map(), calls={selection:0,bindings:0,mode:0,dhcp:0,writes:0}, feedback=[], removals=[], transitions=[], additions=[];
+  let now=0, throwRender=false;const timers=[];
   const iface={name:'Ethernet', display_name:'Ethernet', mac:MAC, is_up:true, is_ethernet:true, is_vpn:false,is_virtual:false,
     ips:[{address:'192.0.2.10',prefix:24,subnet:SUBNET},{address:IP,prefix:24,subnet:SUBNET}]};
   const selection={selected_mac:MAC,interface_index:7,adapter:iface,candidates:[iface],selection_required:false};
@@ -41,15 +41,17 @@ function fixture() {
   const $=id=>{if(!elements.has(id))elements.set(id,element(id));return elements.get(id);};
   $('#static-iface').value='Ethernet';$('#add-sec-ip').value=IP;$('#add-sec-mask').value='255.255.255.0';
   const pending=[];
+  const ui={confirm:()=>true};
   const api={
     onEvent:async(name,fn)=>events.set(name,fn),
     getAdapterSelection:async()=>{calls.selection++;return selection;},
     getAdoptionState:async()=>{calls.bindings++;return {adopted_subnets:{[SUBNET]:IP},meta:{[SUBNET]:meta}};},
     getNetworkMode:async()=>{calls.mode++;return 'static_auto';},getDhcpState:async()=>{calls.dhcp++;return false;},
-    addSecondaryIp:()=>{calls.writes++;const d=deferred();pending.push(d);return d.promise;},
+    addSecondaryIp:(name,ip,mask)=>{calls.writes++;additions.push({name,ip,mask});const d=deferred();pending.push(d);return d.promise;},
     removeAdoptedSubnet:()=>{calls.writes++;const d=deferred();pending.push(d);return d.promise;},
     removeSecondaryIp:(name,ip)=>{calls.writes++;removals.push({name,ip});const d=deferred();pending.push(d);return d.promise;},
     selectAdapter:async()=>selection,
+    setNetworkMode:async request=>{transitions.push(request);return {mode:request.mode,warning:null};},
   };
   const deps={
     './tauri-api.ts':api,
@@ -61,17 +63,229 @@ function fixture() {
   };
   const exports={};
   vm.runInNewContext(compiled,{exports,require:name=>{assert(name in deps,name);return deps[name];},document:{
-    querySelectorAll(){return [...elements.values()].filter(e=>['#static-iface','#btn-add-sec-ip','#ip-config-apply','#ip-mode-dhcp','#ip-mode-static-auto','#ip-mode-static-manual','#reset-adapter-confirm'].includes(e.id)).concat($('#subnet-list').buttons,$('#secondary-ip-list').buttons);}
-  },window:{confirm:()=>true},performance:{now:()=>++now},setTimeout:()=>1,clearTimeout(){}});
+    querySelectorAll(){return [...elements.values()].filter(e=>['#static-iface','#btn-add-sec-ip','#static-ip','#static-mask','#static-gateway','#add-sec-ip','#add-sec-mask','#ip-mode-dhcp','#ip-mode-static-auto','#ip-mode-static-manual','#reset-adapter-confirm'].includes(e.id)).concat($('#subnet-list').buttons,$('#secondary-ip-list').buttons);}
+  },window:ui,performance:{now:()=>++now},
+    setTimeout(fn,ms){timers.push({fn,ms});return timers.length;},clearTimeout(id){timers[id-1]=null;}});
   exports.setupIpConfigDialog();exports.setupInterfaceWatcher();events.get('adapter-selection-changed')(selection);
   exports.renderSubnetList();
   const reply=(extra={})=>({operation:1,outcome:'success',reason:null,view:{selection:{...selection,adapter:{...iface,ips:iface.ips.filter(i=>i.address!==IP)},candidates:[{...iface,ips:iface.ips.filter(i=>i.address!==IP)}]},identity:{guid:'guid-a',index:7,mac:MAC,alias:'Ethernet'},dhcp:false,observation_error:null,subnet:SUBNET,binding:{...meta,desired:'removed',applied:false},address:IP,prefix:24,mode:'static_auto'},...extra});
-  return {exports,api,events,$,calls,pending,feedback,removals,state,selection,iface,adoptionMeta,adoptedSubnets,reply,
+  return {exports,api,events,$,calls,pending,feedback,removals,transitions,additions,ui,state,selection,iface,adoptionMeta,adoptedSubnets,reply,
     failRender(){throwRender=true;},
+    runTimers(ms){timers.forEach((timer,index)=>{if(timer?.ms===ms){timers[index]=null;timer.fn();}});},
     async hostRemove(){const btn=$('#subnet-list').buttons[0];assert(btn);return $('#subnet-list').fire('click',{target:btn});},
     setSelection(next){events.get('adapter-selection-changed')(next);},
   };
 }
+
+test('IP Configuration has one Close action and no Cancel or Apply action',()=>{
+  const html=fs.readFileSync(path.join(__dirname,'../index.html'),'utf8');
+  const dialog=html.match(/<dialog id="ip-config-dialog"[\s\S]*?<\/dialog>/)[0];
+  assert.match(dialog,/id="ip-config-close">Close<\/button>/);
+  assert(!/ip-config-(cancel|apply)/.test(dialog));
+});
+
+test('Closing an unchanged ambiguous or disconnected adapter does not write network settings',async()=>{
+  for(const missing of [false,true]){
+    const f=fixture();f.adoptionMeta.clear();f.adoptedSubnets.clear();
+    f.api.getAdoptionState=async()=>({adopted_subnets:{},meta:{}});
+    f.api.getAdapterSelection=async()=>missing?{...f.selection,interface_index:null,adapter:null,candidates:[]}:
+      {...f.selection,adapter:{...f.iface,is_up:false}};
+    await f.$('#btn-ip-config').fire('click');
+    assert.equal(f.$('#static-ip').value,'');
+    await f.$('#ip-config-close').fire('click');
+    assert.equal(f.$('#ip-config-dialog').open,false);
+    assert.equal(f.transitions.length,0);assert.equal(f.calls.writes,0);assert.equal(f.feedback.length,0);
+  }
+});
+
+for(const field of ['mode','primary'])test(`Reverting ${field} edits permits closing an ambiguous adapter without a write`,async()=>{
+  const f=fixture();f.adoptionMeta.clear();f.adoptedSubnets.clear();
+  f.api.getAdoptionState=async()=>({adopted_subnets:{},meta:{}});
+  await f.$('#btn-ip-config').fire('click');assert.equal(f.$('#static-ip').value,'');
+  if(field==='mode'){
+    f.$('#ip-mode-static-auto').checked=false;f.$('#ip-mode-dhcp').checked=true;await f.$('#ip-mode-dhcp').fire('change');
+    f.$('#ip-mode-dhcp').checked=false;f.$('#ip-mode-static-auto').checked=true;await f.$('#ip-mode-static-auto').fire('change');
+  }else{
+    f.$('#static-ip').value='198.51.100.10';await f.$('#static-ip').fire('input');
+    f.$('#static-ip').value='';await f.$('#static-ip').fire('input');
+  }
+  await f.$('#ip-config-close').fire('click');
+  assert.equal(f.$('#ip-config-dialog').open,false);assert.equal(f.transitions.length,0);assert.equal(f.feedback.length,0);
+});
+
+test('Close saves primary fields and mode once, then an unsubmitted secondary, before closing',async()=>{
+  const f=fixture(),mode=deferred();await f.$('#btn-ip-config').fire('click');
+  f.$('#static-ip').value='198.51.100.10';await f.$('#static-ip').fire('input');
+  f.$('#static-mask').value='255.255.255.0';f.$('#static-gateway').value='198.51.100.1';
+  f.$('#ip-mode-static-auto').checked=false;f.$('#ip-mode-static-manual').checked=true;
+  await f.$('#ip-mode-static-manual').fire('change');f.$('#add-sec-ip').value='203.0.113.10';
+  f.api.setNetworkMode=request=>{f.transitions.push(request);return mode.promise;};
+  const close=f.$('#ip-config-close').fire('click');
+  await f.$('#ip-config-close').fire('click');
+  let prevented=false;await f.$('#ip-config-dialog').fire('cancel',{preventDefault(){prevented=true;}});
+  assert(prevented);assert.equal(f.transitions.length,1);assert.equal(f.calls.writes,0);
+  assert.equal(f.$('#ip-config-dialog').open,true);assert.equal(f.$('#static-ip').disabled,true);
+  assert.equal(f.$('#ip-config-close').disabled,true);
+  assert.deepEqual(JSON.parse(JSON.stringify(f.transitions[0])),{name:'Ethernet',mode:'static_manual',ip:'198.51.100.10',subnet_mask:'255.255.255.0',gateway:'198.51.100.1',confirmed:false});
+  mode.resolve({mode:'static_manual',warning:null});await flush();
+  assert.equal(f.calls.writes,1);assert.equal(f.$('#ip-config-dialog').open,true);
+  assert.deepEqual(f.additions,[{name:'Ethernet',ip:'203.0.113.10',mask:'255.255.255.0'}]);
+  const reply=f.reply();reply.view.subnet=null;reply.view.binding=null;reply.view.selection=f.selection;
+  const before={...f.calls};f.pending[0].resolve(reply);await close;
+  assert.equal(f.$('#ip-config-dialog').open,false);assert.equal(f.$('#add-sec-ip').value,'');
+  assert.equal(f.$('#static-ip').disabled,false);assert.equal(f.$('#ip-config-close').disabled,false);
+  assert.equal(f.calls.selection,before.selection,'secondary reply adds no follow-up fetch');
+});
+
+test('Escape saves edits and an invalid or failed save leaves the dialog open with the draft intact',async()=>{
+  const f=fixture();await f.$('#btn-ip-config').fire('click');
+  f.$('#static-ip').value='';await f.$('#static-ip').fire('input');
+  let prevented=0;
+  await f.$('#ip-config-dialog').fire('cancel',{preventDefault(){prevented++;}});await flush();
+  assert.equal(prevented,1);assert.equal(f.transitions.length,0);assert.equal(f.$('#ip-config-dialog').open,true);
+  assert.match(f.feedback.at(-1).msg,/address and mask/);
+  f.$('#static-ip').value='198.51.100.10';f.api.setNetworkMode=async()=>{throw Error('native state unknown');};
+  await f.$('#ip-config-dialog').fire('cancel',{preventDefault(){prevented++;}});await flush();
+  assert.equal(prevented,2);assert.equal(f.$('#ip-config-dialog').open,true);
+  assert.equal(f.$('#static-ip').value,'198.51.100.10');assert.equal(f.$('#ip-config-close').disabled,false);
+  assert.equal(f.$('#static-ip').disabled,false);assert.match(f.feedback.at(-1).msg,/native state unknown/);
+  f.api.setNetworkMode=async request=>{f.transitions.push(request);return {mode:request.mode,warning:null};};
+  await f.$('#ip-config-dialog').fire('cancel',{preventDefault(){prevented++;}});await flush();
+  assert.equal(f.transitions.length,1);assert.equal(f.$('#ip-config-dialog').open,false);
+});
+
+test('Closing with only a secondary address reuses its mutation reply without changing primary or fetching',async()=>{
+  const f=fixture();await f.$('#btn-ip-config').fire('click');const before={...f.calls};
+  f.$('#add-sec-ip').value='203.0.113.10';
+  const close=f.$('#ip-config-close').fire('click');assert.equal(f.calls.writes,1);
+  assert.equal(f.transitions.length,0);
+  const reply=f.reply();reply.view.subnet=null;reply.view.binding=null;reply.view.selection=f.selection;
+  f.pending[0].resolve(reply);await close;await flush();
+  assert.equal(f.$('#ip-config-dialog').open,false);
+  for(const name of ['selection','bindings','mode','dhcp'])assert.equal(f.calls[name],before[name],name);
+});
+
+test('A failed or pending secondary save retains the entry and keeps Close available for retry',async()=>{
+  for(const kind of ['error','pending']){
+    const f=fixture();await f.$('#btn-ip-config').fire('click');f.$('#add-sec-ip').value='203.0.113.10';
+    const close=f.$('#ip-config-close').fire('click');
+    if(kind==='error')f.pending[0].reject(Error('write failed'));
+    else {const reply=f.reply({outcome:'pending',reason:'adapter unavailable'});reply.view.observation_error='unknown';f.pending[0].resolve(reply);}
+    await close;assert.equal(f.$('#ip-config-dialog').open,true);assert.equal(f.$('#add-sec-ip').value,'203.0.113.10');
+    assert.equal(f.$('#ip-config-close').disabled,false);assert(f.feedback.at(-1).error);
+  }
+});
+
+test('Adding with plus clears a verified entry so Close cannot add it twice',async()=>{
+  const f=fixture();await f.$('#btn-ip-config').fire('click');f.$('#add-sec-ip').value='203.0.113.10';
+  const add=f.$('#btn-add-sec-ip').fire('click');
+  const reply=f.reply();reply.view.subnet=null;reply.view.binding=null;reply.view.selection=f.selection;
+  f.pending[0].resolve(reply);await add;await f.$('#ip-config-close').fire('click');
+  assert.equal(f.calls.writes,1);assert.equal(f.transitions.length,0);assert.equal(f.$('#ip-config-dialog').open,false);
+});
+
+test('Draft primary, gateway and mode survive native refreshes and a secondary mutation reply',async()=>{
+  const f=fixture();await f.$('#btn-ip-config').fire('click');
+  f.$('#static-ip').value='198.51.100.10';f.$('#static-gateway').value='198.51.100.1';await f.$('#static-gateway').fire('input');
+  f.$('#ip-mode-static-auto').checked=false;f.$('#ip-mode-static-manual').checked=true;await f.$('#ip-mode-static-manual').fire('change');
+  await f.exports.refreshInterfaces();
+  f.$('#add-sec-ip').value='203.0.113.10';const add=f.$('#btn-add-sec-ip').fire('click');
+  const reply=f.reply();reply.view.subnet=null;reply.view.binding=null;reply.view.selection=f.selection;
+  f.pending[0].resolve(reply);await add;
+  assert.equal(f.$('#static-ip').value,'198.51.100.10');assert.equal(f.$('#static-gateway').value,'198.51.100.1');
+  assert.equal(f.$('#ip-mode-static-manual').checked,true);assert.equal(f.$('#ip-mode-static-auto').checked,false);
+});
+
+test('A delayed DHCP read cannot overwrite a mode selected while Configure is opening',async()=>{
+  const f=fixture(),dhcp=deferred();f.api.getDhcpState=()=>dhcp.promise;
+  const opening=f.$('#btn-ip-config').fire('click');await flush();
+  f.$('#ip-mode-static-auto').checked=false;f.$('#ip-mode-static-manual').checked=true;await f.$('#ip-mode-static-manual').fire('change');
+  dhcp.resolve(true);await opening;
+  assert.equal(f.$('#ip-mode-static-manual').checked,true);assert.equal(f.$('#ip-mode-dhcp').checked,false);
+});
+
+test('Close preserves the existing DHCP warning and saves only after confirmation',async()=>{
+  const f=fixture();await f.$('#btn-ip-config').fire('click');
+  f.$('#ip-mode-static-auto').checked=false;f.$('#ip-mode-dhcp').checked=true;await f.$('#ip-mode-dhcp').fire('change');
+  f.api.setNetworkMode=async request=>{f.transitions.push(request);return {mode:request.confirmed?'dhcp':'static_auto',warning:request.confirmed?null:'DHCP may interrupt cameras'};};
+  f.ui.confirm=()=>false;await f.$('#ip-config-close').fire('click');
+  assert.equal(f.transitions.length,1);assert.equal(f.$('#ip-config-dialog').open,true);assert.equal(f.state.config.network_mode,'static_auto');
+  f.ui.confirm=()=>true;await f.$('#ip-config-close').fire('click');
+  assert.deepEqual(f.transitions.map(r=>r.confirmed),[false,false,true]);
+  assert.equal(f.transitions[2].ip,null);assert.equal(f.transitions[2].gateway,null);
+  assert.equal(f.state.config.network_mode,'dhcp');assert.equal(f.$('#ip-config-dialog').open,false);
+});
+
+test('An adapter change during mode save cannot submit the secondary entry to the new adapter',async()=>{
+  const f=fixture(),mode=deferred();await f.$('#btn-ip-config').fire('click');
+  f.$('#static-ip').value='198.51.100.10';await f.$('#static-ip').fire('input');f.$('#add-sec-ip').value='203.0.113.10';
+  f.api.setNetworkMode=()=>mode.promise;const close=f.$('#ip-config-close').fire('click');
+  const changed={...f.selection,selected_mac:'40:cd:3a:00:00:02',interface_index:8};
+  f.setSelection(changed);f.api.getAdapterSelection=async()=>changed;
+  mode.resolve({mode:'static_auto',warning:null});await close;
+  assert.equal(f.calls.writes,0);assert.equal(f.$('#ip-config-dialog').open,true);
+  assert.equal(f.$('#add-sec-ip').value,'203.0.113.10');assert.match(f.feedback.at(-1).msg,/adapter changed/);
+});
+
+test('A completed add from a closed dialog cannot clear an entry in a new dialog session',async()=>{
+  const f=fixture();await f.$('#btn-ip-config').fire('click');f.$('#add-sec-ip').value='203.0.113.10';
+  const add=f.$('#btn-add-sec-ip').fire('click');f.$('#ip-config-dialog').close();
+  await f.$('#btn-ip-config').fire('click');f.$('#add-sec-ip').value='203.0.113.10';
+  const reply=f.reply();reply.view.subnet=null;reply.view.binding=null;reply.view.selection=f.selection;
+  f.pending[0].resolve(reply);await add;await flush();
+  assert.equal(f.$('#add-sec-ip').value,'203.0.113.10');assert.equal(f.$('#ip-config-dialog').open,true);
+});
+
+test('A disconnected adapter and both Host IP rows survive repeated refresh failures',async()=>{
+  const f=fixture();const down={...f.selection,adapter:{...f.iface,is_up:false}};down.candidates=[down.adapter];
+  f.api.getAdapterSelection=async()=>down;
+  await f.exports.refreshInterfaces();
+  f.api.getAdapterSelection=async()=>{throw Error('ARP capture cannot start while Ethernet is down');};
+  for(let i=0;i<3;i++){
+    await f.exports.refreshInterfaces();
+    assert.equal(f.$('#iface-name').textContent,'Ethernet (Disconnected)');
+    assert.equal(f.state.activeInterface.is_up,false);
+    for(const ip of f.iface.ips)assert(f.$('#subnet-list').innerHTML.includes(ip.address));
+  }
+  assert.equal(f.state.config.network_mode,'static_auto');
+});
+
+test('Startup can paint a known disconnected selection when its first view query fails',async()=>{
+  const f=fixture();f.state.activeInterface=null;
+  const down={...f.selection,adapter:{...f.iface,is_up:false}};down.candidates=[down.adapter];
+  f.setSelection(down);
+  f.api.getAdapterSelection=async()=>{throw Error('late startup query failure');};
+  await f.exports.refreshInterfaces();
+  assert.equal(f.$('#iface-name').textContent,'Ethernet (Disconnected)');
+  assert.equal(f.state.activeInterface.is_up,false);
+  for(const ip of f.iface.ips)assert(f.$('#subnet-list').innerHTML.includes(ip.address));
+});
+
+test('A native down event fences an older up reply even without a selection event',async()=>{
+  const f=fixture(),old=deferred();
+  f.api.getAdapterSelection=()=>{f.calls.selection++;return f.calls.selection===1?old.promise:Promise.reject(Error('new view unavailable'));};
+  const read=f.exports.refreshInterfaces();
+  f.events.get('interface-status-changed')({...f.iface,is_up:false});await flush();
+  f.runTimers(2000);
+  old.resolve(f.selection);await read;await flush();
+  assert.equal(f.$('#iface-name').textContent,'Ethernet (Disconnected)');
+  assert.equal(f.state.activeInterface.is_up,false);
+  assert.equal(f.calls.selection,2);
+  for(const ip of f.iface.ips)assert(f.$('#subnet-list').innerHTML.includes(ip.address));
+});
+
+test('A confirmed missing selected adapter is never resurrected by a later failed refresh',async()=>{
+  const f=fixture();await f.exports.refreshInterfaces();
+  const absent={...f.selection,adapter:null,interface_index:null,candidates:[]};
+  f.setSelection(absent);f.api.getAdapterSelection=async()=>absent;
+  await f.exports.refreshInterfaces();
+  f.api.getAdapterSelection=async()=>{throw Error('native enumeration unavailable');};
+  await f.exports.refreshInterfaces();
+  assert.equal(f.state.activeInterface,null);
+  assert.match(f.$('#iface-name').textContent,/unavailable/);
+  assert(!f.$('#subnet-list').innerHTML.includes(f.iface.ips[0].address));
+  assert(f.$('#subnet-list').innerHTML.includes(IP),'saved Host intent remains visible');
+});
 
 test('Configure stays usable during a fresh read and Add reaches the mutation handler',async()=>{
   const f=fixture(),read=deferred();
@@ -79,6 +293,7 @@ test('Configure stays usable during a fresh read and Add reaches the mutation ha
   const opening=f.$('#btn-ip-config').fire('click');await flush();
   assert.equal(f.$('#ip-config-dialog').open,true);
   assert.equal(f.$('#static-iface').value,'Ethernet');
+  f.$('#add-sec-ip').value=IP;
   const add=f.$('#btn-add-sec-ip').fire('click');assert.equal(f.calls.writes,1);
   const reply=f.reply();reply.view.selection=f.selection;reply.view.subnet=null;reply.view.binding=null;
   f.pending[0].resolve(reply);await add;read.resolve(f.selection);await opening;await flush();
@@ -164,7 +379,7 @@ test('SP10 double Add click acknowledges synchronously, disables both panels and
   const f=fixture();
   const first=f.$('#btn-add-sec-ip').fire('click');const second=f.$('#btn-add-sec-ip').fire('click');
   assert.equal(f.calls.writes,1);assert.equal(f.$('#ip-config-spinner').style.display,'');
-  assert.equal(f.$('#static-iface').disabled,true);assert.equal(f.$('#ip-config-apply').disabled,true);
+  assert.equal(f.$('#static-iface').disabled,true);assert.equal(f.$('#ip-mode-static-auto').disabled,true);
   assert.equal(f.$('#subnet-list').buttons[0].disabled,true);assert.equal(f.$('#host-title').style.pointerEvents,'none');
   const added=f.reply();added.view.selection=f.selection;added.view.binding=null;
   f.pending[0].resolve(added);await first;await second;
@@ -195,13 +410,13 @@ for(const kind of ['IPC','render'])test(`SP10 ${kind} failure always releases co
   const f=fixture();const pending=f.hostRemove();await flush();
   if(kind==='IPC')f.pending[0].reject(Error('injected IPC failure'));
   else {f.failRender();f.pending[0].resolve(f.reply());}
-  await pending;await flush();assert.equal(f.$('#btn-add-sec-ip').disabled,false);assert.equal(f.$('#ip-config-apply').disabled,false);
+  await pending;await flush();assert.equal(f.$('#btn-add-sec-ip').disabled,false);assert.equal(f.$('#ip-mode-static-auto').disabled,false);
   assert.equal(f.$('#ip-config-spinner').style.display,'none');assert(f.feedback.at(-1).error);
 });
 
 test('SP10 close/reopen does not abandon a running removal or resurrect an older dialog fetch',async()=>{
   const f=fixture();await f.$('#btn-ip-config').fire('click');const pending=f.hostRemove();await flush();
-  await f.$('#ip-config-cancel').fire('click');assert.equal(f.$('#ip-config-dialog').open,false);
+  await f.$('#ip-config-close').fire('click');assert.equal(f.$('#ip-config-dialog').open,false);
   await f.$('#btn-ip-config').fire('click');assert.equal(f.$('#ip-config-dialog').open,true);
   // Reopen queued one ordinary refresh, not another write. Make its actual read match Windows.
   const result=f.reply();f.api.getAdapterSelection=async()=>{f.calls.selection++;return result.view.selection;};
@@ -261,7 +476,7 @@ test('SP11 stale post-reply events trigger one current read and cannot repaint o
 test('SP10 close/reopen retires old dialog-open continuations and pending fetches',async()=>{
   const f=fixture(),old=deferred(),current=deferred();
   f.api.getAdapterSelection=()=>{f.calls.selection++;return f.calls.selection===1?old.promise:current.promise;};
-  const first=f.$('#btn-ip-config').fire('click');await flush();await f.$('#ip-config-cancel').fire('click');
+  const first=f.$('#btn-ip-config').fire('click');await flush();await f.$('#ip-config-close').fire('click');
   const second=f.$('#btn-ip-config').fire('click');await flush();
   const pending=f.hostRemove();await flush();const result=f.reply();f.pending[0].resolve(result);await pending;await flush();
   f.api.getAdoptionState=async()=>({adopted_subnets:{},meta:{[SUBNET]:result.view.binding}});

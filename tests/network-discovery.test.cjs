@@ -90,7 +90,8 @@ test("A failed interface query cannot make the next up event start discovery thr
   const f = fixture();
   f.api.getAdapterSelection = async () => { throw Error("provider timed out"); };
   await f.exports.refreshInterfaces();
-  assert.equal(f.state.activeInterface, null);
+  assert.equal(f.state.activeInterface.is_up, false);
+  assert.equal(f.state.activeInterface.ips[0].address, "192.168.1.100");
   f.up(); await flush();
   assert.equal(f.calls.discovery, 0);
   assert.equal(f.calls.reconnect, 1);

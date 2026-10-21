@@ -38,9 +38,16 @@ pub async fn get_capture_state(
 #[tauri::command]
 pub async fn get_adapter_selection(
     manager: State<'_, NetworkManager>,
+    config: State<'_, AppConfig>,
     app: tauri::AppHandle,
 ) -> Result<crate::network::AdapterSelection, AppError> {
-    crate::network::watcher::refresh(&app).await?;
+    if let Err(error) = crate::network::watcher::refresh(&app).await {
+        // Capture pre-attach may fail on a disconnected wired port. Preserve
+        // watcher-owned restoration, but let the native adapter read decide
+        // whether the Host view is available independently of capture.
+        log::debug!("Adapter view refresh continues after discovery refresh failed: {error}");
+        return manager.get_adapter_selection(&config).await;
+    }
     Ok(manager.adapter_selection_state().await)
 }
 
