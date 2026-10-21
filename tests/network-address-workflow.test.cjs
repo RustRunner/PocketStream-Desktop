@@ -49,7 +49,7 @@ function fixture() {
     getNetworkMode:async()=>{calls.mode++;return 'static_auto';},getDhcpState:async()=>{calls.dhcp++;return false;},
     addSecondaryIp:(name,ip,mask)=>{calls.writes++;additions.push({name,ip,mask});const d=deferred();pending.push(d);return d.promise;},
     removeAdoptedSubnet:()=>{calls.writes++;const d=deferred();pending.push(d);return d.promise;},
-    removeSecondaryIp:(name,ip)=>{calls.writes++;removals.push({name,ip});const d=deferred();pending.push(d);return d.promise;},
+    removeSecondaryIp:(name,ip,primary=false)=>{calls.writes++;removals.push(primary?{name,ip,primary}:{name,ip});const d=deferred();pending.push(d);return d.promise;},
     selectAdapter:async()=>selection,
     setNetworkMode:async request=>{transitions.push(request);return {mode:request.mode,warning:null};},
   };
@@ -63,7 +63,7 @@ function fixture() {
   };
   const exports={};
   vm.runInNewContext(compiled,{exports,require:name=>{assert(name in deps,name);return deps[name];},document:{
-    querySelectorAll(){return [...elements.values()].filter(e=>['#static-iface','#btn-add-sec-ip','#static-ip','#static-mask','#static-gateway','#add-sec-ip','#add-sec-mask','#ip-mode-dhcp','#ip-mode-static-auto','#ip-mode-static-manual','#reset-adapter-confirm'].includes(e.id)).concat($('#subnet-list').buttons,$('#secondary-ip-list').buttons);}
+    querySelectorAll(){return [...elements.values()].filter(e=>['#static-iface','#btn-add-sec-ip','#static-ip','#static-mask','#static-gateway','#primary-existing-ip','#btn-remove-primary-ip','#add-sec-ip','#add-sec-mask','#ip-mode-dhcp','#ip-mode-static-auto','#ip-mode-static-manual','#reset-adapter-confirm'].includes(e.id)).concat($('#subnet-list').buttons,$('#secondary-ip-list').buttons);}
   },window:ui,performance:{now:()=>++now},
     setTimeout(fn,ms){timers.push({fn,ms});return timers.length;},clearTimeout(id){timers[id-1]=null;}});
   exports.setupIpConfigDialog();exports.setupInterfaceWatcher();events.get('adapter-selection-changed')(selection);
@@ -92,6 +92,55 @@ test('Host card has no delete control while Configure retains exact-address Remo
   assert.equal(f.$('#subnet-list').buttons.length,0);
   assert(!/data-remove|btn-remove|<button/.test(f.$('#subnet-list').innerHTML));
   assert(f.$('#secondary-ip-list').buttons.some(b=>b.dataset.removeBinding===SUBNET));
+});
+
+test('Primary edit carries the exact previous tuple and reopens with the saved primary, never as a secondary',async()=>{
+  const f=fixture();await f.$('#btn-ip-config').fire('click');
+  f.$('#static-ip').value='198.51.100.10';await f.$('#static-ip').fire('input');
+  const next={...f.selection,adapter:{...f.iface,ips:[f.iface.ips[1],{address:'198.51.100.10',prefix:24,subnet:'198.51.100.0/24'}]}};
+  next.candidates=[next.adapter];
+  f.api.setNetworkMode=async request=>{f.transitions.push(request);f.api.getAdapterSelection=async()=>next;return {mode:'static_auto',warning:null,primary_address:'198.51.100.10/24'};};
+  await f.$('#ip-config-close').fire('click');
+  assert.equal(f.transitions[0].previous_address,'192.0.2.10/24');
+  assert.equal(f.calls.writes,0,'primary edit never calls Add Secondary');
+  await f.$('#btn-ip-config').fire('click');
+  assert.equal(f.$('#static-ip').value,'198.51.100.10');
+  assert(!f.$('#secondary-ip-list').innerHTML.includes('198.51.100.10'));
+  assert(f.$('#secondary-ip-list').innerHTML.includes(IP));
+});
+
+test('Explicit primary survives address reordering and additional unmanaged secondaries',async()=>{
+  const f=fixture();f.state.config.primary_addresses={[MAC]:'192.0.2.10/24'};
+  f.iface.ips.push({address:'203.0.113.10',prefix:24,subnet:'203.0.113.0/24'});f.iface.ips.reverse();
+  await f.$('#btn-ip-config').fire('click');
+  assert.equal(f.$('#static-ip').value,'192.0.2.10');
+  assert(!f.$('#secondary-ip-list').innerHTML.includes('192.0.2.10'));
+  assert(f.$('#secondary-ip-list').innerHTML.includes('203.0.113.10'));
+});
+
+test('Legacy ambiguous primary can be chosen explicitly without erasing the new address draft',async()=>{
+  const f=fixture();f.adoptionMeta.clear();f.adoptedSubnets.clear();f.api.getAdoptionState=async()=>({adopted_subnets:{},meta:{}});
+  await f.$('#btn-ip-config').fire('click');assert.equal(f.$('#primary-existing-field').style.display,'');
+  f.$('#static-ip').value='198.51.100.10';await f.$('#static-ip').fire('input');
+  f.$('#primary-existing-ip').value='192.0.2.10/24';await f.$('#primary-existing-ip').fire('change');
+  assert.equal(f.$('#static-ip').value,'198.51.100.10');
+  await f.$('#ip-config-close').fire('click');
+  assert.equal(f.transitions[0].previous_address,'192.0.2.10/24');
+});
+
+test('Primary Remove uses the same verified reply, clears its role and does not promote a secondary',async()=>{
+  const f=fixture();f.state.config.primary_addresses={[MAC]:'192.0.2.10/24'};
+  await f.$('#btn-ip-config').fire('click');const before={...f.calls};
+  const remove=f.$('#btn-remove-primary-ip').fire('click');assert.equal(f.calls.writes,1);
+  assert.equal(f.$('#btn-remove-primary-ip').disabled,true);assert.equal(f.$('#primary-existing-ip').disabled,true);
+  assert.deepEqual(f.removals,[{name:'Ethernet',ip:'192.0.2.10',primary:true}]);
+  const reply=f.reply();reply.view.address='192.0.2.10';reply.view.subnet=null;reply.view.binding=null;
+  reply.view.primary_address='';reply.view.selection={...f.selection,adapter:{...f.iface,ips:[f.iface.ips[1]]},candidates:[{...f.iface,ips:[f.iface.ips[1]]}]};
+  f.pending[0].resolve(reply);await remove;
+  assert.equal(f.$('#static-ip').value,'');assert.equal(f.$('#btn-remove-primary-ip').style.display,'none');
+  assert(f.$('#secondary-ip-list').innerHTML.includes(IP));
+  for(const key of ['selection','bindings','mode','dhcp'])assert.equal(f.calls[key],before[key]);
+  await f.$('#ip-config-close').fire('click');assert.equal(f.transitions.length,0);
 });
 
 test('Fresh adoption shows the green auto badge; restored, pending and ended attachments stay plain',async()=>{
@@ -149,7 +198,7 @@ test('Close saves primary fields and mode once, then an unsubmitted secondary, b
   assert(prevented);assert.equal(f.transitions.length,1);assert.equal(f.calls.writes,0);
   assert.equal(f.$('#ip-config-dialog').open,true);assert.equal(f.$('#static-ip').disabled,true);
   assert.equal(f.$('#ip-config-close').disabled,true);
-  assert.deepEqual(JSON.parse(JSON.stringify(f.transitions[0])),{name:'Ethernet',mode:'static_manual',ip:'198.51.100.10',subnet_mask:'255.255.255.0',gateway:'198.51.100.1',confirmed:false});
+  assert.deepEqual(JSON.parse(JSON.stringify(f.transitions[0])),{name:'Ethernet',mode:'static_manual',ip:'198.51.100.10',subnet_mask:'255.255.255.0',gateway:'198.51.100.1',previous_address:'192.0.2.10/24',confirmed:false});
   mode.resolve({mode:'static_manual',warning:null});await flush();
   assert.equal(f.calls.writes,1);assert.equal(f.$('#ip-config-dialog').open,true);
   assert.deepEqual(f.additions,[{name:'Ethernet',ip:'203.0.113.10',mask:'255.255.255.0'}]);

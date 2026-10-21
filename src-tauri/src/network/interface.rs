@@ -722,6 +722,14 @@ pub(crate) trait AddressIo: Send + Sync {
     fn claim(&self, config: &crate::config::AppConfig, ip: &str) -> Result<(), AppError> {
         config.claim_binding(ip)
     }
+    fn persist_primary(
+        &self,
+        config: &crate::config::AppConfig,
+        mac: &str,
+        cidr: &str,
+    ) -> Result<(), AppError> {
+        config.set_primary_address(mac, cidr)
+    }
     fn descriptor(&self, native: &NativeAdapter) -> Option<InterfaceInfo> {
         ADAPTER_SNAPSHOT
             .qualified
@@ -952,6 +960,7 @@ pub(crate) struct NativeAdapter {
     pub mac: String,
     pub is_up: bool,
     pub ips: Vec<IpInfo>,
+    pub gateways: Vec<String>,
 }
 
 /// Enumerate every local adapter's MAC, up-state, and IPv4 addresses via the
@@ -968,12 +977,15 @@ pub(crate) struct NativeAdapter {
 #[cfg(target_os = "windows")]
 pub(super) fn local_adapters_iphelper() -> Result<Vec<NativeAdapter>, AppError> {
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
-        GAA_FLAG_SKIP_MULTICAST,
+        GetAdaptersAddresses, GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_SKIP_ANYCAST,
+        GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
     };
     use windows_sys::Win32::Networking::WinSock::AF_INET;
 
-    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    let flags = GAA_FLAG_SKIP_ANYCAST
+        | GAA_FLAG_SKIP_MULTICAST
+        | GAA_FLAG_SKIP_DNS_SERVER
+        | GAA_FLAG_INCLUDE_GATEWAYS;
     local_adapters_iphelper_with(|buffer, size| unsafe {
         GetAdaptersAddresses(AF_INET as u32, flags, std::ptr::null(), buffer, size)
     })
@@ -1055,6 +1067,21 @@ fn local_adapters_iphelper_with(
             ua = u.Next;
         }
 
+        let mut gateways = Vec::new();
+        let mut gateway = ad.FirstGatewayAddress;
+        while !gateway.is_null() {
+            let row = unsafe { &*gateway };
+            let sa = row.Address.lpSockaddr;
+            if !sa.is_null() && unsafe { (*sa).sa_family } == AF_INET {
+                let octets = unsafe { (*(sa as *const SOCKADDR_IN)).sin_addr.S_un.S_un_b };
+                let address =
+                    std::net::Ipv4Addr::new(octets.s_b1, octets.s_b2, octets.s_b3, octets.s_b4);
+                if !address.is_unspecified() && !gateways.contains(&address.to_string()) {
+                    gateways.push(address.to_string());
+                }
+            }
+            gateway = row.Next;
+        }
         adapters.push(NativeAdapter {
             index: unsafe { ad.Anonymous1.Anonymous.IfIndex },
             guid: if ad.AdapterName.is_null() {
@@ -1081,6 +1108,7 @@ fn local_adapters_iphelper_with(
             mac,
             is_up,
             ips,
+            gateways,
         });
         cur = ad.Next;
     }
@@ -1341,6 +1369,7 @@ pub(super) mod address_test_io {
                 mac: "40:cd:3a:00:00:01".into(),
                 is_up: true,
                 dhcp: false,
+                gateways: vec![],
                 ips: ips
                     .iter()
                     .map(|address| IpInfo {
@@ -1611,6 +1640,36 @@ mod tests {
             duplicate.push(rows[0].clone());
             assert!(native_by_alias(&duplicate, "Ethernet").is_err());
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_gateway_is_read_from_windows_sys_059_adapter_data() {
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_GATEWAY_ADDRESS_LH,
+        };
+        use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKADDR_IN};
+        let mut address: SOCKADDR_IN = unsafe { std::mem::zeroed() };
+        address.sin_family = AF_INET;
+        address.sin_addr.S_un.S_addr = u32::from_ne_bytes([192, 0, 2, 1]);
+        let mut gateway: IP_ADAPTER_GATEWAY_ADDRESS_LH = unsafe { std::mem::zeroed() };
+        gateway.Address.lpSockaddr = (&mut address as *mut SOCKADDR_IN).cast();
+        gateway.Address.iSockaddrLength = std::mem::size_of::<SOCKADDR_IN>() as i32;
+        let mut adapter: IP_ADAPTER_ADDRESSES_LH = unsafe { std::mem::zeroed() };
+        adapter.FirstGatewayAddress = &mut gateway;
+        let rows = local_adapters_iphelper_with(|buffer, _| {
+            unsafe { *buffer = adapter };
+            0
+        })
+        .unwrap();
+        assert_eq!(rows[0].gateways, vec!["192.0.2.1"]);
+        adapter.FirstGatewayAddress = std::ptr::null_mut();
+        let rows = local_adapters_iphelper_with(|buffer, _| {
+            unsafe { *buffer = adapter };
+            0
+        })
+        .unwrap();
+        assert!(rows[0].gateways.is_empty());
     }
 
     #[tokio::test(start_paused = true)]

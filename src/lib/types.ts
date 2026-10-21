@@ -137,6 +137,8 @@ export interface AdoptedMeta {
 
 export interface AppSettings {
   selected_adapter_mac: string | null;
+  /** Backend-owned explicit primary CIDR per adapter MAC; empty means removed. */
+  primary_addresses?: Record<string, string>;
   stream: StreamConfig;
   rtsp_server: RtspServerConfig;
   credentials: Credentials;
@@ -282,6 +284,7 @@ export interface AddressReply {
     address: string;
     prefix: number | null;
     mode: NetworkMode;
+    primary_address?: string | null;
   };
 }
 
@@ -386,9 +389,11 @@ export interface ModeTransition {
   ip: string | null;
   subnet_mask: string | null;
   gateway: string | null;
+  previous_address?: string | null;
   confirmed: boolean;
 }
 export interface ModeTransitionReply {
   warning: string | null;
   mode: NetworkMode;
+  primary_address?: string | null;
 }

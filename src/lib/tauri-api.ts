@@ -132,8 +132,8 @@ export async function addSecondaryIp(
   return await invoke("add_secondary_ip", { name, ip, subnetMask });
 }
 
-export async function removeSecondaryIp(name: string, ip: string): Promise<AddressReply> {
-  return await invoke("remove_secondary_ip", { name, ip });
+export async function removeSecondaryIp(name: string, ip: string, primary = false): Promise<AddressReply> {
+  return await invoke("remove_secondary_ip", { name, ip, primary });
 }
 
 /**

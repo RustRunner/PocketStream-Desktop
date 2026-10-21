@@ -1,5 +1,3 @@
-use std::net::Ipv4Addr;
-
 use crate::error::AppError;
 
 /// Assign a static IP address to a network interface.
@@ -10,11 +8,12 @@ use crate::error::AppError;
 /// Platform-specific implementation:
 /// - Windows: uses `netsh interface ip set address`
 /// - Linux: uses `ip addr` commands
-pub async fn assign_static_ip(
+pub(crate) async fn assign_static_ip(
     interface: &str,
     ip: &str,
     subnet_mask: &str,
     gateway: Option<&str>,
+    expected: &super::interface::NativeIdentity,
 ) -> Result<(), AppError> {
     super::interface::validate_interface_name(interface).await?;
     validate_ip(ip)?;
@@ -25,7 +24,7 @@ pub async fn assign_static_ip(
 
     #[cfg(target_os = "windows")]
     {
-        assign_windows(interface, ip, subnet_mask, gateway).await
+        assign_windows(interface, ip, subnet_mask, gateway, expected).await
     }
 
     #[cfg(target_os = "linux")]
@@ -45,13 +44,14 @@ async fn assign_windows(
     ip: &str,
     subnet_mask: &str,
     gateway: Option<&str>,
+    expected: &super::interface::NativeIdentity,
 ) -> Result<(), AppError> {
-    assign_windows_with(&WindowsIpOps, interface, ip, subnet_mask, gateway).await
+    assign_windows_with(&WindowsIpOps, interface, ip, subnet_mask, gateway, expected).await
 }
 
 #[cfg(target_os = "windows")]
 trait StaticIpOps {
-    async fn snapshot(&self, interface: &str) -> Result<super::interface::InterfaceInfo, AppError>;
+    async fn snapshot(&self, interface: &str) -> Result<super::interface::NativeAdapter, AppError>;
     async fn gateway(&self, interface: &str) -> Result<Option<String>, AppError>;
     async fn command(&self, args: &[&str]) -> Result<String, AppError>;
 }
@@ -61,8 +61,11 @@ struct WindowsIpOps;
 
 #[cfg(target_os = "windows")]
 impl StaticIpOps for WindowsIpOps {
-    async fn snapshot(&self, interface: &str) -> Result<super::interface::InterfaceInfo, AppError> {
-        super::interface::get_by_name(interface).await
+    async fn snapshot(&self, interface: &str) -> Result<super::interface::NativeAdapter, AppError> {
+        Ok(
+            super::interface::native_by_alias(&super::interface::read_native().await?, interface)?
+                .clone(),
+        )
     }
     async fn gateway(&self, interface: &str) -> Result<Option<String>, AppError> {
         current_default_gateway(interface).await
@@ -79,21 +82,12 @@ async fn assign_windows_with(
     ip: &str,
     subnet_mask: &str,
     gateway: Option<&str>,
+    expected: &super::interface::NativeIdentity,
 ) -> Result<(), AppError> {
     // Snapshot BEFORE the set. Propagate a snapshot failure instead of
     // treating it as an empty adapter: the old unwrap_or_default() would
     // then re-add nothing, silently wiping every secondary (including the
     // adopted rescue IP) when the set below replaces all addresses.
-    let info = ops.snapshot(interface).await?;
-
-    // Snapshot every address immediately before the set, including external
-    // additions since the dialog opened. Only the explicitly chosen IP changes.
-    let to_restore: Vec<super::interface::IpInfo> = info
-        .ips
-        .into_iter()
-        .filter(|sec| sec.address != ip)
-        .collect();
-
     // Preserve the existing default gateway when the caller didn't
     // specify one. `netsh set address ... static <ip> <mask>` with no
     // gateway argument CLEARS the interface's default gateway, so a
@@ -107,6 +101,18 @@ async fn assign_windows_with(
         None
     };
     let effective_gw: Option<&str> = gateway.or(preserved_gw.as_deref());
+
+    let info = ops.snapshot(interface).await?;
+    if info.identity() != *expected {
+        return Err(AppError::Network(
+            "Selected adapter changed before primary write".into(),
+        ));
+    }
+    let to_restore: Vec<_> = info
+        .ips
+        .into_iter()
+        .filter(|sec| sec.address != ip)
+        .collect();
 
     // Set primary static IP (replaces all existing IPs)
     let mut args = vec![
@@ -150,39 +156,19 @@ async fn assign_windows_with(
 
 /// The interface's current IPv4 default gateway, if it has one.
 ///
-/// Locale-invariant: `Get-NetRoute` yields the raw NextHop IP, so no
-/// text parsing against localized output. A missing route is distinct
-/// from a failed query: failure must not silently clear an existing gateway.
+/// Native IP Helper data keeps operation reads free of PowerShell/CIM. A
+/// valid empty gateway list is distinct from a failed or ambiguous query.
 #[cfg(target_os = "windows")]
 async fn current_default_gateway(interface: &str) -> Result<Option<String>, AppError> {
-    let script = format!(
-        "$ErrorActionPreference='Stop'; Get-NetRoute -AddressFamily IPv4 -ErrorAction Stop | \
-         Where-Object {{ $_.InterfaceAlias -eq '{}' -and $_.DestinationPrefix -eq '0.0.0.0/0' }} | \
-         Select-Object -ExpandProperty NextHop -First 1",
-        interface.replace('\'', "''")
-    );
-    let fut = super::async_cmd("powershell")
-        .args(["-NoProfile", "-Command", &script])
-        .kill_on_drop(true)
-        .output();
-    let output = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
-        .await
-        .map_err(|_| AppError::Network("Default gateway query timed out".into()))?
-        .map_err(|e| AppError::Network(format!("Default gateway query failed: {e}")))?;
-    if !output.status.success() {
-        return Err(AppError::Network(format!(
-            "Default gateway query failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
+    let native = super::interface::read_native().await?;
+    let adapter = super::interface::native_by_alias(&native, interface)?;
+    match adapter.gateways.as_slice() {
+        [] => Ok(None),
+        [gateway] => Ok(Some(gateway.clone())),
+        _ => Err(AppError::Network(
+            "Multiple IPv4 gateways; enter the intended gateway explicitly".into(),
+        )),
     }
-    let gw = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    // A missing route yields empty output or the unspecified address.
-    if gw.is_empty() || gw == "0.0.0.0" {
-        return Ok(None);
-    }
-    gw.parse::<Ipv4Addr>()
-        .map(|a| Some(a.to_string()))
-        .map_err(|_| AppError::Network("Default gateway query returned an invalid address".into()))
 }
 
 /// Convert a CIDR prefix length to a dotted subnet mask.
@@ -502,6 +488,11 @@ pub(super) async fn add_native_address(
     validate_ip(ip)?;
     let prefix = mask_to_prefix(mask)?;
     validate_native_writer(adapter)?;
+    if !adapter.is_up {
+        return Err(AppError::Network(
+            "Selected Ethernet adapter is disconnected".into(),
+        ));
+    }
     if adapter.dhcp {
         return Err(AppError::Network("adapter is DHCP".into()));
     }
@@ -527,7 +518,7 @@ pub(super) async fn add_native_address(
     }
 }
 fn validate_native_writer(adapter: &super::interface::NativeAdapter) -> Result<(), AppError> {
-    if !adapter.is_up || adapter.index == 0 || adapter.guid.is_empty() || adapter.alias.is_empty() {
+    if adapter.index == 0 || adapter.guid.is_empty() || adapter.alias.is_empty() {
         return Err(AppError::Network(
             "Selected adapter unavailable or unqualified".into(),
         ));
@@ -593,7 +584,7 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     struct StaticOps {
-        metadata: super::super::interface::InterfaceInfo,
+        metadata: super::super::interface::NativeAdapter,
         native_fails: bool,
         commands: std::sync::Mutex<Vec<Vec<String>>>,
     }
@@ -603,10 +594,11 @@ mod tests {
         async fn snapshot(
             &self,
             _: &str,
-        ) -> Result<super::super::interface::InterfaceInfo, AppError> {
+        ) -> Result<super::super::interface::NativeAdapter, AppError> {
             if self.native_fails {
-                super::super::interface::failed_native_snapshot(vec![self.metadata.clone()])
-                    .map(|mut rows| rows.remove(0))
+                Err(AppError::Network(
+                    "GetAdaptersAddresses failed with code 8".into(),
+                ))
             } else {
                 Ok(self.metadata.clone())
             }
@@ -626,19 +618,18 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[tokio::test]
     async fn static_apply_requires_native_snapshot_before_replacing_addresses() {
-        use super::super::interface::{InterfaceInfo, IpInfo};
+        use super::super::interface::{IpInfo, NativeAdapter};
         for native_fails in [true, false] {
             let ops = StaticOps {
-                metadata: InterfaceInfo {
-                    name: "Ethernet".into(),
-                    display_name: "Ethernet".into(),
-                    description: String::new(),
+                metadata: NativeAdapter {
+                    alias: "Ethernet".into(),
+                    index: 7,
+                    guid: "guid-a".into(),
+                    dhcp: false,
+                    gateways: vec![],
                     mac: "40:cd:3a:00:00:01".into(),
                     is_up: true,
-                    is_ethernet: true,
-                    is_wifi: false,
-                    is_vpn: false,
-                    is_virtual: false,
+
                     ips: ["192.0.2.20", "198.51.100.99"]
                         .into_iter()
                         .map(|address| IpInfo {
@@ -651,8 +642,15 @@ mod tests {
                 native_fails,
                 commands: Default::default(),
             };
-            let result =
-                assign_windows_with(&ops, "Ethernet", "192.0.2.20", "255.255.255.0", None).await;
+            let result = assign_windows_with(
+                &ops,
+                "Ethernet",
+                "192.0.2.20",
+                "255.255.255.0",
+                None,
+                &ops.metadata.identity(),
+            )
+            .await;
             let commands = ops.commands.lock().unwrap();
             if native_fails {
                 assert!(result
@@ -702,6 +700,52 @@ mod tests {
             assert!(parse_dhcp_state(output).is_err());
         }
         assert!(mask_to_prefix("255.0.255.0").is_err());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn primary_writer_rejects_changed_native_identity_before_any_command() {
+        let ops = StaticOps {
+            metadata: super::super::interface::NativeAdapter {
+                alias: "Ethernet".into(),
+                guid: "new-guid".into(),
+                index: 7,
+                is_up: true,
+                ..Default::default()
+            },
+            native_fails: false,
+            commands: Default::default(),
+        };
+        let mut expected = ops.metadata.identity();
+        expected.guid = "old-guid".into();
+        assert!(assign_windows_with(
+            &ops,
+            "Ethernet",
+            "192.0.2.10",
+            "255.255.255.0",
+            None,
+            &expected
+        )
+        .await
+        .is_err());
+        assert!(ops.commands.lock().unwrap().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn disconnected_native_writer_allows_removal_validation_but_rejects_addition() {
+        let adapter = super::super::interface::NativeAdapter {
+            alias: "Ethernet".into(),
+            guid: "guid".into(),
+            index: 7,
+            ..Default::default()
+        };
+        validate_native_writer(&adapter).unwrap();
+        assert!(add_native_address(&adapter, "192.0.2.10", "255.255.255.0")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("disconnected"));
     }
 
     // ── validate_ip ─────────────────────────────────────────────────

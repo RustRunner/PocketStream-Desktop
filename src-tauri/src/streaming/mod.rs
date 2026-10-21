@@ -2609,6 +2609,7 @@ mod tests {
     ) -> AppSettings {
         AppSettings {
             selected_adapter_mac: None,
+            primary_addresses: std::collections::HashMap::new(),
             stream: StreamConfig {
                 camera_mac: None,
                 protocol,

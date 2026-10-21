@@ -548,7 +548,9 @@ fn binding_action(
     conflicts: &[ipnetwork::Ipv4Network],
 ) -> BindingAction {
     use crate::config::{BindingDesired, NetworkMode};
-    let Some(iface) = iface.filter(|i| i.is_up) else {
+    let Some(iface) =
+        iface.filter(|i| i.is_up || (row.desired == BindingDesired::Removed && dhcp.is_ok()))
+    else {
         return BindingAction::Unavailable("selected adapter unavailable".into());
     };
     if row
@@ -695,6 +697,8 @@ pub struct ModeTransition {
     pub subnet_mask: Option<String>,
     pub gateway: Option<String>,
     #[serde(default)]
+    pub previous_address: Option<String>,
+    #[serde(default)]
     pub confirmed: bool,
 }
 
@@ -702,6 +706,7 @@ pub struct ModeTransition {
 pub struct ModeTransitionReply {
     pub warning: Option<String>,
     pub mode: crate::config::NetworkMode,
+    pub primary_address: Option<String>,
 }
 
 pub struct NetworkManager {
@@ -2539,6 +2544,7 @@ impl NetworkManager {
             return Ok(ModeTransitionReply {
                 warning: Some("Switching to DHCP removes manually configured addresses from this adapter. Saved managed secondaries will remain pending until a static mode returns. Continue?".into()),
                 mode: config.get_network_mode(),
+                primary_address: config.get().primary_addresses.get(&adapter_mac(&iface.mac).unwrap_or_default()).cloned(),
             });
         }
         if request.mode != NetworkMode::Dhcp {
@@ -2571,13 +2577,18 @@ impl NetworkManager {
         }
         let address = self.address_work.lock().await;
         let result = async {
-            // An unreadable DHCP state never permits an address write.
-            ip_config::get_dhcp_state(&iface.name).await?;
             // Refresh identity after waiting for in-flight scratch cleanup.
-            let current = self.selected_write_adapter(config, &request.name).await?;
-            if adapter_mac(&current.mac) != adapter_mac(&iface.mac) {
+            let before = self.operation_snapshot(config).await?;
+            if before.selected.alias != request.name
+                || adapter_mac(&before.selected.mac) != adapter_mac(&iface.mac)
+            {
                 return Err(AppError::Network("Selected adapter changed".into()));
             }
+            let previous = if request.mode != NetworkMode::Dhcp {
+                self.primary_to_replace(config, &before, &request)?
+            } else {
+                None
+            };
             if request.mode == NetworkMode::Dhcp {
                 ip_config::set_dhcp(&iface.name).await?;
             } else {
@@ -2586,8 +2597,11 @@ impl NetworkManager {
                     request.ip.as_deref().unwrap(),
                     request.subnet_mask.as_deref().unwrap(),
                     request.gateway.as_deref(),
+                    &before.selected.identity(),
                 )
                 .await?;
+                self.finish_primary_change(config, &before, &request, previous)
+                    .await?;
             }
             let actual_dhcp = ip_config::get_dhcp_state(&iface.name).await?;
             if actual_dhcp != (request.mode == NetworkMode::Dhcp) {
@@ -2596,13 +2610,6 @@ impl NetworkManager {
                 ));
             }
             config.set_network_mode(request.mode)?;
-            if let Some(ip) = request
-                .ip
-                .as_deref()
-                .filter(|_| request.mode != NetworkMode::Dhcp)
-            {
-                self.claim_binding_locked(config, ip, &request.name).await?;
-            }
             Ok(())
         }
         .await;
@@ -2649,6 +2656,11 @@ impl NetworkManager {
         Ok(ModeTransitionReply {
             warning: None,
             mode,
+            primary_address: config
+                .get()
+                .primary_addresses
+                .get(&adapter_mac(&iface.mac).unwrap_or_default())
+                .cloned(),
         })
     }
 
@@ -4565,7 +4577,7 @@ impl NetworkManager {
         name: &str,
     ) -> Result<InterfaceInfo, AppError> {
         let snapshot = self.operation_snapshot(config).await?;
-        if snapshot.iface.name != name || !snapshot.iface.is_up {
+        if snapshot.iface.name != name {
             return Err(AppError::Network(
                 "Selected Ethernet adapter unavailable or changed".into(),
             ));
