@@ -1172,12 +1172,27 @@ async fn attempt_adoption(
     let ops = auto_adopt::PendingAdoptOps::new(&config, &ctx.adapter_mac, auto_adopt::RealAdoptOps);
     if ctx.fence.is_stale()
         || ctx.address_fence.is_stale()
-        || config.get().adopted_meta.contains_key(device_subnet)
         || config.get_network_mode() != crate::config::NetworkMode::StaticAuto
     {
         return AdoptionAttemptOutcome::NoOp;
     }
     if crate::validation::prohibited_camera_ip(device_ip) {
+        return AdoptionAttemptOutcome::NoOp;
+    }
+    if let Err(error) = ctx
+        .app_handle
+        .state::<NetworkManager>()
+        .prepare_subnet_adoption(
+            &config,
+            device_subnet,
+            &ctx.adapter_mac,
+            ctx.interface_index,
+            &ctx.fence,
+            &ctx.address_fence,
+        )
+        .await
+    {
+        log::debug!("Adoption deferred for {}: {}", device_subnet, error);
         return AdoptionAttemptOutcome::NoOp;
     }
 
@@ -1473,13 +1488,34 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
         );
         if self.shutdown()
             || self.ctx.address_fence.is_stale()
-            || config.get().adopted_meta.contains_key(subnet)
             || config.get_network_mode() != crate::config::NetworkMode::StaticAuto
             || !matches!(
                 ip_config::get_dhcp_state(&self.ctx.iface_name).await,
                 Ok(false)
             )
         {
+            return false;
+        }
+        if let Err(error) = self
+            .ctx
+            .app_handle
+            .state::<NetworkManager>()
+            .prepare_subnet_adoption(
+                &config,
+                subnet,
+                &self.ctx.adapter_mac,
+                self.ctx.interface_index,
+                &self.ctx.fence,
+                &self.ctx.address_fence,
+            )
+            .await
+        {
+            log::info!(
+                "{}: probe deferred for {}: {}",
+                self.origin.label(),
+                subnet,
+                error
+            );
             return false;
         }
         if self.shutdown() || config.get_network_mode() != crate::config::NetworkMode::StaticAuto {
@@ -2860,6 +2896,62 @@ impl NetworkManager {
     async fn reconcile_bindings_locked(&self, config: &crate::config::AppConfig) {
         self.reconcile_bindings_traced(config, None).await;
     }
+
+    /// Caller holds address_work. A completed deletion may be superseded by
+    /// fresh discovery, but pending removals and unknown native state cannot.
+    /// Retire the exact saved row before reserving any new temporary address.
+    async fn prepare_subnet_adoption(
+        &self,
+        config: &crate::config::AppConfig,
+        subnet: &str,
+        owner: &str,
+        index: u32,
+        session: &SweepFence,
+        address: &SweepFence,
+    ) -> Result<(), AppError> {
+        let Some(row) = config.get().adopted_meta.get(subnet).cloned() else {
+            return Ok(());
+        };
+        if !row.removal_complete() || session.is_stale() || address.is_stale() {
+            return Err(AppError::Network(
+                "Saved binding is still pending or present".into(),
+            ));
+        }
+        let snapshot = self.operation_snapshot(config).await?;
+        if session.is_stale()
+            || address.is_stale()
+            || !snapshot.selected.is_up
+            || snapshot.selected.dhcp
+            || adapter_mac(&snapshot.selected.mac) != adapter_mac(owner)
+            || snapshot.selected.index != index
+            || row.adapter_mac.as_deref().and_then(adapter_mac) != adapter_mac(owner)
+            || !matches!(
+                binding_action(
+                    subnet,
+                    &row,
+                    Some(&snapshot.iface),
+                    config.get_network_mode(),
+                    &Ok(snapshot.selected.dhcp),
+                    &[],
+                ),
+                BindingAction::Observed(false)
+            )
+        {
+            return Err(AppError::Network(
+                "Removal absence or selected adapter is unconfirmed".into(),
+            ));
+        }
+        self.address_io
+            .forget_completed_removal(config, subnet, &row)?;
+        self.adopted_meta
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(subnet);
+        self.adopted_ips.lock().await.remove(subnet);
+        log::info!("event=adoption_eligible adapter_mac={} interface_index={} subnet={} reason=removal_completed",
+            log_value(owner), index, log_value(subnet));
+        Ok(())
+    }
     async fn reconcile_bindings_traced(
         &self,
         config: &crate::config::AppConfig,
@@ -3989,18 +4081,28 @@ impl NetworkManager {
                 if *shutdown_rx.borrow() {
                     break;
                 }
-                ctx.address_fence = SweepFence::new(
+                let next_address_fence = SweepFence::new(
                     address_generation.load(Ordering::Acquire),
                     address_generation.clone(),
                     address_active.clone(),
                 );
                 let _address = address_work_for_adopt.lock().await;
-                if ctx.address_fence.is_stale() {
+                if next_address_fence.is_stale() {
                     continue;
                 }
                 if ctx.fence.is_stale() || *shutdown_rx.borrow() {
                     break;
                 }
+                if ctx.address_fence.generation != next_address_fence.generation {
+                    // A manual add/remove can invalidate permanent session
+                    // knowledge without restarting capture or discovery.
+                    known_subnets.clear();
+                    dwell = auto_adopt::DwellTracker::new();
+                    cache_probe_done = false;
+                    cache_probe_attempted.clear();
+                    cached_dhcp_state = None;
+                }
+                ctx.address_fence = next_address_fence;
 
                 // Refresh the local-IP set the capture listener filters
                 // against: addresses move under us (DHCP renew, WiFi roam)
@@ -4102,7 +4204,12 @@ impl NetworkManager {
                             adopted.lock().await.keys().cloned().collect();
                         let pending_keys: HashSet<String> = meta_for_adopt
                             .lock()
-                            .map(|m| m.keys().cloned().collect())
+                            .map(|m| {
+                                m.iter()
+                                    .filter(|(_, row)| !row.removal_complete())
+                                    .map(|(subnet, _)| subnet.clone())
+                                    .collect()
+                            })
                             .unwrap_or_default();
                         let ghost_nets = ghost::non_wired_interface_networks().await;
                         cached_ghosts = Some((ghost_nets.clone(), std::time::Instant::now()));

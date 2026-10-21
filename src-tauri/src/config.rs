@@ -153,6 +153,14 @@ pub struct AdoptedMeta {
     pub last_error: Option<String>,
 }
 
+impl AdoptedMeta {
+    /// Removal is a transaction, not a permanent subnet exclusion. Only an
+    /// observed, successfully saved absence permits a fresh adoption attempt.
+    pub(crate) fn removal_complete(&self) -> bool {
+        self.desired == BindingDesired::Removed && !self.applied && self.last_error.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BindingDesired {
@@ -552,8 +560,9 @@ impl AppConfig {
         )
     }
 
-    /// Persist an observed binding state. Removed intent can only be cleared
-    /// by the explicit manual-claim path, never by a late probe or restore.
+    /// Persist an observed binding state. Late status/restore writes cannot
+    /// overwrite removal intent. Fresh adoption first retires a completed
+    /// removal after verifying native absence under the address-work lock.
     pub fn set_binding(&self, subnet: &str, row: AdoptedMeta) -> Result<(), crate::AppError> {
         self.set_binding_with(subnet, row, save_to_disk)
     }
@@ -627,6 +636,47 @@ impl AppConfig {
 
     pub fn claim_binding(&self, address: &str) -> Result<(), crate::AppError> {
         self.claim_binding_with(address, save_to_disk)
+    }
+
+    pub(crate) fn forget_completed_removal(
+        &self,
+        subnet: &str,
+        expected: &AdoptedMeta,
+    ) -> Result<(), crate::AppError> {
+        self.forget_completed_removal_with(subnet, expected, save_to_disk)
+    }
+
+    pub(crate) fn forget_completed_removal_with(
+        &self,
+        subnet: &str,
+        expected: &AdoptedMeta,
+        persist: impl FnOnce(&AppSettings) -> Result<(), crate::AppError>,
+    ) -> Result<(), crate::AppError> {
+        self.change_settings_with(
+            |s| {
+                let owner = expected
+                    .adapter_mac
+                    .as_deref()
+                    .and_then(crate::network::device_registry::canonical_mac);
+                if !expected.removal_complete()
+                    || s.adopted_meta.get(subnet) != Some(expected)
+                    || s.adopted_subnets.contains_key(subnet)
+                    || s.network_mode != NetworkMode::StaticAuto
+                    || owner.is_none()
+                    || owner
+                        != s.selected_adapter_mac
+                            .as_deref()
+                            .and_then(crate::network::device_registry::canonical_mac)
+                {
+                    return Err(crate::AppError::Network(
+                        "Saved removal changed or is not complete".into(),
+                    ));
+                }
+                s.adopted_meta.remove(subnet);
+                Ok(())
+            },
+            persist,
+        )
     }
 
     pub(crate) fn claim_binding_with(
@@ -2217,6 +2267,61 @@ password = ""
             .unwrap()
             .pending_addresses
             .is_empty());
+    }
+
+    #[test]
+    fn fresh_adoption_retires_only_the_unchanged_completed_removal() {
+        let subnet = "192.0.2.0/24";
+        let owner = "40:cd:3a:00:00:01";
+        let removed = AdoptedMeta {
+            adapter_mac: Some(owner.into()),
+            address: Some("192.0.2.100".into()),
+            prefix: Some(24),
+            desired: BindingDesired::Removed,
+            ..Default::default()
+        };
+        for case in 0..6 {
+            let mut settings = AppSettings {
+                selected_adapter_mac: Some(owner.into()),
+                network_mode: NetworkMode::StaticAuto,
+                ..Default::default()
+            };
+            settings.adopted_meta.insert(subnet.into(), removed.clone());
+            match case {
+                0 => {
+                    settings.adopted_meta.get_mut(subnet).unwrap().last_error =
+                        Some("new removal".into())
+                }
+                1 => {
+                    settings.adopted_meta.get_mut(subnet).unwrap().address =
+                        Some("192.0.2.101".into())
+                }
+                2 => settings.selected_adapter_mac = Some("aa:bb:cc:dd:ee:ff".into()),
+                3 => settings.network_mode = NetworkMode::StaticManual,
+                4 => {
+                    settings
+                        .adopted_subnets
+                        .insert(subnet.into(), "192.0.2.100".into());
+                }
+                _ => {}
+            }
+            let config = AppConfig::temporary_test_config(settings);
+            let before = config.get();
+            let calls = std::cell::Cell::new(0);
+            let result = config.forget_completed_removal_with(subnet, &removed, |_| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            });
+            if case < 5 {
+                assert!(result.is_err());
+                assert_eq!(calls.get(), 0);
+                assert_eq!(config.get().adopted_meta, before.adopted_meta);
+            } else {
+                result.unwrap();
+                assert_eq!(calls.get(), 1);
+                assert!(!config.get().adopted_meta.contains_key(subnet));
+            }
+        }
     }
 
     #[test]
