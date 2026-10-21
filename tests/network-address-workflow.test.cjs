@@ -9,7 +9,7 @@ const compiled = ts.transpileModule(source + '\nexports.renderSelectionForTest =
 const flush = async () => { for(let i=0;i<40;i++) await Promise.resolve(); };
 const deferred = () => { let resolve,reject; const promise=new Promise((a,b)=>{resolve=a;reject=b;});return {promise,resolve,reject}; };
 const IP='192.0.2.20', SUBNET='192.0.2.0/24', MAC='40:cd:3a:00:00:01';
-function fixture() {
+function fixture({initialSelection=true}={}) {
   const events=new Map(), elements=new Map(), calls={selection:0,bindings:0,mode:0,dhcp:0,writes:0}, feedback=[], removals=[], transitions=[], additions=[];
   let now=0, throwRender=false;const timers=[];
   const iface={name:'Ethernet', display_name:'Ethernet', mac:MAC, is_up:true, is_ethernet:true, is_vpn:false,is_virtual:false,
@@ -17,7 +17,7 @@ function fixture() {
   const selection={selected_mac:MAC,interface_index:7,adapter:iface,candidates:[iface],selection_required:false};
   const meta={adapter_mac:MAC,address:IP,prefix:24,desired:'present',applied:true,last_error:null};
   const adoptionMeta=new Map([[SUBNET,meta]]),adoptedSubnets=new Map([[SUBNET,IP]]);
-  const state={config:{network_mode:'static_auto',selected_adapter_mac:MAC},activeInterface:iface,activeAdoptionId:null};
+  const state={config:{network_mode:'static_auto',selected_adapter_mac:MAC},activeInterface:initialSelection?iface:null,activeAdoptionId:null};
   function element(id='',dataset={}) {
     const handlers=new Map();let html='';
     const el={id,dataset,style:{},disabled:false,checked:false,value:'',open:false,buttons:[],textContent:'',className:'',
@@ -66,7 +66,7 @@ function fixture() {
     querySelectorAll(){return [...elements.values()].filter(e=>['#static-iface','#btn-add-sec-ip','#static-ip','#static-mask','#static-gateway','#primary-existing-ip','#btn-remove-primary-ip','#add-sec-ip','#add-sec-mask','#ip-mode-dhcp','#ip-mode-static-auto','#ip-mode-static-manual','#reset-adapter-confirm'].includes(e.id)).concat($('#subnet-list').buttons,$('#secondary-ip-list').buttons);}
   },window:ui,performance:{now:()=>++now},
     setTimeout(fn,ms){timers.push({fn,ms});return timers.length;},clearTimeout(id){timers[id-1]=null;}});
-  exports.setupIpConfigDialog();exports.setupInterfaceWatcher();events.get('adapter-selection-changed')(selection);
+  exports.setupIpConfigDialog();exports.setupInterfaceWatcher();if(initialSelection)events.get('adapter-selection-changed')(selection);
   exports.renderSubnetList();
   const reply=(extra={})=>({operation:1,outcome:'success',reason:null,view:{selection:{...selection,adapter:{...iface,ips:iface.ips.filter(i=>i.address!==IP)},candidates:[{...iface,ips:iface.ips.filter(i=>i.address!==IP)}]},identity:{guid:'guid-a',index:7,mac:MAC,alias:'Ethernet'},dhcp:false,observation_error:null,subnet:SUBNET,binding:{...meta,desired:'removed',applied:false},address:IP,prefix:24,mode:'static_auto'},...extra});
   return {exports,api,events,$,calls,pending,feedback,removals,transitions,additions,ui,state,selection,iface,adoptionMeta,adoptedSubnets,reply,
@@ -148,6 +148,7 @@ test('Fresh adoption shows the green auto badge; restored, pending and ended att
   assert(!f.$('#subnet-list').innerHTML.includes('badge-auto'),'restored binding is plain');
   f.exports.sessionAdoptedSubnets.add(SUBNET);f.exports.renderSubnetList();
   assert(f.$('#subnet-list').innerHTML.includes('<span class="badge-auto">auto</span>'));
+  assert.match(f.$('#subnet-list').innerHTML,/<span class="auto-ip-group"><span class="badge-auto">auto<\/span><span class="status-value">192\.0\.2\.20\/24<\/span>/);
   const meta=f.adoptionMeta.get(SUBNET);meta.applied=false;f.exports.renderSubnetList();
   assert(!f.$('#subnet-list').innerHTML.includes('badge-auto'),'pending is not applied');
   meta.applied=true;f.state.activeInterface={...f.iface,is_up:false};
@@ -320,6 +321,22 @@ test('A disconnected adapter and both Host IP rows survive repeated refresh fail
     for(const ip of f.iface.ips)assert(f.$('#subnet-list').innerHTML.includes(ip.address));
   }
   assert.equal(f.state.config.network_mode,'static_auto');
+});
+
+test('Cold startup stays neutral during a delayed failed read and then paints the real adapter',async()=>{
+  const f=fixture({initialSelection:false}),first=deferred();
+  f.api.getAdapterSelection=()=>first.promise;
+  const pending=f.exports.refreshInterfaces();
+  assert.equal(f.$('#iface-name').textContent,'Checking Ethernet…');
+  first.reject(Error('adapter provider changed during enumeration'));await pending;
+  assert.equal(f.$('#iface-name').textContent,'Checking Ethernet…');
+  assert.equal(f.state.activeInterface,null);assert.equal(f.feedback.length,0);
+  f.api.getAdapterSelection=async()=>({...f.selection,adapter:{...f.iface,is_up:false}});
+  await f.exports.refreshInterfaces();
+  assert.equal(f.$('#iface-name').textContent,'Ethernet (Disconnected)');
+  for(const ip of f.iface.ips)assert(f.$('#subnet-list').innerHTML.includes(ip.address));
+  f.api.getAdapterSelection=async()=>f.selection;await f.exports.refreshInterfaces();
+  assert.equal(f.$('#iface-name').textContent,'Ethernet');assert.equal(f.calls.writes,0);
 });
 
 test('Startup can paint a known disconnected selection when its first view query fails',async()=>{

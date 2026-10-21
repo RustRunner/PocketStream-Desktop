@@ -1478,6 +1478,13 @@
   gap: 4px;
 }
 
+/* Reserve all three dots so centered recovery text never shifts per tick. */
+.playback-dots {
+  display: inline-block;
+  width: 3ch;
+  text-align: left;
+}
+
 
 /* ── QR Code Dialog ────────────────────────────────────────────────── */
 
