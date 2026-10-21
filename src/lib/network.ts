@@ -141,6 +141,7 @@ export function refreshInterfaces(): Promise<void> {
   if (refreshFlight) { refreshTrailing = true; return refreshFlight; }
   const request = ++interfaceRefresh, bindings = ++bindingRefresh;
   refreshTrailing = false;
+  if (!state.activeInterface && !adapterSelection) $("#iface-name").textContent = "Checking Ethernet…";
   refreshFlight = (async () => {
     try {
       const [selection, snapshot, mode] = await Promise.all([
@@ -167,7 +168,7 @@ export function refreshInterfaces(): Promise<void> {
       // native view, including a disconnected adapter and its observed IPs.
       if (state.activeInterface) renderInterfaceName();
       else if (adapterSelection) applySelection(adapterSelection);
-      else $("#iface-name").textContent = "Error";
+      else $("#iface-name").textContent = "Checking Ethernet…";
       renderNetwork();
       warnNoEthernet();
     }
@@ -498,7 +499,7 @@ export function renderSubnetList(): void {
     const badge = managed && observed && meta?.applied && sessionAdoptedSubnets.has(subnet)
       ? '<span class="badge-auto">auto</span>' : "";
     return `<div class="status-row subnet-row" data-subnet="${escapeHtml(subnet)}">
-      <span class="status-label">IP:</span><span class="auto-ip-group"><span class="status-value">${escapeHtml(cidr)}</span>${badge}</span></div>`;
+      <span class="status-label">IP:</span><span class="auto-ip-group">${badge}<span class="status-value">${escapeHtml(cidr)}</span></span></div>`;
   }).join("");
   lockAddressControls();
 }

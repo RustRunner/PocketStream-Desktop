@@ -3062,9 +3062,13 @@ impl NetworkManager {
     async fn native_interfaces(
         &self,
         selected_mac: Option<&str>,
-    ) -> Result<Vec<InterfaceInfo>, AppError> {
+    ) -> Result<(Vec<interface::NativeAdapter>, Vec<InterfaceInfo>), AppError> {
         let Some(mac) = selected_mac else {
-            return self.list_interfaces().await;
+            let views = self.list_interfaces().await?;
+            return Ok((
+                interface::read_native_with(self.address_io.as_ref()).await?,
+                views,
+            ));
         };
         let mut all = interface::read_native_with(self.address_io.as_ref()).await?;
         if let Ok(selected) = interface::select_native(&all, mac) {
@@ -3085,14 +3089,42 @@ impl NetworkManager {
             .collect();
         let pending = self.pending_ip_strings().await;
         views = strip_pending_ips(views, &pending);
-        Ok(views)
+        Ok((all, views))
+    }
+
+    /// A native display snapshot, without discovery/address locks or writes.
+    /// It does not change the backend's selected adapter or session lifecycle.
+    pub async fn adapter_selection_view(
+        &self,
+        config: &crate::config::AppConfig,
+    ) -> Result<AdapterSelection, AppError> {
+        let selected_mac = config.get().selected_adapter_mac;
+        let (native, views) = self.native_interfaces(selected_mac.as_deref()).await?;
+        if config.get().selected_adapter_mac != selected_mac {
+            return Err(AppError::Network(
+                "Selected adapter changed during display read; retry".into(),
+            ));
+        }
+        let adapter = pick_adapter(&views, selected_mac.as_deref()).cloned();
+        let interface_index = adapter
+            .as_ref()
+            .map(|a| interface::select_native(&native, &a.mac).map(|n| n.index))
+            .transpose()?;
+        let candidates: Vec<_> = views.into_iter().filter(adapter_candidate).collect();
+        Ok(AdapterSelection {
+            selection_required: selected_mac.is_none() && candidates.len() > 1,
+            selected_mac,
+            adapter,
+            interface_index,
+            candidates,
+        })
     }
 
     pub async fn get_adapter_selection(
         &self,
         config: &crate::config::AppConfig,
     ) -> Result<AdapterSelection, AppError> {
-        let list = self
+        let (_, list) = self
             .native_interfaces(config.get().selected_adapter_mac.as_deref())
             .await?;
         self.resolve_adapter_selection(config, &list).await
@@ -5594,6 +5626,99 @@ mod tests {
         let mut iface = adapter("Ethernet", ips);
         iface.mac = "40:cd:3a:00:00:01".into();
         iface
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn host_view_reads_fresh_link_and_ips_without_lifecycle_locks_or_writes() {
+        use interface::address_test_io::FakeAddressIo;
+        let io = FakeAddressIo::new(&["192.168.2.100", "192.168.1.100"]);
+        let manager = NetworkManager::with_address_io(io.clone());
+        let config = crate::config::AppConfig::temporary_test_config(crate::config::AppSettings {
+            selected_adapter_mac: Some("40:cd:3a:00:00:01".into()),
+            ..Default::default()
+        });
+        let before = toml::to_string(&config.get()).unwrap();
+        let _discovery = manager.discovery_op.lock().await;
+        let _address = manager.address_work.lock().await;
+        for up in [false, true] {
+            io.table.lock().unwrap()[0].is_up = up;
+            let view = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                manager.adapter_selection_view(&config),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(view.interface_index, Some(7));
+            assert_eq!(view.selected_mac, config.get().selected_adapter_mac);
+            let iface = view.adapter.unwrap();
+            assert_eq!(iface.is_up, up);
+            assert_eq!(iface.ips.len(), 2);
+            assert_eq!(iface.ips[0].address, "192.168.2.100");
+        }
+        assert_eq!(io.providers.load(Ordering::Relaxed), 0);
+        assert!(io.writes.lock().unwrap().is_empty());
+        assert!(io.saves.lock().unwrap().is_empty());
+        assert_eq!(toml::to_string(&config.get()).unwrap(), before);
+        assert!(manager.adapter_selection_state().await.adapter.is_none());
+        assert!(!manager.discovery_active.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn host_view_native_absence_or_unknown_state_never_substitutes_another_adapter() {
+        use interface::address_test_io::FakeAddressIo;
+        for case in 0..4 {
+            let io = FakeAddressIo::new(&["192.168.2.100"]);
+            let config =
+                crate::config::AppConfig::temporary_test_config(crate::config::AppSettings {
+                    selected_adapter_mac: Some(
+                        if case == 0 {
+                            "aa:bb:cc:dd:ee:ff"
+                        } else {
+                            "40:cd:3a:00:00:01"
+                        }
+                        .into(),
+                    ),
+                    ..Default::default()
+                });
+            match case {
+                1 => io.table.lock().unwrap().clear(),
+                2 => io.fail_read.store(true, Ordering::Relaxed),
+                3 => io.table.lock().unwrap()[0].index = 8,
+                _ => {}
+            }
+            let manager = NetworkManager::with_address_io(io.clone());
+            let result = manager.adapter_selection_view(&config).await;
+            if case < 2 {
+                let view = result.unwrap();
+                assert!(view.adapter.is_none() && view.interface_index.is_none());
+                assert_eq!(view.selected_mac, config.get().selected_adapter_mac);
+            } else {
+                assert!(result.is_err());
+            }
+            assert!(io.writes.lock().unwrap().is_empty());
+            assert!(io.saves.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn host_view_rejects_a_selection_changed_during_its_native_read() {
+        use interface::address_test_io::FakeAddressIo;
+        let io = FakeAddressIo::new(&["192.168.2.100"]);
+        *io.delay.lock().unwrap() = std::time::Duration::from_millis(100);
+        let manager = Arc::new(NetworkManager::with_address_io(io.clone()));
+        let config = Arc::new(crate::config::AppConfig::temporary_test_config(
+            crate::config::AppSettings {
+                selected_adapter_mac: Some("40:cd:3a:00:00:01".into()),
+                ..Default::default()
+            },
+        ));
+        let (m, c) = (manager.clone(), config.clone());
+        let read = tokio::spawn(async move { m.adapter_selection_view(&c).await });
+        tokio::task::yield_now().await;
+        config.settings.lock().unwrap().selected_adapter_mac = Some("aa:bb:cc:dd:ee:ff".into());
+        assert!(read.await.unwrap().is_err());
+        assert!(io.writes.lock().unwrap().is_empty());
     }
 
     #[derive(Default)]

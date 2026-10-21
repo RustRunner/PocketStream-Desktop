@@ -23,6 +23,9 @@ function fixture() {
       };
     }
     appendChild(child) { child.parent = this; this.children.push(child); return child; }
+    get textContent() { return (this._text || '') + (this.children || []).map(c => c.textContent).join(''); }
+    set textContent(value) { this._text=String(value);this.children=[]; }
+    setAttribute(name,value) { this.attributes ??= {};this.attributes[name]=value; }
     append(...children) { children.forEach(c => this.appendChild(c)); }
     remove() { if (this.parent) this.parent.children = this.parent.children.filter(c => c !== this); }
     addEventListener(name, callback) { this.listeners[name] = callback; }
@@ -145,6 +148,9 @@ test("Recovery shows one message with cycling dots, no button/countdown/toast, a
   for (const dots of ["..", "...", "."]) {
     f.advance(1000); publish(status());
     assert.equal(overlay.querySelector(".playback-reason").textContent, `Network Error: Check link. Retrying${dots}`);
+    assert.equal(overlay.querySelector(".playback-dots").textContent, dots);
+    assert.equal(overlay.querySelector(".playback-dots").attributes['aria-hidden'], 'true');
+    assert.equal(overlay.querySelector(".playback-reason")._text, 'Network Error: Check link. Retrying');
   }
   publish(status({ playback_next_retry_secs: 0 }));
   assert.equal(overlay.querySelector(".playback-reason").textContent, "Network Error: Check link. Retrying.");

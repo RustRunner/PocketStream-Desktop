@@ -699,9 +699,17 @@ function showStreamLost(status: StreamStatus): void {
   else recoveryDotsStartedAt = null;
   const dots = ".".repeat(1 + Math.floor((Date.now() - (recoveryDotsStartedAt ?? Date.now())) / 1000) % 3);
   const message = recovering
-    ? `Network Error: Check link. Retrying${dots}`
+    ? "Network Error: Check link. Retrying"
     : status.playback_state === "failed" ? `Playback failed${reason ? `: ${reason}` : ""}` : "Connecting";
-  overlay.querySelector<HTMLElement>(".playback-reason")!.textContent = message;
+  const label = overlay.querySelector<HTMLElement>(".playback-reason")!;
+  label.textContent = message;
+  if (recovering) {
+    const suffix = document.createElement("span");
+    suffix.className = "playback-dots";
+    suffix.setAttribute("aria-hidden", "true");
+    suffix.textContent = dots;
+    label.append(suffix);
+  }
   overlay.classList.add("visible");
 }
 

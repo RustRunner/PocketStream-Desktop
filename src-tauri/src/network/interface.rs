@@ -135,6 +135,10 @@ pub(crate) fn invalidate_adapter_snapshot() {
 }
 
 async fn adapter_snapshot() -> Result<Vec<InterfaceInfo>, AppError> {
+    // Establish identity before get() captures its generation. The first
+    // notification must not invalidate its own cold metadata enumeration.
+    #[cfg(windows)]
+    observe_topology(&ADAPTER_SNAPSHOT, &local_adapters_iphelper()?);
     ADAPTER_SNAPSHOT
         .get(|| async {
             #[cfg(target_os = "windows")]
@@ -623,20 +627,7 @@ async fn query_adapters_windows() -> Result<Vec<InterfaceInfo>, AppError> {
             })
         })
         .collect();
-    if generation
-        == ADAPTER_SNAPSHOT
-            .generation
-            .load(std::sync::atomic::Ordering::Acquire)
-    {
-        *ADAPTER_SNAPSHOT
-            .qualified
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = qualified;
-        *ADAPTER_SNAPSHOT
-            .topology
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = topology(&native);
-    }
+    publish_qualification(&ADAPTER_SNAPSHOT, generation, &native, qualified);
     Ok(adapters.iter().map(|a| parse_adapter(a, false)).collect())
 }
 
@@ -945,12 +936,29 @@ pub(crate) async fn notification_topology_changed() -> Result<bool, AppError> {
 }
 fn observe_topology(cache: &AdapterSnapshot, all: &[NativeAdapter]) -> bool {
     let next = topology(all);
-    let changed = *cache.topology.lock().unwrap_or_else(|p| p.into_inner()) != next;
+    let mut current = cache.topology.lock().unwrap_or_else(|p| p.into_inner());
+    let changed = *current != next;
     if changed {
         cache.invalidate();
-        *cache.topology.lock().unwrap_or_else(|p| p.into_inner()) = next;
+        *current = next;
     }
     changed
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn publish_qualification(
+    cache: &AdapterSnapshot,
+    generation: u64,
+    native: &[NativeAdapter],
+    qualified: Vec<(NativeIdentity, InterfaceInfo)>,
+) {
+    // Share the topology lock with invalidation so an older query cannot
+    // publish qualification after a replacement/index change retires it.
+    let mut current = cache.topology.lock().unwrap_or_else(|p| p.into_inner());
+    if generation == cache.generation.load(std::sync::atomic::Ordering::Acquire) {
+        *cache.qualified.lock().unwrap_or_else(|p| p.into_inner()) = qualified;
+        *current = topology(native);
+    }
 }
 
 /// A local adapter's MAC, up-state, and IPv4 addresses as read from the IP
@@ -1788,6 +1796,45 @@ mod tests {
         assert_eq!(registry.snapshot()[0].status, DeviceStatus::Offline);
         assert!(fence.is_stale());
         assert_eq!(registry.snapshot().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initial_topology_before_metadata_query_does_not_cancel_it_on_link_notification() {
+        let cache = std::sync::Arc::new(AdapterSnapshot::default());
+        let io = address_test_io::FakeAddressIo::new(&["192.168.2.100"]);
+        let mut native = io.table.lock().unwrap().clone();
+        assert!(observe_topology(&cache, &native));
+        let c = cache.clone();
+        let query = tokio::spawn(async move {
+            c.get(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                Ok(vec![])
+            })
+            .await
+        });
+        tokio::task::yield_now().await;
+        native[0].is_up = false;
+        native[0].ips.clear();
+        assert!(!observe_topology(&cache, &native));
+        assert!(query.await.unwrap().is_ok());
+        assert!(cache.cached().is_some());
+    }
+
+    #[test]
+    fn topology_change_rejects_late_qualification_publication() {
+        let cache = AdapterSnapshot::default();
+        let io = address_test_io::FakeAddressIo::new(&["192.168.2.100"]);
+        let mut native = io.table.lock().unwrap().clone();
+        observe_topology(&cache, &native);
+        let generation = cache.generation.load(std::sync::atomic::Ordering::Acquire);
+        let qualified = vec![(native[0].identity(), io.descriptor(&native[0]).unwrap())];
+        publish_qualification(&cache, generation, &native, qualified.clone());
+        assert_eq!(cache.qualified.lock().unwrap().len(), 1);
+        native[0].index += 1;
+        assert!(observe_topology(&cache, &native));
+        publish_qualification(&cache, generation, &native, qualified);
+        assert!(cache.qualified.lock().unwrap().is_empty());
+        assert_eq!(*cache.topology.lock().unwrap(), topology(&native));
     }
 
     #[tokio::test(start_paused = true)]
