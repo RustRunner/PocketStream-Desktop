@@ -722,6 +722,14 @@ pub(crate) trait AddressIo: Send + Sync {
     fn claim(&self, config: &crate::config::AppConfig, ip: &str) -> Result<(), AppError> {
         config.claim_binding(ip)
     }
+    fn forget_completed_removal(
+        &self,
+        config: &crate::config::AppConfig,
+        subnet: &str,
+        expected: &crate::config::AdoptedMeta,
+    ) -> Result<(), AppError> {
+        config.forget_completed_removal(subnet, expected)
+    }
     fn persist_primary(
         &self,
         config: &crate::config::AppConfig,

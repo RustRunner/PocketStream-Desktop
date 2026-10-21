@@ -433,9 +433,9 @@ impl NetworkManager {
         if !add && tx.subnet.is_some() {
             return self.remove_saved_operation(config, before, fence, tx).await;
         }
-        // Explicit removal of an unmanaged address must not be undone by a
-        // later automatic adoption. Use the existing subnet tombstone when
-        // it does not belong to another address; never overwrite another row.
+        // Track unmanaged removal durably until Windows confirms absence.
+        // Fresh discovery may adopt again after completion. Never overwrite
+        // another address's saved row to record this removal.
         if !add {
             if let Some(prefix) = tx.prefix {
                 let subnet = ipnetwork::Ipv4Network::new(tx.address.parse().unwrap(), prefix)
@@ -922,6 +922,14 @@ mod tests {
         fn claim(&self, c: &AppConfig, ip: &str) -> Result<(), AppError> {
             c.claim_binding_with(ip, |_| self.persist("claim", ip))
         }
+        fn forget_completed_removal(
+            &self,
+            c: &AppConfig,
+            subnet: &str,
+            expected: &AdoptedMeta,
+        ) -> Result<(), AppError> {
+            c.forget_completed_removal_with(subnet, expected, |_| self.persist("retire", subnet))
+        }
         fn persist_primary(&self, c: &AppConfig, mac: &str, cidr: &str) -> Result<(), AppError> {
             c.set_primary_address_with(mac, cidr, |_| self.persist("primary", cidr))
         }
@@ -976,6 +984,175 @@ mod tests {
             subnet: TARGET.into(),
             hint: Some("Ethernet".into()),
         }
+    }
+
+    fn adoption_test_fence() -> SweepFence {
+        SweepFence::new(
+            1,
+            Arc::new(AtomicU64::new(1)),
+            Arc::new(AtomicBool::new(true)),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_removal_allows_fresh_adoption_in_session_and_after_restart() {
+        for managed in [false, true] {
+            for restart in [false, true] {
+                let (m, c, io) = fixture(usize::from(managed));
+                {
+                    let mut table = io.os.table.lock().unwrap();
+                    let primary = &mut table[0].ips[0];
+                    primary.address = "192.168.2.100".into();
+                    primary.subnet = "192.168.2.0/24".into();
+                }
+                c.settings
+                    .lock()
+                    .unwrap()
+                    .primary_addresses
+                    .insert("40:cd:3a:00:00:01".into(), "192.168.2.100/24".into());
+                let request = if managed {
+                    removal()
+                } else {
+                    AddressRequest::RemoveManual {
+                        name: "Ethernet".into(),
+                        ip: IP.into(),
+                    }
+                };
+                let result = m.address_operation(&c, request).await;
+                assert_eq!(result.outcome, AddressOutcome::Success);
+                assert!(c.get().adopted_meta[TARGET].removal_complete());
+                let before = c.get();
+                let c = if restart {
+                    Arc::new(AppConfig::temporary_test_config(
+                        toml::from_str(&toml::to_string(&before).unwrap()).unwrap(),
+                    ))
+                } else {
+                    c
+                };
+                let manager = NetworkManager::with_address_io(io.clone());
+                *manager.adopted_meta.lock().unwrap() = c.get().adopted_meta.clone();
+                let session = adoption_test_fence();
+                let address = manager.address_fence();
+                manager
+                    .prepare_subnet_adoption(&c, TARGET, "40:cd:3a:00:00:01", 7, &session, &address)
+                    .await
+                    .unwrap();
+                assert!(!c.get().adopted_meta.contains_key(TARGET));
+                assert!(!manager.adopted_meta.lock().unwrap().contains_key(TARGET));
+                assert!(c.get().adopted_subnets.is_empty());
+                assert_eq!(c.get().primary_addresses, before.primary_addresses);
+                assert_eq!(*io.os.writes.lock().unwrap(), [(false, IP.into())]);
+                assert!(io.os.table.lock().unwrap()[0]
+                    .ips
+                    .iter()
+                    .any(|i| i.address == "192.168.2.100"));
+                assert!(io
+                    .events
+                    .lock()
+                    .unwrap()
+                    .contains(&format!("retire:{TARGET}")));
+                // The normal commit path can now accept a freshly verified
+                // adoption; a late status write could not clear the tombstone.
+                c.set_binding_for_operation_with(
+                    TARGET,
+                    AdoptedMeta {
+                        adapter_mac: Some("40:cd:3a:00:00:01".into()),
+                        address: Some(IP.into()),
+                        prefix: Some(24),
+                        applied: true,
+                        ..Default::default()
+                    },
+                    false,
+                    |_| Ok(()),
+                )
+                .unwrap();
+                assert_eq!(c.get().adopted_subnets[TARGET], IP);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fresh_adoption_never_bypasses_pending_removal_or_unknown_native_state() {
+        for case in 0..15 {
+            let (m, c, io) = fixture(1);
+            let mut row = c.get().adopted_meta[TARGET].clone();
+            row.desired = BindingDesired::Removed;
+            row.applied = false;
+            io.os.table.lock().unwrap()[0]
+                .ips
+                .retain(|i| i.address != IP);
+            let session = adoption_test_fence();
+            let address = adoption_test_fence();
+            match case {
+                0 => row.desired = BindingDesired::Present,
+                1 => row.applied = true,
+                2 => row.last_error = Some("Removal awaiting Windows confirmation".into()),
+                3 => io.os.fail_read.store(true, Ordering::Relaxed),
+                4 => io.os.table.lock().unwrap()[0].dhcp = true,
+                5 => io.os.table.lock().unwrap()[0].is_up = false,
+                6 => io.os.table.lock().unwrap()[0].index = 8,
+                7 => row.adapter_mac = Some("aa:bb:cc:dd:ee:ff".into()),
+                8 => session.active.store(false, Ordering::Relaxed),
+                9 => address.current.store(2, Ordering::Relaxed),
+                10 => io.os.table.lock().unwrap()[0].ips.push(interface::IpInfo {
+                    address: IP.into(),
+                    prefix: 24,
+                    subnet: TARGET.into(),
+                }),
+                11 => io.os.table.lock().unwrap()[0].ips.push(interface::IpInfo {
+                    address: IP.into(),
+                    prefix: 25,
+                    subnet: "192.0.2.0/25".into(),
+                }),
+                12 => row.prefix = None,
+                13 => c.settings.lock().unwrap().network_mode = NetworkMode::Dhcp,
+                _ => c.settings.lock().unwrap().network_mode = NetworkMode::StaticManual,
+            }
+            {
+                let mut settings = c.settings.lock().unwrap();
+                settings.adopted_subnets.clear();
+                settings.adopted_meta.insert(TARGET.into(), row.clone());
+            }
+            assert!(
+                m.prepare_subnet_adoption(&c, TARGET, "40:cd:3a:00:00:01", 7, &session, &address,)
+                    .await
+                    .is_err(),
+                "case {case}"
+            );
+            assert_eq!(c.get().adopted_meta[TARGET], row, "case {case}");
+            assert!(io.os.writes.lock().unwrap().is_empty());
+            assert!(!io
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.starts_with("retire:")));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_removal_save_failure_keeps_intent_and_prevents_adoption() {
+        let (m, c, io) = fixture(1);
+        assert_eq!(
+            m.address_operation(&c, removal()).await.outcome,
+            AddressOutcome::Success
+        );
+        let before = c.get().adopted_meta[TARGET].clone();
+        let saves = io.saves.load(Ordering::Relaxed);
+        io.fail_save.store(saves + 1, Ordering::Relaxed);
+        let fence = adoption_test_fence();
+        assert!(m
+            .prepare_subnet_adoption(&c, TARGET, "40:cd:3a:00:00:01", 7, &fence, &fence,)
+            .await
+            .is_err());
+        assert_eq!(c.get().adopted_meta[TARGET], before);
+        assert_eq!(m.adopted_meta.lock().unwrap()[TARGET], before);
+        assert_eq!(*io.os.writes.lock().unwrap(), [(false, IP.into())]);
+        io.fail_save.store(0, Ordering::Relaxed);
+        m.prepare_subnet_adoption(&c, TARGET, "40:cd:3a:00:00:01", 7, &fence, &fence)
+            .await
+            .unwrap();
+        assert!(!c.get().adopted_meta.contains_key(TARGET));
     }
 
     fn primary_request(previous: Option<&str>) -> ModeTransition {
