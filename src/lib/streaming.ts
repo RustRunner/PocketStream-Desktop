@@ -700,11 +700,12 @@ function showStreamLost(status: StreamStatus): void {
     area.appendChild(overlay);
   }
   const reason = status.playback_fault?.reason;
-  const phase = status.playback_state === "failed" ? "Playback failed" : status.playback_state === "starting" ? "Connecting" : "Recovering";
-  const retry = status.playback_next_retry_secs === null ? "" : ` — retry in ${status.playback_next_retry_secs}s`;
-  const message = status.playback_state === "recovering" && reason
-    ? reason : `${phase}${reason ? `: ${reason}` : ""}`;
-  overlay.querySelector<HTMLElement>(".playback-reason")!.textContent = `${message}${retry}`;
+  const recovering = status.playback_state === "recovering"
+    || (status.playback_state === "starting" && status.playback_fault !== null);
+  const message = recovering
+    ? `Network Error: Check link. Retrying in ${status.playback_next_retry_secs ?? 0}s…`
+    : status.playback_state === "failed" ? `Playback failed${reason ? `: ${reason}` : ""}` : "Connecting";
+  overlay.querySelector<HTMLElement>(".playback-reason")!.textContent = message;
   overlay.classList.add("visible");
 }
 

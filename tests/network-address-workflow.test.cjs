@@ -10,7 +10,7 @@ const flush = async () => { for(let i=0;i<40;i++) await Promise.resolve(); };
 const deferred = () => { let resolve,reject; const promise=new Promise((a,b)=>{resolve=a;reject=b;});return {promise,resolve,reject}; };
 const IP='192.0.2.20', SUBNET='192.0.2.0/24', MAC='40:cd:3a:00:00:01';
 function fixture() {
-  const events=new Map(), elements=new Map(), calls={selection:0,bindings:0,mode:0,dhcp:0,writes:0}, feedback=[];
+  const events=new Map(), elements=new Map(), calls={selection:0,bindings:0,mode:0,dhcp:0,writes:0}, feedback=[], removals=[];
   let now=0, throwRender=false;
   const iface={name:'Ethernet', display_name:'Ethernet', mac:MAC, is_up:true, is_ethernet:true, is_vpn:false,is_virtual:false,
     ips:[{address:'192.0.2.10',prefix:24,subnet:SUBNET},{address:IP,prefix:24,subnet:SUBNET}]};
@@ -31,8 +31,9 @@ function fixture() {
     Object.defineProperty(el,'innerHTML',{get:()=>html,set(value){
       if(id==='#subnet-list' && throwRender){throwRender=false;throw Error('injected render failure');}
       html=value;el.buttons=[];
-      for(const match of value.matchAll(/<button[^>]*data-remove-(adopted|binding)="([^"]*)"[^>]*>/g)) {
-        const key=match[1]==='adopted'?'removeAdopted':'removeBinding';el.buttons.push(element('',{[key]:match[2]}));
+      if(id==='#static-iface')el.value=value.match(/<option value="([^"]*)"/)?.[1]??'';
+      for(const match of value.matchAll(/<button[^>]*data-remove-(adopted|binding|ip)="([^"]*)"[^>]*>/g)) {
+        const key=match[1]==='adopted'?'removeAdopted':match[1]==='binding'?'removeBinding':'removeIp';el.buttons.push(element('',{[key]:match[2]}));
       }
     }});
     return el;
@@ -47,6 +48,7 @@ function fixture() {
     getNetworkMode:async()=>{calls.mode++;return 'static_auto';},getDhcpState:async()=>{calls.dhcp++;return false;},
     addSecondaryIp:()=>{calls.writes++;const d=deferred();pending.push(d);return d.promise;},
     removeAdoptedSubnet:()=>{calls.writes++;const d=deferred();pending.push(d);return d.promise;},
+    removeSecondaryIp:(name,ip)=>{calls.writes++;removals.push({name,ip});const d=deferred();pending.push(d);return d.promise;},
     selectAdapter:async()=>selection,
   };
   const deps={
@@ -64,12 +66,99 @@ function fixture() {
   exports.setupIpConfigDialog();exports.setupInterfaceWatcher();events.get('adapter-selection-changed')(selection);
   exports.renderSubnetList();
   const reply=(extra={})=>({operation:1,outcome:'success',reason:null,view:{selection:{...selection,adapter:{...iface,ips:iface.ips.filter(i=>i.address!==IP)},candidates:[{...iface,ips:iface.ips.filter(i=>i.address!==IP)}]},identity:{guid:'guid-a',index:7,mac:MAC,alias:'Ethernet'},dhcp:false,observation_error:null,subnet:SUBNET,binding:{...meta,desired:'removed',applied:false},address:IP,prefix:24,mode:'static_auto'},...extra});
-  return {exports,api,events,$,calls,pending,feedback,state,selection,iface,adoptionMeta,adoptedSubnets,reply,
+  return {exports,api,events,$,calls,pending,feedback,removals,state,selection,iface,adoptionMeta,adoptedSubnets,reply,
     failRender(){throwRender=true;},
     async hostRemove(){const btn=$('#subnet-list').buttons[0];assert(btn);return $('#subnet-list').fire('click',{target:btn});},
     setSelection(next){events.get('adapter-selection-changed')(next);},
   };
 }
+
+test('Configure stays usable during a fresh read and Add reaches the mutation handler',async()=>{
+  const f=fixture(),read=deferred();
+  f.api.getAdapterSelection=()=>{f.calls.selection++;return read.promise;};
+  const opening=f.$('#btn-ip-config').fire('click');await flush();
+  assert.equal(f.$('#ip-config-dialog').open,true);
+  assert.equal(f.$('#static-iface').value,'Ethernet');
+  const add=f.$('#btn-add-sec-ip').fire('click');assert.equal(f.calls.writes,1);
+  const reply=f.reply();reply.view.selection=f.selection;reply.view.subnet=null;reply.view.binding=null;
+  f.pending[0].resolve(reply);await add;read.resolve(f.selection);await opening;await flush();
+  assert.equal(f.calls.selection,1);assert.equal(f.$('#btn-add-sec-ip').disabled,false);
+});
+
+test('Unchanged events emitted by the selection query do not invalidate Configure or feed another fetch',async()=>{
+  const f=fixture();
+  f.api.getAdapterSelection=async()=>{
+    f.calls.selection++;
+    if(f.calls.selection<=3){f.setSelection({...f.selection});f.events.get('interface-status-changed')({...f.iface});}
+    return f.selection;
+  };
+  await f.$('#btn-ip-config').fire('click');await flush();
+  assert.equal(f.$('#static-iface').value,'Ethernet');
+  assert.equal(f.calls.selection,1);assert.equal(f.calls.bindings,1);
+  assert(f.$('#secondary-ip-list').innerHTML.includes(IP));
+});
+
+test('A genuine address event still retires an older interface read',async()=>{
+  const f=fixture(),old=deferred(),ip='198.51.100.10';
+  const current={...f.selection,adapter:{...f.iface,ips:[{address:ip,prefix:24,subnet:'198.51.100.0/24'}]}};
+  current.candidates=[current.adapter];
+  f.api.getAdapterSelection=()=>{f.calls.selection++;return f.calls.selection===1?old.promise:Promise.resolve(current);};
+  const read=f.exports.refreshInterfaces();
+  f.setSelection(current);f.events.get('interface-status-changed')(current.adapter);
+  old.resolve(f.selection);await read;await flush();
+  assert(f.state.activeInterface.ips.some(i=>i.address===ip));
+  assert.equal(f.calls.selection,2,'one trailing read for the genuine change');
+});
+
+test('An unchanged self-emitted event after a verified mutation does not schedule a second fetch',async()=>{
+  const f=fixture();const add=f.$('#btn-add-sec-ip').fire('click');
+  const result=f.reply();result.view.selection=f.selection;result.view.subnet=null;result.view.binding=null;
+  f.pending[0].resolve(result);await add;
+  f.api.getAdapterSelection=async()=>{
+    f.calls.selection++;
+    if(f.calls.selection<=3){f.setSelection({...f.selection});f.events.get('interface-status-changed')({...f.iface});}
+    return f.selection;
+  };
+  await f.exports.refreshInterfaces();await flush();
+  assert.equal(f.calls.selection,1);assert.equal(f.calls.bindings,1);
+});
+
+test('Explicit removal of an observed host IP uses its exact address in either enumeration order',async()=>{
+  for(const reverse of [false,true]){
+    const f=fixture(),ip='198.51.100.10';
+    f.iface.ips.push({address:ip,prefix:24,subnet:'198.51.100.0/24'});
+    if(reverse)f.iface.ips.reverse();
+    await f.$('#btn-ip-config').fire('click');
+    const btn=f.$('#secondary-ip-list').buttons.find(b=>b.dataset.removeIp===ip);assert(btn);
+    const one=btn.fire('click'),two=btn.fire('click');assert.equal(f.calls.writes,1);
+    assert.equal(btn.disabled,true);assert.deepEqual(f.removals,[{name:'Ethernet',ip}]);
+    const reply=f.reply();reply.view.subnet=null;reply.view.binding=null;reply.view.address=ip;
+    reply.view.selection={...f.selection,adapter:{...f.iface,ips:f.iface.ips.filter(i=>i.address!==ip)},
+      candidates:[{...f.iface,ips:f.iface.ips.filter(i=>i.address!==ip)}]};
+    const before={...f.calls};f.pending[0].resolve(reply);await one;await two;await flush();
+    assert(!f.$('#subnet-list').innerHTML.includes(ip));assert(!f.$('#secondary-ip-list').innerHTML.includes(ip));
+    assert.equal(f.adoptionMeta.get(SUBNET).desired,'present');
+    assert.equal(f.calls.selection,before.selection);assert.equal(f.$('#btn-add-sec-ip').disabled,false);
+  }
+});
+
+test('The two unmanaged host IPs have Remove buttons and plain address labels',async()=>{
+  for(const reverse of [false,true]){
+    const f=fixture();f.adoptionMeta.clear();f.adoptedSubnets.clear();
+    f.api.getAdoptionState=async()=>{f.calls.bindings++;return {adopted_subnets:{},meta:{}};};
+    f.iface.ips=[{address:'10.3.1.10',prefix:24,subnet:'10.3.1.0/24'},
+      {address:'192.168.1.100',prefix:24,subnet:'192.168.1.0/24'}];
+    if(reverse)f.iface.ips.reverse();
+    await f.$('#btn-ip-config').fire('click');
+    const list=f.$('#secondary-ip-list');
+    assert.equal(list.buttons.length,2);
+    for(const ip of f.iface.ips){
+      assert(list.buttons.some(btn=>btn.dataset.removeIp===ip.address));
+      assert(list.innerHTML.includes(`<span>${ip.address}/24</span>`));
+    }
+    assert(!/ownership|reconciliation|applied/.test(list.innerHTML));
+  }
+});
 
 test('SP10 double Add click acknowledges synchronously, disables both panels and issues one IPC',async()=>{
   const f=fixture();

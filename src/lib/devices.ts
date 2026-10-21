@@ -68,7 +68,7 @@ function cssAttrValue(value: string): string {
 
 // ── Local scanning state ────────────────────────────────────────────
 
-/** Current capture state for the launch notice and degraded indicator. */
+/** Current capture state for the launch notice and diagnostics. */
 export let captureState: CaptureState = {
   candidate_count: 0,
   active: false,
@@ -86,14 +86,10 @@ function updateCaptureState(next: CaptureState): void {
   captureState = next;
   captureRevision++;
   const indicator = $("#capture-scope-status");
-  const outcome = next.active ? next.outcome : null;
-  const message = outcome?.scope === "scoped_by_name"
-    ? "Discovery degraded: capture matched by name. Devices require Ethernet verification."
-    : outcome?.scope === "unscoped_fallback"
-      ? `Discovery degraded: unscoped capture (${outcome.reason}). Devices require Ethernet verification.`
-      : "";
-  indicator.textContent = message;
-  indicator.hidden = !message;
+  // Capture scope remains available to the notice and logger; the Nodes card
+  // shows the devices without a permanent explanation of the capture fallback.
+  indicator.textContent = "";
+  indicator.hidden = true;
   for (const subscriber of captureSubscribers) subscriber(next);
 }
 

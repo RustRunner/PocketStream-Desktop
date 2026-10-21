@@ -10,6 +10,7 @@ const flush = async () => { for (let i = 0; i < 20; i++) await Promise.resolve()
 // Actual modules/controllers; fake only DOM, IPC and timers. No new framework.
 function fixture() {
   const ids = new Map(), events = new Map(), timers = [], logs = [], visibility = [];
+  let now = 20000;
   class Element {
     constructor(tag = "div") {
       Object.assign(this, { tag, className: "", textContent: "", innerHTML: "", style: {}, children: [], listeners: {} });
@@ -51,8 +52,11 @@ function fixture() {
     onEvent: async (name, callback) => { events.set(name, callback); return () => {}; },
     setVideoVisible: async value => { visibility.push(value); },
     retryPlayback: async () => {}, getCaptureState: async () => null,
+    takeScreenshot: async () => "C:\\Pictures\\PocketStream\\capture.jpg",
+    startRecording: async () => {}, stopRecording: async () => "C:\\Videos\\PocketStream\\recording.mp4",
   };
-  const globals = { document, console: { log() {} }, setTimeout: fn => { timers.push(fn); return timers.length; }, clearTimeout() {} };
+  const globals = { document, console: { log() {} }, Date: class extends Date { static now() { return now; } },
+    setTimeout: fn => { timers.push(fn); return timers.length; }, clearTimeout() {} };
   function load(text, deps = {}, extra = {}) {
     const exports = {};
     vm.runInNewContext(ts.transpileModule(text, {
@@ -79,16 +83,26 @@ function fixture() {
     + "\nexports.showUpdateToast = showUpdateToast;", {}, { api, formatError: String });
   return { api, shared, network, streaming, updater, load, deps, events, logs, visibility,
     $: shared.$, toast: () => body.querySelector(".toast"), update: () => body.querySelector(".update-toast"),
-    runTimers: () => timers.splice(0).forEach(fn => fn()) };
+    advance: ms => { now += ms; }, runTimers: () => timers.splice(0).forEach(fn => fn()) };
 }
 
-test("Routine status is logged without creating or evicting an actionable toast", () => {
+test("User actions retain success and error toasts alongside diagnostics", () => {
   const f = fixture();
-  f.shared.showToast("Settings saved"); assert.equal(f.toast(), null);
+  f.shared.showToast("Settings saved"); assert.equal(f.toast().textContent, "Settings saved");
   f.shared.showToast("Enter a valid address", true);
   const error = f.toast(); assert.equal(error.textContent, "Enter a valid address");
-  f.shared.showToast("Stream recovered"); assert.equal(f.toast(), error);
+  f.shared.showToast("Address updated"); assert.equal(f.toast().textContent, "Address updated");
   assert(f.logs.some(x => x.message.includes("Settings saved")));
+});
+
+test("Screenshot and recording buttons show the saved file paths", async () => {
+  const f = fixture(); f.streaming.setupStreamControls();
+  await f.$("#btn-screenshot").fire("click");
+  assert.equal(f.toast().textContent, "Screenshot saved: C:\\Pictures\\PocketStream\\capture.jpg");
+  await f.$("#btn-record").fire("click");
+  assert.equal(f.toast().textContent, "Recording started");
+  f.advance(1000); await f.$("#btn-record").fire("click");
+  assert.equal(f.toast().textContent, "Recording saved: C:\\Videos\\PocketStream\\recording.mp4");
 });
 
 test("Update toast keeps Install and survives routine and error notifications", async () => {
@@ -123,13 +137,16 @@ test("Drop/recovery uses only the persistent reason and preserves Retry/countdow
   const publish = f.events.get("stream-status"); publish(status()); await flush();
   const overlay = f.$("#video-area").querySelector(".stream-lost-overlay");
   assert.equal(overlay.querySelector(".playback-reason").textContent,
-    "Network error: Selected Ethernet adapter unavailable — retry in 24s");
+    "Network Error: Check link. Retrying in 24s…");
   assert.equal(f.toast(), null); assert(overlay.classList.contains("visible"));
   assert.equal(f.visibility.at(-1), false);
   await overlay.querySelector("button").fire("click");
   assert.equal(retries, 1); assert(overlay.classList.contains("visible"));
   publish(status({ playback_next_retry_secs: 0 }));
-  assert.match(overlay.querySelector(".playback-reason").textContent, /retry in 0s$/);
+  assert.equal(overlay.querySelector(".playback-reason").textContent, "Network Error: Check link. Retrying in 0s…");
+  publish(status({ playback_state: "starting", playback_next_retry_secs: null }));
+  assert.equal(overlay.querySelector(".playback-reason").textContent, "Network Error: Check link. Retrying in 0s…");
+  assert.equal(overlay.children.filter(c => c.tag === "span").length, 1);
   publish(status({ playback_state: "playing", playback_fault: null, playback_next_retry_secs: null }));
   await flush(); assert.equal(f.toast(), null); assert(!overlay.classList.contains("visible"));
   assert.equal(f.visibility.at(-1), true);
@@ -140,7 +157,7 @@ test("Connecting/failure/fallback labels and actionable Retry failure remain", a
   const publish = f.events.get("stream-status");
   for (const [playback_state, playback_fault, expected] of [
     ["starting", null, "Connecting"], ["failed", { reason: "Invalid credentials" }, "Playback failed: Invalid credentials"],
-    ["recovering", null, "Recovering"],
+    ["recovering", null, "Network Error: Check link. Retrying in 0s…"],
   ]) {
     publish(status({ playback_state, playback_fault, playback_next_retry_secs: null }));
     assert.equal(f.$("#video-area").querySelector(".playback-reason").textContent, expected);
@@ -171,6 +188,19 @@ test("Quiet discovery and auto-adoption retries are diagnostic only", () => {
   assert.equal(f.toast(), null);
   assert(f.logs.some(x => x.message.includes("Discovery degraded")));
   assert(f.logs.some(x => x.message.includes("Auto-adopt failed")));
+});
+
+test("Degraded capture never occupies Nodes card space and still publishes capture state", async () => {
+  const f = fixture(); const devices = f.load(source("src/lib/devices.ts"), f.deps);
+  await devices.refreshCaptureState();
+  let observed; devices.subscribeCaptureState(value => { observed = value; });
+  for (const outcome of [{ scope: "scoped_by_name", source_id: 1 },
+    { scope: "unscoped_fallback", reason: "no source matched" }]) {
+    f.events.get("capture-active")({ active: true, outcome, adapter_name: "Ethernet", candidate_count: 2 });
+    assert.equal(f.$("#capture-scope-status").hidden, true);
+    assert.equal(f.$("#capture-scope-status").textContent, "");
+    assert.equal(observed.active, true); assert.equal(observed.candidate_count, 2);
+  }
 });
 
 test("Host card hides completed removals but retains pending removals and saved addresses", () => {

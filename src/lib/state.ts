@@ -119,10 +119,9 @@ export function escapeHtml(str: unknown): string {
 }
 
 export function showToast(message: string, isError = false): void {
-  // Routine status stays in diagnostics. Actionable errors still notify;
-  // the independent updater toast keeps its Install/Later actions.
+  // User actions, including recording and screenshots, retain their feedback.
+  // Ethernet and playback-loss status use their own persistent surfaces.
   logToFile(isError ? "error" : "info", `toast: ${message}`);
-  if (!isError) return;
 
   // Never evict the update notification — it stays until the user acts on
   // it. Only clear a prior transient toast.

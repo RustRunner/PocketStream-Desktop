@@ -241,6 +241,9 @@ function isDownEvent(iface: InterfaceInfo): boolean {
 export function setupInterfaceWatcher(onReconnect: () => void = () => {}): void {
   onDiscoveryReconnect = onReconnect;
   api.onEvent<AdapterSelection>("adapter-selection-changed", (selection) => {
+    // The selection query may emit this same snapshot itself. Retire older
+    // reads only for an actual change, so opening Configure can finish.
+    if (JSON.stringify(selection) === JSON.stringify(adapterSelection)) return;
     ++interfaceRefresh;
     if (verifiedAddressView && !addressBusy) { refreshNetworkEvent(); return; }
     rememberAdapterSelection(selection);
@@ -249,6 +252,9 @@ export function setupInterfaceWatcher(onReconnect: () => void = () => {}): void 
     const expectedMac = adapterSelection?.selected_mac?.replaceAll("-", ":").toLowerCase();
     if (iface.mac.replaceAll("-", ":").toLowerCase() !== (expectedMac ?? "")) return;
     if (addressBusy) { refreshTrailing = true; return; }
+    // A query can cause an unchanged status event. Fetching again for that
+    // event feeds the same query back into itself, especially with link down.
+    if (JSON.stringify(iface) === JSON.stringify(state.activeInterface)) return;
     // A queued callback describes an earlier observation. After a reply, use
     // a fresh shared read rather than repainting its payload over verified IPs.
     if (verifiedAddressView) { refreshNetworkEvent(); return; }
@@ -572,7 +578,7 @@ function renderAdapterChoices(): void {
   if (field) field.style.display = dialogInterfaces.length > 1 ? "" : "none";
 }
 
-const addressControlSelector = "#static-iface, #btn-add-sec-ip, #ip-config-apply, #ip-mode-dhcp, #ip-mode-static-auto, #ip-mode-static-manual, #reset-adapter-confirm, [data-remove-adopted], [data-remove-binding]";
+const addressControlSelector = "#static-iface, #btn-add-sec-ip, #ip-config-apply, #ip-mode-dhcp, #ip-mode-static-auto, #ip-mode-static-manual, #reset-adapter-confirm, [data-remove-adopted], [data-remove-binding], [data-remove-ip]";
 function lockAddressControls(): void {
   if (!addressBusy) return;
   document.querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLSelectElement>(addressControlSelector).forEach((el) => {
@@ -667,6 +673,12 @@ export function setupIpConfigDialog(
 
     try {
       if (dialogSession !== session || !dialog.open) return;
+      // Keep a known adapter usable while the fresh read is in flight. Every
+      // write still validates the selected adapter against fresh native state.
+      if (adapterSelection) {
+        dialogInterfaces = (adapterSelection.candidates ?? []).filter(isWiredCandidate);
+        renderNetwork();
+      }
       await reloadDialogInterfaces();
       if (dialogSession !== session || !dialog.open || addressBusy) return;
       await syncModeFromInterface();
@@ -827,15 +839,22 @@ function renderSecondaryIps(iface: InterfaceInfo | undefined, primary: { address
   list.innerHTML = rows.size ? [...rows].map(([address, prefix]) => {
     const binding = saved.get(address);
     const m = binding?.meta;
-    const status = m ? (m.desired === "removed" ? "pending removal" : m.applied ? "applied" : "pending") : "ownership unknown";
-    const reason = m?.last_error ? ` — ${m.last_error}` : m && !m.adapter_mac ? " — adapter ownership awaiting reconciliation" : "";
-    return `<div class="secondary-ip-item"><span>${escapeHtml(`${address}/${prefix} — ${status}${reason}`)}</span>
-      ${binding ? `<button class="btn-remove-ip" data-remove-binding="${escapeHtml(binding.subnet)}" title="Remove ${escapeHtml(`${address}/${prefix}`)}">Remove</button>` : ""}</div>`;
+    const status = m?.desired === "removed" ? " — pending removal" : m && !m.applied ? " — pending" : "";
+    const reason = m?.last_error ? ` — ${m.last_error}` : "";
+    return `<div class="secondary-ip-item"><span>${escapeHtml(`${address}/${prefix}${status}${reason}`)}</span>
+      ${binding || iface ? `<button class="btn-remove-ip" ${binding ? `data-remove-binding="${escapeHtml(binding.subnet)}"` : `data-remove-ip="${escapeHtml(address)}"`} title="Remove ${escapeHtml(`${address}/${prefix}`)}">Remove</button>` : ""}</div>`;
   }).join("") : '<p class="placeholder-text" style="padding:8px">No secondary IPs</p>';
-  list.querySelectorAll<HTMLButtonElement>("[data-remove-binding]").forEach((btn) => {
+  list.querySelectorAll<HTMLButtonElement>("[data-remove-binding], [data-remove-ip]").forEach((btn) => {
     btn.addEventListener("click", async () => {
       if (selectingAdapter || addressBusy) return;
       const subnet = btn.dataset["removeBinding"];
+      const ip = btn.dataset["removeIp"];
+      if (!subnet && ip && iface) {
+        const prefix = rows.get(ip);
+        if (!window.confirm(`Remove ${ip}/${prefix} from ${iface.display_name || iface.name}? This may interrupt devices using this host address. Device history is retained.`)) return;
+        await mutateAddress("Removing address…", () => api.removeSecondaryIp(iface.name, ip), btn);
+        return;
+      }
       const m = subnet ? adoptionMeta.get(subnet) : undefined;
       if (!subnet || !m?.address) return;
       if (!window.confirm(`Remove ${m.address}/${m.prefix ?? "?"} from its saved adapter? Nodes on ${subnet} may share this host address and lose connectivity. Device history is retained.`)) return;
