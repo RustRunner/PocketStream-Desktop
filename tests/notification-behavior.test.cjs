@@ -227,3 +227,77 @@ test("Host card hides completed removals but retains pending removals and saved 
   f.network.renderSubnetList(); const html = f.$("#subnet-list").innerHTML;
   assert(html.includes("172.26.95.99") && html.includes("169.254.10.2"));
 });
+
+async function nodeRemovalFixture(kind) {
+  const f = fixture(), calls = [];
+  const first = { mac: "40:cd:3a:03:8f:3f", ip: "192.168.1.204", subnet: "192.168.1.0/24",
+    alias: "", open_ports: [554], status: "cached_only", first_seen: "before", last_seen: "before" };
+  let records = kind === "all" ? [first, { ...first, mac: "40:cd:3a:03:8f:40", ip: "192.168.1.205" }] : [first];
+  let pins = kind === "cached" ? [] : [{ ip: first.ip, alias: "", expected_mac: first.mac }];
+  f.shared.state.config = { network_mode: "static_auto", manual_nodes: pins };
+  f.shared.state.activeInterface = { name: "Ethernet", mac: "00:22:20:3a:e3:b3", is_up: true,
+    ips: [{ address: "192.168.1.100", prefix: 24, subnet: first.subnet }] };
+  f.api.getConfig = async () => ({ ...f.shared.state.config, manual_nodes: [...pins] });
+  f.api.getDeviceList = async () => [...records];
+  const publish = () => f.events.get("device-list-changed")([...records]);
+  f.api.forgetDevice = async mac => {
+    calls.push(["forget", mac]); records = records.filter(r => r.mac !== mac); publish();
+  };
+  f.api.removeManualNode = async (ip, expectedMac) => {
+    calls.push(["manual", ip, expectedMac]);
+    pins = pins.filter(n => n.ip !== ip || n.expected_mac !== expectedMac);
+    records = records.filter(r => r.mac !== expectedMac && r.mac !== `manual:${ip}`); publish();
+  };
+  f.api.clearManualNodes = async () => { calls.push(["clear-pins"]); pins = []; };
+  let finishScan;
+  f.api.scanNetwork = () => new Promise(resolve => { finishScan = resolve; });
+  f.api.reportScanResult = async (key, ports) => {
+    const row = records.find(r => r.mac === key);
+    if (row) { row.open_ports = ports; publish(); }
+  };
+  f.deps["./store.ts"] = f.load(source("src/lib/store.ts"));
+  f.deps["./device-state.ts"] = f.load(source("src/lib/device-state.ts"), f.deps);
+  const mirror = f.load(source("src/lib/device-list.ts"), f.deps);
+  f.deps["./device-list.ts"] = mirror;
+  const card = f.$("#device-list"); card.querySelectorAll = () => [];
+  const cacheList = f.$("#cache-dialog-list"); let buttons = [], nextButton = 0;
+  cacheList.querySelectorAll = selector => {
+    assert.equal(selector, ".cache-forget-btn");
+    buttons = [...cacheList.innerHTML.matchAll(/<button class="cache-forget-btn[^\"]*" data-mac="([^\"]*)" data-ip="([^\"]*)" data-manual="([^\"]*)"/g)].map(match => {
+      const btn = f.$(`#node-remove-${++nextButton}`);
+      btn.dataset = { mac: match[1], ip: match[2], manual: match[3] }; return btn;
+    });
+    return buttons;
+  };
+  f.deps["./streaming.js"] = { showModalWithVideo: async dialog => { dialog.open = true; } };
+  const devices = f.load(source("src/lib/devices.ts") + "\nexports.scanForTest = scanDevicePorts;", f.deps);
+  const cache = f.load(source("src/lib/device-cache.ts"), f.deps);
+  devices.setupArpListeners(); cache.setupCacheDialog(); await mirror.start();
+  await f.$("#btn-nodes-config").fire("click");
+  assert(card.innerHTML.includes(first.ip)); assert(cacheList.innerHTML.includes(first.ip));
+  const scan = devices.scanForTest(first.mac, first.ip);
+  assert(finishScan, "the real scan handler has an outstanding reply");
+  return { f, first, calls, card, cacheList, mirror, scan,
+    remove: () => kind === "all" ? f.$("#cache-clear-all").fire("click") : buttons[0].fire("click"),
+    finish: () => finishScan([{ reachable: true, open_ports: [554] }]),
+    rediscover: () => { records = [first]; publish(); },
+  };
+}
+
+for (const kind of ["cached", "manual", "all"]) {
+  test(`Nodes ${kind} removal clears the card immediately while the last port scan is pending`, async () => {
+    const t = await nodeRemovalFixture(kind); await t.remove();
+    const cardAfterRemoval = t.card.innerHTML;
+    assert.equal(t.mirror.getDevices().length, 0, "authoritative event retired the records");
+    assert.equal(t.cacheList.innerHTML, "", "Configure is already empty");
+    assert.equal(t.f.$("#cache-dialog-empty").style.display, "");
+    t.finish(); await t.scan;
+    assert.equal(cardAfterRemoval, "", "the card must clear even while the scan reply is outstanding");
+    assert(!t.card.innerHTML.includes(t.first.ip), "late capabilities cannot repaint the deleted node");
+    assert(!t.f.logs.some(x => x.message.includes("subscriber threw")));
+    if (kind === "cached") assert.deepEqual(t.calls, [["forget", t.first.mac]]);
+    if (kind === "manual") assert.deepEqual(t.calls, [["manual", t.first.ip, t.first.mac]]);
+    if (kind === "all") assert.deepEqual(t.calls, [["manual", t.first.ip, t.first.mac], ["forget", "40:cd:3a:03:8f:40"], ["clear-pins"]]);
+    t.rediscover(); assert(t.card.innerHTML.includes(t.first.ip), "fresh backend discovery is still visible");
+  });
+}

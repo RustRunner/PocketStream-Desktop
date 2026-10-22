@@ -563,11 +563,12 @@ export function renderArpDeviceList(): void {
     }
   }
 
-  if (bySubnet.size === 0 && pendingScans <= 0) {
+  if (bySubnet.size === 0) {
+    // An empty backend snapshot retires old rows even with a scan pending.
     // The header's Discovery spinner carries the "still working"
     // signal — leave the list empty while it's visible. Only show
     // the "No devices found" placeholder once everything's settled.
-    list.innerHTML = isDiscoveryActive()
+    list.innerHTML = pendingScans > 0 || isDiscoveryActive()
       ? ""
       : '<p class="placeholder-text">No devices found.</p>';
     return;
