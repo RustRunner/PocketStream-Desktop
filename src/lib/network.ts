@@ -815,15 +815,29 @@ export function setupIpConfigDialog(
         spinner.style.display = "";
         let reply = await api.setNetworkMode(request);
         if (reply.warning) {
-          if (!window.confirm(reply.warning)) return;
+          if (!window.confirm(reply.warning)) {
+            // Cancel the proposed mode, so Close/Escape can leave without
+            // proposing the same DHCP change again. Keep other field edits.
+            $<HTMLInputElement>("#ip-mode-dhcp").checked = reply.mode === "dhcp";
+            $<HTMLInputElement>("#ip-mode-static-auto").checked = reply.mode === "static_auto";
+            $<HTMLInputElement>("#ip-mode-static-manual").checked = reply.mode === "static_manual";
+            if (session) { session.mode = reply.mode; session.modeEdited = false; }
+            updateModeVisibility();
+            return;
+          }
           reply = await api.setNetworkMode({ ...request, confirmed: true });
         }
         if (reply.warning) { showToast(reply.warning, true); return; }
+        ++interfaceRefresh; ++bindingRefresh;
+        hostMode = reply.mode;
         if (state.config) state.config.network_mode = reply.mode;
         rememberPrimaryAddress(selectedMac, reply.primary_address);
         if (session) { session.primaryEdited = false; session.modeEdited = false; session.mode = reply.mode; session.primaryChosen = false; }
+        renderModeBadge();
+        if (reply.mode === "static_manual") hideDiscoveryStatus();
         onModeApplied(previousMode, reply.mode);
         await refreshInterfaces();
+        if (previousMode === "static_manual" && reply.mode !== "static_manual" && isInterfaceConnected()) resetDiscoveryStatus();
         dialogSaving = false;
         unlockAddressControls(hostPointer);
       }

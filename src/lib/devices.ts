@@ -143,6 +143,7 @@ let settleTimer: ReturnType<typeof setTimeout> | null = null;
 
 /** Reset the settle timer — called on every new ARP device or adoption. */
 function debounceScan(): void {
+  if (state.config?.network_mode === "static_manual") return;
   if (settleTimer) clearTimeout(settleTimer);
   settleTimer = setTimeout(() => {
     settleTimer = null;
@@ -213,7 +214,7 @@ let initialFlowStartedAt = 0;
 let graceTimer: ReturnType<typeof setTimeout> | null = null;
 
 function initialGraceRemaining(): number {
-  if (initialFlowComplete || initialFlowStartedAt === 0) return 0;
+  if (state.config?.network_mode === "static_manual" || initialFlowComplete || initialFlowStartedAt === 0) return 0;
   return initialFlowStartedAt + INITIAL_DISCOVERY_GRACE_MS - Date.now();
 }
 
@@ -252,6 +253,8 @@ function applyDiscoveryPhaseToDOM(): void {
 }
 
 function setDiscoveryPhase(phase: DiscoveryPhase): void {
+  // Late ARP, scan and reconnect callbacks cannot revive Manual discovery.
+  if (state.config?.network_mode === "static_manual") phase = "idle";
   if (phase === "discovering" && initialFlowComplete) {
     phase = "idle";
   }
@@ -279,9 +282,10 @@ function isDiscoveryActive(): boolean {
   return discoveryPhase !== "idle";
 }
 
-/** Hide the Nodes-card discovery spinner. Exported for the interface
- *  watcher so it can cancel a stuck spinner on link-down. */
+/** Retire pending discovery progress on link-down or entering Manual. */
 export function hideDiscoveryStatus(): void {
+  if (settleTimer) clearTimeout(settleTimer);
+  settleTimer = null;
   clearGraceTimer();
   setDiscoveryPhase("idle");
 }
@@ -463,7 +467,8 @@ const MAX_SCAN_RETRIES = 2;
 const RETRY_DELAY_MS = 4000;
 
 async function scanDevicePorts(mac: string, ip: string, attempt = 0): Promise<void> {
-  if (state.config?.network_mode === "static_manual") {
+  const isManual = () => state.config?.network_mode === "static_manual";
+  if (isManual()) {
     if (attempt > 0) pendingScans--;
     return;
   }
@@ -473,6 +478,10 @@ async function scanDevicePorts(mac: string, ip: string, attempt = 0): Promise<vo
 
   try {
     const results = await api.scanNetwork(`${ip}/32`);
+    if (isManual()) {
+      pendingScans--;
+      return;
+    }
     let found = false;
     if (results) {
       for (const r of results) {
@@ -497,7 +506,7 @@ async function scanDevicePorts(mac: string, ip: string, attempt = 0): Promise<vo
     }
   } catch (e) {
     log(`Port scan failed for ${ip}: ${formatError(e)}`);
-    if (attempt < MAX_SCAN_RETRIES) {
+    if (attempt < MAX_SCAN_RETRIES && !isManual()) {
       setTimeout(() => scanDevicePorts(mac, ip, attempt + 1), RETRY_DELAY_MS);
       return;
     }

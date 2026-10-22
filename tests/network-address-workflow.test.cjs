@@ -10,7 +10,7 @@ const flush = async () => { for(let i=0;i<40;i++) await Promise.resolve(); };
 const deferred = () => { let resolve,reject; const promise=new Promise((a,b)=>{resolve=a;reject=b;});return {promise,resolve,reject}; };
 const IP='192.0.2.20', SUBNET='192.0.2.0/24', MAC='40:cd:3a:00:00:01';
 function fixture({initialSelection=true}={}) {
-  const events=new Map(), elements=new Map(), calls={selection:0,bindings:0,mode:0,dhcp:0,writes:0}, feedback=[], removals=[], transitions=[], additions=[];
+  const events=new Map(), elements=new Map(), calls={selection:0,bindings:0,mode:0,dhcp:0,writes:0,discoveryStops:0,discoveryStarts:0}, feedback=[], removals=[], transitions=[], additions=[];
   let now=0, throwRender=false;const timers=[];
   const iface={name:'Ethernet', display_name:'Ethernet', mac:MAC, is_up:true, is_ethernet:true, is_vpn:false,is_virtual:false,
     ips:[{address:'192.0.2.10',prefix:24,subnet:SUBNET},{address:IP,prefix:24,subnet:SUBNET}]};
@@ -57,7 +57,7 @@ function fixture({initialSelection=true}={}) {
     './tauri-api.ts':api,
     './state.ts':{$,$$:()=>[],state,adoptionMeta,adoptedSubnets,showToast:(msg,error)=>feedback.push({msg,error}),log(){},
       escapeHtml:s=>String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('"','&quot;')},
-    './devices.js':{renderArpDeviceList(){},resetDiscoveryStatus(){},hideDiscoveryStatus(){}},
+    './devices.js':{renderArpDeviceList(){},resetDiscoveryStatus(){calls.discoveryStarts++;},hideDiscoveryStatus(){calls.discoveryStops++;}},
     './streaming.js':{handleHardDisconnect(){},handleReconnect:async()=>{},showModalWithVideo:async d=>{d.open=true;}},
     './store.ts':{},'./errors.ts':{formatError:String},'./device-list.ts':{},
   };
@@ -317,10 +317,88 @@ test('Close preserves the existing DHCP warning and saves only after confirmatio
   f.api.setNetworkMode=async request=>{f.transitions.push(request);return {mode:request.confirmed?'dhcp':'static_auto',warning:request.confirmed?null:'DHCP may interrupt cameras'};};
   f.ui.confirm=()=>false;await f.$('#ip-config-close').fire('click');
   assert.equal(f.transitions.length,1);assert.equal(f.$('#ip-config-dialog').open,true);assert.equal(f.state.config.network_mode,'static_auto');
+  f.$('#ip-mode-static-auto').checked=false;f.$('#ip-mode-dhcp').checked=true;await f.$('#ip-mode-dhcp').fire('change');
   f.ui.confirm=()=>true;await f.$('#ip-config-close').fire('click');
   assert.deepEqual(f.transitions.map(r=>r.confirmed),[false,false,true]);
   assert.equal(f.transitions[2].ip,null);assert.equal(f.transitions[2].gateway,null);
   assert.equal(f.state.config.network_mode,'dhcp');assert.equal(f.$('#ip-config-dialog').open,false);
+});
+
+for(const initial of ['static_auto','static_manual'])for(const exit of ['Close','Escape'])
+test(`Cancelling DHCP from ${initial} restores the active mode and allows ${exit} without another warning`,async()=>{
+  const f=fixture();f.state.config.network_mode=initial;f.api.getNetworkMode=async()=>initial;
+  f.exports.syncHostModeFromConfig();await f.$('#btn-ip-config').fire('click');
+  f.$(`#ip-mode-${initial.replace('_','-')}`).checked=false;f.$('#ip-mode-dhcp').checked=true;
+  await f.$('#ip-mode-dhcp').fire('change');let warnings=0;
+  f.api.setNetworkMode=async request=>{f.transitions.push(request);assert.equal(request.confirmed,false);return {mode:initial,warning:'DHCP may interrupt cameras'};};
+  f.ui.confirm=()=>{warnings++;return false;};const before={...f.calls};
+  await f.$('#ip-config-close').fire('click');
+  assert.equal(f.$('#ip-mode-dhcp').checked,false);
+  assert.equal(f.$(`#ip-mode-${initial.replace('_','-')}`).checked,true);
+  assert.equal(f.$('#ip-static-section').style.display,'');
+  assert.equal(f.state.config.network_mode,initial);assert.equal(f.$('#ip-config-dialog').open,true);
+  for(const id of ['#ip-config-close','#static-iface','#static-ip','#ip-mode-static-auto','#ip-mode-static-manual','#ip-mode-dhcp'])assert.equal(f.$(id).disabled,false,id);
+  if(exit==='Close')await f.$('#ip-config-close').fire('click');
+  else {let prevented=false;await f.$('#ip-config-dialog').fire('cancel',{preventDefault(){prevented=true;}});await flush();assert(prevented);}
+  assert.equal(f.$('#ip-config-dialog').open,false);assert.equal(warnings,1);assert.equal(f.transitions.length,1);
+  for(const name of ['selection','bindings','mode','dhcp','writes','discoveryStops','discoveryStarts'])assert.equal(f.calls[name],before[name],name);
+  assert.equal(f.feedback.length,0);
+});
+
+test('Confirmed mode round trips stop Manual discovery, restart it on exit and paint the reply before a slow refresh',async()=>{
+  const f=fixture(),applied=[];let saved='static_auto';
+  f.api.getNetworkMode=async()=>saved;
+  f.api.getDhcpState=async()=>saved==='dhcp';
+  f.api.setNetworkMode=async request=>{f.transitions.push(request);saved=request.mode;return {mode:saved,warning:null};};
+  const modes=['static_manual','dhcp','static_auto','dhcp','static_manual','static_auto'];
+  for(const next of modes){
+    await f.$('#btn-ip-config').fire('click');
+    for(const mode of ['dhcp','static_auto','static_manual'])f.$(`#ip-mode-${mode.replace('_','-')}`).checked=mode===next;
+    await f.$(`#ip-mode-${next.replace('_','-')}`).fire('change');
+    const before={...f.calls},previous=saved,old=f.api.getAdapterSelection,read=deferred();
+    f.api.getAdapterSelection=()=>{f.calls.selection++;return read.promise;};
+    const close=f.$('#ip-config-close').fire('click');await flush();
+    assert.equal(f.state.config.network_mode,next);applied.push(next);
+    assert.equal(f.$('#ip-mode').className,`status-value mode-${next==='dhcp'?'dhcp':next==='static_manual'?'manual':'static'}`);
+    if(next==='dhcp')assert.match(f.$('#ip-mode').innerHTML,/DHCP — set static/);
+    else assert.equal(f.$('#ip-mode').textContent,next==='static_manual'?'Static — manual nodes':'Static — auto-adopt ready');
+    assert.equal(f.calls.discoveryStops,before.discoveryStops+(next==='static_manual'?1:0));
+    read.resolve(f.selection);await close;f.api.getAdapterSelection=old;
+    assert.equal(f.calls.discoveryStarts,before.discoveryStarts+(previous==='static_manual'&&next!=='static_manual'?1:0));
+    assert.equal(f.$('#ip-config-dialog').open,false);assert.equal(f.$('#ip-config-close').disabled,false);
+  }
+  assert.deepEqual(applied,modes);assert.equal(f.transitions.length,6);assert.equal(f.calls.writes,0);
+});
+
+test('A confirmed Manual reply retires an older refresh so it cannot repaint the Auto badge',async()=>{
+  const f=fixture();await f.$('#btn-ip-config').fire('click');
+  const old=deferred();let saved='static_auto';
+  f.api.getAdapterSelection=()=>{f.calls.selection++;return old.promise;};
+  f.api.getNetworkMode=async()=>saved;
+  const read=f.exports.refreshInterfaces();await flush();
+  f.$('#ip-mode-static-auto').checked=false;f.$('#ip-mode-static-manual').checked=true;
+  await f.$('#ip-mode-static-manual').fire('change');
+  f.api.setNetworkMode=async()=>{saved='static_manual';return {mode:saved,warning:null};};
+  const close=f.$('#ip-config-close').fire('click');await flush();
+  assert.equal(f.$('#ip-mode').textContent,'Static — manual nodes');
+  assert.equal(f.calls.discoveryStops,1);
+  old.resolve(f.selection);await read;await close;await flush();
+  assert.equal(f.$('#ip-mode').textContent,'Static — manual nodes');
+  assert.equal(f.state.config.network_mode,'static_manual');
+  assert.equal(f.$('#ip-config-dialog').open,false);assert.equal(f.$('#ip-config-close').disabled,false);
+});
+
+test('Cancelling DHCP preserves primary edits and Close saves them in the restored static mode',async()=>{
+  const f=fixture();await f.$('#btn-ip-config').fire('click');
+  f.$('#static-ip').value='198.51.100.10';await f.$('#static-ip').fire('input');
+  f.$('#ip-mode-static-auto').checked=false;f.$('#ip-mode-dhcp').checked=true;await f.$('#ip-mode-dhcp').fire('change');
+  f.api.setNetworkMode=async request=>{f.transitions.push(request);return {mode:'static_auto',warning:request.mode==='dhcp'?'DHCP may interrupt cameras':null};};
+  f.ui.confirm=()=>false;await f.$('#ip-config-close').fire('click');
+  assert.equal(f.$('#static-ip').value,'198.51.100.10');assert.equal(f.$('#ip-mode-static-auto').checked,true);
+  await f.$('#ip-config-close').fire('click');
+  assert.deepEqual(f.transitions.map(request=>request.mode),['dhcp','static_auto']);
+  assert.equal(f.transitions[1].ip,'198.51.100.10');assert.equal(f.transitions[1].confirmed,false);
+  assert.equal(f.$('#ip-config-dialog').open,false);assert.equal(f.calls.discoveryStops,0);
 });
 
 test('An adapter change during mode save cannot submit the secondary entry to the new adapter',async()=>{

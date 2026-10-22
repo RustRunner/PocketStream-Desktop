@@ -301,3 +301,49 @@ for (const kind of ["cached", "manual", "all"]) {
     t.rediscover(); assert(t.card.innerHTML.includes(t.first.ip), "fresh backend discovery is still visible");
   });
 }
+
+for (const result of ["ports", "empty", "error"]) {
+  test(`Manual mode stops Discovery and retires a delayed ${result} scan without retries or lost history`, async () => {
+    const f = fixture(), timers = new Map(), scans = [], reports = [];
+    let timerId = 0;
+    const record = { mac: "40:cd:3a:03:8f:3f", ip: "192.168.1.204", subnet: "192.168.1.0/24",
+      alias: "CAM", open_ports: [554], status: "live", first_seen: "before", last_seen: "before" };
+    f.shared.state.config = { network_mode: "static_auto" };
+    f.shared.state.activeInterface = { name: "Ethernet", mac: "00:22:20:3a:e3:b3", is_up: true,
+      ips: [{ address: "192.168.1.100", prefix: 24, subnet: record.subnet }] };
+    f.api.getDeviceList = async () => [record];
+    f.api.scanNetwork = () => new Promise((resolve, reject) => scans.push({ resolve, reject }));
+    f.api.reportScanResult = async (...args) => { reports.push(args); };
+    f.deps["./store.ts"] = f.load(source("src/lib/store.ts"));
+    f.deps["./device-state.ts"] = f.load(source("src/lib/device-state.ts"), f.deps);
+    const mirror = f.load(source("src/lib/device-list.ts"), f.deps);
+    f.deps["./device-list.ts"] = mirror;
+    f.$("#device-list").querySelectorAll = () => [];
+    const devices = f.load(source("src/lib/devices.ts") + "\nexports.scanForTest = scanDevicePorts;", f.deps, {
+      setTimeout(fn, ms) { timers.set(++timerId, { fn, ms }); return timerId; },
+      clearTimeout(id) { timers.delete(id); },
+    });
+    devices.setupArpListeners(); await mirror.start();
+    const history = JSON.stringify(mirror.getDevices());
+    const scan = devices.scanForTest(record.mac, record.ip);
+    f.events.get("arp-device-discovered")({ ip: "192.168.1.205", mac: "40:cd:3a:03:8f:40" });
+    assert.equal(scans.length, 1); assert(timers.size > 0, "settle work is pending before mode change");
+    f.shared.state.config.network_mode = "static_manual"; devices.hideDiscoveryStatus();
+    assert.equal(timers.size, 0, "Manual discards the old settle/grace work");
+    f.events.get("arp-device-discovered")({ ip: "192.168.1.205", mac: "40:cd:3a:03:8f:40" });
+    if (result === "ports") devices.resetDiscoveryStatus(); // Queued NIC reconnect in Manual.
+    if (result === "error") scans[0].reject(Error("prior scan cancelled by transition"));
+    else scans[0].resolve([{ reachable: true, open_ports: result === "ports" ? [80, 554] : [] }]);
+    await scan; await flush();
+    assert.equal(scans.length, 1); assert.equal(reports.length, 0);
+    assert.equal(timers.size, 0, "no old scan retry or startup grace survives in Manual");
+    assert(f.$("#discovery-status").classList.contains("hidden"));
+    assert(!f.$("#btn-refresh-nodes").classList.contains("discovery-active"));
+    assert.equal(JSON.stringify(mirror.getDevices()), history);
+    f.shared.state.config.network_mode = "static_auto"; devices.resetDiscoveryStatus();
+    assert.equal(scans.length, 2, "returning to Auto can scan the retained identity again");
+    assert(f.$("#btn-refresh-nodes").classList.contains("discovery-active"));
+    scans[1].resolve([{ reachable: true, open_ports: [554] }]); await flush();
+    assert.equal(reports.length, 1); assert.equal(JSON.stringify(mirror.getDevices()), history);
+  });
+}
