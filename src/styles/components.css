@@ -1371,6 +1371,20 @@
   display: none;
 }
 
+#btn-refresh-nodes .spinner {
+  display: none;
+}
+
+#btn-refresh-nodes.spinning .spinner,
+#btn-refresh-nodes.discovery-active .spinner {
+  display: block;
+}
+
+#btn-refresh-nodes.spinning svg,
+#btn-refresh-nodes.discovery-active svg {
+  display: none;
+}
+
 .discovery-dots {
   display: inline-block;
   width: 3ch;
