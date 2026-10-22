@@ -29,7 +29,7 @@ function fixture() {
     append(...children) { children.forEach(c => this.appendChild(c)); }
     remove() { if (this.parent) this.parent.children = this.parent.children.filter(c => c !== this); }
     addEventListener(name, callback) { this.listeners[name] = callback; }
-    fire(name) { return this.listeners[name]?.({ preventDefault() {} }); }
+    fire(name, event = {}) { return this.listeners[name]?.({ preventDefault() {}, ...event }); }
     querySelector(selector) {
       for (const child of this.children) {
         const matches = selector.startsWith(".")
@@ -347,3 +347,173 @@ for (const result of ["ports", "empty", "error"]) {
     assert.equal(reports.length, 1); assert.equal(JSON.stringify(mirror.getDevices()), history);
   });
 }
+
+async function cameraRoleFixture({ alias = "", persisted = false, protocol = "rtsp" } = {}) {
+  const f = fixture(), calls = [], key = "40:cd:3a:03:8f:3f";
+  let records = [{ mac: key, ip: "192.168.1.204", subnet: "192.168.1.0/24", alias,
+    status: "live", open_ports: [554], first_seen: "before", last_seen: "before" }];
+  f.shared.state.config = { network_mode: "static_manual", manual_nodes: [], rtsp_server: {},
+    stream: { protocol, camera_mac: persisted ? key : null, camera_ip: persisted ? records[0].ip : "", audio_muted: false } };
+  f.shared.state.activeInterface = { name: "Ethernet", mac: "00:22:20:3a:e3:b3", is_up: true,
+    ips: [{ address: "192.168.1.100", prefix: 24, subnet: records[0].subnet }] };
+  f.api.getDeviceList = async () => records;
+  f.api.getConfig = async () => f.shared.state.config;
+  f.api.setDeviceAlias = async (target, next) => {
+    calls.push(["role", target, next]);
+    records = records.map(row => ({ ...row, alias: row.mac === target ? next : row.alias === next ? "" : row.alias }));
+    return records;
+  };
+  f.api.updateStreamSettings = async settings => { calls.push(["settings", { ...settings }]); };
+  f.api.createVideoWindow = async () => { calls.push(["window"]); return "123"; };
+  f.api.startStream = async () => { calls.push(["preview"]); };
+  f.api.stopStream = async () => { calls.push(["stop"]); };
+  f.api.listVpnInterfaces = async () => [];
+  f.api.startRtspServer = async () => { calls.push(["relay"]); return { rtsp_url: "rtsp://127.0.0.1:8554/test", display_url: "rtsp://127.0.0.1:8554/test" }; };
+  f.api.stopRtspServer = async () => { calls.push(["stop-relay"]); };
+  const store = f.load(source("src/lib/store.ts")); f.deps["./store.ts"] = store;
+  f.deps["./device-state.ts"] = f.load(source("src/lib/device-state.ts"), f.deps);
+  const mirror = f.load(source("src/lib/device-list.ts"), f.deps); f.deps["./device-list.ts"] = mirror;
+  const network = f.load(source("src/lib/network.ts"), f.deps); f.deps["./network.ts"] = network;
+  const streaming = f.load(source("src/lib/streaming.ts"), f.deps, { window: { devicePixelRatio: 1 } });
+  f.deps["./streaming.ts"] = streaming;
+  const devices = f.load(source("src/lib/devices.ts"), f.deps);
+  const card = f.$("#device-list");
+  card.querySelectorAll = selector => {
+    if (selector === ".device-item") return [...card.innerHTML.matchAll(/class="device-item[^\"]*" data-key="([^\"]*)"/g)].map(match => {
+      const row = f.$(`#row-${match[1]}`); row.dataset = { key: match[1] }; return row;
+    });
+    if (selector === ".node-role-select") return [...card.innerHTML.matchAll(/class="node-role-select" data-role-key="([^\"]*)"/g)].map(match => {
+      const select = f.$(`#role-${match[1]}`); select.dataset = { roleKey: match[1] }; select.isConnected = true; return select;
+    });
+    return [];
+  };
+  f.$("#video-area").getBoundingClientRect = () => ({ x: 0, y: 0, width: 640, height: 480 });
+  f.$("#rtsp-server-enable").checked = true;
+  streaming.setupStreamControls(); streaming.setupRtspControls();
+  devices.setupArpListeners(); await mirror.start();
+  return { f, calls, store, mirror, network, streaming, key,
+    click: () => f.$(`#row-${key}`).fire("click", { target: { closest: () => null } }),
+    async role(action) { const select = f.$(`#role-${key}`); select.value = action; select.fire("change"); await flush(); },
+    async replace(rows) { records = rows; f.events.get("device-list-changed")(rows); await flush(); },
+  };
+}
+
+test("Clicking an unassigned node cannot select a video target or start preview/re-stream", async () => {
+  const t = await cameraRoleFixture(); await t.click();
+  assert.equal(t.store.selectedDevice.get().key, t.key); assert.equal(t.store.sessionCamTarget.get(), null);
+  assert.equal(t.network.getActiveCamTarget(), null);
+  await t.f.$("#btn-toggle-stream").fire("click"); await t.f.$("#btn-toggle-rtsp").fire("click");
+  assert(!t.calls.some(([kind]) => ["settings", "window", "preview", "relay"].includes(kind)));
+  assert.match(t.f.toast().textContent, /CAM/); assert.equal(t.f.$("#btn-toggle-stream").disabled, false);
+});
+
+for (const alias of ["", "PTU"]) test(`Saved ${alias || "unassigned"} target cannot bypass the CAM requirement`, async () => {
+  const t = await cameraRoleFixture({ alias, persisted: true });
+  t.store.sessionCamTarget.set({ key: t.key, expectedMac: t.key });
+  await t.f.$("#btn-toggle-stream").fire("click"); await t.f.$("#btn-toggle-rtsp").fire("click");
+  assert.equal(t.network.getActiveCamTarget(), null);
+  assert(!t.calls.some(([kind]) => ["settings", "window", "preview", "relay"].includes(kind)));
+});
+
+test("The CAM dropdown enables both starts and Clear stops preview and blocks subsequent starts", async () => {
+  const t = await cameraRoleFixture(); await t.role("cam");
+  assert.equal(t.network.getActiveCamTarget().key, t.key);
+  await t.f.$("#btn-toggle-stream").fire("click"); await t.f.$("#btn-toggle-rtsp").fire("click");
+  assert.equal(t.calls.filter(([kind]) => kind === "preview").length, 1);
+  assert.equal(t.calls.filter(([kind]) => kind === "relay").length, 1);
+  await t.role("clear");
+  assert.equal(t.f.shared.state.isStreaming, false); assert.equal(t.network.getActiveCamTarget(), null);
+  assert.equal(t.f.shared.state.isRtspDesired, false);
+  assert.equal(t.calls.filter(([kind]) => kind === "stop-relay").length, 1);
+  await t.f.$("#btn-toggle-stream").fire("click"); await t.f.$("#btn-toggle-rtsp").fire("click");
+  assert.equal(t.calls.filter(([kind]) => kind === "preview").length, 1);
+  assert.equal(t.calls.filter(([kind]) => kind === "relay").length, 1);
+  assert.equal(t.calls.filter(([kind]) => kind === "stop").length, 1);
+});
+
+test("Missing identities and duplicate CAM roles cannot redirect a saved video selection", async () => {
+  const t = await cameraRoleFixture({ alias: "CAM", persisted: true });
+  const first = t.mirror.getDevices()[0], other = { ...first, mac: "40:cd:3a:03:8f:40" };
+  t.store.sessionCamTarget.set({ key: t.key, expectedMac: t.key });
+  await t.replace([first, other]); assert.equal(t.network.getActiveCamTarget(), null);
+  await t.replace([other]); assert.equal(t.network.getActiveCamTarget(), null);
+  await t.f.$("#btn-toggle-stream").fire("click"); assert(!t.calls.some(([kind]) => kind === "preview"));
+});
+
+test("UDP input can start preview and re-stream without a CAM node", async () => {
+  const t = await cameraRoleFixture({ protocol: "udp" });
+  await t.f.$("#btn-toggle-stream").fire("click"); await t.f.$("#btn-toggle-stream").fire("click");
+  await t.f.$("#btn-toggle-rtsp").fire("click");
+  assert.equal(t.calls.filter(([kind]) => kind === "preview").length, 1);
+  assert.equal(t.calls.filter(([kind]) => kind === "relay").length, 1);
+  assert(!t.calls.some(([kind]) => kind === "settings"));
+});
+
+for (const alias of ["", "PTU"]) test(`Clicking another ${alias || "unassigned"} node preserves the assigned CAM target`, async () => {
+  const t = await cameraRoleFixture({ alias: "CAM", persisted: true });
+  const first = t.mirror.getDevices()[0], other = { ...first, mac: "40:cd:3a:03:8f:40", ip: "192.168.1.205", alias };
+  await t.replace([first, other]);
+  await t.f.$(`#row-${other.mac}`).fire("click", { target: { closest: () => null } });
+  assert.equal(t.store.selectedDevice.get().key, other.mac);
+  assert.equal(t.network.getActiveCamTarget().key, first.mac);
+  await t.f.$("#btn-toggle-stream").fire("click");
+  assert.equal(t.calls.find(([kind]) => kind === "settings")[1].camera_mac, first.mac);
+});
+
+test("An IP-only manual target still requires CAM and follows only its saved binding", async () => {
+  const t = await cameraRoleFixture(), first = t.mirror.getDevices()[0];
+  const manual = { ...first, mac: `manual:${first.ip}` };
+  t.f.shared.state.config.stream.camera_ip = first.ip;
+  t.store.sessionCamTarget.set({ key: manual.mac, expectedMac: null });
+  await t.replace([manual]); assert.equal(t.network.getActiveCamTarget(), null);
+  t.f.shared.state.config.manual_nodes = [{ ip: first.ip, expected_mac: first.mac }];
+  await t.replace([{ ...first, alias: "CAM" }]);
+  assert.equal(t.network.getActiveCamTarget().expectedMac, first.mac);
+  await t.f.$("#btn-toggle-stream").fire("click"); assert(t.calls.some(([kind]) => kind === "preview"));
+});
+
+test("Losing CAM during the settings save blocks video creation and the start command", async () => {
+  const t = await cameraRoleFixture({ alias: "CAM" }); let release;
+  t.f.api.updateStreamSettings = () => new Promise(resolve => { release = resolve; });
+  const start = t.f.$("#btn-toggle-stream").fire("click");
+  await t.replace(t.mirror.getDevices().map(row => ({ ...row, alias: "" })));
+  release(); await start;
+  assert(!t.calls.some(([kind]) => ["window", "preview"].includes(kind)));
+  assert.equal(t.f.shared.state.isStreaming, false); assert.match(t.f.toast().textContent, /CAM assignment changed/);
+});
+
+test("A failed re-stream stop leaves CAM assigned and reports an actionable error", async () => {
+  const t = await cameraRoleFixture({ alias: "CAM" });
+  await t.f.$("#btn-toggle-rtsp").fire("click");
+  t.f.api.stopRtspServer = async () => { throw Error("stop refused"); };
+  await t.role("clear");
+  assert.equal(t.mirror.getDevices()[0].alias, "CAM"); assert.equal(t.f.shared.state.isRtspDesired, true);
+  assert.equal(t.f.$(`#role-${t.key}`).selectedIndex, 0);
+  assert(!t.calls.some(([kind]) => kind === "role")); assert.match(t.f.toast().textContent, /CAM role unchanged/);
+});
+
+test("Reassigning CAM stops the old preview/re-stream and directs the next start to the new identity", async () => {
+  const t = await cameraRoleFixture({ alias: "CAM", persisted: true });
+  const first = t.mirror.getDevices()[0], other = { ...first, mac: "40:cd:3a:03:8f:40", ip: "192.168.1.205", alias: "" };
+  await t.replace([first, other]);
+  await t.f.$("#btn-toggle-stream").fire("click"); await t.f.$("#btn-toggle-rtsp").fire("click");
+  const select = t.f.$(`#role-${other.mac}`); select.value = "cam"; select.fire("change"); await flush();
+  assert.equal(t.f.shared.state.isStreaming, false); assert.equal(t.f.shared.state.isRtspDesired, false);
+  assert.equal(t.calls.filter(([kind]) => kind === "stop").length, 1);
+  assert.equal(t.calls.filter(([kind]) => kind === "stop-relay").length, 1);
+  assert.equal(t.mirror.deviceByKey(first.mac).alias, ""); assert.equal(t.network.getActiveCamTarget().key, other.mac);
+  await t.f.$("#btn-toggle-stream").fire("click");
+  assert.equal(t.calls.filter(([kind]) => kind === "settings").at(-1)[1].camera_mac, other.mac);
+});
+
+test("Explicitly reselecting the existing CAM replaces a missing saved selection without stopping streams", async () => {
+  const t = await cameraRoleFixture({ alias: "CAM", persisted: true });
+  const missing = "40:cd:3a:03:8f:40";
+  t.f.shared.state.config.stream.camera_mac = missing;
+  t.store.sessionCamTarget.set({ key: missing, expectedMac: missing });
+  assert.equal(t.network.getActiveCamTarget(), null);
+  await t.role("cam");
+  assert.equal(t.network.getActiveCamTarget()?.key, t.key);
+  assert.equal(t.f.shared.state.config.stream.camera_mac, t.key);
+  assert(!t.calls.some(([kind]) => kind === "stop" || kind === "stop-relay"));
+});

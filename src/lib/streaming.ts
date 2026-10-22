@@ -171,13 +171,16 @@ export function getActivePlaybackTarget(): DeviceTarget | null { return activePl
  *  The route/freshness readiness gate is added by S6. */
 async function persistPlaybackTarget(target: DeviceTarget): Promise<void> {
   const record = deviceList.resolveTarget(target);
-  if (!record || record.alias === "PTU" || record.ip.startsWith("169.254.")) {
-    throw new Error("Selected device is unavailable; select a node before starting");
+  if (!record || record.alias !== "CAM" || record.ip.startsWith("169.254.")) {
+    throw new Error("Assign a node as CAM in the Nodes dropdown before streaming");
   }
   if (!state.config) throw new Error("Stream settings are not loaded");
   state.config.stream.camera_ip = record.ip;
   state.config.stream.camera_mac = deviceList.targetFor(record).expectedMac;
   await api.updateStreamSettings(state.config.stream);
+  if (deviceList.resolveTarget(target)?.alias !== "CAM" || !getActiveCamTarget()) {
+    throw new Error("CAM assignment changed; select CAM in the Nodes dropdown before streaming");
+  }
 }
 
 /** Stop the stream and reset every piece of frontend stream state.
@@ -220,7 +223,7 @@ export function setupStreamControls(): void {
           const udp = state.config?.stream.protocol === "udp";
           const target = udp ? null : getActiveCamTarget();
           if (!udp && !target) {
-            showToast("Pick a node first (click it in the Nodes panel)", true);
+            showToast("Assign a node as CAM in the Nodes dropdown before streaming", true);
             return;
           }
           // Claim the playback identity before the slow awaits so a
@@ -459,7 +462,7 @@ export function setupRtspControls(): void {
         // the saved interface.
         const target = getActiveCamTarget();
         if (state.config?.stream.protocol !== "udp") {
-          if (!target) throw new Error("Pick a node before starting the RTSP server");
+          if (!target) throw new Error("Assign a node as CAM in the Nodes dropdown before streaming");
           await persistPlaybackTarget(target);
         }
         const info = await api.startRtspServer();
@@ -503,7 +506,7 @@ async function populateVpnDropdown(): Promise<void> {
   }
 }
 
-function updateRtspUI(displayUrl: string | null, status?: StreamStatus): void {
+export function updateRtspUI(displayUrl: string | null, status?: StreamStatus): void {
   const btn = $<HTMLButtonElement>("#btn-toggle-rtsp");
   btn.textContent = state.isRtspDesired ? "Stop Server" : "Start Server";
   // Always allow stopping, including while the listener is rebuilding.

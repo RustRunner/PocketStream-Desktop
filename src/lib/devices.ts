@@ -42,7 +42,7 @@ import {
   visibleDevices,
 } from "./device-state.ts";
 import * as deviceList from "./device-list.ts";
-import { getActivePlaybackTarget, stopStreamNow } from "./streaming.ts";
+import { getActivePlaybackTarget, stopStreamNow, updateRtspUI } from "./streaming.ts";
 import { haltPtuUnit } from "./ptz.ts";
 import { selectedDevice, sessionCamTarget } from "./store.ts";
 import { formatError } from "./errors.ts";
@@ -654,19 +654,9 @@ export function renderArpDeviceList(): void {
       if (!record) return;
       const targetChoice = deviceList.targetFor(record);
       selectedDevice.set(targetChoice);
-      // Remember this pick as the session's CAM target (getActiveCamIp
-      // reads it first). Deliberately kept out of state.config: Save
-      // Settings builds its payload from there, so a click would leak
-      // to disk on the next unrelated save. Persistence happens only
-      // when a stream actually starts or the device is explicitly
-      // assigned CAM — a node the user merely clicks but never streams
-      // is not persisted across launches. PTU is alias-driven only,
-      // with no click override — and the PTU-designated node itself is
-      // never a camera target, so clicking its row keeps the selection
-      // highlight but must not hijack the CAM pick away from the
-      // assigned CAM (an RTSP start against the PTU wedges in a stall
-      // loop).
-      if (record.alias !== "PTU") {
+      // Highlighting a row never assigns its role. Only a CAM-designated
+      // record may become the session's video target.
+      if (record.alias === "CAM") {
         sessionCamTarget.set(targetChoice);
       }
     });
@@ -727,9 +717,8 @@ export function renderArpDeviceList(): void {
  *  A node losing PTU gets a farewell halt (a delivered move whose
  *  release-stop is still queued would otherwise drive the unit
  *  unstoppably). Losing CAM on the node whose stream is playing drops
- *  the stream — compared against the runtime playback identity, not
- *  the persisted camera_ip, so a click-selected stream on an
- *  unrelated node is never touched. Losing CAM without it being
+ *  the stream — compared against the runtime playback identity, so
+ *  endpoint changes cannot stop a different record. Losing CAM without it being
  *  reassigned also detaches the session pick and persisted camera IP;
  *  otherwise Start Stream would silently reconnect to the node the
  *  user just cleared through the fallback chain.
@@ -747,8 +736,8 @@ async function handleRoleSelection(
   const target = deviceList.targetFor(record);
   const ip = record.ip;
   const current = record.alias || "";
+  // CAM is also explicit playback intent, even when its alias is unchanged.
   const noOp =
-    (action === "cam" && current === "CAM" && deviceList.getDevices().filter((r) => r.alias === "CAM").length === 1) ||
     (action === "ptu" && current === "PTU" && deviceList.getDevices().filter((r) => r.alias === "PTU").length === 1) ||
     (action === "clear" && current === "");
   if (noOp) {
@@ -764,6 +753,17 @@ async function handleRoleSelection(
   const lostCams = devices.filter((r) => r.alias === "CAM" && losesRole(r.mac, "CAM"));
   const lostPtus = devices.filter((r) => r.alias === "PTU" && losesRole(r.mac, "PTU"));
   for (const outgoing of lostPtus) haltPtuUnit(outgoing.ip, deviceList.targetFor(outgoing));
+  if (lostCams.length > 0 && state.isRtspDesired && state.config?.stream.protocol === "rtsp") {
+    try {
+      await api.stopRtspServer();
+      state.isRtspDesired = false;
+      updateRtspUI(null);
+    } catch (e) {
+      select.selectedIndex = 0;
+      showToast(`Failed to stop RTSP server; CAM role unchanged: ${formatError(e)}`, true);
+      return;
+    }
+  }
 
   function detachCamera(recordKey: string): void {
     if (sessionCamTarget.get()?.key === recordKey) sessionCamTarget.set(null);
@@ -798,7 +798,7 @@ async function handleRoleSelection(
     if (action === "cam") {
       // A CAM designation is deliberate — persist it to disk so
       // getActiveCamIp's config fallback picks it up next session
-      // (the click-to-select path only sets this in memory), and
+      // (clicking an existing CAM only sets this in memory), and
       // mirror into selectedDevice/sessionCamTarget so subscribers (zoom
       // restore, panel highlight) react immediately and this newest
       // designation outranks any earlier node click.

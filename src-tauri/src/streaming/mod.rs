@@ -1578,6 +1578,25 @@ fn stream_target(settings: &AppSettings) -> Option<CameraTarget> {
     })
 }
 
+/// Video eligibility is distinct from shared network readiness used by PTU
+/// and presence probes. Saved endpoints never substitute for a CAM role.
+fn require_cam_role(
+    target: &CameraTarget,
+    records: &[crate::network::DeviceRecord],
+) -> Result<(), AppError> {
+    let mut cameras = records.iter().filter(|record| record.alias == "CAM");
+    match (cameras.next(), cameras.next()) {
+        (Some(record), None)
+            if record.mac.eq_ignore_ascii_case(&target.key) && record.ip == target.ip =>
+        {
+            Ok(())
+        }
+        _ => Err(AppError::Stream(
+            "Assign this node as CAM in the Nodes dropdown before streaming".into(),
+        )),
+    }
+}
+
 async fn preflight_target(
     handle: Option<&tauri::AppHandle>,
     target: Option<&CameraTarget>,
@@ -1588,11 +1607,12 @@ async fn preflight_target(
     }; // UDP is exempt
     let handle =
         handle.ok_or_else(|| AppError::Stream("Ethernet readiness service unavailable".into()))?;
-    handle
-        .state::<crate::network::NetworkManager>()
+    let manager = handle.state::<crate::network::NetworkManager>();
+    let path = manager
         .camera_ready(target, &handle.state::<crate::config::AppConfig>())
-        .await
-        .map(Some)
+        .await?;
+    require_cam_role(&path.target, &manager.registry().snapshot())?;
+    Ok(Some(path))
 }
 
 fn relay_preflight(
@@ -1616,10 +1636,10 @@ fn relay_preflight(
         let handle = handle
             .as_ref()
             .ok_or_else(|| AppError::Stream("Readiness service unavailable".into()))?;
-        handle
-            .state::<crate::network::NetworkManager>()
-            .camera_ready_now(&target, &handle.state::<crate::config::AppConfig>())
-            .map(|_| ())
+        let manager = handle.state::<crate::network::NetworkManager>();
+        let path =
+            manager.camera_ready_now(&target, &handle.state::<crate::config::AppConfig>())?;
+        require_cam_role(&path.target, &manager.registry().snapshot())
     }))
 }
 
@@ -2258,6 +2278,65 @@ mod tests {
 
     fn adopted_set(addrs: &[&str]) -> std::collections::HashSet<String> {
         addrs.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn role_record(alias: &str) -> crate::network::DeviceRecord {
+        crate::network::DeviceRecord {
+            mac: "aa:bb:cc:dd:ee:01".into(),
+            ip: "192.0.2.20".into(),
+            subnet: "192.0.2.0/24".into(),
+            alias: alias.into(),
+            status: crate::network::DeviceStatus::Live,
+            open_ports: vec![554],
+            verified_by_mac: Some("aa:bb:cc:dd:ee:10".into()),
+            last_verified_at: Some("now".into()),
+            first_seen: "before".into(),
+            last_seen: "now".into(),
+        }
+    }
+
+    #[test]
+    fn video_role_gate_requires_an_explicit_unique_cam() {
+        let row = role_record("");
+        let target = CameraTarget {
+            key: row.mac.clone(),
+            expected_mac: Some(row.mac.clone()),
+            ip: row.ip.clone(),
+        };
+        for alias in ["", "PTU", "camera", "CAM"] {
+            assert_eq!(
+                require_cam_role(&target, &[role_record(alias)]).is_ok(),
+                alias == "CAM"
+            );
+        }
+        assert!(require_cam_role(&target, &[]).is_err());
+        let cam = role_record("CAM");
+        let mut other = cam.clone();
+        other.mac = "aa:bb:cc:dd:ee:02".into();
+        assert!(require_cam_role(&target, &[cam, other]).is_err());
+    }
+
+    #[test]
+    fn video_role_gate_keeps_identity_and_clearing_role_blocks_reconnect() {
+        let mut row = role_record("CAM");
+        let mut target = CameraTarget {
+            key: format!("manual:{}", row.ip),
+            expected_mac: None,
+            ip: row.ip.clone(),
+        };
+        assert!(require_cam_role(&target, &[row.clone()]).is_err());
+        // Shared native readiness resolves a manual key through its saved MAC.
+        target.key = row.mac.clone();
+        target.expected_mac = Some(row.mac.clone());
+        assert!(require_cam_role(&target, &[row.clone()]).is_ok());
+        row.alias.clear();
+        assert!(require_cam_role(&target, &[row.clone()]).is_err());
+        row.alias = "CAM".into();
+        row.mac = "aa:bb:cc:dd:ee:02".into();
+        assert!(require_cam_role(&target, &[row.clone()]).is_err());
+        row.mac = target.key.clone();
+        row.ip = "192.0.2.21".into();
+        assert!(require_cam_role(&target, &[row]).is_err());
     }
 
     #[tokio::test]
