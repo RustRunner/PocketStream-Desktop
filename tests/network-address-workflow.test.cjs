@@ -727,3 +727,18 @@ test('SP07 APIPA Node visibility excludes every status without changing history 
   const history=JSON.stringify(records);assert.equal(module.visibleDevices(records).length,1);assert.equal(JSON.stringify(records),history);
   assert.equal(f.adoptionMeta.get('169.254.0.0/16').address,'169.254.20.99');
 });
+
+for(const saved of [false,true])test(`Host Configure hides ${saved?'saved':'native'} APIPA secondary rows without removing addresses or history`,async()=>{
+  const f=fixture(),address='169.254.20.99';
+  f.iface.ips.push({address,prefix:16,subnet:'169.254.0.0/16'});
+  if(saved)f.adoptionMeta.set('169.254.0.0/16',{adapter_mac:MAC,address,prefix:16,desired:'present',applied:false,last_error:'adapter disconnected'});
+  f.api.getAdoptionState=async()=>({adopted_subnets:Object.fromEntries(f.adoptedSubnets),meta:Object.fromEntries(f.adoptionMeta)});
+  const before=JSON.stringify([...f.adoptionMeta]),ips=JSON.stringify(f.iface.ips);
+  await f.$('#btn-ip-config').fire('click');
+  assert(!f.$('#secondary-ip-list').innerHTML.includes(address));
+  assert(!f.$('#secondary-ip-list').buttons.some(button=>Object.values(button.dataset).includes(address)));
+  assert(f.$('#secondary-ip-list').innerHTML.includes(IP),'ordinary secondary remains removable');
+  assert.equal(JSON.stringify([...f.adoptionMeta]),before);assert.equal(JSON.stringify(f.iface.ips),ips);
+  assert.equal(f.calls.writes,0);assert.equal(f.transitions.length,0);
+  if(saved)assert(f.$('#subnet-list').innerHTML.includes(address),'saved Host-card behavior is unchanged');
+});

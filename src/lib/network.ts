@@ -506,8 +506,8 @@ export function renderSubnetList(): void {
 
 // ── CAM / PTU target resolution ─────────────────────────────────────
 // Replaces the legacy #camera-ip / #ptu-ip dropdowns. Targets now flow
-// from a precedence chain: current click selection → persisted config
-// (CAM only) → alias designation → none. Callers ask the resolver
+// from the persisted/session identity and current CAM/PTU assignment.
+// Callers ask the resolver
 // at the moment they need to act (Start Stream, PTZ command, etc.),
 // so any state shift in the Nodes panel takes effect on the next
 // action without needing dropdown re-population.
@@ -519,21 +519,23 @@ function targetByAlias(alias: string): DeviceTarget | null {
 }
 
 export function getActiveCamTarget(): DeviceTarget | null {
+  const aliased = targetByAlias("CAM");
+  if (!aliased) return null;
   const session = sessionCamTarget.get();
   if (session) {
     // Hold missing selections instead of falling through to a replacement.
-    if (deviceList.resolveTarget(session)?.alias !== "PTU") return session;
+    const record = deviceList.resolveTarget(session);
+    if (!record) return null;
+    if (record.alias === "CAM") return session;
   }
   const configured = state.config?.stream;
   if (configured?.camera_mac) {
     const target = { key: configured.camera_mac, expectedMac: configured.camera_mac };
-    if (deviceList.resolveTarget(target)?.alias !== "PTU") return target;
+    const record = deviceList.resolveTarget(target);
+    if (!record) return null;
+    if (record.alias === "CAM") return target;
   }
-  const aliased = targetByAlias("CAM");
-  if (aliased) return aliased;
-  // Legacy IP-only settings can resolve only an explicit, unbound manual key.
-  const manual = deviceList.deviceByKey(`manual:${configured?.camera_ip ?? ""}`);
-  return manual && manual.alias !== "PTU" ? deviceList.targetFor(manual) : null;
+  return aliased;
 }
 
 export function getActiveCamIp(): string | null {
@@ -944,9 +946,9 @@ function populateDialogFields(): void {
 /** Merge observed secondaries with durable pending/failed removal intent. */
 function renderSecondaryIps(iface: InterfaceInfo | undefined, primary: { address: string } | undefined): void {
   const list = $("#secondary-ip-list");
-  const rows = new Map((iface?.ips ?? []).filter((ip) => ip.address !== primary?.address)
+  const rows = new Map((iface?.ips ?? []).filter((ip) => !isApipa(ip.address) && ip.address !== primary?.address)
     .map((ip) => [ip.address, ip.prefix]));
-  const saved = new Map([...adoptionMeta].filter(([, m]) => m.address && m.address !== primary?.address &&
+  const saved = new Map([...adoptionMeta].filter(([, m]) => m.address && !isApipa(m.address) && m.address !== primary?.address &&
     (m.desired !== "removed" || m.applied || m.last_error)).map(([subnet, m]) => [m.address!, { subnet, meta: m }]));
   for (const [address, { meta }] of saved) rows.set(address, meta.prefix ?? 24);
   list.innerHTML = rows.size ? [...rows].map(([address, prefix]) => {
