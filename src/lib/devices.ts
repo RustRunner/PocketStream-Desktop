@@ -179,14 +179,14 @@ function scanAllRoutableDevices(): void {
 // ── Discovery status ─────────────────────────────────────────────────
 //
 // Phase machine with three states driving the Nodes-card spinner:
-//   "discovering" → "IP Discovery..."  (ARP + subnet adoption in flight)
-//   "scanning"    → "Port Scan..."     (TCP probes in flight)
+//   "discovering" → "Discovery..."   (ARP + subnet adoption in flight)
+//   "scanning"    → "Discovery..."   (TCP probes in flight)
 //   "idle"        → no spinner         (everything settled)
 //
 // The spinner is a *startup progress indicator*, not a live activity
 // readout. Once the initial flow completes (first idle after adoption
 // + scanning), background ARP traffic must not resurrect it — otherwise
-// the nodes card would flicker back to "IP Discovery..." indefinitely
+// the Nodes header would flicker back to "Discovery..." indefinitely
 // on any busy network. `initialFlowComplete` enforces that by coercing
 // any post-startup "discovering" request into "idle".
 //
@@ -246,8 +246,7 @@ function applyDiscoveryPhaseToDOM(): void {
     container.classList.add("hidden");
     return;
   }
-  const label = discoveryPhase === "scanning" ? "Port Scan..." : "IP Discovery...";
-  $("#discovery-label").textContent = label;
+  $("#discovery-label").textContent = "Discovery...";
   container.classList.remove("hidden");
 }
 
@@ -266,7 +265,7 @@ function setDiscoveryPhase(phase: DiscoveryPhase): void {
   // Engage the one-shot lock only on a *real* completion — scanning →
   // idle via scanDevicePorts. A direct discovering → idle (hideDiscoveryStatus
   // on link drop, explicit reset paths) is not completion and must not
-  // lock future "IP Discovery..." transitions.
+  // lock future "Discovery..." transitions.
   if (phase === "idle" && wasScanning) initialFlowComplete = true;
   applyDiscoveryPhaseToDOM();
 }
@@ -292,7 +291,7 @@ export function resetDiscoveryStatus(): void {
   settleTimer = null;
   clearGraceTimer();
   // Clear the one-shot lock so a reconnect / user-initiated rescan can
-  // legitimately show "IP Discovery..." again at the start of the fresh
+  // legitimately show "Discovery..." again at the start of the fresh
   // flow. Must happen BEFORE setDiscoveryPhase, or the coercion would
   // bounce "discovering" → "idle". The grace clock restarts with the
   // fresh flow for the same reason.
@@ -303,7 +302,7 @@ export function resetDiscoveryStatus(): void {
   // fast UI recovery, so the backend often doesn't re-fire subnet-adopted
   // or arp-device-discovered events — which means debounceScan never
   // triggers, scanAllRoutableDevices never runs, and the spinner would
-  // stay on "IP Discovery..." indefinitely. Kick a scan of the already-
+  // stay on "Discovery..." indefinitely. Kick a scan of the already-
   // known devices immediately; if the deviceList is empty (cold start),
   // the function returns early and we correctly stay in "discovering"
   // waiting for fresh ARP events.
@@ -564,7 +563,7 @@ export function renderArpDeviceList(): void {
   }
 
   if (bySubnet.size === 0 && pendingScans <= 0) {
-    // Spinner (IP Discovery / Port Scan) carries the "still working"
+    // The header's Discovery spinner carries the "still working"
     // signal — leave the list empty while it's visible. Only show
     // the "No devices found" placeholder once everything's settled.
     list.innerHTML = isDiscoveryActive()
