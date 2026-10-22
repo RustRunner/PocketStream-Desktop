@@ -1360,11 +1360,11 @@
 .discovery-status {
   display: flex;
   align-items: center;
-  justify-content: center;
-  gap: 10px;
-  padding: 8px 24px;
+  flex-shrink: 0;
+  gap: 8px;
+  white-space: nowrap;
   color: var(--md-on-surface-variant);
-  font-size: 14px;
+  font-size: 12px;
 }
 
 .discovery-status.hidden {
