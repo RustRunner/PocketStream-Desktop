@@ -3185,6 +3185,11 @@ impl NetworkManager {
             self.adopted_ips.lock().await.clear();
             if let Ok(mut meta) = self.adopted_meta.lock() {
                 for row in meta.values_mut() {
+                    // Adapter loss must not reopen a completed deletion.
+                    // Reconciliation rechecks its absence on adapter return.
+                    if row.removal_complete() {
+                        continue;
+                    }
                     row.applied = false;
                     row.last_error = Some("selected adapter unavailable".into());
                 }
@@ -5626,6 +5631,80 @@ mod tests {
         let mut iface = adapter("Ethernet", ips);
         iface.mac = "40:cd:3a:00:00:01".into();
         iface
+    }
+
+    #[tokio::test]
+    async fn adapter_selection_changes_preserve_completed_removals_without_hiding_pending_rows() {
+        use crate::config::BindingDesired::Removed;
+        use interface::address_test_io::FakeAddressIo;
+        for previously_selected in [false, true] {
+            let io = FakeAddressIo::new(&["192.168.2.100"]);
+            let manager = NetworkManager::with_address_io(io.clone());
+            let mut completed = saved_binding("172.26.95.99");
+            completed.desired = Removed;
+            let mut pending = saved_binding("198.51.100.20");
+            pending.desired = Removed;
+            pending.last_error = Some("Removal awaiting Windows confirmation".into());
+            let mut still_applied = saved_binding("203.0.113.20");
+            still_applied.desired = Removed;
+            still_applied.applied = true;
+            let mut present = saved_binding("192.0.2.20");
+            present.applied = true;
+            let rows: HashMap<_, _> = [
+                ("172.26.95.0/24".into(), completed.clone()),
+                ("198.51.100.0/24".into(), pending),
+                ("203.0.113.0/24".into(), still_applied),
+                ("192.0.2.0/24".into(), present),
+            ]
+            .into_iter()
+            .collect();
+            let config =
+                crate::config::AppConfig::temporary_test_config(crate::config::AppSettings {
+                    selected_adapter_mac: completed.adapter_mac.clone(),
+                    adopted_meta: rows.clone(),
+                    ..Default::default()
+                });
+            let before = toml::to_string(&config.get()).unwrap();
+            *manager.adopted_meta.lock().unwrap() = rows;
+            manager
+                .adopted_ips
+                .lock()
+                .await
+                .insert("192.0.2.0/24".into(), ip("192.0.2.20"));
+            if previously_selected {
+                *manager.adapter_selection.lock().await = discovery_selection(true);
+            }
+
+            let selection = manager
+                .resolve_adapter_selection(&config, &[])
+                .await
+                .unwrap();
+            assert!(selection.adapter.is_none());
+            assert!(selection.interface_index.is_none());
+            let snapshot = manager.adoption_snapshot().await;
+            assert!(snapshot.adopted_subnets.is_empty());
+            let removed = &snapshot.meta["172.26.95.0/24"];
+            assert_eq!(removed.desired, Removed);
+            assert!(!removed.applied);
+            assert_eq!(
+                removed.last_error, None,
+                "adapter loss must not reopen a completed deletion"
+            );
+            assert_eq!(
+                manager.adopted_meta.lock().unwrap()["172.26.95.0/24"],
+                completed
+            );
+            for subnet in ["198.51.100.0/24", "203.0.113.0/24", "192.0.2.0/24"] {
+                assert!(
+                    snapshot.meta[subnet].last_error.is_some(),
+                    "retain unresolved {subnet}"
+                );
+            }
+            assert_eq!(toml::to_string(&config.get()).unwrap(), before);
+            assert!(io.writes.lock().unwrap().is_empty());
+            assert!(io.saves.lock().unwrap().is_empty());
+            assert_eq!(io.providers.load(Ordering::Relaxed), 0);
+        }
     }
 
     #[tokio::test(start_paused = true)]
