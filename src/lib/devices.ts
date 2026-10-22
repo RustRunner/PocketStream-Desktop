@@ -179,8 +179,8 @@ function scanAllRoutableDevices(): void {
 // ── Discovery status ─────────────────────────────────────────────────
 //
 // Phase machine with three states driving the Nodes-card spinner:
-//   "discovering" → "Discovery..."   (ARP + subnet adoption in flight)
-//   "scanning"    → "Discovery..."   (TCP probes in flight)
+//   "discovering" → Discovery + dots  (ARP + subnet adoption in flight)
+//   "scanning"    → Discovery + dots  (TCP probes in flight)
 //   "idle"        → no spinner         (everything settled)
 //
 // The spinner is a *startup progress indicator*, not a live activity
@@ -242,11 +242,12 @@ function armGraceTimer(delay: number): void {
 function applyDiscoveryPhaseToDOM(): void {
   const container = $("#discovery-status");
   if (!container) return;
+  // The manual Refresh request owns "spinning" independently of this flow.
+  $("#btn-refresh-nodes").classList.toggle("discovery-active", discoveryPhase !== "idle");
   if (discoveryPhase === "idle") {
     container.classList.add("hidden");
     return;
   }
-  $("#discovery-label").textContent = "Discovery...";
   container.classList.remove("hidden");
 }
 
@@ -354,7 +355,7 @@ export function setupArpListeners(): void {
     if (isNew) {
       log(`ARP: discovered ${device.ip} (${device.mac})`);
       // Mid-scan ARPs flip us back to "discovering" only if we're not
-      // already showing "Port Scan..." for in-flight scans. That keeps
+      // already in the scanning phase for in-flight scans. That keeps
       // the UX linear (Discovery → Scan → idle) instead of flickering
       // back to Discovery every time a late ARP arrives during a scan.
       if (discoveryPhase === "idle") {
