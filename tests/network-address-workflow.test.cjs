@@ -157,6 +157,40 @@ test('Fresh adoption shows the green auto badge; restored, pending and ended att
   assert(f.$('#subnet-list').innerHTML.includes(IP),'saved address remains visible');
 });
 
+test('Completed removed history stays hidden before and after Ethernet link-up without hiding real 172 addresses',async()=>{
+  const f=fixture(),subnet='172.26.95.0/24',address='172.26.95.99';
+  f.adoptionMeta.set(subnet,{adapter_mac:MAC,address,prefix:24,desired:'removed',applied:false,last_error:null});
+  f.api.getAdoptionState=async()=>({adopted_subnets:{[SUBNET]:IP},meta:Object.fromEntries(f.adoptionMeta)});
+  for(const up of [false,true]){
+    const adapter={...f.iface,is_up:up};
+    f.api.getAdapterSelection=async()=>({...f.selection,adapter,candidates:[adapter]});
+    await f.exports.refreshInterfaces();await f.$('#btn-ip-config').fire('click');
+    assert(!f.$('#subnet-list').innerHTML.includes(address));
+    assert(!f.$('#secondary-ip-list').innerHTML.includes(address));
+    assert(f.$('#subnet-list').innerHTML.includes(f.iface.ips[0].address));
+    assert(f.$('#subnet-list').innerHTML.includes(IP),'legitimate saved adoption is retained');
+    assert(f.adoptionMeta.has(subnet),'history is retained');
+  }
+  f.iface.ips.push({address,prefix:24,subnet});
+  f.exports.renderSelectionForTest(f.selection);
+  assert(f.$('#subnet-list').innerHTML.includes(address),'an address actually assigned to Ethernet is visible');
+  assert(f.$('#secondary-ip-list').innerHTML.includes(address));
+  assert.equal(f.calls.writes,0);
+});
+
+test('Pending or failed removed bindings remain visible and removable in Configure',async()=>{
+  for(const [applied,last_error] of [[true,null],[false,'Removal awaiting Windows confirmation']]){
+    const f=fixture();Object.assign(f.adoptionMeta.get(SUBNET),{desired:'removed',applied,last_error});
+    f.iface.ips=f.iface.ips.filter(ip=>ip.address!==IP);
+    f.state.activeInterface={...f.iface,is_up:false};
+    f.$('#ip-config-dialog').open=true;f.exports.renderSelectionForTest({...f.selection,adapter:f.state.activeInterface});
+    assert(f.$('#subnet-list').innerHTML.includes(IP));
+    assert(f.$('#secondary-ip-list').innerHTML.includes(IP));
+    assert(f.$('#secondary-ip-list').buttons.some(btn=>btn.dataset.removeBinding===SUBNET));
+    assert.equal(f.calls.writes,0);
+  }
+});
+
 test('Closing an unchanged ambiguous or disconnected adapter does not write network settings',async()=>{
   for(const missing of [false,true]){
     const f=fixture();f.adoptionMeta.clear();f.adoptedSubnets.clear();
