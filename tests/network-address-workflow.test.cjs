@@ -521,6 +521,28 @@ test('SP10/SP11 Modal removal paints Host and open dialog from one reply with ze
   for(const name of ['selection','bindings','mode','dhcp'])assert.equal(f.calls[name],before[name],name);
 });
 
+test('Removing the last Host IP clears both panels and an older interface fetch cannot restore it',async()=>{
+  const f=fixture(),old=deferred();f.iface.ips=[f.iface.ips[1]];
+  f.state.config.primary_addresses={[MAC]:''};
+  f.api.getAdapterSelection=()=>{f.calls.selection++;return old.promise;};
+  const read=f.exports.refreshInterfaces();const removal=f.modalRemove();await flush();
+  assert(f.$('#subnet-list').innerHTML.includes(IP),'retain the address until removal is verified');
+  const result=f.reply(),empty={...f.iface,ips:[]};
+  result.view.selection={...f.selection,adapter:empty,candidates:[empty]};
+  f.pending[0].resolve(result);await removal;await flush();
+  assert.equal(f.state.activeInterface.ips.length,0);assert.equal(f.$('#subnet-list').innerHTML,'');
+  assert(!f.$('#secondary-ip-list').innerHTML.includes(IP));
+  assert(f.$('#secondary-ip-list').innerHTML.includes('No secondary IPs'));
+  assert.equal(f.adoptionMeta.get(SUBNET).desired,'removed');
+  assert.equal(f.adoptionMeta.get(SUBNET).applied,false);assert(!f.adoptedSubnets.has(SUBNET));
+  const before={...f.calls};old.resolve(f.selection);await read;await flush();
+  assert.equal(f.state.activeInterface.ips.length,0);assert.equal(f.$('#subnet-list').innerHTML,'');
+  assert(!f.$('#secondary-ip-list').innerHTML.includes(IP),'stale fetch cannot repaint the modal');
+  assert.equal(f.calls.writes,1);assert.equal(f.calls.selection,1);
+  for(const name of ['selection','bindings','mode','dhcp'])assert.equal(f.calls[name],before[name],name);
+  assert(!f.feedback.some(item=>item.error));
+});
+
 test('SP10 adapter A/B/A retires the old success even when the final MAC matches',async()=>{
   const f=fixture();const pending=f.modalRemove();await flush();
   f.setSelection({...f.selection,selected_mac:'40:cd:3a:00:00:02',interface_index:8});f.setSelection(f.selection);
