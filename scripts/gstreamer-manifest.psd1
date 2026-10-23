@@ -12,28 +12,28 @@
 @{
     PinnedVersion = '1.26.11'
 
-    # Canonical SRT 1.5.6 drop-in built by build-patched-libsrt.ps1. The
+    # Canonical SRT 1.5.7 drop-in built by build-patched-libsrt.ps1. The
     # release tag is deliberately outside v* so it cannot trigger or become
     # an application update. bundle-gstreamer.ps1 verifies the archive and
     # inner DLL hashes before replacing the stock 1.5.4 libsrt.dll.
     PatchedSrt = @{
-        Version           = '1.5.6'
-        RuntimeVersionHex = '0x010506'
-        ReleaseTag        = 'deps-libsrt-1.5.6-gstreamer-1.26.11-1'
-        ArchiveFile       = 'pocketstream-libsrt-1.5.6-gstreamer-1.26.11-windows-x86_64.zip'
-        AssetUrl          = 'https://github.com/RustRunner/PocketStream-Desktop/releases/download/deps-libsrt-1.5.6-gstreamer-1.26.11-1/pocketstream-libsrt-1.5.6-gstreamer-1.26.11-windows-x86_64.zip'
-        ArchiveSha256     = '21aa68ef59e443509756b22421638ba48db206dcffb323e4b080399095af43c4'
+        Version           = '1.5.7'
+        RuntimeVersionHex = '0x010507'
+        ReleaseTag        = 'deps-libsrt-1.5.7-gstreamer-1.26.11-1'
+        ArchiveFile       = 'pocketstream-libsrt-1.5.7-gstreamer-1.26.11-windows-x86_64.zip'
+        AssetUrl          = 'https://github.com/RustRunner/PocketStream-Desktop/releases/download/deps-libsrt-1.5.7-gstreamer-1.26.11-1/pocketstream-libsrt-1.5.7-gstreamer-1.26.11-windows-x86_64.zip'
+        ArchiveSha256     = 'c6b364a4b1205b5aafb5a64644941d4ca811f9dae6ad459b4240550d44a29948'
         DllFile           = 'libsrt.dll'
-        DllSha256         = '45d2508afcd922f64124671965a1dabf02bca2bcc295d8c82f70c4653aaeab30'
+        DllSha256         = '8d58764b2d53df76b7e9b69e55cd3250d3bb0c14631224c0f16962c5317a5600'
 
         # Reproducibility and stock-ABI pins consumed by the G1-R runtime
         # verifier. These duplicate the machine-readable dependency artifact
         # deliberately: disagreement between the repository contract and the
         # published artifact must fail closed.
-        SourceArchiveSha256 = '2c4980c2c4cfd142d21b829d939dc51db9c6628af5967fff62fd7290769569c7'
+        SourceArchiveSha256 = '017cd1e437ef2073a4dd10ddf7b55e86bc3d6ebac0393d13bd22f6a57055d32b'
         CerberoCommit       = 'cebb549ade5b73048fc29be5a45332246f1c14f6'
-        PatchedRecipeBlob   = '80037d6b64bda97413e143ffb58b8604b9c5ad9b'
-        RecipePatchSha256   = '40d311f06bbf5f2911696b65769c51a8aaa744d07809c06291baa8bb30cf6430'
+        PatchedRecipeBlob   = '90a31783902af6d66d2b5e14c0133216921665e6'
+        RecipePatchSha256   = 'd8d257e19403a8268628a877ef78a78cb94aa46605868bcf573197b5bbac84bf'
         MinGwCompilerSha256 = '114d0947d549750b1273d765a4fe415e7f2fdd1eb2a3bb2671e2735f20c50cd8'
         StockRuntimeUrl     = 'https://gstreamer.freedesktop.org/data/pkg/windows/1.26.11/msvc/gstreamer-1.0-msvc-x86_64-1.26.11.msi'
         StockRuntimeSha256  = '31cbc21fa0950b5c1e79c80959b2799805cb05a7a35953a13a9f790776137605'
@@ -46,7 +46,7 @@
         # prefix, so its staged hash is intentionally distinct from the
         # build-time dependency hash recorded inside provenance.json.
         StagedClosure = @{
-            'bin/libsrt.dll'                         = '45d2508afcd922f64124671965a1dabf02bca2bcc295d8c82f70c4653aaeab30'
+            'bin/libsrt.dll'                         = '8d58764b2d53df76b7e9b69e55cd3250d3bb0c14631224c0f16962c5317a5600'
             'bin/libcrypto-3-x64.dll'                = '8a0e2418a3106c814a2c117c591750f34c0c1b9bef23d2e95dd36c61558e37e0'
             'bin/libstdc++-6.dll'                    = '6d8c75b04fa69225ee34cb65cd06b1dd6757640fb646851d8d87c453c8895812'
             'bin/libgcc_s_seh-1.dll'                 = '323372c82a994267b23140681c41c44f3aee0d0032ff9d884d69b1a1ed7f2ac1'
@@ -98,7 +98,7 @@
         'bin/jpeg8.dll'                                   = '930870255cac71ef7dd324a7314f9443fbaf49138257239ef9aad7f1e6a8379a'
         'bin/libcrypto-3-x64.dll'                         = '8a0e2418a3106c814a2c117c591750f34c0c1b9bef23d2e95dd36c61558e37e0'
         'bin/libgcc_s_seh-1.dll'                          = '323372c82a994267b23140681c41c44f3aee0d0032ff9d884d69b1a1ed7f2ac1'
-        'bin/libsrt.dll'                                  = '45d2508afcd922f64124671965a1dabf02bca2bcc295d8c82f70c4653aaeab30'
+        'bin/libsrt.dll'                                  = '8d58764b2d53df76b7e9b69e55cd3250d3bb0c14631224c0f16962c5317a5600'
         'bin/libstdc++-6.dll'                             = '6d8c75b04fa69225ee34cb65cd06b1dd6757640fb646851d8d87c453c8895812'
         'bin/libwinpthread-1.dll'                         = '1e165b3f54a3f0387e4e3c1b5ae6143652aee4e4afd6e9474fcfde2cd8a92bbb'
         'bin/orc-0.4-0.dll'                               = '42dcb7649c460395ed1f083a1dc3005fa7036f057ac89d30e5ce8947af24feef'
@@ -144,10 +144,10 @@
     # prerelease tag is used instead of mutating the earlier GStreamer-only
     # mirror after the SRT closure was added.
     SourceRelease = @{
-        Tag            = 'deps-src-gstreamer-1.26.11-srt-1.5.6-1'
-        Url            = 'https://github.com/RustRunner/PocketStream-Desktop/releases/tag/deps-src-gstreamer-1.26.11-srt-1.5.6-1'
+        Tag            = 'deps-src-gstreamer-1.26.11-srt-1.5.7-1'
+        Url            = 'https://github.com/RustRunner/PocketStream-Desktop/releases/tag/deps-src-gstreamer-1.26.11-srt-1.5.7-1'
         IndexFile      = 'SHA256SUMS.txt'
-        IndexSha256    = 'cd359e660d72946277feadf4d918ff004562060b570ef1fead083f9ef2750da4'
+        IndexSha256    = '8d292bdc9befbcd0809141fc7dc7fb2ef6fd580d7208b65309c1216472abc001'
         Assets = @{
             'bzip2' = @{ Version = '1.0.8'; SourceTag = '1.0.8'; File = 'bzip2-1.0.8.tar.gz'; Url = 'https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz'; Sha256 = 'ab5a03176ee106d3f0fa90e381da478ddae405918153cca248e682cd0c4a2269' }
             'cerbero' = @{ Version = '1.26.11'; SourceTag = '1.26.11'; File = 'cerbero-1.26.11.tar.gz'; Url = 'https://github.com/GStreamer/cerbero/archive/refs/tags/1.26.11.tar.gz'; Sha256 = 'c385254bd01a975a48087f28a10e530ae8444ca4351b07831cda60ca8f9c858c' }
@@ -170,8 +170,8 @@
             'orc' = @{ Version = '0.4.41'; SourceTag = '0.4.41'; File = 'orc-0.4.41.tar.xz'; Url = 'https://gstreamer.freedesktop.org/src/orc/orc-0.4.41.tar.xz'; Sha256 = 'cb1bfd4f655289cd39bc04642d597be9de5427623f0861c1fc19c08d98467fa2' }
             'pcre2' = @{ Version = '10.42'; SourceTag = 'pcre2-10.42'; File = 'pcre2-10.42.tar.bz2'; Url = 'https://github.com/PhilipHazel/pcre2/releases/download/pcre2-10.42/pcre2-10.42.tar.bz2'; Sha256 = '8d36cd8cb6ea2a4c2bb358ff6411b0c788633a2a45dabbf1aeb4b701d1b5e840' }
             'proxy-libintl' = @{ Version = '0.4'; SourceTag = '0.4'; File = 'proxy-libintl-0.4.tar.gz'; Url = 'https://github.com/frida/proxy-libintl/archive/refs/tags/0.4.tar.gz'; Sha256 = '13ef3eea0a3bc0df55293be368dfbcff5a8dd5f4759280f28e030d1494a5dffb' }
-            'srt' = @{ Version = '1.5.6'; SourceTag = 'v1.5.6'; File = 'srt-1.5.6.tar.gz'; Url = 'https://github.com/Haivision/srt/archive/v1.5.6.tar.gz'; Sha256 = '2c4980c2c4cfd142d21b829d939dc51db9c6628af5967fff62fd7290769569c7' }
-            'srt-recipe-patch' = @{ Version = '1'; SourceTag = 'repository'; File = 'cerbero-srt-1.5.6.patch'; RepositoryPath = 'scripts/patches/cerbero-srt-1.5.6.patch'; Sha256 = '40d311f06bbf5f2911696b65769c51a8aaa744d07809c06291baa8bb30cf6430' }
+            'srt' = @{ Version = '1.5.7'; SourceTag = 'v1.5.7'; File = 'srt-1.5.7.tar.gz'; Url = 'https://github.com/Haivision/srt/archive/v1.5.7.tar.gz'; Sha256 = '017cd1e437ef2073a4dd10ddf7b55e86bc3d6ebac0393d13bd22f6a57055d32b' }
+            'srt-recipe-patch' = @{ Version = '1'; SourceTag = 'repository'; File = 'cerbero-srt-1.5.7.patch'; RepositoryPath = 'scripts/patches/cerbero-srt-1.5.7.patch'; Sha256 = 'd8d257e19403a8268628a877ef78a78cb94aa46605868bcf573197b5bbac84bf' }
             'x264' = @{ Version = '0.164.3108+git31e19f9'; SourceTag = '31e19f9'; File = 'x264_0.164.3108+git31e19f9.orig.tar.gz'; Url = 'https://gstreamer.freedesktop.org/src/mirror/x264_0.164.3108%2Bgit31e19f9.orig.tar.gz'; Sha256 = '41606cb8e788a7f8c4514290646d4ba5c7bc68d9e1ccd1a73f446a90546913eb' }
             'zlib' = @{ Version = '1.3.1'; SourceTag = 'v1.3.1'; File = 'zlib-1.3.1.tar.gz'; Url = 'https://zlib.net/fossils/zlib-1.3.1.tar.gz'; Sha256 = '9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23' }
         }
@@ -200,22 +200,22 @@
         'orc'                = @{ Version = '0.4.41'; SourceAssets = @('orc'); BuildOrigin = 'gstreamer-1.26.11-msi'; BuildInputs = @('cerbero') }
         'pcre2'              = @{ Version = '10.42'; SourceAssets = @('pcre2'); BuildOrigin = 'gstreamer-1.26.11-msi'; BuildInputs = @('cerbero') }
         'proxy-libintl'      = @{ Version = '0.4'; SourceAssets = @('proxy-libintl'); BuildOrigin = 'gstreamer-1.26.11-msi'; BuildInputs = @('cerbero') }
-        'srt'                = @{ Version = '1.5.6'; SourceAssets = @('srt'); BuildOrigin = 'patched-libsrt-dependency'; BuildInputs = @('cerbero', 'srt-recipe-patch') }
+        'srt'                = @{ Version = '1.5.7'; SourceAssets = @('srt'); BuildOrigin = 'patched-libsrt-dependency'; BuildInputs = @('cerbero', 'srt-recipe-patch') }
         'winpthreads'        = @{ Version = '12.0.0'; SourceAssets = @('mingw-w64'); BuildOrigin = 'gstreamer-1.26.11-msi'; BuildInputs = @('cerbero') }
         'x264'               = @{ Version = '0.164.3108+git31e19f9'; SourceAssets = @('x264'); BuildOrigin = 'gstreamer-1.26.11-msi'; BuildInputs = @('cerbero') }
         'zlib'               = @{ Version = '1.3.1'; SourceAssets = @('zlib'); BuildOrigin = 'gstreamer-1.26.11-msi'; BuildInputs = @('cerbero') }
     }
 
     SecurityReview = @{
-        RecordPath             = 'docs/runtime-evidence/g3-security-review-2026-08-25.md'
-        CanonicalTextSha256    = '98cd53cee3d0798d5677c67daab6387641db866512c362d911b783dcc3144347'
-        ReviewedAt             = '2026-08-25'
+        RecordPath             = 'docs/runtime-evidence/g3-security-review-2026-10-23.md'
+        CanonicalTextSha256    = 'd6274edcd32aaa282b699b434af9ee5b3b403f8fa2791131979d97a2e369596c'
+        ReviewedAt             = '2026-10-23'
         MaxAgeDays             = 30
-        SrtVersion             = '1.5.6'
-        SrtDllSha256           = '45d2508afcd922f64124671965a1dabf02bca2bcc295d8c82f70c4653aaeab30'
+        SrtVersion             = '1.5.7'
+        SrtDllSha256           = '8d58764b2d53df76b7e9b69e55cd3250d3bb0c14631224c0f16962c5317a5600'
         OpenSslVersion         = '3.5.0'
         OpenSslDllSha256       = '8a0e2418a3106c814a2c117c591750f34c0c1b9bef23d2e95dd36c61558e37e0'
-        RequiredAdvisoryIds    = @('CVE-2026-55869', 'CVE-2026-55868')
+        RequiredAdvisoryIds    = @('CVE-2026-55869', 'CVE-2026-55868', 'GHSA-m96h-3rc9-xx6h')
         OpenSslAdvisoryUrl     = 'https://openssl-library.org/news/vulnerabilities-3.5/'
     }
 
@@ -268,7 +268,7 @@
 
         # SRT output, its OpenSSL AES backend, and MinGW runtime closure.
         # The stock libsrt.dll is copied first, then replaced only by the
-        # hash-pinned 1.5.6 artifact above.
+        # hash-pinned 1.5.7 artifact above.
         'libsrt.dll'
         'libcrypto-3-x64.dll'
         'libstdc++-6.dll'

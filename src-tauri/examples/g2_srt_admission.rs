@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const EXPECTED_SRT_VERSION: u32 = 0x010506;
+const EXPECTED_SRT_VERSION: u32 = 0x010507;
 const CLIENT_LIMIT: usize = 10;
 const PENDING_TTL: Duration = Duration::from_secs(10);
 const WAIT_STEP: Duration = Duration::from_millis(25);
@@ -579,7 +579,7 @@ fn run_bound_wrong_handshake(
         let wrong_passphrase = CString::new(WRONG_PASSPHRASE)?;
         let key_length = 16i32;
         let connect_timeout_ms = 1_500i32;
-        // SRT 1.5.6 public SRT_SOCKOPT values from srt.h.
+        // SRT 1.5.7 public SRT_SOCKOPT values from srt.h.
         const SRTO_PASSPHRASE: i32 = 26;
         const SRTO_PBKEYLEN: i32 = 27;
         const SRTO_CONNTIMEO: i32 = 36;

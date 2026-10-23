@@ -11,8 +11,8 @@ SHA256SUMS.txt. It never discovers versions or hashes from the network.
 
 Publish the resulting directory only as the manifest-pinned prerelease:
 
-  gh release create deps-src-gstreamer-1.26.11-srt-1.5.6-1 --prerelease `
-    --title "Third-party source: GStreamer 1.26.11 + SRT 1.5.6" `
+  gh release create deps-src-gstreamer-1.26.11-srt-1.5.7-1 --prerelease `
+    --title "Third-party source: GStreamer 1.26.11 + SRT 1.5.7" `
     --notes "Complete native source and build inputs for PocketStream Desktop. See SHA256SUMS.txt." `
     <staging-dir>\*
 

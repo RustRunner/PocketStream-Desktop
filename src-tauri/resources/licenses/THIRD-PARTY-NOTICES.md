@@ -13,7 +13,7 @@ the application loads whatever compatible DLLs are present there.
 **Corresponding source.** The complete hash-pinned native source closure,
 including every component archive, the exact Cerbero build inputs, and
 PocketStream's tracked SRT recipe override, is published at:
-<https://github.com/RustRunner/PocketStream-Desktop/releases/tag/deps-src-gstreamer-1.26.11-srt-1.5.6-1>
+<https://github.com/RustRunner/PocketStream-Desktop/releases/tag/deps-src-gstreamer-1.26.11-srt-1.5.7-1>
 The release includes `SHA256SUMS.txt`; exact upstream locations and hashes
 remain recorded in `scripts/gstreamer-manifest.psd1` in the source tree.
 
@@ -38,7 +38,7 @@ GStreamer core library and core elements.
 - License: LGPL-2.1-or-later — [texts/LGPL-2.1.txt](texts/LGPL-2.1.txt)
 - Copyright © the GStreamer contributors
 - Upstream: <https://gstreamer.freedesktop.org/>
-- Source: deps-src-gstreamer-1.26.11-srt-1.5.6-1 release (see above)
+- Source: deps-src-gstreamer-1.26.11-srt-1.5.7-1 release (see above)
 
 ## gst-plugins-base
 
@@ -49,7 +49,7 @@ libraries, playback, OpenGL, and related plugins).
 - License: LGPL-2.1-or-later — [texts/LGPL-2.1.txt](texts/LGPL-2.1.txt)
 - Copyright © the GStreamer contributors
 - Upstream: <https://gstreamer.freedesktop.org/>
-- Source: deps-src-gstreamer-1.26.11-srt-1.5.6-1 release (see above)
+- Source: deps-src-gstreamer-1.26.11-srt-1.5.7-1 release (see above)
 
 ## gst-plugins-good
 
@@ -60,7 +60,7 @@ ISO-MP4 muxing).
 - License: LGPL-2.1-or-later — [texts/LGPL-2.1.txt](texts/LGPL-2.1.txt)
 - Copyright © the GStreamer contributors
 - Upstream: <https://gstreamer.freedesktop.org/>
-- Source: deps-src-gstreamer-1.26.11-srt-1.5.6-1 release (see above)
+- Source: deps-src-gstreamer-1.26.11-srt-1.5.7-1 release (see above)
 
 ## gst-plugins-bad
 
@@ -71,7 +71,7 @@ demuxing/muxing, SRT, Direct3D 11, raw parsing).
 - License: LGPL-2.1-or-later — [texts/LGPL-2.1.txt](texts/LGPL-2.1.txt)
 - Copyright © the GStreamer contributors
 - Upstream: <https://gstreamer.freedesktop.org/>
-- Source: deps-src-gstreamer-1.26.11-srt-1.5.6-1 release (see above)
+- Source: deps-src-gstreamer-1.26.11-srt-1.5.7-1 release (see above)
 
 ## gst-plugins-ugly
 
@@ -84,7 +84,7 @@ distributed under the GPL.
   (combination with x264 distributed under [texts/GPL-2.0.txt](texts/GPL-2.0.txt))
 - Copyright © the GStreamer contributors
 - Upstream: <https://gstreamer.freedesktop.org/>
-- Source: deps-src-gstreamer-1.26.11-srt-1.5.6-1 release (see above)
+- Source: deps-src-gstreamer-1.26.11-srt-1.5.7-1 release (see above)
 
 ## gst-libav
 
@@ -94,7 +94,7 @@ GStreamer FFmpeg wrapper plugin (H.264 decoding).
 - License: LGPL-2.1-or-later — [texts/LGPL-2.1.txt](texts/LGPL-2.1.txt)
 - Copyright © the GStreamer contributors
 - Upstream: <https://gstreamer.freedesktop.org/>
-- Source: deps-src-gstreamer-1.26.11-srt-1.5.6-1 release (see above)
+- Source: deps-src-gstreamer-1.26.11-srt-1.5.7-1 release (see above)
 
 ## gst-rtsp-server
 
@@ -104,25 +104,25 @@ GStreamer RTSP server library.
 - License: LGPL-2.1-or-later — [texts/LGPL-2.1.txt](texts/LGPL-2.1.txt)
 - Copyright © the GStreamer contributors
 - Upstream: <https://gstreamer.freedesktop.org/>
-- Source: deps-src-gstreamer-1.26.11-srt-1.5.6-1 release (see above)
+- Source: deps-src-gstreamer-1.26.11-srt-1.5.7-1 release (see above)
 
 ## srt
 
 Secure Reliable Transport library used by the GStreamer SRT plugin. The
-bundled DLL is PocketStream's pinned 1.5.6 Cerbero drop-in, not the stock
+bundled DLL is PocketStream's pinned 1.5.7 Cerbero drop-in, not the stock
 GStreamer 1.26.11 SRT 1.5.4 DLL.
 
-- Version: 1.5.6
+- Version: 1.5.7
 - License: MPL-2.0 — [texts/MPL-2.0.txt](texts/MPL-2.0.txt)
 - Copyright © Haivision Systems Inc., The Board of Trustees of the
   University of Illinois, and other contributors
 - Upstream: <https://github.com/Haivision/srt>
-- Source: <https://github.com/Haivision/srt/archive/v1.5.6.tar.gz>
+- Source: <https://github.com/Haivision/srt/archive/v1.5.7.tar.gz>
   (SHA-256 `2c4980c2c4cfd142d21b829d939dc51db9c6628af5967fff62fd7290769569c7`)
-- Mirrored source and recipe override: deps-src-gstreamer-1.26.11-srt-1.5.6-1
+- Mirrored source and recipe override: deps-src-gstreamer-1.26.11-srt-1.5.7-1
   release (see above)
 - Build artifact and provenance:
-  <https://github.com/RustRunner/PocketStream-Desktop/releases/tag/deps-libsrt-1.5.6-gstreamer-1.26.11-1>
+  <https://github.com/RustRunner/PocketStream-Desktop/releases/tag/deps-libsrt-1.5.7-gstreamer-1.26.11-1>
 
 ## openssl
 
@@ -134,7 +134,7 @@ OpenSSL libcrypto, used as the SRT AES encryption backend.
 - Upstream: <https://openssl-library.org/>
 - Source: <https://github.com/openssl/openssl/releases/download/openssl-3.5.0/openssl-3.5.0.tar.gz>
   (SHA-256 `344d0a79f1a9b08029b0744e2cc401a43f9c90acd1044d09a530b4885a8e9fc0`)
-- Mirrored source: deps-src-gstreamer-1.26.11-srt-1.5.6-1 release (see above)
+- Mirrored source: deps-src-gstreamer-1.26.11-srt-1.5.7-1 release (see above)
 
 ## gcc-runtime
 
@@ -149,7 +149,7 @@ GNU C/C++ runtime libraries used by the Cerbero MinGW SRT build
 - Upstream: <https://gcc.gnu.org/>
 - Source: <https://ftp.gnu.org/gnu/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz>
   (SHA-256 `a7b39bc69cbf9e25826c5a60ab26477001f7c08d85cec04bc0e29cabed6f3cc9`)
-- Mirrored source: deps-src-gstreamer-1.26.11-srt-1.5.6-1 release (see above)
+- Mirrored source: deps-src-gstreamer-1.26.11-srt-1.5.7-1 release (see above)
 
 ## winpthreads
 
@@ -162,7 +162,7 @@ POSIX threads compatibility runtime from mingw-w64.
 - Upstream: <https://www.mingw-w64.org/>
 - Source: <https://downloads.sourceforge.net/project/mingw-w64/mingw-w64/mingw-w64-release/mingw-w64-v12.0.0.tar.bz2>
   (SHA-256 `cc41898aac4b6e8dd5cffd7331b9d9515b912df4420a3a612b5ea2955bbeed2f`)
-- Mirrored source: deps-src-gstreamer-1.26.11-srt-1.5.6-1 release (see above)
+- Mirrored source: deps-src-gstreamer-1.26.11-srt-1.5.7-1 release (see above)
 
 ## glib
 
@@ -173,7 +173,7 @@ GLib, GObject, GModule, and GIO libraries.
 - Copyright © 1995 onwards Peter Mattis, Spencer Kimball, Josh MacDonald,
   and the GLib contributors
 - Upstream: <https://gitlab.gnome.org/GNOME/glib>
-- Source: deps-src-gstreamer-1.26.11-srt-1.5.6-1 release (see above)
+- Source: deps-src-gstreamer-1.26.11-srt-1.5.7-1 release (see above)
 
 ## proxy-libintl
 
@@ -183,7 +183,7 @@ Thin proxy for the gettext libintl API.
 - License: LGPL-2.0-or-later — [texts/LGPL-2.0.txt](texts/LGPL-2.0.txt)
 - Copyright © 2008 Tor Lillqvist and the proxy-libintl contributors
 - Upstream: <https://github.com/frida/proxy-libintl>
-- Source: deps-src-gstreamer-1.26.11-srt-1.5.6-1 release (see above)
+- Source: deps-src-gstreamer-1.26.11-srt-1.5.7-1 release (see above)
 
 ## ffmpeg
 
@@ -194,7 +194,7 @@ libswresample, libswscale), built in their LGPL configuration.
 - License: LGPL-2.1-or-later — [texts/LGPL-2.1.txt](texts/LGPL-2.1.txt)
 - Copyright © the FFmpeg developers
 - Upstream: <https://ffmpeg.org/>
-- Source: deps-src-gstreamer-1.26.11-srt-1.5.6-1 release (see above)
+- Source: deps-src-gstreamer-1.26.11-srt-1.5.7-1 release (see above)
 
 ## x264
 
@@ -204,7 +204,7 @@ H.264/AVC encoder library.
 - License: GPL-2.0-or-later — [texts/GPL-2.0.txt](texts/GPL-2.0.txt)
 - Copyright © 2003 onwards the x264 project
 - Upstream: <https://www.videolan.org/developers/x264.html>
-- Source: deps-src-gstreamer-1.26.11-srt-1.5.6-1 release (see above)
+- Source: deps-src-gstreamer-1.26.11-srt-1.5.7-1 release (see above)
 
 ## orc
 

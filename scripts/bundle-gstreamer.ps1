@@ -11,6 +11,7 @@
 [CmdletBinding()]
 param(
     [string]$DependencyCacheDir,
+    [switch]$AllowDraftDependencyRelease,
     [switch]$ValidateManifestOnly
 )
 
@@ -262,7 +263,12 @@ function Get-VerifiedPatchedSrtArchive {
     $downloadPath = "$archivePath.$PID.$([Guid]::NewGuid().ToString('N')).download"
     try {
         Write-Host "Downloading patched SRT $($Srt.Version) dependency..." -ForegroundColor Cyan
-        & $curl.Source -fsSL --retry 3 --retry-delay 5 -o $downloadPath $Srt.AssetUrl
+        if ($AllowDraftDependencyRelease) {
+            & gh release download $Srt.ReleaseTag --repo RustRunner/PocketStream-Desktop `
+                --pattern $Srt.ArchiveFile --output $downloadPath
+        } else {
+            & $curl.Source -fsSL --retry 3 --retry-delay 5 -o $downloadPath $Srt.AssetUrl
+        }
         if ($LASTEXITCODE -ne 0) {
             throw "download failed with exit code $LASTEXITCODE`: $($Srt.AssetUrl)"
         }

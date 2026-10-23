@@ -23,6 +23,7 @@ same-address refresh, and the ten-caller cap.
 param(
     [string]$GStreamerRoot = $env:GSTREAMER_1_0_ROOT_MSVC_X86_64,
     [string]$BundleRoot,
+    [string]$G1EvidencePath,
     [string]$EvidencePath,
     [string]$HarnessPath,
     [switch]$KeepWorkDirectory
@@ -37,7 +38,9 @@ $ManifestPath = Join-Path $ScriptDir 'gstreamer-manifest.psd1'
 $HarnessSourcePath = Join-Path $ProjectDir 'src-tauri\examples\g2_srt_admission.rs'
 $CargoManifestPath = Join-Path $ProjectDir 'src-tauri\Cargo.toml'
 $CargoLockPath = Join-Path $ProjectDir 'src-tauri\Cargo.lock'
-$G1EvidencePath = Join-Path $ProjectDir 'docs\runtime-evidence\g1-r-srt-1.5.6.json'
+if ([string]::IsNullOrWhiteSpace($G1EvidencePath)) {
+    $G1EvidencePath = Join-Path $ProjectDir 'docs\runtime-evidence\g1-r-srt-1.5.7.json'
+}
 $Manifest = Import-PowerShellDataFile $ManifestPath
 $Srt = $Manifest.PatchedSrt
 $BuildHarness = [string]::IsNullOrWhiteSpace($HarnessPath)
@@ -52,7 +55,7 @@ if ([string]::IsNullOrWhiteSpace($BundleRoot)) {
     $BundleRoot = Join-Path $ProjectDir 'src-tauri\resources\gstreamer'
 }
 if ([string]::IsNullOrWhiteSpace($EvidencePath)) {
-    $EvidencePath = Join-Path $ProjectDir 'docs\runtime-evidence\g2-srt-admission-1.5.6.json'
+    $EvidencePath = Join-Path $ProjectDir 'docs\runtime-evidence\g2-srt-admission-1.5.7.json'
 }
 
 if (-not [string]::IsNullOrWhiteSpace($GStreamerRoot)) {

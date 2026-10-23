@@ -5,7 +5,7 @@ Runs PocketStream's G1-R gate against the exact staged SRT runtime.
 
 .DESCRIPTION
 Validates the canonical dependency release and its provenance, compares the
-staged SRT 1.5.6 DLL with stock GStreamer 1.26.11 at the PE import/export
+staged SRT 1.5.7 DLL with stock GStreamer 1.26.11 at the PE import/export
 boundary, re-derives the seven-file dependency closure, loads the SRT and
 MPEG-TS plugins with system plugins hidden, and exercises transport behavior
 over loopback.
@@ -38,6 +38,7 @@ param(
     [ValidateRange(1, 86400)]
     [int]$SoakSeconds = 660,
     [switch]$Smoke,
+    [switch]$AllowDraftDependencyRelease,
     [switch]$KeepWorkDirectory
 )
 
@@ -49,7 +50,7 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectDir = Split-Path -Parent $ScriptDir
 $ManifestPath = Join-Path $ScriptDir 'gstreamer-manifest.psd1'
-$RecipePatchPath = Join-Path $ScriptDir 'patches\cerbero-srt-1.5.6.patch'
+$RecipePatchPath = Join-Path $ScriptDir 'patches\cerbero-srt-1.5.7.patch'
 $Manifest = Import-PowerShellDataFile $ManifestPath
 $Srt = $Manifest.PatchedSrt
 
@@ -69,7 +70,7 @@ if ([string]::IsNullOrWhiteSpace($EvidencePath)) {
     if ($Smoke) {
         $EvidencePath = Join-Path ([System.IO.Path]::GetTempPath()) 'pocketstream-g1-r-smoke.json'
     } else {
-        $EvidencePath = Join-Path $ProjectDir 'docs\runtime-evidence\g1-r-srt-1.5.6.json'
+        $EvidencePath = Join-Path $ProjectDir 'docs\runtime-evidence\g1-r-srt-1.5.7.json'
     }
 }
 
@@ -305,7 +306,8 @@ function Start-GstProcess {
     param(
         [Parameter(Mandatory = $true)][string]$Name,
         [Parameter(Mandatory = $true)][string]$Executable,
-        [Parameter(Mandatory = $true)][string[]]$Arguments
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [switch]$TraceSrt
     )
     foreach ($argument in $Arguments) {
         if ($argument -match '[\s"]') {
@@ -321,6 +323,11 @@ function Start-GstProcess {
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
+    $debugLog = Join-Path $WorkDir "$Name.gst.log"
+    if ($TraceSrt) {
+        $startInfo.EnvironmentVariables['GST_DEBUG'] = 'srtobject:5'
+        $startInfo.EnvironmentVariables['GST_DEBUG_FILE'] = $debugLog
+    }
 
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $startInfo
@@ -332,6 +339,7 @@ function Start-GstProcess {
         Process = $process
         StdoutTask = $process.StandardOutput.ReadToEndAsync()
         StderrTask = $process.StandardError.ReadToEndAsync()
+        DebugLog = $debugLog
     }
     [void]$script:LiveProcesses.Add($run)
     return $run
@@ -386,7 +394,8 @@ function Start-SrtListener {
         [Parameter(Mandatory = $true)][string]$Address,
         [Parameter(Mandatory = $true)][int]$Port,
         [AllowNull()][string]$Passphrase = $null,
-        [int]$NumBuffers = -1
+        [int]$NumBuffers = -1,
+        [switch]$TraceSrt
     )
     $arguments = @(
         '-q',
@@ -404,7 +413,24 @@ function Start-SrtListener {
     if ($null -ne $Passphrase) {
         $arguments += @("passphrase=$Passphrase", 'pbkeylen=16')
     }
-    return Start-GstProcess -Name $Name -Executable $IsolatedLaunchPath -Arguments $arguments
+    return Start-GstProcess -Name $Name -Executable $IsolatedLaunchPath -Arguments $arguments -TraceSrt:$TraceSrt
+}
+
+function Wait-SrtAcceptedCallers {
+    param([object]$Listener, [int]$Count)
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        Assert-GstProcessAlive -Run $Listener -Description 'Fan-out listener while accepting callers'
+        if (Test-Path -LiteralPath $Listener.DebugLog) {
+            $stream = [IO.File]::Open($Listener.DebugLog, [IO.FileMode]::Open,
+                [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+            $reader = New-Object IO.StreamReader($stream)
+            try { $log = $reader.ReadToEnd() } finally { $reader.Dispose() }
+            if ([regex]::Matches($log, 'Accept to connect \d+').Count -ge $Count) { return }
+        }
+        Start-Sleep -Milliseconds 50
+    } while ($timer.ElapsedMilliseconds -lt 8000)
+    throw "Fan-out listener did not accept $Count callers within eight seconds."
 }
 
 function Start-SrtClient {
@@ -550,25 +576,46 @@ try {
     }
     $script:CurlPath = $curlCommand.Source
     $releaseApiUrl = "https://api.github.com/repos/RustRunner/PocketStream-Desktop/releases/tags/$($Srt.ReleaseTag)"
-    Invoke-CurlDownload -Url $releaseApiUrl -Destination $ReleaseJsonPath `
-        -Headers @('Accept: application/vnd.github+json', 'X-GitHub-Api-Version: 2022-11-28')
+    if ($AllowDraftDependencyRelease) {
+        $releaseIdText = @(& gh release view $Srt.ReleaseTag --repo RustRunner/PocketStream-Desktop --json databaseId) -join "`n"
+        if ($LASTEXITCODE -ne 0) { throw 'Dependency draft lookup failed.' }
+        $releaseId = [long]($releaseIdText | ConvertFrom-Json).databaseId
+        & gh api "repos/RustRunner/PocketStream-Desktop/releases/$releaseId" | Set-Content -LiteralPath $ReleaseJsonPath -Encoding UTF8
+        if ($LASTEXITCODE -ne 0) { throw 'Dependency draft metadata lookup failed.' }
+    } else {
+        Invoke-CurlDownload -Url $releaseApiUrl -Destination $ReleaseJsonPath `
+            -Headers @('Accept: application/vnd.github+json', 'X-GitHub-Api-Version: 2022-11-28')
+    }
     $release = Get-Content -LiteralPath $ReleaseJsonPath -Raw | ConvertFrom-Json
     Assert-Equal -Actual $release.tag_name -Expected $Srt.ReleaseTag -Description 'Canonical dependency release tag'
     Assert-True -Condition ([bool]$release.prerelease) -Message 'Canonical dependency release is not marked as a prerelease.'
-    Assert-True -Condition (-not [bool]$release.draft) -Message 'Canonical dependency release is still a draft.'
+    Assert-True -Condition ($AllowDraftDependencyRelease -or -not [bool]$release.draft) -Message 'Canonical dependency release is still a draft.'
     Assert-True -Condition (-not ([string]$release.tag_name).StartsWith('v', [StringComparison]::OrdinalIgnoreCase)) `
         -Message 'Canonical dependency release tag must not match the application v* namespace.'
     $releaseAssets = @($release.assets | Where-Object { $_.name -ceq $Srt.ArchiveFile })
     Assert-True -Condition ($releaseAssets.Count -eq 1) -Message 'Canonical dependency release must contain exactly one manifest-pinned archive asset.'
     $releaseAsset = $releaseAssets[0]
-    Assert-Equal -Actual $releaseAsset.browser_download_url -Expected $Srt.AssetUrl -Description 'Canonical dependency asset URL'
+    if ([bool]$release.draft) {
+        $draftAssetUrl = [string]$releaseAsset.browser_download_url
+        Assert-True -Condition ($draftAssetUrl.StartsWith('https://github.com/RustRunner/PocketStream-Desktop/releases/download/untagged-', [StringComparison]::Ordinal) -and
+            $draftAssetUrl.EndsWith('/' + $Srt.ArchiveFile, [StringComparison]::Ordinal)) `
+            -Message 'Unexpected dependency draft asset URL.'
+    } else {
+        Assert-Equal -Actual $releaseAsset.browser_download_url -Expected $Srt.AssetUrl -Description 'Canonical dependency asset URL'
+    }
     $digestProperty = $releaseAsset.PSObject.Properties['digest']
     if ($null -ne $digestProperty -and -not [string]::IsNullOrWhiteSpace([string]$digestProperty.Value)) {
         Assert-Equal -Actual ([string]$digestProperty.Value).ToLowerInvariant() `
             -Expected "sha256:$($Srt.ArchiveSha256)" -Description 'GitHub dependency asset digest'
     }
 
-    Invoke-CurlDownload -Url $Srt.AssetUrl -Destination $DownloadedArchive
+    if ($AllowDraftDependencyRelease) {
+        & gh release download $Srt.ReleaseTag --repo RustRunner/PocketStream-Desktop `
+            --pattern $Srt.ArchiveFile --output $DownloadedArchive
+        if ($LASTEXITCODE -ne 0) { throw 'Dependency draft download failed.' }
+    } else {
+        Invoke-CurlDownload -Url $Srt.AssetUrl -Destination $DownloadedArchive
+    }
     Assert-Equal -Actual (Get-Sha256 -Path $DownloadedArchive) -Expected $Srt.ArchiveSha256 -Description 'Clean dependency archive download SHA256'
 
     $archive = [System.IO.Compression.ZipFile]::OpenRead($DownloadedArchive)
@@ -753,11 +800,15 @@ try {
     # transiently represented in libsrt's own backlog; that pending-capacity
     # timing is deliberately a G2 concern, not part of this transport gate.
     $fanoutPort = Get-FreeUdpPort
-    $fanoutListener = Start-SrtListener -Name 'fanout-listener' -Address '127.0.0.1' -Port $fanoutPort -Passphrase $testPassphrase
+    $fanoutListener = Start-SrtListener -Name 'fanout-listener' -Address '127.0.0.1' -Port $fanoutPort -Passphrase $testPassphrase -TraceSrt
     Start-Sleep -Milliseconds 750
     Assert-GstProcessAlive -Run $fanoutListener -Description 'Fan-out listener'
     $fanoutA = Start-SrtClient -Name 'fanout-client-a' -Port $fanoutPort -Passphrase $testPassphrase -NumBuffers 500
+    # GStreamer's listener has a one-handshake backlog. Establish each caller
+    # before the next handshake, then verify simultaneous active transfers.
+    Wait-SrtAcceptedCallers -Listener $fanoutListener -Count 1
     $fanoutB = Start-SrtClient -Name 'fanout-client-b' -Port $fanoutPort -Passphrase $testPassphrase -NumBuffers 500
+    Wait-SrtAcceptedCallers -Listener $fanoutListener -Count 2
     Start-Sleep -Seconds 1
     Assert-GstProcessAlive -Run $fanoutA -Description 'First concurrent SRT caller'
     Assert-GstProcessAlive -Run $fanoutB -Description 'Second concurrent SRT caller'
@@ -923,8 +974,8 @@ try {
             note = 'Caller callback ordering, authentication=true behavior, identity correlation, and pending/active admission caps remain reserved for G2.'
         }
         security_review = [ordered]@{
-            record = 'docs/runtime-evidence/g1-r-security-review-2026-08-25.md'
-            reviewed_at = '2026-08-25'
+            record = $Manifest.SecurityReview.RecordPath
+            reviewed_at = $Manifest.SecurityReview.ReviewedAt
         }
     }
 
@@ -939,7 +990,7 @@ try {
     if ($Smoke) {
         Write-Host 'G1-R harness smoke passed; the shortened soak is not gate evidence.' -ForegroundColor Yellow
     } else {
-        Write-Host 'G1-R passed against the exact staged SRT 1.5.6 runtime.' -ForegroundColor Green
+        Write-Host 'G1-R passed against the exact staged SRT 1.5.7 runtime.' -ForegroundColor Green
     }
     Write-Host "  libsrt.dll: $($Srt.DllSha256)"
     Write-Host "  srt_getversion: $runtimeVersionHex"

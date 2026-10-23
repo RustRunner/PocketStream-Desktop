@@ -210,7 +210,9 @@ jobs:
       # SDK install on this runner cannot hide a bundle omission.
       - name: Bundle GStreamer runtime
         shell: pwsh
-        run: pwsh -ExecutionPolicy Bypass -File scripts/bundle-gstreamer.ps1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: pwsh -ExecutionPolicy Bypass -File scripts/bundle-gstreamer.ps1 -AllowDraftDependencyRelease
 
       - name: Bundle smoke check (isolated plugin path)
         shell: pwsh
@@ -229,7 +231,7 @@ jobs:
 
           # Run the inspection process from the bundle bin itself. Otherwise
           # Windows searches the complete SDK's executable directory first,
-          # where stock SRT 1.5.4 could mask the staged 1.5.6 DLL.
+          # where stock SRT 1.5.4 could mask the staged 1.5.7 DLL.
           $systemInspect = (Get-Command gst-inspect-1.0.exe).Source
           $isolatedInspect = Join-Path $bundleBin 'gst-inspect-1.0.exe'
           if (Test-Path $isolatedInspect) { throw "Unexpected bundled tool: $isolatedInspect" }
@@ -285,7 +287,7 @@ jobs:
           if ($gaps) { throw "Plugin imports missing from the bundle: $($gaps -join '; ')" }
           Write-Host 'All audio plugin imports resolve inside the bundle (or the OS/VC runtime).'
 
-      # G1-R is the security/ABI/behavior boundary for the SRT 1.5.6
+      # G1-R is the security/ABI/behavior boundary for the SRT 1.5.7
       # replacement. It re-downloads the canonical prerelease asset, verifies
       # the exact staged hash and provenance, hides the machine-wide plugin
       # path, and repeats encrypted/passwordless transport, fan-out, removal,
@@ -294,10 +296,12 @@ jobs:
       - name: G1-R patched SRT runtime gate
         shell: powershell
         timeout-minutes: 20
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $evidence = Join-Path $env:RUNNER_TEMP 'g1-r-srt-1.5.6.json'
+          $evidence = Join-Path $env:RUNNER_TEMP 'g1-r-srt-1.5.7.json'
           & powershell.exe -NoProfile -ExecutionPolicy Bypass `
-            -File scripts\verify-g1r-srt.ps1 -EvidencePath $evidence
+            -File scripts\verify-g1r-srt.ps1 -AllowDraftDependencyRelease -EvidencePath $evidence
           if ($LASTEXITCODE -ne 0) {
             throw "G1-R runtime gate failed with exit $LASTEXITCODE"
           }
@@ -307,7 +311,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: g1-r-srt-runtime-evidence
-          path: ${{ runner.temp }}\g1-r-srt-1.5.6.json
+          path: ${{ runner.temp }}\g1-r-srt-1.5.7.json
           if-no-files-found: warn
 
       - uses: Swatinem/rust-cache@v2
@@ -317,7 +321,7 @@ jobs:
 
       # G2 is the strict pre-production admission boundary. The dedicated
       # Rust harness runs only after G1-R succeeds, loads the exact staged SRT
-      # 1.5.6 closure, and exercises the dynamic srtsink callbacks with real
+      # 1.5.7 closure, and exercises the dynamic srtsink callbacks with real
       # callers. Production CallerRegistry/SRT listener work remains blocked
       # if authentication gating, address correlation, pending expiry, or the
       # ten-caller invariant changes.
@@ -325,8 +329,8 @@ jobs:
         shell: powershell
         timeout-minutes: 15
         run: |
-          $g1Evidence = Join-Path $env:RUNNER_TEMP 'g1-r-srt-1.5.6.json'
-          $evidence = Join-Path $env:RUNNER_TEMP 'g2-srt-admission-1.5.6.json'
+          $g1Evidence = Join-Path $env:RUNNER_TEMP 'g1-r-srt-1.5.7.json'
+          $evidence = Join-Path $env:RUNNER_TEMP 'g2-srt-admission-1.5.7.json'
           & powershell.exe -NoProfile -ExecutionPolicy Bypass `
             -File scripts\verify-g2-srt.ps1 `
             -G1EvidencePath $g1Evidence -EvidencePath $evidence
@@ -339,7 +343,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: g2-srt-admission-evidence
-          path: ${{ runner.temp }}\g2-srt-admission-1.5.6.json
+          path: ${{ runner.temp }}\g2-srt-admission-1.5.7.json
           if-no-files-found: warn
 
       # Compile AND run the crate's tests, including the #[cfg(windows)]
@@ -364,9 +368,9 @@ jobs:
         shell: powershell
         timeout-minutes: 10
         run: |
-          $g1Evidence = Join-Path $env:RUNNER_TEMP 'g1-r-srt-1.5.6.json'
-          $g2Evidence = Join-Path $env:RUNNER_TEMP 'g2-srt-admission-1.5.6.json'
-          $g3Evidence = Join-Path $env:RUNNER_TEMP 'g3-srt-staged-1.5.6.json'
+          $g1Evidence = Join-Path $env:RUNNER_TEMP 'g1-r-srt-1.5.7.json'
+          $g2Evidence = Join-Path $env:RUNNER_TEMP 'g2-srt-admission-1.5.7.json'
+          $g3Evidence = Join-Path $env:RUNNER_TEMP 'g3-srt-staged-1.5.7.json'
           & powershell.exe -NoProfile -ExecutionPolicy Bypass `
             -File scripts\verify-g3-srt.ps1 -StagedOnly `
             -SkipPublishedSourceCheck `
@@ -381,7 +385,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: g3-srt-staged-evidence
-          path: ${{ runner.temp }}\g3-srt-staged-1.5.6.json
+          path: ${{ runner.temp }}\g3-srt-staged-1.5.7.json
           if-no-files-found: warn
 
   audit:

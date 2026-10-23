@@ -34,6 +34,8 @@ Primary, saved secondary and unmanaged address removal, and DHCP mode changes, n
 
 ## Verification
 
+Release preparation updates the native SRT library to 1.5.7 for the newly disclosed handshake vulnerability. The compiler, source recipe, DLL hashes and source archives are pinned, with a fresh [security review](docs/runtime-evidence/g3-security-review-2026-10-23.md). Dependency binaries and corresponding sources can be verified from authenticated GitHub drafts; the build does not publish them.
+
 The local Windows regression run passes 777 Rust tests with two hardware-dependent tests ignored, plus 151 frontend tests. TypeScript, UI contracts, formatting, Clippy and the production frontend build pass. Windows test executables now receive their Common Controls manifest at build time, so the standard Cargo test command needs no manual patch. CI and release checks now run the complete frontend suite through `npm test`.
 
 On the tested Windows setup, switching off the Wi-Fi radio retained the conflicting local route and HTTP access timed out. Fully disabling the Wi-Fi adapter selected Ethernet instead; the camera returned HTTP 200 and its page opened. This targeted check does not complete the broader hardware qualification below.
@@ -44,7 +46,7 @@ On the tested Windows setup, switching off the Wi-Fi radio retained the conflict
 
 ## Qualification still required
 
-The draft build verifies the complete uploaded dependency-source asset set even while that source release is unpublished. Installed draft verification records `draft_ready=true`; full `g3_complete` remains false until the dependency-source prerelease is published. Publish that source prerelease before manually publishing the application, and rerun the default G3 check for final publication evidence. The build workflow publishes neither release.
+The draft build verifies the complete uploaded dependency-source asset set even while that source release is unpublished. Installed draft verification records `draft_ready=true`; full `g3_complete` remains false until the dependency-source prerelease is published. Publish that source prerelease before manually publishing the application, and rerun the default G3 check for final publication evidence. The SRT binary dependency is also staged as a draft for review. The build workflow publishes none of these releases.
 
 The automated checks cover logic and simulated failure boundaries. Elevated Windows hardware runs must still establish capture-source matching on the reference ASIX adapter, selected-Ethernet proof with overlapping Wi-Fi subnets, cable-loss and freshness timing, crash/reboot address lifetime, DHCP transitions, recovery/recording behavior and native notice/video interaction.
 

@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-Builds PocketStream's pinned SRT 1.5.6 drop-in with GStreamer Cerbero 1.26.11.
+Builds PocketStream's pinned SRT 1.5.7 drop-in with GStreamer Cerbero 1.26.11.
 
 .DESCRIPTION
 Checks out the exact Cerbero 1.26.11 commit, applies the tracked two-line SRT
@@ -28,7 +28,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 #>
 [CmdletBinding()]
 param(
-    [string]$WorkRoot = (Join-Path ([System.IO.Path]::GetTempPath()) 'pocketstream-libsrt-1.5.6'),
+    [string]$WorkRoot = (Join-Path ([System.IO.Path]::GetTempPath()) 'pocketstream-libsrt-1.5.7'),
     [string]$OutDir,
     [string]$DumpbinPath,
     [switch]$SkipBootstrap,
@@ -41,17 +41,17 @@ $ErrorActionPreference = 'Stop'
 $CerberoRepository = 'https://github.com/GStreamer/cerbero.git'
 $CerberoCommit = 'cebb549ade5b73048fc29be5a45332246f1c14f6'
 $CerberoVersion = '1.26.11'
-$SrtVersion = '1.5.6'
-$SrtVersionNumber = 0x010506
-$SrtSourceUrl = 'https://github.com/Haivision/srt/archive/v1.5.6.tar.gz'
-$SrtSourceSha256 = '2c4980c2c4cfd142d21b829d939dc51db9c6628af5967fff62fd7290769569c7'
+$SrtVersion = '1.5.7'
+$SrtVersionNumber = 0x010507
+$SrtSourceUrl = 'https://github.com/Haivision/srt/archive/v1.5.7.tar.gz'
+$SrtSourceSha256 = '017cd1e437ef2073a4dd10ddf7b55e86bc3d6ebac0393d13bd22f6a57055d32b'
 $StockRuntimeUrl = 'https://gstreamer.freedesktop.org/data/pkg/windows/1.26.11/msvc/gstreamer-1.0-msvc-x86_64-1.26.11.msi'
 $StockRuntimeSha256 = '31cbc21fa0950b5c1e79c80959b2799805cb05a7a35953a13a9f790776137605'
 
 # Git blob IDs are over normalized LF content, so this also detects an
 # accidental recipe edit regardless of the checkout's core.autocrlf setting.
 $OriginalRecipeBlob = 'd34b2a34e5bb8c375b1869e0e5d2fc8ba4f2e984'
-$PatchedRecipeBlob = '80037d6b64bda97413e143ffb58b8604b9c5ad9b'
+$PatchedRecipeBlob = '90a31783902af6d66d2b5e14c0133216921665e6'
 
 # Exact dependency table from the stock GStreamer 1.26.11 libsrt.dll. A
 # changed import is a review event: it may alter both ABI compatibility and
@@ -336,7 +336,7 @@ function Prepare-CerberoCheckout {
     $recipePath = Join-Path $Checkout 'recipes\srt.recipe'
     $recipeText = [System.IO.File]::ReadAllText($recipePath)
     $requiredRecipeLines = @(
-        "version = '1.5.6'"
+        "version = '1.5.7'"
         "url = 'https://github.com/Haivision/srt/archive/v%(version)s.tar.gz'"
         "tarball_checksum = '$SrtSourceSha256'"
         'can_msvc = False'
@@ -463,7 +463,7 @@ if (-not (Get-Command git.exe -ErrorAction SilentlyContinue)) {
 }
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$patchPath = Join-Path $scriptDir 'patches\cerbero-srt-1.5.6.patch'
+$patchPath = Join-Path $scriptDir 'patches\cerbero-srt-1.5.7.patch'
 if (-not (Test-Path -LiteralPath $patchPath -PathType Leaf)) {
     throw "Tracked Cerbero recipe patch is missing: $patchPath"
 }
@@ -531,7 +531,7 @@ if (Test-Path -LiteralPath $wrongNamePath -PathType Leaf) {
     throw "Unexpected srt.dll found beside libsrt.dll; the GStreamer 1.26.11 drop-in filename contract is ambiguous: $wrongNamePath"
 }
 
-$sourceArchive = Join-Path $cerberoHome 'sources\local\srt-1.5.6\v1.5.6.tar.gz'
+$sourceArchive = Join-Path $cerberoHome 'sources\local\srt-1.5.7\v1.5.7.tar.gz'
 if (-not (Test-Path -LiteralPath $sourceArchive -PathType Leaf)) {
     throw "Cerbero's fetched SRT source archive was not found at the expected path: $sourceArchive"
 }

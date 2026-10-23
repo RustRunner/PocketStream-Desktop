@@ -168,7 +168,9 @@ jobs:
       # can't ship a broken installer.
       - name: Bundle GStreamer runtime
         shell: pwsh
-        run: pwsh -File scripts/bundle-gstreamer.ps1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: pwsh -File scripts/bundle-gstreamer.ps1 -AllowDraftDependencyRelease
 
       # Verify the complete source asset set, including an authenticated draft.
       # Nothing is published here. Full G3 completion still requires public
@@ -179,7 +181,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $evidence = Join-Path $env:RUNNER_TEMP 'g3-srt-release-staged-1.5.6.json'
+          $evidence = Join-Path $env:RUNNER_TEMP 'g3-srt-release-staged-1.5.7.json'
           & powershell.exe -NoProfile -ExecutionPolicy Bypass `
             -File scripts\verify-g3-srt.ps1 -StagedOnly -AllowDraftSourceRelease `
             -EvidencePath $evidence
@@ -234,7 +236,7 @@ jobs:
           if ($installer.ExitCode -ne 0) {
             throw "NSIS silent install failed with exit $($installer.ExitCode)"
           }
-          $evidence = Join-Path $env:RUNNER_TEMP 'g3-srt-installed-1.5.6.json'
+          $evidence = Join-Path $env:RUNNER_TEMP 'g3-srt-installed-1.5.7.json'
           & powershell.exe -NoProfile -ExecutionPolicy Bypass `
             -File scripts\verify-g3-srt.ps1 -AllowDraftSourceRelease `
             -InstalledAppRoot $installRoot -InstallerPath $installerPath `
@@ -251,6 +253,6 @@ jobs:
         with:
           name: g3-srt-release-evidence
           path: |
-            ${{ runner.temp }}\g3-srt-release-staged-1.5.6.json
-            ${{ runner.temp }}\g3-srt-installed-1.5.6.json
+            ${{ runner.temp }}\g3-srt-release-staged-1.5.7.json
+            ${{ runner.temp }}\g3-srt-installed-1.5.7.json
           if-no-files-found: warn

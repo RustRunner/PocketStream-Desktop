@@ -76,16 +76,16 @@ if ([string]::IsNullOrWhiteSpace($BundleRoot)) {
     $BundleRoot = Join-Path $ProjectDir 'src-tauri\resources\gstreamer'
 }
 if ([string]::IsNullOrWhiteSpace($G1EvidencePath)) {
-    $G1EvidencePath = Join-Path $ProjectDir 'docs\runtime-evidence\g1-r-srt-1.5.6.json'
+    $G1EvidencePath = Join-Path $ProjectDir 'docs\runtime-evidence\g1-r-srt-1.5.7.json'
 }
 if ([string]::IsNullOrWhiteSpace($G2EvidencePath)) {
-    $G2EvidencePath = Join-Path $ProjectDir 'docs\runtime-evidence\g2-srt-admission-1.5.6.json'
+    $G2EvidencePath = Join-Path $ProjectDir 'docs\runtime-evidence\g2-srt-admission-1.5.7.json'
 }
 if ([string]::IsNullOrWhiteSpace($EvidencePath)) {
     if ($StagedOnly) {
         $EvidencePath = Join-Path ([System.IO.Path]::GetTempPath()) 'pocketstream-g3-staged.json'
     } else {
-        $EvidencePath = Join-Path $ProjectDir 'docs\runtime-evidence\g3-srt-1.5.6.json'
+        $EvidencePath = Join-Path $ProjectDir 'docs\runtime-evidence\g3-srt-1.5.7.json'
     }
 }
 
