@@ -42,6 +42,7 @@ import {
   visibleDevices,
 } from "./device-state.ts";
 import * as deviceList from "./device-list.ts";
+import * as ipConflicts from "./ip-conflicts.ts";
 import { getActivePlaybackTarget, stopStreamNow, updateRestreamUI } from "./streaming.ts";
 import { haltPtuUnit } from "./ptz.ts";
 import { selectedDevice, sessionCamTarget } from "./store.ts";
@@ -317,6 +318,8 @@ export function resetDiscoveryStatus(): void {
 // ── ARP event listeners ─────────────────────────────────────────────
 
 export function setupArpListeners(): void {
+  ipConflicts.subscribe(renderArpDeviceList);
+  void ipConflicts.start().catch((e) => log(`Failed to check PC address conflicts: ${formatError(e)}`));
   void refreshCaptureState().catch((e) => log(`Failed to load capture state: ${formatError(e)}`));
 
   // Re-render whenever the backend pushes a new snapshot.
@@ -605,6 +608,7 @@ export function renderArpDeviceList(): void {
       // are attribute-safe, so the data-* attributes are covered too.
       const ipEsc = escapeHtml(r.ip);
       const portsEsc = escapeHtml(ports.join(", "));
+      const conflict = ipConflicts.forIp(r.ip);
 
       // The node's name doubles as the role dropdown face: a synthetic
       // first option carries the current display name (selected +
@@ -622,9 +626,10 @@ export function renderArpDeviceList(): void {
             </select>
           </div>
           <div class="device-detail-row">
-            <a class="device-ip" href="#" data-browse="${ipEsc}" title="Open in browser">${ipEsc}</a>
+            <a class="device-ip${conflict ? " conflicting" : ""}" href="#" data-browse="${ipEsc}" title="${escapeHtml(conflict?.message ?? "Open in browser")}">${ipEsc}</a>
             <span class="device-ports">${portsEsc}</span>
           </div>
+          ${conflict ? `<div class="device-ip-conflict" title="${escapeHtml(conflict.message)}">IP conflict with PC: ${escapeHtml(conflict.adapters.join(", "))}</div>` : ""}
         </div>`;
     }
 
@@ -672,8 +677,10 @@ export function renderArpDeviceList(): void {
         const item = link.closest<HTMLElement>(".device-item");
         const record = deviceList.deviceByKey(item?.dataset["key"]);
         if (!record) return;
-        // Preserve the row's identity when the browser needs an Ethernet
-        // bridge. A backend failure must not fall back to ambiguous OS routing.
+        const conflict = ipConflicts.forIp(ip);
+        if (conflict) { showToast(conflict.message, true); return; }
+        // The backend checks current PC addresses again before opening, so a
+        // newly arrived conflict cannot fall back to ambiguous OS routing.
         if (window.__TAURI__) {
           api.openDeviceBrowser(ip, deviceList.targetFor(record)).catch((error) => {
             showToast(`Unable to open device page: ${formatError(error)}`, true);

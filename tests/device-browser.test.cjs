@@ -26,6 +26,7 @@ function fixture(tauri = true) {
     selector === ".device-item" ? [row] : selector.includes("data-browse") ? [link] : [] };
   let fail = false;
   let present = true;
+  let conflict = null;
   const deps = {
     "./tauri-api.ts": { openDeviceBrowser: async (ip, target) => {
       calls.push({ ip, ...target });
@@ -34,6 +35,7 @@ function fixture(tauri = true) {
     "./state.ts": { $: () => list, escapeHtml: String, showToast: (...args) => toasts.push(args) },
     "./network.ts": {}, "./streaming.ts": {}, "./ptz.ts": {},
     "./device-state.ts": { visibleDevices: rows => rows, presenceLabel: () => "Active" },
+    "./ip-conflicts.ts": { forIp: () => conflict },
     "./device-list.ts": { getDevices: () => [record], deviceByKey: key => present && key === record.mac ? record : undefined,
       targetFor: row => ({ key: row.mac, expectedMac: row.mac }) },
     "./store.ts": { selectedDevice: { get: () => null } },
@@ -43,6 +45,7 @@ function fixture(tauri = true) {
     require(name) { assert(name in deps, name); return deps[name]; } });
   api.renderArpDeviceList();
   return { calls, opened, toasts, record, fail: () => { fail = true; }, remove: () => { present = false; },
+    list, conflict: (next) => { conflict = next; api.renderArpDeviceList(); },
     click: async () => { click({ preventDefault() {} }); for (let i = 0; i < 5; i++) await Promise.resolve(); } };
 }
 
@@ -68,6 +71,23 @@ test("A removed node cannot open a stale browser link", async () => {
   await f.click();
   assert.deepEqual(f.calls, []);
   assert.deepEqual(f.opened, []);
+});
+
+test("A PC IP conflict stays visible on the node and explains the fix when clicked", async () => {
+  const f = fixture();
+  const conflict = { adapters: ["Wi-Fi 2"], message: "IP conflict: change the device or PC address" };
+  f.conflict(conflict);
+  assert.match(f.list.innerHTML, /device-ip conflicting/);
+  assert.match(f.list.innerHTML, /IP conflict with PC: Wi-Fi 2/);
+  assert(f.list.innerHTML.includes(f.record.mac));
+  await f.click();
+  assert.deepEqual(f.calls, []);
+  assert.deepEqual(f.opened, []);
+  assert.equal(f.toasts[0][0], conflict.message);
+  f.conflict(null);
+  assert(!f.list.innerHTML.includes("IP conflict with PC"));
+  await f.click();
+  assert.equal(f.calls.length, 1, "normal browser access resumes after the conflict is resolved");
 });
 
 test("Device browser IPC preserves the expected MAC field", async () => {

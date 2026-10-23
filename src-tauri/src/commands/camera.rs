@@ -14,26 +14,21 @@ use crate::validation::{parse_camera_ip, parse_camera_url_host};
 /// the shell plugin isn't installed at all, so the webview process
 /// can't be coerced into opening an arbitrary URL or path. The IP is
 /// validated with fresh device identity evidence on the selected Ethernet.
-/// If Windows routes that IP elsewhere, a loopback HTTP bridge provides the
-/// bound Ethernet connection without changing browser or network settings.
+/// A PC address conflict produces an actionable error instead of opening the
+/// wrong host or disguising the conflict behind a loopback web address.
 #[tauri::command]
 pub async fn open_device_browser(
-    app: tauri::AppHandle,
     target: CameraTarget,
-    browser: State<'_, crate::network::device_browser::DeviceBrowser>,
+    manager: State<'_, NetworkManager>,
+    config: State<'_, AppConfig>,
 ) -> Result<(), AppError> {
-    use tauri::Manager;
     let addr = parse_camera_ip(&target.ip)?;
-    let ready: crate::network::bound_tcp::PathReady = std::sync::Arc::new(move || {
-        app.state::<NetworkManager>()
-            .camera_ready_bound_now(&target, &app.state::<AppConfig>())
-    });
-    let path = ready()?;
-    let url = if crate::network::route::egress_index(addr).ok() == Some(path.index) {
-        format!("http://{addr}/")
-    } else {
-        browser.url_for(ready)?
-    };
+    let owners = crate::network::ip_conflict::local_ip_owners()?;
+    if let Some(warning) = crate::network::ip_conflict::conflict_message(&target.ip, &owners) {
+        return Err(AppError::Network(warning));
+    }
+    manager.camera_ready_now(&target, &config)?;
+    let url = format!("http://{addr}/");
     #[cfg(target_os = "windows")]
     {
         crate::network::cmd("explorer")

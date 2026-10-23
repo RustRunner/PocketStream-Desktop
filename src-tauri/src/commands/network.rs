@@ -8,6 +8,11 @@ use crate::network::{DeviceRecord, DeviceStatus, InterfaceInfo, NetworkManager, 
 use crate::validation::parse_cidr;
 
 #[tauri::command]
+pub fn get_host_ip_owners() -> Result<Vec<crate::network::ip_conflict::HostIpOwner>, AppError> {
+    crate::network::ip_conflict::local_ip_owners()
+}
+
+#[tauri::command]
 pub async fn scan_network(
     manager: State<'_, NetworkManager>,
     config: State<'_, AppConfig>,

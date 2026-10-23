@@ -73,6 +73,7 @@ function fixture() {
   const deps = {
     "./tauri-api.ts": api, "./state.ts": shared, "./errors.ts": { formatError: String },
     "./store.ts": blank, "./device-state.ts": blank,
+    "./ip-conflicts.ts": { forIp: () => null, subscribe: () => () => {}, start: async () => {} },
     "./device-list.ts": { subscribe: noop, getDevices: () => [] }, "./ptz.ts": blank,
     "./devices.js": { renderArpDeviceList: noop, hideDiscoveryStatus: noop },
     "./streaming.js": { handleHardDisconnect: noop }, "qrcode": blank,

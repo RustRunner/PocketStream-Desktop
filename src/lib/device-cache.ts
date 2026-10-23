@@ -11,6 +11,7 @@
 import * as api from "./tauri-api.ts";
 import { $, state, log, escapeHtml, showToast } from "./state.ts";
 import * as deviceList from "./device-list.ts";
+import * as ipConflicts from "./ip-conflicts.ts";
 import { markIpScanned, presenceLabel, visibleDevices } from "./device-state.ts";
 import { showModalWithVideo } from "./streaming.js";
 import { formatError } from "./errors.ts";
@@ -62,6 +63,7 @@ function renderDialogList(): void {
   listEl.innerHTML = entries
     .map((e) => {
       const name = e.alias || "(unnamed)";
+      const conflict = ipConflicts.forIp(e.ip);
       const pinBadge = e.isManual
         ? '<span class="cache-item-pin" title="Manually pinned">pin</span>'
         : "";
@@ -74,6 +76,7 @@ function renderDialogList(): void {
                 <span class="cache-item-subnet">${escapeHtml(e.subnet)}</span>
               </div>
               <div class="cache-item-detail">${escapeHtml(e.presence)}</div>
+              ${conflict ? `<div class="device-ip-conflict" title="${escapeHtml(conflict.message)}">IP conflict with PC: ${escapeHtml(conflict.adapters.join(", "))}</div>` : ""}
             </div>
             <button class="cache-forget-btn icon-btn small" data-mac="${escapeHtml(e.mac)}" data-ip="${escapeHtml(e.ip)}" data-manual="${e.isManual ? "1" : ""}" title="Remove">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
@@ -256,6 +259,9 @@ export function setupCacheDialog(): void {
   // Re-render when the device list changes (subscribe-based, so an
   // add/remove via Tauri events reflects without manual polling).
   deviceList.subscribe(() => {
+    if (dialog.open) renderDialogList();
+  });
+  ipConflicts.subscribe(() => {
     if (dialog.open) renderDialogList();
   });
 }

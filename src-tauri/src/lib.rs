@@ -389,7 +389,6 @@ pub fn run() {
         .manage(app_config)
         .manage(stream_manager)
         .manage(network::NetworkManager::new())
-        .manage(network::device_browser::DeviceBrowser::default())
         .manage(camera::flir_ptu::PtuController::new())
         .invoke_handler(tauri::generate_handler![
             // Logging
@@ -406,6 +405,7 @@ pub fn run() {
             // Network
             commands::scan_network,
             commands::list_interfaces,
+            commands::get_host_ip_owners,
             commands::list_vpn_interfaces,
             commands::set_static_ip,
             commands::add_secondary_ip,
@@ -482,6 +482,7 @@ pub fn run() {
             // The pending-IP registry lets the watcher strip transient
             // scratch binds from its emissions.
             let event_watcher_ok = network::watcher::start(handle.clone());
+            network::ip_conflict::start_monitor(handle.clone());
 
             // Load adopted subnets from config, then start discovery
             // subsystems gated on the user's chosen network mode.

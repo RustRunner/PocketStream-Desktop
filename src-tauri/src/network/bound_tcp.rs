@@ -48,19 +48,6 @@ pub(crate) struct BoundTcpTransport {
 
 impl BoundTcpTransport {
     pub(crate) fn start(url: &str, ready: PathReady) -> Result<Self, AppError> {
-        Self::start_on_loopback(url, ready, Ipv4Addr::LOCALHOST)
-    }
-
-    pub(crate) fn start_on_loopback(
-        url: &str,
-        ready: PathReady,
-        listen_ip: Ipv4Addr,
-    ) -> Result<Self, AppError> {
-        if !listen_ip.is_loopback() {
-            return Err(AppError::Network(
-                "Device bridge must listen on loopback".into(),
-            ));
-        }
         let path = ready()?;
         let endpoint = reqwest::Url::parse(url)
             .map_err(|_| AppError::Stream("Invalid device TCP URL".into()))?;
@@ -69,7 +56,7 @@ impl BoundTcpTransport {
             .ip
             .parse::<Ipv4Addr>()
             .map_err(|_| AppError::Stream("Camera requires an IPv4 address".into()))?;
-        if !matches!(endpoint.scheme(), "rtsp" | "http")
+        if endpoint.scheme() != "rtsp"
             || endpoint.host_str().and_then(|h| h.parse::<Ipv4Addr>().ok()) != Some(ip)
             || path.index == 0
             || endpoint.port() == Some(0)
@@ -78,19 +65,14 @@ impl BoundTcpTransport {
                 "Device URL does not match the verified Ethernet path".into(),
             ));
         }
-        let destination = SocketAddrV4::new(
-            ip,
-            endpoint
-                .port()
-                .unwrap_or(if endpoint.scheme() == "rtsp" { 554 } else { 80 }),
-        );
+        let destination = SocketAddrV4::new(ip, endpoint.port().unwrap_or(554));
         let gate = Arc::new(Gate {
             path,
             ready,
             active: AtomicBool::new(true),
         });
         gate.check()?;
-        let listener = TcpListener::bind((listen_ip, 0)).map_err(transport_error)?;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(transport_error)?;
         listener.set_nonblocking(true).map_err(transport_error)?;
         let address = listener.local_addr().map_err(transport_error)?;
         let current = gate.clone();
@@ -111,10 +93,6 @@ impl BoundTcpTransport {
 
     pub(crate) fn address(&self) -> SocketAddr {
         self.address
-    }
-
-    pub(crate) fn is_ready(&self) -> bool {
-        self.gate.check().is_ok()
     }
 
     pub(crate) fn readiness_check(&self) -> impl Fn() -> bool + Send + Sync + 'static {

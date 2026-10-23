@@ -1165,6 +1165,18 @@
   text-decoration: underline;
 }
 
+.device-ip.conflicting,
+.device-ip-conflict {
+  color: var(--status-warning);
+}
+
+.device-ip-conflict {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
 .device-ports {
   font-size: 12px;
   color: var(--md-on-surface-variant);

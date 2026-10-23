@@ -54,6 +54,7 @@ function fixture(mode = "static_auto") {
   const deviceDeps = {
     "./tauri-api.ts": api, "./state.ts": shared, "./errors.ts": { formatError: String },
     "./network.ts": blank, "./device-state.ts": blank, "./device-list.ts": blank,
+    "./ip-conflicts.ts": { forIp: () => null, subscribe: () => () => {}, start: async () => {} },
     "./streaming.ts": blank, "./ptz.ts": blank, "./store.ts": blank,
   };
   const devices = load(source("src/lib/devices.ts"), deviceDeps);

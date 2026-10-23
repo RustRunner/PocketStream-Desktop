@@ -26,6 +26,7 @@ import type {
   DeviceRecord,
   DeviceStatus,
   InterfaceInfo,
+  HostIpOwner,
   LicenseDocumentId,
   NetworkMode,
   RestreamOperationResult,
@@ -105,6 +106,10 @@ export async function scanNetwork(subnet: string): Promise<ScanResult[]> {
 
 export async function listInterfaces(): Promise<InterfaceInfo[]> {
   return await invoke<InterfaceInfo[]>("list_interfaces");
+}
+
+export async function getHostIpOwners(): Promise<HostIpOwner[]> {
+  return await invoke<HostIpOwner[]>("get_host_ip_owners");
 }
 
 export async function getAdapterSelection(): Promise<AdapterSelection> {
@@ -336,8 +341,8 @@ export async function ptuSend(
   return await invoke<Record<string, string>>("ptu_send", { target: { ip, key: target.key, expected_mac: target.expectedMac }, cmd });
 }
 
-/** Open the verified Ethernet device's web UI, using a local bridge when
- *  the OS would send the browser to another adapter with the same IP. */
+/** Open the verified Ethernet device's actual IP; PC address conflicts are
+ *  reported as errors so the user can correct the network configuration. */
 export async function openDeviceBrowser(ip: string, target: DeviceTarget): Promise<void> {
   return await invoke("open_device_browser", { target: { ip, key: target.key, expected_mac: target.expectedMac } });
 }

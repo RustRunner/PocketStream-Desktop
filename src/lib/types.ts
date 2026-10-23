@@ -209,6 +209,11 @@ export interface AdapterSelection {
   candidates: InterfaceInfo[];
 }
 
+export interface HostIpOwner {
+  address: string;
+  adapter_name: string;
+}
+
 // ── Streaming (streaming/mod.rs) ─────────────────────────────────────
 
 export type RelayState =
