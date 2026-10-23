@@ -1,0 +1,2 @@
+# Pinned patch bytes must match their SHA-256 on every checkout.
+*.patch text eol=lf

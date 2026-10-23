@@ -211,7 +211,10 @@ if ($hasMetadata -and $hasSourceRelease) {
             }
         }
 
-        $sumLines = foreach ($assetId in @($assets.Keys | Sort-Object)) {
+        # The pinned index must have identical ordering on Windows and Linux.
+        $sourceIds = [string[]]@($assets.Keys)
+        [Array]::Sort($sourceIds, [StringComparer]::Ordinal)
+        $sumLines = foreach ($assetId in $sourceIds) {
             $asset = $assets[$assetId]
             "$($asset.Sha256)  $($asset.File)"
         }

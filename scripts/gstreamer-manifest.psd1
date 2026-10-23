@@ -147,7 +147,7 @@
         Tag            = 'deps-src-gstreamer-1.26.11-srt-1.5.6-1'
         Url            = 'https://github.com/RustRunner/PocketStream-Desktop/releases/tag/deps-src-gstreamer-1.26.11-srt-1.5.6-1'
         IndexFile      = 'SHA256SUMS.txt'
-        IndexSha256    = '1f96c037df4ff730546a9eded8f9940c9bd7a3a69d071dcf3bd95dda7762b518'
+        IndexSha256    = 'cd359e660d72946277feadf4d918ff004562060b570ef1fead083f9ef2750da4'
         Assets = @{
             'bzip2' = @{ Version = '1.0.8'; SourceTag = '1.0.8'; File = 'bzip2-1.0.8.tar.gz'; Url = 'https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz'; Sha256 = 'ab5a03176ee106d3f0fa90e381da478ddae405918153cca248e682cd0c4a2269' }
             'cerbero' = @{ Version = '1.26.11'; SourceTag = '1.26.11'; File = 'cerbero-1.26.11.tar.gz'; Url = 'https://github.com/GStreamer/cerbero/archive/refs/tags/1.26.11.tar.gz'; Sha256 = 'c385254bd01a975a48087f28a10e530ae8444ca4351b07831cda60ca8f9c858c' }

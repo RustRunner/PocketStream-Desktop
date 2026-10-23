@@ -265,7 +265,10 @@ foreach ($assetId in @($Manifest.SourceRelease.Assets.Keys | Sort-Object)) {
         -Description "Staged source asset '$assetId' SHA256"
 }
 
-$sumLines = foreach ($assetId in @($Manifest.SourceRelease.Assets.Keys | Sort-Object)) {
+# Culture-sensitive sorting differs between Windows NLS and Linux ICU.
+$sourceIds = [string[]]@($Manifest.SourceRelease.Assets.Keys)
+[Array]::Sort($sourceIds, [StringComparer]::Ordinal)
+$sumLines = foreach ($assetId in $sourceIds) {
     $asset = $Manifest.SourceRelease.Assets[$assetId]
     "$($asset.Sha256)  $($asset.File)"
 }

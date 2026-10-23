@@ -247,7 +247,7 @@ function Prepare-CerberoCheckout {
     if (-not (Test-Path -LiteralPath $Checkout)) {
         Write-Host "Cloning Cerbero into $Checkout" -ForegroundColor Cyan
         Invoke-Native -FilePath 'git.exe' -Arguments @(
-            'clone', '--filter=blob:none', '--depth=1', '--branch', $CerberoVersion,
+            'clone', '--config', 'core.autocrlf=false', '--filter=blob:none', '--depth=1', '--branch', $CerberoVersion,
             $CerberoRepository, $Checkout
         )
     }
