@@ -5,6 +5,7 @@ pub mod recorder;
 mod relay;
 pub mod rtsp_client;
 pub mod rtsp_server;
+mod rtsp_transport;
 mod srt_server;
 pub mod video_embed;
 
@@ -2402,7 +2403,7 @@ async fn playback_step(ctx: &PlaybackSupervisorContext) {
             PlaybackPipeline::new_udp(settings.stream.udp_port, window, health.clone(), generation)
         }
         StreamProtocol::Rtsp => StreamManager::build_input_url(&settings).and_then(|url| {
-            PlaybackPipeline::new_rtsp(
+            let mut pipeline = PlaybackPipeline::new_rtsp(
                 &url,
                 500,
                 true,
@@ -2412,7 +2413,23 @@ async fn playback_step(ctx: &PlaybackSupervisorContext) {
                 &settings.credentials.username,
                 &settings.credentials.password,
                 settings.stream.audio_muted,
-            )
+            )?;
+            let camera = path
+                .as_ref()
+                .map(|p| p.target.clone())
+                .ok_or_else(|| AppError::Stream("Camera Ethernet path unavailable".into()))?;
+            let handle = ctx.app.clone();
+            let current_epoch = ctx.epoch.clone();
+            pipeline.bind_rtsp_transport(
+                &url,
+                Arc::new(move || {
+                    if current_epoch.load(Ordering::Acquire) != epoch {
+                        return Err(AppError::Stream("Playback connection superseded".into()));
+                    }
+                    camera_stream_path(handle.as_ref(), &camera)
+                }),
+            )?;
+            Ok(pipeline)
         }),
     };
     let p = match built {
@@ -2528,18 +2545,24 @@ async fn preflight_target(
     handle: Option<&tauri::AppHandle>,
     target: Option<&CameraTarget>,
 ) -> Result<Option<ReadyPath>, AppError> {
-    use tauri::Manager;
     let Some(target) = target else {
         return Ok(None);
     }; // UDP is exempt
+    camera_stream_path(handle, target).map(Some)
+}
+
+fn camera_stream_path(
+    handle: Option<&tauri::AppHandle>,
+    target: &CameraTarget,
+) -> Result<ReadyPath, AppError> {
+    use tauri::Manager;
     let handle =
         handle.ok_or_else(|| AppError::Stream("Ethernet readiness service unavailable".into()))?;
     let manager = handle.state::<crate::network::NetworkManager>();
-    let path = manager
-        .camera_ready(target, &handle.state::<crate::config::AppConfig>())
-        .await?;
+    let path =
+        manager.camera_ready_bound_now(target, &handle.state::<crate::config::AppConfig>())?;
     require_cam_role(&path.target, &manager.registry().snapshot())?;
-    Ok(Some(path))
+    Ok(path)
 }
 
 fn relay_preflight(
@@ -2549,21 +2572,12 @@ fn relay_preflight(
     generation: Arc<std::sync::atomic::AtomicU64>,
     expected_generation: u64,
 ) -> Option<rtsp_server::UpstreamReady> {
-    use tauri::Manager;
     let target = target?; // UDP has no camera gate
     Some(guard_relay_upstream(
         health,
         generation,
         expected_generation,
-        Arc::new(move || {
-            let handle = handle
-                .as_ref()
-                .ok_or_else(|| AppError::Stream("Readiness service unavailable".into()))?;
-            let manager = handle.state::<crate::network::NetworkManager>();
-            let path =
-                manager.camera_ready_now(&target, &handle.state::<crate::config::AppConfig>())?;
-            require_cam_role(&path.target, &manager.registry().snapshot())
-        }),
+        Arc::new(move || camera_stream_path(handle.as_ref(), &target)),
     ))
 }
 
@@ -3790,7 +3804,7 @@ mod tests {
             41,
             Arc::new(move || {
                 calls.fetch_add(1, Ordering::AcqRel);
-                Ok(())
+                Ok(rtsp_transport::test_path("192.0.2.1"))
             }),
         );
         guard().unwrap();

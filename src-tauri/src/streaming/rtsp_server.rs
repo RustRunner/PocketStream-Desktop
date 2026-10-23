@@ -41,7 +41,8 @@ pub struct RtspRuntimeProbe {
     active: Arc<Mutex<Option<ActiveRtspMedia>>>,
 }
 
-pub type UpstreamReady = Arc<dyn Fn() -> Result<(), AppError> + Send + Sync>;
+pub type UpstreamReady =
+    Arc<dyn Fn() -> Result<crate::network::route::ReadyPath, AppError> + Send + Sync>;
 
 impl RtspRuntimeProbe {
     fn new(health: Arc<RelayRuntimeHealth>) -> Self {
@@ -211,15 +212,8 @@ fn configure_upstream_target(
     src: &gst::Element,
     ready: UpstreamReady,
     url: &str,
-) -> Result<(), AppError> {
-    ready()?;
-    // rtspsrc may create a new TCP connection for a subsequent request.
-    // Revalidate on its sending thread as well as at lazy media creation.
-    src.connect("before-send", false, move |_| {
-        Some(ready().is_ok().to_value())
-    });
-    src.set_property("location", url);
-    Ok(())
+) -> Result<super::rtsp_transport::RtspTransport, AppError> {
+    super::rtsp_transport::configure(src, url, ready)
 }
 
 fn observed_probe_bytes(data: Option<&gst::PadProbeData<'_>>) -> u64 {
@@ -803,12 +797,15 @@ impl RtspRestreamer {
                         log::error!("RTSP relay TCP receive policy failed: {}", error);
                         return;
                     }
-                    if let Err(error) =
-                        configure_upstream_target(&src, guarded.clone(), &url_for_factory)
-                    {
-                        log::warn!("RTSP relay upstream refused: {error}");
-                        return; // location remains unset; no upstream connection
-                    }
+                    let transport =
+                        match configure_upstream_target(&src, guarded.clone(), &url_for_factory) {
+                            Ok(transport) => transport,
+                            Err(error) => {
+                                log::warn!("RTSP relay upstream refused: {error}");
+                                return; // location remains unset; no upstream connection
+                            }
+                        };
+                    media.connect_unprepared(move |_| transport.shutdown());
                     if !user_for_factory.is_empty() {
                         src.set_property("user-id", &user_for_factory);
                         src.set_property("user-pw", &pw_for_factory);
@@ -1170,7 +1167,7 @@ mod tests {
         let current = ready.clone();
         let gate: UpstreamReady = Arc::new(move || {
             if current.load(Ordering::Acquire) {
-                Ok(())
+                Ok(super::super::rtsp_transport::test_path("192.0.2.1"))
             } else {
                 Err(AppError::Stream("route or identity changed".into()))
             }
@@ -1179,7 +1176,8 @@ mod tests {
         assert!(configure_upstream_target(&source, gate.clone(), "rtsp://192.0.2.1/live").is_err());
         assert!(source.property::<Option<String>>("location").is_none());
         ready.store(true, Ordering::Release);
-        configure_upstream_target(&source, gate.clone(), "rtsp://192.0.2.1/live").unwrap();
+        let _transport =
+            configure_upstream_target(&source, gate.clone(), "rtsp://192.0.2.1/live").unwrap();
         assert_eq!(
             source.property::<String>("location"),
             "rtsp://192.0.2.1/live"

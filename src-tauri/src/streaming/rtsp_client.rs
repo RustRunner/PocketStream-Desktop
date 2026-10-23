@@ -51,6 +51,7 @@ pub struct PlaybackPipeline {
     /// lost: the branch builder reads this value and re-applies it
     /// after state sync. Seeded from config at construction.
     desired_mute: Arc<AtomicBool>,
+    rtsp_transport: Option<super::rtsp_transport::RtspTransport>,
 }
 
 impl PlaybackPipeline {
@@ -259,6 +260,7 @@ impl PlaybackPipeline {
             audio_present: Arc::new(AtomicBool::new(false)),
             audio_codec: Arc::new(Mutex::new(None)),
             desired_mute: Arc::new(AtomicBool::new(false)),
+            rtsp_transport: None,
         })
     }
 
@@ -289,6 +291,20 @@ impl PlaybackPipeline {
         (present, codec)
     }
 
+    /// Install the verified Ethernet transport before entering Playing.
+    pub(super) fn bind_rtsp_transport(
+        &mut self,
+        url: &str,
+        ready: super::rtsp_server::UpstreamReady,
+    ) -> Result<(), AppError> {
+        let source = self
+            .pipeline
+            .by_name("src")
+            .ok_or_else(|| AppError::Stream("RTSP source missing".into()))?;
+        self.rtsp_transport = Some(super::rtsp_transport::configure(&source, url, ready)?);
+        Ok(())
+    }
+
     /// Start playback.
     pub fn play(&self) -> Result<(), AppError> {
         self.health
@@ -310,6 +326,9 @@ impl PlaybackPipeline {
 
     /// Stop and clean up.
     pub fn stop(&self) -> Result<(), AppError> {
+        if let Some(transport) = &self.rtsp_transport {
+            transport.shutdown();
+        }
         self.pipeline
             .set_state(gst::State::Null)
             .map_err(|e| AppError::Stream(format!("Failed to stop pipeline: {}", e)))?;
@@ -555,7 +574,7 @@ impl Drop for PlaybackPipeline {
         // dropped without an explicit stop() — e.g. when play() fails
         // right after construction, or an error path drops it — doesn't
         // leak the GStreamer pipeline and its elements.
-        let _ = self.pipeline.set_state(gst::State::Null);
+        let _ = self.stop();
     }
 }
 

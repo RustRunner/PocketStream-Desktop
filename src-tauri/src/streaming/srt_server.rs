@@ -800,6 +800,9 @@ impl SrtRestreamer {
         let signal_ids = preflight_srt_capabilities()?;
         let parts = parse_pipeline(RTSP_PIPELINE_SKELETON)?;
         configure_rtsp_source(&parts.source, input_url, username, password)?;
+        let transport =
+            super::rtsp_transport::configure(&parts.source, input_url, upstream_ready.clone())
+                .map_err(RestreamBuildFailure::configuration)?;
         configure_sink(
             &parts.sink,
             server_port,
@@ -832,6 +835,9 @@ impl SrtRestreamer {
         signal_handlers.push((
             parts.source.clone(),
             parts.source.connect("before-send", false, move |_| {
+                // Disconnecting this handler during teardown drops the owner
+                // and closes the listener and every camera connection.
+                let _transport_owner = &transport;
                 if upstream_callbacks.is_shutdown_requested() {
                     return Some(false.to_value());
                 }

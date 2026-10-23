@@ -3380,6 +3380,25 @@ impl NetworkManager {
         target: &route::CameraTarget,
         config: &crate::config::AppConfig,
     ) -> Result<route::ReadyPath, AppError> {
+        self.camera_path_now(target, config, false)
+    }
+
+    /// Only for transports that bind both the source address and interface.
+    /// Unbound consumers must continue to use camera_ready[_now].
+    pub(crate) fn camera_ready_bound_now(
+        &self,
+        target: &route::CameraTarget,
+        config: &crate::config::AppConfig,
+    ) -> Result<route::ReadyPath, AppError> {
+        self.camera_path_now(target, config, true)
+    }
+
+    fn camera_path_now(
+        &self,
+        target: &route::CameraTarget,
+        config: &crate::config::AppConfig,
+        bound: bool,
+    ) -> Result<route::ReadyPath, AppError> {
         if self.presence.tick(&self.device_registry) {
             if let Ok(emitter) = self.device_emitter.try_lock() {
                 if let Some(emitter) = emitter.as_ref() {
@@ -3418,13 +3437,18 @@ impl NetworkManager {
             .probe_scope()
             .ok_or_else(|| AppError::Network("Selected Ethernet adapter unavailable".into()))?;
         let ip = crate::validation::parse_camera_ip(&target.ip)?;
-        let source = route::check_ready(
-            &target,
-            Some(&adapter),
-            index,
-            &self.device_registry.snapshot(),
-            route::egress_index(ip).ok(),
-        )?;
+        let records = self.device_registry.snapshot();
+        let source = if bound {
+            route::check_bound_ready(&target, Some(&adapter), index, &records)
+        } else {
+            route::check_ready(
+                &target,
+                Some(&adapter),
+                index,
+                &records,
+                route::egress_index(ip).ok(),
+            )
+        }?;
         #[cfg(windows)]
         if !interface::source_matches_interface(index, source) {
             return Err(AppError::Network(

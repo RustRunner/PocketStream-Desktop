@@ -12,11 +12,11 @@ pub struct CameraTarget {
 }
 
 #[derive(Clone)]
-pub(crate) struct ReadyPath {
-    pub target: CameraTarget,
-    pub source: Ipv4Addr,
-    pub index: u32,
-    pub fence: super::SweepFence,
+pub struct ReadyPath {
+    pub(crate) target: CameraTarget,
+    pub(crate) source: Ipv4Addr,
+    pub(crate) index: u32,
+    pub(crate) fence: super::SweepFence,
 }
 
 pub fn egress_index(destination: Ipv4Addr) -> Result<u32, AppError> {
@@ -55,15 +55,29 @@ pub(super) fn check_ready(
     records: &[DeviceRecord],
     egress: Option<u32>,
 ) -> Result<Ipv4Addr, AppError> {
+    if egress != Some(index) {
+        return Err(AppError::Network(
+            "Ethernet not ready: OS route does not select the selected Ethernet adapter".into(),
+        ));
+    }
+    check_bound_ready(target, adapter, index, records)
+}
+
+/// An explicitly source/interface-bound transport does not use the default
+/// route. It still requires the same applied address and fresh MAC evidence.
+pub(super) fn check_bound_ready(
+    target: &CameraTarget,
+    adapter: Option<&InterfaceInfo>,
+    index: u32,
+    records: &[DeviceRecord],
+) -> Result<Ipv4Addr, AppError> {
     let fail = |reason: &str| AppError::Network(format!("Ethernet not ready: {reason}"));
     let ip = crate::validation::parse_camera_ip(&target.ip)?;
     let adapter = adapter
         .filter(|a| a.is_up && a.is_ethernet && !a.is_wifi && !a.is_virtual && !a.is_vpn)
         .ok_or_else(|| fail("selected adapter unavailable"))?;
-    if index == 0 || egress != Some(index) {
-        return Err(fail(
-            "OS route does not select the selected Ethernet adapter",
-        ));
+    if index == 0 {
+        return Err(fail("selected adapter has no interface index"));
     }
     let source = super::select_wired_source(ip, &Default::default(), &adapter.ips)
         .filter(|source| *source != ip && !crate::validation::prohibited_camera_ip(*source))
@@ -143,12 +157,22 @@ mod tests {
         for route in [None, Some(0), Some(8)] {
             assert!(check_ready(&target, Some(&adapter), 7, &rows, route).is_err());
         }
+        // Explicitly bound RTSP can use Ethernet even when Wi-Fi owns the
+        // same destination IP and wins GetBestInterfaceEx's unbound lookup.
+        assert_eq!(
+            check_bound_ready(&target, Some(&adapter), 7, &rows).unwrap(),
+            "192.168.1.101".parse::<Ipv4Addr>().unwrap()
+        );
+        assert!(check_bound_ready(&target, Some(&adapter), 0, &rows).is_err());
+        assert!(check_bound_ready(&target, None, 7, &rows).is_err());
         let mut missing = adapter.clone();
         missing.ips.clear();
         assert!(check_ready(&target, Some(&missing), 7, &rows, Some(7)).is_err());
+        assert!(check_bound_ready(&target, Some(&missing), 7, &rows).is_err());
         let mut wrong = target.clone();
         wrong.expected_mac = Some("aa:bb:cc:dd:ee:02".into());
         assert!(check_ready(&wrong, Some(&adapter), 7, &rows, Some(7)).is_err());
+        assert!(check_bound_ready(&wrong, Some(&adapter), 7, &rows).is_err());
         wrong = target.clone();
         wrong.ip = "169.254.1.204".into();
         assert!(check_ready(&wrong, Some(&adapter), 7, &rows, Some(7)).is_err());
@@ -166,10 +190,12 @@ mod tests {
             let mut stale = rows.clone();
             stale[0].status = status;
             assert!(check_ready(&target, Some(&adapter), 7, &stale, Some(7)).is_err());
+            assert!(check_bound_ready(&target, Some(&adapter), 7, &stale).is_err());
         }
         let mut other_adapter = rows.clone();
         other_adapter[0].verified_by_mac = Some("40:cd:3a:00:00:02".into());
         assert!(check_ready(&target, Some(&adapter), 7, &other_adapter, Some(7)).is_err());
+        assert!(check_bound_ready(&target, Some(&adapter), 7, &other_adapter).is_err());
         assert!(registry
             .expire_evidence(tokio::time::Instant::now() + super::super::presence::FRESHNESS));
         assert!(check_ready(&target, Some(&adapter), 7, &registry.snapshot(), Some(7)).is_err());
