@@ -704,6 +704,14 @@ pub(crate) trait AddressIo: Send + Sync {
     ) -> Result<(), AppError> {
         config.set_binding(subnet, row)
     }
+    fn forget_unowned_binding(
+        &self,
+        config: &crate::config::AppConfig,
+        subnet: &str,
+        expected: &crate::config::AdoptedMeta,
+    ) -> Result<(), AppError> {
+        config.forget_unowned_binding(subnet, expected)
+    }
     fn claim(&self, config: &crate::config::AppConfig, ip: &str) -> Result<(), AppError> {
         config.claim_binding(ip)
     }

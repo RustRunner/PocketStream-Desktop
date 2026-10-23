@@ -276,6 +276,7 @@ impl NetworkManager {
         tx: &mut Transaction,
     ) -> Result<(), AppError> {
         let settings = config.get();
+        let remove_saved = matches!(&request, AddressRequest::RemoveSaved { .. });
         let (add, alias, mask) = match request {
             AddressRequest::Add { name, ip, mask } => {
                 ip.parse::<Ipv4Addr>()
@@ -346,6 +347,9 @@ impl NetworkManager {
                 tx.address
                     .parse::<Ipv4Addr>()
                     .map_err(|_| AppError::Network("Saved address is invalid".into()))?;
+                if remove_saved && row.adapter_mac.is_none() {
+                    return self.forget_unowned_address(config, fence, tx).await;
+                }
                 if row.adapter_mac.as_deref().and_then(adapter_mac).is_none()
                     || row.prefix.is_none_or(|p| p > 32)
                 {
@@ -751,6 +755,57 @@ impl NetworkManager {
         }
     }
 
+    async fn forget_unowned_address(
+        &self,
+        config: &AppConfig,
+        fence: &SweepFence,
+        tx: &mut Transaction,
+    ) -> Result<(), AppError> {
+        // Old configs did not record the owning adapter. Never infer ownership
+        // from the current selection, even if the same address is present there.
+        // An address absent everywhere needs only its stale saved entry removed.
+        let before = self
+            .operation_snapshot_traced(config, Some(&tx.trace))
+            .await?;
+        tx.trace.phase("preflight");
+        self.validate_operation_context(config, tx, fence)?;
+        let ensure_absent = |snapshot: &OperationSnapshot| {
+            if snapshot
+                .all
+                .iter()
+                .any(|a| a.ips.iter().any(|ip| ip.address == tx.address))
+            {
+                Err(AppError::Network(
+                    "Saved adapter ownership is unknown and this address is still assigned in Windows; no change made".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        ensure_absent(&before)?;
+        let after = self
+            .observe_operation_traced(&before, Some(&tx.trace))
+            .await?;
+        self.validate_operation_context(config, tx, fence)?;
+        ensure_absent(&after)?;
+        tx.trace.phase("observation");
+        let subnet = tx.subnet.as_deref().unwrap();
+        let row = tx.row.as_ref().unwrap();
+        tx.prefix = row.prefix;
+        self.address_io
+            .forget_unowned_binding(config, subnet, row)?;
+        tx.trace.phase("status_save");
+        self.adopted_meta
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(subnet);
+        self.adopted_ips.lock().await.remove(subnet);
+        tx.row = None;
+        tx.observed = Some(after);
+        tx.outcome = AddressOutcome::Success;
+        Ok(())
+    }
+
     async fn remove_saved_operation(
         &self,
         config: &AppConfig,
@@ -922,6 +977,14 @@ mod tests {
         fn claim(&self, c: &AppConfig, ip: &str) -> Result<(), AppError> {
             c.claim_binding_with(ip, |_| self.persist("claim", ip))
         }
+        fn forget_unowned_binding(
+            &self,
+            c: &AppConfig,
+            subnet: &str,
+            expected: &AdoptedMeta,
+        ) -> Result<(), AppError> {
+            c.forget_unowned_binding_with(subnet, expected, |_| self.persist("forget", subnet))
+        }
         fn forget_completed_removal(
             &self,
             c: &AppConfig,
@@ -992,6 +1055,179 @@ mod tests {
             Arc::new(AtomicU64::new(1)),
             Arc::new(AtomicBool::new(true)),
         )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn legacy_unowned_removal_forgets_only_the_absent_binding_and_survives_restart() {
+        for up in [true, false] {
+            let (m, c, io) = fixture(2);
+            {
+                let mut settings = c.settings.lock().unwrap();
+                let row = settings.adopted_meta.get_mut(TARGET).unwrap();
+                row.adapter_mac = None;
+                row.last_error = Some("selected adapter unavailable".into());
+                settings
+                    .primary_addresses
+                    .insert("40:cd:3a:00:00:01".into(), "192.0.2.10/24".into());
+            }
+            *m.adopted_meta.lock().unwrap() = c.get().adopted_meta.clone();
+            m.adopted_ips
+                .lock()
+                .await
+                .insert(TARGET.into(), IP.parse().unwrap());
+            {
+                let mut table = io.os.table.lock().unwrap();
+                table[0].ips.retain(|i| i.address != IP);
+                table[0].is_up = up;
+            }
+            let mut expected = c.get();
+            expected.adopted_subnets.remove(TARGET);
+            expected.adopted_meta.remove(TARGET);
+            let result = m.address_operation(&c, removal()).await;
+            assert_eq!(
+                result.outcome,
+                AddressOutcome::Success,
+                "{:?}",
+                result.reason
+            );
+            assert_eq!(result.view.subnet.as_deref(), Some(TARGET));
+            assert!(result.view.binding.is_none());
+            assert!(result.view.observation_error.is_none());
+            assert!(!m.adopted_meta.lock().unwrap().contains_key(TARGET));
+            assert!(!m.adopted_ips.lock().await.contains_key(TARGET));
+            assert!(io.os.writes.lock().unwrap().is_empty());
+            assert_eq!(io.os.reads.load(Ordering::Relaxed), 2);
+            assert_eq!(io.saves.load(Ordering::Relaxed), 1);
+            let saved = crate::config::test_support::serialize_for_test(&c.get());
+            let restarted = crate::config::test_support::parse_for_test(&saved).unwrap();
+            assert_eq!(
+                crate::config::test_support::serialize_for_test(&restarted),
+                crate::config::test_support::serialize_for_test(&expected),
+            );
+            m.reconcile_bindings_locked(&c).await;
+            assert!(!c.get().adopted_meta.contains_key(TARGET));
+            assert!(!io.os.writes.lock().unwrap().iter().any(|(_, ip)| ip == IP));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn legacy_unowned_removal_never_guesses_ownership_or_forgets_unknown_state() {
+        for case in 0..7 {
+            let (m, c, io) = fixture(1);
+            c.settings
+                .lock()
+                .unwrap()
+                .adopted_meta
+                .get_mut(TARGET)
+                .unwrap()
+                .adapter_mac = None;
+            if case != 0 {
+                io.os.table.lock().unwrap()[0]
+                    .ips
+                    .retain(|i| i.address != IP);
+            }
+            match case {
+                0 => {} // Present on the selected adapter: ownership still unknown.
+                1 => {
+                    // Even an unqualified, MAC-less adapter with another prefix
+                    // prevents treating the saved address as absent.
+                    io.os.table.lock().unwrap().push(NativeAdapter {
+                        index: 8,
+                        guid: "other-guid".into(),
+                        alias: "Other".into(),
+                        ips: vec![interface::IpInfo {
+                            address: IP.into(),
+                            prefix: 25,
+                            subnet: "192.0.2.0/25".into(),
+                        }],
+                        ..Default::default()
+                    });
+                }
+                2 => io.os.fail_read_at.store(1, Ordering::Relaxed),
+                3 => io.os.fail_read_at.store(2, Ordering::Relaxed),
+                4 => io.fail_save.store(1, Ordering::Relaxed),
+                5 => c
+                    .settings
+                    .lock()
+                    .unwrap()
+                    .pending_addresses
+                    .push(PendingAddress {
+                        adapter_mac: "aa:bb:cc:dd:ee:ff".into(),
+                        address: IP.into(),
+                        prefix: 24,
+                    }),
+                _ => {
+                    c.settings
+                        .lock()
+                        .unwrap()
+                        .adopted_subnets
+                        .insert(TARGET.into(), "192.0.2.21".into());
+                }
+            }
+            let before = crate::config::test_support::serialize_for_test(&c.get());
+            let result = m.address_operation(&c, removal()).await;
+            assert_eq!(result.outcome, AddressOutcome::Failed, "case {case}");
+            assert!(result.view.binding.is_some());
+            assert_eq!(
+                crate::config::test_support::serialize_for_test(&c.get()),
+                before,
+                "case {case}"
+            );
+            assert!(io.os.writes.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn legacy_unowned_removal_rechecks_address_selection_and_saved_row() {
+        for case in 0..3 {
+            let (m, c, io) = fixture(1);
+            c.settings
+                .lock()
+                .unwrap()
+                .adopted_meta
+                .get_mut(TARGET)
+                .unwrap()
+                .adapter_mac = None;
+            io.os.table.lock().unwrap()[0]
+                .ips
+                .retain(|i| i.address != IP);
+            *io.os.delay.lock().unwrap() = Duration::from_millis(100);
+            let manager = m.clone();
+            let config = c.clone();
+            let task =
+                tokio::spawn(async move { manager.address_operation(&config, removal()).await });
+            tokio::task::yield_now().await;
+            assert_eq!(io.os.reads.load(Ordering::Relaxed), 1);
+            match case {
+                0 => io.os.table.lock().unwrap()[0].ips.push(interface::IpInfo {
+                    address: IP.into(),
+                    prefix: 24,
+                    subnet: TARGET.into(),
+                }),
+                1 => {
+                    c.settings
+                        .lock()
+                        .unwrap()
+                        .adopted_meta
+                        .get_mut(TARGET)
+                        .unwrap()
+                        .adapter_mac = Some("40:cd:3a:00:00:01".into())
+                }
+                _ => {
+                    c.settings.lock().unwrap().selected_adapter_mac =
+                        Some("aa:bb:cc:dd:ee:ff".into())
+                }
+            }
+            let before = crate::config::test_support::serialize_for_test(&c.get());
+            let result = task.await.unwrap();
+            assert_eq!(result.outcome, AddressOutcome::Failed, "case {case}");
+            assert_eq!(
+                crate::config::test_support::serialize_for_test(&c.get()),
+                before
+            );
+            assert_eq!(io.saves.load(Ordering::Relaxed), 0);
+            assert!(io.os.writes.lock().unwrap().is_empty());
+        }
     }
 
     #[tokio::test(start_paused = true)]

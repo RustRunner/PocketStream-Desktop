@@ -1087,6 +1087,48 @@ impl AppConfig {
         )
     }
 
+    /// Explicit cleanup of a legacy binding after the caller observes its address
+    /// absent from every native adapter under the address-work lock. This never
+    /// grants ownership to the selected adapter or creates an OS removal intent.
+    pub(crate) fn forget_unowned_binding(
+        &self,
+        subnet: &str,
+        expected: &AdoptedMeta,
+    ) -> Result<(), crate::AppError> {
+        self.forget_unowned_binding_with(subnet, expected, save_to_disk)
+    }
+
+    pub(crate) fn forget_unowned_binding_with(
+        &self,
+        subnet: &str,
+        expected: &AdoptedMeta,
+        persist: impl FnOnce(&AppSettings) -> Result<(), crate::AppError>,
+    ) -> Result<(), crate::AppError> {
+        self.change_settings_with(
+            |s| {
+                if expected.adapter_mac.is_some()
+                    || expected.address.is_none()
+                    || s.adopted_meta.get(subnet) != Some(expected)
+                    || s.adopted_subnets
+                        .get(subnet)
+                        .is_some_and(|ip| Some(ip) != expected.address.as_ref())
+                    || s.pending_addresses
+                        .iter()
+                        .any(|p| Some(&p.address) == expected.address.as_ref())
+                {
+                    return Err(crate::AppError::Network(
+                        "Saved binding changed or address ownership is pending; retry removal"
+                            .into(),
+                    ));
+                }
+                s.adopted_subnets.remove(subnet);
+                s.adopted_meta.remove(subnet);
+                Ok(())
+            },
+            persist,
+        )
+    }
+
     pub fn claim_binding(&self, address: &str) -> Result<(), crate::AppError> {
         self.claim_binding_with(address, save_to_disk)
     }

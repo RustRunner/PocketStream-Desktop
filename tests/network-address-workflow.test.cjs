@@ -687,6 +687,21 @@ test('SP10 unknown observation retains last known addresses and pending row with
   assert.equal(f.adoptionMeta.get(SUBNET).applied,true);assert.equal(f.feedback.at(-1).error,true);
 });
 
+test('removing an absent legacy binding clears the pending row without an ownership error',async()=>{
+  const f=fixture();
+  f.adoptionMeta.set(SUBNET,{...f.adoptionMeta.get(SUBNET),adapter_mac:null,applied:false,last_error:'selected adapter unavailable'});
+  f.iface.ips=f.iface.ips.filter(i=>i.address!==IP);
+  f.iface.is_up=false;
+  const pending=f.modalRemove();await flush();
+  const result=f.reply();result.view.binding=null;
+  f.pending[0].resolve(result);await pending;await flush();
+  assert.equal(f.calls.writes,1);
+  assert(!f.adoptionMeta.has(SUBNET));assert(!f.adoptedSubnets.has(SUBNET));
+  assert(!f.$('#secondary-ip-list').innerHTML.includes(IP));
+  assert.equal(f.feedback.at(-1).error,false);
+  assert.equal(f.$('#btn-add-sec-ip').disabled,false);
+});
+
 test('SP11 stale post-reply events trigger one current read and cannot repaint old IPs',async()=>{
   const f=fixture();const pending=f.modalRemove();await flush();f.pending[0].resolve(f.reply());await pending;await flush();
   const fresh=deferred();f.api.getAdapterSelection=()=>{f.calls.selection++;return fresh.promise;};
