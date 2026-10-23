@@ -44,6 +44,8 @@ On the tested Windows setup, switching off the Wi-Fi radio retained the conflict
 
 ## Qualification still required
 
+The draft build verifies the complete uploaded dependency-source asset set even while that source release is unpublished. Installed draft verification records `draft_ready=true`; full `g3_complete` remains false until the dependency-source prerelease is published. Publish that source prerelease before manually publishing the application, and rerun the default G3 check for final publication evidence. The build workflow publishes neither release.
+
 The automated checks cover logic and simulated failure boundaries. Elevated Windows hardware runs must still establish capture-source matching on the reference ASIX adapter, selected-Ethernet proof with overlapping Wi-Fi subnets, cable-loss and freshness timing, crash/reboot address lifetime, DHCP transitions, recovery/recording behavior and native notice/video interaction.
 
 Resource qualification must include at least 20 cable cycles, five camera reboots behind a switch and 60 minutes of playback with representative recording and relay. Measure the app, WebView2 and child processes together. The switch reboot fixture remains required even for planned direct-attach deployment. Record date, adapter/camera identities, build identity, timings and log excerpts in the qualification notes; these hardware checks are pending.

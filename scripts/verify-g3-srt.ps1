@@ -12,6 +12,10 @@ and installed runtimes with only their own DLL and plugin paths visible.
 staging half of the gate but writes result "staged-pass" and g3_complete=false.
 A complete pass requires a real NSIS-installed application root, its installer,
 and the published corresponding-source prerelease.
+
+-AllowDraftSourceRelease verifies authenticated draft asset hashes as well.
+An installed artifact with unpublished sources writes result "draft-pass" and
+draft_ready=true, while g3_complete remains false until sources are published.
 #>
 
 [CmdletBinding()]
@@ -26,6 +30,7 @@ param(
     [string]$DependencyCacheDir,
     [switch]$StagedOnly,
     [switch]$SkipPublishedSourceCheck,
+    [switch]$AllowDraftSourceRelease,
     [switch]$KeepWorkDirectory
 )
 
@@ -42,6 +47,12 @@ $PackagePath = Join-Path $ProjectDir 'package.json'
 $RepositoryLicenseRoot = Join-Path $ProjectDir 'src-tauri\resources\licenses'
 $Manifest = Import-PowerShellDataFile $ManifestPath
 $Srt = $Manifest.PatchedSrt
+$SourcePolicyPath = Join-Path $ScriptDir 'source-release-policy.ps1'
+. $SourcePolicyPath
+
+if ($AllowDraftSourceRelease -and $SkipPublishedSourceCheck) {
+    throw 'Draft source verification cannot be combined with skipping the source check.'
+}
 
 if ($env:OS -ne 'Windows_NT' -or -not [Environment]::Is64BitOperatingSystem) {
     throw 'G3 must run on 64-bit Windows.'
@@ -636,53 +647,33 @@ function Get-LicenseClosureEvidence {
     return $records
 }
 
-function Get-PublishedSourceEvidence {
+function Get-SourceReleaseEvidence {
     $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
     if (-not $curl) {
         throw 'curl.exe is required to verify the published G3 source release.'
     }
-    $apiUrl = "https://api.github.com/repos/RustRunner/PocketStream-Desktop/releases/tags/$($Manifest.SourceRelease.Tag)"
-    $releaseText = @(& $curl.Source -fsSL `
-        -H 'Accept: application/vnd.github+json' `
-        -H 'X-GitHub-Api-Version: 2022-11-28' $apiUrl 2>&1 |
-        ForEach-Object { $_.ToString() }) -join "`n"
-    if ($LASTEXITCODE -ne 0) {
-        throw "Published source release lookup failed with exit $LASTEXITCODE`: $apiUrl`n$releaseText"
+    if ($AllowDraftSourceRelease) {
+        $gh = Get-Command gh -ErrorAction SilentlyContinue
+        if (-not $gh) { throw 'Authenticated GitHub CLI is required to verify source drafts.' }
+        $releaseIdText = @(& $gh.Source release view $Manifest.SourceRelease.Tag `
+            --repo RustRunner/PocketStream-Desktop --json databaseId) -join "`n"
+        if ($LASTEXITCODE -ne 0) { throw 'Source draft lookup failed.' }
+        $releaseId = [long]($releaseIdText | ConvertFrom-Json).databaseId
+        $releaseText = @(& $gh.Source api "repos/RustRunner/PocketStream-Desktop/releases/$releaseId") -join "`n"
+        if ($LASTEXITCODE -ne 0) { throw 'Source draft metadata lookup failed.' }
+    } else {
+        $apiUrl = "https://api.github.com/repos/RustRunner/PocketStream-Desktop/releases/tags/$($Manifest.SourceRelease.Tag)"
+        $releaseText = @(& $curl.Source -fsSL `
+            -H 'Accept: application/vnd.github+json' `
+            -H 'X-GitHub-Api-Version: 2022-11-28' $apiUrl 2>&1 |
+            ForEach-Object { $_.ToString() }) -join "`n"
+        if ($LASTEXITCODE -ne 0) {
+            throw "Published source release lookup failed with exit $LASTEXITCODE`: $apiUrl`n$releaseText"
+        }
     }
     $release = $releaseText | ConvertFrom-Json
-    Assert-Equal -Actual $release.tag_name -Expected $Manifest.SourceRelease.Tag `
-        -Description 'Published source release tag'
-    Assert-True -Condition ([bool]$release.prerelease) `
-        -Message 'Published source release is not marked as a prerelease.'
-    Assert-True -Condition (-not [bool]$release.draft) `
-        -Message 'Published source release is still a draft.'
-    Assert-Equal -Actual $release.html_url -Expected $Manifest.SourceRelease.Url `
-        -Description 'Published source release URL'
-
-    $expectedAssets = @($Manifest.SourceRelease.Assets.Values |
-        ForEach-Object { [string]$_.File })
-    $expectedAssets += [string]$Manifest.SourceRelease.IndexFile
-    $actualAssets = @($release.assets | ForEach-Object { [string]$_.name })
-    Assert-ExactStringSet -Actual $actualAssets -Expected $expectedAssets `
-        -Description 'Published source release asset set'
-
-    foreach ($assetId in $Manifest.SourceRelease.Assets.Keys) {
-        $sourceAsset = $Manifest.SourceRelease.Assets[$assetId]
-        $matches = @($release.assets | Where-Object { $_.name -ceq $sourceAsset.File })
-        Assert-True -Condition ($matches.Count -eq 1) `
-            -Message "Published source release must contain one '$($sourceAsset.File)' asset."
-        Assert-Equal -Actual ([string]$matches[0].digest).ToLowerInvariant() `
-            -Expected "sha256:$($sourceAsset.Sha256)" `
-            -Description "Published source asset '$assetId' digest"
-    }
-    $indexMatches = @($release.assets | Where-Object {
-        $_.name -ceq $Manifest.SourceRelease.IndexFile
-    })
-    Assert-True -Condition ($indexMatches.Count -eq 1) `
-        -Message 'Published source release must contain one SHA256 index.'
-    Assert-Equal -Actual ([string]$indexMatches[0].digest).ToLowerInvariant() `
-        -Expected "sha256:$($Manifest.SourceRelease.IndexSha256)" `
-        -Description 'Published source index digest'
+    Assert-SourceReleaseMetadata -SourceManifest $Manifest.SourceRelease `
+        -Release $release -AllowDraft:$AllowDraftSourceRelease
 
     $latestApiUrl = 'https://api.github.com/repos/RustRunner/PocketStream-Desktop/releases/latest'
     $latestText = @(& $curl.Source -fsSL `
@@ -700,9 +691,10 @@ function Get-PublishedSourceEvidence {
 
     return [pscustomobject][ordered]@{
         verified = $true
+        published = -not [bool]$release.draft
         tag = [string]$release.tag_name
         html_url = [string]$release.html_url
-        asset_count = $expectedAssets.Count
+        asset_count = $Manifest.SourceRelease.Assets.Count + 1
         index_sha256 = [string]$Manifest.SourceRelease.IndexSha256
         latest_application_tag = [string]$latest.tag_name
     }
@@ -859,14 +851,15 @@ try {
     if ($SkipPublishedSourceCheck) {
         $publishedSourceEvidence = [pscustomobject][ordered]@{
             verified = $false
+            published = $false
             reason = 'explicitly skipped by incomplete staged-only run'
             tag = [string]$Manifest.SourceRelease.Tag
             asset_count = $Manifest.SourceRelease.Assets.Count + 1
             index_sha256 = [string]$Manifest.SourceRelease.IndexSha256
         }
     } else {
-        Write-Host 'G3: verifying published complete-source prerelease...' -ForegroundColor Cyan
-        $publishedSourceEvidence = Get-PublishedSourceEvidence
+        Write-Host 'G3: verifying complete-source release assets and publication status...' -ForegroundColor Cyan
+        $publishedSourceEvidence = Get-SourceReleaseEvidence
     }
 
     New-Item -ItemType Directory -Path $WorkDir | Out-Null
@@ -917,12 +910,16 @@ try {
         }
     }
 
-    $g3Complete = (-not [bool]$StagedOnly) -and [bool]$publishedSourceEvidence.verified
+    $completion = Get-G3CompletionState -StagedOnly ([bool]$StagedOnly) `
+        -SourceVerified ([bool]$publishedSourceEvidence.verified) `
+        -SourcePublished ([bool]$publishedSourceEvidence.published)
+    $g3Complete = $completion.complete
     $evidence = [ordered]@{
         schema_version = 1
         gate = 'G3'
-        result = if ($g3Complete) { 'pass' } else { 'staged-pass' }
+        result = $completion.result
         g3_complete = $g3Complete
+        draft_ready = $completion.draft_ready
         generated_at_utc = [DateTime]::UtcNow.ToString('o')
         dependency_boundary = [ordered]@{
             prerequisite_gates = @('G1-R', 'G2')
@@ -939,6 +936,7 @@ try {
             manifest_sha256 = Get-Sha256 -Path $ManifestPath
             third_party_check_sha256 = Get-Sha256 -Path $CheckThirdPartyPath
             source_mirror_script_sha256 = Get-Sha256 -Path $MirrorSourcePath
+            source_policy_script_sha256 = Get-Sha256 -Path $SourcePolicyPath
             powershell_version = $PSVersionTable.PSVersion.ToString()
             dumpbin_file_version = (Get-Item -LiteralPath $script:DumpbinPath).VersionInfo.FileVersion
             gst_inspect_sha256 = Get-Sha256 -Path $SdkInspectPath
@@ -962,9 +960,7 @@ try {
             notices_and_metadata_check = 'pass'
         }
         installed_package = $installedPackageEvidence
-        incomplete_reason = if ($g3Complete) { $null } else {
-            'Staged-only evidence cannot satisfy G3; published source and a real NSIS-installed layout remain mandatory.'
-        }
+        incomplete_reason = $completion.incomplete_reason
     }
 
     $evidenceParent = Split-Path -Parent $EvidencePath
@@ -975,6 +971,8 @@ try {
         -Value (($evidence | ConvertTo-Json -Depth 16) + "`n")
     if ($g3Complete) {
         Write-Host "G3 passed; final evidence written to $EvidencePath" -ForegroundColor Green
+    } elseif ($completion.draft_ready) {
+        Write-Host "G3 draft artifact passed; source publication pending. Evidence: $EvidencePath" -ForegroundColor Yellow
     } else {
         Write-Host "G3 staged check passed (incomplete by design); evidence written to $EvidencePath" -ForegroundColor Yellow
     }

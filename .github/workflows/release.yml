@@ -126,6 +126,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "frontend tests failed" }
           ./scripts/check-third-party.ps1
           if ($LASTEXITCODE -ne 0) { throw "third-party notices check failed" }
+          ./scripts/test-source-release-policy.ps1
+          if ($LASTEXITCODE -ne 0) { throw "source release policy tests failed" }
           ./scripts/mirror-gstreamer-src.ps1 -ValidateManifestOnly
           if ($LASTEXITCODE -ne 0) { throw "native source manifest check failed" }
           Push-Location src-tauri
@@ -168,17 +170,18 @@ jobs:
         shell: pwsh
         run: pwsh -File scripts/bundle-gstreamer.ps1
 
-      # Prove the exact packaged input and require the complete native-source
-      # prerelease before spending time signing and drafting an application
-      # release. This evidence remains staged-only until the NSIS artifact is
-      # installed and checked below.
+      # Verify the complete source asset set, including an authenticated draft.
+      # Nothing is published here. Full G3 completion still requires public
+      # sources; installed draft readiness is recorded separately below.
       - name: G3 staged release closure gate
         shell: powershell
         timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $evidence = Join-Path $env:RUNNER_TEMP 'g3-srt-release-staged-1.5.6.json'
           & powershell.exe -NoProfile -ExecutionPolicy Bypass `
-            -File scripts\verify-g3-srt.ps1 -StagedOnly `
+            -File scripts\verify-g3-srt.ps1 -StagedOnly -AllowDraftSourceRelease `
             -EvidencePath $evidence
           if ($LASTEXITCODE -ne 0) {
             throw "G3 staged release gate failed with exit $LASTEXITCODE"
@@ -207,11 +210,14 @@ jobs:
 
       # Install the just-built NSIS artifact into a fresh runner directory and
       # rerun the exact hash/import/plugin checks there. Only this invocation
-      # can emit g3_complete=true. The GitHub release is still a draft, so a
+      # can emit draft_ready=true (or g3_complete=true with public sources).
+      # The GitHub release is still a draft, so a
       # failed installed-package gate cannot reach the updater.
-      - name: Install draft artifact and complete G3
+      - name: Install and verify draft artifact
         shell: powershell
         timeout-minutes: 15
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
           $installerName = "PocketStream Desktop_${version}_x64-setup.exe"
@@ -223,19 +229,21 @@ jobs:
           if (Test-Path -LiteralPath $installRoot) {
             throw "Fresh G3 install root already exists: $installRoot"
           }
-          $installer = Start-Process -FilePath $installerPath -Wait -PassThru `
+          $installer = Start-Process -FilePath $installerPath -Wait -PassThru -WindowStyle Hidden `
             -ArgumentList @('/S', "/D=$installRoot")
           if ($installer.ExitCode -ne 0) {
             throw "NSIS silent install failed with exit $($installer.ExitCode)"
           }
           $evidence = Join-Path $env:RUNNER_TEMP 'g3-srt-installed-1.5.6.json'
           & powershell.exe -NoProfile -ExecutionPolicy Bypass `
-            -File scripts\verify-g3-srt.ps1 `
+            -File scripts\verify-g3-srt.ps1 -AllowDraftSourceRelease `
             -InstalledAppRoot $installRoot -InstallerPath $installerPath `
             -EvidencePath $evidence
           if ($LASTEXITCODE -ne 0) {
             throw "G3 installed-package gate failed with exit $LASTEXITCODE"
           }
+          $result = Get-Content -LiteralPath $evidence -Raw | ConvertFrom-Json
+          if (-not $result.draft_ready) { throw 'Installed draft verification is incomplete' }
 
       - name: Upload G3 release evidence
         if: always()

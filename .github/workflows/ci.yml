@@ -120,6 +120,8 @@ jobs:
           & powershell.exe -NoProfile -ExecutionPolicy Bypass `
             -File scripts\check-third-party.ps1
           if ($LASTEXITCODE -ne 0) { throw "third-party closure validation failed with exit $LASTEXITCODE" }
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\test-source-release-policy.ps1
+          if ($LASTEXITCODE -ne 0) { throw "source release policy tests failed with exit $LASTEXITCODE" }
 
       - uses: dtolnay/rust-toolchain@stable
 
