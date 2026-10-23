@@ -1,6 +1,6 @@
 # PocketStream Desktop
 
-**PocketStream Desktop** is a Tauri/Rust Windows application for field camera work. It discovers IP cameras on the selected Ethernet adapter, including cameras that retain an old DHCP address on another subnet, plays and records their RTSP/UDP streams, re-serves them over a token-protected RTSP server, and drives FLIR pan-tilt units. Cameras using APIPA (169.254.0.0/16) must first be configured with a usable non-APIPA address using their vendor's tools.
+**PocketStream Desktop** is a Tauri/Rust Windows application for field camera work. It discovers IP cameras on the selected Ethernet adapter, including cameras that retain an old DHCP address on another subnet, plays and records their RTSP/UDP streams, re-serves them over RTSP or SRT, and drives FLIR pan-tilt units. Cameras using APIPA (169.254.0.0/16) must first be configured with a usable non-APIPA address using their vendor's tools.
 
 Based on [PocketStream for Android](https://github.com/RustRunner/PocketStream).
 
@@ -11,6 +11,8 @@ The application supports two primary streaming modes:
 **Mode A (RTSP Input):** Compatible with modern cameras including Amcrest, Hikvision, and Dahua models, requiring standard RTSP credential configuration.
 
 **Mode B (UDP Input):** Designed for legacy hardware or cameras that push video directly to the device via UDP protocol.
+
+Choose RTSP or SRT independently under **Output Protocol** for re-streaming. SRT input is not currently supported.
 
 ## Key Features
 
@@ -24,24 +26,32 @@ The application supports two primary streaming modes:
 
 ### Video Streaming & Recording
 - Low-latency RTSP and UDP playback via GStreamer
+- Camera RTSP connections use the verified Ethernet adapter and source address, including when Wi-Fi has an overlapping subnet
 - G.711 camera audio playback with a persistent mute control
 - Screenshot capture to Pictures directory
 - MP4 recording with one-click start/stop
 - Stream health monitoring with user-friendly error messages
 
-### RTSP Re-Streaming Server
+### RTSP / SRT Re-Streaming Server
 - Token-protected RTSP server for sharing the camera feed over the network
-- Bind to local network IP or VPN IP
+- SRT listener with configurable port, latency, Stream ID and optional passphrase encryption, supporting up to 10 callers
+- With VPN set to **None**, the displayed URL prefers an active physical Wi-Fi address, then Ethernet; camera-adopted addresses are excluded
+- Selecting a VPN explicitly binds the server to that adapter's address
 - QR code generation for easy client connection
 - Bandwidth and uptime monitoring
 
 ### Network Management
 - Static IP assignment and secondary IP management on Ethernet interfaces
+- Address removal and DHCP changes wait for the native confirmation dialog
 - Auto-detection of interface status changes (zero network overhead)
+- Host link status refreshes when Windows reports the change; Ethernet hardware negotiation can still take several seconds
+- PC/device IP conflicts identify the owning adapter and explain how to restore browser access
 - VPN interface enumeration for secure remote streaming
 - Automatic Windows Firewall rule management for the RTSP server
 
 All APIPA Nodes are hidden, including historical entries. Saved APIPA host addresses and stored node history are retained. Removing a Node does not remove a host binding. See [reliability release notes](RELEASE-NOTES.md) for binding lifetime, rollback limitations and pending hardware qualification.
+
+If a camera shares the PC's Wi-Fi IP, turning off the Wi-Fi radio may leave Windows reserving that address. An **IP still reserved by PC** warning identifies this case. To reach the camera's web page, open Network Connections (`Win+R` → `ncpa.cpl`) and fully disable the named adapter. Give the camera an unused IP, then re-enable the adapter. PocketStream refreshes the warning automatically and checks the current address ownership and Ethernet route when opening a device page.
 
 ### PTZ Camera Control
 - FLIR PTU control via directional D-pad with hold-to-move
@@ -83,13 +93,24 @@ npx tauri build
 
 The installer will be generated in `src-tauri/target/release/bundle/nsis/`.
 
+### Tests
+
+```bash
+npm test
+npm run typecheck
+```
+
+`npm test` runs every frontend regression test in `tests/`. CI and release checks run the same command.
+
+With the frontend built and the GStreamer SDK's `bin` directory on `PATH`, run `cargo test --lib --locked` from `src-tauri/`. Windows development and test executables embed their Common Controls manifest during linking; no manual executable patch is needed. Leave `POCKETSTREAM_RELEASE` unset for development and tests. Release packaging sets it to `1` to request administrator access.
+
 ## Architecture
 
 | Layer | Technology | Role |
 |-------|-----------|------|
 | Frontend | HTML + TypeScript (vanilla) | UI, settings, device list |
 | Backend | Rust + Tauri 2 | Streaming, network ops, camera control |
-| Video | GStreamer | RTSP/UDP playback, recording, re-streaming |
+| Video | GStreamer | RTSP/UDP playback, recording, RTSP/SRT re-streaming |
 | Network | PacketMonitor API + pnet | ARP discovery, interface management |
 | Crypto | AES-256-GCM | Credential encryption at rest |
 
