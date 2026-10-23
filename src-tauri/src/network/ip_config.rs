@@ -15,6 +15,8 @@ pub(crate) async fn assign_static_ip(
     gateway: Option<&str>,
     expected: &super::interface::NativeIdentity,
 ) -> Result<(), AppError> {
+    #[cfg(not(windows))]
+    let _ = expected;
     super::interface::validate_interface_name(interface).await?;
     validate_ip(ip)?;
     validate_ip(subnet_mask)?;
@@ -510,7 +512,7 @@ pub(super) async fn add_native_address(
     #[cfg(not(windows))]
     {
         let _ = prefix;
-        return Err(AppError::Network("Native writes require Windows".into()));
+        Err(AppError::Network("Native writes require Windows".into()))
     }
     #[cfg(windows)]
     {

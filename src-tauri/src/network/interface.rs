@@ -13,6 +13,7 @@ static ADAPTER_QUERY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_ne
 const ADAPTER_QUERY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 const SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 pub(crate) static NATIVE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(windows)]
 pub(crate) static PROVIDER_CALLS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -68,6 +69,7 @@ impl AdapterSnapshot {
             .map(|v| v.adapters.clone())
     }
 
+    #[cfg(any(windows, test))]
     fn invalidate(&self) {
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -757,6 +759,7 @@ pub(crate) async fn read_native_with(io: &dyn AddressIo) -> Result<Vec<NativeAda
         .await
         .map_err(|_| AppError::Network("Native adapter observation timed out after 2s".into()))?
 }
+#[cfg(windows)]
 pub(crate) async fn read_native() -> Result<Vec<NativeAdapter>, AppError> {
     read_native_with(&RealAddressIo).await
 }
@@ -931,10 +934,12 @@ pub(crate) fn native_conflicts(
         .collect()
 }
 
+#[cfg(windows)]
 pub(crate) async fn notification_topology_changed() -> Result<bool, AppError> {
     let all = read_native().await?;
     Ok(observe_topology(&ADAPTER_SNAPSHOT, &all))
 }
+#[cfg(any(windows, test))]
 fn observe_topology(cache: &AdapterSnapshot, all: &[NativeAdapter]) -> bool {
     let next = topology(all);
     let mut current = cache.topology.lock().unwrap_or_else(|p| p.into_inner());
@@ -1132,6 +1137,7 @@ fn local_adapters_iphelper_with(
     Ok(adapters)
 }
 
+#[cfg(windows)]
 pub(crate) async fn native_dhcp_state(alias: &str) -> Result<bool, AppError> {
     Ok(native_by_alias(&read_native().await?, alias)?.dhcp)
 }
