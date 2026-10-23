@@ -39,6 +39,24 @@ pub(crate) fn emit_selection(handle: &AppHandle, selection: &AdapterSelection) {
     let _ = handle.emit("interface-status-changed", selected_status(selection));
 }
 
+/// The existing 250ms native observer can see a cable before Windows sends an
+/// IP-interface notification. Wake this same worker instead of leaving capture
+/// activation/reconciliation waiting for the five-second retry timer.
+pub(crate) fn emit_link_change(handle: &AppHandle, selection: &AdapterSelection) {
+    log::info!(
+        "event=ethernet_link adapter_mac={} interface_index={} link_up={}",
+        super::log_value(selection.selected_mac.as_deref().unwrap_or("unknown")),
+        selection.interface_index.unwrap_or(0),
+        selection
+            .adapter
+            .as_ref()
+            .is_some_and(|adapter| adapter.is_up)
+    );
+    emit_selection(handle, selection);
+    #[cfg(target_os = "windows")]
+    imp::wake(2);
+}
+
 /// Shared by native notifications, the fallback poller and the UI query.
 pub(crate) async fn refresh(handle: &AppHandle) -> Result<(), crate::AppError> {
     let manager = handle.state::<NetworkManager>();
@@ -149,7 +167,7 @@ mod imp {
     // One queued wake plus a bounded dirty bitset; notifications during an
     // outstanding refresh remain armed for its trailing pass.
     static DIRTY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-    fn wake(kind: u8) {
+    pub(super) fn wake(kind: u8) {
         if DIRTY.fetch_or(kind, Ordering::AcqRel) != 0 {
             return;
         }
@@ -291,6 +309,73 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn observed_link_wakes_worker_before_retry_and_coalesces_notifications() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = calls.clone();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(watch_changes(rx, move |changed| {
+            observed.lock().unwrap().push(changed);
+            async {}
+        }));
+        tokio::task::yield_now().await;
+        // Link observed on the first native tick; accompanying Windows
+        // notifications join it instead of starting duplicate discovery work.
+        tokio::time::advance(Duration::from_millis(250)).await;
+        for _ in 0..4 {
+            tx.send(()).unwrap();
+        }
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(299)).await;
+        tokio::task::yield_now().await;
+        assert!(calls.lock().unwrap().is_empty());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(*calls.lock().unwrap(), vec![true]);
+        drop(tx);
+        task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn link_change_during_slow_refresh_gets_a_trailing_pass() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        let calls = Arc::new(Mutex::new(0));
+        let observed = calls.clone();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let gate = release.clone();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(watch_changes(rx, move |changed| {
+            assert!(changed);
+            let first = {
+                let mut count = observed.lock().unwrap();
+                *count += 1;
+                *count == 1
+            };
+            let gate = gate.clone();
+            async move {
+                if first {
+                    gate.notified().await;
+                }
+            }
+        }));
+        tx.send(()).unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(300)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(*calls.lock().unwrap(), 1);
+        tx.send(()).unwrap();
+        release.notify_one();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(300)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(*calls.lock().unwrap(), 2);
+        drop(tx);
+        task.await.unwrap();
+    }
 
     #[tokio::test(start_paused = true)]
     async fn pending_discovery_retries_provider_and_attach_failures_without_events() {

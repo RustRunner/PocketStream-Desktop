@@ -2727,7 +2727,7 @@ impl NetworkManager {
                     break;
                 }
                 if let Some(selection) = control.observe_link(interface::quick_link_by_mac) {
-                    watcher::emit_selection(&app, &selection);
+                    watcher::emit_link_change(&app, &selection);
                 }
                 if control.tick(&registry) {
                     emitter.poke();
@@ -2742,7 +2742,7 @@ impl NetworkManager {
                             biased;
                             _ = tick.tick() => {
                                 if let Some(selection) = control.observe_link(interface::quick_link_by_mac) {
-                                    watcher::emit_selection(&app, &selection);
+                                    watcher::emit_link_change(&app, &selection);
                                 }
                                 if control.tick(&registry) { emitter.poke(); }
                             }

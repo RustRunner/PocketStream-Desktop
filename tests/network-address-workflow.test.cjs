@@ -10,7 +10,7 @@ const flush = async () => { for(let i=0;i<40;i++) await Promise.resolve(); };
 const deferred = () => { let resolve,reject; const promise=new Promise((a,b)=>{resolve=a;reject=b;});return {promise,resolve,reject}; };
 const IP='192.0.2.20', SUBNET='192.0.2.0/24', MAC='40:cd:3a:00:00:01';
 function fixture({initialSelection=true}={}) {
-  const events=new Map(), elements=new Map(), calls={selection:0,bindings:0,mode:0,dhcp:0,writes:0,discoveryStops:0,discoveryStarts:0}, feedback=[], removals=[], transitions=[], additions=[];
+  const events=new Map(), elements=new Map(), calls={selection:0,bindings:0,mode:0,dhcp:0,writes:0,discoveryStops:0,discoveryStarts:0,reconnects:0,disconnects:0}, feedback=[], removals=[], transitions=[], additions=[];
   let now=0, throwRender=false;const timers=[];
   const iface={name:'Ethernet', display_name:'Ethernet', mac:MAC, is_up:true, is_ethernet:true, is_vpn:false,is_virtual:false,
     ips:[{address:'192.0.2.10',prefix:24,subnet:SUBNET},{address:IP,prefix:24,subnet:SUBNET}]};
@@ -58,7 +58,7 @@ function fixture({initialSelection=true}={}) {
     './state.ts':{$,$$:()=>[],state,adoptionMeta,adoptedSubnets,showToast:(msg,error)=>feedback.push({msg,error}),log(){},
       escapeHtml:s=>String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('"','&quot;')},
     './devices.js':{renderArpDeviceList(){},resetDiscoveryStatus(){calls.discoveryStarts++;},hideDiscoveryStatus(){calls.discoveryStops++;}},
-    './streaming.js':{handleHardDisconnect(){},handleReconnect:async()=>{},showModalWithVideo:async d=>{d.open=true;}},
+    './streaming.js':{handleHardDisconnect(){calls.disconnects++;},handleReconnect:async()=>{calls.reconnects++;},showModalWithVideo:async d=>{d.open=true;}},
     './store.ts':{},'./errors.ts':{formatError:String},'./device-list.ts':{},
   };
   const exports={};
@@ -514,6 +514,56 @@ test('A disconnected adapter and both Host IP rows survive repeated refresh fail
     for(const ip of f.iface.ips)assert(f.$('#subnet-list').innerHTML.includes(ip.address));
   }
   assert.equal(f.state.config.network_mode,'static_auto');
+});
+
+for(const ips of [[],[{address:'169.254.1.20',prefix:16,subnet:'169.254.0.0/16'}]])
+test(`Cable-up paints immediately while waiting for ${ips.length?'an address beyond APIPA':'IPv4'}, without resuming video`,async()=>{
+  const f=fixture(), read=deferred();
+  const down={...f.selection,adapter:{...f.iface,is_up:false,ips}};
+  f.exports.renderSelectionForTest(down);
+  f.api.getAdapterSelection=()=>read.promise;
+  const up={...down.adapter,is_up:true};
+  f.events.get('interface-status-changed')(up);
+  assert.equal(f.$('#iface-name').textContent,'Ethernet (Connected; waiting for IP)');
+  assert.equal(f.exports.isInterfaceConnected(),false);
+  assert.equal(f.calls.reconnects,0);
+  await flush();
+  f.runTimers(2000);
+  assert.equal(f.$('#iface-name').textContent,'Ethernet (Connected; waiting for IP)');
+  assert.equal(f.exports.isInterfaceConnected(),false);
+  read.resolve({...down,adapter:up});await flush();
+  assert.equal(f.calls.reconnects,0);
+  f.api.getAdapterSelection=async()=>f.selection;
+  f.events.get('interface-status-changed')(f.iface);
+  assert.equal(f.$('#iface-name').textContent,'Ethernet');
+  assert.equal(f.exports.isInterfaceConnected(),true);
+  assert.equal(f.calls.reconnects,1);
+  await flush();
+});
+
+test('Cable-up paints while a verified address view waits for a fresh read without resurrecting a removed IP',async()=>{
+  const f=fixture();const remove=f.modalRemove();await flush();
+  const reply=f.reply();reply.view.selection.adapter.is_up=false;
+  f.pending[0].resolve(reply);await remove;
+  const read=deferred();f.api.getAdapterSelection=()=>read.promise;
+  f.events.get('interface-status-changed')({...f.iface,is_up:true});
+  assert.equal(f.$('#iface-name').textContent,'Ethernet');
+  assert(!f.state.activeInterface.ips.some(ip=>ip.address===IP));
+  assert.equal(f.calls.reconnects,0);
+  await flush();
+  read.resolve({...reply.view.selection,adapter:{...reply.view.selection.adapter,is_up:true}});await flush();
+  assert(!f.state.activeInterface.ips.some(ip=>ip.address===IP));
+});
+
+test('A short link-down bounce still avoids teardown and delayed Disconnected painting',async()=>{
+  const f=fixture(),read=deferred();f.exports.renderSelectionForTest(f.selection);
+  f.api.getAdapterSelection=()=>read.promise;
+  f.events.get('interface-status-changed')({...f.iface,is_up:false});await flush();
+  assert.equal(f.$('#iface-name').textContent,'Ethernet');
+  f.events.get('interface-status-changed')({...f.iface});
+  read.resolve(f.selection);await flush();f.runTimers(2000);
+  assert.equal(f.$('#iface-name').textContent,'Ethernet');
+  assert.equal(f.calls.disconnects,0);
 });
 
 test('Cold startup stays neutral during a delayed failed read and then paints the real adapter',async()=>{

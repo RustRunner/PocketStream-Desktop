@@ -81,6 +81,7 @@ function applySelection(selection: AdapterSelection): void {
   rememberAdapterSelection(selection);
   dialogInterfaces = (selection.candidates ?? []).filter(isWiredCandidate);
   const eth = selection.interface_index !== null ? selection.adapter : null;
+  if (eth && !isDownEvent(eth)) cancelPendingDown();
   state.activeInterface = eth;
   if (!eth?.is_up) sessionAdoptedSubnets.clear();
   renderInterfaceName();
@@ -88,10 +89,10 @@ function applySelection(selection: AdapterSelection): void {
   else warnNoEthernet();
 }
 
-function renderInterfaceName(): void {
-  const eth = state.activeInterface;
+function renderInterfaceName(eth = state.activeInterface): void {
   $("#iface-name").textContent = eth
-    ? (eth.display_name || eth.name) + (isDownEvent(eth) ? " (Disconnected)" : "")
+    ? (eth.display_name || eth.name) + (!eth.is_up ? " (Disconnected)"
+      : isDownEvent(eth) ? " (Connected; waiting for IP)" : "")
     : unavailableAdapterLabel();
 }
 
@@ -242,6 +243,14 @@ const STABLE_DOWN_MS = 2000;
 let pendingDownTimer: ReturnType<typeof setTimeout> | null = null;
 let pendingDownIface: InterfaceInfo | null = null;
 
+function cancelPendingDown(): void {
+  if (!pendingDownTimer) return;
+  log("Network: down event suppressed (recovered within debounce window)");
+  clearTimeout(pendingDownTimer);
+  pendingDownTimer = null;
+  pendingDownIface = null;
+}
+
 function isDownEvent(iface: InterfaceInfo): boolean {
   if (!iface.name) return true; // sentinel: no adapter at all
   if (!iface.is_up) return true;
@@ -264,8 +273,17 @@ export function setupInterfaceWatcher(onReconnect: () => void = () => {}): void 
     if (addressBusy) { refreshTrailing = true; return; }
     // A query can cause an unchanged status event. Fetching again for that
     // event feeds the same query back into itself, especially with link down.
-    if (JSON.stringify(iface) === JSON.stringify(state.activeInterface)) return;
+    if (JSON.stringify(iface) === JSON.stringify(state.activeInterface)) {
+      // During the down debounce we retain the last up snapshot. A matching
+      // up event is recovery, not a duplicate that can leave teardown armed.
+      if (!isDownEvent(iface)) cancelPendingDown();
+      return;
+    }
     ++interfaceRefresh;
+    // A cable-up observation can precede DHCP/address reconciliation. Paint
+    // the link immediately without replacing verified IPs or resuming video.
+    // Link-down still follows the existing bounce/teardown debounce below.
+    if (iface.name && iface.is_up) renderInterfaceName(iface);
     // A queued callback describes an earlier observation. After a reply, use
     // a fresh shared read rather than repainting its payload over verified IPs.
     if (verifiedAddressView) { refreshNetworkEvent(); return; }
@@ -301,12 +319,7 @@ export function setupInterfaceWatcher(onReconnect: () => void = () => {}): void 
     // case, not as a reconnect — wasDown will already be false
     // because state.activeInterface still reflects the prior up
     // state (we never updated it during the suppressed window).
-    if (pendingDownTimer) {
-      log("Network: down event suppressed (recovered within debounce window)");
-      clearTimeout(pendingDownTimer);
-      pendingDownTimer = null;
-      pendingDownIface = null;
-    }
+    cancelPendingDown();
 
     applyUpEvent(iface, wasDown);
   });
@@ -370,11 +383,10 @@ function applyDownEvent(iface: InterfaceInfo): void {
     return;
   }
 
-  // Adapter present but down or APIPA-only.
+  // Physical link and usable IPv4 readiness are separate states.
   state.activeInterface = iface;
-  handleHardDisconnect("Ethernet disconnected");
-  $("#iface-name").textContent =
-    (iface.display_name || iface.name) + " (Disconnected)";
+  handleHardDisconnect(iface.is_up ? "Ethernet connected; waiting for IP" : "Ethernet disconnected");
+  renderInterfaceName();
   // Render retained history even without a usable host address.
   // The backend owns verification, expiry and inactive reasons.
   renderArpDeviceList();
