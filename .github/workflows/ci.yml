@@ -27,6 +27,8 @@ jobs:
       # typecheck is the cheapest drift net against the Rust side. Run
       # before the build so a contract break fails fast.
       - run: npm run typecheck
+      - name: Frontend regression tests
+        run: npm test
       - run: npm run build
 
   rust:
