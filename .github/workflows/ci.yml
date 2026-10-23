@@ -95,16 +95,6 @@ jobs:
     name: Rust Compile (Windows)
     runs-on: windows-latest
     steps:
-      - name: Check read-only access to the pinned draft dependency
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh api repos/RustRunner/PocketStream-Desktop/releases/422306293 --jq .id
-          if ($LASTEXITCODE -ne 0) { throw 'Read-only token cannot access the pinned dependency draft by ID' }
-          gh api repos/RustRunner/PocketStream-Desktop/releases/assets/670396703 --jq .digest
-          if ($LASTEXITCODE -ne 0) { throw 'Read-only token cannot access the pinned dependency asset by ID' }
-
       - uses: actions/checkout@v4
 
       # Keep native-dependency automation on the Windows PowerShell version

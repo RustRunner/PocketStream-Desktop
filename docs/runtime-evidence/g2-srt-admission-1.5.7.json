@@ -1,0 +1,108 @@
+{
+    "schema_version":  1,
+    "gate":  "G2",
+    "result":  "pass",
+    "g2_complete":  true,
+    "generated_at_utc":  "2026-10-23T21:18:47.2724774Z",
+    "dependency_boundary":  {
+                                "prerequisite_gate":  "G1-R",
+                                "g1_evidence_sha256":  "92d5ca8c7680be29bfa5853efc30f8f73dcc2ebb1d3781df68e577e2dfd095e2",
+                                "release_tag":  "deps-libsrt-1.5.7-gstreamer-1.26.11-1",
+                                "archive_sha256":  "c6b364a4b1205b5aafb5a64644941d4ca811f9dae6ad459b4240550d44a29948",
+                                "libsrt_sha256":  "8d58764b2d53df76b7e9b69e55cd3250d3bb0c14631224c0f16962c5317a5600",
+                                "srt_getversion_hex":  "0x010507",
+                                "staged_closure_files":  7
+                            },
+    "harness":  {
+                    "script_sha256":  "c5a28b296919a3562340fe2637ac390c0df8caa80ff3861e12b10c41eeb8a793",
+                    "rust_source_sha256":  "f6c50802234faf5e0a79ac741a9da7598189a1a282f6496da05533037854196d",
+                    "executable_sha256":  "6a3c9f6558ce36c704790fb7551102871e4a7406828ebce3f5e87c6f9f36bd22",
+                    "built_from_source_in_this_run":  false,
+                    "compile_sdk":  "prebuilt harness supplied",
+                    "manifest_sha256":  "3be8a982ff04a2cbe67119d82c9a01c673b340f5ea3ec86fe7fbca160c47a1ae",
+                    "cargo_lock_sha256":  "21935f69e57d24a299bb96b0ca2c7f20b3ddb5dd985e88a9f33fd69b75e477ac",
+                    "powershell_version":  "5.1.26100.9444",
+                    "rustc_version":  "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+                    "cargo_version":  "cargo 1.97.1 (c980f4866 2026-06-30)"
+                },
+    "isolated_runtime":  {
+                             "gstreamer_version":  "GStreamer 1.26.11",
+                             "srt_plugin_version":  "1.26.11",
+                             "srt_plugin_path":  "lib/gstreamer-1.0/gstsrt.dll",
+                             "srt_getversion_hex":  "0x010507",
+                             "isolated_plugin_negative_control":  "opusdec absent",
+                             "required_elements":  [
+                                                       "fakesrc",
+                                                       "queue",
+                                                       "fakesink",
+                                                       "srtsink",
+                                                       "srtsrc"
+                                                   ]
+                         },
+    "admission_contract":  {
+                               "authentication_required_for_connecting_callback":  true,
+                               "callback_false_is_pre_accept_rejection":  true,
+                               "canonical_remote_identity":  "IP address plus UDP port",
+                               "caller_added_integer_argument":  "unused and always zero",
+                               "pending_ttl_seconds":  10,
+                               "pending_plus_active_limit":  10,
+                               "password_verification_owner":  "libsrt after application callback",
+                               "post_accept_cap_fallback":  false
+                           },
+    "scenarios":  {
+                      "authentication_gate":  {
+                                                  "unauthenticated_successful_callers":  1,
+                                                  "caller_connecting_count":  0,
+                                                  "caller_added_count":  1,
+                                                  "caller_removed_count":  1,
+                                                  "callback_requires_authentication":  true
+                                              },
+                      "application_rejection":  {
+                                                    "connecting_decision":  "false",
+                                                    "caller_rejected_signals":  1,
+                                                    "caller_added_signals":  0,
+                                                    "client_failed":  true,
+                                                    "false_return_prevented_add":  true
+                                                },
+                      "successful_lifecycle":  {
+                                                   "ordering":  [
+                                                                    "caller-connecting",
+                                                                    "caller-added",
+                                                                    "caller-removed"
+                                                                ],
+                                                   "caller_added_unused_values":  [
+                                                                                      0
+                                                                                  ],
+                                                   "caller_removed_unused_values":  [
+                                                                                        0
+                                                                                    ],
+                                                   "canonical_key_format":  "IP-plus-UDP-port",
+                                                   "canonical_key_equal_across_signals":  true,
+                                                   "stream_id_utf8_bytes":  36,
+                                                   "stream_id_delivered_byte_for_byte":  true,
+                                                   "active_after_removal":  0
+                                               },
+                      "password_failures_and_pending_ttl":  {
+                                                                "wrong_passphrase_client_failed":  true,
+                                                                "missing_passphrase_client_failed":  true,
+                                                                "application_rejections_for_library_failures":  0,
+                                                                "caller_rejected_signals_for_library_failures":  0,
+                                                                "active_during_library_failures":  0,
+                                                                "pending_before_expiry":  3,
+                                                                "repeated_same_key_refreshes":  1,
+                                                                "expired_on_next_admission":  3,
+                                                                "correct_passphrase_active_after_expiry":  1,
+                                                                "active_after_removal":  0
+                                                            },
+                      "strict_capacity":  {
+                                              "simultaneous_attempts":  11,
+                                              "admitted_before_cap":  10,
+                                              "eleventh_application_rejected":  true,
+                                              "eleventh_caller_rejected_signal":  true,
+                                              "maximum_pending_plus_active":  10,
+                                              "active_at_cap":  10,
+                                              "slot_reused_after_removal":  true,
+                                              "active_after_teardown":  0
+                                          }
+                  }
+}
