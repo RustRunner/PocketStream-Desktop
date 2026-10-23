@@ -45,6 +45,8 @@ pub struct StreamConfig {
     pub udp_port: u16,
     /// Camera IP address (discovered or manual)
     pub camera_ip: String,
+    #[serde(default)]
+    pub camera_mac: Option<String>,
     /// Whether audio playback is muted. `false` by default — audio
     /// plays when a stream carries a supported track. `serde(default)`
     /// migrates config files that predate the field.
@@ -169,6 +171,8 @@ pub enum NetworkMode {
 /// toggles so users can flip Auto → Manual → Auto without losing pins.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ManualNode {
+    #[serde(default)]
+    pub expected_mac: Option<String>,
     pub ip: String,
     #[serde(default)]
     pub alias: String,
@@ -182,6 +186,10 @@ pub struct ManualNode {
 /// targeted port scan confirms they are still reachable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedDevice {
+    #[serde(default)]
+    pub verified_by_mac: Option<String>,
+    #[serde(default)]
+    pub last_verified_at: Option<String>,
     pub mac: String,
     pub ip: String,
     pub subnet: String,
@@ -196,10 +204,8 @@ pub struct CachedDevice {
 /// Lifecycle metadata for one adopted subnet. Persisted as a map
 /// parallel to `adopted_subnets` (never a value-type change to that
 /// map, so configs written by older builds keep loading untouched).
-/// Display and history data only: nothing here is trusted for removal
-/// decisions — the APIPA boundary is re-derived from the subnet key on
-/// every decision so a stored flag can't drift from the subnet it
-/// describes, and wall time is never used to remove anything.
+/// Saved intent and the last observed OS state. Wall-clock liveness is
+/// informational; committed bindings are removed only by explicit user intent.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AdoptedMeta {
     /// RFC3339 wall time the subnet was adopted. For adoptions
@@ -212,30 +218,68 @@ pub struct AdoptedMeta {
     /// `None` until evidence arrives.
     #[serde(default)]
     pub last_device_seen: Option<String>,
+    #[serde(default)]
+    pub adapter_mac: Option<String>,
+    #[serde(default)]
+    pub prefix: Option<u8>,
+    #[serde(default)]
+    pub address: Option<String>,
+    #[serde(default)]
+    pub desired: BindingDesired,
+    #[serde(default)]
+    pub applied: bool,
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
-/// Align lifecycle metadata with the adopted map being persisted:
-/// drop metadata for subnets no longer present, backfill metadata for
-/// subnets that lack any (legacy configs, writers that recorded none)
-/// using `now_rfc3339` as the adoption time. Keeps the invariant that
-/// the two maps always describe the same subnets, whatever the caller
-/// passed.
+impl AdoptedMeta {
+    /// Removal is a transaction, not a permanent subnet exclusion. Only an
+    /// observed, successfully saved absence permits a fresh adoption attempt.
+    pub(crate) fn removal_complete(&self) -> bool {
+        self.desired == BindingDesired::Removed && !self.applied && self.last_error.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingDesired {
+    #[default]
+    Present,
+    Removed,
+}
+
+/// Exact write-ahead ownership of an uncommitted OS address. Backend-owned;
+/// cleared atomically when a binding commits or the user claims the address.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PendingAddress {
+    pub adapter_mac: String,
+    pub address: String,
+    pub prefix: u8,
+}
+
+/// Backfill legacy metadata without discarding detached removal intent.
 pub fn align_adopted_meta(
     adopted: &HashMap<String, String>,
     meta: &mut HashMap<String, AdoptedMeta>,
     now_rfc3339: &str,
 ) {
-    meta.retain(|subnet, _| adopted.contains_key(subnet));
-    for subnet in adopted.keys() {
-        meta.entry(subnet.clone()).or_insert_with(|| AdoptedMeta {
+    meta.retain(|subnet, row| {
+        adopted.contains_key(subnet) || row.desired == BindingDesired::Removed
+    });
+    for (subnet, address) in adopted {
+        let row = meta.entry(subnet.clone()).or_insert_with(|| AdoptedMeta {
             adopted_at: Some(now_rfc3339.to_string()),
-            last_device_seen: None,
+            ..Default::default()
         });
+        row.address.get_or_insert_with(|| address.clone());
+        if row.prefix.is_none() {
+            row.prefix = subnet.rsplit_once('/').and_then(|(_, p)| p.parse().ok());
+        }
     }
 }
 
-/// Remove exactly one subnet — and its metadata row — from an adoption
-/// map pair, leaving every other entry and its metadata untouched.
+/// Retire exactly one route, retaining its exact address and removal intent.
 /// Returns whether the subnet entry existed. Pure so the surgical
 /// contract is unit-testable.
 fn remove_adoption_entry(
@@ -243,12 +287,27 @@ fn remove_adoption_entry(
     meta: &mut HashMap<String, AdoptedMeta>,
     subnet: &str,
 ) -> bool {
-    meta.remove(subnet);
-    adopted.remove(subnet).is_some()
+    let address = adopted.remove(subnet);
+    if address.is_none() && !meta.contains_key(subnet) {
+        return false;
+    }
+    let row = meta.entry(subnet.to_string()).or_default();
+    if row.address.is_none() {
+        row.address = address;
+    }
+    if row.prefix.is_none() {
+        row.prefix = subnet.rsplit_once('/').and_then(|(_, p)| p.parse().ok());
+    }
+    row.desired = BindingDesired::Removed;
+    true
 }
 
 #[derive(Clone)]
 pub struct AppSettings {
+    pub selected_adapter_mac: Option<String>,
+    /// Explicit primary IPv4 CIDR per adapter MAC. Empty means the user removed
+    /// the primary; an absent entry is legacy/unknown, never enumeration order.
+    pub primary_addresses: HashMap<String, String>,
     pub stream: StreamConfig,
     /// Persisted output selector. Missing values in pre-neutralization config
     /// files migrate to RTSP.
@@ -262,6 +321,7 @@ pub struct AppSettings {
     /// `adopted_subnets`. See `AdoptedMeta` for what is (and is
     /// deliberately not) stored.
     pub adopted_meta: HashMap<String, AdoptedMeta>,
+    pub pending_addresses: Vec<PendingAddress>,
     /// Last zoom slider position (0–100 %) per camera IP.
     /// Restored on launch so the slider doesn't reset to Wide when the
     /// camera is still pointed at the last-set zoom. Stored as percent
@@ -279,7 +339,10 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            selected_adapter_mac: None,
+            primary_addresses: HashMap::new(),
             stream: StreamConfig {
+                camera_mac: None,
                 protocol: StreamProtocol::Rtsp,
                 rtsp_port: 554,
                 rtsp_path: "/z3-1.sdp".into(),
@@ -301,6 +364,7 @@ impl Default for AppSettings {
             },
             adopted_subnets: HashMap::new(),
             adopted_meta: HashMap::new(),
+            pending_addresses: Vec::new(),
             zoom_positions: HashMap::new(),
             network_mode: NetworkMode::default(),
             manual_nodes: Vec::new(),
@@ -369,6 +433,8 @@ impl From<&SrtServerConfig> for SrtServerView {
 /// for the existing masked/copy settings interaction.
 #[derive(Clone, Serialize)]
 pub struct AppSettingsView {
+    pub selected_adapter_mac: Option<String>,
+    pub primary_addresses: HashMap<String, String>,
     pub stream: StreamConfig,
     pub restream_protocol: RestreamProtocol,
     pub rtsp_server: RtspServerConfig,
@@ -384,6 +450,8 @@ pub struct AppSettingsView {
 impl From<&AppSettings> for AppSettingsView {
     fn from(settings: &AppSettings) -> Self {
         Self {
+            selected_adapter_mac: settings.selected_adapter_mac.clone(),
+            primary_addresses: settings.primary_addresses.clone(),
             stream: settings.stream.clone(),
             restream_protocol: settings.restream_protocol,
             rtsp_server: settings.rtsp_server.clone(),
@@ -434,6 +502,12 @@ impl Default for PersistedSrtServerConfig {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct PersistedAppSettings {
+    #[serde(default)]
+    selected_adapter_mac: Option<String>,
+    #[serde(default)]
+    primary_addresses: HashMap<String, String>,
+    #[serde(default)]
+    pending_addresses: Vec<PendingAddress>,
     stream: StreamConfig,
     #[serde(default)]
     restream_protocol: RestreamProtocol,
@@ -480,6 +554,9 @@ fn runtime_settings_from_persisted(
     key: Option<&[u8]>,
 ) -> Result<AppSettings, crate::AppError> {
     let PersistedAppSettings {
+        selected_adapter_mac,
+        primary_addresses,
+        pending_addresses,
         stream,
         restream_protocol,
         rtsp_server,
@@ -513,6 +590,9 @@ fn runtime_settings_from_persisted(
     )?;
 
     crate::settings_validation::validate_prospective_settings(AppSettings {
+        selected_adapter_mac,
+        primary_addresses,
+        pending_addresses,
         stream,
         restream_protocol,
         rtsp_server,
@@ -561,6 +641,9 @@ where
     };
 
     Ok(PersistedAppSettings {
+        selected_adapter_mac: settings.selected_adapter_mac,
+        primary_addresses: settings.primary_addresses,
+        pending_addresses: settings.pending_addresses,
         stream: settings.stream,
         restream_protocol: settings.restream_protocol,
         rtsp_server: PersistedRtspServerConfig {
@@ -651,6 +734,71 @@ fn update_cached_alias_in_place(cache: &mut [CachedDevice], mac: &str, alias: &s
 }
 
 impl AppConfig {
+    #[cfg(test)]
+    pub(crate) fn temporary_test_config(settings: AppSettings) -> Self {
+        Self {
+            settings: Mutex::new(settings),
+            cache: Mutex::new(vec![]),
+            startup_notices: Mutex::new(vec![]),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_temporary_test_binding(
+        &self,
+        subnet: &str,
+        row: AdoptedMeta,
+    ) -> Result<(), crate::AppError> {
+        self.set_binding_with(subnet, row, |_| Ok(()))
+    }
+
+    pub(crate) fn reserve_temporary_with(
+        &self,
+        row: PendingAddress,
+        persist: impl FnOnce(&AppSettings) -> Result<(), crate::AppError>,
+    ) -> Result<(), crate::AppError> {
+        self.change_settings_with(
+            |s| {
+                let owner = crate::network::device_registry::canonical_mac(&row.adapter_mac);
+                if owner.is_none()
+                    || owner
+                        != s.selected_adapter_mac
+                            .as_deref()
+                            .and_then(crate::network::device_registry::canonical_mac)
+                    || s.network_mode != NetworkMode::StaticAuto
+                    || row.prefix != 24
+                    || crate::validation::parse_camera_ip(&row.address).is_err()
+                    || s.adopted_meta
+                        .values()
+                        .any(|m| m.address.as_ref() == Some(&row.address))
+                    || s.pending_addresses
+                        .iter()
+                        .any(|p| p.adapter_mac == row.adapter_mac && p.address == row.address)
+                {
+                    return Err(crate::AppError::Network(
+                        "Temporary address ownership unavailable or already reserved".into(),
+                    ));
+                }
+                s.pending_addresses.push(row);
+                Ok(())
+            },
+            persist,
+        )
+    }
+
+    pub(crate) fn forget_temporary_with(
+        &self,
+        row: &PendingAddress,
+        persist: impl FnOnce(&AppSettings) -> Result<(), crate::AppError>,
+    ) -> Result<(), crate::AppError> {
+        self.change_settings_with(
+            |s| {
+                s.pending_addresses.retain(|p| p != row);
+                Ok(())
+            },
+            persist,
+        )
+    }
     pub fn load_or_default() -> Self {
         let mut notices = Vec::new();
         let mut settings = load_from_disk(&mut notices).unwrap_or_default();
@@ -748,17 +896,22 @@ impl AppConfig {
 
     /// Replace just the stream config and persist.
     pub fn update_stream(&self, stream: StreamConfig) -> Result<(), crate::AppError> {
-        let mut prospective = self.get();
-        prospective.stream = stream.clone();
-        crate::settings_validation::validate_prospective_settings(prospective)?;
-        match self.settings.lock() {
-            Ok(mut guard) => guard.stream = stream,
-            Err(poisoned) => {
-                log::error!("Config mutex poisoned during update_stream, recovering");
-                poisoned.into_inner().stream = stream;
-            }
-        }
-        self.save()
+        self.update_stream_with(stream, save_to_disk)
+    }
+
+    fn update_stream_with(
+        &self,
+        stream: StreamConfig,
+        persist: impl FnOnce(&AppSettings) -> Result<(), crate::AppError>,
+    ) -> Result<(), crate::AppError> {
+        self.change_settings_with(
+            |settings| {
+                settings.stream = stream;
+                crate::settings_validation::validate_prospective_settings(settings.clone())?;
+                Ok(())
+            },
+            persist,
+        )
     }
 
     /// Atomically persist the shared Enable field and both protocol sections,
@@ -839,60 +992,206 @@ impl AppConfig {
         Ok(prospective)
     }
 
-    /// Replace the adopted-subnets map together with its lifecycle
-    /// metadata — one locked update, one save — so a crash can never
-    /// persist half a lifecycle transition. Field-scoped so the
-    /// background adopt/prune tasks can't revert a concurrent user save
-    /// of unrelated sections — a whole-struct get→mutate→update cycle
-    /// would race user settings saves in both directions (user edit
-    /// reverted, or a still-bound adopted subnet dropped). The two maps
-    /// are aligned before the write (stray metadata dropped, missing
-    /// metadata backfilled), so the persisted pair always describes the
-    /// same subnets regardless of caller bookkeeping.
-    pub fn update_adoption_state(
+    /// Liveness writes cannot change ownership, desired state, or saved addresses.
+    pub fn update_adoption_liveness(
         &self,
-        adopted: HashMap<String, String>,
-        mut meta: HashMap<String, AdoptedMeta>,
+        meta: HashMap<String, AdoptedMeta>,
     ) -> Result<(), crate::AppError> {
-        align_adopted_meta(&adopted, &mut meta, &chrono::Utc::now().to_rfc3339());
-        match self.settings.lock() {
-            Ok(mut guard) => {
-                guard.adopted_subnets = adopted;
-                guard.adopted_meta = meta;
-            }
-            Err(poisoned) => {
-                log::error!("Config mutex poisoned during update_adoption_state, recovering");
-                let mut guard = poisoned.into_inner();
-                guard.adopted_subnets = adopted;
-                guard.adopted_meta = meta;
-            }
-        }
-        self.save()
+        self.change_settings_with(
+            |s| {
+                for (subnet, incoming) in meta {
+                    if let Some(row) = s.adopted_meta.get_mut(&subnet) {
+                        if row.desired == BindingDesired::Present && row.address == incoming.address
+                        {
+                            row.last_device_seen = incoming.last_device_seen;
+                        }
+                    }
+                }
+                Ok(())
+            },
+            save_to_disk,
+        )
     }
 
-    /// Field-scoped like [`Self::update_adoption_state`], but surgical:
-    /// removes exactly `subnet` (and its metadata row) from the persisted
-    /// adoption state, preserving every other entry. For callers with no
-    /// live adoption state — rebuilding the persisted map from live
-    /// state would wipe the entries that never restored this session.
-    /// Saves only when the entry existed; returns whether it did.
-    pub fn remove_adopted_subnet_entry(&self, subnet: &str) -> Result<bool, crate::AppError> {
-        let removed = match self.settings.lock() {
-            Ok(mut guard) => {
-                let s = &mut *guard;
-                remove_adoption_entry(&mut s.adopted_subnets, &mut s.adopted_meta, subnet)
-            }
-            Err(poisoned) => {
-                log::error!("Config mutex poisoned during remove_adopted_subnet_entry, recovering");
-                let mut guard = poisoned.into_inner();
-                let s = &mut *guard;
-                remove_adoption_entry(&mut s.adopted_subnets, &mut s.adopted_meta, subnet)
-            }
-        };
-        if removed {
-            self.save()?;
+    /// Persist an observed binding state. Late status/restore writes cannot
+    /// overwrite removal intent. Fresh adoption first retires a completed
+    /// removal after verifying native absence under the address-work lock.
+    pub fn set_binding(&self, subnet: &str, row: AdoptedMeta) -> Result<(), crate::AppError> {
+        self.set_binding_with(subnet, row, save_to_disk)
+    }
+
+    pub fn set_binding_intent(
+        &self,
+        subnet: &str,
+        row: AdoptedMeta,
+    ) -> Result<(), crate::AppError> {
+        self.set_binding_for_operation_with(subnet, row, true, save_to_disk)
+    }
+    fn set_binding_with(
+        &self,
+        subnet: &str,
+        row: AdoptedMeta,
+        persist: impl FnOnce(&AppSettings) -> Result<(), crate::AppError>,
+    ) -> Result<(), crate::AppError> {
+        self.set_binding_for_operation_with(subnet, row, false, persist)
+    }
+
+    pub(crate) fn set_binding_for_operation_with(
+        &self,
+        subnet: &str,
+        row: AdoptedMeta,
+        force_intent: bool,
+        persist: impl FnOnce(&AppSettings) -> Result<(), crate::AppError>,
+    ) -> Result<(), crate::AppError> {
+        self.change_settings_if_with(
+            |s| {
+                let needs_handover = row.desired == BindingDesired::Present
+                    && row.applied
+                    && row.last_error.is_none()
+                    && s.pending_addresses.iter().any(|p| {
+                        Some(&p.adapter_mac) == row.adapter_mac.as_ref()
+                            && Some(&p.address) == row.address.as_ref()
+                            && Some(p.prefix) == row.prefix
+                    });
+                if !force_intent && s.adopted_meta.get(subnet) == Some(&row) && !needs_handover {
+                    return Ok(((), false));
+                }
+                if row.desired == BindingDesired::Present
+                    && s.adopted_meta
+                        .get(subnet)
+                        .is_some_and(|m| m.desired == BindingDesired::Removed)
+                {
+                    return Err(crate::AppError::Network(
+                        "Binding was removed by the user".into(),
+                    ));
+                }
+                if row.desired == BindingDesired::Removed {
+                    remove_adoption_entry(&mut s.adopted_subnets, &mut s.adopted_meta, subnet);
+                } else if let Some(address) = &row.address {
+                    s.adopted_subnets
+                        .entry(subnet.to_string())
+                        .or_insert_with(|| address.clone());
+                }
+                if row.desired == BindingDesired::Present && row.applied && row.last_error.is_none()
+                {
+                    s.pending_addresses.retain(|p| {
+                        Some(&p.adapter_mac) != row.adapter_mac.as_ref()
+                            || Some(&p.address) != row.address.as_ref()
+                            || Some(p.prefix) != row.prefix
+                    });
+                }
+                s.adopted_meta.insert(subnet.to_string(), row);
+                Ok(((), true))
+            },
+            persist,
+        )
+    }
+
+    pub fn claim_binding(&self, address: &str) -> Result<(), crate::AppError> {
+        self.claim_binding_with(address, save_to_disk)
+    }
+
+    pub(crate) fn forget_completed_removal(
+        &self,
+        subnet: &str,
+        expected: &AdoptedMeta,
+    ) -> Result<(), crate::AppError> {
+        self.forget_completed_removal_with(subnet, expected, save_to_disk)
+    }
+
+    pub(crate) fn forget_completed_removal_with(
+        &self,
+        subnet: &str,
+        expected: &AdoptedMeta,
+        persist: impl FnOnce(&AppSettings) -> Result<(), crate::AppError>,
+    ) -> Result<(), crate::AppError> {
+        self.change_settings_with(
+            |s| {
+                let owner = expected
+                    .adapter_mac
+                    .as_deref()
+                    .and_then(crate::network::device_registry::canonical_mac);
+                if !expected.removal_complete()
+                    || s.adopted_meta.get(subnet) != Some(expected)
+                    || s.adopted_subnets.contains_key(subnet)
+                    || s.network_mode != NetworkMode::StaticAuto
+                    || owner.is_none()
+                    || owner
+                        != s.selected_adapter_mac
+                            .as_deref()
+                            .and_then(crate::network::device_registry::canonical_mac)
+                {
+                    return Err(crate::AppError::Network(
+                        "Saved removal changed or is not complete".into(),
+                    ));
+                }
+                s.adopted_meta.remove(subnet);
+                Ok(())
+            },
+            persist,
+        )
+    }
+
+    pub(crate) fn claim_binding_with(
+        &self,
+        address: &str,
+        persist: impl FnOnce(&AppSettings) -> Result<(), crate::AppError>,
+    ) -> Result<(), crate::AppError> {
+        self.change_settings_with(
+            |s| {
+                s.pending_addresses.retain(|p| {
+                    p.address != address
+                        || crate::network::device_registry::canonical_mac(&p.adapter_mac)
+                            != s.selected_adapter_mac
+                                .as_deref()
+                                .and_then(crate::network::device_registry::canonical_mac)
+                });
+                let keys: Vec<_> = s
+                    .adopted_meta
+                    .iter()
+                    .filter(|(_, row)| {
+                        row.address.as_deref() == Some(address)
+                            && row.adapter_mac.as_ref().is_none_or(|owner| {
+                                s.selected_adapter_mac.as_ref().is_some_and(|selected| {
+                                    crate::network::device_registry::canonical_mac(owner)
+                                        == crate::network::device_registry::canonical_mac(selected)
+                                })
+                            })
+                    })
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                for key in keys {
+                    s.adopted_subnets.remove(&key);
+                    s.adopted_meta.remove(&key);
+                }
+                Ok(())
+            },
+            persist,
+        )
+    }
+
+    /// The same write-before-publish seam as manual-node identity binding.
+    fn change_settings_with<T>(
+        &self,
+        change: impl FnOnce(&mut AppSettings) -> Result<T, crate::AppError>,
+        persist: impl FnOnce(&AppSettings) -> Result<(), crate::AppError>,
+    ) -> Result<T, crate::AppError> {
+        self.change_settings_if_with(|s| change(s).map(|value| (value, true)), persist)
+    }
+    fn change_settings_if_with<T>(
+        &self,
+        change: impl FnOnce(&mut AppSettings) -> Result<(T, bool), crate::AppError>,
+        persist: impl FnOnce(&AppSettings) -> Result<(), crate::AppError>,
+    ) -> Result<T, crate::AppError> {
+        let _save = CONFIG_SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+        let mut next = settings.clone();
+        let (result, changed) = change(&mut next)?;
+        if changed {
+            persist(&next)?;
+            *settings = next;
         }
-        Ok(removed)
+        Ok(result)
     }
 
     /// Persist one zoom-slider position (clamped to 0–100). Field-scoped
@@ -941,16 +1240,50 @@ impl AppConfig {
         }
     }
 
+    /// Persist before exposing the new selection to network operations.
+    pub fn set_selected_adapter_mac(&self, mac: String) -> Result<(), crate::AppError> {
+        let _save = CONFIG_SAVE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut settings = self.settings.lock().unwrap_or_else(|p| p.into_inner());
+        let mut next = settings.clone();
+        next.selected_adapter_mac = Some(mac);
+        save_to_disk(&next)?;
+        *settings = next;
+        Ok(())
+    }
+
     /// Replace the network mode and persist.
     pub fn set_network_mode(&self, mode: NetworkMode) -> Result<(), crate::AppError> {
-        match self.settings.lock() {
-            Ok(mut guard) => guard.network_mode = mode,
-            Err(poisoned) => {
-                log::error!("Config mutex poisoned during set_network_mode, recovering");
-                poisoned.into_inner().network_mode = mode;
-            }
+        self.change_settings_with(
+            |s| {
+                s.network_mode = mode;
+                Ok(())
+            },
+            save_to_disk,
+        )
+    }
+
+    pub(crate) fn set_primary_address(&self, mac: &str, cidr: &str) -> Result<(), crate::AppError> {
+        self.set_primary_address_with(mac, cidr, save_to_disk)
+    }
+
+    pub(crate) fn set_primary_address_with(
+        &self,
+        mac: &str,
+        cidr: &str,
+        persist: impl FnOnce(&AppSettings) -> Result<(), crate::AppError>,
+    ) -> Result<(), crate::AppError> {
+        let mac = crate::network::device_registry::canonical_mac(mac)
+            .ok_or_else(|| crate::AppError::Config("Invalid primary adapter MAC".into()))?;
+        if !cidr.is_empty() {
+            crate::validation::parse_cidr(cidr)?;
         }
-        self.save()
+        self.change_settings_with(
+            |s| {
+                s.primary_addresses.insert(mac, cidr.into());
+                Ok(())
+            },
+            persist,
+        )
     }
 
     /// Replace just the audio mute preference and persist.
@@ -987,7 +1320,19 @@ impl AppConfig {
             }
         };
         if let Some(existing) = guard.manual_nodes.iter_mut().find(|n| n.ip == node.ip) {
+            if existing.expected_mac.is_some()
+                && node.expected_mac.is_some()
+                && existing.expected_mac != node.expected_mac
+            {
+                return Err(crate::AppError::Network(
+                    "different device at this address; remove the old pin before reassigning"
+                        .into(),
+                ));
+            }
             existing.alias = node.alias;
+            if existing.expected_mac.is_none() {
+                existing.expected_mac = node.expected_mac;
+            }
         } else {
             guard.manual_nodes.push(node);
         }
@@ -1001,7 +1346,11 @@ impl AppConfig {
     /// already matches. Used by the role single-holder enforcement to
     /// write demotions through to config — a registry-only demotion
     /// would resurrect on the next manual-node hydration.
-    pub fn update_manual_node_alias(&self, ip: &str, alias: &str) -> Result<bool, crate::AppError> {
+    pub fn update_manual_node_alias(
+        &self,
+        key: &str,
+        alias: &str,
+    ) -> Result<bool, crate::AppError> {
         let changed = {
             let mut guard = match self.settings.lock() {
                 Ok(g) => g,
@@ -1012,7 +1361,11 @@ impl AppConfig {
                     poisoned.into_inner()
                 }
             };
-            match guard.manual_nodes.iter_mut().find(|n| n.ip == ip) {
+            match guard
+                .manual_nodes
+                .iter_mut()
+                .find(|n| manual_node_key(n).eq_ignore_ascii_case(key))
+            {
                 Some(node) if node.alias != alias => {
                     node.alias = alias.to_string();
                     true
@@ -1026,27 +1379,68 @@ impl AppConfig {
         Ok(changed)
     }
 
-    /// Remove a manual node by IP. No-op if the IP isn't pinned.
-    pub fn remove_manual_node(&self, ip: &str) -> Result<(), crate::AppError> {
-        let removed = match self.settings.lock() {
-            Ok(mut guard) => {
-                let before = guard.manual_nodes.len();
-                guard.manual_nodes.retain(|n| n.ip != ip);
-                before != guard.manual_nodes.len()
-            }
-            Err(poisoned) => {
-                log::error!("Config mutex poisoned during remove_manual_node, recovering");
-                let mut guard = poisoned.into_inner();
-                let before = guard.manual_nodes.len();
-                guard.manual_nodes.retain(|n| n.ip != ip);
-                before != guard.manual_nodes.len()
-            }
-        };
-        if removed {
-            self.save()
-        } else {
-            Ok(())
+    /// Persist first-verification identity before the registry can promote it.
+    #[allow(dead_code)] // S5a's presence task consumes this transaction.
+    pub(crate) fn bind_manual_node(
+        &self,
+        ip: &str,
+        mac: &str,
+        fence: &crate::network::SweepFence,
+    ) -> Result<ManualNode, crate::AppError> {
+        self.bind_manual_node_with(ip, mac, fence, save_to_disk)
+    }
+
+    fn bind_manual_node_with(
+        &self,
+        ip: &str,
+        mac: &str,
+        fence: &crate::network::SweepFence,
+        save: impl FnOnce(&AppSettings) -> Result<(), crate::AppError>,
+    ) -> Result<ManualNode, crate::AppError> {
+        let mac = crate::network::device_registry::canonical_mac(mac)
+            .ok_or_else(|| crate::AppError::Network("Invalid device MAC".into()))?;
+        let _save = CONFIG_SAVE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut settings = self.settings.lock().unwrap_or_else(|p| p.into_inner());
+        if fence.is_stale() {
+            return Err(crate::AppError::Network("verification retired".into()));
         }
+        let mut next = settings.clone();
+        let node = next
+            .manual_nodes
+            .iter_mut()
+            .find(|n| n.ip == ip)
+            .ok_or_else(|| crate::AppError::Network("manual node no longer exists".into()))?;
+        let changed = bind_manual_identity(node, &mac);
+        let bound = node.clone();
+        if changed {
+            save(&next)?;
+            *settings = next;
+            log::info!(
+                "Manual node {} bound on first fresh verification to {}",
+                ip,
+                mac
+            );
+        }
+        Ok(bound)
+    }
+
+    /// Compare the expected identity too, so a stale removal cannot delete a new pin.
+    pub fn remove_manual_node(
+        &self,
+        ip: &str,
+        expected_mac: Option<&str>,
+    ) -> Result<bool, crate::AppError> {
+        let _save = CONFIG_SAVE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut settings = self.settings.lock().unwrap_or_else(|p| p.into_inner());
+        let mut next = settings.clone();
+        next.manual_nodes
+            .retain(|n| n.ip != ip || !same_expected_mac(n.expected_mac.as_deref(), expected_mac));
+        if next.manual_nodes.len() == settings.manual_nodes.len() {
+            return Ok(false);
+        }
+        save_to_disk(&next)?;
+        *settings = next;
+        Ok(true)
     }
 
     /// Drop every pinned manual node.
@@ -1100,24 +1494,19 @@ impl AppConfig {
     /// Insert or update a cached device entry (keyed by MAC).
     /// Persists the cache file after mutation.
     pub fn upsert_cached_device(&self, device: CachedDevice) -> Result<(), crate::AppError> {
-        match self.cache.lock() {
-            Ok(mut guard) => {
-                if let Some(existing) = guard.iter_mut().find(|d| d.mac == device.mac) {
-                    *existing = device;
-                } else {
-                    guard.push(device);
-                }
-            }
-            Err(poisoned) => {
-                log::error!("Cache mutex poisoned during upsert, recovering");
-                let mut guard = poisoned.into_inner();
-                if let Some(existing) = guard.iter_mut().find(|d| d.mac == device.mac) {
-                    *existing = device;
-                } else {
-                    guard.push(device);
-                }
-            }
+        self.upsert_cached_device_fenced(device, None)
+    }
+
+    pub(crate) fn upsert_cached_device_fenced(
+        &self,
+        device: CachedDevice,
+        fence: Option<&crate::network::SweepFence>,
+    ) -> Result<(), crate::AppError> {
+        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        if !upsert_cache_record(&mut cache, device, fence) {
+            return Ok(());
         }
+        drop(cache);
         self.save_cache()
     }
 
@@ -1168,6 +1557,44 @@ impl AppConfig {
 /// write order — which is why `save`/`save_cache` take it BEFORE locking
 /// the data mutex, not inside the write helper.
 static CONFIG_SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn upsert_cache_record(
+    cache: &mut Vec<CachedDevice>,
+    device: CachedDevice,
+    fence: Option<&crate::network::SweepFence>,
+) -> bool {
+    if fence.is_some_and(|f| f.is_stale()) {
+        return false;
+    }
+    if let Some(existing) = cache.iter_mut().find(|r| r.mac == device.mac) {
+        *existing = device;
+    } else {
+        cache.push(device);
+    }
+    true
+}
+
+pub(crate) fn manual_node_key(node: &ManualNode) -> String {
+    node.expected_mac
+        .clone()
+        .unwrap_or_else(|| format!("manual:{}", node.ip))
+}
+
+fn same_expected_mac(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        _ => false,
+    }
+}
+
+fn bind_manual_identity(node: &mut ManualNode, mac: &str) -> bool {
+    if node.expected_mac.is_some() {
+        return false;
+    }
+    node.expected_mac = Some(mac.into());
+    true
+}
+
 static CACHE_SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn config_dir() -> PathBuf {
@@ -1455,7 +1882,7 @@ fn decrypt_field(field: &str, key: &[u8], label: &str) -> String {
     }
 }
 
-fn save_to_disk(settings: &AppSettings) -> Result<(), crate::AppError> {
+pub(crate) fn save_to_disk(settings: &AppSettings) -> Result<(), crate::AppError> {
     let dir = config_dir();
     fs::create_dir_all(&dir).map_err(|e| crate::AppError::Config(e.to_string()))?;
 
@@ -1593,9 +2020,7 @@ fn read_key() -> std::io::Result<Option<([u8; 32], bool)>> {
 /// Write the 32-byte key, DPAPI-wrapped on Windows, via `atomic_write`
 /// (the previous plain `fs::write` could leave a truncated key on a
 /// mid-write crash).
-fn write_key(key: &[u8; 32]) -> Result<(), crate::AppError> {
-    let path = key_path();
-
+fn write_key_to(path: &Path, key: &[u8; 32]) -> Result<(), crate::AppError> {
     let on_disk: Vec<u8> = {
         #[cfg(windows)]
         {
@@ -1609,7 +2034,7 @@ fn write_key(key: &[u8; 32]) -> Result<(), crate::AppError> {
         }
     };
 
-    atomic_write(&path, &on_disk).map_err(|e| crate::AppError::Config(e.to_string()))?;
+    atomic_write(path, &on_disk).map_err(|e| crate::AppError::Config(e.to_string()))?;
 
     // Restrict the key file to the current user. On Windows the DPAPI
     // wrap already binds it to the user account (and AppData inherits a
@@ -1618,7 +2043,7 @@ fn write_key(key: &[u8; 32]) -> Result<(), crate::AppError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = fs::set_permissions(&path, fs::Permissions::from_mode(0o600)) {
+        if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
             log::warn!("Failed to chmod 0600 on key file {}: {}", path.display(), e);
         }
     }
@@ -1627,13 +2052,17 @@ fn write_key(key: &[u8; 32]) -> Result<(), crate::AppError> {
 }
 
 fn get_or_create_key() -> Result<Vec<u8>, crate::AppError> {
-    match read_key() {
+    get_or_create_key_at(&key_path())
+}
+
+fn get_or_create_key_at(path: &Path) -> Result<Vec<u8>, crate::AppError> {
+    match read_key_from(path) {
         Ok(Some((key, needs_rewrap))) => {
             if needs_rewrap {
                 // Upgrade a legacy unprotected key to DPAPI in place. The
                 // key bytes are unchanged, so existing ciphertext stays
                 // valid; a failure is non-fatal (keep using the raw key).
-                if let Err(e) = write_key(&key) {
+                if let Err(e) = write_key_to(path, &key) {
                     log::warn!("Failed to upgrade encryption key to DPAPI: {}", e);
                 }
             }
@@ -1642,7 +2071,7 @@ fn get_or_create_key() -> Result<Vec<u8>, crate::AppError> {
         Ok(None) => {
             let mut key = [0u8; 32];
             rand::thread_rng().fill_bytes(&mut key);
-            write_key(&key)?;
+            write_key_to(path, &key)?;
             Ok(key.to_vec())
         }
         // Transient read failure — do NOT regenerate (that would orphan
@@ -1716,20 +2145,82 @@ mod hex {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
+    pub(crate) const TEST_KEY: [u8; 32] = [0x42; 32];
 
-    const TEST_KEY: [u8; 32] = [0x42; 32];
-
-    fn serialize_for_test(settings: &AppSettings) -> String {
+    pub(crate) fn serialize_for_test(settings: &AppSettings) -> String {
         serialize_settings_with_srt_encryptor(settings, &TEST_KEY, encrypt_string_checked)
             .expect("test settings should serialize")
     }
 
-    fn parse_for_test(content: &str) -> Result<AppSettings, crate::AppError> {
+    pub(crate) fn parse_for_test(content: &str) -> Result<AppSettings, crate::AppError> {
         let persisted: PersistedAppSettings =
             toml::from_str(content).map_err(|error| crate::AppError::Config(error.to_string()))?;
         runtime_settings_from_persisted(persisted, Some(&TEST_KEY))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use super::test_support::{parse_for_test, serialize_for_test, TEST_KEY};
+
+    fn apply_stream_settings_for_test(settings: &mut AppSettings, incoming: AppSettings) {
+        let config = AppConfig::for_test(settings.clone());
+        config
+            .update_stream_with(incoming.stream, |_| Ok(()))
+            .unwrap();
+        *settings = config.get();
+    }
+
+    #[test]
+    fn protected_srt_and_durable_network_settings_round_trip_together() {
+        let mut settings = AppSettings {
+            selected_adapter_mac: Some("40:cd:3a:00:00:01".into()),
+            ..Default::default()
+        };
+        settings
+            .primary_addresses
+            .insert("40:cd:3a:00:00:01".into(), "192.0.2.10/24".into());
+        settings.pending_addresses.push(PendingAddress {
+            adapter_mac: "40:cd:3a:00:00:01".into(),
+            address: "198.51.100.100".into(),
+            prefix: 24,
+        });
+        settings.restream_protocol = RestreamProtocol::Srt;
+        settings.srt_server.passphrase = SrtPassphraseState::Available("merged-srt-secret".into());
+        let encoded = serialize_for_test(&settings);
+        assert!(!encoded.contains("merged-srt-secret"));
+        let restored = parse_for_test(&encoded).unwrap();
+        assert_eq!(restored.selected_adapter_mac, settings.selected_adapter_mac);
+        assert_eq!(restored.primary_addresses, settings.primary_addresses);
+        assert_eq!(restored.pending_addresses, settings.pending_addresses);
+        assert_eq!(restored.restream_protocol, RestreamProtocol::Srt);
+        assert!(restored.srt_server == settings.srt_server);
+    }
+
+    #[test]
+    fn failed_stream_save_preserves_camera_identity_and_network_ownership() {
+        let mut settings = AppSettings::default();
+        settings.stream.camera_mac = Some("aa:bb:cc:dd:ee:01".into());
+        settings.selected_adapter_mac = Some("40:cd:3a:00:00:01".into());
+        let config = AppConfig::for_test(settings.clone());
+        assert!(config
+            .update_stream_with(
+                StreamConfig {
+                    camera_mac: Some("aa:bb:cc:dd:ee:02".into()),
+                    ..settings.stream.clone()
+                },
+                |_| Err(crate::AppError::Config("save failed".into()))
+            )
+            .is_err());
+        assert_eq!(config.get().stream.camera_mac, settings.stream.camera_mac);
+        assert_eq!(
+            config.get().selected_adapter_mac,
+            settings.selected_adapter_mac
+        );
     }
 
     // ── Encryption / Decryption ─────────────────────────────────────
@@ -2225,7 +2716,10 @@ password = ""
     #[test]
     fn settings_toml_with_populated_fields() {
         let settings = AppSettings {
+            selected_adapter_mac: None,
+            primary_addresses: HashMap::new(),
             stream: StreamConfig {
+                camera_mac: None,
                 protocol: StreamProtocol::Udp,
                 rtsp_port: 8554,
                 rtsp_path: "/cam1".into(),
@@ -2247,6 +2741,7 @@ password = ""
             },
             adopted_subnets: std::collections::HashMap::new(),
             adopted_meta: std::collections::HashMap::new(),
+            pending_addresses: Vec::new(),
             zoom_positions: std::collections::HashMap::new(),
             network_mode: NetworkMode::default(),
             manual_nodes: Vec::new(),
@@ -2259,6 +2754,32 @@ password = ""
         assert!(parsed.rtsp_server.enabled);
         assert_eq!(parsed.credentials.username, "admin");
         assert!(parsed.stream.audio_muted);
+    }
+
+    #[test]
+    fn explicit_primary_roundtrip_is_backend_owned_and_failed_save_does_not_publish() {
+        let config = AppConfig::temporary_test_config(AppSettings::default());
+        config
+            .set_primary_address_with("40-CD-3A-00-00-01", "192.0.2.10/24", |_| Ok(()))
+            .unwrap();
+        assert!(config
+            .set_primary_address_with("40:cd:3a:00:00:01", "198.51.100.10/24", |_| Err(
+                crate::AppError::Config("save failed".into())
+            ))
+            .is_err());
+        assert_eq!(
+            config.get().primary_addresses["40:cd:3a:00:00:01"],
+            "192.0.2.10/24"
+        );
+        let mut saved = config.get();
+        apply_stream_settings_for_test(&mut saved, AppSettings::default());
+        let encoded = serialize_for_test(&saved);
+        let decoded: AppSettings = parse_for_test(&encoded).unwrap();
+        assert_eq!(decoded.primary_addresses, saved.primary_addresses);
+        let mut old: toml::Value = toml::from_str(&serialize_for_test(&saved)).unwrap();
+        old.as_table_mut().unwrap().remove("primary_addresses");
+        let legacy = parse_for_test(&toml::to_string(&old).unwrap()).unwrap();
+        assert!(legacy.primary_addresses.is_empty());
     }
 
     #[test]
@@ -2483,17 +3004,12 @@ password = ""
     // ── Key Management ──────────────────────────────────────────────
 
     #[test]
-    #[cfg_attr(not(target_os = "windows"), ignore)]
     fn get_or_create_key_returns_stable_32_bytes() {
-        // Uses the real config dir (%APPDATA%/PocketStream/.key), so length
-        // and stability are asserted in ONE test: as two separate tests
-        // they ran in parallel and raced to create the shared key file on
-        // a fresh machine, each overwriting the other's freshly-generated
-        // key (locally it passed only because the file already existed).
-        // Skipped on non-Windows where the config dir isn't present.
-        let k1 = get_or_create_key().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".key");
+        let k1 = get_or_create_key_at(&path).unwrap();
         assert_eq!(k1.len(), 32, "key should be 32 bytes");
-        let k2 = get_or_create_key().unwrap();
+        let k2 = get_or_create_key_at(&path).unwrap();
         assert_eq!(k1, k2, "same key should be returned on subsequent calls");
     }
 
@@ -2531,6 +3047,7 @@ password = ""
             AdoptedMeta {
                 adopted_at: Some("2026-07-16T00:20:37Z".into()),
                 last_device_seen: Some("2026-07-17T01:10:18Z".into()),
+                ..Default::default()
             },
         );
         meta.insert(
@@ -2538,6 +3055,7 @@ password = ""
             AdoptedMeta {
                 adopted_at: Some("2026-07-16T00:20:37Z".into()),
                 last_device_seen: None,
+                ..Default::default()
             },
         );
 
@@ -2553,7 +3071,12 @@ password = ""
             adopted.get("169.254.73.0/24"),
             Some(&"169.254.73.99".to_string())
         );
-        assert_eq!(meta.len(), 1);
+        assert_eq!(meta.len(), 2);
+        let removed = &meta["172.31.169.0/24"];
+        assert_eq!(removed.desired, BindingDesired::Removed);
+        assert_eq!(removed.address.as_deref(), Some("172.31.169.100"));
+        assert_eq!(removed.prefix, Some(24));
+        align_adopted_meta(&adopted, &mut meta, "later");
         assert_eq!(
             meta.get("169.254.73.0/24").unwrap().adopted_at.as_deref(),
             Some("2026-07-16T00:20:37Z")
@@ -2566,7 +3089,452 @@ password = ""
             "10.0.0.0/24"
         ));
         assert_eq!(adopted.len(), 1);
-        assert_eq!(meta.len(), 1);
+        assert_eq!(meta.len(), 2);
+    }
+
+    fn binding_test_config() -> AppConfig {
+        AppConfig {
+            settings: Mutex::new(AppSettings {
+                selected_adapter_mac: Some("40:cd:3a:00:00:01".into()),
+                ..Default::default()
+            }),
+            cache: Mutex::new(vec![]),
+            startup_notices: Mutex::new(vec![]),
+        }
+    }
+
+    #[test]
+    fn temporary_claim_commit_and_user_saves_preserve_write_order_and_legacy_defaults() {
+        let config = AppConfig::temporary_test_config(AppSettings {
+            selected_adapter_mac: Some("40:CD:3A:00:00:01".into()),
+            network_mode: NetworkMode::StaticAuto,
+            ..Default::default()
+        });
+        let pending = PendingAddress {
+            adapter_mac: "40:cd:3a:00:00:01".into(),
+            address: "172.31.169.100".into(),
+            prefix: 24,
+        };
+        config
+            .reserve_temporary_with(pending.clone(), |_| Ok(()))
+            .unwrap();
+        let mut settings = config.get();
+        apply_stream_settings_for_test(&mut settings, AppSettings::default());
+        assert_eq!(settings.pending_addresses, vec![pending.clone()]);
+        assert!(config
+            .claim_binding_with(&pending.address, |_| Err(crate::AppError::Network(
+                "save failed".into()
+            )))
+            .is_err());
+        assert_eq!(config.get().pending_addresses, vec![pending.clone()]);
+        config
+            .claim_binding_with(&pending.address, |_| Ok(()))
+            .unwrap();
+        assert!(config.get().pending_addresses.is_empty());
+        config
+            .reserve_temporary_with(pending.clone(), |_| Ok(()))
+            .unwrap();
+        let row = AdoptedMeta {
+            adapter_mac: Some(pending.adapter_mac.clone()),
+            address: Some(pending.address.clone()),
+            prefix: Some(24),
+            applied: true,
+            ..Default::default()
+        };
+        assert!(config
+            .set_binding_with("172.31.169.0/24", row.clone(), |_| Err(
+                crate::AppError::Network("save failed".into())
+            ))
+            .is_err());
+        assert_eq!(config.get().pending_addresses, vec![pending]);
+        assert!(config.get().adopted_subnets.is_empty());
+        config
+            .set_binding_with("172.31.169.0/24", row, |saved| {
+                assert!(saved.pending_addresses.is_empty());
+                assert_eq!(
+                    saved
+                        .adopted_subnets
+                        .get("172.31.169.0/24")
+                        .map(String::as_str),
+                    Some("172.31.169.100")
+                );
+                Ok(())
+            })
+            .unwrap();
+        let legacy =
+            serialize_for_test(&AppSettings::default()).replace("pending_addresses = []\n", "");
+        assert!(parse_for_test(&legacy)
+            .unwrap()
+            .pending_addresses
+            .is_empty());
+    }
+
+    #[test]
+    fn fresh_adoption_retires_only_the_unchanged_completed_removal() {
+        let subnet = "192.0.2.0/24";
+        let owner = "40:cd:3a:00:00:01";
+        let removed = AdoptedMeta {
+            adapter_mac: Some(owner.into()),
+            address: Some("192.0.2.100".into()),
+            prefix: Some(24),
+            desired: BindingDesired::Removed,
+            ..Default::default()
+        };
+        for case in 0..6 {
+            let mut settings = AppSettings {
+                selected_adapter_mac: Some(owner.into()),
+                network_mode: NetworkMode::StaticAuto,
+                ..Default::default()
+            };
+            settings.adopted_meta.insert(subnet.into(), removed.clone());
+            match case {
+                0 => {
+                    settings.adopted_meta.get_mut(subnet).unwrap().last_error =
+                        Some("new removal".into())
+                }
+                1 => {
+                    settings.adopted_meta.get_mut(subnet).unwrap().address =
+                        Some("192.0.2.101".into())
+                }
+                2 => settings.selected_adapter_mac = Some("aa:bb:cc:dd:ee:ff".into()),
+                3 => settings.network_mode = NetworkMode::StaticManual,
+                4 => {
+                    settings
+                        .adopted_subnets
+                        .insert(subnet.into(), "192.0.2.100".into());
+                }
+                _ => {}
+            }
+            let config = AppConfig::temporary_test_config(settings);
+            let before = config.get();
+            let calls = std::cell::Cell::new(0);
+            let result = config.forget_completed_removal_with(subnet, &removed, |_| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            });
+            if case < 5 {
+                assert!(result.is_err());
+                assert_eq!(calls.get(), 0);
+                assert_eq!(config.get().adopted_meta, before.adopted_meta);
+            } else {
+                result.unwrap();
+                assert_eq!(calls.get(), 1);
+                assert!(!config.get().adopted_meta.contains_key(subnet));
+            }
+        }
+    }
+
+    #[test]
+    fn sp_status_equality_skips_atomic_save_but_repeated_intent_is_a_barrier() {
+        let config = AppConfig::temporary_test_config(AppSettings::default());
+        let mut row = AdoptedMeta {
+            address: Some("192.0.2.20".into()),
+            prefix: Some(24),
+            adapter_mac: Some("40:cd:3a:00:00:01".into()),
+            ..Default::default()
+        };
+        let count = std::cell::Cell::new(0);
+        let persist = |_: &AppSettings| {
+            count.set(count.get() + 1);
+            Ok(())
+        };
+        config
+            .set_binding_with("192.0.2.0/24", row.clone(), persist)
+            .unwrap();
+        config
+            .set_binding_with("192.0.2.0/24", row.clone(), |_| {
+                panic!("equal status must not fsync")
+            })
+            .unwrap();
+        assert_eq!(count.get(), 1);
+        config.settings.lock().unwrap().stream.camera_ip = "keep-current-user-setting".into();
+        row.applied = true;
+        config
+            .set_binding_with("192.0.2.0/24", row.clone(), persist)
+            .unwrap();
+        assert_eq!(config.get().stream.camera_ip, "keep-current-user-setting");
+        row.last_error = Some("temporary failure".into());
+        config
+            .set_binding_with("192.0.2.0/24", row.clone(), persist)
+            .unwrap();
+        config
+            .settings
+            .lock()
+            .unwrap()
+            .pending_addresses
+            .push(PendingAddress {
+                adapter_mac: row.adapter_mac.clone().unwrap(),
+                address: row.address.clone().unwrap(),
+                prefix: 24,
+            });
+        config
+            .set_binding_with("192.0.2.0/24", row.clone(), |_| {
+                panic!("equal failed status cannot retire ownership or save")
+            })
+            .unwrap();
+        assert_eq!(config.get().pending_addresses.len(), 1);
+        row.desired = BindingDesired::Removed;
+        row.last_error = Some("Removal awaiting Windows confirmation".into());
+        for _ in 0..2 {
+            config
+                .set_binding_for_operation_with("192.0.2.0/24", row.clone(), true, persist)
+                .unwrap();
+        }
+        assert_eq!(
+            count.get(),
+            5,
+            "each new removal crosses the durability barrier"
+        );
+        assert!(!config.get().adopted_subnets.contains_key("192.0.2.0/24"));
+        assert_eq!(config.get().adopted_meta["192.0.2.0/24"], row);
+    }
+
+    #[test]
+    fn binding_removal_save_failure_precedes_os_write_and_restart_retains_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let config = binding_test_config();
+        let row = AdoptedMeta {
+            adapter_mac: Some("40:cd:3a:00:00:01".into()),
+            prefix: Some(24),
+            address: Some("172.31.169.99".into()),
+            applied: true,
+            adopted_at: Some("2026-10-20T00:00:00Z".into()),
+            ..Default::default()
+        };
+        let persist = |s: &AppSettings| {
+            atomic_write(&path, serialize_for_test(s).as_bytes()).map_err(crate::AppError::Io)
+        };
+        config
+            .set_binding_with("172.31.169.0/24", row.clone(), persist)
+            .unwrap();
+        let blocked = dir.path().join("not-a-directory");
+        fs::write(&blocked, b"block").unwrap();
+        let mut removed = row.clone();
+        removed.desired = BindingDesired::Removed;
+        let mut os_writes = 0;
+        if config
+            .set_binding_with("172.31.169.0/24", removed.clone(), |s| {
+                atomic_write(
+                    &blocked.join("config.toml"),
+                    serialize_for_test(s).as_bytes(),
+                )
+                .map_err(crate::AppError::Io)
+            })
+            .is_ok()
+        {
+            os_writes += 1;
+        }
+        assert_eq!(os_writes, 0);
+        assert_eq!(config.get().adopted_meta["172.31.169.0/24"], row);
+        config
+            .set_binding_with("172.31.169.0/24", removed.clone(), persist)
+            .unwrap();
+        // Restart after the intent save and before the OS unbind.
+        let mut restarted: AppSettings =
+            parse_for_test(&fs::read_to_string(&path).unwrap()).unwrap();
+        align_adopted_meta(
+            &restarted.adopted_subnets,
+            &mut restarted.adopted_meta,
+            "later",
+        );
+        assert!(restarted.adopted_subnets.is_empty());
+        assert_eq!(restarted.adopted_meta["172.31.169.0/24"], removed);
+        assert!(config
+            .set_binding_with("172.31.169.0/24", row, |_| panic!(
+                "late adoption must not save"
+            ))
+            .is_err());
+        let mut edited = AppSettings::default();
+        edited.adopted_meta.clear();
+        apply_stream_settings_for_test(&mut restarted, edited);
+        assert_eq!(
+            restarted.adopted_meta["172.31.169.0/24"].desired,
+            BindingDesired::Removed
+        );
+        config
+            .change_settings_with(
+                |s| {
+                    s.selected_adapter_mac = Some("40:cd:3a:00:00:02".into());
+                    Ok(())
+                },
+                persist,
+            )
+            .unwrap();
+        config.claim_binding_with("172.31.169.99", persist).unwrap();
+        assert_eq!(
+            config.get().adopted_meta["172.31.169.0/24"].desired,
+            BindingDesired::Removed
+        );
+        config
+            .change_settings_with(
+                |s| {
+                    s.selected_adapter_mac = Some("40:cd:3a:00:00:01".into());
+                    Ok(())
+                },
+                persist,
+            )
+            .unwrap();
+        config.claim_binding_with("172.31.169.99", persist).unwrap();
+        assert!(config.get().adopted_meta.is_empty());
+    }
+
+    #[test]
+    fn mode_save_failure_does_not_publish_an_unpersisted_mode() {
+        let config = binding_test_config();
+        let before = config.get_network_mode();
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("not-a-directory");
+        fs::write(&blocked, b"block").unwrap();
+        assert!(config
+            .change_settings_with(
+                |s| {
+                    s.network_mode = NetworkMode::Dhcp;
+                    Ok(())
+                },
+                |s| atomic_write(
+                    &blocked.join("config.toml"),
+                    serialize_for_test(s).as_bytes()
+                )
+                .map_err(crate::AppError::Io)
+            )
+            .is_err());
+        assert_eq!(config.get_network_mode(), before);
+        let legacy: AdoptedMeta = toml::from_str("adopted_at='old'").unwrap();
+        assert_eq!(legacy.desired, BindingDesired::Present);
+        assert!(!legacy.applied && legacy.adapter_mac.is_none());
+    }
+
+    #[test]
+    fn durable_fields_round_trip_repeatedly_and_previous_metadata_schema_still_parses() {
+        #[derive(Deserialize)]
+        struct PreviousMeta {
+            adopted_at: Option<String>,
+            last_device_seen: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct PreviousSettings {
+            adopted_subnets: HashMap<String, String>,
+            adopted_meta: HashMap<String, PreviousMeta>,
+        }
+        let mut settings = AppSettings::default();
+        settings
+            .adopted_subnets
+            .insert("172.26.95.0/24".into(), "172.26.95.99".into());
+        settings.adopted_meta.insert(
+            "169.254.20.0/24".into(),
+            AdoptedMeta {
+                address: Some("169.254.20.99".into()),
+                prefix: Some(24),
+                adapter_mac: Some("40:cd:3a:00:00:01".into()),
+                desired: BindingDesired::Removed,
+                applied: true,
+                last_error: Some("OS rejected removal".into()),
+                adopted_at: Some("original timestamp".into()),
+                last_device_seen: Some("last seen".into()),
+            },
+        );
+        align_adopted_meta(
+            &settings.adopted_subnets,
+            &mut settings.adopted_meta,
+            "backfilled",
+        );
+        let original = settings.adopted_meta.clone();
+        for _ in 0..2 {
+            let encoded = serialize_for_test(&settings);
+            let previous: PreviousSettings = toml::from_str(&encoded).unwrap();
+            assert_eq!(previous.adopted_subnets, settings.adopted_subnets);
+            assert_eq!(
+                previous.adopted_meta["169.254.20.0/24"]
+                    .adopted_at
+                    .as_deref(),
+                Some("original timestamp")
+            );
+            assert_eq!(
+                previous.adopted_meta["169.254.20.0/24"]
+                    .last_device_seen
+                    .as_deref(),
+                Some("last seen")
+            );
+            settings = parse_for_test(&encoded).unwrap();
+            align_adopted_meta(
+                &settings.adopted_subnets,
+                &mut settings.adopted_meta,
+                "later load",
+            );
+            assert_eq!(settings.adopted_meta, original);
+        }
+    }
+
+    #[test]
+    fn stream_update_preserves_adopted_subnets() {
+        let mut current = AppSettings::default();
+        current
+            .adopted_subnets
+            .insert("192.168.1.0/24".into(), "192.168.1.50".into());
+
+        let incoming = AppSettings::default();
+        apply_stream_settings_for_test(&mut current, incoming);
+
+        assert_eq!(current.adopted_subnets.len(), 1);
+        assert_eq!(
+            current.adopted_subnets.get("192.168.1.0/24"),
+            Some(&"192.168.1.50".to_string())
+        );
+    }
+
+    #[test]
+    fn stream_update_preserves_zoom_positions() {
+        let mut current = AppSettings::default();
+        current.zoom_positions.insert("192.168.1.10".into(), 75);
+
+        let incoming = AppSettings::default();
+        apply_stream_settings_for_test(&mut current, incoming);
+
+        assert_eq!(current.zoom_positions.len(), 1);
+        assert_eq!(current.zoom_positions.get("192.168.1.10"), Some(&75));
+    }
+
+    #[test]
+    fn stream_update_preserves_network_mode() {
+        // A partial frontend payload (just stream/rtsp/credentials) must
+        // not clobber the user's chosen mode via serde defaults.
+        let mut current = AppSettings {
+            network_mode: NetworkMode::StaticManual,
+            ..Default::default()
+        };
+        apply_stream_settings_for_test(&mut current, AppSettings::default());
+        assert_eq!(current.network_mode, NetworkMode::StaticManual);
+    }
+
+    #[test]
+    fn selected_adapter_is_defaulted_round_tripped_and_backend_owned() {
+        let legacy = serialize_for_test(&AppSettings::default());
+        assert!(!legacy.contains("selected_adapter_mac"));
+        let mut settings: AppSettings = parse_for_test(&legacy).unwrap();
+        assert_eq!(settings.selected_adapter_mac, None);
+        settings.selected_adapter_mac = Some("40:cd:3a:00:00:01".into());
+        apply_stream_settings_for_test(&mut settings, AppSettings::default());
+        let encoded = serialize_for_test(&settings);
+        let restored: AppSettings = parse_for_test(&encoded).unwrap();
+        assert_eq!(
+            restored.selected_adapter_mac.as_deref(),
+            Some("40:cd:3a:00:00:01")
+        );
+    }
+
+    #[test]
+    fn stream_update_preserves_manual_nodes() {
+        let mut current = AppSettings::default();
+        current.manual_nodes.push(ManualNode {
+            expected_mac: None,
+            ip: "192.168.1.50".into(),
+            alias: "CAM".into(),
+        });
+        apply_stream_settings_for_test(&mut current, AppSettings::default());
+        assert_eq!(current.manual_nodes.len(), 1);
+        assert_eq!(current.manual_nodes[0].ip, "192.168.1.50");
+        assert_eq!(current.manual_nodes[0].alias, "CAM");
     }
 
     // ── Network Mode ────────────────────────────────────────────────
@@ -2598,10 +3566,12 @@ password = ""
     fn manual_node_toml_roundtrip() {
         let mut settings = AppSettings::default();
         settings.manual_nodes.push(ManualNode {
+            expected_mac: None,
             ip: "192.168.1.202".into(),
             alias: "PTU".into(),
         });
         settings.manual_nodes.push(ManualNode {
+            expected_mac: None,
             ip: "10.13.248.55".into(),
             alias: String::new(),
         });
@@ -2658,6 +3628,7 @@ password = ""
             AdoptedMeta {
                 adopted_at: Some("2026-07-16T10:29:13+00:00".into()),
                 last_device_seen: None,
+                ..Default::default()
             },
         );
         let toml_str = serialize_for_test(&settings);
@@ -2730,6 +3701,7 @@ password = ""
             AdoptedMeta {
                 adopted_at: Some("2026-07-01T00:00:00+00:00".into()),
                 last_device_seen: Some("2026-07-15T00:00:00+00:00".into()),
+                ..Default::default()
             },
         );
         align_adopted_meta(&adopted, &mut meta, "2026-07-16T00:00:00+00:00");
@@ -2755,6 +3727,8 @@ password = ""
         let original = CacheFile {
             devices: vec![
                 CachedDevice {
+                    verified_by_mac: None,
+                    last_verified_at: None,
                     mac: "AA:BB:CC:DD:EE:FF".into(),
                     ip: "192.168.1.10".into(),
                     subnet: "192.168.1.0/24".into(),
@@ -2763,6 +3737,8 @@ password = ""
                     last_seen: "2026-04-27T12:00:00Z".into(),
                 },
                 CachedDevice {
+                    verified_by_mac: None,
+                    last_verified_at: None,
                     mac: "11:22:33:44:55:66".into(),
                     ip: "192.168.1.20".into(),
                     subnet: "192.168.1.0/24".into(),
@@ -2789,6 +3765,8 @@ password = ""
     #[test]
     fn cached_alias_update_includes_zero_port_rows_without_inserting() {
         let mut cache = vec![CachedDevice {
+            verified_by_mac: None,
+            last_verified_at: None,
             mac: "AA:BB:CC:DD:EE:FF".into(),
             ip: "192.168.1.207".into(),
             subnet: "192.168.1.0/24".into(),
@@ -2814,6 +3792,8 @@ password = ""
     #[test]
     fn cached_alias_update_is_idempotent() {
         let mut cache = vec![CachedDevice {
+            verified_by_mac: None,
+            last_verified_at: None,
             mac: "AA:BB:CC:DD:EE:FF".into(),
             ip: "192.168.1.207".into(),
             subnet: "192.168.1.0/24".into(),
@@ -3134,5 +4114,145 @@ password = ""
         let extracted = extract_legacy_device_cache(toml_content);
         assert!(extracted.is_some());
         assert!(extracted.unwrap().is_empty());
+    }
+
+    #[test]
+    fn cache_identity_write_fences_stale_results_and_keeps_zero_ports() {
+        let make = |mac: &str| CachedDevice {
+            mac: mac.into(),
+            ip: "192.168.1.204".into(),
+            subnet: "192.168.1.0/24".into(),
+            open_ports: vec![],
+            alias: "CAM".into(),
+            last_seen: "2026-10-19T12:00:00Z".into(),
+            verified_by_mac: Some("40:cd:3a:00:00:01".into()),
+            last_verified_at: Some("2026-10-19T12:00:00Z".into()),
+        };
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let fence = crate::network::SweepFence::new(
+            1,
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            active.clone(),
+        );
+        let mut cache = vec![];
+        assert!(upsert_cache_record(&mut cache, make("old"), Some(&fence)));
+        assert!(upsert_cache_record(&mut cache, make("new"), Some(&fence)));
+        active.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(!upsert_cache_record(
+            &mut cache,
+            make("stale"),
+            Some(&fence)
+        ));
+        let parsed: CacheFile =
+            toml::from_str(&toml::to_string(&CacheFile { devices: cache }).unwrap()).unwrap();
+        assert_eq!(parsed.devices.len(), 2);
+        assert!(parsed.devices.iter().all(|d| d.open_ports.is_empty()
+            && d.verified_by_mac.is_some()
+            && d.last_verified_at.is_some()));
+        let legacy: CachedDevice = toml::from_str(
+            r#"mac='old'
+ip='192.168.1.204'
+subnet='192.168.1.0/24'
+last_seen='old'"#,
+        )
+        .unwrap();
+        assert!(legacy.verified_by_mac.is_none() && legacy.last_verified_at.is_none());
+    }
+
+    #[test]
+    fn first_manual_verification_is_saved_once_and_survives_restart() {
+        let mut settings = AppSettings::default();
+        settings.manual_nodes.push(ManualNode {
+            ip: "192.168.1.204".into(),
+            alias: "CAM".into(),
+            expected_mac: None,
+        });
+        let config = AppConfig {
+            settings: Mutex::new(settings),
+            cache: Mutex::new(vec![]),
+            startup_notices: Mutex::new(vec![]),
+        };
+        let fence = crate::network::SweepFence::new(
+            1,
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        config
+            .bind_manual_node_with("192.168.1.204", "aa:bb:cc:dd:ee:02", &fence, |s| {
+                std::fs::write(&path, serialize_for_test(s)).unwrap();
+                Ok(())
+            })
+            .unwrap();
+        let disk: AppSettings = parse_for_test(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            disk.manual_nodes[0].expected_mac.as_deref(),
+            Some("aa:bb:cc:dd:ee:02")
+        );
+        let bound = config
+            .bind_manual_node_with("192.168.1.204", "aa:bb:cc:dd:ee:04", &fence, |_| {
+                panic!("replacement must not rebind or save")
+            })
+            .unwrap();
+        assert_eq!(bound.expected_mac, disk.manual_nodes[0].expected_mac);
+        assert_eq!(config.get_manual_nodes(), disk.manual_nodes);
+    }
+
+    #[test]
+    fn failed_or_retired_manual_binding_does_not_publish_the_identity() {
+        let mut settings = AppSettings::default();
+        settings.manual_nodes.push(ManualNode {
+            ip: "192.168.1.204".into(),
+            alias: "".into(),
+            expected_mac: None,
+        });
+        let config = AppConfig {
+            settings: Mutex::new(settings),
+            cache: Mutex::new(vec![]),
+            startup_notices: Mutex::new(vec![]),
+        };
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let fence = crate::network::SweepFence::new(
+            1,
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            active.clone(),
+        );
+        assert!(config
+            .bind_manual_node_with("192.168.1.204", "aa:bb:cc:dd:ee:02", &fence, |_| Err(
+                crate::AppError::Network("save failed".into())
+            ))
+            .is_err());
+        assert!(config.get_manual_nodes()[0].expected_mac.is_none());
+        active.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(config
+            .bind_manual_node_with("192.168.1.204", "aa:bb:cc:dd:ee:02", &fence, |_| panic!(
+                "retired proof must not save"
+            ))
+            .is_err());
+        assert!(config.get_manual_nodes()[0].expected_mac.is_none());
+    }
+
+    #[test]
+    fn target_fields_default_and_round_trip_with_user_settings() {
+        let legacy = serialize_for_test(&AppSettings::default());
+        let mut settings: AppSettings = parse_for_test(&legacy).unwrap();
+        assert!(settings.stream.camera_mac.is_none());
+        let node: ManualNode = toml::from_str("ip='192.168.1.204'\nalias='CAM'").unwrap();
+        assert!(node.expected_mac.is_none());
+        settings.stream.camera_ip = node.ip.clone();
+        settings.stream.camera_mac = Some("aa:bb:cc:dd:ee:02".into());
+        settings.manual_nodes.push(node);
+        let stream: StreamConfig =
+            toml::from_str(&toml::to_string(&settings.stream).unwrap()).unwrap();
+        let incoming = AppSettings {
+            stream,
+            ..Default::default()
+        };
+        apply_stream_settings_for_test(&mut settings, incoming);
+        let disk: AppSettings = parse_for_test(&serialize_for_test(&settings)).unwrap();
+        assert_eq!(disk.stream.camera_mac.as_deref(), Some("aa:bb:cc:dd:ee:02"));
+        assert_eq!(disk.stream.camera_ip, "192.168.1.204");
+        assert_eq!(disk.manual_nodes.len(), 1);
     }
 }

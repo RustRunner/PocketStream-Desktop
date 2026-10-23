@@ -17,11 +17,13 @@
 
 /** User-visible reachability status of a device record.
  *  Wire shape uses snake_case via `#[serde(rename_all = "snake_case")]`. */
-export type DeviceStatus = "live" | "verifying" | "offline" | "cached_only";
+export type DeviceStatus = "live" | "verifying" | "offline" | "cached_only" | "offline_non_wired_subnet" | "offline_host_owned_ip" | "offline_different_device" | "offline_ambiguous_role";
 
 /** Unified device record. Replaces the old split between ARP map +
  *  scan-result map + alias map + cache file rows. */
 export interface DeviceRecord {
+  verified_by_mac: string | null;
+  last_verified_at: string | null;
   mac: string;
   ip: string;
   subnet: string;
@@ -44,6 +46,7 @@ export type NetworkMode = "dhcp" | "static_auto" | "static_manual";
 /** User-pinned device for `NetworkMode = "static_manual"`. Persists
  *  across mode toggles. */
 export interface ManualNode {
+  expected_mac: string | null;
   ip: string;
   alias: string;
 }
@@ -60,6 +63,7 @@ export interface IpInfo {
 export interface InterfaceInfo {
   name: string;
   display_name: string;
+  description: string;
   ips: IpInfo[];
   mac: string;
   is_up: boolean;
@@ -95,6 +99,7 @@ export interface StreamConfig {
   rtsp_path: string;
   udp_port: number;
   camera_ip: string;
+  camera_mac: string | null;
   /** Audio mute preference; false = audio plays when a stream carries
    *  a supported track. Required so every StreamConfig literal carries
    *  it — an omitted field would deserialize to false backend-side and
@@ -161,6 +166,13 @@ export interface Credentials {
  *  preserves it across saves and the UI reads adoption state via
  *  `get_adoption_state` instead. */
 export interface AdoptedMeta {
+  adapter_mac?: string | null;
+  prefix?: number | null;
+  address?: string | null;
+  desired?: "present" | "removed";
+  applied?: boolean;
+  last_error?: string | null;
+
   /** RFC3339 wall time the subnet was adopted. */
   adopted_at: string | null;
   /** RFC3339 wall time of the last positive device evidence, or null. */
@@ -168,6 +180,9 @@ export interface AdoptedMeta {
 }
 
 export interface AppSettings {
+  selected_adapter_mac: string | null;
+  /** Backend-owned explicit primary CIDR per adapter MAC; empty means removed. */
+  primary_addresses?: Record<string, string>;
   stream: StreamConfig;
   restream_protocol: RestreamProtocol;
   rtsp_server: RtspServerConfig;
@@ -186,6 +201,14 @@ export interface AppSettings {
   manual_nodes: ManualNode[];
 }
 
+export interface AdapterSelection {
+  selected_mac: string | null;
+  adapter: InterfaceInfo | null;
+  interface_index: number | null;
+  selection_required: boolean;
+  candidates: InterfaceInfo[];
+}
+
 // ── Streaming (streaming/mod.rs) ─────────────────────────────────────
 
 export type RelayState =
@@ -198,6 +221,14 @@ export type RelayState =
 
 export interface StreamStatus {
   playing: boolean;
+  playback_desired: boolean;
+  playback_state: "stopped" | "starting" | "playing" | "recovering" | "failed";
+  playback_fault: { kind: "bus_error" | "eos" | "first_frame_timeout" | "frame_stall" | "device_loss" | "configuration";
+    domain: string | null; code: number | null; reason: string; retryable: boolean } | null;
+  playback_recovery_attempt: number;
+  playback_next_retry_secs: number | null;
+  recording_report: string | null;
+  recording_finalized_path: string | null;
   /** Persisted output selector, including while stopped. */
   selected_protocol: RestreamProtocol;
   /** Stored or starting runtime; null once teardown completes. */
@@ -276,6 +307,13 @@ export interface ArpDevicePayload {
  *  (see Rust `AdoptedMetaView`). `stale` is computed backend-side from
  *  the same policy the removal pass uses; the frontend only renders. */
 export interface AdoptedMetaView {
+  adapter_mac?: string | null;
+  prefix?: number | null;
+  address?: string | null;
+  desired?: "present" | "removed";
+  applied?: boolean;
+  last_error?: string | null;
+
   /** RFC3339; null for entries recorded before metadata existed. */
   adopted_at: string | null;
   /** RFC3339; null until positive device evidence arrives. */
@@ -288,6 +326,25 @@ export interface AdoptedMetaView {
 export interface AdoptionSnapshot {
   adopted_subnets: Record<string, string>;
   meta: Record<string, AdoptedMetaView>;
+}
+
+/** An observation returned by one serialized address operation; not a version. */
+export interface AddressReply {
+  operation: number;
+  outcome: "success" | "pending" | "failed" | "busy";
+  reason: string | null;
+  view: {
+    selection: AdapterSelection;
+    identity: { guid: string; index: number; mac: string; alias: string } | null;
+    dhcp: boolean | null;
+    observation_error: string | null;
+    subnet: string | null;
+    binding: AdoptedMetaView | null;
+    address: string;
+    prefix: number | null;
+    mode: NetworkMode;
+    primary_address?: string | null;
+  };
 }
 
 /** Payload for the `subnet-adopted` event emitted by the network
@@ -340,6 +397,19 @@ export interface AdoptionLifecyclePayload {
   adoption_id: string;
 }
 
+export type CaptureScopeOutcome =
+  | { scope: "selected_interface"; source_id: number | null }
+  | { scope: "scoped_by_name"; source_id: number }
+  | { scope: "unscoped_fallback"; reason: string };
+
+/** Shared by the `capture-active` event and get_capture_state query. */
+export interface CaptureState {
+  candidate_count: number;
+  active: boolean;
+  adapter_name: string | null;
+  outcome: CaptureScopeOutcome | null;
+}
+
 /** Payload for the `discovery-degraded` event: the capture backend
  *  delivered no ARP payload events within the window after the provoking
  *  ping sweep. Diagnostic only — availability is never flipped on this. */
@@ -370,3 +440,19 @@ export type LicenseDocumentId =
   | "libpng"
   | "libjpeg-turbo"
   | "bzip2";
+
+/** One fenced OS/config mode transition. A warning reply changes nothing. */
+export interface ModeTransition {
+  name: string;
+  mode: NetworkMode;
+  ip: string | null;
+  subnet_mask: string | null;
+  gateway: string | null;
+  previous_address?: string | null;
+  confirmed: boolean;
+}
+export interface ModeTransitionReply {
+  warning: string | null;
+  mode: NetworkMode;
+  primary_address?: string | null;
+}

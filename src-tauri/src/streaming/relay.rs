@@ -39,6 +39,7 @@ pub enum RelayState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelayFaultKind {
     GstError,
+    PermanentGstError,
     Eos,
     Capability,
     MediaStatusError,
@@ -51,6 +52,7 @@ impl RelayFaultKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::GstError => "gst_error",
+            Self::PermanentGstError => "permanent_gst_error",
             Self::Eos => "eos",
             Self::Capability => "capability",
             Self::MediaStatusError => "media_status_error",
@@ -120,6 +122,7 @@ impl RestreamBuildFailure {
 /// Generation-scoped dependencies shared by eager and deferred output
 /// adapters. It deliberately owns no protocol settings or secrets.
 pub struct RestreamRuntimeContext {
+    pub upstream_ready: Option<super::rtsp_server::UpstreamReady>,
     pub health: std::sync::Arc<RelayRuntimeHealth>,
     pub event_tx: RelayEventSender,
     pub server_instance: u64,
@@ -355,6 +358,18 @@ impl RelayRuntimeHealth {
         self.lock().server_generation
     }
 
+    pub fn permanent_failure(&self) -> bool {
+        self.lock()
+            .first_fault
+            .as_ref()
+            .is_some_and(|f| f.kind == RelayFaultKind::PermanentGstError)
+    }
+
+    pub fn upstream_allowed(&self) -> bool {
+        let inner = self.lock();
+        inner.state != RelayState::Stopped && inner.first_fault.is_none()
+    }
+
     /// Reserve a new listener instance before a build begins.  Automatic
     /// replacements keep the explicit-start generation but receive a fresh
     /// instance id for late-callback rejection.
@@ -493,7 +508,7 @@ impl RelayRuntimeHealth {
     /// immediately.
     pub fn begin_data_generation(&self, server_instance: u64) -> Option<u64> {
         let mut inner = self.lock();
-        if inner.server_instance != server_instance {
+        if inner.server_instance != server_instance || inner.first_fault.is_some() {
             return None;
         }
         inner.data_generation = inner.data_generation.wrapping_add(1).max(1);
@@ -516,6 +531,7 @@ impl RelayRuntimeHealth {
     ) -> bool {
         inner.server_instance == server_instance
             && inner.active_data_generation == Some(data_generation)
+            && inner.first_fault.is_none()
     }
 
     /// Arm (or reconcile) the first-buffer deadline for the current data
@@ -650,7 +666,11 @@ impl RelayRuntimeHealth {
         inner.healthy_since = None;
         Self::transition(
             &mut inner,
-            RelayState::Recovering,
+            if fault.kind == RelayFaultKind::PermanentGstError {
+                RelayState::Failed
+            } else {
+                RelayState::Recovering
+            },
             Some(fault.kind),
             Some(&fault.reason),
         );
@@ -748,6 +768,407 @@ impl RelayRuntimeHealth {
 pub fn recovery_delay(attempt: u32) -> Duration {
     let index = attempt.saturating_sub(1) as usize;
     RECOVERY_DELAYS[index.min(RECOVERY_DELAYS.len() - 1)]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaybackState {
+    Stopped,
+    Starting,
+    Playing,
+    Recovering,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaybackFaultKind {
+    BusError,
+    Eos,
+    FirstFrameTimeout,
+    FrameStall,
+    DeviceLoss,
+    Configuration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PlaybackFault {
+    pub kind: PlaybackFaultKind,
+    pub domain: Option<String>,
+    pub code: Option<i32>,
+    pub reason: String,
+    pub retryable: bool,
+}
+
+impl PlaybackFault {
+    pub fn new(kind: PlaybackFaultKind, reason: impl Into<String>, retryable: bool) -> Self {
+        Self {
+            kind,
+            domain: None,
+            code: None,
+            reason: reason.into(),
+            retryable,
+        }
+    }
+}
+
+pub struct PlaybackSnapshot {
+    pub state: PlaybackState,
+    pub fault: Option<PlaybackFault>,
+    pub attempt: u32,
+    pub next_retry_secs: Option<u64>,
+    pub generation: u64,
+    pub active: bool,
+}
+
+struct PlaybackInner {
+    state: PlaybackState,
+    generation: u64,
+    active: bool,
+    first_fault: Option<PlaybackFault>,
+    fault: Option<PlaybackFault>,
+    started: Option<Instant>,
+    last_buffer: Option<Instant>,
+    healthy_since: Option<Instant>,
+    attempt: u32,
+    next_retry: Option<Instant>,
+}
+
+/// Same first-fault retirement as the relay. Callbacks only touch this record;
+/// the playback supervisor alone owns pipeline teardown, recording and retry.
+pub struct PlaybackHealth {
+    inner: Mutex<PlaybackInner>,
+}
+
+impl PlaybackHealth {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(PlaybackInner {
+                state: PlaybackState::Starting,
+                generation: 0,
+                active: false,
+                first_fault: None,
+                fault: None,
+                started: None,
+                last_buffer: None,
+                healthy_since: None,
+                attempt: 0,
+                next_retry: Some(Instant::now()),
+            }),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, PlaybackInner> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn snapshot(&self) -> PlaybackSnapshot {
+        let s = self.lock();
+        PlaybackSnapshot {
+            state: s.state,
+            fault: s.fault.clone(),
+            attempt: s.attempt,
+            generation: s.generation,
+            active: s.active,
+            next_retry_secs: s.next_retry.map(|t| {
+                let d = t.saturating_duration_since(Instant::now());
+                d.as_secs() + u64::from(d.subsec_nanos() != 0)
+            }),
+        }
+    }
+
+    pub fn due(&self, now: Instant) -> bool {
+        self.lock().next_retry.is_some_and(|t| now >= t)
+    }
+
+    pub fn begin_attempt(&self) -> u64 {
+        let mut s = self.lock();
+        s.generation = s.generation.wrapping_add(1).max(1);
+        s.active = true;
+        s.first_fault = None;
+        s.started = None;
+        s.last_buffer = None;
+        s.healthy_since = None;
+        s.next_retry = None;
+        s.generation
+    }
+
+    pub fn pipeline_started(&self, generation: u64, now: Instant) {
+        let mut s = self.lock();
+        if s.active && s.generation == generation {
+            s.started = Some(now);
+        }
+    }
+
+    pub fn observe_buffer(&self, generation: u64, now: Instant) -> bool {
+        let mut s = self.lock();
+        if !s.active || s.generation != generation {
+            return false;
+        }
+        if s.last_buffer
+            .is_some_and(|last| now.saturating_duration_since(last) >= Duration::from_secs(3))
+        {
+            s.healthy_since = None;
+        }
+        s.last_buffer = Some(now);
+        s.healthy_since.get_or_insert(now);
+        s.state = PlaybackState::Playing;
+        s.fault = None;
+        true
+    }
+
+    pub fn record_fault(&self, generation: u64, fault: PlaybackFault) -> bool {
+        let mut s = self.lock();
+        if !s.active || s.generation != generation {
+            return false;
+        }
+        // Retirement precedes slow detach/Null. A late buffer cannot recover it.
+        s.active = false;
+        s.first_fault = Some(fault.clone());
+        s.state = if fault.retryable {
+            PlaybackState::Recovering
+        } else {
+            PlaybackState::Failed
+        };
+        log::warn!(
+            "Playback generation={} state={:?} fault={:?} attempt={} reason={}",
+            generation,
+            s.state,
+            fault.kind,
+            s.attempt,
+            fault.reason
+        );
+        s.fault = Some(fault);
+        s.healthy_since = None;
+        s.next_retry = None;
+        true
+    }
+
+    pub fn watchdog(&self, now: Instant, stall: Duration) -> Option<PlaybackFault> {
+        let mut s = self.lock();
+        if let Some(fault) = &s.first_fault {
+            return Some(fault.clone());
+        }
+        if !s.active {
+            return None;
+        }
+        let fault = match s.last_buffer {
+            Some(last) if now.saturating_duration_since(last) >= stall => Some(PlaybackFault::new(
+                PlaybackFaultKind::FrameStall,
+                "No usable frames for 3 seconds",
+                true,
+            )),
+            None if s
+                .started
+                .is_some_and(|t| now.saturating_duration_since(t) >= FIRST_BUFFER_TIMEOUT) =>
+            {
+                Some(PlaybackFault::new(
+                    PlaybackFaultKind::FirstFrameTimeout,
+                    "No first frame within 15 seconds",
+                    true,
+                ))
+            }
+            _ => None,
+        };
+        if fault.is_none()
+            && s.healthy_since
+                .is_some_and(|t| now.saturating_duration_since(t) >= HEALTHY_RESET_WINDOW)
+        {
+            s.attempt = 0;
+        }
+        let generation = s.generation;
+        drop(s);
+        if let Some(fault) = &fault {
+            self.record_fault(generation, fault.clone());
+        }
+        fault
+    }
+
+    pub fn schedule_recovery(&self) {
+        let mut s = self.lock();
+        if s.state != PlaybackState::Recovering || s.next_retry.is_some() {
+            return;
+        }
+        s.attempt = s.attempt.saturating_add(1);
+        s.next_retry = Some(Instant::now() + recovery_delay(s.attempt));
+    }
+
+    pub fn wake_ready(&self) {
+        let mut s = self.lock();
+        if s.state == PlaybackState::Recovering && s.next_retry.is_some() {
+            s.next_retry = Some(Instant::now());
+        }
+    }
+
+    pub fn retry(&self) {
+        let mut s = self.lock();
+        if matches!(s.state, PlaybackState::Failed | PlaybackState::Recovering) {
+            s.state = PlaybackState::Recovering;
+            s.active = false;
+            s.next_retry = Some(Instant::now());
+            s.first_fault = None;
+        }
+    }
+
+    pub fn stop(&self) {
+        let mut s = self.lock();
+        s.active = false;
+        s.state = PlaybackState::Stopped;
+        s.next_retry = None;
+        s.first_fault = None;
+    }
+}
+
+#[cfg(test)]
+mod playback_tests {
+    use super::*;
+    const STALL: Duration = Duration::from_secs(3);
+
+    fn fault(kind: PlaybackFaultKind) -> PlaybackFault {
+        PlaybackFault::new(kind, "latched fault", true)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stable_latched_error_retires_before_late_frame_without_repeat_events() {
+        let h = PlaybackHealth::new();
+        let generation = h.begin_attempt();
+        h.pipeline_started(generation, Instant::now());
+        assert!(h.record_fault(generation, fault(PlaybackFaultKind::BusError)));
+        assert!(!h.observe_buffer(generation, Instant::now()));
+        assert!(!h.record_fault(generation, fault(PlaybackFaultKind::Eos)));
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert_eq!(
+                h.watchdog(Instant::now(), STALL).unwrap().kind,
+                PlaybackFaultKind::BusError
+            );
+        }
+        h.schedule_recovery();
+        assert_eq!(h.snapshot().attempt, 1);
+        assert!(h.due(Instant::now()));
+        let replacement = h.begin_attempt();
+        assert!(!h.observe_buffer(generation, Instant::now()));
+        assert_eq!(h.snapshot().state, PlaybackState::Recovering);
+        assert!(h.observe_buffer(replacement, Instant::now()));
+        assert_eq!(h.snapshot().state, PlaybackState::Playing);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_frame_deadline_covers_starting_and_handshake_without_frames() {
+        let h = PlaybackHealth::new();
+        let generation = h.begin_attempt();
+        h.pipeline_started(generation, Instant::now());
+        tokio::time::advance(FIRST_BUFFER_TIMEOUT - Duration::from_millis(1)).await;
+        assert!(h.watchdog(Instant::now(), STALL).is_none());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(
+            h.watchdog(Instant::now(), STALL).unwrap().kind,
+            PlaybackFaultKind::FirstFrameTimeout
+        );
+        assert!(!h.observe_buffer(generation, Instant::now()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_buffer_starts_playing_then_three_second_stall_retires_it() {
+        let h = PlaybackHealth::new();
+        let g = h.begin_attempt();
+        h.pipeline_started(g, Instant::now());
+        tokio::time::advance(Duration::from_secs(14)).await;
+        h.observe_buffer(g, Instant::now());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(h.watchdog(Instant::now(), STALL).is_none());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(
+            h.watchdog(Instant::now(), STALL).unwrap().kind,
+            PlaybackFaultKind::FrameStall
+        );
+        assert_eq!(h.snapshot().state, PlaybackState::Recovering);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn all_backoff_stages_cap_and_readiness_wakes_early() {
+        let h = PlaybackHealth::new();
+        for attempt in 1..=9 {
+            let g = h.begin_attempt();
+            h.record_fault(g, fault(PlaybackFaultKind::DeviceLoss));
+            h.schedule_recovery();
+            assert_eq!(h.snapshot().attempt, attempt);
+            assert_eq!(
+                h.snapshot().next_retry_secs,
+                Some(recovery_delay(attempt).as_secs())
+            );
+            h.wake_ready();
+            assert!(h.due(Instant::now()));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn continuous_frames_reset_attempts_only_after_thirty_seconds() {
+        let h = PlaybackHealth::new();
+        let g = h.begin_attempt();
+        h.record_fault(g, fault(PlaybackFaultKind::Eos));
+        h.schedule_recovery();
+        let g = h.begin_attempt();
+        h.observe_buffer(g, Instant::now());
+        for _ in 0..29 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            h.observe_buffer(g, Instant::now());
+            h.watchdog(Instant::now(), STALL);
+        }
+        assert_eq!(h.snapshot().attempt, 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        h.observe_buffer(g, Instant::now());
+        h.watchdog(Instant::now(), STALL);
+        assert_eq!(h.snapshot().attempt, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn permanent_failure_waits_for_manual_retry_even_after_readiness() {
+        let h = PlaybackHealth::new();
+        let g = h.begin_attempt();
+        h.record_fault(
+            g,
+            PlaybackFault::new(
+                PlaybackFaultKind::Configuration,
+                "Check camera settings",
+                false,
+            ),
+        );
+        h.schedule_recovery();
+        h.wake_ready();
+        tokio::time::advance(Duration::from_secs(120)).await;
+        assert_eq!(h.snapshot().state, PlaybackState::Failed);
+        assert!(!h.due(Instant::now()));
+        h.retry();
+        assert!(h.due(Instant::now()));
+        let replacement = h.begin_attempt();
+        assert_eq!(h.snapshot().state, PlaybackState::Recovering);
+        assert!(!h.observe_buffer(g, Instant::now()));
+        assert!(h.observe_buffer(replacement, Instant::now()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_cancels_every_backoff_and_rejects_late_buffers() {
+        for stage in 1..=RECOVERY_DELAYS.len() {
+            let h = PlaybackHealth::new();
+            let mut g = 0;
+            for _ in 0..stage {
+                g = h.begin_attempt();
+                h.record_fault(g, fault(PlaybackFaultKind::BusError));
+                h.schedule_recovery();
+            }
+            assert_eq!(
+                h.snapshot().next_retry_secs,
+                Some(RECOVERY_DELAYS[stage - 1].as_secs())
+            );
+            h.stop();
+            h.wake_ready();
+            tokio::time::advance(Duration::from_secs(120)).await;
+            assert!(!h.due(Instant::now()));
+            assert!(!h.observe_buffer(g, Instant::now()));
+            assert_eq!(h.snapshot().state, PlaybackState::Stopped);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -995,6 +1416,30 @@ mod tests {
             health.snapshot().error.as_deref(),
             Some("early callback failure")
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn permanent_media_fault_retires_and_stays_failed_until_explicit_start() {
+        let health = RelayRuntimeHealth::new(1, RelayIngestKind::Rtsp);
+        let instance = health.begin_server_instance(false);
+        health.loop_started(instance);
+        health.mark_listener_bound(instance);
+        let generation = begin_data(&health, instance);
+        let fault = health
+            .report_fault(
+                instance,
+                generation,
+                RelayFaultKind::PermanentGstError,
+                "Check credentials".into(),
+            )
+            .unwrap();
+        assert!(!health.observe_buffer(instance, generation, Instant::now()));
+        assert!(health.begin_data_generation(instance).is_none());
+        assert!(health.accept_fault(&fault.fault));
+        assert!(health.permanent_failure());
+        tokio::time::advance(Duration::from_secs(120)).await;
+        assert!(health.evaluate_watchdog(Instant::now()).is_none());
+        assert_eq!(health.snapshot().state, RelayState::Failed);
     }
 
     #[tokio::test(start_paused = true)]

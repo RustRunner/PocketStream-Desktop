@@ -273,12 +273,13 @@ pub struct DataSourceSpecification {
 /// enumeration buffer — `PacketMonitorAddSingleDataSourceToSession`
 /// must receive the original in-buffer entry pointer, so the offset is
 /// the identity that survives parsing.
+#[derive(Debug)]
 pub struct DataSourceEntry {
     pub offset: usize,
     pub name: String,
     pub description: String,
     pub id: u32,
-    pub is_present: bool,
+    pub is_present: i32,
     /// `detail[0..6]`; `None` when all-zero.
     pub mac: Option<[u8; 6]>,
 }
@@ -336,7 +337,7 @@ pub fn parse_data_source_list(buf: &[u8]) -> Result<Vec<DataSourceEntry>, String
             name: utf16_z(&spec.name),
             description: utf16_z(&spec.description),
             id: spec.id,
-            is_present: spec.is_present != 0,
+            is_present: spec.is_present,
             mac: if mac == [0u8; 6] { None } else { Some(mac) },
         });
     }
@@ -347,11 +348,12 @@ pub fn parse_data_source_list(buf: &[u8]) -> Result<Vec<DataSourceEntry>, String
 /// is the join key — it is the only machine identity present in both
 /// the data source (`detail[0..6]`) and the adapter info the discovery
 /// path already resolves; no GUID exists in the enumeration output.
-/// `display_name` anchors log lines only.
-#[derive(Clone)]
+/// Name and description provide a diagnostic fallback, never MAC proof.
+#[derive(Debug, Clone)]
 pub struct CaptureScope {
     pub mac: Option<[u8; 6]>,
     pub display_name: String,
+    pub description: String,
 }
 
 /// How the caller wants the session scoped. `PreferScoped` preserves the
@@ -366,6 +368,8 @@ pub enum CaptureMode {
 }
 
 /// How the session ended up scoped — logged exactly once per start.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "scope", rename_all = "snake_case")]
 pub enum ScopeOutcome {
     /// Scoped to the selected adapter's data source. The id is what the
     /// join bound — recorded so a later liveness probe can detect the
@@ -373,9 +377,22 @@ pub enum ScopeOutcome {
     SelectedInterface {
         source_id: Option<u32>,
     },
+    ScopedByName {
+        source_id: u32,
+    },
     UnscopedFallback {
         reason: String,
     },
+}
+
+impl ScopeOutcome {
+    pub fn source_id(&self) -> Option<u32> {
+        match self {
+            Self::SelectedInterface { source_id } => *source_id,
+            Self::ScopedByName { source_id } => Some(*source_id),
+            Self::UnscopedFallback { .. } => None,
+        }
+    }
 }
 
 /// Why the join produced no scoped source.
@@ -411,8 +428,8 @@ impl std::fmt::Display for JoinFailure {
     }
 }
 
-/// Pure join: exactly one present, MAC-matching source or a failure the
-/// caller converts into the unscoped fallback. Never picks "closest",
+/// Pure MAC join: exactly one present, MAC-matching source or a failure
+/// that permits a diagnostic name match before unscoped fallback. Never picks "closest",
 /// never more than one. `is_present` is a flag-bearing BOOL on real
 /// hardware (values 8 and 9 observed), so presence means nonzero.
 pub fn select_scoped_source(
@@ -423,7 +440,7 @@ pub fn select_scoped_source(
     let matches: Vec<usize> = entries
         .iter()
         .enumerate()
-        .filter(|(_, e)| e.is_present && e.mac == Some(mac))
+        .filter(|(_, e)| e.is_present != 0 && e.mac == Some(mac))
         .map(|(i, _)| i)
         .collect();
     match matches.len() {
@@ -431,6 +448,24 @@ pub fn select_scoped_source(
         0 => Err(JoinFailure::NoMatch),
         n => Err(JoinFailure::Ambiguous(n)),
     }
+}
+
+/// Exact, nonempty, case-insensitive name/description equality only.
+/// A unique match narrows capture but does not verify adapter identity.
+fn select_named_source(entries: &[DataSourceEntry], scope: &CaptureScope) -> Option<usize> {
+    let mut matches = entries.iter().enumerate().filter(|(_, entry)| {
+        entry.is_present != 0
+            && [&scope.display_name, &scope.description]
+                .iter()
+                .any(|wanted| {
+                    !wanted.trim().is_empty()
+                        && [&entry.name, &entry.description]
+                            .iter()
+                            .any(|actual| wanted.trim().eq_ignore_ascii_case(actual.trim()))
+                })
+    });
+    let (index, _) = matches.next()?;
+    matches.next().is_none().then_some(index)
 }
 
 // ── Availability probe ──────────────────────────────────────────────
@@ -509,7 +544,8 @@ pub fn live_source_id_for(scope: &CaptureScope) -> Result<u32, String> {
         if hr != 0 {
             return Err(format!("PacketMonitorInitialize: HRESULT 0x{hr:08X}"));
         }
-        let result = CaptureSession::enumerate_and_join(&api, handle, scope).map(|(_, _, id)| id);
+        let result = CaptureSession::enumerate_and_join(&api, handle, scope)
+            .and_then(|(_, _, outcome)| outcome.source_id().ok_or("no scoped source id".into()));
         let _ = (api.uninitialize)(handle);
         result
     }
@@ -545,16 +581,14 @@ impl CaptureSession {
             ));
         }
         match Self::try_start(&api, session_name, &config, Some(scope)) {
-            Ok((handle, session, stream, scoped_id)) => Ok((
+            Ok((handle, session, stream, outcome)) => Ok((
                 Self {
                     api,
                     handle,
                     session,
                     stream,
                 },
-                ScopeOutcome::SelectedInterface {
-                    source_id: scoped_id,
-                },
+                outcome,
             )),
             Err(scoped_reason) => {
                 let (handle, session, stream, _) =
@@ -586,7 +620,7 @@ impl CaptureSession {
         session_name: &str,
         config: &RealtimeStreamConfiguration,
         scope: Option<&CaptureScope>,
-    ) -> Result<(PmHandle, PmHandle, PmHandle, Option<u32>), String> {
+    ) -> Result<(PmHandle, PmHandle, PmHandle, ScopeOutcome), String> {
         unsafe {
             let mut handle: PmHandle = std::ptr::null_mut();
             let hr = (api.initialize)(API_VERSION_1_0, std::ptr::null_mut(), &mut handle);
@@ -596,7 +630,7 @@ impl CaptureSession {
 
             // Enumeration needs only the post-Initialize handle; join
             // before any session exists so a failure unwinds cheaply.
-            let scoped_source: Option<(Vec<u8>, usize, u32)> = match scope {
+            let scoped_source = match scope {
                 Some(s) => match Self::enumerate_and_join(api, handle, s) {
                     Ok(found) => Some(found),
                     Err(e) => {
@@ -669,9 +703,13 @@ impl CaptureSession {
                 return Err(format!("PacketMonitorSetSessionActive: HRESULT 0x{hr:08X}"));
             }
 
-            let scoped_id = scoped_source.as_ref().map(|(_, _, id)| *id);
-            drop(scoped_source);
-            Ok((handle, session, stream, scoped_id))
+            let outcome = scoped_source.map_or_else(
+                || ScopeOutcome::UnscopedFallback {
+                    reason: "capture started without a scoped source".into(),
+                },
+                |(_, _, outcome)| outcome,
+            );
+            Ok((handle, session, stream, outcome))
         }
     }
 
@@ -679,12 +717,12 @@ impl CaptureSession {
     /// then the pure join. Returns the raw list buffer plus the byte
     /// offset of the matched entry — the original in-buffer pointer is
     /// what `PacketMonitorAddSingleDataSourceToSession` must receive —
-    /// and the matched entry's data-source id.
+    /// and the matched entry's scope outcome.
     fn enumerate_and_join(
         api: &PktMonApi,
         handle: PmHandle,
         scope: &CaptureScope,
-    ) -> Result<(Vec<u8>, usize, u32), String> {
+    ) -> Result<(Vec<u8>, usize, ScopeOutcome), String> {
         unsafe {
             let mut needed: usize = 0;
             let hr = (api.enum_data_sources)(
@@ -713,7 +751,18 @@ impl CaptureSession {
                 return Err(format!("PacketMonitorEnumDataSources: HRESULT 0x{hr:08X}"));
             }
             let entries = parse_data_source_list(&buf)?;
-            let idx = select_scoped_source(&entries, scope).map_err(|e| e.to_string())?;
+            let (idx, by_name) = match select_scoped_source(&entries, scope) {
+                Ok(idx) => (idx, false),
+                Err(reason) => {
+                    log::warn!(
+                        "Capture scope join failed: adapter={scope:?} reason={reason} sources={entries:?}"
+                    );
+                    let idx = select_named_source(&entries, scope).ok_or_else(|| {
+                        format!("{reason}; no unique present name/description match")
+                    })?;
+                    (idx, true)
+                }
+            };
             log::debug!(
                 "Capture scope join: '{}' -> data source id={} ({}, {})",
                 scope.display_name,
@@ -723,7 +772,14 @@ impl CaptureSession {
             );
             let offset = entries[idx].offset;
             let source_id = entries[idx].id;
-            Ok((buf, offset, source_id))
+            let outcome = if by_name {
+                ScopeOutcome::ScopedByName { source_id }
+            } else {
+                ScopeOutcome::SelectedInterface {
+                    source_id: Some(source_id),
+                }
+            };
+            Ok((buf, offset, outcome))
         }
     }
 
@@ -837,7 +893,7 @@ mod tests {
         assert_eq!(entries[0].name, "e1dn.sys");
         assert_eq!(entries[0].description, "Test Adapter");
         assert_eq!(entries[0].id, 70);
-        assert!(entries[0].is_present, "is_present=8 means present");
+        assert_eq!(entries[0].is_present, 8, "preserve the raw presence flag");
         assert_eq!(entries[0].mac, Some(MAC_WIRED));
         assert_eq!(entries[1].mac, Some(MAC_WIFI));
         assert_eq!(entries[0].offset, 8 + 2 * 8);
@@ -892,7 +948,7 @@ mod tests {
             name: "test.sys".into(),
             description: String::new(),
             id: 1,
-            is_present: present,
+            is_present: i32::from(present),
             mac,
         }
     }
@@ -901,6 +957,7 @@ mod tests {
         CaptureScope {
             mac: Some(MAC_WIRED),
             display_name: "Ethernet".into(),
+            description: "ASIX Adapter".into(),
         }
     }
 
@@ -934,6 +991,7 @@ mod tests {
         let scope = CaptureScope {
             mac: None,
             display_name: "Ethernet".into(),
+            description: String::new(),
         };
         assert_eq!(
             select_scoped_source(&entries, &scope),
@@ -959,6 +1017,47 @@ mod tests {
         assert_eq!(
             select_scoped_source(&entries, &wired_scope()),
             Err(JoinFailure::NoMatch)
+        );
+    }
+
+    #[test]
+    fn named_source_matches_description_or_name_uniquely() {
+        let mut named = entry(None, true);
+        named.description = " asix adapter ".into();
+        named.is_present = 9;
+        let entries = [entry(Some(MAC_WIFI), true), named];
+        assert_eq!(select_named_source(&entries, &wired_scope()), Some(1));
+        let mut scope = wired_scope();
+        scope.description.clear();
+        scope.display_name = "TEST.SYS".into();
+        assert_eq!(select_named_source(&entries[1..], &scope), Some(0));
+    }
+
+    #[test]
+    fn named_source_rejects_ambiguous_absent_empty_and_partial_matches() {
+        let mut named = entry(None, true);
+        named.description = "ASIX Adapter".into();
+        let entries = [named, entry(None, true)];
+        let mut scope = wired_scope();
+        scope.display_name = "test.sys".into();
+        assert_eq!(select_named_source(&entries, &scope), None);
+        let mut absent = entry(None, false);
+        absent.description = "ASIX Adapter".into();
+        assert_eq!(select_named_source(&[absent], &wired_scope()), None);
+        scope.display_name.clear();
+        scope.description.clear();
+        assert_eq!(select_named_source(&entries, &scope), None);
+        scope.description = "ASIX".into();
+        assert_eq!(select_named_source(&entries, &scope), None);
+    }
+
+    #[test]
+    fn scope_outcome_preserves_name_match_provenance_in_ipc() {
+        let outcome = ScopeOutcome::ScopedByName { source_id: 42 };
+        assert_eq!(outcome.source_id(), Some(42));
+        assert_eq!(
+            serde_json::to_value(&outcome).unwrap(),
+            serde_json::json!({ "scope": "scoped_by_name", "source_id": 42 })
         );
     }
 

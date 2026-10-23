@@ -12,9 +12,16 @@
  * relevant interface in `types.ts`.
  */
 
+import type { DeviceTarget } from "./store.ts";
+
 import type {
+  AdapterSelection,
+  AddressReply,
   AdoptionSnapshot,
+  ModeTransition,
+  ModeTransitionReply,
   AppSettings,
+  CaptureState,
   Credentials,
   DeviceRecord,
   DeviceStatus,
@@ -100,6 +107,14 @@ export async function listInterfaces(): Promise<InterfaceInfo[]> {
   return await invoke<InterfaceInfo[]>("list_interfaces");
 }
 
+export async function getAdapterSelection(): Promise<AdapterSelection> {
+  return await invoke<AdapterSelection>("get_adapter_selection");
+}
+
+export async function selectAdapter(mac: string): Promise<AdapterSelection> {
+  return await invoke<AdapterSelection>("select_adapter", { mac });
+}
+
 export async function listVpnInterfaces(): Promise<InterfaceInfo[]> {
   return await invoke<InterfaceInfo[]>("list_vpn_interfaces");
 }
@@ -117,12 +132,12 @@ export async function addSecondaryIp(
   name: string,
   ip: string,
   subnetMask: string
-): Promise<void> {
+): Promise<AddressReply> {
   return await invoke("add_secondary_ip", { name, ip, subnetMask });
 }
 
-export async function removeSecondaryIp(name: string, ip: string): Promise<void> {
-  return await invoke("remove_secondary_ip", { name, ip });
+export async function removeSecondaryIp(name: string, ip: string, primary = false): Promise<AddressReply> {
+  return await invoke("remove_secondary_ip", { name, ip, primary });
 }
 
 /**
@@ -133,10 +148,14 @@ export async function setDhcp(name: string): Promise<void> {
   return await invoke("set_dhcp", { name });
 }
 
+export async function getDhcpState(name: string): Promise<boolean> {
+  return await invoke<boolean>("get_dhcp_state", { name });
+}
+
 /**
  * Look up the MAC currently bound to `ip` from the live ARP cache.
  * Returns null if the IP doesn't respond. Used by the cache verify
- * path to confirm the responder at a cached IP is the same physical
+ * diagnostic path to compare the responder at a cached IP is the same physical
  * device (matching MAC), not an unrelated host that happens to share
  * the address today.
  */
@@ -158,8 +177,12 @@ export async function refreshAdapter(
 
 // ── ARP Discovery ───────────────────────────────────────────────────
 
-export async function startArpDiscovery(iface: string): Promise<void> {
-  return await invoke("start_arp_discovery", { interface: iface });
+export async function getCaptureState(): Promise<CaptureState> {
+  return await invoke<CaptureState>("get_capture_state");
+}
+
+export async function startArpDiscovery(iface: string, refresh = false): Promise<void> {
+  return await invoke("start_arp_discovery", { interface: iface, refresh });
 }
 
 // ── Device Registry (canonical device list) ─────────────────────────
@@ -169,14 +192,14 @@ export async function getDeviceList(): Promise<DeviceRecord[]> {
 }
 
 export async function reportScanResult(
-  ip: string,
+  key: string,
   openPorts: number[]
 ): Promise<void> {
-  return await invoke("report_scan_result", { ip, openPorts });
+  return await invoke("report_scan_result", { key, openPorts });
 }
 
-export async function setDeviceAlias(ip: string, alias: string): Promise<DeviceRecord[]> {
-  return await invoke<DeviceRecord[]>("set_device_alias", { ip, alias });
+export async function setDeviceAlias(key: string, alias: string): Promise<DeviceRecord[]> {
+  return await invoke<DeviceRecord[]>("set_device_alias", { key, alias });
 }
 
 export async function setDeviceStatus(
@@ -188,14 +211,6 @@ export async function setDeviceStatus(
 
 export async function forgetDevice(mac: string): Promise<void> {
   return await invoke("forget_device", { mac });
-}
-
-/** Evict a phantom cached device (targeted verify found no open ports).
- *  The backend no-ops for aliased CAM/PTU, manual, and Live entries, so
- *  this is safe to call unconditionally on a failed verify. Returns true
- *  if a device was actually removed. */
-export async function evictPhantomDevice(ip: string): Promise<boolean> {
-  return await invoke<boolean>("evict_phantom_device", { ip });
 }
 
 /** Atomic adoption snapshot: routing map + per-subnet lifecycle
@@ -215,12 +230,9 @@ export async function getConfiguredAdoptions(): Promise<Record<string, string>> 
   return await invoke<Record<string, string>>("get_configured_adoptions");
 }
 
-/** Remove an auto-adopted subnet: unbinds its secondary IP (resolving the
- *  real owning adapter — `ifaceHint` is ordering only) and drops it from
- *  persisted config, even when no live adoption state exists this session.
- *  Rejects (with a backend message) if the subnet is neither adopted nor
- *  configured. */
-export async function removeAdoptedSubnet(subnet: string, ifaceHint?: string): Promise<void> {
+/** Save removal intent before unbinding the exact saved address on its
+ *  owning adapter. Failure remains pending and is retried on adapter return. */
+export async function removeAdoptedSubnet(subnet: string, ifaceHint?: string): Promise<AddressReply> {
   return await invoke("remove_adopted_subnet", { subnet, ifaceHint });
 }
 
@@ -252,6 +264,14 @@ export async function startStream(
           ? windowHandle
           : parseInt(windowHandle, 10),
   });
+}
+
+export async function retryPlayback(): Promise<void> {
+  return await invoke("retry_playback", { manual: true });
+}
+
+export async function reassertPlayback(): Promise<void> {
+  return await invoke("retry_playback", { manual: false });
 }
 
 export async function stopStream(): Promise<void> {
@@ -310,9 +330,10 @@ export async function stopRecording(): Promise<string> {
 
 export async function ptuSend(
   ip: string,
-  cmd: string
+  cmd: string,
+  target: DeviceTarget
 ): Promise<Record<string, string>> {
-  return await invoke<Record<string, string>>("ptu_send", { ip, cmd });
+  return await invoke<Record<string, string>>("ptu_send", { target: { ip, key: target.key, expected_mac: target.expectedMac }, cmd });
 }
 
 /** Open a discovered device's web UI in the system browser. Backend
@@ -368,20 +389,22 @@ export async function sonyCgiZoom(
   ip: string,
   zoomSpeed: number,
   username: string,
-  password: string
+  password: string,
+  target: DeviceTarget
 ): Promise<void> {
-  return await invoke("sony_cgi_zoom", { ip, zoomSpeed, username, password });
+  return await invoke("sony_cgi_zoom", { target: { ip, key: target.key, expected_mac: target.expectedMac }, zoomSpeed, username, password });
 }
 
 export async function controlCgiZoomDirect(
   ip: string,
-  position: number
+  position: number,
+  target: DeviceTarget
 ): Promise<void> {
-  return await invoke("control_cgi_zoom_direct", { ip, position });
+  return await invoke("control_cgi_zoom_direct", { target: { ip, key: target.key, expected_mac: target.expectedMac }, position });
 }
 
-export async function controlCgiProbeStatus(ip: string): Promise<string> {
-  return await invoke<string>("control_cgi_probe_status", { ip });
+export async function controlCgiProbeStatus(ip: string, target: DeviceTarget): Promise<string> {
+  return await invoke<string>("control_cgi_probe_status", { target: { ip, key: target.key, expected_mac: target.expectedMac } });
 }
 
 export async function setZoomPosition(
@@ -397,16 +420,16 @@ export async function getNetworkMode(): Promise<NetworkMode> {
   return await invoke<NetworkMode>("get_network_mode");
 }
 
-export async function setNetworkMode(mode: NetworkMode): Promise<void> {
-  return await invoke("set_network_mode", { mode });
+export async function setNetworkMode(request: ModeTransition): Promise<ModeTransitionReply> {
+  return await invoke<ModeTransitionReply>("set_network_mode", { request });
 }
 
-export async function addManualNode(ip: string, alias: string): Promise<void> {
-  return await invoke("add_manual_node", { ip, alias });
+export async function addManualNode(ip: string, alias: string, expectedMac: string | null = null): Promise<void> {
+  return await invoke("add_manual_node", { ip, alias, expectedMac });
 }
 
-export async function removeManualNode(ip: string): Promise<void> {
-  return await invoke("remove_manual_node", { ip });
+export async function removeManualNode(ip: string, expectedMac: string | null): Promise<void> {
+  return await invoke("remove_manual_node", { ip, expectedMac });
 }
 
 export async function clearManualNodes(): Promise<void> {

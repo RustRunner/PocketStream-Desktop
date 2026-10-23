@@ -26,6 +26,11 @@ import {
   setupArpListeners,
   loadExistingArpState,
   resetDiscoveryStatus,
+  captureState,
+  refreshCaptureState,
+  subscribeCaptureState,
+  listeningNoticeReady,
+  type ListeningNoticeTrigger,
 } from "./lib/devices.ts";
 import { setupCacheDialog } from "./lib/device-cache.ts";
 import * as deviceList from "./lib/device-list.ts";
@@ -39,10 +44,6 @@ import {
   handleHardDisconnect,
   syncVideoVisibility,
   showModalWithVideo,
-  createVideoWindowSynced,
-  beginPipelineSwitch,
-  endPipelineSwitch,
-  updateStreamUI,
   updateMuteButton,
   applyRestreamOperationResult,
   beginRestreamSettingsSave,
@@ -56,6 +57,7 @@ import { setupPtzControls } from "./lib/ptz.ts";
 import type {
   Credentials,
   LicenseDocumentId,
+  NetworkMode,
   StreamConfig,
   StreamProtocol,
 } from "./lib/types.ts";
@@ -85,7 +87,8 @@ document.addEventListener("DOMContentLoaded", async () => {
   setupProtocolToggle();
   setupStreamControls();
   setupRestreamControls();
-  setupIpConfigDialog();
+  setupListeningNotice();
+  setupIpConfigDialog(listeningNoticeModeApplied);
   setupSettingsSave();
   setupCacheDialog();
   setupRefreshButton();
@@ -95,6 +98,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   startStatusListener();
 
   await loadConfig();
+  armListeningNotice("launch", true);
 
   // Paint the mute button's persisted visual state now that config is
   // loaded; it stays disabled until a stream carries audio.
@@ -136,7 +140,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   // render path, so the very first snapshot triggers an initial paint
   // instead of requiring a separate kick.
   setupArpListeners();
-  setupInterfaceWatcher();
+  setupInterfaceWatcher(cancelListeningNotice);
   await deviceList.start();
 
   // Load any devices the backend discovered before our listeners were ready
@@ -145,6 +149,86 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Check for updates (non-blocking)
   checkForUpdates();
 });
+
+// ── Capture listening notice ───────────────────────────────────────
+
+let pendingListeningNotice: ListeningNoticeTrigger = null;
+let openingListeningNotice: ListeningNoticeTrigger = null;
+let waitingForNoticeState = false;
+let listeningNoticeRequest = 0;
+
+function cancelListeningNotice(): void {
+  pendingListeningNotice = null;
+  waitingForNoticeState = false;
+  listeningNoticeRequest++;
+}
+
+function setupListeningNotice(): void {
+  const dialog = $<HTMLDialogElement>("#listening-notice-dialog");
+  dialog.addEventListener("cancel", (event) => event.preventDefault());
+  $<HTMLButtonElement>("#listening-notice-ok").addEventListener("click", () => {
+    dialog.close();
+    considerListeningNotice();
+  });
+  subscribeCaptureState(() => {
+    if (openingListeningNotice && openingListeningNotice !== "launch"
+        && (!captureState.active || !captureState.outcome)) cancelListeningNotice();
+    considerListeningNotice();
+  });
+  void refreshCaptureState().catch((e) => log(`Failed to load capture state: ${formatError(e)}`));
+}
+
+function armListeningNotice(trigger: ListeningNoticeTrigger, useCurrent: boolean): void {
+  cancelListeningNotice();
+  const request = listeningNoticeRequest;
+  pendingListeningNotice = state.config?.network_mode === "static_auto" ? trigger : null;
+  waitingForNoticeState = trigger !== "launch" && !useCurrent;
+  if (useCurrent || trigger === "launch") considerListeningNotice();
+  // Launch instructions must paint before adapter enumeration or capture.
+  // The background state subscription still reports discovery readiness.
+  if (trigger === "launch") return;
+  void refreshCaptureState().then(() => {
+    if (request !== listeningNoticeRequest) return;
+    waitingForNoticeState = false;
+    considerListeningNotice();
+    // A mode Apply already awaited its initial attach. A failed attach
+    // must not leave a prompt armed for a later recovery restart.
+    if (!captureState.active) cancelListeningNotice();
+  }).catch((e) => {
+    if (request === listeningNoticeRequest) cancelListeningNotice();
+    log(`Failed to load capture state: ${formatError(e)}`);
+  });
+}
+
+function listeningNoticeModeApplied(previous: NetworkMode | null, next: NetworkMode): void {
+  cancelListeningNotice();
+  if (previous === next || next !== "static_auto") return;
+  // Manual stopped capture. Fetch its newly activated state instead of
+  // consuming a possibly older cached activation from the previous mode.
+  armListeningNotice(previous === "static_manual" ? "mode_from_manual" : "mode_from_dhcp", previous === "dhcp");
+}
+
+function considerListeningNotice(): void {
+  const ready = listeningNoticeReady(state.config?.network_mode,
+    captureState.active && captureState.outcome !== null, pendingListeningNotice, captureState);
+  const dialog = $<HTMLDialogElement>("#listening-notice-dialog");
+  if (!ready || waitingForNoticeState || openingListeningNotice || dialog.open) return;
+  const trigger = pendingListeningNotice;
+  const launch = trigger === "launch";
+  const adapter = captureState.adapter_name;
+  const selected = state.activeInterface;
+  $("#listening-notice-title").textContent = launch
+    ? "Static–Auto device discovery"
+    : `PocketStream is now listening for devices on "${selected?.name === adapter ? selected.display_name || adapter : adapter}".`;
+  pendingListeningNotice = null;
+  openingListeningNotice = trigger;
+  const request = listeningNoticeRequest;
+  void showModalWithVideo(dialog, () => request === listeningNoticeRequest
+    && state.config?.network_mode === "static_auto" && (launch || (captureState.active
+    && captureState.outcome !== null && captureState.adapter_name === adapter)), !launch)
+    .catch((e) => log(`Failed to open listening notice: ${formatError(e)}`))
+    .finally(() => { openingListeningNotice = null; considerListeningNotice(); });
+}
 
 // ── Auto-updater ───────────────────────────────────────────────────
 
@@ -319,28 +403,14 @@ async function applyPathChange(): Promise<void> {
   // Only restart if there's actually a stream to switch. If the user
   // hasn't started one yet, the new path is queued for the next
   // Start Stream click via state.config.stream.rtsp_path.
-  if (!state.isStreaming || state.streamLost) return;
+  if (!state.isStreaming) return;
 
-  // Suppress the drop detector across the deliberate stop→start: on a
-  // camera with slow RTSP setup the switch spans several status ticks
-  // whose playing=false would otherwise trip the stream-lost teardown
-  // against the pipeline this very switch just started.
-  beginPipelineSwitch();
   try {
-    await api.stopStream();
-    const bounds = getVideoAreaBounds();
-    const handle = await createVideoWindowSynced(bounds);
-    await api.startStream(handle);
+    // The backend supersedes the prior source and retains the existing HWND.
+    await api.startStream();
     showToast("Switched to " + newPath);
   } catch (e) {
-    // The old pipeline is gone and the new one failed to start —
-    // reflect the stopped reality instead of leaving the UI claiming a
-    // live stream that no longer exists.
-    state.isStreaming = false;
-    updateStreamUI();
     showToast("Failed to switch path: " + formatError(e), true);
-  } finally {
-    endPipelineSwitch();
   }
 }
 
@@ -425,6 +495,7 @@ function setupSettingsSave(): void {
       rtsp_path: rtspPath,
       udp_port: parseInt($<HTMLInputElement>("#udp-port").value) || 8600,
       camera_ip: state.config?.stream?.camera_ip || "",
+      camera_mac: state.config?.stream?.camera_mac ?? null,
       // Not a Settings field — preserve the live preference so an
       // unrelated save can't unmute/reset it (the mute toggle keeps
       // state.config in sync when it flips this).
@@ -660,7 +731,8 @@ function setupRefreshButton(): void {
         return;
       }
       resetDiscoveryStatus();
-      await api.startArpDiscovery(state.activeInterface.name);
+      cancelListeningNotice();
+      await api.startArpDiscovery(state.activeInterface.name, true);
       await loadExistingArpState();
     } catch (e) {
       showToast("Refresh failed: " + formatError(e), true);

@@ -2,7 +2,7 @@
   "name": "pocketstream-desktop",
   "private": true,
   "license": "GPL-3.0-only",
-  "version": "0.6.6",
+  "version": "0.6.7",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -12,7 +12,9 @@
     "typecheck": "tsc --noEmit",
     "check:dom": "node scripts/check-dom-selectors.mjs",
     "check:restream": "node scripts/check-restream-card.mjs && node scripts/check-restream-ui.mjs",
-    "check:contracts": "npm run check:dom && npm run check:restream"
+    "check:contracts": "npm run check:dom && npm run check:restream",
+    "test:ptu": "node --test tests/ptu-workflow.test.cjs",
+    "test:network-addresses": "node --test tests/network-address-workflow.test.cjs"
   },
   "dependencies": {
     "qrcode": "^1.5.4"

@@ -97,6 +97,7 @@ pub fn is_structural_ghost_adoption(subnet_key: &str, networks: &[Ipv4Network]) 
 
 /// How a persisted adoption entry should be handled on restore.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub enum AdoptionClass {
     /// Re-bind and keep.
     Keep,
@@ -113,6 +114,7 @@ pub enum AdoptionClass {
 /// ghost (a non-wired interface owns it), then an unparseable IP; anything
 /// else is kept and re-bound. A foreign camera subnet owned by no local
 /// interface (e.g. CAM) is neither native nor ghost, so it is kept.
+#[cfg(test)]
 pub fn classify_adoption(
     subnet_key: &str,
     ip_str: &str,
@@ -196,6 +198,7 @@ mod tests {
         InterfaceInfo {
             name: "t".into(),
             display_name: "t".into(),
+            description: String::new(),
             ips,
             mac: String::new(),
             is_up,
@@ -438,6 +441,8 @@ mod tests {
 
     fn cached(mac: &str, ip: &str) -> CachedDevice {
         CachedDevice {
+            verified_by_mac: None,
+            last_verified_at: None,
             mac: mac.into(),
             ip: ip.into(),
             subnet: String::new(),

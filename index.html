@@ -232,7 +232,11 @@
                 </svg>
                 <h2 id="nodes-title" class="clickable-title" title="Add/Remove Nodes">Nodes</h2>
                 <div class="header-actions">
+                  <div id="discovery-status" class="discovery-status">
+                    <span id="discovery-label">Discovery<span class="discovery-dots" aria-hidden="true"><span>.</span><span>.</span><span>.</span></span></span>
+                  </div>
                   <button id="btn-refresh-nodes" class="icon-btn small" title="Refresh nodes">
+                    <span class="spinner" aria-hidden="true"></span>
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
                       <path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/>
                     </svg>
@@ -240,10 +244,7 @@
                 </div>
               </div>
               <div class="card-body">
-                <div id="discovery-status" class="discovery-status">
-                  <div class="spinner"></div>
-                  <span id="discovery-label">IP Discovery...</span>
-                </div>
+                <p id="capture-scope-status" class="muted" role="status" aria-live="polite" hidden></p>
                 <div id="device-list" class="device-list"></div>
               </div>
               <div class="card-footer">
@@ -507,6 +508,10 @@
         <div id="ip-static-section">
           <!-- Primary IP -->
           <h3 class="ip-section-label">Primary IP</h3>
+          <div class="input-field" id="primary-existing-field" style="display:none">
+            <label for="primary-existing-ip">Address to replace</label>
+            <select id="primary-existing-ip"></select>
+          </div>
           <div class="ip-row-fields">
             <div class="input-field" style="flex:2">
               <label for="static-ip">Address</label>
@@ -521,6 +526,7 @@
             <label for="static-gateway">Gateway (optional)</label>
             <input type="text" id="static-gateway" placeholder="192.168.1.1" />
           </div>
+          <button type="button" class="text-btn" id="btn-remove-primary-ip" style="display:none">Remove primary IP</button>
 
           <!-- Secondary IPs -->
           <h3 class="ip-section-label">Secondary IPs</h3>
@@ -541,8 +547,18 @@
         </div>
       </div>
       <div class="dialog-actions">
-        <button class="text-btn" id="ip-config-cancel">Cancel</button>
-        <button class="filled-btn" id="ip-config-apply">Apply</button>
+        <button type="button" class="filled-btn" id="ip-config-close">Close</button>
+      </div>
+    </dialog>
+
+    <!-- Capture listening notice: acknowledged only with OK. -->
+    <dialog id="listening-notice-dialog" class="dialog" closedby="none" aria-labelledby="listening-notice-title" style="max-width: 520px">
+      <div class="dialog-body">
+        <p id="listening-notice-title" style="margin-bottom: 16px">Static–Auto device discovery</p>
+        <p>Discovery starts automatically. Some cameras announce themselves only when their network link comes up. If your camera does not appear after discovery starts, unplug the camera's network cable and plug it back in.</p>
+      </div>
+      <div class="dialog-actions">
+        <button type="button" class="filled-btn" id="listening-notice-ok" autofocus>OK</button>
       </div>
     </dialog>
 

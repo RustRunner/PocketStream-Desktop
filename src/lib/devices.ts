@@ -12,7 +12,6 @@
  * Concerns that live here (not in the backend):
  *   - The discovery phase spinner machine (UX, not data)
  *   - Settle-debounced scan trigger (UX policy)
- *   - Cache verification retry policy (UX policy)
  *   - The DOM rendering itself
  *   - Role dropdown UI (CAM / PTU / Clear per node)
  */
@@ -30,24 +29,28 @@ import {
 import {
   renderSubnetList,
   isInterfaceConnected,
-  refreshIpDialogIfOpen,
+  refreshHostBindings,
+  refreshNetworkEvent,
+  sessionAdoptedSubnets,
 } from "./network.ts";
 import {
   clearScannedIps,
   hasRouteToSubnet,
   isIpScanned,
   markIpScanned,
+  presenceLabel,
   visibleDevices,
 } from "./device-state.ts";
 import * as deviceList from "./device-list.ts";
-import { getActivePlaybackIp, stopStreamNow } from "./streaming.ts";
+import { getActivePlaybackTarget, stopStreamNow, updateRestreamUI } from "./streaming.ts";
 import { haltPtuUnit } from "./ptz.ts";
-import { selectedDevice, sessionCamIp } from "./store.ts";
+import { selectedDevice, sessionCamTarget } from "./store.ts";
 import { formatError } from "./errors.ts";
 import type {
   AdoptionFailedPayload,
   ArpDevicePayload,
-  DevicePingResultPayload,
+  CaptureState,
+  NetworkMode,
   DeviceRecord,
   DiscoveryDegradedPayload,
   DiscoveryRecoveredPayload,
@@ -65,26 +68,70 @@ function cssAttrValue(value: string): string {
 
 // ── Local scanning state ────────────────────────────────────────────
 
+/** Current capture state for the launch notice and diagnostics. */
+export let captureState: CaptureState = {
+  candidate_count: 0,
+  active: false,
+  adapter_name: null,
+  outcome: null,
+};
+
+type CaptureSubscriber = (next: CaptureState) => void;
+const captureSubscribers = new Set<CaptureSubscriber>();
+let captureSubscription: Promise<() => void> | null = null;
+let captureRevision = 0;
+let captureFetch = 0;
+
+function updateCaptureState(next: CaptureState): void {
+  captureState = next;
+  captureRevision++;
+  const indicator = $("#capture-scope-status");
+  // Capture scope remains available to the notice and logger; the Nodes card
+  // shows the devices without a permanent explanation of the capture fallback.
+  indicator.textContent = "";
+  indicator.hidden = true;
+  for (const subscriber of captureSubscribers) subscriber(next);
+}
+
+export function subscribeCaptureState(subscriber: CaptureSubscriber): () => void {
+  captureSubscribers.add(subscriber);
+  return () => { captureSubscribers.delete(subscriber); };
+}
+
+/** Subscribe before every fetch; an event or newer query wins a stale reply. */
+export async function refreshCaptureState(): Promise<CaptureState> {
+  captureSubscription ??= api.onEvent<CaptureState>("capture-active", updateCaptureState)
+    .catch((error: unknown) => { captureSubscription = null; throw error; });
+  await captureSubscription;
+  const request = ++captureFetch;
+  const revision = captureRevision;
+  const current = await api.getCaptureState();
+  if (current && request === captureFetch && revision === captureRevision) updateCaptureState(current);
+  return captureState;
+}
+
+export type ListeningNoticeTrigger = "launch" | "mode_from_manual" | "mode_from_dhcp"
+  | "refresh" | "reconnect" | "watchdog" | null;
+
+/** Pure eligibility rule; only launch and a real change to Auto may arm it. */
+export function listeningNoticeReady(
+  mode: NetworkMode | undefined, discoveryAvailable: boolean,
+  trigger: ListeningNoticeTrigger, capture: CaptureState,
+): boolean {
+  return mode === "static_auto" && (trigger === "launch" || (discoveryAvailable
+    && capture.active && capture.outcome !== null && capture.adapter_name !== null
+    && (trigger === "mode_from_manual" || trigger === "mode_from_dhcp")));
+}
+
 let pendingScans = 0;
 
-// ── ICMP reachability dots ──────────────────────────────────────────
-// IP → latest ping result. Missing entry = no probe yet (gray dot).
-// The backend pinger publishes `device-ping-result` events; we treat
-// the latest value per IP as the source of truth for the dot.
-const pingResults = new Map<string, boolean>();
-
-/** Render a status dot for a device's IP based on the latest ping
- *  result. Gray if no probe has come back yet, green if reachable,
- *  red if the last probe failed. */
-function renderReachabilityDot(ip: string): string {
-  const result = pingResults.get(ip);
-  if (result === undefined) {
-    return '<span class="device-dot dot-pending" title="Checking reachability..."></span>';
-  }
-  if (result) {
-    return '<span class="device-dot dot-green" title="Reachable"></span>';
-  }
-  return '<span class="device-dot dot-red" title="No response on last probe"></span>';
+/** The dot and text use the same backend presence status. ICMP and
+ *  open ports never change either indicator. */
+function renderPresenceDot(record: DeviceRecord): string {
+  const color = record.status === "live" ? "dot-green"
+    : record.status === "verifying" || record.status === "cached_only" ? "dot-pending"
+    : "dot-red";
+  return `<span class="device-dot ${color}" title="${escapeHtml(presenceLabel(record))}"></span>`;
 }
 
 // ── Debounced scan trigger ─────────────────────────────────────────
@@ -96,6 +143,7 @@ let settleTimer: ReturnType<typeof setTimeout> | null = null;
 
 /** Reset the settle timer — called on every new ARP device or adoption. */
 function debounceScan(): void {
+  if (state.config?.network_mode === "static_manual") return;
   if (settleTimer) clearTimeout(settleTimer);
   settleTimer = setTimeout(() => {
     settleTimer = null;
@@ -106,10 +154,11 @@ function debounceScan(): void {
 /** Scan every device the backend currently knows about that's on a
  *  routable subnet and we haven't scanned this session. */
 function scanAllRoutableDevices(): void {
-  const toScan: string[] = [];
+  if (state.config?.network_mode === "static_manual") return;
+  const toScan: DeviceRecord[] = [];
   for (const record of deviceList.getDevices()) {
     if (!isIpScanned(record.ip) && hasRouteToSubnet(record.subnet)) {
-      toScan.push(record.ip);
+      toScan.push(record);
     }
   }
   if (toScan.length === 0) {
@@ -123,22 +172,22 @@ function scanAllRoutableDevices(): void {
   }
   log(`Scanning ${toScan.length} routable device(s)...`);
   setDiscoveryPhase("scanning");
-  for (const ip of toScan) {
-    scanDevicePorts(ip);
+  for (const record of toScan) {
+    scanDevicePorts(record.mac, record.ip);
   }
 }
 
 // ── Discovery status ─────────────────────────────────────────────────
 //
 // Phase machine with three states driving the Nodes-card spinner:
-//   "discovering" → "IP Discovery..."  (ARP + subnet adoption in flight)
-//   "scanning"    → "Port Scan..."     (TCP probes in flight)
+//   "discovering" → Discovery + dots  (ARP + subnet adoption in flight)
+//   "scanning"    → Discovery + dots  (TCP probes in flight)
 //   "idle"        → no spinner         (everything settled)
 //
 // The spinner is a *startup progress indicator*, not a live activity
 // readout. Once the initial flow completes (first idle after adoption
 // + scanning), background ARP traffic must not resurrect it — otherwise
-// the nodes card would flicker back to "IP Discovery..." indefinitely
+// the Nodes header would flicker back to "Discovery..." indefinitely
 // on any busy network. `initialFlowComplete` enforces that by coercing
 // any post-startup "discovering" request into "idle".
 //
@@ -165,7 +214,7 @@ let initialFlowStartedAt = 0;
 let graceTimer: ReturnType<typeof setTimeout> | null = null;
 
 function initialGraceRemaining(): number {
-  if (initialFlowComplete || initialFlowStartedAt === 0) return 0;
+  if (state.config?.network_mode === "static_manual" || initialFlowComplete || initialFlowStartedAt === 0) return 0;
   return initialFlowStartedAt + INITIAL_DISCOVERY_GRACE_MS - Date.now();
 }
 
@@ -194,16 +243,18 @@ function armGraceTimer(delay: number): void {
 function applyDiscoveryPhaseToDOM(): void {
   const container = $("#discovery-status");
   if (!container) return;
+  // The manual Refresh request owns "spinning" independently of this flow.
+  $("#btn-refresh-nodes").classList.toggle("discovery-active", discoveryPhase !== "idle");
   if (discoveryPhase === "idle") {
     container.classList.add("hidden");
     return;
   }
-  const label = discoveryPhase === "scanning" ? "Port Scan..." : "IP Discovery...";
-  $("#discovery-label").textContent = label;
   container.classList.remove("hidden");
 }
 
 function setDiscoveryPhase(phase: DiscoveryPhase): void {
+  // Late ARP, scan and reconnect callbacks cannot revive Manual discovery.
+  if (state.config?.network_mode === "static_manual") phase = "idle";
   if (phase === "discovering" && initialFlowComplete) {
     phase = "idle";
   }
@@ -218,7 +269,7 @@ function setDiscoveryPhase(phase: DiscoveryPhase): void {
   // Engage the one-shot lock only on a *real* completion — scanning →
   // idle via scanDevicePorts. A direct discovering → idle (hideDiscoveryStatus
   // on link drop, explicit reset paths) is not completion and must not
-  // lock future "IP Discovery..." transitions.
+  // lock future "Discovery..." transitions.
   if (phase === "idle" && wasScanning) initialFlowComplete = true;
   applyDiscoveryPhaseToDOM();
 }
@@ -231,9 +282,10 @@ function isDiscoveryActive(): boolean {
   return discoveryPhase !== "idle";
 }
 
-/** Hide the Nodes-card discovery spinner. Exported for the interface
- *  watcher so it can cancel a stuck spinner on link-down. */
+/** Retire pending discovery progress on link-down or entering Manual. */
 export function hideDiscoveryStatus(): void {
+  if (settleTimer) clearTimeout(settleTimer);
+  settleTimer = null;
   clearGraceTimer();
   setDiscoveryPhase("idle");
 }
@@ -244,7 +296,7 @@ export function resetDiscoveryStatus(): void {
   settleTimer = null;
   clearGraceTimer();
   // Clear the one-shot lock so a reconnect / user-initiated rescan can
-  // legitimately show "IP Discovery..." again at the start of the fresh
+  // legitimately show "Discovery..." again at the start of the fresh
   // flow. Must happen BEFORE setDiscoveryPhase, or the coercion would
   // bounce "discovering" → "idle". The grace clock restarts with the
   // fresh flow for the same reason.
@@ -255,7 +307,7 @@ export function resetDiscoveryStatus(): void {
   // fast UI recovery, so the backend often doesn't re-fire subnet-adopted
   // or arp-device-discovered events — which means debounceScan never
   // triggers, scanAllRoutableDevices never runs, and the spinner would
-  // stay on "IP Discovery..." indefinitely. Kick a scan of the already-
+  // stay on "Discovery..." indefinitely. Kick a scan of the already-
   // known devices immediately; if the deviceList is empty (cold start),
   // the function returns early and we correctly stay in "discovering"
   // waiting for fresh ARP events.
@@ -265,8 +317,24 @@ export function resetDiscoveryStatus(): void {
 // ── ARP event listeners ─────────────────────────────────────────────
 
 export function setupArpListeners(): void {
+  void refreshCaptureState().catch((e) => log(`Failed to load capture state: ${formatError(e)}`));
+
   // Re-render whenever the backend pushes a new snapshot.
-  deviceList.subscribe(renderArpDeviceList);
+  let scanReadyKeys = new Set<string>();
+  let liveSubnets = new Set<string>();
+  deviceList.subscribe((snapshot) => {
+    const nextLive = new Set(snapshot.filter((r) => r.status === "live").map((r) => r.subnet));
+    for (const subnet of sessionAdoptedSubnets) {
+      if (liveSubnets.has(subnet) && !nextLive.has(subnet)) sessionAdoptedSubnets.delete(subnet);
+    }
+    liveSubnets = nextLive;
+    renderSubnetList();
+    renderArpDeviceList();
+    const ready = snapshot.filter((r) => r.status === "live" && hasRouteToSubnet(r.subnet));
+    const newPeer = ready.some((r) => !scanReadyKeys.has(r.mac) && !isIpScanned(r.ip));
+    scanReadyKeys = new Set(ready.map((r) => r.mac));
+    if (newPeer && state.config?.network_mode !== "static_manual") debounceScan();
+  });
 
   // Only show a spinner when the link is actually up. A stale
   // disconnected adapter (state.activeInterface set, but ips=[]) would
@@ -291,7 +359,7 @@ export function setupArpListeners(): void {
     if (isNew) {
       log(`ARP: discovered ${device.ip} (${device.mac})`);
       // Mid-scan ARPs flip us back to "discovering" only if we're not
-      // already showing "Port Scan..." for in-flight scans. That keeps
+      // already in the scanning phase for in-flight scans. That keeps
       // the UX linear (Discovery → Scan → idle) instead of flickering
       // back to Discovery every time a late ARP arrives during a scan.
       if (discoveryPhase === "idle") {
@@ -301,38 +369,14 @@ export function setupArpListeners(): void {
     }
   });
 
-  api.onEvent<DevicePingResultPayload>("device-ping-result", (data) => {
-    const prev = pingResults.get(data.ip);
-    pingResults.set(data.ip, data.reachable);
-    // Only re-render when the dot color would change. ICMP results
-    // are inherently noisy; redrawing every device row twice per
-    // minute regardless of change would be a wasted render.
-    if (prev !== data.reachable) {
-      renderArpDeviceList();
-    }
-  });
-
   // Quiet-network watchdog signals. Diagnostic only — the backend never
   // flips discovery availability on silence, so this is a heads-up that a
   // provoked ping sweep drew no ARP frames (dead subnet, or capture not
-  // delivering). At most one degraded toast per discovery session.
+  // delivering). Keep this in diagnostics and the existing panel state.
   api.onEvent<DiscoveryDegradedPayload>("discovery-degraded", (data) => {
     const drops =
       data.missed_packets > 0 ? ` (ring drops: ${data.missed_packets})` : "";
     log(`Discovery degraded: ${data.reason}${drops}`);
-    // The watchdog sees only the ARP capture channel — not ICMP, and
-    // not the OS ARP-table merge that backstops it at sweep end. When
-    // the panel already shows a reachable node (cached device with a
-    // green ping dot, or a Live record), a "no devices" toast
-    // contradicts what the user is looking at. Keep the log line for
-    // diagnosing real capture regressions; toast only when the panel
-    // is as empty as the capture channel.
-    const anyReachable =
-      [...pingResults.values()].some(Boolean) ||
-      deviceList.getDevices().some((r) => r.status === "live");
-    if (!anyReachable) {
-      showToast("No devices responding to discovery yet", true);
-    }
     // If the only thing keeping the startup spinner alive is the grace
     // hold, a dead capture channel means there's nothing left to wait
     // for — unwind just the hold; every other spinner state keeps its
@@ -350,52 +394,38 @@ export function setupArpListeners(): void {
     log("Discovery recovered — devices responding again");
   });
 
-  api.onEvent<SubnetAdoptedPayload>("subnet-adopted", (data) => {
+  api.onEvent<SubnetAdoptedPayload & import("./types.ts").AdoptedMetaView & { restored: boolean }>("subnet-adopted", (data) => {
     log(`Subnet adopted: ${data.subnet} -> ${data.adopted_ip}`);
     adoptedSubnets.set(data.subnet, data.adopted_ip);
-    adoptionMeta.set(data.subnet, {
-      adopted_at: data.adopted_at,
-      last_device_seen: data.last_device_seen,
-      stale: data.stale,
-    });
+    adoptionMeta.set(data.subnet, data);
+    if (data.restored === false && state.activeInterface?.is_up && data.adapter_mac?.replaceAll("-", ":").toLowerCase() === state.activeInterface.mac.replaceAll("-", ":").toLowerCase()) sessionAdoptedSubnets.add(data.subnet);
     renderSubnetList();
-    // Briefly flash the row so the user notices a live adoption. The
-    // class auto-clears after the CSS animation; the persistent "(auto)"
-    // badge stays put. No state to clean up because renderSubnetList
-    // rebuilds the row from scratch next render.
+    // Flash only a fresh adoption; restored rows remain plain.
     const row = $(
       `#subnet-list .subnet-row[data-subnet="${cssAttrValue(data.subnet)}"]`
     );
-    if (row) {
+    if (row && data.restored === false) {
       row.classList.add("subnet-row-just-adopted");
       setTimeout(() => row.classList.remove("subnet-row-just-adopted"), 2500);
     }
     // Reset the settle timer — netsh needs time to activate the IP
     debounceScan();
+    refreshNetworkEvent();
   });
 
   api.onEvent<AdoptionFailedPayload>("adoption-failed", (data) => {
     // Diagnostic only — the adopt loop retries with backoff on its own.
     log(`Auto-adopt failed for ${data.subnet}: ${data.error}`);
-    showToast(`Couldn't join ${data.subnet} — will retry`, true);
   });
 
-  // One removal path for every surface: whether the backend reaped a
-  // stale adoption or the user removed one from either panel, this
-  // event is what clears the frontend maps and re-renders — the
-  // optimistic local deletes in the click handlers are just immediate
-  // feedback, this is authoritative.
+  // Removal does not erase backend tombstones; refresh their final status.
   api.onEvent<SubnetRemovedPayload>("subnet-removed", (data) => {
     log(`Subnet removed (${data.reason}): ${data.subnet} (${data.adopted_ip})`);
     adoptedSubnets.delete(data.subnet);
+    sessionAdoptedSubnets.delete(data.subnet);
     adoptionMeta.delete(data.subnet);
     renderSubnetList();
-    void refreshIpDialogIfOpen();
-    // Manual removals already toast from their click handler; only a
-    // background reap needs to tell the user something happened.
-    if (data.reason === "stale_apipa") {
-      showToast(`Removed stale adoption ${data.subnet} — no device seen there`);
-    }
+    refreshNetworkEvent();
   });
 
   // Initial hydration / scan kickoff is orchestrated from main.js
@@ -407,27 +437,19 @@ export function setupArpListeners(): void {
  *  backend has already given us (cached entries from cold start, or
  *  ARP discoveries we missed before subscribing). */
 export async function loadExistingArpState(): Promise<void> {
+  if (state.config?.network_mode === "static_manual") {
+    setDiscoveryPhase("idle");
+    return;
+  }
   if (!isInterfaceConnected()) {
     setDiscoveryPhase("idle");
     return;
   }
 
   try {
-    const snapshot = await api.getAdoptionState();
-    const entries = Object.entries(snapshot.adopted_subnets);
-    for (const [subnet, ip] of entries) {
-      adoptedSubnets.set(subnet, ip);
-    }
-    for (const [subnet, meta] of Object.entries(snapshot.meta)) {
-      adoptionMeta.set(subnet, meta);
-    }
-    if (entries.length > 0) renderSubnetList();
+    await refreshHostBindings();
 
-    // Kick verification + scanning for whatever's already in the
-    // registry. Cached-only records on routable subnets get a fast
-    // verify pass; everything else falls through to the regular
-    // scan-all path.
-    verifyCachedRoutableDevices();
+    // Presence is owned by the backend. Scan only for capabilities.
 
     if (deviceList.getDevices().length > 0) {
       scanAllRoutableDevices();
@@ -439,151 +461,33 @@ export async function loadExistingArpState(): Promise<void> {
   }
 }
 
-// ── Cache verification ─────────────────────────────────────────────
-// For cached-only records on currently-routable subnets, run a fast
-// targeted scan to confirm they're still reachable. Three attempts
-// handles devices (notably the FLIR PTU) that need an extra moment
-// to respond on a freshly bound secondary IP. Worst case before
-// flagging offline: ~5s (1.5s + 3s + ~1s scans).
-
-const VERIFY_MAX_ATTEMPTS = 3;
-const VERIFY_RETRY_DELAY_MS = 1500;
-
-/** How long to wait before re-verifying a device that's currently
- *  flagged offline. Without this, a device that failed the startup
- *  verify race (e.g., a brief ping-sweep saturation during cold
- *  start) stays flagged offline forever — the isIpScanned guard
- *  would normally block any future scan anyway, so we also clear
- *  that on offline-set. */
-const OFFLINE_RETRY_INTERVAL_MS = 60_000;
-const offlineRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
-
-function verifyCachedRoutableDevices(): void {
-  for (const record of deviceList.getDevices()) {
-    if (record.status !== "cached_only") continue;
-    if (!hasRouteToSubnet(record.subnet)) continue;
-    if (isIpScanned(record.ip)) continue;
-    fastVerifyCachedDevice(record.mac, record.ip);
-  }
-}
-
-/** Schedule a periodic re-verify for an offline device so the status
- *  self-heals once the device responds again (without requiring the
- *  user to click the Nodes refresh button). Replaces any previously
- *  pending retry for the same MAC. */
-function scheduleOfflineRetry(mac: string, ip: string): void {
-  const existing = offlineRetryTimers.get(mac);
-  if (existing) clearTimeout(existing);
-  const timer = setTimeout(() => {
-    offlineRetryTimers.delete(mac);
-    const record = deviceList.getDevices().find((r) => r.mac === mac);
-    // Bail if the device went away (forgot), is no longer offline
-    // (something else verified it), or the subnet is no longer
-    // routable (Ethernet down / subnet dropped).
-    if (!record || record.status !== "offline") return;
-    if (!hasRouteToSubnet(record.subnet)) return;
-    fastVerifyCachedDevice(mac, ip);
-  }, OFFLINE_RETRY_INTERVAL_MS);
-  offlineRetryTimers.set(mac, timer);
-}
-
-async function fastVerifyCachedDevice(
-  mac: string,
-  ip: string,
-  attempt = 0
-): Promise<void> {
-  if (attempt === 0) {
-    markIpScanned(ip);
-    // Flip to verifying so the UI shows the badge through retries.
-    api.setDeviceStatus(mac, "verifying").catch((e: unknown) => {
-      log(`set verifying status failed for ${ip}: ${formatError(e)}`);
-    });
-  }
-
-  let verified = false;
-  try {
-    const results = await api.scanNetwork(`${ip}/32`);
-    if (results) {
-      for (const r of results) {
-        if (r.ip === ip && r.reachable && r.open_ports.length > 0) {
-          // Identity check: a successful port scan only proves *some
-          // host* answers at this IP. To claim our cached record is
-          // still live, the responder's MAC must also match — otherwise
-          // a different device that happens to occupy this IP today
-          // would resurrect the record as a false-positive Live.
-          const liveMac = await api.resolveMac(ip);
-          if (liveMac && liveMac.toLowerCase() === mac.toLowerCase()) {
-            // Backend's report_scan_result auto-flips the record to
-            // "live" + persists to cache + emits a new snapshot.
-            await api.reportScanResult(r.ip, r.open_ports);
-            verified = true;
-          } else {
-            log(
-              `Cache verify: identity mismatch at ${ip} — expected ${mac}, found ${liveMac ?? "no ARP"}`
-            );
-          }
-        }
-      }
-    }
-  } catch (e) {
-    log(`Cache verify failed for ${ip} (attempt ${attempt + 1}): ${formatError(e)}`);
-  }
-
-  if (verified) {
-    return;
-  }
-  if (attempt + 1 < VERIFY_MAX_ATTEMPTS) {
-    // Hold the verifying badge through the retry — flipping to offline
-    // just to flip back would be jarring.
-    setTimeout(
-      () => fastVerifyCachedDevice(mac, ip, attempt + 1),
-      VERIFY_RETRY_DELAY_MS
-    );
-  } else {
-    // Final attempt failed — flag offline so the UI can dim it and
-    // the user knows clicking it may not work right now. Clear the
-    // scanned flag so future scans CAN retry this IP (without this,
-    // isIpScanned blocks every later attempt and the device stays
-    // offline forever even after it comes back), and schedule a
-    // periodic re-verify so the status self-heals when conditions
-    // improve.
-    markIpScanned(ip, /* clear */ true);
-    // Evict phantom cache rows: a device that never verifies is probably
-    // gone. The backend exempts aliased CAM/PTU, manual nodes, and Live
-    // entries, so only genuinely-unimportant phantoms are removed; the
-    // exempt ones fall through to the dim-and-re-verify self-heal path.
-    let evicted = false;
-    try {
-      evicted = await api.evictPhantomDevice(ip);
-    } catch (e) {
-      log(`evict phantom ${ip} failed: ${formatError(e)}`);
-    }
-    if (evicted) return;
-    api.setDeviceStatus(mac, "offline").catch((e: unknown) => {
-      log(`set offline status failed for ${ip}: ${formatError(e)}`);
-    });
-    scheduleOfflineRetry(mac, ip);
-  }
-}
-
 // ── Port scanning ───────────────────────────────────────────────────
 
 const MAX_SCAN_RETRIES = 2;
 const RETRY_DELAY_MS = 4000;
 
-async function scanDevicePorts(ip: string, attempt = 0): Promise<void> {
+async function scanDevicePorts(mac: string, ip: string, attempt = 0): Promise<void> {
+  const isManual = () => state.config?.network_mode === "static_manual";
+  if (isManual()) {
+    if (attempt > 0) pendingScans--;
+    return;
+  }
   if (attempt === 0 && isIpScanned(ip)) return;
   markIpScanned(ip);
   if (attempt === 0) pendingScans++;
 
   try {
     const results = await api.scanNetwork(`${ip}/32`);
+    if (isManual()) {
+      pendingScans--;
+      return;
+    }
     let found = false;
     if (results) {
       for (const r of results) {
         if (r.reachable && r.open_ports.length > 0) {
-          // Backend persists, flips status to live, and emits a snapshot.
-          await api.reportScanResult(r.ip, r.open_ports);
+          // Attach capabilities to the scheduled identity, without promoting it.
+          await api.reportScanResult(mac, r.open_ports);
           found = true;
         }
       }
@@ -595,15 +499,15 @@ async function scanDevicePorts(ip: string, attempt = 0): Promise<void> {
       // duplicate scan chain for this IP; release it only once retries
       // are exhausted.
       if (attempt < MAX_SCAN_RETRIES) {
-        setTimeout(() => scanDevicePorts(ip, attempt + 1), RETRY_DELAY_MS);
+        setTimeout(() => scanDevicePorts(mac, ip, attempt + 1), RETRY_DELAY_MS);
         return; // don't decrement pendingScans yet
       }
       markIpScanned(ip, /* clear */ true);
     }
   } catch (e) {
     log(`Port scan failed for ${ip}: ${formatError(e)}`);
-    if (attempt < MAX_SCAN_RETRIES) {
-      setTimeout(() => scanDevicePorts(ip, attempt + 1), RETRY_DELAY_MS);
+    if (attempt < MAX_SCAN_RETRIES && !isManual()) {
+      setTimeout(() => scanDevicePorts(mac, ip, attempt + 1), RETRY_DELAY_MS);
       return;
     }
     markIpScanned(ip, /* clear */ true);
@@ -634,7 +538,7 @@ async function scanDevicePorts(ip: string, attempt = 0): Promise<void> {
 // ── Device list rendering ───────────────────────────────────────────
 
 // Render deferral while a role menu is open: the list is rebuilt
-// wholesale via innerHTML on every snapshot and on ping-dot flips,
+// wholesale via innerHTML on every snapshot,
 // and that teardown would close an open <select> popup mid-pick.
 // While one is open, renders queue behind a flag and flush on close.
 let roleMenuOpen = false;
@@ -656,21 +560,10 @@ export function renderArpDeviceList(): void {
   }
   const list = $("#device-list");
 
-  // While disconnected, render nothing — the records may still be in
-  // the backend's registry (preserved deliberately so a replug restores
-  // them fast), but they're unreachable right now. Returning early
-  // keeps the card empty without having to drop the state.
-  if (!isInterfaceConnected()) {
-    list.innerHTML = "";
-    return;
-  }
-
-  // Shared visibility filter (panel-strict): drops the host's own IPs,
-  // cached-only rows on unroutable subnets, own-MAC ghosts, and any
-  // non-manual entry without an open port. The Add/Remove Nodes dialog
-  // uses the same helper without the strict flag.
+  // Keep the same history as the manager dialog, including disconnected
+  // and zero-port records. The backend owns inactive topology reasons.
   const bySubnet = new Map<string, DeviceRecord[]>();
-  for (const record of visibleDevices(deviceList.getDevices(), /* panelStrict */ true)) {
+  for (const record of visibleDevices(deviceList.getDevices())) {
     const bucket = bySubnet.get(record.subnet);
     if (bucket) {
       bucket.push(record);
@@ -679,11 +572,12 @@ export function renderArpDeviceList(): void {
     }
   }
 
-  if (bySubnet.size === 0 && pendingScans <= 0) {
-    // Spinner (IP Discovery / Port Scan) carries the "still working"
+  if (bySubnet.size === 0) {
+    // An empty backend snapshot retires old rows even with a scan pending.
+    // The header's Discovery spinner carries the "still working"
     // signal — leave the list empty while it's visible. Only show
     // the "No devices found" placeholder once everything's settled.
-    list.innerHTML = isDiscoveryActive()
+    list.innerHTML = pendingScans > 0 || isDiscoveryActive()
       ? ""
       : '<p class="placeholder-text">No devices found.</p>';
     return;
@@ -702,12 +596,9 @@ export function renderArpDeviceList(): void {
       const ports = r.open_ports;
 
       const classes = ["device-item"];
-      if (selectedDevice.get() === r.ip) classes.push("selected");
+      if (selectedDevice.get()?.key === r.mac) classes.push("selected");
 
-      // ICMP-result dot replaces the old verifying/offline/cached
-      // badges — one signal, three colors. Missing entry = no probe
-      // yet (gray); the pinger fills it in within seconds.
-      const dot = renderReachabilityDot(r.ip);
+      const dot = renderPresenceDot(r);
 
       // Escape backend-sourced strings before they hit innerHTML — same
       // treatment device-cache.ts gives these fields. escapeHtml quotes
@@ -720,10 +611,10 @@ export function renderArpDeviceList(): void {
       // disabled + hidden so it shows on the closed face but never
       // duplicates CAM/PTU inside the popup), followed by the actions.
       html += `
-        <div class="${classes.join(" ")}" data-ip="${ipEsc}">
+        <div class="${classes.join(" ")}" data-key="${escapeHtml(r.mac)}" data-ip="${ipEsc}">
           <div class="device-name-row">
             ${dot}
-            <select class="node-role-select" data-role-ip="${ipEsc}" title="Assign role">
+            <select class="node-role-select" data-role-key="${escapeHtml(r.mac)}" title="Assign role">
               <option selected disabled hidden>${escapeHtml(name)}</option>
               <option value="cam">CAM</option>
               <option value="ptu">PTU</option>
@@ -743,7 +634,7 @@ export function renderArpDeviceList(): void {
   if (!html) {
     // Keep the list empty while either ARP discovery is still running
     // (no devices yet, but they may show up) OR a port scan is still
-    // in flight (devices exist but haven't qualified for display yet).
+    // in flight and no records have arrived yet.
     // Only show "No devices found." once both have settled.
     if (pendingScans > 0 || isDiscoveryActive()) return;
     list.innerHTML = '<p class="placeholder-text">No devices found.</p>';
@@ -759,22 +650,14 @@ export function renderArpDeviceList(): void {
       if (target.closest(".device-ip") || target.closest(".node-role-select")) return;
       list.querySelectorAll(".device-item").forEach((i) => i.classList.remove("selected"));
       item.classList.add("selected");
-      const ip = item.dataset["ip"] ?? null;
-      selectedDevice.set(ip);
-      // Remember this pick as the session's CAM target (getActiveCamIp
-      // reads it first). Deliberately kept out of state.config: Save
-      // Settings builds its payload from there, so a click would leak
-      // to disk on the next unrelated save. Persistence happens only
-      // when a stream actually starts or the device is explicitly
-      // assigned CAM — a node the user merely clicks but never streams
-      // is not persisted across launches. PTU is alias-driven only,
-      // with no click override — and the PTU-designated node itself is
-      // never a camera target, so clicking its row keeps the selection
-      // highlight but must not hijack the CAM pick away from the
-      // assigned CAM (an RTSP start against the PTU wedges in a stall
-      // loop).
-      if (ip && deviceList.deviceByIp(ip)?.alias !== "PTU") {
-        sessionCamIp.set(ip);
+      const record = deviceList.deviceByKey(item.dataset["key"]);
+      if (!record) return;
+      const targetChoice = deviceList.targetFor(record);
+      selectedDevice.set(targetChoice);
+      // Highlighting a row never assigns its role. Only a CAM-designated
+      // record may become the session's video target.
+      if (record.alias === "CAM") {
+        sessionCamTarget.set(targetChoice);
       }
     });
   });
@@ -814,9 +697,9 @@ export function renderArpDeviceList(): void {
         if (e.key === "Escape") closeRoleMenu();
       });
       select.addEventListener("change", () => {
-        const ip = select.dataset["roleIp"];
+        const key = select.dataset["roleKey"];
         const action = select.value;
-        if (ip) void handleRoleSelection(select, ip, action);
+        if (key) void handleRoleSelection(select, key, action);
         closeRoleMenu();
       });
     });
@@ -834,9 +717,8 @@ export function renderArpDeviceList(): void {
  *  A node losing PTU gets a farewell halt (a delivered move whose
  *  release-stop is still queued would otherwise drive the unit
  *  unstoppably). Losing CAM on the node whose stream is playing drops
- *  the stream — compared against the runtime playback identity, not
- *  the persisted camera_ip, so a click-selected stream on an
- *  unrelated node is never touched. Losing CAM without it being
+ *  the stream — compared against the runtime playback identity, so
+ *  endpoint changes cannot stop a different record. Losing CAM without it being
  *  reassigned also detaches the session pick and persisted camera IP;
  *  otherwise Start Stream would silently reconnect to the node the
  *  user just cleared through the fallback chain.
@@ -846,13 +728,17 @@ export function renderArpDeviceList(): void {
  *  leftovers — the role state is unchanged and the user re-picks. */
 async function handleRoleSelection(
   select: HTMLSelectElement,
-  ip: string,
+  key: string,
   action: string
 ): Promise<void> {
-  const current = deviceList.deviceByIp(ip)?.alias || "";
+  const record = deviceList.deviceByKey(key);
+  if (!record) return;
+  const target = deviceList.targetFor(record);
+  const ip = record.ip;
+  const current = record.alias || "";
+  // CAM is also explicit playback intent, even when its alias is unchanged.
   const noOp =
-    (action === "cam" && current === "CAM") ||
-    (action === "ptu" && current === "PTU") ||
+    (action === "ptu" && current === "PTU" && deviceList.getDevices().filter((r) => r.alias === "PTU").length === 1) ||
     (action === "clear" && current === "");
   if (noOp) {
     select.selectedIndex = 0;
@@ -861,71 +747,45 @@ async function handleRoleSelection(
 
   const alias = action === "cam" ? "CAM" : action === "ptu" ? "PTU" : "";
 
-  // Pre-mutation holders — the state the user acted on.
   const devices = deviceList.getDevices();
-  const prevCamIp = devices.find((r) => r.alias === "CAM")?.ip ?? null;
-  const prevPtuIp = devices.find((r) => r.alias === "PTU")?.ip ?? null;
-
-  // A role is lost either by steal (another node takes it) or by the
-  // holder itself being overwritten or cleared.
-  const lostCamIp =
-    prevCamIp && (alias === "CAM" ? prevCamIp !== ip : prevCamIp === ip)
-      ? prevCamIp
-      : null;
-  const lostPtuIp =
-    prevPtuIp && (alias === "PTU" ? prevPtuIp !== ip : prevPtuIp === ip)
-      ? prevPtuIp
-      : null;
-
-  if (lostPtuIp) {
-    // Purges the queue and pins the halt to the outgoing IP before
-    // the alias moves, so nothing pending can reach the wrong unit.
-    haltPtuUnit(lostPtuIp);
-  }
-
-  if (lostCamIp && lostCamIp === getActivePlaybackIp()) {
-    await stopStreamNow(
-      action === "clear"
-        ? "Stream stopped — CAM cleared"
-        : "Stream stopped — CAM reassigned"
-    );
-  }
-
-  if (lostCamIp && action !== "cam") {
-    // CAM removed without a new holder (Clear, or PTU overwriting the
-    // CAM node): fully detach so getActiveCamIp resolves to nothing
-    // instead of falling back to the node that just lost the role.
-    if (sessionCamIp.get() === lostCamIp) {
-      sessionCamIp.set(null);
+  const losesRole = (recordKey: string, role: string): boolean =>
+    recordKey === key ? alias !== role : alias === role;
+  const lostCams = devices.filter((r) => r.alias === "CAM" && losesRole(r.mac, "CAM"));
+  const lostPtus = devices.filter((r) => r.alias === "PTU" && losesRole(r.mac, "PTU"));
+  for (const outgoing of lostPtus) haltPtuUnit(outgoing.ip, deviceList.targetFor(outgoing));
+  if (lostCams.length > 0 && state.isRestreamDesired && state.config?.stream.protocol === "rtsp") {
+    try {
+      await api.stopRestreamServer();
+      state.isRestreamDesired = false;
+      updateRestreamUI(null);
+    } catch (e) {
+      select.selectedIndex = 0;
+      showToast(`Failed to stop RTSP server; CAM role unchanged: ${formatError(e)}`, true);
+      return;
     }
-    if (state.config && state.config.stream.camera_ip === lostCamIp) {
-      state.config.stream.camera_ip = "";
-      api.updateStreamSettings(state.config.stream).catch((e: unknown) => {
-        log(`clear persisted CAM failed for ${lostCamIp}: ${formatError(e)}`);
+  }
+
+  function detachCamera(recordKey: string): void {
+    if (sessionCamTarget.get()?.key === recordKey) sessionCamTarget.set(null);
+    const stream = state.config?.stream;
+    const configuredKey = stream?.camera_mac ?? (stream?.camera_ip ? `manual:${stream.camera_ip}` : null);
+    if (stream && configuredKey?.toLowerCase() === recordKey.toLowerCase()) {
+      stream.camera_ip = "";
+      stream.camera_mac = null;
+      api.updateStreamSettings(stream).catch((e: unknown) => {
+        log(`clear persisted CAM failed for ${recordKey}: ${formatError(e)}`);
       });
     }
   }
-
+  for (const outgoing of lostCams) {
+    if (getActivePlaybackTarget()?.key === outgoing.mac) {
+      await stopStreamNow(action === "clear" ? "Stream stopped — CAM cleared" : "Stream stopped — CAM reassigned");
+    }
+    if (action !== "cam") detachCamera(outgoing.mac);
+  }
   if (action === "ptu") {
-    // The node just became the PTU, which is never a camera target —
-    // independent of what it was called before. A click-streamed
-    // unaliased node can be assigned PTU directly: drop a stream
-    // playing it, and detach any session pick or persisted camera IP
-    // a bare row click left aimed at it. (When the node also held CAM,
-    // the blocks above already did all of this and these checks
-    // no-op.)
-    if (getActivePlaybackIp() === ip) {
-      await stopStreamNow("Stream stopped — node is now the PTU");
-    }
-    if (sessionCamIp.get() === ip) {
-      sessionCamIp.set(null);
-    }
-    if (state.config && state.config.stream.camera_ip === ip) {
-      state.config.stream.camera_ip = "";
-      api.updateStreamSettings(state.config.stream).catch((e: unknown) => {
-        log(`clear persisted CAM failed for ${ip}: ${formatError(e)}`);
-      });
-    }
+    if (getActivePlaybackTarget()?.key === key) await stopStreamNow("Stream stopped — node is now the PTU");
+    detachCamera(key);
   }
 
   // Disabled while the write is in flight so a double-pick can't race
@@ -934,22 +794,23 @@ async function handleRoleSelection(
   // is already a no-op in newer backend state.
   select.disabled = true;
   try {
-    await deviceList.setAlias(ip, alias);
+    await deviceList.setAlias(key, alias);
     if (action === "cam") {
       // A CAM designation is deliberate — persist it to disk so
       // getActiveCamIp's config fallback picks it up next session
-      // (the click-to-select path only sets this in memory), and
-      // mirror into selectedDevice/sessionCamIp so subscribers (zoom
+      // (clicking an existing CAM only sets this in memory), and
+      // mirror into selectedDevice/sessionCamTarget so subscribers (zoom
       // restore, panel highlight) react immediately and this newest
       // designation outranks any earlier node click.
       if (state.config) {
         state.config.stream.camera_ip = ip;
+        state.config.stream.camera_mac = target.expectedMac;
         api.updateStreamSettings(state.config.stream).catch((e: unknown) => {
           log(`persist CAM pick failed for ${ip}: ${formatError(e)}`);
         });
       }
-      selectedDevice.set(ip);
-      sessionCamIp.set(ip);
+      selectedDevice.set(target);
+      sessionCamTarget.set(target);
     }
   } catch (e) {
     showToast(`Failed to set role: ${formatError(e)}`, true);

@@ -11,7 +11,7 @@
 import * as api from "./tauri-api.ts";
 import { $, state, log, escapeHtml, showToast } from "./state.ts";
 import * as deviceList from "./device-list.ts";
-import { markIpScanned, visibleDevices } from "./device-state.ts";
+import { markIpScanned, presenceLabel, visibleDevices } from "./device-state.ts";
 import { showModalWithVideo } from "./streaming.js";
 import { formatError } from "./errors.ts";
 
@@ -21,31 +21,25 @@ interface NodeEntry {
   subnet: string;
   alias: string;
   isManual: boolean;
+  expectedMac: string | null;
+  presence: string;
 }
 
 /** Render the current node list into the dialog. Called on open and
  *  after any add/remove so the list reflects the latest state without
  *  the user having to close and re-open.
  *
- *  Uses the same filter as the Nodes panel render path so the two
- *  views stay consistent: manual pins always show, real-MAC entries
- *  need at least one discovered open port. Without this, cache rows
- *  whose verify scan came back with zero ports linger here as
- *  phantoms while being invisible in the panel — the asymmetry
- *  bit a user in the field after they ran a Manual mode session
- *  and accumulated ARP-discovered devices that later lost their
- *  ports. (Auto-eviction of those stale cache rows is tracked
- *  separately for a v0.5.x follow-up.) */
+ *  Both Nodes views show retained history with backend presence,
+ *  subject to the user's APIPA visibility exclusion. */
 function renderDialogList(): void {
-  // Same visibility helper the Nodes panel uses, minus the panel-strict
-  // exclusions — the dialog must still list cached-only-unroutable and
-  // own-MAC rows so the user can remove them.
   const entries: NodeEntry[] = visibleDevices(deviceList.getDevices()).map((r) => ({
     mac: r.mac,
     ip: r.ip,
     subnet: r.subnet,
     alias: r.alias || "",
-    isManual: r.mac.startsWith("manual:"),
+    isManual: r.mac.startsWith("manual:") || !!state.config?.manual_nodes.some((n) => n.expected_mac?.toLowerCase() === r.mac.toLowerCase()),
+    expectedMac: state.config?.manual_nodes.find((n) => n.expected_mac?.toLowerCase() === r.mac.toLowerCase())?.expected_mac ?? null,
+    presence: presenceLabel(r),
   }));
   entries.sort((a, b) => {
     if (a.subnet !== b.subnet) return a.subnet.localeCompare(b.subnet);
@@ -79,6 +73,7 @@ function renderDialogList(): void {
                 <span class="cache-item-ip">${escapeHtml(e.ip)}</span>
                 <span class="cache-item-subnet">${escapeHtml(e.subnet)}</span>
               </div>
+              <div class="cache-item-detail">${escapeHtml(e.presence)}</div>
             </div>
             <button class="cache-forget-btn icon-btn small" data-mac="${escapeHtml(e.mac)}" data-ip="${escapeHtml(e.ip)}" data-manual="${e.isManual ? "1" : ""}" title="Remove">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
@@ -99,14 +94,12 @@ function renderDialogList(): void {
         const manual = btn.dataset["manual"] === "1";
         try {
           if (manual && ip) {
-            await api.removeManualNode(ip);
+            await api.removeManualNode(ip, entries.find((e) => e.mac === mac)?.expectedMac ?? null);
           } else if (mac) {
             await api.forgetDevice(mac);
           }
           // A forgotten device must be re-scannable if it is rediscovered
-          // later this session: the scan dedup set would otherwise skip
-          // it, its fresh record would never gain open ports, and the
-          // Nodes panel (which requires ports) would never show it again.
+          // later this session so its capabilities can be refreshed.
           if (ip) markIpScanned(ip, /* clear */ true);
         } catch (e) {
           log(`Failed to remove node: ${formatError(e)}`);
@@ -126,6 +119,7 @@ async function openCacheDialog(): Promise<void> {
   $<HTMLInputElement>("#add-node-ip").value = "";
   $<HTMLInputElement>("#add-node-alias").value = "";
 
+  if (state.config) state.config.manual_nodes = (await api.getConfig()).manual_nodes;
   renderDialogList();
   if (dialog.open) dialog.close();
   await showModalWithVideo(dialog);
@@ -157,12 +151,10 @@ async function handleAddNode(): Promise<void> {
 
   // Routability check — informational, doesn't block. Lets the user
   // pre-add nodes for a subnet they're about to configure (e.g.,
-  // typing 192.168.1.50 before adding a secondary IP on .100). If
-  // the host has no IP on that /24, the dot will stay red until the
-  // user adds a matching secondary in IP Config.
+  // typing 192.168.1.50 before adding a secondary IP on .100).
   if (!hostHasRouteToIp(ip)) {
     showToast(
-      "Heads up: host has no IP on " + nodeSubnet(ip) + " yet — dot will stay red until you add a matching secondary"
+      "Host has no IP on " + nodeSubnet(ip) + " yet — the node stays inactive until Ethernet verification succeeds"
     );
   }
 
@@ -205,18 +197,18 @@ async function clearAll(): Promise<void> {
   const targets = deviceList.getDevices().map((r) => ({
     mac: r.mac,
     ip: r.ip,
-    isManual: r.mac.startsWith("manual:"),
+    isManual: r.mac.startsWith("manual:") || !!state.config?.manual_nodes.some((n) => n.expected_mac?.toLowerCase() === r.mac.toLowerCase()),
+    expectedMac: state.config?.manual_nodes.find((n) => n.expected_mac?.toLowerCase() === r.mac.toLowerCase())?.expected_mac ?? null,
   }));
   for (const t of targets) {
     try {
       if (t.isManual) {
-        await api.removeManualNode(t.ip);
+        await api.removeManualNode(t.ip, t.expectedMac);
       } else {
         await api.forgetDevice(t.mac);
       }
       // Same re-scannability release as the per-row forget: without it,
-      // a cleared-then-rediscovered device is skipped by the scan dedup,
-      // never regains ports, and stays invisible for the session.
+      // a cleared-then-rediscovered device would skip capability scans.
       markIpScanned(t.ip, /* clear */ true);
     } catch (e) {
       log(`Failed to clear ${t.mac}: ${formatError(e)}`);

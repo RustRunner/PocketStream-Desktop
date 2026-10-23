@@ -5,8 +5,8 @@
 import * as api from "./tauri-api.ts";
 import { $, state, log, showToast } from "./state.ts";
 import { formatError } from "./errors.ts";
-import { getActiveCamIp, getActivePtuIp } from "./network.ts";
-import { selectedDevice } from "./store.ts";
+import { getActiveCamIp, getActivePtuIp, getActiveCamTarget, getActivePtuTarget } from "./network.ts";
+import { selectedDevice, type DeviceTarget } from "./store.ts";
 import * as deviceList from "./device-list.ts";
 
 // ── Local PTU state ─────────────────────────────────────────────────
@@ -49,15 +49,42 @@ function getPtuIp(): string | null {
   return getActivePtuIp();
 }
 
+interface PtuOperation {
+  target: DeviceTarget;
+  targetIp: string;
+  generation: number;
+}
+
+let ptuOperationGeneration = 0;
+
+function capturePtuOperation(): PtuOperation | null {
+  const target = getActivePtuTarget();
+  const targetIp = deviceList.endpointFor(target);
+  return target && targetIp
+    ? { target: { ...target }, targetIp, generation: ptuOperationGeneration }
+    : null;
+}
+
+function ptuOperationCurrent(operation: PtuOperation | null): operation is PtuOperation {
+  const current = getActivePtuTarget();
+  return operation !== null
+    && operation.generation === ptuOperationGeneration
+    && current?.key === operation.target.key
+    && current.expectedMac === operation.target.expectedMac
+    && deviceList.endpointFor(current) === operation.targetIp;
+}
+
+/** Include identity as well as endpoint: a replacement can reuse the same IP. */
+function targetStamp(target: DeviceTarget | null): string {
+  return JSON.stringify([target?.key, target?.expectedMac, deviceList.endpointFor(target)]);
+}
+
 // ── PTU command FIFO ────────────────────────────────────────────────
 // Every PTU HTTP send goes through this queue, so exactly one request
 // is in flight and commands reach the unit in the order they were
-// issued. Without it, a quick D-pad tap could deliver stop before move
-// (the move used to wait behind a speed-limit query while the stop
-// fired immediately) and the PTU would drive at full speed until the
-// next command. One global queue is enough: only one PTU is active at
-// a time (alias-driven), and the target IP is resolved at dequeue so a
-// PTU re-alias mid-queue sends to the current unit.
+// issued. Without it, a quick D-pad tap could deliver stop before move.
+// Each entry keeps its original key, expected MAC and endpoint, so
+// reassigning PTU cannot redirect delayed work to the new holder.
 
 interface QueuedPtuCmd {
   /** Command string, or a thunk evaluated at dequeue time — used by
@@ -71,10 +98,9 @@ interface QueuedPtuCmd {
    *  happened. */
   stillWanted?: () => boolean;
   /** Explicit target for entries that must reach a specific unit
-   *  regardless of the current alias state (the farewell halt) —
-   *  dequeue-time resolution would otherwise drop them once the alias
-   *  is cleared, or worse, send them to the new holder. */
+   *  regardless of the current alias state (the farewell halt). */
   targetIp?: string;
+  target?: DeviceTarget;
 }
 
 const ptuQueue: QueuedPtuCmd[] = [];
@@ -82,7 +108,7 @@ let ptuDraining = false;
 
 function enqueuePtuCmd(
   cmd: string | (() => string),
-  opts?: { stillWanted?: () => boolean; targetIp?: string }
+  opts?: { stillWanted?: () => boolean; targetIp?: string; target?: DeviceTarget }
 ): Promise<Record<string, string> | null> {
   return new Promise((resolve, reject) => {
     ptuQueue.push({
@@ -90,7 +116,8 @@ function enqueuePtuCmd(
       resolve,
       reject,
       stillWanted: opts?.stillWanted,
-      targetIp: opts?.targetIp,
+      targetIp: opts?.targetIp ?? deviceList.endpointFor(opts?.target ?? getActivePtuTarget()) ?? undefined,
+      target: opts?.target ?? getActivePtuTarget() ?? undefined,
     });
     if (!ptuDraining) {
       ptuDraining = true;
@@ -106,14 +133,15 @@ async function drainPtuQueue(): Promise<void> {
       item.resolve(null);
       continue;
     }
-    const ip = item.targetIp ?? getPtuIp();
-    if (!ip) {
+    const target = item.target;
+    const ip = item.targetIp;
+    if (!ip || !target) {
       item.resolve(null);
       continue;
     }
     const cmdStr = typeof item.cmd === "function" ? item.cmd() : item.cmd;
     try {
-      item.resolve(await api.ptuSend(ip, cmdStr));
+      item.resolve(await api.ptuSend(ip, cmdStr, target));
     } catch (e) {
       item.reject(e);
     }
@@ -143,12 +171,15 @@ function purgePtuQueue(): void {
  *  never blocked; a failed halt retries once, then surfaces loudly —
  *  a possibly-still-moving PTU is the one physical-safety event in
  *  role reassignment. */
-export function haltPtuUnit(ip: string): void {
+export function haltPtuUnit(ip: string, target: DeviceTarget): void {
+  // Purging the FIFO alone cannot cancel an ACK or timer still owned by a
+  // Home/preset/init workflow. Retire those continuations as well.
+  ptuOperationGeneration++;
   purgePtuQueue();
   void (async () => {
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        await enqueuePtuCmd("PS=0&TS=0", { targetIp: ip });
+        await enqueuePtuCmd("PS=0&TS=0", { targetIp: ip, target });
         return;
       } catch (e) {
         if (attempt === 0) continue;
@@ -162,9 +193,16 @@ export function haltPtuUnit(ip: string): void {
   })();
 }
 
-async function ptuCmd(cmd: string): Promise<Record<string, string> | null> {
-  if (!getPtuIp()) return null;
-  return enqueuePtuCmd(cmd);
+async function ptuCmd(
+  cmd: string,
+  operation: PtuOperation | null = capturePtuOperation()
+): Promise<Record<string, string> | null> {
+  if (!ptuOperationCurrent(operation)) return null;
+  return enqueuePtuCmd(cmd, {
+    target: operation.target,
+    targetIp: operation.targetIp,
+    stillWanted: () => ptuOperationCurrent(operation),
+  });
 }
 
 /**
@@ -184,6 +222,7 @@ async function ptuCmd(cmd: string): Promise<Record<string, string> | null> {
  * trailing C=V then halted what little motion had started.
  */
 async function waitForPtuTarget(
+  operation: PtuOperation,
   targetPan: number,
   targetTilt: number,
   maxTries = 40
@@ -195,8 +234,10 @@ async function waitForPtuTarget(
   let started = false;
   for (let i = 0; i < maxTries; i++) {
     await new Promise((r) => setTimeout(r, 250));
+    if (!ptuOperationCurrent(operation)) return;
     try {
-      const data = await ptuCmd("PP&TP");
+      const data = await ptuCmd("PP&TP", operation);
+      if (!ptuOperationCurrent(operation)) return;
       if (!data) break;
       const pan = parseInt(data["PP"] ?? "", 10);
       const tilt = parseInt(data["TP"] ?? "", 10);
@@ -226,16 +267,19 @@ async function waitForPtuTarget(
       break;
     }
   }
-  await ptuCmd("C=V").catch(() => {});
+  if (!ptuOperationCurrent(operation)) return;
+  await ptuCmd("C=V", operation).catch(() => {});
   log("PTU: back to speed mode");
 }
 
 // ── PTZ control setup ───────────────────────────────────────────────
 
 async function queryPtuSpeed(): Promise<void> {
-  if (!getPtuIp()) return;
+  const operation = capturePtuOperation();
+  if (!operation) return;
   try {
-    const data = await ptuCmd("PU&TU&PL&TL");
+    const data = await ptuCmd("PU&TU&PL&TL", operation);
+    if (!ptuOperationCurrent(operation)) return;
     if (data) {
       const panUpper = parseInt(data["PU"] ?? "") || 100;
       const tiltUpper = parseInt(data["TU"] ?? "") || 100;
@@ -246,7 +290,7 @@ async function queryPtuSpeed(): Promise<void> {
       );
       ptuSpeedQueried = true;
       log(`PTU limits: big=${ptuSpeedBig} small=${ptuSpeedSmall}`);
-      await ptuCmd("C=V");
+      await ptuCmd("C=V", operation);
     }
   } catch (e) {
     log(`PTU init failed: ${formatError(e)}`);
@@ -258,11 +302,12 @@ type SpeedAction = "up" | "down" | "left" | "right";
 export function setupPtzControls(): void {
   // PTU IP is alias-driven now (no dropdown). Watch the device list
   // and re-query speed limits whenever the PTU-aliased device changes.
-  let lastPtuIp: string | null = null;
+  let lastPtu: string | null = null;
   deviceList.subscribe(() => {
-    const current = getActivePtuIp();
-    if (current !== lastPtuIp) {
-      lastPtuIp = current;
+    const current = targetStamp(getActivePtuTarget());
+    if (current !== lastPtu) {
+      lastPtu = current;
+      ptuOperationGeneration++;
       ptuSpeedQueried = false;
       queryPtuSpeed();
     }
@@ -281,15 +326,18 @@ export function setupPtzControls(): void {
 
     if (action === "home") {
       btn.addEventListener("click", async () => {
-        if (!getPtuIp()) return;
+        const operation = capturePtuOperation();
+        const camera = targetStamp(getActiveCamTarget());
+        if (!operation) return;
         try {
-          await ptuCmd(`C=I&PS=${ptuSpeedBig}&TS=${ptuSpeedBig}&PP=0&TP=0`);
+          await ptuCmd(`C=I&PS=${ptuSpeedBig}&TS=${ptuSpeedBig}&PP=0&TP=0`, operation);
+          if (!ptuOperationCurrent(operation)) return;
           showToast("PTU homing");
           // Home is the full resting pose: zoom pulls back to wide while
           // the pan/tilt goto runs. Gated on a resolved CAM like preset
           // recall — no CAM means no zoom to park, not a toast.
-          if (getCameraIp() && zoomParkWide) zoomParkWide();
-          await waitForPtuTarget(0, 0);
+          if (camera === targetStamp(getActiveCamTarget()) && getCameraIp() && zoomParkWide) zoomParkWide();
+          await waitForPtuTarget(operation, 0, 0);
         } catch (e) {
           log(`PTU home: ${formatError(e)}`);
         }
@@ -309,21 +357,28 @@ export function setupPtzControls(): void {
     // limits (the 0.2.9 runaway-pan case). The prefix flips the unit
     // back to velocity mode in the same command, which both closes that
     // window and makes grabbing the D-pad cancel an in-flight goto.
+    let pressOperation: PtuOperation | null = null;
     const startMove = (): void => {
       if (!getPtuIp()) return;
+      const operation = capturePtuOperation();
+      if (!operation) return;
+      pressOperation = operation;
       if (!ptuSpeedQueried) void queryPtuSpeed();
       const seq = ++ptuPressSeq;
       if (action && action in speedCmds) {
         const cmdFn = speedCmds[action as SpeedAction];
         enqueuePtuCmd(() => `C=V&${cmdFn()}`, {
-          stillWanted: () => ptuReleasedThrough < seq,
+          target: operation.target,
+          targetIp: operation.targetIp,
+          stillWanted: () => ptuReleasedThrough < seq && ptuOperationCurrent(operation),
         }).catch((e) => log(`PTU ${action}: ${formatError(e)}`));
       }
     };
     const stopMove = (): void => {
-      if (!getPtuIp()) return;
       ptuReleasedThrough = ptuPressSeq;
-      ptuCmd("C=V&PS=0&TS=0").catch(() => {});
+      const operation = pressOperation;
+      pressOperation = null;
+      if (operation) ptuCmd("C=V&PS=0&TS=0", operation).catch(() => {});
     };
 
     btn.addEventListener("pointerdown", (e) => {
@@ -340,23 +395,30 @@ export function setupPtzControls(): void {
     .querySelectorAll<HTMLElement>(".ptz-preset-btn[data-preset]")
     .forEach((btn) => {
       let pressTimer: ReturnType<typeof setTimeout> | null = null;
+      let pressOperation: PtuOperation | null = null;
+      let pressCamera = "";
       const preset = parseInt(btn.dataset["preset"] ?? "", 10);
 
       btn.addEventListener("pointerdown", (e) => {
         e.preventDefault();
+        const operation = capturePtuOperation();
+        const camera = targetStamp(getActiveCamTarget());
+        pressOperation = operation;
+        pressCamera = camera;
         pressTimer = setTimeout(async () => {
           pressTimer = null;
-          if (!getPtuIp()) return;
+          if (!ptuOperationCurrent(operation)) return;
           try {
-            const data = await ptuCmd("PP&TP");
-            if (data) {
+            const data = await ptuCmd("PP&TP", operation);
+            if (data && ptuOperationCurrent(operation)) {
               // Also snapshot current zoom slider position so recalling
               // this preset restores framing on the CAM that's selected
               // now. `zoom` is nullable: a preset saved with no CAM
               // chosen just doesn't touch zoom on recall.
               const zoomEl = $<HTMLInputElement>("#zoom-slider");
               const zoomVal = zoomEl ? parseInt(zoomEl.value, 10) : NaN;
-              const zoom = Number.isFinite(zoomVal) ? zoomVal : null;
+              const zoom = camera === targetStamp(getActiveCamTarget())
+                && Number.isFinite(zoomVal) ? zoomVal : null;
               ptuPresets.set(preset, {
                 pan: data["PP"] ?? "0",
                 tilt: data["TP"] ?? "0",
@@ -377,7 +439,9 @@ export function setupPtzControls(): void {
         if (pressTimer) {
           clearTimeout(pressTimer);
           pressTimer = null;
-          if (!getPtuIp()) return;
+          const operation = pressOperation;
+          if (!ptuOperationCurrent(operation)) return;
+          const camera = pressCamera;
           const saved = ptuPresets.get(preset);
           if (saved) {
             try {
@@ -387,9 +451,12 @@ export function setupPtzControls(): void {
               // C=V. A PS=SPEED command in C=I mode can drive the unit past
               // its limits (observed in 0.2.9 as runaway pan).
               await ptuCmd(
-                `C=I&PS=${ptuSpeedBig}&TS=${ptuSpeedBig}&PP=${saved.pan}&TP=${saved.tilt}`
+                `C=I&PS=${ptuSpeedBig}&TS=${ptuSpeedBig}&PP=${saved.pan}&TP=${saved.tilt}`,
+                operation
               );
+              if (!ptuOperationCurrent(operation)) return;
               waitForPtuTarget(
+                operation,
                 parseInt(saved.pan, 10),
                 parseInt(saved.tilt, 10)
               ).catch(() => {});
@@ -398,7 +465,7 @@ export function setupPtzControls(): void {
               // can't overlap an in-flight slider request (two concurrent
               // HTTP requests to control.cgi can wedge the camera's Lua
               // server, freezing the RTSP stream).
-              if (saved.zoom !== null && getCameraIp()) {
+              if (camera === targetStamp(getActiveCamTarget()) && saved.zoom !== null && getCameraIp()) {
                 const zoomEl = $<HTMLInputElement>("#zoom-slider");
                 if (zoomEl) zoomEl.value = String(saved.zoom);
                 if (zoomRequest) zoomRequest(saved.zoom);
@@ -446,9 +513,8 @@ let zoomErrorToasted = false;
 /** `quiet` marks a background push (saved-position restore): failures
  *  log but never toast — a toast about an action the user didn't take
  *  is noise. User-initiated sends (drag, preset recall) keep toasting. */
-async function sendZoomPosition(percent: number, quiet: boolean): Promise<void> {
-  const ip = getCameraIp();
-  if (!ip) {
+async function sendZoomPosition(percent: number, quiet: boolean, target: DeviceTarget | null, ip: string | null): Promise<void> {
+  if (!ip || !target) {
     if (!quiet && !zoomErrorToasted) {
       showToast("Select a CAM IP to use zoom", true);
       zoomErrorToasted = true;
@@ -458,7 +524,7 @@ async function sendZoomPosition(percent: number, quiet: boolean): Promise<void> 
   const position = Math.round((percent / 100) * ZOOM_MAX);
   log(`Zoom: ${percent}% (${position}) ip=${ip}${quiet ? " (restore)" : ""}`);
   try {
-    await api.controlCgiZoomDirect(ip, position);
+    await api.controlCgiZoomDirect(ip, position, target);
     zoomErrorToasted = false;
   } catch (e) {
     log(`Zoom failed: ${formatError(e)}`);
@@ -489,16 +555,17 @@ function setupZoomSlider(): void {
   // transients.
   const MIN_GAP_MS = 100;
   let inFlight = false;
-  let queued: { percent: number; quiet: boolean } | null = null;
-  let lastSentPercent: number | null = null;
+  let queued: { percent: number; quiet: boolean; target: DeviceTarget | null; ip: string | null } | null = null;
+  let lastSent: string | null = null;
 
   async function drain(): Promise<void> {
     while (queued !== null) {
       const target = queued;
       queued = null;
-      if (target.percent === lastSentPercent) continue;
-      lastSentPercent = target.percent;
-      await sendZoomPosition(target.percent, target.quiet);
+      const stamp = `${target.target?.key}:${target.ip}:${target.percent}`;
+      if (stamp === lastSent) continue;
+      lastSent = stamp;
+      await sendZoomPosition(target.percent, target.quiet, target.target, target.ip);
       if (queued !== null) {
         await new Promise((r) => setTimeout(r, MIN_GAP_MS));
       }
@@ -510,7 +577,8 @@ function setupZoomSlider(): void {
   // supersedes a queued quiet restore — the failure toast then belongs
   // to the value the user actually asked for.
   function request(percent: number, quiet = false): void {
-    queued = { percent, quiet };
+    const target = getActiveCamTarget();
+    queued = { percent, quiet, target, ip: deviceList.endpointFor(target) };
     if (inFlight) return;
     inFlight = true;
     drain();
@@ -577,7 +645,7 @@ function setupZoomSlider(): void {
   // timeout. Until the record exists AND reports live, hold the push
   // and let the deviceList subscription below fire it the moment the
   // CAM flips live (also covers a camera that boots after the app).
-  let pendingRestoreIp: string | null = null;
+  let pendingRestoreKey: string | null = null;
 
   function applySavedZoom(): void {
     const ip = getCameraIp();
@@ -588,14 +656,13 @@ function setupZoomSlider(): void {
     // A missing record is held exactly like a non-live one: the restore
     // can run before the registry has hydrated its cache at all, which
     // is precisely the no-route window. Nothing legitimate is lost by
-    // holding — manually-entered IPs hydrate as Live records, so the
-    // only record-less state is "not discovered yet".
-    const record = deviceList.deviceByIp(ip);
+    // holding: manual and cached entries remain inactive until verified.
+    const record = deviceList.resolveTarget(getActiveCamTarget());
     if (!record || record.status !== "live") {
-      pendingRestoreIp = ip;
+      pendingRestoreKey = getActiveCamTarget()?.key ?? null;
       return;
     }
-    pendingRestoreIp = null;
+    pendingRestoreKey = null;
     // Don't pre-set lastSentPercent — we want request() below to fire
     // so the camera catches up to the slider. Quiet: this is a
     // background restore, not a user action.
@@ -603,13 +670,13 @@ function setupZoomSlider(): void {
   }
 
   deviceList.subscribe(() => {
-    if (!pendingRestoreIp) return;
-    const record = deviceList.deviceByIp(pendingRestoreIp);
+    if (!pendingRestoreKey) return;
+    const record = deviceList.deviceByKey(pendingRestoreKey);
     if (record?.status !== "live") return;
     // Re-check the selection — the user may have moved on while the
     // restore was pending; applySavedZoom re-derives everything.
-    if (getCameraIp() !== pendingRestoreIp) {
-      pendingRestoreIp = null;
+    if (getActiveCamTarget()?.key !== pendingRestoreKey) {
+      pendingRestoreKey = null;
       return;
     }
     applySavedZoom();

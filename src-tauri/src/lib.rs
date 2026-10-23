@@ -220,57 +220,38 @@ fn setup_bundled_gstreamer() -> bool {
     true
 }
 
-/// Background task that polls the active Ethernet interface every 3 seconds
-/// via pnet (zero network traffic) and emits an event when status changes.
-async fn watch_interface(mac: String, display_name: String, handle: tauri::AppHandle) {
-    use tauri::Emitter;
-
-    let mut prev_up = true;
-    let mut prev_ips: Vec<String> = Vec::new();
-
-    // Capture initial state
-    if let Some((is_up, ips)) = network::interface::quick_status_by_mac(&mac) {
-        prev_up = is_up;
-        prev_ips = ips.iter().map(|ip| ip.address.clone()).collect();
-    }
-
+/// Fallback watcher follows the same persisted selection as native events.
+async fn watch_interface(handle: tauri::AppHandle) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-
-        let (raw_up, ips) = network::interface::quick_status_by_mac(&mac).unwrap_or_default();
-
-        // On Windows, pnet's is_up() can report false for adapters that
-        // are clearly operational (ARP/IP traffic is flowing). Treat the
-        // interface as up if it has at least one IPv4 address assigned.
-        let is_up = raw_up || !ips.is_empty();
-
-        let current_ips: Vec<String> = ips.iter().map(|ip| ip.address.clone()).collect();
-        if is_up == prev_up && current_ips == prev_ips {
-            continue;
+        let manager = handle.state::<network::NetworkManager>();
+        let selection = manager.adapter_selection_state().await;
+        if let Some(iface) = &selection.adapter {
+            if let Some((is_up, ips)) = network::interface::quick_status_by_mac(&iface.mac) {
+                let pending = manager.pending_ip_strings().await;
+                let mut current: Vec<_> = ips
+                    .iter()
+                    .filter(|ip| !pending.contains(&ip.address))
+                    .map(|ip| (&ip.address, ip.prefix))
+                    .collect();
+                let mut previous: Vec<_> = iface
+                    .ips
+                    .iter()
+                    .map(|ip| (&ip.address, ip.prefix))
+                    .collect();
+                current.sort_unstable();
+                previous.sort_unstable();
+                if is_up == iface.is_up
+                    && current == previous
+                    && network::interface::index_for_mac(&iface.mac) == selection.interface_index
+                {
+                    continue;
+                }
+            }
         }
-
-        log::info!(
-            "Interface '{}' changed: up={} ips={:?}",
-            display_name,
-            is_up,
-            current_ips
-        );
-
-        let info = network::interface::InterfaceInfo {
-            name: display_name.clone(),
-            display_name: display_name.clone(),
-            ips,
-            mac: mac.clone(),
-            is_up,
-            is_ethernet: true,
-            is_wifi: false,
-            is_vpn: false,
-            is_virtual: false,
-        };
-
-        let _ = handle.emit("interface-status-changed", &info);
-        prev_up = is_up;
-        prev_ips = current_ips;
+        if let Err(e) = network::watcher::refresh(&handle).await {
+            log::debug!("Fallback adapter watcher refresh failed: {e}");
+        }
     }
 }
 
@@ -441,19 +422,22 @@ pub fn run() {
             commands::get_interface_info,
             // ARP Discovery
             commands::start_arp_discovery,
+            commands::get_capture_state,
+            commands::get_adapter_selection,
+            commands::select_adapter,
             commands::stop_arp_discovery,
             commands::get_device_list,
             commands::report_scan_result,
             commands::set_device_alias,
             commands::set_device_status,
             commands::forget_device,
-            commands::evict_phantom_device,
             commands::get_adoption_state,
             commands::get_configured_adoptions,
             commands::remove_adopted_subnet,
             // Streaming
             commands::start_stream,
             commands::stop_stream,
+            commands::retry_playback,
             commands::set_audio_muted,
             commands::start_restream_server,
             commands::stop_restream_server,
@@ -496,11 +480,7 @@ pub fn run() {
             // redundant and we skip spawning it to avoid duplicate events.
             // The pending-IP registry lets the watcher strip transient
             // scratch binds from its emissions.
-            let watcher_pending = {
-                let manager: tauri::State<'_, network::NetworkManager> = handle.state();
-                manager.pending_ips_handle()
-            };
-            let event_watcher_ok = network::watcher::start(handle.clone(), watcher_pending);
+            let event_watcher_ok = network::watcher::start(handle.clone());
 
             // Load adopted subnets from config, then start discovery
             // subsystems gated on the user's chosen network mode.
@@ -517,32 +497,16 @@ pub fn run() {
                 let mode = config.get_network_mode();
                 log::info!("Network mode: {:?}", mode);
 
-                // Static-Manual replaces the cache + ARP world entirely:
-                // the Nodes panel reflects only the user's pinned list.
-                // Hydrating the cache here would surface ghost entries
-                // from the last Auto session.
-                if mode == config::NetworkMode::StaticManual {
-                    manager.hydrate_manual_nodes(&config).await;
-                } else {
-                    manager.hydrate_device_registry(&config).await;
-                }
+                manager.hydrate_device_registry(&config).await;
+                manager.hydrate_manual_nodes(&config).await;
+                manager.start_presence(handle.clone()).await;
                 manager.load_adopted_from_config(&config, &handle).await;
 
-                match network::interface::list_physical().await {
-                    Ok(interfaces) => {
-                        // Prefer a live camera port; fall back to any wired
-                        // physical adapter regardless of media state so the
-                        // capture listener can pre-attach and hear the
-                        // link-up burst the moment a cable arrives.
-                        let up_eth = interfaces.iter().find(|i| {
-                            network::interface::is_wired_ethernet(i) && !i.ips.is_empty()
-                        });
-                        let eth = up_eth.or_else(|| {
-                            interfaces
-                                .iter()
-                                .find(|i| network::interface::is_wired_physical(i))
-                        });
-                        let media_up = up_eth.is_some();
+                match manager.get_adapter_selection(&config).await {
+                    Ok(selection) => {
+                        network::watcher::emit_selection(&handle, &selection);
+                        let media_up = selection.adapter.as_ref().is_some_and(|i| i.is_up && !i.ips.is_empty());
+                        let eth = selection.adapter;
 
                         if let Some(iface) = eth {
                             // ARP discovery (and the auto-adopt loop it
@@ -569,8 +533,8 @@ pub fn run() {
                                         // With the cable out, the start
                                         // pre-attaches the listener and then
                                         // reports the expected no-link error;
-                                        // discovery proper starts on the
-                                        // frontend's up-event.
+                                        // the backend watcher completes
+                                        // discovery when the link returns.
                                         Err(e) if !media_up => {
                                             log::info!(
                                                 "ARP discovery waiting for link-up: {}",
@@ -595,26 +559,17 @@ pub fn run() {
                                 );
                             }
 
-                            // Start lightweight interface watcher (pnet-based,
-                            // no network traffic — just reads OS adapter state).
-                            // Skipped when the event-driven watcher is active,
-                            // since both would emit `interface-status-changed`
-                            // and cause duplicate UI updates.
-                            if !event_watcher_ok {
-                                let mac = iface.mac.clone();
-                                let display = iface.display_name.clone();
-                                let wh = handle.clone();
-                                tokio::spawn(async move {
-                                    watch_interface(mac, display, wh).await;
-                                });
-                            }
                         } else {
-                            log::info!("No wired Ethernet adapter found for ARP discovery");
+                            log::info!("Selected Ethernet unavailable or selection required; no substitute chosen");
                         }
                     }
                     Err(e) => {
                         log::warn!("Failed to enumerate interfaces for ARP: {}", e);
                     }
+                }
+
+                if !event_watcher_ok {
+                    tokio::spawn(watch_interface(handle.clone()));
                 }
 
                 // ICMP pinger drives the green/red reachability dot in
@@ -632,24 +587,28 @@ pub fn run() {
             std::process::exit(1);
         })
         .run(|app_handle, event| {
-            // Graceful-shutdown cleanup: remove every secondary IP that
-            // auto-adopt added during this session, so they don't survive
-            // across restarts and accumulate on the user's adapter when
-            // moving between sites. After a hard crash this won't run;
-            // the leftover IPs are recovered into in-memory state by
-            // `load_adopted_from_config` on the next startup and cleaned
-            // up by the next graceful exit (self-healing on one cycle).
+            // Graceful shutdown cleans only tracked scratch/uncommitted
+            // addresses. Durable temporary ownership allows another cleanup
+            // attempt after a crash or failed removal. Committed host
+            // bindings stay in Windows/config until explicitly removed.
             //
-            // Bounded at 5 s total so a stalled netsh can't hang the
-            // process. block_on is safe here — the event loop is already
-            // exiting and there's no UI to keep responsive.
+            // Address cleanup is bounded at 5 s; streaming shutdown has
+            // its own 5 s wait. block_on is safe here — the event loop is
+            // already exiting and there's no UI to keep responsive.
             if let tauri::RunEvent::ExitRequested { .. } = event {
+                let stream: tauri::State<'_, streaming::StreamManager> = app_handle.state();
+                let _ = tauri::async_runtime::block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        let _ = tokio::join!(stream.stop_playback(), stream.stop_restream_server());
+                    }).await
+                });
                 let manager: tauri::State<'_, network::NetworkManager> = app_handle.state();
                 let _ = tauri::async_runtime::block_on(async {
+                    manager.stop_presence().await;
                     manager.stop_ping_dot().await;
                     tokio::time::timeout(
                         std::time::Duration::from_secs(5),
-                        manager.cleanup_adopted_ips(),
+                        manager.cleanup_adopted_ips(&app_handle.state::<config::AppConfig>()),
                     )
                     .await
                 });

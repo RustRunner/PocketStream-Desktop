@@ -1,6 +1,6 @@
 # PocketStream Desktop
 
-**PocketStream Desktop** is a Tauri/Rust Windows application for field camera work. It discovers IP cameras on the wire automatically (even ones stranded on stale DHCP leases or link-local addresses), plays and records their RTSP/UDP streams, re-serves them over a token-protected RTSP server, and drives FLIR pan-tilt units.
+**PocketStream Desktop** is a Tauri/Rust Windows application for field camera work. It discovers IP cameras on the selected Ethernet adapter, including cameras that retain an old DHCP address on another subnet, plays and records their RTSP/UDP streams, re-serves them over a token-protected RTSP server, and drives FLIR pan-tilt units. Cameras using APIPA (169.254.0.0/16) must first be configured with a usable non-APIPA address using their vendor's tools.
 
 Based on [PocketStream for Android](https://github.com/RustRunner/PocketStream).
 
@@ -16,10 +16,10 @@ The application supports two primary streaming modes:
 
 ### Automatic Device Discovery
 - ARP-based device detection on the Ethernet interface — no manual IP entry required
-- Self-healing packet capture: a session that starts deaf is restarted and escalated automatically before discovery is ever reported degraded
-- Known cameras are re-discovered actively — cached devices are verified on-wire by MAC and their subnets adopted in seconds, without waiting for the camera's own broadcasts
+- Bounded packet-capture recovery, with a visible degraded status when capture uses a name match or an unscoped fallback
+- Known cameras are re-discovered actively — cached devices require fresh verification on the selected Ethernet adapter by MAC, without waiting for the camera's own broadcasts
 - TCP port scanning of discovered hosts (RTSP, HTTP, SSH, and common camera ports)
-- Automatic subnet adoption when cameras are on non-native networks, gated on a repeat ARP observation; stale link-local adoptions are reaped automatically
+- Automatic subnet adoption for verified non-APIPA camera networks; committed host bindings persist across exit, adapter return and restart until explicitly removed
 - Node role assignment — a single CAM and a single PTU, enforced with safe role handoff
 
 ### Video Streaming & Recording
@@ -40,6 +40,8 @@ The application supports two primary streaming modes:
 - Auto-detection of interface status changes (zero network overhead)
 - VPN interface enumeration for secure remote streaming
 - Automatic Windows Firewall rule management for the RTSP server
+
+All APIPA Nodes are hidden, including historical entries. Saved APIPA host addresses and stored node history are retained. Removing a Node does not remove a host binding. See [reliability release notes](RELEASE-NOTES.md) for binding lifetime, rollback limitations and pending hardware qualification.
 
 ### PTZ Camera Control
 - FLIR PTU control via directional D-pad with hold-to-move

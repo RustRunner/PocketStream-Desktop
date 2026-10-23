@@ -120,45 +120,24 @@ export function hasRouteToSubnet(subnet: string): boolean {
 
 // ── Device visibility ─────────────────────────────────────────────
 
-/** IPs that belong to the host itself — the active interface's
- *  addresses plus any adopted secondary IPs. A registry row at one of
- *  these is us, not a discovered node, and is never shown. */
-function ownHostIps(): Set<string> {
-  const ips = new Set<string>();
-  if (state.activeInterface) {
-    for (const ip of state.activeInterface.ips) ips.add(ip.address);
-  }
-  for (const ip of adoptedSubnets.values()) ips.add(ip);
-  return ips;
+/** Both Nodes views retain backend history regardless of ports, link or
+ *  topology. The user's APIPA visibility override applies to every row;
+ *  filtering never changes history storage or saved host addresses. */
+export function visibleDevices(records: DeviceRecord[]): DeviceRecord[] {
+  return records.filter((r) => !r.ip.startsWith("169.254."));
 }
 
-/** Filter a registry snapshot down to the nodes worth showing the user.
- *  Shared by the Nodes panel and the Add/Remove Nodes dialog so the two
- *  never disagree about what counts as a node:
- *    - the host's own IPs are dropped
- *    - manual pins always qualify (they carry no scan result yet)
- *    - everything else needs at least one discovered open port
- *
- *  `panelStrict` layers on the Nodes-panel-only exclusions that the
- *  manager dialog must NOT apply (the dialog has to keep listing these
- *  so the user can remove them):
- *    - cached-only entries on subnets we can't currently route to
- *    - ghost records whose MAC matches our own adapter (stale gratuitous
- *      ARP captured while binding a secondary IP)
- */
-export function visibleDevices(
-  records: DeviceRecord[],
-  panelStrict = false
-): DeviceRecord[] {
-  const ownIps = ownHostIps();
-  const ownMac = state.activeInterface?.mac?.toLowerCase() || null;
-  return records.filter((r) => {
-    if (ownIps.has(r.ip)) return false;
-    if (panelStrict) {
-      if (r.status === "cached_only" && !hasRouteToSubnet(r.subnet)) return false;
-      if (ownMac && r.mac.toLowerCase() === ownMac) return false;
-    }
-    if (r.mac.startsWith("manual:")) return true;
-    return r.open_ports.length > 0;
-  });
+/** Presence comes only from the backend's selected-adapter evidence. */
+export function presenceLabel(record: DeviceRecord): string {
+  const labels: Record<DeviceRecord["status"], string> = {
+    live: "Active",
+    verifying: "Inactive — checking Ethernet",
+    offline: "Inactive — no recent Ethernet verification",
+    cached_only: "Inactive — awaiting Ethernet verification",
+    offline_non_wired_subnet: "Inactive — subnet is on a non-Ethernet adapter",
+    offline_host_owned_ip: "Inactive — address belongs to this host",
+    offline_different_device: "Inactive — different device at this address",
+    offline_ambiguous_role: "Inactive — ambiguous role; reassign explicitly",
+  };
+  return labels[record.status];
 }

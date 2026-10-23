@@ -565,10 +565,24 @@ fn spawn_bus_thread(
                     break;
                 }
                 match message.view() {
-                    gst::MessageView::Error(..) => callbacks.emit_fault(
-                        RelayFaultKind::GstError,
-                        "SRT relay pipeline reported a GStreamer error".into(),
-                    ),
+                    gst::MessageView::Error(error) => {
+                        let fault = super::classify::bus_fault(
+                            &error.error(),
+                            "SRT relay pipeline reported a GStreamer error".into(),
+                            error
+                                .details()
+                                .and_then(|d| d.get::<u32>("rtsp-status-code").ok()),
+                            error.debug().as_deref().unwrap_or_default(),
+                        );
+                        callbacks.emit_fault(
+                            if fault.retryable {
+                                RelayFaultKind::GstError
+                            } else {
+                                RelayFaultKind::PermanentGstError
+                            },
+                            fault.reason,
+                        );
+                    }
                     gst::MessageView::Eos(..) => callbacks.emit_fault(
                         RelayFaultKind::Eos,
                         "SRT relay pipeline reached end of stream".into(),
@@ -778,6 +792,11 @@ impl SrtRestreamer {
         stream_id: &str,
         runtime: RestreamRuntimeContext,
     ) -> Result<Self, RestreamBuildFailure> {
+        let upstream_ready = runtime
+            .upstream_ready
+            .clone()
+            .ok_or_else(|| configuration_failure("RTSP upstream readiness guard unavailable"))?;
+        upstream_ready().map_err(RestreamBuildFailure::configuration)?;
         let signal_ids = preflight_srt_capabilities()?;
         let parts = parse_pipeline(RTSP_PIPELINE_SKELETON)?;
         configure_rtsp_source(&parts.source, input_url, username, password)?;
@@ -809,6 +828,23 @@ impl SrtRestreamer {
             parts.source.clone(),
             super::connect_video_only_select_stream(&parts.source),
         )];
+        let upstream_callbacks = callbacks.clone();
+        signal_handlers.push((
+            parts.source.clone(),
+            parts.source.connect("before-send", false, move |_| {
+                if upstream_callbacks.is_shutdown_requested() {
+                    return Some(false.to_value());
+                }
+                let ready = upstream_ready().is_ok();
+                if !ready {
+                    upstream_callbacks.emit_fault(
+                        RelayFaultKind::GstError,
+                        "Camera readiness lost for SRT relay".into(),
+                    );
+                }
+                Some(ready.to_value())
+            }),
+        ));
         signal_handlers.extend(install_admission_handlers(
             &parts.sink,
             signal_ids,
@@ -1032,6 +1068,7 @@ mod tests {
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
         (
             RestreamRuntimeContext {
+                upstream_ready: None,
                 health: health.clone(),
                 event_tx,
                 server_instance,
@@ -1078,6 +1115,40 @@ mod tests {
     fn required_srt_callback_abi_is_available() {
         init_gstreamer();
         build_ok(preflight_srt_capabilities());
+    }
+
+    #[test]
+    fn rtsp_input_requires_camera_readiness_before_building_srt_output() {
+        for denied in [false, true] {
+            let (mut runtime, health) = runtime(RelayIngestKind::Rtsp);
+            if denied {
+                runtime.upstream_ready = Some(Arc::new(|| {
+                    Err(AppError::Stream("CAM role missing".into()))
+                }));
+            }
+            let result = SrtRestreamer::start_from_rtsp(
+                "rtsp://192.0.2.20/live",
+                8890,
+                Some("127.0.0.1"),
+                "",
+                "",
+                None,
+                125,
+                "",
+                runtime,
+            );
+            let failure = match result {
+                Ok(_) => panic!("unverified camera must not start SRT output"),
+                Err(failure) => failure,
+            };
+            assert_eq!(failure.kind, RestreamBuildFailureKind::Configuration);
+            assert!(!health.snapshot().loop_alive);
+            assert!(failure.error.to_string().contains(if denied {
+                "CAM role missing"
+            } else {
+                "readiness guard unavailable"
+            }));
+        }
     }
 
     #[test]

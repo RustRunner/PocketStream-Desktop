@@ -22,6 +22,110 @@ pub struct ArpDevice {
     pub last_seen: String,
 }
 
+const CANDIDATE_TTL: Duration = Duration::from_secs(30);
+const MAX_CANDIDATES: usize = 1024;
+type CandidateKey = (u32, [u8; 6], Ipv4Addr, [u8; 6]);
+
+/// Read by S5a's verifier; never serialized or used as presence evidence.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct Candidate {
+    pub interface_index: u32,
+    pub adapter_mac: [u8; 6],
+    pub ip: Ipv4Addr,
+    pub mac: [u8; 6],
+    pub observed_at: Instant,
+}
+
+/// Transient observations, never registry records or cache rows.
+#[derive(Default)]
+pub(crate) struct CandidateSet {
+    entries: StdMutex<HashMap<CandidateKey, Instant>>,
+}
+
+impl CandidateSet {
+    #[allow(dead_code)] // S5a consumes the dormant queue.
+    pub(crate) fn snapshot(&self, now: Instant) -> Vec<Candidate> {
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        entries.retain(|_, seen| now.saturating_duration_since(*seen) < CANDIDATE_TTL);
+        entries
+            .iter()
+            .map(|((index, adapter, ip, mac), observed_at)| Candidate {
+                interface_index: *index,
+                adapter_mac: *adapter,
+                ip: *ip,
+                mac: *mac,
+                observed_at: *observed_at,
+            })
+            .collect()
+    }
+    pub(crate) fn count(&self, now: Instant) -> usize {
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        entries.retain(|_, seen| now.saturating_duration_since(*seen) < CANDIDATE_TTL);
+        entries.len()
+    }
+
+    pub(crate) fn clear(&self) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct CandidateIngress {
+    pub(crate) store: Arc<CandidateSet>,
+    pub(crate) interface_index: u32,
+    pub(crate) adapter_mac: [u8; 6],
+}
+
+impl CandidateIngress {
+    pub(crate) fn observe(
+        &self,
+        ip: Ipv4Addr,
+        mac: [u8; 6],
+        fence: &super::SweepFence,
+        now: Instant,
+    ) {
+        let mut entries = self.store.entries.lock().unwrap_or_else(|p| p.into_inner());
+        let reason = if fence.is_stale() {
+            Some("stale_fence")
+        } else if self.interface_index == 0 {
+            Some("missing_index")
+        } else if crate::validation::prohibited_camera_ip(ip) {
+            Some("prohibited_ip")
+        } else if mac == [0; 6] || mac[0] & 1 != 0 {
+            Some("invalid_peer_mac")
+        } else if mac == self.adapter_mac {
+            Some("own_mac")
+        } else if self.adapter_mac == [0; 6] || self.adapter_mac[0] & 1 != 0 {
+            Some("invalid_adapter_mac")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            if reason == "stale_fence" {
+                note_fence_drop("candidate");
+            }
+            note_candidate_rejection(reason, self.interface_index, self.adapter_mac, mac, ip);
+            return;
+        }
+        entries.retain(|_, seen| now.saturating_duration_since(*seen) < CANDIDATE_TTL);
+        let key = (self.interface_index, self.adapter_mac, ip, mac);
+        if entries.len() >= MAX_CANDIDATES && !entries.contains_key(&key) {
+            if let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, seen)| **seen)
+                .map(|(key, _)| *key)
+            {
+                entries.remove(&oldest);
+            }
+        }
+        entries.insert(key, now);
+    }
+}
+
 /// Handle to a live capture session.
 ///
 /// Drop-safety: dropping the handle drops `shutdown_tx`; the blocking
@@ -60,11 +164,9 @@ static DATA_CB_PANIC_LOGGED: AtomicBool = AtomicBool::new(false);
 /// was saturated (a distinct-tuple flood or a slow registry). Never resets.
 static ARP_TASKS_DROPPED: AtomicU64 = AtomicU64::new(0);
 
-/// Count of ARP frames dropped because the sender IP is on a subnet owned
-/// exclusively by a non-Ethernet interface (WiFi/VPN). The capture backend
-/// is unscoped, so wireless ARP (the WiFi gateway and other wireless hosts)
-/// reaches the callback; discovery is wired-Ethernet only, so these are
-/// filtered before they can become nodes. Never resets.
+/// Legacy listener frames dropped by subnet when no verifier is installed.
+/// Activated discovery uses capture scope or fresh selected-interface proof,
+/// including on overlapping subnets. Never resets.
 static ARP_NONETH_DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Count of ARP frames dropped because the sender IP is one of the host's
@@ -75,14 +177,66 @@ static ARP_NONETH_DROPPED: AtomicU64 = AtomicU64::new(0);
 /// node. Never resets.
 static ARP_SELF_IP_DROPPED: AtomicU64 = AtomicU64::new(0);
 
+/// Prohibited sender addresses (including APIPA), rejected before merging.
+static ARP_PROHIBITED_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+static CANDIDATES_REJECTED: AtomicU64 = AtomicU64::new(0);
+static REJECTIONS_BY_REASON: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+fn note_candidate_rejection(
+    reason: &'static str,
+    index: u32,
+    adapter: [u8; 6],
+    mac: [u8; 6],
+    ip: Ipv4Addr,
+) {
+    CANDIDATES_REJECTED.fetch_add(1, Ordering::Relaxed);
+    let bucket = match reason {
+        "stale_fence" => 0,
+        "missing_index" => 1,
+        "prohibited_ip" => 2,
+        "invalid_peer_mac" => 3,
+        "own_mac" => 4,
+        "invalid_adapter_mac" => 5,
+        "self_ip" => 6,
+        _ => 7,
+    };
+    let count = REJECTIONS_BY_REASON[bucket].fetch_add(1, Ordering::Relaxed) + 1;
+    if count.is_power_of_two() {
+        log::debug!("event=candidate_rejected adapter_mac={} interface_index={} identity={} ip={} reason={} count={}",
+            format_mac(&adapter), index, format_mac(&mac), ip, reason, count);
+    }
+}
+
+static FENCE_DROPS: AtomicU64 = AtomicU64::new(0);
+static PROBES_STARTED: AtomicU64 = AtomicU64::new(0);
+static PROBES_ANSWERED: AtomicU64 = AtomicU64::new(0);
+static PROBES_FAILED: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn diagnostic_counts() -> String {
+    format!("probes_started={} probes_answered={} probes_failed={} candidates_rejected={} fence_drops={}",
+        PROBES_STARTED.load(Ordering::Relaxed), PROBES_ANSWERED.load(Ordering::Relaxed),
+        PROBES_FAILED.load(Ordering::Relaxed), CANDIDATES_REJECTED.load(Ordering::Relaxed), FENCE_DROPS.load(Ordering::Relaxed))
+}
+
+pub(crate) fn note_fence_drop(path: &'static str) {
+    let count = FENCE_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
+    if count.is_power_of_two() {
+        log::debug!("event=fence_drop path={} count={}", path, count);
+    }
+}
+
+pub fn prohibited_dropped() -> u64 {
+    ARP_PROHIBITED_DROPPED.load(Ordering::Relaxed)
+}
+
 /// Total ARP frames dropped due to the callback-task bound this session.
 /// A diagnostic companion to [`frames_seen`] / [`missed_max`].
 pub fn tasks_dropped() -> u64 {
     ARP_TASKS_DROPPED.load(Ordering::Relaxed)
 }
 
-/// Total ARP frames dropped because the sender IP is on a non-Ethernet
-/// (WiFi/VPN) subnet — filtered out to keep discovery wired-Ethernet only.
+/// Total legacy frames dropped by the non-Ethernet subnet prefilter.
 pub fn noneth_dropped() -> u64 {
     ARP_NONETH_DROPPED.load(Ordering::Relaxed)
 }
@@ -136,7 +290,7 @@ pub(crate) fn capture_health(payload_delta: u64, self_delta: u64) -> CaptureHeal
     }
 }
 
-/// Per-session counters for the two signals the health verdict needs.
+/// Per-session health and prohibited-drop counters.
 ///
 /// The process-global counters cannot isolate a capture-only restart: it
 /// keeps the same discovery generation, so already-spawned callbacks from
@@ -149,6 +303,7 @@ pub(crate) fn capture_health(payload_delta: u64, self_delta: u64) -> CaptureHeal
 pub(crate) struct SessionCounters {
     frames_seen: AtomicU64,
     self_ip_dropped: AtomicU64,
+    prohibited_dropped: AtomicU64,
 }
 
 /// A point-in-time read of one session's counters, for delta math across
@@ -157,6 +312,7 @@ pub(crate) struct SessionCounters {
 pub(crate) struct CounterSnapshot {
     pub frames_seen: u64,
     pub self_ip_dropped: u64,
+    pub prohibited_dropped: u64,
 }
 
 impl SessionCounters {
@@ -164,11 +320,17 @@ impl SessionCounters {
         CounterSnapshot {
             frames_seen: self.frames_seen.load(Ordering::Relaxed),
             self_ip_dropped: self.self_ip_dropped.load(Ordering::Relaxed),
+            prohibited_dropped: self.prohibited_dropped.load(Ordering::Relaxed),
         }
     }
 
     fn note_self_ip_dropped(&self) {
         self.self_ip_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_prohibited_dropped(&self) {
+        self.prohibited_dropped.fetch_add(1, Ordering::Relaxed);
+        ARP_PROHIBITED_DROPPED.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -395,11 +557,12 @@ impl DedupeLru {
 
 /// Verdict for a captured ARP sender: admit it as a peer, or drop it.
 /// When several drop conditions apply at once the precedence is
-/// non-wired subnet, then self IP, then own MAC — all three drop the
+/// prohibited address, legacy non-wired subnet, self IP, then own MAC — all drop the
 /// frame, so the order only decides which counter and log fire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SenderVerdict {
     Accept,
+    DropProhibited,
     /// Sender is on a subnet owned exclusively by a non-wired local
     /// interface (WiFi/VPN/virtual) — not a wired peer.
     DropNonWiredSubnet,
@@ -412,20 +575,30 @@ enum SenderVerdict {
     DropOwnMac,
 }
 
-/// Pure sender gate for the capture callback: scope discovery to the
-/// wired port's peers and reject the host's own traffic. An empty
+/// Sender gate for the capture callback: scope discovery to the
+/// wired port's peers and reject the host's own traffic. On the verified path,
+/// topology cannot exclude a sender: MAC-scoped capture proves its interface,
+/// and all other observations require fresh verification on that interface.
+/// An overlapping or stale Wi-Fi prefix is not evidence against either path.
+/// On the legacy path, an empty
 /// `local_ips` or `excluded` disables that check (fail-open). A wired
-/// camera — on the Ethernet port's subnet or a foreign/APIPA subnet —
-/// matches none of the drop conditions. Module-level and pure so it is
-/// unit-testable without constructing any capture state.
+/// camera with a permitted address — on the Ethernet or a foreign subnet —
+/// matches none of the drop conditions. Prohibited drops are counted here,
+/// before any registry/callback work, with no dependency on topology reads.
 fn classify_sender(
     ip: Ipv4Addr,
     mac: [u8; 6],
     own_mac: Option<[u8; 6]>,
     local_ips: &HashSet<Ipv4Addr>,
     excluded: &[ipnetwork::Ipv4Network],
+    counters: &SessionCounters,
+    has_verifier: bool,
 ) -> SenderVerdict {
-    if excluded.iter().any(|net| net.contains(ip)) {
+    if crate::validation::prohibited_camera_ip(ip) {
+        counters.note_prohibited_dropped();
+        return SenderVerdict::DropProhibited;
+    }
+    if !has_verifier && excluded.iter().any(|net| net.contains(ip)) {
         return SenderVerdict::DropNonWiredSubnet;
     }
     if local_ips.contains(&ip) {
@@ -437,12 +610,21 @@ fn classify_sender(
     SenderVerdict::Accept
 }
 
+fn identity_scoped(outcome: &pktmon::ScopeOutcome) -> bool {
+    matches!(
+        outcome,
+        pktmon::ScopeOutcome::SelectedInterface { source_id: Some(_) }
+    )
+}
+
 /// Everything the C data callback needs. Reached through the stream's
 /// `user_context` pointer; lives (in an `Arc`) on the listener's
 /// spawn_blocking thread for the whole session, so the pointer stays
 /// valid until after `SetSessionActive(FALSE)` — no callback fires
 /// afterward.
 struct CallbackContext {
+    candidates: Option<CandidateIngress>,
+    scope_proven: AtomicBool,
     own_mac: Option<[u8; 6]>,
     /// Every IPv4 address currently assigned to any local adapter, shared
     /// with the discovery loop that refreshes it as addresses change
@@ -616,17 +798,9 @@ unsafe fn data_cb_inner(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor
     let Some((op, mac, ip)) = extract_arp(frame, packet_type) else {
         return;
     };
-    if ip == Ipv4Addr::new(0, 0, 0, 0) {
-        return;
-    }
-    // Gate discovery to the wired Ethernet port's peers. The capture
-    // backend is unscoped (only the in-driver EtherType=ARP constraint
-    // applies), so ARP from the WiFi side — the gateway, other wireless
-    // hosts, and this host's own WiFi NIC — reaches this callback and
-    // would otherwise become phantom nodes. A wired camera, including one
-    // still on its factory/APIPA subnet awaiting adoption, matches none
-    // of the drop conditions. A poisoned local-IP lock fails open (frame
-    // admitted) — same tolerance as the dedupe lock below.
+    // Scope proof or fresh selected-interface verification owns admission.
+    // The subnet exclusion remains only for a legacy listener with no
+    // candidate verifier. Self/prohibited senders are rejected in every scope.
     // Snapshot the exclusion set first (brief lock; poison fails open to
     // "no filtering", the same tolerance as the local-IP set) so the two
     // locks are never held together.
@@ -636,12 +810,44 @@ unsafe fn data_cb_inner(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor
         .map(|v| v.clone())
         .unwrap_or_default();
     let verdict = match ctx.local_ips.lock() {
-        Ok(local) => classify_sender(ip, mac, ctx.own_mac, &local, &excluded),
-        Err(_) => classify_sender(ip, mac, ctx.own_mac, &HashSet::new(), &excluded),
+        Ok(local) => classify_sender(
+            ip,
+            mac,
+            ctx.own_mac,
+            &local,
+            &excluded,
+            &ctx.counters,
+            ctx.candidates.is_some(),
+        ),
+        Err(_) => classify_sender(
+            ip,
+            mac,
+            ctx.own_mac,
+            &HashSet::new(),
+            &excluded,
+            &ctx.counters,
+            ctx.candidates.is_some(),
+        ),
+    };
+    let reject = |reason| {
+        if let Some(ingress) = &ctx.candidates {
+            note_candidate_rejection(
+                reason,
+                ingress.interface_index,
+                ingress.adapter_mac,
+                mac,
+                ip,
+            );
+        }
     };
     match verdict {
         SenderVerdict::Accept => {}
+        SenderVerdict::DropProhibited => {
+            reject("prohibited_ip");
+            return;
+        }
         SenderVerdict::DropNonWiredSubnet => {
+            reject("non_wired_subnet");
             ARP_NONETH_DROPPED.fetch_add(1, Ordering::Relaxed);
             if !ctx.noneth_logged.swap(true, Ordering::Relaxed) {
                 log::info!(
@@ -653,6 +859,7 @@ unsafe fn data_cb_inner(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor
             return;
         }
         SenderVerdict::DropSelfIp => {
+            reject("self_ip");
             ARP_SELF_IP_DROPPED.fetch_add(1, Ordering::Relaxed);
             ctx.counters.note_self_ip_dropped();
             if !ctx.selfip_logged.swap(true, Ordering::Relaxed) {
@@ -666,7 +873,10 @@ unsafe fn data_cb_inner(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor
         // Our own gratuitous ARP (emitted when we add a secondary IP);
         // it would otherwise land as a phantom peer that gets scanned
         // against our own IP and cached as a ghost node.
-        SenderVerdict::DropOwnMac => return,
+        SenderVerdict::DropOwnMac => {
+            reject("own_mac");
+            return;
+        }
     }
 
     // Liveness is recorded here, at parse-accept — a deduped or fenced
@@ -684,7 +894,15 @@ unsafe fn data_cb_inner(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor
     // session's shared registry. Checked here, before the spawn, so a stale
     // frame costs nothing.
     if ctx.fence.is_stale() {
+        note_fence_drop("capture_callback");
         return;
+    }
+
+    if !ctx.scope_proven.load(Ordering::Acquire) {
+        if let Some(candidates) = &ctx.candidates {
+            candidates.observe(ip, mac, &ctx.fence, Instant::now());
+            return;
+        }
     }
 
     // Bound in-flight on_arp_seen tasks: a distinct-tuple ARP flood bypasses
@@ -713,18 +931,31 @@ unsafe fn data_cb_inner(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor
     let registry = ctx.registry.clone();
     let emitter = ctx.emitter.clone();
     let app_handle = ctx.app_handle.clone();
+    let fence = ctx.fence.clone();
+    // Only the D1 input wired by S5a can authorize the new verified path.
+    let verified_by = ctx.candidates.as_ref().map(|ingress| ingress.adapter_mac);
     ctx.runtime.spawn(async move {
         // Hold the permit for the task's lifetime; dropping it on completion
         // frees the slot for the next admitted frame.
         let _permit = permit;
-        on_arp_seen(ip, mac, devices, registry, emitter, app_handle).await;
+        on_arp_seen(
+            ip,
+            mac,
+            devices,
+            registry,
+            emitter,
+            app_handle,
+            &fence,
+            verified_by,
+        )
+        .await;
     });
 }
 
 /// Merge one observed (ip, mac) into the legacy map and the canonical
-/// registry, mirror same-IP cache evictions, and emit on first sight.
-/// Extracted from the old listener loop unchanged so swapping the
-/// capture backend doesn't disturb it.
+/// registry, persist verified identities, and emit on first sight. The
+/// legacy observation path stays wired until S5a supplies candidate ingress.
+#[allow(clippy::too_many_arguments)]
 async fn on_arp_seen(
     ip: Ipv4Addr,
     mac: [u8; 6],
@@ -732,7 +963,13 @@ async fn on_arp_seen(
     registry: Arc<DeviceRegistry>,
     emitter: Arc<DeviceListEmitter>,
     app_handle: tauri::AppHandle,
+    fence: &super::SweepFence,
+    verified_by: Option<[u8; 6]>,
 ) {
+    if fence.is_stale() {
+        note_fence_drop("capture_merge");
+        return;
+    }
     let ip_str = ip.to_string();
     let mac_str = format_mac(&mac);
     let octets = ip.octets();
@@ -755,6 +992,9 @@ async fn on_arp_seen(
     // iterates over it; can be retired once auto-adopt uses the registry.
     let is_new = {
         let mut map = devices.lock().await;
+        if fence.is_stale() {
+            return;
+        }
         let is_new = !map.contains_key(&mac_str);
         let entry = map.entry(mac_str.clone()).or_insert(device.clone());
         entry.last_seen = device.last_seen.clone();
@@ -772,14 +1012,34 @@ async fn on_arp_seen(
     // no-op unless that subnet is adopted.
     {
         let manager: tauri::State<'_, crate::network::NetworkManager> = app_handle.state();
-        manager.note_positive_liveness(&app_handle, ip).await;
+        manager
+            .note_positive_liveness_fenced(&app_handle, ip, fence)
+            .await;
     }
 
-    // Mirror into the canonical DeviceRegistry (its own lock) and evict
-    // same-IP dupe cache rows — all outside the `devices` lock.
-    let result = registry.merge_arp(&device);
+    // Merge into the canonical registry outside the `devices` lock.
+    // Other identities at the same IP stay inactive with their own aliases.
+    let result = match verified_by {
+        Some(adapter) => {
+            registry.merge_verified(&device, &format_mac(&adapter), &device.last_seen, fence)
+        }
+        None => registry.merge_arp_fenced(&device, fence),
+    };
     if result.changed {
         emitter.poke();
+    }
+    if verified_by.is_some() {
+        if let Some(record) = registry.cache_record(&device.mac) {
+            let cache_handle = app_handle.clone();
+            let cache_fence = fence.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let config: tauri::State<'_, crate::config::AppConfig> = cache_handle.state();
+                if let Err(e) = config.upsert_cached_device_fenced(record, Some(&cache_fence)) {
+                    log::warn!("Failed to persist verified capture identity: {e}");
+                }
+            })
+            .await;
+        }
     }
     if !result.dropped_macs.is_empty() {
         let cfg: tauri::State<'_, crate::config::AppConfig> = app_handle.state();
@@ -805,6 +1065,7 @@ async fn on_arp_seen(
 /// can hold a clone and start an identical session later.
 #[derive(Clone)]
 pub(crate) struct ListenerParams {
+    pub candidates: Option<CandidateIngress>,
     pub devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
     pub registry: Arc<DeviceRegistry>,
     pub emitter: Arc<DeviceListEmitter>,
@@ -860,6 +1121,7 @@ pub(crate) async fn start_listener(
     drain_prior_capture(prior).await?;
 
     let ListenerParams {
+        candidates,
         devices,
         registry,
         emitter,
@@ -890,6 +1152,8 @@ pub(crate) async fn start_listener(
 
     let join = tokio::task::spawn_blocking(move || {
         let ctx = Arc::new(CallbackContext {
+            candidates,
+            scope_proven: AtomicBool::new(false),
             own_mac,
             local_ips,
             dedupe: StdMutex::new(DedupeLru::new()),
@@ -924,11 +1188,20 @@ pub(crate) async fn start_listener(
             mode,
         ) {
             Ok((s, outcome)) => {
+                ctx.scope_proven
+                    .store(identity_scoped(&outcome), Ordering::Release);
                 match &outcome {
                     pktmon::ScopeOutcome::SelectedInterface { source_id } => {
                         log::info!(
                             "PacketMonitor: ARP capture active (scope=selected-interface, source_id={}, adapter='{}')",
                             source_id.map_or_else(|| "unknown".to_string(), |v| v.to_string()),
+                            scope.display_name
+                        );
+                    }
+                    pktmon::ScopeOutcome::ScopedByName { source_id } => {
+                        log::warn!(
+                            "PacketMonitor: ARP capture active (scope=scoped-by-name, source_id={}, adapter='{}'); name match is not identity proof",
+                            source_id,
                             scope.display_name
                         );
                     }
@@ -1031,92 +1304,126 @@ fn extract_arp(frame: &[u8], packet_type: u16) -> Option<(u16, [u8; 6], Ipv4Addr
     None
 }
 
-fn format_mac(mac: &[u8; 6]) -> String {
+pub(crate) fn format_mac(mac: &[u8; 6]) -> String {
     format!(
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     )
 }
 
-/// Force a fresh on-wire ARP resolution of `target`, pinned to the
-/// adapter that owns `scratch` (the caller's temporary probe address).
-///
-/// Two steps, neither of which parses localized OS text:
-/// 1. Flush the target's neighbor entry, scoped to the adapter — so a
-///    Stale/Delay/Probe leftover cannot masquerade as a fresh answer.
-///    Flush failure fails closed.
-/// 2. `SendARP` (IP Helper) with the scratch as the source: it transmits
-///    a real ARP request and returns the responder's MAC directly.
-///    Because step 1 emptied the cache entry, any MAC returned is fresh
-///    on-wire evidence by construction — and being pure ARP, devices
-///    that drop ICMP still answer. Runs on the blocking pool relying on
-///    the call's own internal retry bound (a few seconds);
-///    `spawn_blocking` cannot be aborted, so no abort wrapper is
-///    layered on top — the caller budgets for the duration instead.
-///
-/// `Ok(Some(mac))` — colon-lowercase MAC of the fresh responder;
-/// `Ok(None)` — no response; `Err` — the resolution could not be
-/// attempted (flush failed, task lost).
+/// Fresh ARP on the selected interface. ResolveIpNetEntry2 flushes the
+/// matching neighbor entry itself, then sends ARP; never read the cache as
+/// a fallback. The source must uniquely belong to this index. One native
+/// resolution stays in flight until it returns; spawn_blocking cannot be
+/// aborted, so the sequential caller retains its pass budget and fence.
 pub(crate) async fn fresh_resolve_mac(
     target: Ipv4Addr,
     scratch: Ipv4Addr,
+    interface_index: u32,
 ) -> Result<Option<String>, AppError> {
-    flush_neighbor(target, scratch).await?;
-
-    #[cfg(target_os = "windows")]
-    {
-        tokio::task::spawn_blocking(move || send_arp_blocking(target, scratch))
+    PROBES_STARTED.fetch_add(1, Ordering::Relaxed);
+    let started = Instant::now();
+    let result = async {
+        crate::validation::parse_camera_ip(&target.to_string())?;
+        #[cfg(target_os = "windows")]
+        {
+            tokio::task::spawn_blocking(move || {
+                resolve_neighbor_blocking(target, scratch, interface_index)
+            })
             .await
-            .map_err(|e| AppError::Network(format!("SendARP task failed to join: {}", e)))
+            .map_err(|e| {
+                AppError::Network(format!("ResolveIpNetEntry2 task failed to join: {e}"))
+            })?
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (target, scratch, interface_index);
+            Err(AppError::Network(
+                "fresh ARP resolution is Windows-only".into(),
+            ))
+        }
     }
-    #[cfg(not(target_os = "windows"))]
-    {
-        Err(AppError::Network(
-            "fresh ARP resolution is Windows-only".into(),
-        ))
-    }
-}
-
-/// Remove the target's neighbor-cache entry on the adapter owning
-/// `scratch`. Success is signalled by our own sentinel on stdout, never
-/// by parsing cmdlet output (which is localized). A missing sentinel —
-/// no adapter owns the scratch, cmdlet failure, timeout — is an error:
-/// the caller must fail closed rather than trust a possibly-stale cache.
-async fn flush_neighbor(target: Ipv4Addr, scratch: Ipv4Addr) -> Result<(), AppError> {
-    let script = format!(
-        "$idx=(Get-NetIPAddress -IPAddress '{scratch}' -AddressFamily IPv4 -ErrorAction SilentlyContinue \
-         | Select-Object -First 1).InterfaceIndex; \
-         if ($null -ne $idx) {{ Remove-NetNeighbor -InterfaceIndex $idx -IPAddress '{target}' \
-         -Confirm:$false -ErrorAction SilentlyContinue; Write-Output 'flushed' }}"
-    );
-    match run_powershell(&script).await {
-        Some(out) if out.contains("flushed") => Ok(()),
-        _ => Err(AppError::Network(format!(
-            "could not flush the neighbor entry for {} on the adapter owning {}",
-            target, scratch
-        ))),
-    }
-}
-
-/// Blocking `SendARP` call (IP Helper — kernel-provided FFI, no
-/// Packet.dll involvement). `IPAddr` is a u32 holding the address bytes
-/// in network order in memory; reinterpreting the octets native-endian
-/// produces exactly that layout on either endianness.
-#[cfg(target_os = "windows")]
-fn send_arp_blocking(target: Ipv4Addr, scratch: Ipv4Addr) -> Option<String> {
-    use windows_sys::Win32::NetworkManagement::IpHelper::SendARP;
-    let dest = u32::from_ne_bytes(target.octets());
-    let src = u32::from_ne_bytes(scratch.octets());
-    let mut mac = [0u8; 8];
-    let mut len: u32 = mac.len() as u32;
-    let rc = unsafe { SendARP(dest, src, mac.as_mut_ptr() as *mut _, &mut len) };
-    if rc == 0 && len == 6 {
-        Some(format_mac(&[
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-        ]))
+    .await;
+    if matches!(&result, Ok(Some(_))) {
+        PROBES_ANSWERED.fetch_add(1, Ordering::Relaxed);
     } else {
-        None
+        PROBES_FAILED.fetch_add(1, Ordering::Relaxed);
     }
+    log::debug!(
+        "event=arp_probe interface_index={} target={} source={} answered={} duration_ms={} {}",
+        interface_index,
+        target,
+        scratch,
+        matches!(&result, Ok(Some(_))),
+        started.elapsed().as_millis(),
+        diagnostic_counts()
+    );
+    result
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_neighbor_blocking(
+    target: Ipv4Addr,
+    source: Ipv4Addr,
+    interface_index: u32,
+) -> Result<Option<String>, AppError> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{ResolveIpNetEntry2, MIB_IPNET_ROW2};
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKADDR_IN, SOCKADDR_INET};
+
+    if !super::interface::source_matches_interface(interface_index, source) {
+        return Err(AppError::Network(format!(
+            "ARP source {source} does not uniquely belong to interface {interface_index}"
+        )));
+    }
+    // Zeroed rows/addresses are valid initializers. Only Address and the
+    // selected InterfaceIndex are supplied; no cached MAC enters the call.
+    let mut row: MIB_IPNET_ROW2 = unsafe { std::mem::zeroed() };
+    row.InterfaceIndex = interface_index;
+    let sockaddr = |ip: Ipv4Addr| {
+        let mut address: SOCKADDR_IN = unsafe { std::mem::zeroed() };
+        address.sin_family = AF_INET;
+        address.sin_addr.S_un.S_addr = u32::from_ne_bytes(ip.octets());
+        SOCKADDR_INET { Ipv4: address }
+    };
+    row.Address = sockaddr(target);
+    let src = sockaddr(source);
+    let result = unsafe { ResolveIpNetEntry2(&mut row, &src) };
+    let mac = resolved_neighbor_mac(result, interface_index, &row)?;
+    if !super::interface::source_matches_interface(interface_index, source) {
+        return Err(AppError::Network(
+            "ARP source changed during resolution".into(),
+        ));
+    }
+    Ok(Some(mac))
+}
+
+#[cfg(target_os = "windows")]
+fn resolved_neighbor_mac(
+    result: u32,
+    interface_index: u32,
+    row: &windows_sys::Win32::NetworkManagement::IpHelper::MIB_IPNET_ROW2,
+) -> Result<String, AppError> {
+    use windows_sys::Win32::Networking::WinSock::NlnsReachable;
+    if result != 0 {
+        return Err(AppError::Network(format!(
+            "ResolveIpNetEntry2 failed: {result}"
+        )));
+    }
+    if row.InterfaceIndex != interface_index
+        || row.State != NlnsReachable
+        || row.PhysicalAddressLength != 6
+    {
+        return Err(AppError::Network(
+            "ARP resolution returned invalid interface/state/MAC length".into(),
+        ));
+    }
+    let mac: [u8; 6] = row.PhysicalAddress[..6].try_into().unwrap();
+    if mac == [0; 6] || mac[0] & 1 != 0 {
+        return Err(AppError::Network(
+            "ARP resolution returned a non-unicast MAC".into(),
+        ));
+    }
+    Ok(format_mac(&mac))
 }
 
 /// Read the OS ARP table for a specific interface and return dynamic entries.
@@ -1179,7 +1486,7 @@ async fn run_powershell(script: &str) -> Option<String> {
 /// Parse `Get-NetNeighbor | ConvertTo-Json` output into dynamic
 /// (IP, MAC) pairs. ConvertTo-Json emits a bare object for one row and
 /// an array for many.
-fn parse_neighbors_json(stdout: &str) -> Vec<(Ipv4Addr, String)> {
+pub(crate) fn parse_neighbors_json(stdout: &str) -> Vec<(Ipv4Addr, String)> {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
         return vec![];
@@ -1253,10 +1560,11 @@ pub(crate) fn normalize_mac(raw: &str) -> Option<String> {
 /// record as a false-positive Live.
 pub async fn resolve_mac_for_ip(
     target_ip: Ipv4Addr,
-    source: Option<Ipv4Addr>,
+    source: Option<(u32, Ipv4Addr)>,
     timeout: std::time::Duration,
 ) -> Result<Option<String>, AppError> {
-    let Some(source) = source else {
+    crate::validation::parse_camera_ip(&target_ip.to_string())?;
+    let Some((_interface_index, source)) = source else {
         log::debug!(
             "MAC verify for {}: no wired source IP for its subnet — verification fails",
             target_ip
@@ -1344,6 +1652,41 @@ pub async fn send_arp_probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn fresh_neighbor_result_rejects_errors_stale_rows_and_wrong_interfaces() {
+        use windows_sys::Win32::NetworkManagement::IpHelper::MIB_IPNET_ROW2;
+        use windows_sys::Win32::Networking::WinSock::{
+            NlnsDelay, NlnsProbe, NlnsReachable, NlnsStale,
+        };
+        let mut row: MIB_IPNET_ROW2 = unsafe { std::mem::zeroed() };
+        row.InterfaceIndex = 7;
+        row.State = NlnsReachable;
+        row.PhysicalAddressLength = 6;
+        row.PhysicalAddress[..6].copy_from_slice(&[0x40, 0xcd, 0x3a, 3, 0x28, 0xe2]);
+        assert_eq!(
+            resolved_neighbor_mac(0, 7, &row).unwrap(),
+            "40:cd:3a:03:28:e2"
+        );
+        // A failed native flush/resolve never returns a populated old MAC.
+        for error in [5, 53, 1168] {
+            assert!(resolved_neighbor_mac(error, 7, &row).is_err());
+        }
+        assert!(resolved_neighbor_mac(0, 8, &row).is_err());
+        for state in [NlnsStale, NlnsDelay, NlnsProbe] {
+            row.State = state;
+            assert!(resolved_neighbor_mac(0, 7, &row).is_err());
+        }
+        row.State = NlnsReachable;
+        row.PhysicalAddressLength = 8;
+        assert!(resolved_neighbor_mac(0, 7, &row).is_err());
+        row.PhysicalAddressLength = 6;
+        for mac in [[0; 6], [0xff; 6], [1, 2, 3, 4, 5, 6]] {
+            row.PhysicalAddress[..6].copy_from_slice(&mac);
+            assert!(resolved_neighbor_mac(0, 7, &row).is_err());
+        }
+    }
     use std::net::Ipv4Addr;
 
     #[test]
@@ -1592,6 +1935,53 @@ mod tests {
     const OTHER_MAC: [u8; 6] = [0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb];
 
     #[test]
+    fn prohibited_senders_drop_without_topology_and_do_not_count_as_payload() {
+        let counters = SessionCounters::default();
+        let before = prohibited_dropped();
+        for ip in [
+            "169.254.0.0",
+            "169.254.73.42",
+            "169.254.255.255",
+            "0.0.0.0",
+            "127.0.0.1",
+            "255.255.255.255",
+        ] {
+            assert_eq!(
+                classify_sender(
+                    ipv4(ip),
+                    OTHER_MAC,
+                    None,
+                    &HashSet::new(),
+                    &[],
+                    &counters,
+                    false
+                ),
+                SenderVerdict::DropProhibited
+            );
+        }
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.prohibited_dropped, 6);
+        assert_eq!(snapshot.frames_seen, 0);
+        assert_eq!(snapshot.self_ip_dropped, 0);
+        assert!(prohibited_dropped() >= before + 6);
+    }
+
+    #[tokio::test]
+    async fn apipa_verification_fails_before_any_native_or_ping_work() {
+        let ip = ipv4("169.254.73.42");
+        assert!(fresh_resolve_mac(ip, ipv4("169.254.73.99"), 0)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("routable IPv4 address first"));
+        assert!(resolve_mac_for_ip(ip, None, Duration::from_secs(1))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("routable IPv4 address first"));
+    }
+
+    #[test]
     fn sender_own_wifi_ip_on_shared_subnet_dropped_as_self() {
         // Our own WiFi NIC ARPing on the shared subnet: wrong MAC for the
         // own-MAC check, subnet not excludable — the self-IP check is the
@@ -1603,10 +1993,70 @@ mod tests {
                 OTHER_MAC,
                 Some(WIRED_MAC),
                 &local,
-                &[]
+                &[],
+                &SessionCounters::default(),
+                false
             ),
             SenderVerdict::DropSelfIp
         );
+    }
+
+    #[test]
+    fn verified_path_accepts_a_camera_even_with_a_stale_wifi_exclusion() {
+        let local = local_set(&["192.168.1.100", "192.168.1.73"]);
+        let excluded = ["192.168.1.0/24".parse().unwrap()];
+        let counters = SessionCounters::default();
+        assert_eq!(
+            classify_sender(
+                ipv4("192.168.1.204"),
+                OTHER_MAC,
+                Some(WIRED_MAC),
+                &local,
+                &excluded,
+                &counters,
+                true
+            ),
+            SenderVerdict::Accept
+        );
+        assert_eq!(
+            classify_sender(
+                ipv4("192.168.1.100"),
+                OTHER_MAC,
+                Some(WIRED_MAC),
+                &local,
+                &excluded,
+                &counters,
+                true
+            ),
+            SenderVerdict::DropSelfIp
+        );
+        assert_eq!(
+            classify_sender(
+                ipv4("192.168.1.204"),
+                WIRED_MAC,
+                Some(WIRED_MAC),
+                &local,
+                &excluded,
+                &counters,
+                true
+            ),
+            SenderVerdict::DropOwnMac
+        );
+        for has_verifier in [false, true] {
+            assert_eq!(
+                classify_sender(
+                    ipv4("169.254.10.2"),
+                    OTHER_MAC,
+                    Some(WIRED_MAC),
+                    &local,
+                    &excluded,
+                    &counters,
+                    has_verifier
+                ),
+                SenderVerdict::DropProhibited
+            );
+        }
+        assert_eq!(counters.snapshot().prohibited_dropped, 2);
     }
 
     #[test]
@@ -1621,7 +2071,9 @@ mod tests {
                 WIRED_MAC,
                 Some(WIRED_MAC),
                 &local,
-                &[]
+                &[],
+                &SessionCounters::default(),
+                false
             ),
             SenderVerdict::DropOwnMac
         );
@@ -1636,7 +2088,9 @@ mod tests {
                 OTHER_MAC,
                 Some(WIRED_MAC),
                 &local_set(&["192.168.1.101"]),
-                &excluded
+                &excluded,
+                &SessionCounters::default(),
+                false
             ),
             SenderVerdict::DropNonWiredSubnet
         );
@@ -1654,7 +2108,9 @@ mod tests {
                 OTHER_MAC,
                 Some(WIRED_MAC),
                 &local,
-                &[]
+                &[],
+                &SessionCounters::default(),
+                false
             ),
             SenderVerdict::Accept
         );
@@ -1664,18 +2120,28 @@ mod tests {
                 OTHER_MAC,
                 Some(WIRED_MAC),
                 &local,
-                &[]
+                &[],
+                &SessionCounters::default(),
+                false
             ),
             SenderVerdict::Accept
         );
     }
 
     #[test]
-    fn empty_sets_fail_open() {
-        // Enumeration failure yields empty sets; the filter must admit
-        // everything rather than blind discovery.
+    fn empty_topology_sets_admit_a_permitted_peer() {
+        // Missing topology does not block a permitted peer; prohibited
+        // senders are rejected independently of these sets.
         assert_eq!(
-            classify_sender(ipv4("192.168.1.204"), OTHER_MAC, None, &HashSet::new(), &[]),
+            classify_sender(
+                ipv4("192.168.1.204"),
+                OTHER_MAC,
+                None,
+                &HashSet::new(),
+                &[],
+                &SessionCounters::default(),
+                false
+            ),
             SenderVerdict::Accept
         );
     }
@@ -1691,7 +2157,9 @@ mod tests {
                 OTHER_MAC,
                 Some(WIRED_MAC),
                 &local_set(&["192.168.12.103"]),
-                &excluded
+                &excluded,
+                &SessionCounters::default(),
+                false
             ),
             SenderVerdict::DropNonWiredSubnet
         );
@@ -1990,5 +2458,58 @@ mod tests {
     fn parse_neighbors_json_empty_and_blank() {
         assert!(parse_neighbors_json("").is_empty());
         assert!(parse_neighbors_json("   \r\n ").is_empty());
+    }
+
+    #[test]
+    fn candidate_ttl_scope_bound_and_retirement() {
+        let store = Arc::new(CandidateSet::default());
+        let ingress = CandidateIngress {
+            store: store.clone(),
+            interface_index: 7,
+            adapter_mac: WIRED_MAC,
+        };
+        let active = Arc::new(AtomicBool::new(true));
+        let fence = super::super::SweepFence::new(1, Arc::new(AtomicU64::new(1)), active.clone());
+        let now = Instant::now();
+        ingress.observe(ipv4("192.168.1.204"), OTHER_MAC, &fence, now);
+        assert_eq!(store.count(now), 1);
+        let observed = store.snapshot(now);
+        assert_eq!(observed[0].interface_index, 7);
+        assert_eq!(observed[0].adapter_mac, WIRED_MAC);
+        assert_eq!(observed[0].ip, ipv4("192.168.1.204"));
+        assert_eq!(observed[0].mac, OTHER_MAC);
+        assert_eq!(observed[0].observed_at, now);
+        ingress.observe(ipv4("169.254.1.1"), OTHER_MAC, &fence, now);
+        assert_eq!(store.count(now), 1);
+        assert_eq!(store.count(now + CANDIDATE_TTL), 0);
+        for i in 0..(MAX_CANDIDATES + 1) {
+            ingress.observe(
+                Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8),
+                OTHER_MAC,
+                &fence,
+                now,
+            );
+        }
+        assert_eq!(store.count(now), MAX_CANDIDATES);
+        store.clear();
+        active.store(false, Ordering::Relaxed);
+        ingress.observe(ipv4("192.168.1.204"), OTHER_MAC, &fence, now);
+        assert_eq!(store.count(now), 0);
+    }
+
+    #[test]
+    fn name_and_unscoped_capture_require_candidate_verification() {
+        assert!(!identity_scoped(&pktmon::ScopeOutcome::ScopedByName {
+            source_id: 42
+        }));
+        assert!(!identity_scoped(&pktmon::ScopeOutcome::UnscopedFallback {
+            reason: "join failed".into()
+        }));
+        assert!(!identity_scoped(&pktmon::ScopeOutcome::SelectedInterface {
+            source_id: None
+        }));
+        assert!(identity_scoped(&pktmon::ScopeOutcome::SelectedInterface {
+            source_id: Some(42)
+        }));
     }
 }

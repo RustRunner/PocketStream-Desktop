@@ -9,24 +9,114 @@
 //! The callback runs on a system thread owned by IP Helper. It is deliberately
 //! tiny (just a non-blocking send) to avoid holding that thread.
 //!
-//! On non-Windows platforms this module is a no-op — the legacy pnet-based
-//! watcher in `lib.rs::watch_interface` continues to handle those.
+//! Where native notifications are unavailable, `lib.rs::watch_interface`
+//! polls this same selection refresh path.
 
-use tauri::AppHandle;
+use super::{AdapterSelection, InterfaceInfo, NetworkManager};
+use tauri::{AppHandle, Emitter, Manager};
 
-use super::auto_adopt::PendingIps;
+pub(crate) fn selected_status(selection: &AdapterSelection) -> InterfaceInfo {
+    selection
+        .adapter
+        .clone()
+        .filter(|_| selection.interface_index.is_some())
+        .unwrap_or_else(|| InterfaceInfo {
+            name: String::new(),
+            display_name: "Selected Ethernet adapter unavailable".into(),
+            description: String::new(),
+            mac: selection.selected_mac.clone().unwrap_or_default(),
+            ips: vec![],
+            is_up: false,
+            is_ethernet: true,
+            is_wifi: false,
+            is_vpn: false,
+            is_virtual: false,
+        })
+}
 
-/// `pending` is the manager's pending-IP registry: scratch and
-/// not-yet-handed-over addresses are stripped from every emission so
-/// transient probe binds neither render as host rows nor read as IP
-/// changes to the frontend.
+pub(crate) fn emit_selection(handle: &AppHandle, selection: &AdapterSelection) {
+    let _ = handle.emit("adapter-selection-changed", selection);
+    let _ = handle.emit("interface-status-changed", selected_status(selection));
+}
+
+/// Shared by native notifications, the fallback poller and the UI query.
+pub(crate) async fn refresh(handle: &AppHandle) -> Result<(), crate::AppError> {
+    let manager = handle.state::<NetworkManager>();
+    let config = handle.state::<crate::config::AppConfig>();
+    // Complete a known adapter's link-up before a slow provider refresh.
+    // Unknown metadata/index changes still go through selection below.
+    manager.resume_discovery(&config, handle).await?;
+    let previous = manager.adapter_selection_state().await;
+    let mut selection = manager.get_adapter_selection(&config).await?;
+    manager.update_presence_adapter(&selection, config.get_network_mode());
+    if (previous.selected_mac != selection.selected_mac
+        || previous.interface_index != selection.interface_index)
+        && selection.adapter.is_some()
+        && selection.interface_index.is_some()
+    {
+        manager.start_selected_adapter(&config, handle).await;
+        selection = manager.get_adapter_selection(&config).await?;
+    }
+    retry_discovery(handle).await?;
+    if serde_json::to_value(previous).ok() != serde_json::to_value(&selection).ok() {
+        emit_selection(handle, &selection);
+    }
+    Ok(())
+}
+
+async fn retry_discovery(handle: &AppHandle) -> Result<(), crate::AppError> {
+    let manager = handle.state::<NetworkManager>();
+    let config = handle.state::<crate::config::AppConfig>();
+    if manager.resume_discovery(&config, handle).await? {
+        // Missing metadata or a changed index goes through the existing
+        // selection/restore path. The next tick completes capture/session setup.
+        let previous = manager.adapter_selection_state().await;
+        let selection = manager.get_adapter_selection(&config).await?;
+        if previous.selected_mac != selection.selected_mac
+            || previous.interface_index != selection.interface_index
+        {
+            manager.start_selected_adapter(&config, handle).await;
+        }
+        emit_selection(handle, &selection);
+    }
+    Ok(())
+}
+
+/// One existing watcher owns notifications and bounded pending-start retries.
+/// A failed provider/start does not require another native event to recover.
+#[cfg(any(target_os = "windows", test))]
+async fn watch_changes<F, Fut>(mut rx: tokio::sync::mpsc::UnboundedReceiver<()>, mut refresh: F)
+where
+    F: FnMut(bool) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    use std::time::Duration;
+    let period = Duration::from_secs(5);
+    let mut retry = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let changed = tokio::select! {
+            event = rx.recv() => { if event.is_none() { return; } true },
+            _ = retry.tick() => false,
+        };
+        if changed {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            while rx.try_recv().is_ok() {}
+        }
+        refresh(changed).await;
+        retry.reset(); // give a failed/slow attempt a full bounded pause
+    }
+}
+
+/// Interface enumeration goes through the manager, which strips pending
+/// scratch addresses before selection or emission.
 #[cfg(target_os = "windows")]
-pub fn start(handle: AppHandle, pending: PendingIps) -> bool {
-    imp::start(handle, pending)
+pub fn start(handle: AppHandle) -> bool {
+    imp::start(handle)
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn start(_handle: AppHandle, _pending: PendingIps) -> bool {
+pub fn start(_handle: AppHandle) -> bool {
     false
 }
 
@@ -35,9 +125,8 @@ mod imp {
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::OnceLock;
-    use std::time::Duration;
 
-    use tauri::{AppHandle, Emitter};
+    use tauri::AppHandle;
     use tokio::sync::mpsc;
 
     use windows_sys::Win32::Foundation::{BOOLEAN, HANDLE, NO_ERROR};
@@ -45,9 +134,6 @@ mod imp {
         CancelMibChangeNotify2, NotifyIpInterfaceChange, NotifyUnicastIpAddressChange,
         MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE, MIB_UNICASTIPADDRESS_ROW,
     };
-
-    use crate::network::auto_adopt::PendingIps;
-    use crate::network::interface;
 
     // AF_UNSPEC covers both IPv4 and IPv6 in a single registration.
     const AF_UNSPEC: u16 = 0;
@@ -60,7 +146,13 @@ mod imp {
         std::sync::RwLock::new(None);
     static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-    fn wake() {
+    // One queued wake plus a bounded dirty bitset; notifications during an
+    // outstanding refresh remain armed for its trailing pass.
+    static DIRTY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    fn wake(kind: u8) {
+        if DIRTY.fetch_or(kind, Ordering::AcqRel) != 0 {
+            return;
+        }
         if let Ok(guard) = SENDER.read() {
             if let Some(tx) = guard.as_ref() {
                 let _ = tx.send(());
@@ -84,7 +176,7 @@ mod imp {
         _row: *const MIB_IPINTERFACE_ROW,
         _ty: MIB_NOTIFICATION_TYPE,
     ) {
-        wake();
+        wake(2);
     }
 
     unsafe extern "system" fn address_cb(
@@ -92,10 +184,10 @@ mod imp {
         _row: *const MIB_UNICASTIPADDRESS_ROW,
         _ty: MIB_NOTIFICATION_TYPE,
     ) {
-        wake();
+        wake(1);
     }
 
-    pub fn start(handle: AppHandle, pending: PendingIps) -> bool {
+    pub fn start(handle: AppHandle) -> bool {
         // Claim the init slot. INITIALIZED stays true ONLY on success —
         // a failed attempt below resets it so a later call can retry.
         // (The old code latched it before registration, so one failure
@@ -108,6 +200,7 @@ mod imp {
         }
 
         let (tx, rx) = mpsc::unbounded_channel();
+        DIRTY.store(0, Ordering::Release);
         // Overwrite any sender a prior failed attempt left behind.
         if let Ok(mut guard) = SENDER.write() {
             *guard = Some(tx);
@@ -164,81 +257,143 @@ mod imp {
         // which runs outside any tokio runtime context — a bare tokio::spawn
         // panics with "there is no reactor running", killing the process
         // silently on a Windows GUI app (no stderr to see the panic).
-        tauri::async_runtime::spawn(debounce_loop(rx, handle, pending));
+        tauri::async_runtime::spawn(debounce_loop(rx, handle));
         true
     }
 
-    async fn debounce_loop(
-        mut rx: mpsc::UnboundedReceiver<()>,
-        handle: AppHandle,
-        pending: PendingIps,
-    ) {
-        loop {
-            if rx.recv().await.is_none() {
-                return;
-            }
-
-            // Coalesce bursts — a link transition often fires several
-            // IP/interface notifications in quick succession.
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            while rx.try_recv().is_ok() {}
-
-            let list = match interface::list_physical().await {
-                Ok(l) => l,
-                Err(e) => {
-                    log::debug!("Watcher enumeration failed: {}", e);
-                    continue;
-                }
-            };
-            // Strip transient scratch/pending addresses before the pick:
-            // a probe's bind/release must not surface as a host IP or
-            // masquerade as an IP change.
-            let pending_now: std::collections::HashSet<String> = pending
-                .lock()
-                .await
-                .iter()
-                .map(|e| e.ip.to_string())
-                .collect();
-            let list = crate::network::strip_pending_ips(list, &pending_now);
-
-            // Prefer an ethernet adapter that has at least one IPv4 address.
-            // Fall back to the first ethernet adapter so "disconnected but
-            // still known" surfaces in the UI as per the relaxed-filter plan.
-            // Exclude VPN and virtual adapters from both arms so a
-            // VPN-as-Ethernet or virtual switch never drives the camera-port
-            // banner; the relaxed up-state (no is_up check) is kept on
-            // purpose so a disconnected wired port still shows the banner.
-            let pick = list
-                .iter()
-                .find(|i| i.is_ethernet && !i.is_vpn && !i.is_virtual && !i.ips.is_empty())
-                .or_else(|| {
-                    list.iter()
-                        .find(|i| i.is_ethernet && !i.is_vpn && !i.is_virtual)
-                })
-                .cloned();
-
-            if let Some(iface) = pick {
-                log::debug!(
-                    "Watcher emitting interface-status-changed: '{}' ips={}",
-                    iface.display_name,
-                    iface.ips.len()
-                );
-                let _ = handle.emit("interface-status-changed", &iface);
-            } else {
-                // No ethernet adapter present — emit an empty sentinel so
-                // the UI can show the "no adapter" banner.
-                let sentinel = interface::InterfaceInfo {
-                    name: String::new(),
-                    display_name: String::new(),
-                    ips: vec![],
-                    mac: String::new(),
-                    is_up: false,
-                    is_ethernet: true,
-                    is_wifi: false,
-                    is_vpn: false,
-                    is_virtual: false,
+    async fn debounce_loop(rx: mpsc::UnboundedReceiver<()>, handle: AppHandle) {
+        super::watch_changes(rx, |changed| {
+            let handle = handle.clone();
+            async move {
+                let result = if changed {
+                    let _kinds = DIRTY.swap(0, Ordering::AcqRel);
+                    // Both callback kinds can accompany an IP write. Only a
+                    // changed native identity/topology retires qualification.
+                    match super::super::interface::notification_topology_changed().await {
+                        Ok(_) => super::refresh(&handle).await,
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    super::retry_discovery(&handle).await
                 };
-                let _ = handle.emit("interface-status-changed", &sentinel);
+                if let Err(e) = result {
+                    log::warn!(
+                        "event=discovery_resume phase=failed retry_after_s=5 error={}",
+                        super::super::log_value(&e.to_string())
+                    );
+                }
+            }
+        })
+        .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_discovery_retries_provider_and_attach_failures_without_events() {
+        use crate::network::{discovery_resume_action, DiscoveryResume};
+        use std::sync::{Arc, Mutex};
+        let iface = InterfaceInfo {
+            name: "Ethernet".into(),
+            display_name: "Ethernet".into(),
+            description: "ASIX".into(),
+            mac: "40:cd:3a:00:00:01".into(),
+            ips: vec![],
+            is_up: false,
+            is_ethernet: true,
+            is_wifi: false,
+            is_vpn: false,
+            is_virtual: false,
+        };
+        let initial = AdapterSelection {
+            selected_mac: Some(iface.mac.clone()),
+            interface_index: Some(7),
+            ..Default::default()
+        };
+        // provider attempts, start attempts, selection, active
+        let state = Arc::new(Mutex::new((0, 0, initial, false)));
+        let task_state = state.clone();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(watch_changes(rx, move |changed| {
+            assert!(!changed, "no native or frontend events were sent");
+            let state = task_state.clone();
+            let iface = iface.clone();
+            async move {
+                let mut s = state.lock().unwrap();
+                match discovery_resume_action(
+                    crate::config::NetworkMode::StaticAuto,
+                    true,
+                    s.3,
+                    s.2.selected_mac.as_deref(),
+                    &s.2,
+                    Some((7, true, vec![])),
+                    false,
+                ) {
+                    DiscoveryResume::RefreshSelection => {
+                        s.0 += 1;
+                        if s.0 == 2 {
+                            s.2.adapter = Some(iface);
+                        } // first query failed
+                    }
+                    DiscoveryResume::Start(_) => {
+                        s.1 += 1;
+                        if s.1 == 2 {
+                            s.3 = true;
+                        } // first attach failed
+                    }
+                    DiscoveryResume::Idle => {}
+                }
+            }
+        }));
+        tokio::task::yield_now().await;
+        for expected in [(1, 0), (2, 0), (2, 1), (2, 2), (2, 2)] {
+            tokio::time::advance(std::time::Duration::from_secs(5)).await;
+            tokio::task::yield_now().await;
+            let s = state.lock().unwrap();
+            assert_eq!((s.0, s.1), expected);
+        }
+        drop(tx);
+        task.await.unwrap();
+    }
+
+    #[test]
+    fn watcher_reports_selected_usb_or_unavailable_never_the_dock() {
+        let iface = |name: &str, mac: &str| InterfaceInfo {
+            name: name.into(),
+            display_name: name.into(),
+            description: String::new(),
+            ips: vec![],
+            mac: mac.into(),
+            is_up: true,
+            is_ethernet: true,
+            is_wifi: false,
+            is_vpn: false,
+            is_virtual: false,
+        };
+        let dock = iface("Dock", "40:cd:3a:00:00:01");
+        let usb = iface("USB", "40:cd:3a:00:00:02");
+        for list in [
+            vec![dock.clone(), usb.clone()],
+            vec![usb.clone(), dock.clone()],
+            vec![dock],
+        ] {
+            let adapter = crate::network::pick_adapter(&list, Some(&usb.mac)).cloned();
+            let selection = AdapterSelection {
+                selected_mac: Some(usb.mac.clone()),
+                interface_index: adapter.as_ref().map(|_| 23),
+                adapter,
+                ..Default::default()
+            };
+            let event = selected_status(&selection);
+            assert_eq!(event.mac, usb.mac);
+            if selection.adapter.is_some() {
+                assert_eq!(event.name, "USB");
+            } else {
+                assert!(event.name.is_empty());
+                assert!(!event.is_up);
             }
         }
     }

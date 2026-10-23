@@ -15,9 +15,11 @@ import {
 } from "./state.ts";
 import { resetDiscoveryStatus, hideDiscoveryStatus, renderArpDeviceList } from "./devices.js";
 import { handleHardDisconnect, handleReconnect, showModalWithVideo } from "./streaming.js";
-import { sessionCamIp } from "./store.ts";
+import { sessionCamTarget, type DeviceTarget } from "./store.ts";
 import { formatError } from "./errors.ts";
 import type {
+  AdapterSelection,
+  AddressReply,
   AdoptionLifecyclePayload,
   InterfaceInfo,
   NetworkMode,
@@ -34,6 +36,85 @@ void $$;
 // Host card and the radio state in the IP Config dialog. null =
 // unknown / not yet probed.
 let hostMode: NetworkMode | null = null;
+let adapterSelection: AdapterSelection | null = null;
+let interfaceRefresh = 0;
+let selectingAdapter = false;
+let onDiscoveryReconnect = () => {};
+/** Presentation only, empty at launch and never persisted. */
+export const sessionAdoptedSubnets = new Set<string>();
+let bindingRefresh = 0;
+
+// Ordinary callers share one fetch and, while it runs, one trailing fetch.
+// Each caller settles with its current cycle; it does not wait for a later event.
+let refreshFlight: Promise<void> | null = null;
+let refreshTrailing = false;
+let eventRefreshQueued = false;
+let verifiedAddressView = false;
+let addressBusy: { retired: boolean } | null = null;
+const disabledControls = new Map<HTMLButtonElement | HTMLInputElement | HTMLSelectElement, boolean>();
+
+export function refreshHostBindings(): Promise<void> { return refreshInterfaces(); }
+
+/** Collapse a callback burst before entering the shared fetch path. */
+export function refreshNetworkEvent(): void {
+  if (addressBusy) { refreshTrailing = true; return; }
+  if (eventRefreshQueued) return;
+  eventRefreshQueued = true;
+  void Promise.resolve().then(() => {
+    eventRefreshQueued = false;
+    return refreshInterfaces();
+  });
+}
+
+
+function renderNetwork(): void {
+  renderSubnetList();
+  if ($<HTMLDialogElement>("#ip-config-dialog").open) {
+    renderAdapterChoices();
+    populateDialogFields();
+  }
+  lockAddressControls();
+}
+
+function applySelection(selection: AdapterSelection): void {
+  rememberAdapterSelection(selection);
+  dialogInterfaces = (selection.candidates ?? []).filter(isWiredCandidate);
+  const eth = selection.interface_index !== null ? selection.adapter : null;
+  state.activeInterface = eth;
+  if (!eth?.is_up) sessionAdoptedSubnets.clear();
+  renderInterfaceName();
+  if (eth && !isDownEvent(eth)) lastAdapterWarningAt = 0;
+  else warnNoEthernet();
+}
+
+function renderInterfaceName(): void {
+  const eth = state.activeInterface;
+  $("#iface-name").textContent = eth
+    ? (eth.display_name || eth.name) + (isDownEvent(eth) ? " (Disconnected)" : "")
+    : unavailableAdapterLabel();
+}
+
+function rememberAdapterSelection(next: AdapterSelection): void {
+  if (adapterSelection && (adapterSelection.selected_mac !== next.selected_mac ||
+      adapterSelection.interface_index !== next.interface_index)) {
+    if (addressBusy) addressBusy.retired = true;
+    sessionAdoptedSubnets.clear();
+    if (pendingDownTimer) clearTimeout(pendingDownTimer);
+    pendingDownTimer = null;
+    pendingDownIface = null;
+    if (state.activeInterface) handleHardDisconnect("Ethernet adapter changed or unavailable");
+    state.activeInterface = null;
+  }
+  adapterSelection = next;
+  if (state.config) state.config.selected_adapter_mac = next.selected_mac;
+}
+
+function unavailableAdapterLabel(): string {
+  if (adapterSelection?.selection_required) return "Select Ethernet adapter in Configure";
+  return adapterSelection?.selected_mac
+    ? `Selected adapter ${adapterSelection.selected_mac} unavailable`
+    : "None found";
+}
 
 /** Sync hostMode from state.config (no IPC). Cheap and synchronous —
  *  callable as soon as loadConfig() resolves, which lets the Host card
@@ -41,14 +122,6 @@ let hostMode: NetworkMode | null = null;
 export function syncHostModeFromConfig(): void {
   hostMode = state.config?.network_mode ?? null;
   renderModeBadge();
-}
-
-async function refreshHostMode(): Promise<void> {
-  try {
-    hostMode = await api.getNetworkMode();
-  } catch (_) {
-    hostMode = null;
-  }
 }
 
 // ── Interface discovery ─────────────────────────────────────────────
@@ -63,51 +136,53 @@ function isWiredCandidate(i: InterfaceInfo): boolean {
   return i.is_ethernet && !i.is_vpn && !i.is_virtual;
 }
 
-export async function refreshInterfaces(): Promise<void> {
-  try {
-    const interfaces = await api.listInterfaces();
-    const ethList = (interfaces || []).filter(isWiredCandidate);
-    // Pick the first truly-connected adapter. "Connected" means link up AND
-    // at least one real IPv4 — APIPA (169.254.x.x) addresses don't count,
-    // since Windows assigns them when no real network is reachable.
-    const eth = ethList.find(
-      (i) => i.is_up && i.ips.some((ip) => !ip.address.startsWith("169.254."))
-    );
-
-    if (eth) {
-      state.activeInterface = eth;
-      $("#iface-name").textContent = eth.display_name || eth.name;
-      await refreshHostMode();
-      renderSubnetList();
-      // Recovery — reset the dedup so the next failure toasts again.
-      lastAdapterWarningAt = 0;
-    } else if (ethList.length > 0) {
-      // Adapter is known to Windows but has no IP. Treat this the same
-      // as "no ethernet detected" from the user's perspective — the
-      // actionable state is identical (click Reset adapter).
-      const stale = ethList[0]!;
-      state.activeInterface = stale;
-      $("#iface-name").textContent =
-        (stale.display_name || stale.name) + " (Disconnected)";
-      renderSubnetList();
-      warnNoEthernet();
-    } else {
-      state.activeInterface = null;
-      $("#iface-name").textContent = "None found";
+export function refreshInterfaces(): Promise<void> {
+  if (addressBusy) { refreshTrailing = true; return Promise.resolve(); }
+  if (refreshFlight) { refreshTrailing = true; return refreshFlight; }
+  const request = ++interfaceRefresh, bindings = ++bindingRefresh;
+  refreshTrailing = false;
+  if (!state.activeInterface && !adapterSelection) $("#iface-name").textContent = "Checking Ethernet…";
+  refreshFlight = (async () => {
+    try {
+      const [selection, snapshot, mode] = await Promise.all([
+        api.getAdapterSelection(), api.getAdoptionState(), api.getNetworkMode(),
+      ]);
+      if (request !== interfaceRefresh || bindings !== bindingRefresh || !selection) return;
+      if (snapshot) {
+        adoptedSubnets.clear(); adoptionMeta.clear();
+        for (const [subnet, ip] of Object.entries(snapshot.adopted_subnets)) adoptedSubnets.set(subnet, ip);
+        for (const [subnet, meta] of Object.entries(snapshot.meta)) adoptionMeta.set(subnet, meta);
+        for (const subnet of sessionAdoptedSubnets) {
+          const meta = adoptionMeta.get(subnet);
+          if (!meta?.applied || meta.desired !== "present") sessionAdoptedSubnets.delete(subnet);
+        }
+      }
+      hostMode = mode;
+      verifiedAddressView = false;
+      applySelection(selection);
+      renderNetwork();
+    } catch (e) {
+      if (request !== interfaceRefresh || bindings !== bindingRefresh) return;
+      log(`Failed to list interfaces: ${formatError(e)}`);
+      // A failed refresh is not evidence of adapter removal. Keep the last
+      // native view, including a disconnected adapter and its observed IPs.
+      if (state.activeInterface) renderInterfaceName();
+      else if (adapterSelection) applySelection(adapterSelection);
+      else $("#iface-name").textContent = "Checking Ethernet…";
+      renderNetwork();
       warnNoEthernet();
     }
-  } catch (e) {
-    log(`Failed to list interfaces: ${formatError(e)}`);
-    $("#iface-name").textContent = "Error";
-    warnNoEthernet();
-  }
+  })().finally(() => {
+    refreshFlight = null;
+    if (refreshTrailing && !addressBusy) void refreshInterfaces();
+  });
+  return refreshFlight;
 }
 
-// ── No-Ethernet toast dedup ─────────────────────────────────────────
+// ── No-Ethernet diagnostic throttling ──────────────────────────────
 // refreshInterfaces can fire rapidly (startup + manual refresh + watcher
-// events arriving during a disconnect), so rate-limit the toast to at
-// most once per window. Reset to 0 on a successful enumeration so the
-// next failure re-toasts.
+// events arriving during a disconnect). The Host card and launch modal
+// cover the visible state; keep only a throttled diagnostic here.
 
 const NO_ETHERNET_COOLDOWN_MS = 15000;
 let lastAdapterWarningAt = 0;
@@ -116,22 +191,20 @@ export function warnNoEthernet(): void {
   const now = Date.now();
   if (now - lastAdapterWarningAt < NO_ETHERNET_COOLDOWN_MS) return;
   lastAdapterWarningAt = now;
-  showToast(
-    "No Ethernet detected — check Ethernet connection and/or reset Ethernet adapter",
-    true
+  log(
+    adapterSelection?.selection_required
+      ? "Choose the camera's Ethernet adapter in Configure"
+      : adapterSelection?.selected_mac && (!adapterSelection.adapter || adapterSelection.interface_index === null)
+        ? unavailableAdapterLabel()
+        : "No Ethernet detected — check Ethernet connection and/or reset Ethernet adapter"
   );
 }
 
-/** True if `address` is in the APIPA range (169.254.0.0/16). Windows
- *  assigns these as a fallback when DHCP fails — they technically count
- *  as "an IP" but linger as a secondary on the adapter after DHCP
- *  recovers (Windows doesn't auto-clean them). Used to hide them from
- *  the host subnet list and dropdowns where they'd just be confusing
- *  selectable entries that can't carry usable host-originated traffic.
- *
- *  NOTE: discovered *devices* in 169.254.x.x are NOT filtered — some
- *  cameras (FLIR in particular) fall back to APIPA on DHCP failure
- *  and the auto-adopt path is the user's recovery route. */
+/** True if `address` is in the APIPA range (169.254.0.0/16).
+ *  Exclude APIPA from usable host choices; saved host addresses remain
+ *  stored. All APIPA Nodes, including historical rows, are hidden by
+ *  device-state.ts. APIPA cameras require vendor-side configuration;
+ *  discovery never adopts their subnet or attempts an APIPA rescue. */
 export function isApipa(address: string): boolean {
   return address.startsWith("169.254.");
 }
@@ -173,8 +246,29 @@ function isDownEvent(iface: InterfaceInfo): boolean {
   return !iface.ips.some((ip) => !isApipa(ip.address));
 }
 
-export function setupInterfaceWatcher(): void {
+export function setupInterfaceWatcher(onReconnect: () => void = () => {}): void {
+  onDiscoveryReconnect = onReconnect;
+  api.onEvent<AdapterSelection>("adapter-selection-changed", (selection) => {
+    // The selection query may emit this same snapshot itself. Retire older
+    // reads only for an actual change, so opening Configure can finish.
+    if (JSON.stringify(selection) === JSON.stringify(adapterSelection)) return;
+    ++interfaceRefresh;
+    if (verifiedAddressView && !addressBusy) { refreshNetworkEvent(); return; }
+    rememberAdapterSelection(selection);
+  });
   api.onEvent<InterfaceInfo>("interface-status-changed", (iface) => {
+    const expectedMac = adapterSelection?.selected_mac?.replaceAll("-", ":").toLowerCase();
+    if (iface.mac.replaceAll("-", ":").toLowerCase() !== (expectedMac ?? "")) return;
+    if (addressBusy) { refreshTrailing = true; return; }
+    // A query can cause an unchanged status event. Fetching again for that
+    // event feeds the same query back into itself, especially with link down.
+    if (JSON.stringify(iface) === JSON.stringify(state.activeInterface)) return;
+    ++interfaceRefresh;
+    // A queued callback describes an earlier observation. After a reply, use
+    // a fresh shared read rather than repainting its payload over verified IPs.
+    if (verifiedAddressView) { refreshNetworkEvent(); return; }
+    if (isDownEvent(iface)) sessionAdoptedSubnets.clear();
+    refreshNetworkEvent();
     // Capture the prior connection state BEFORE any state mutation so
     // applyUpEvent can decide whether this is a true reconnect.
     // isInterfaceConnected() is our single source of truth — it also
@@ -254,6 +348,7 @@ export function setupInterfaceWatcher(): void {
 }
 
 function applyDownEvent(iface: InterfaceInfo): void {
+  sessionAdoptedSubnets.clear();
   // Sentinel from the backend watcher: no ethernet adapter present
   // at all. Deliberately does NOT raise the banner here — a mid-
   // session unplug during active use is noise, not a call to action.
@@ -264,10 +359,9 @@ function applyDownEvent(iface: InterfaceInfo): void {
   if (!iface.name) {
     handleHardDisconnect("Ethernet disconnected");
     state.activeInterface = null;
-    $("#iface-name").textContent = "None found";
-    // Preserve the backend's DeviceRegistry across a "no adapter"
-    // blip so a quick replug restores the UI without waiting for a
-    // full re-scan. renderArpDeviceList self-hides when not connected.
+    $("#iface-name").textContent = unavailableAdapterLabel();
+    // History stays visible. Backend expiry owns each row's status,
+    // including the stable-down hold; this event only updates host UI.
     renderArpDeviceList();
     renderSubnetList();
     hideDiscoveryStatus();
@@ -279,10 +373,8 @@ function applyDownEvent(iface: InterfaceInfo): void {
   handleHardDisconnect("Ethernet disconnected");
   $("#iface-name").textContent =
     (iface.display_name || iface.name) + " (Disconnected)";
-  // Preserve the backend's DeviceRegistry — a quick replug of the
-  // same cable should restore the Nodes list instantly instead of
-  // waiting 6+ seconds for ARP + port scan to rediscover what was
-  // there. renderArpDeviceList returns early when the link is down.
+  // Render retained history even without a usable host address.
+  // The backend owns verification, expiry and inactive reasons.
   renderArpDeviceList();
   renderSubnetList();
   // Hide the Nodes-card spinner — no link means no discovery to wait on.
@@ -292,7 +384,7 @@ function applyDownEvent(iface: InterfaceInfo): void {
 function applyUpEvent(iface: InterfaceInfo, wasDown: boolean): void {
   state.activeInterface = iface;
   $("#iface-name").textContent = iface.display_name || iface.name;
-  // Recovery — reset the toast dedup so a future failure re-toasts.
+  // Recovery — reset diagnostic throttling for the next outage.
   lastAdapterWarningAt = 0;
   // Refresh the subnet list since adopted IPs may have appeared
   // (load_adopted_from_config completing during cold start triggers
@@ -318,14 +410,14 @@ function applyUpEvent(iface: InterfaceInfo, wasDown: boolean): void {
   if (wasDown) {
     // If we just came back from disconnected, re-render immediately
     // from the preserved state so the Nodes list snaps back, then
-    // kick off discovery to verify. Verification will dim/mark any
-    // devices that genuinely vanished during the downtime.
+    // let backend readiness resume discovery and verification independently
+    // of UI query/event ordering.
     renderArpDeviceList();
     resetDiscoveryStatus();
-    api.startArpDiscovery(iface.name).catch(() => {});
+    onDiscoveryReconnect();
     // Restart the stream (and re-stream server) if they were running
-    // before the disconnect. Fires in the background; failures
-    // surface as toasts inside handleReconnect.
+    // before the disconnect. Failures are logged; the backend status
+    // owns the persistent playback error and retry controls.
     handleReconnect().catch((e: unknown) =>
       log(`Auto-resume: ${formatError(e)}`)
     );
@@ -379,196 +471,235 @@ export function renderModeBadge(): void {
   });
 }
 
-// Wired once — `#subnet-list` is a stable container whose innerHTML is
-// rebuilt on every renderSubnetList call, so a single delegated click
-// listener survives re-renders without stacking duplicates.
-let subnetRemoveWired = false;
-
-/** Remove an auto-adopted subnet from the host card. Optimistic: on success
- *  drop it from the local map and re-render immediately; the NIC watcher
- *  refreshes the interface IP list shortly after the unbind, and the backend
- *  drops any held-over restore so the row can't resurrect on the next save. */
-async function handleRemoveAdopted(subnet: string, btn: HTMLButtonElement): Promise<void> {
-  btn.disabled = true;
-  try {
-    await api.removeAdoptedSubnet(subnet);
-    adoptedSubnets.delete(subnet);
-    renderSubnetList();
-    showToast(`Removed adopted subnet ${subnet}`);
-  } catch (e) {
-    btn.disabled = false;
-    showToast("Failed: " + formatError(e), true);
-  }
-}
-
 export function renderSubnetList(): void {
   const subnetList = $("#subnet-list");
-  if (!subnetRemoveWired) {
-    subnetRemoveWired = true;
-    subnetList.addEventListener("click", (e) => {
-      const btn = (e.target as HTMLElement).closest<HTMLButtonElement>(
-        "[data-remove-adopted]"
-      );
-      if (!btn) return;
-      const subnet = btn.dataset["removeAdopted"];
-      if (subnet) void handleRemoveAdopted(subnet, btn);
-    });
-  }
   renderModeBadge();
-  if (!state.activeInterface) return;
-
-  const adoptedIpSet = new Set(adoptedSubnets.values());
-  // An adopted row stays on the Host card until the adoption is
-  // explicitly removed — the per-row trash control, the Configure
-  // dialog, or the APIPA reaper (all of which emit subnet-removed and
-  // clear the map). It is NOT tied to Nodes-panel contents: clearing or
-  // losing the nodes behind an adoption must not make the binding look
-  // deleted while the secondary IP is still live on the adapter.
-  // Trash-icon control shared by both auto-row shapes below. `subnetEsc`
-  // must already be HTML-escaped; it doubles as the removal key.
-  const removeBtn = (subnetEsc: string) =>
-    `<button class="btn-remove-ip" data-remove-adopted="${subnetEsc}" title="Remove adopted subnet">` +
-    `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>` +
-    `</button>`;
-  // Native rows: hide APIPA addresses — Windows leaves them as a
-  // secondary after any brief DHCP failure and they can't carry usable
-  // traffic, so showing them as if they were a selectable subnet just
-  // confuses users (seen on multiple Getac installs in the field).
-  // Adopted rows always render (see above).
-  const sortedIps = [...state.activeInterface.ips]
-    .filter((ip) => adoptedIpSet.has(ip.address) || !isApipa(ip.address))
-    .sort((a, b) => {
-      const aAuto = adoptedIpSet.has(a.address) ? 1 : 0;
-      const bAuto = adoptedIpSet.has(b.address) ? 1 : 0;
-      return aAuto - bAuto;
-    });
-  let html = sortedIps
-    .map((ip) => {
-      const isAuto = adoptedIpSet.has(ip.address);
-      // Escape backend-sourced strings interpolated into innerHTML.
-      const subnetEsc = escapeHtml(ip.subnet);
-      const ipEsc = escapeHtml(`${ip.address}/${ip.prefix}`);
-      if (isAuto) {
-        return `
-        <div class="status-row subnet-row subnet-row-auto" data-subnet="${subnetEsc}">
-          <span class="status-label">IP:</span>
-          <span class="auto-ip-group">
-            <span class="badge-auto">(auto)</span>
-            <span class="status-value">${ipEsc}</span>
-          </span>
-          ${removeBtn(subnetEsc)}
-        </div>`;
-      }
-      return `
-      <div class="status-row subnet-row" data-subnet="${subnetEsc}">
-        <span class="status-label">IP:</span>
-        <span class="status-value">${ipEsc}</span>
-      </div>`;
-    })
-    .join("");
-
-  // Add auto-adopted subnets not yet bound as interface IPs (skip if
-  // already shown).
-  const renderedIps = new Set(state.activeInterface.ips.map((ip) => ip.address));
-  for (const [subnet, adoptedIp] of adoptedSubnets) {
-    if (renderedIps.has(adoptedIp)) continue;
-    html += `
-      <div class="status-row subnet-row subnet-row-auto" data-subnet="${escapeHtml(subnet)}">
-        <span class="status-label">IP:</span>
-        <span class="auto-ip-group">
-          <span class="badge-auto">(auto)</span>
-          <span class="status-value">${escapeHtml(`${adoptedIp}/24`)}</span>
-        </span>
-        ${removeBtn(escapeHtml(subnet))}
-      </div>`;
+  type HostRow = { address: string; prefix: number | null; subnet: string; observed: boolean; meta?: import("./types.ts").AdoptedMetaView };
+  const rows = new Map<string, HostRow>();
+  const savedAddresses = new Set([...adoptionMeta.values()].map((m) => m.address));
+  for (const ip of state.activeInterface?.ips ?? []) {
+    if (isApipa(ip.address) && !savedAddresses.has(ip.address)) continue;
+    rows.set(`${ip.address}/${ip.prefix}`, { ...ip, observed: true });
   }
-
-  // Auto-adopted rows carry a per-row remove control. Clicks are handled by
-  // the delegated listener wired above (keyed on data-remove-adopted), which
-  // unbinds the secondary IP and drops the adoption from config.
-  subnetList.innerHTML = html;
+  for (const [subnet, meta] of adoptionMeta) {
+    const address = meta.address ?? adoptedSubnets.get(subnet);
+    if (!address || (meta.desired === "removed" && !meta.applied && !meta.last_error)) continue;
+    const prefix = meta.prefix ?? null;
+    const key = `${address}/${prefix}`;
+    rows.set(key, { address, prefix, subnet, observed: rows.get(key)?.observed ?? false, meta });
+  }
+  const normalizeMac = (mac: string | null | undefined) => mac?.replaceAll("-", ":").toLowerCase();
+  subnetList.innerHTML = [...rows.values()].sort((a, b) =>
+    a.address.localeCompare(b.address) || (a.prefix ?? -1) - (b.prefix ?? -1)
+  ).map(({ address, prefix, subnet, observed, meta }) => {
+    const ownerKnown = /^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/i.test(normalizeMac(meta?.adapter_mac) ?? "") && prefix !== null && prefix >= 0 && prefix <= 32;
+    const mismatch = observed && normalizeMac(meta?.adapter_mac) !== normalizeMac(state.activeInterface?.mac);
+    const managed = ownerKnown && !mismatch && meta?.desired === "present";
+    const cidr = `${address}/${prefix ?? "?"}`;
+    const badge = managed && observed && meta?.applied && sessionAdoptedSubnets.has(subnet)
+      ? '<span class="badge-auto">auto</span>' : "";
+    return `<div class="status-row subnet-row" data-subnet="${escapeHtml(subnet)}">
+      <span class="status-label">IP:</span><span class="auto-ip-group">${badge}<span class="status-value">${escapeHtml(cidr)}</span></span></div>`;
+  }).join("");
+  lockAddressControls();
 }
 
 // ── CAM / PTU target resolution ─────────────────────────────────────
 // Replaces the legacy #camera-ip / #ptu-ip dropdowns. Targets now flow
-// from a precedence chain: current click selection → persisted config
-// (CAM only) → alias designation → none. Callers ask the resolver
+// from the persisted/session identity and current CAM/PTU assignment.
+// Callers ask the resolver
 // at the moment they need to act (Start Stream, PTZ command, etc.),
 // so any state shift in the Nodes panel takes effect on the next
 // action without needing dropdown re-population.
 
-/** Look up the device IP currently aliased to a role string (CAM /
- *  PTU / custom). Aliases are persisted server-side via set_device_alias
- *  and hydrated into the registry from the device cache on cold start,
- *  so this round-trips a role designation across program restarts. */
-function findDeviceIpByAlias(alias: string): string | undefined {
-  return deviceList.getDevices().find((r) => r.alias === alias)?.ip;
+/** Ambiguous legacy roles require an explicit user choice. */
+function targetByAlias(alias: string): DeviceTarget | null {
+  const matches = deviceList.getDevices().filter((r) => r.alias === alias);
+  return matches.length === 1 ? deviceList.targetFor(matches[0]!) : null;
 }
 
-/** The IP to use as the camera target right now. Tries (in order):
- *    1. The session pick — node click, CAM aliasing, or reconnect
- *       resume; the user's most recent explicit intent
- *    2. The device currently aliased CAM — resolved from the live
- *       device list, so it tracks the camera even if its IP shifted
- *       since camera_ip was last persisted
- *    3. The IP persisted in StreamConfig by the last stream start —
- *       the cold-start fallback
- *  The PTU-designated node is never a camera target: an RTSP request
- *  to the pan-tilt unit opens a session that can never preroll and
- *  wedges the pipeline in a stall loop. A session pick or stale
- *  persisted camera_ip that lands on the PTU holder is skipped so the
- *  chain falls through to the real CAM instead (field failure:
- *  Start Stream targeted the PTU after a row click).
- *  Returns null if none of these resolve — Start Stream surfaces a
- *  "select a CAM" toast in that case. */
+export function getActiveCamTarget(): DeviceTarget | null {
+  const aliased = targetByAlias("CAM");
+  if (!aliased) return null;
+  const session = sessionCamTarget.get();
+  if (session) {
+    // Hold missing selections instead of falling through to a replacement.
+    const record = deviceList.resolveTarget(session);
+    if (!record) return null;
+    if (record.alias === "CAM") return session;
+  }
+  const configured = state.config?.stream;
+  if (configured?.camera_mac) {
+    const target = { key: configured.camera_mac, expectedMac: configured.camera_mac };
+    const record = deviceList.resolveTarget(target);
+    if (!record) return null;
+    if (record.alias === "CAM") return target;
+  }
+  return aliased;
+}
+
 export function getActiveCamIp(): string | null {
-  const ptuIp = findDeviceIpByAlias("PTU");
-  const session = sessionCamIp.get();
-  if (session && session !== ptuIp) return session;
-  // A record holds one alias, so the CAM holder can never be the PTU.
-  const aliased = findDeviceIpByAlias("CAM");
-  if (aliased) return aliased;
-  const configured = state.config?.stream.camera_ip || null;
-  return configured && configured !== ptuIp ? configured : null;
+  const ip = deviceList.endpointFor(getActiveCamTarget());
+  return ip && !ip.startsWith("169.254.") ? ip : null;
 }
 
-/** The IP to use as the PTU target right now. PTU is alias-driven
- *  only — there's no per-session click override for it (the click on
- *  a node row is reserved for the CAM target). To switch PTU targets,
- *  re-assign the role from the node's dropdown. */
+export function getActivePtuTarget(): DeviceTarget | null { return targetByAlias("PTU"); }
+
 export function getActivePtuIp(): string | null {
-  return findDeviceIpByAlias("PTU") ?? null;
+  const ip = deviceList.endpointFor(getActivePtuTarget());
+  return ip && !ip.startsWith("169.254.") ? ip : null;
 }
 
 // ── IP Configuration dialog ─────────────────────────────────────────
 
 /** Interfaces loaded when dialog opens — used by add/remove handlers. */
 let dialogInterfaces: InterfaceInfo[] = [];
+let dialogSession: { primaryEdited: boolean; modeEdited: boolean; primary: string; mode: NetworkMode;
+  previousAddress: string | null; primaryChosen: boolean } | null = null;
+let dialogSaving = false;
 
-export function setupIpConfigDialog(): void {
+function rememberPrimaryAddress(mac: string | null | undefined, cidr: string | null | undefined): void {
+  if (!state.config || !mac || cidr === undefined) return;
+  const key = mac.replaceAll("-", ":").toLowerCase();
+  const saved = state.config.primary_addresses ??= {};
+  if (cidr === null) delete saved[key];
+  else saved[key] = cidr;
+}
+
+function primaryFields(): string {
+  return ["#static-ip", "#static-mask", "#static-gateway"]
+    .map((id) => $<HTMLInputElement>(id).value.trim()).join("\n");
+}
+
+function renderAdapterChoices(): void {
+  const selection = adapterSelection;
+  if (!selection) return;
+  const select = $<HTMLSelectElement>("#static-iface");
+  select.innerHTML = '<option value="" disabled>Select Ethernet adapter</option>' +
+    dialogInterfaces.map((i) => `<option value="${escapeHtml(i.name)}">${escapeHtml(
+      `${i.display_name || i.name} (${i.mac})`
+    )}</option>`).join("");
+  select.value = selection.adapter?.name ?? "";
+  const field = select.closest<HTMLElement>(".input-field");
+  if (field) field.style.display = dialogInterfaces.length > 1 ? "" : "none";
+}
+
+const addressControlSelector = "#static-iface, #btn-add-sec-ip, #static-ip, #static-mask, #static-gateway, #primary-existing-ip, #btn-remove-primary-ip, #add-sec-ip, #add-sec-mask, #ip-mode-dhcp, #ip-mode-static-auto, #ip-mode-static-manual, #reset-adapter-confirm, [data-remove-binding], [data-remove-ip]";
+function lockAddressControls(): void {
+  if (!addressBusy && !dialogSaving) return;
+  document.querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLSelectElement>(addressControlSelector).forEach((el) => {
+    if (!disabledControls.has(el)) disabledControls.set(el, el.disabled);
+    el.disabled = true;
+  });
+  $("#host-title").style.pointerEvents = "none";
+}
+
+function unlockAddressControls(pointerEvents: string): void {
+  disabledControls.forEach((disabled, el) => { el.disabled = disabled; });
+  disabledControls.clear();
+  $("#host-title").style.pointerEvents = pointerEvents;
+}
+
+/** Apply only this operation's row and its observed adapter, without IPC. */
+function applyAddressReply(reply: AddressReply): void {
+  ++interfaceRefresh; ++bindingRefresh;
+  const view = reply.view;
+  rememberPrimaryAddress(view.selection.selected_mac, view.primary_address);
+  hostMode = view.mode;
+  if (state.config) state.config.network_mode = view.mode;
+  if (view.subnet) {
+    adoptedSubnets.delete(view.subnet);
+    sessionAdoptedSubnets.delete(view.subnet);
+    if (view.binding) {
+      adoptionMeta.set(view.subnet, view.binding);
+      if (view.binding.desired === "present" && view.binding.applied && view.binding.address)
+        adoptedSubnets.set(view.subnet, view.binding.address);
+    } else adoptionMeta.delete(view.subnet);
+  }
+  if (!view.observation_error) { applySelection(view.selection); verifiedAddressView = true; }
+  else log(`Address observation unavailable: ${view.observation_error}`);
+  renderNetwork();
+  if ($<HTMLDialogElement>("#ip-config-dialog").open && !dialogSession?.modeEdited && view.dhcp !== null) {
+    const mode = view.dhcp ? "dhcp" : view.mode === "dhcp" ? "static_auto" : view.mode;
+    $<HTMLInputElement>("#ip-mode-dhcp").checked = mode === "dhcp";
+    $<HTMLInputElement>("#ip-mode-static-auto").checked = mode === "static_auto";
+    $<HTMLInputElement>("#ip-mode-static-manual").checked = mode === "static_manual";
+    if (dialogSession) dialogSession.mode = mode;
+    updateModeVisibility();
+  }
+}
+
+async function mutateAddress(progress: string, invoke: () => Promise<AddressReply>, button?: HTMLButtonElement): Promise<boolean> {
+  if (addressBusy || selectingAdapter || dialogSaving) return false;
+  const operation = { retired: false };
+  addressBusy = operation;
+  ++interfaceRefresh; ++bindingRefresh;
+  const started = performance.now();
+  const spinner = $<HTMLElement>("#ip-config-spinner");
+  const oldHtml = button?.innerHTML;
+  const spinnerClass = spinner.className;
+  const hostPointer = $("#host-title").style.pointerEvents;
+  try {
+    lockAddressControls();
+    spinner.style.display = "";
+    spinner.className = "";
+    spinner.textContent = progress;
+    if (button) button.textContent = progress;
+    log(`Address request acknowledged in ${(performance.now() - started).toFixed(1)}ms`);
+    const reply = await invoke();
+    log(`Address operation ${reply.operation} IPC returned in ${(performance.now() - started).toFixed(1)}ms`);
+    if (operation.retired) { log("Address reply retired after adapter change"); return false; }
+    applyAddressReply(reply);
+    log(`Address operation ${reply.operation} rendered in ${(performance.now() - started).toFixed(1)}ms`);
+    showToast(reply.reason ?? (reply.outcome === "success" ? "Address updated" : "Address operation pending"), reply.outcome !== "success");
+    return reply.outcome === "success" && !reply.view.observation_error;
+  } catch (e) {
+    showToast("Failed: " + formatError(e), true);
+    return false;
+  } finally {
+    addressBusy = null;
+    unlockAddressControls(hostPointer);
+    spinner.style.display = "none";
+    spinner.textContent = "";
+    spinner.className = spinnerClass;
+    if (button) button.innerHTML = oldHtml ?? "Remove";
+    // Only an independently received event/open request can schedule this read.
+    if (refreshTrailing && !refreshFlight) void refreshInterfaces();
+  }
+}
+
+export function setupIpConfigDialog(
+  onModeApplied: (previous: NetworkMode | null, next: NetworkMode) => void = () => {},
+): void {
   const dialog = $<HTMLDialogElement>("#ip-config-dialog");
+  const closeButton = $<HTMLButtonElement>("#ip-config-close");
+  let closing = false;
+
+  dialog.addEventListener("close", () => { dialogSession = null; ++interfaceRefresh; ++bindingRefresh; });
 
   // ── Open dialog ──────────────────────────────────────────────────
   $<HTMLButtonElement>("#btn-ip-config").addEventListener("click", async () => {
+    if (closing || dialog.open) return;
+    const session = { primaryEdited: false, modeEdited: false, primary: primaryFields(),
+      mode: hostMode ?? state.config?.network_mode ?? "static_auto", previousAddress: null as string | null, primaryChosen: false };
+    dialogSession = session;
+    $<HTMLInputElement>("#add-sec-ip").value = "";
     const select = $<HTMLSelectElement>("#static-iface");
     select.innerHTML = '<option value="">Loading…</option>';
 
+    ++interfaceRefresh; ++bindingRefresh;
     await showModalWithVideo(dialog);
 
     try {
-      dialogInterfaces = ((await api.listInterfaces()) || []).filter(isWiredCandidate);
-      select.innerHTML = dialogInterfaces
-        .map((i) => {
-          const ip = i.ips.length > 0 ? i.ips[0]!.address : "no IP";
-          // Adapter names are backend-sourced and can carry arbitrary
-          // characters (user renames, vendor strings) — escape before
-          // innerHTML, value attribute included.
-          const nameEsc = escapeHtml(i.name);
-          const labelEsc = escapeHtml(`${i.display_name || i.name} (${ip})`);
-          return `<option value="${nameEsc}">${labelEsc}</option>`;
-        })
-        .join("");
-      populateDialogFields();
+      if (dialogSession !== session || !dialog.open) return;
+      // Keep a known adapter usable while the fresh read is in flight. Every
+      // write still validates the selected adapter against fresh native state.
+      if (adapterSelection) {
+        dialogInterfaces = (adapterSelection.candidates ?? []).filter(isWiredCandidate);
+        renderNetwork();
+      }
+      await reloadDialogInterfaces();
+      if (dialogSession !== session || !dialog.open || addressBusy) return;
       await syncModeFromInterface();
     } catch (_) {
       select.innerHTML = '<option value="">Failed to load</option>';
@@ -576,103 +707,160 @@ export function setupIpConfigDialog(): void {
   });
 
   // Re-populate when interface selection changes
-  $<HTMLSelectElement>("#static-iface").addEventListener("change", () => {
-    populateDialogFields();
-    void syncModeFromInterface();
+  $<HTMLSelectElement>("#static-iface").addEventListener("change", async () => {
+    const select = $<HTMLSelectElement>("#static-iface");
+    const iface = dialogInterfaces.find((i) => i.name === select.value);
+    if (!iface || selectingAdapter || addressBusy || dialogSaving) return;
+    selectingAdapter = true;
+    select.disabled = true;
+    try {
+      rememberAdapterSelection(await api.selectAdapter(iface.mac));
+      await reloadDialogInterfaces();
+      await syncModeFromInterface();
+    } catch (e) {
+      showToast("Adapter selection failed: " + formatError(e), true);
+      await reloadDialogInterfaces();
+    } finally {
+      selectingAdapter = false;
+      select.disabled = false;
+    }
   });
 
-  // Mode toggle: hide/show the static-only fields. Applying happens via
-  // the existing Apply button — see branch below.
-  $<HTMLInputElement>("#ip-mode-dhcp").addEventListener("change", updateModeVisibility);
-  $<HTMLInputElement>("#ip-mode-static-auto").addEventListener("change", updateModeVisibility);
-  $<HTMLInputElement>("#ip-mode-static-manual").addEventListener("change", updateModeVisibility);
+  // Native refreshes may update the rows while open, but must not erase edits.
+  for (const id of ["#static-ip", "#static-mask", "#static-gateway"]) {
+    $<HTMLInputElement>(id).addEventListener("input", () => {
+      if (dialogSession) dialogSession.primaryEdited = primaryFields() !== dialogSession.primary;
+    });
+  }
+  for (const id of ["#ip-mode-dhcp", "#ip-mode-static-auto", "#ip-mode-static-manual"]) {
+    $<HTMLInputElement>(id).addEventListener("change", () => {
+      if (dialogSession) dialogSession.modeEdited = readSelectedMode() !== dialogSession.mode;
+      updateModeVisibility();
+    });
+  }
+  $<HTMLSelectElement>("#primary-existing-ip").addEventListener("change", () => {
+    if (!dialogSession || addressBusy || dialogSaving) return;
+    dialogSession.previousAddress = $<HTMLSelectElement>("#primary-existing-ip").value || null;
+    dialogSession.primaryChosen = true;
+    populateDialogFields();
+  });
+  $<HTMLButtonElement>("#btn-remove-primary-ip").addEventListener("click", async () => {
+    if (addressBusy || dialogSaving || selectingAdapter) return;
+    const iface = dialogInterfaces.find((i) => i.name === $<HTMLSelectElement>("#static-iface").value);
+    const ip = dialogSession?.previousAddress?.split("/")[0];
+    if (!iface || !ip || !window.confirm(`Remove ${ip} from ${iface.display_name || iface.name}?`)) return;
+    if (await mutateAddress("Removing address…", () => api.removeSecondaryIp(iface.name, ip, true), $<HTMLButtonElement>("#btn-remove-primary-ip"))) {
+      if (dialogSession) { dialogSession.previousAddress = null; dialogSession.primaryChosen = true; }
+      renderNetwork();
+    }
+  });
 
   // ── Add secondary IP ─────────────────────────────────────────────
-  $<HTMLButtonElement>("#btn-add-sec-ip").addEventListener("click", async () => {
+  async function addDialogAddress(): Promise<boolean> {
+    if (selectingAdapter || addressBusy || dialogSaving) return false;
     const iface = $<HTMLSelectElement>("#static-iface").value;
     const ip = $<HTMLInputElement>("#add-sec-ip").value.trim();
     const mask = $<HTMLInputElement>("#add-sec-mask").value.trim();
+    const session = dialogSession;
     if (!iface || !ip || !mask) {
       showToast("Enter an IP and mask", true);
-      return;
+      return false;
     }
-    const spinner = $<HTMLElement>("#ip-config-spinner");
-    spinner.style.display = "";
-    try {
-      await api.addSecondaryIp(iface, ip, mask);
+    const saved = await mutateAddress("Adding address…", () => api.addSecondaryIp(iface, ip, mask));
+    if (saved && dialogSession === session && $<HTMLInputElement>("#add-sec-ip").value.trim() === ip
+        && $<HTMLInputElement>("#add-sec-mask").value.trim() === mask) {
       $<HTMLInputElement>("#add-sec-ip").value = "";
-      showToast("Secondary IP added");
-      await reloadDialogInterfaces();
-    } catch (e) {
-      showToast("Failed: " + formatError(e), true);
     }
-    spinner.style.display = "none";
-  });
+    return saved;
+  }
+  $<HTMLButtonElement>("#btn-add-sec-ip").addEventListener("click", () => addDialogAddress());
 
-  // ── Cancel ───────────────────────────────────────────────────────
-  $<HTMLButtonElement>("#ip-config-cancel").addEventListener("click", () => dialog.close());
-
-  // ── Apply ────────────────────────────────────────────────────────
-  // Three-mode branching:
-  //   DHCP            → setDhcp + setNetworkMode("dhcp")
-  //   Static-Auto     → setStaticIp + setNetworkMode("static_auto")
-  //   Static-Manual   → setStaticIp + setNetworkMode("static_manual")
-  // The OS-level change goes first so the new mode applies against a
-  // settled adapter (auto-adopt loop reads current IPs to decide
-  // rescue vs pause).
-  $<HTMLButtonElement>("#ip-config-apply").addEventListener("click", async () => {
-    const iface = $<HTMLSelectElement>("#static-iface").value;
-    if (!iface) {
-      showToast("Select an interface", true);
-      return;
+  // Close and Escape share one save path. Only user edits trigger writes;
+  // merely opening a disconnected/ambiguous adapter needs no primary IP.
+  async function saveAndClose(): Promise<void> {
+    if (closing || selectingAdapter || !dialog.open) return;
+    const session = dialogSession;
+    const modeEdited = session?.primaryEdited || session?.modeEdited;
+    const secondaryEntered = !!$<HTMLInputElement>("#add-sec-ip").value.trim();
+    if (!modeEdited && !secondaryEntered) { dialog.close(); return; }
+    if (addressBusy) { showToast("Wait for the address operation to finish", true); return; }
+    const name = $<HTMLSelectElement>("#static-iface").value;
+    const selectedMac = adapterSelection?.selected_mac;
+    const mode = readSelectedMode();
+    if (!name) { showToast("Select an interface", true); return; }
+    const ip = mode === "dhcp" ? null : $<HTMLInputElement>("#static-ip").value.trim();
+    const subnet_mask = mode === "dhcp" ? null : $<HTMLInputElement>("#static-mask").value.trim();
+    if (modeEdited && mode !== "dhcp" && (!ip || !subnet_mask)) {
+      showToast("Fill in address and mask", true); return;
     }
-
+    if (secondaryEntered && !$<HTMLInputElement>("#add-sec-mask").value.trim()) {
+      showToast("Enter an IP and mask", true); return;
+    }
+    if (secondaryEntered && mode === "dhcp") {
+      showToast("Select a static mode to add a secondary IP", true); return;
+    }
+    const previousMode = state.config?.network_mode ?? null;
+    const request = {
+      name, mode, ip, subnet_mask,
+      gateway: mode === "dhcp" ? null : $<HTMLInputElement>("#static-gateway").value.trim() || null,
+      previous_address: mode === "dhcp" ? null : session?.previousAddress ?? null,
+      confirmed: false,
+    };
     const spinner = $<HTMLElement>("#ip-config-spinner");
-    const selectedMode = readSelectedMode();
-
-    if (selectedMode === "dhcp") {
-      spinner.style.display = "";
-      try {
-        await api.setDhcp(iface);
-        await api.setNetworkMode("dhcp");
-        if (state.config) state.config.network_mode = "dhcp";
-        showToast("Switched to DHCP");
-        dialog.close();
-        await refreshInterfaces();
-      } catch (e) {
-        showToast("Failed: " + formatError(e), true);
-      }
-      spinner.style.display = "none";
-      return;
-    }
-
-    // Both Static-Auto and Static-Manual need a host primary IP — same
-    // form, same OS call. The difference is the program mode that gets
-    // saved afterward (which drives ARP/auto-adopt/pinger behavior).
-    const ip = $<HTMLInputElement>("#static-ip").value.trim();
-    const mask = $<HTMLInputElement>("#static-mask").value.trim();
-    const gw = $<HTMLInputElement>("#static-gateway").value.trim() || null;
-    if (!ip || !mask) {
-      showToast("Fill in address and mask", true);
-      return;
-    }
-    spinner.style.display = "";
+    const hostPointer = $("#host-title").style.pointerEvents;
+    closing = true;
+    closeButton.disabled = true;
     try {
-      await api.setStaticIp(iface, ip, mask, gw);
-      await api.setNetworkMode(selectedMode);
-      if (state.config) state.config.network_mode = selectedMode;
-      showToast(
-        selectedMode === "static_manual"
-          ? "Switched to Static — Manual"
-          : "Primary IP updated"
-      );
+      if (modeEdited) {
+        dialogSaving = true;
+        lockAddressControls();
+        spinner.style.display = "";
+        let reply = await api.setNetworkMode(request);
+        if (reply.warning) {
+          if (!window.confirm(reply.warning)) {
+            // Cancel the proposed mode, so Close/Escape can leave without
+            // proposing the same DHCP change again. Keep other field edits.
+            $<HTMLInputElement>("#ip-mode-dhcp").checked = reply.mode === "dhcp";
+            $<HTMLInputElement>("#ip-mode-static-auto").checked = reply.mode === "static_auto";
+            $<HTMLInputElement>("#ip-mode-static-manual").checked = reply.mode === "static_manual";
+            if (session) { session.mode = reply.mode; session.modeEdited = false; }
+            updateModeVisibility();
+            return;
+          }
+          reply = await api.setNetworkMode({ ...request, confirmed: true });
+        }
+        if (reply.warning) { showToast(reply.warning, true); return; }
+        ++interfaceRefresh; ++bindingRefresh;
+        hostMode = reply.mode;
+        if (state.config) state.config.network_mode = reply.mode;
+        rememberPrimaryAddress(selectedMac, reply.primary_address);
+        if (session) { session.primaryEdited = false; session.modeEdited = false; session.mode = reply.mode; session.primaryChosen = false; }
+        renderModeBadge();
+        if (reply.mode === "static_manual") hideDiscoveryStatus();
+        onModeApplied(previousMode, reply.mode);
+        await refreshInterfaces();
+        if (previousMode === "static_manual" && reply.mode !== "static_manual" && isInterfaceConnected()) resetDiscoveryStatus();
+        dialogSaving = false;
+        unlockAddressControls(hostPointer);
+      }
+      if (dialogSession !== session || !dialog.open) return;
+      if (adapterSelection?.selected_mac !== selectedMac) {
+        showToast("Ethernet adapter changed; review the configuration before closing", true); return;
+      }
+      if (secondaryEntered && !await addDialogAddress()) return;
       dialog.close();
-      await refreshInterfaces();
     } catch (e) {
       showToast("Failed: " + formatError(e), true);
+    } finally {
+      dialogSaving = false;
+      closing = false;
+      closeButton.disabled = false;
+      unlockAddressControls(hostPointer);
+      spinner.style.display = "none";
     }
-    spinner.style.display = "none";
-  });
+  }
+  closeButton.addEventListener("click", saveAndClose);
+  dialog.addEventListener("cancel", (event) => { event.preventDefault(); void saveAndClose(); });
 }
 
 /** Read the dialog's currently-selected mode radio. */
@@ -697,10 +885,15 @@ async function syncModeFromInterface(): Promise<void> {
   const name = $<HTMLSelectElement>("#static-iface").value;
   if (!name) return;
   try {
-    const mode = await api.getNetworkMode();
+    const request = interfaceRefresh;
+    const savedMode = hostMode ?? state.config?.network_mode ?? "static_auto";
+    const dhcp = await api.getDhcpState(name);
+    if (request !== interfaceRefresh || addressBusy || dialogSession?.modeEdited || !$<HTMLDialogElement>("#ip-config-dialog").open) return;
+    const mode = dhcp ? "dhcp" : savedMode === "dhcp" ? "static_auto" : savedMode;
     $<HTMLInputElement>("#ip-mode-dhcp").checked = mode === "dhcp";
     $<HTMLInputElement>("#ip-mode-static-auto").checked = mode === "static_auto";
     $<HTMLInputElement>("#ip-mode-static-manual").checked = mode === "static_manual";
+    if (dialogSession) dialogSession.mode = mode;
   } catch (_) {
     // Leave the radio at its current position on error.
   }
@@ -711,140 +904,79 @@ async function syncModeFromInterface(): Promise<void> {
 function populateDialogFields(): void {
   const name = $<HTMLSelectElement>("#static-iface").value;
   const iface = dialogInterfaces.find((i) => i.name === name);
-  if (!iface) return;
+  if (!iface) {
+    $("#primary-existing-field").style.display = "none";
+    $("#btn-remove-primary-ip").style.display = "none";
+    renderSecondaryIps(undefined, undefined); return;
+  }
 
-  // Find the first non-auto-adopted, non-APIPA IP as primary. APIPA is
-  // never used as a fallback — when the adapter has only APIPA (DHCP
-  // failed to acquire a real lease) the field is left empty so the user
-  // types fresh against the `192.168.1.100` placeholder. Seeding the
-  // APIPA value would invite a partial-edit collision that yields a
-  // hybrid like `169.168.1.100` and writes it as a static primary.
-  const adoptedIps = new Set(adoptedSubnets.values());
-  const primary =
-    iface.ips.find((ip) => !adoptedIps.has(ip.address) && !isApipa(ip.address)) ||
-    iface.ips.find((ip) => !isApipa(ip.address));
-  $<HTMLInputElement>("#static-ip").value = primary ? primary.address : "";
-  $<HTMLInputElement>("#static-mask").value = primary ? prefixToMask(primary.prefix) : "255.255.255.0";
+  // Prefer the user's explicit primary. Legacy ambiguous addresses require
+  // a choice; neither a secondary nor a newly adopted address becomes primary
+  // merely because Windows changed enumeration order.
+  const cidr = (ip: { address: string; prefix: number }) => `${ip.address}/${ip.prefix}`;
+  const usable = iface.ips.filter((ip) => !isApipa(ip.address));
+  const savedIps = new Set([...adoptionMeta.values()].map((m) => m.address));
+  const native = usable.filter((ip) => !savedIps.has(ip.address));
+  const saved = state.config?.primary_addresses?.[iface.mac.replaceAll("-", ":").toLowerCase()];
+  const legacy = native.length === 1 ? native[0] : usable.length === 1 ? usable[0] : undefined;
+  const choice = dialogSession && (dialogSession.primaryEdited || dialogSession.primaryChosen)
+    ? dialogSession.previousAddress : saved ?? (legacy ? cidr(legacy) : null);
+  const primary = usable.find((ip) => cidr(ip) === choice);
+  const existing = $<HTMLSelectElement>("#primary-existing-ip");
+  existing.innerHTML = '<option value="">Select an address</option>' + usable.map((ip) => `<option value="${escapeHtml(cidr(ip))}">${escapeHtml(cidr(ip))}</option>`).join("");
+  existing.value = choice ?? "";
+  $("#primary-existing-field").style.display = !primary && saved !== "" && usable.length > 1 ? "" : "none";
+  $("#btn-remove-primary-ip").style.display = primary ? "" : "none";
   // Left blank intentionally. The snapshot carries no gateway to seed it
-  // with, but a blank gateway on Apply no longer wipes the configured
+  // with, but a blank gateway on save no longer wipes the configured
   // one — the backend preserves the existing default gateway when this
   // field is empty. Type a value here only to change it.
-  $<HTMLInputElement>("#static-gateway").value = "";
+  if (!dialogSession?.primaryEdited) {
+    $<HTMLInputElement>("#static-ip").value = primary ? primary.address : "";
+    $<HTMLInputElement>("#static-mask").value = primary ? prefixToMask(primary.prefix) : "255.255.255.0";
+    $<HTMLInputElement>("#static-gateway").value = "";
+    if (dialogSession) dialogSession.primary = primaryFields();
+  }
+  if (dialogSession && !dialogSession.primaryEdited) dialogSession.previousAddress = primary ? cidr(primary) : null;
 
   // Secondary = all IPs except the primary
   renderSecondaryIps(iface, primary);
 }
 
-/** Render the secondary IP list with remove buttons. */
-function renderSecondaryIps(
-  iface: InterfaceInfo,
-  primary: { address: string } | undefined
-): void {
+/** Merge observed secondaries with durable pending/failed removal intent. */
+function renderSecondaryIps(iface: InterfaceInfo | undefined, primary: { address: string } | undefined): void {
   const list = $("#secondary-ip-list");
-  const secondaries = iface.ips.filter((ip) => !primary || ip.address !== primary.address);
-
-  if (secondaries.length === 0) {
-    list.innerHTML = '<p class="placeholder-text" style="padding:8px">No secondary IPs</p>';
-    return;
-  }
-
-  // Only the specific IPs we auto-adopted carry the "(auto)" badge.
-  // adoptedSubnets is keyed by subnet → IP we added on that subnet; a
-  // user-set static IP on the same /24 is a different value and must
-  // not get tagged "auto" just because the subnet is in the map.
-  const adoptedIpSet = new Set(adoptedSubnets.values());
-  // Reverse map for the lifecycle metadata lookup: adopted IP → subnet
-  // (the metadata mirror is keyed by subnet, rows render by IP).
-  const ipToSubnet = new Map(
-    [...adoptedSubnets].map(([subnet, ip]) => [ip, subnet])
-  );
-  list.innerHTML = secondaries
-    .map((ip) => {
-      const isAuto = adoptedIpSet.has(ip.address);
-      let badge = isAuto ? '<span class="badge-auto">(auto)</span>' : "";
-      let tooltip = "";
-      if (isAuto) {
-        // Stale flag and tooltip come from the backend's adoption
-        // snapshot — the same policy that decides removal, so the
-        // badge can't disagree with what the reaper would do.
-        const subnet = ipToSubnet.get(ip.address);
-        const meta = subnet ? adoptionMeta.get(subnet) : undefined;
-        if (meta) {
-          tooltip = meta.last_device_seen
-            ? `last device seen: ${new Date(meta.last_device_seen).toLocaleString()}`
-            : "no device seen this session";
-          if (meta.stale) {
-            badge += ' <span class="badge-stale">stale</span>';
-          }
-        }
+  const rows = new Map((iface?.ips ?? []).filter((ip) => !isApipa(ip.address) && ip.address !== primary?.address)
+    .map((ip) => [ip.address, ip.prefix]));
+  const saved = new Map([...adoptionMeta].filter(([, m]) => m.address && !isApipa(m.address) && m.address !== primary?.address &&
+    (m.desired !== "removed" || m.applied || m.last_error)).map(([subnet, m]) => [m.address!, { subnet, meta: m }]));
+  for (const [address, { meta }] of saved) rows.set(address, meta.prefix ?? 24);
+  list.innerHTML = rows.size ? [...rows].map(([address, prefix]) => {
+    const binding = saved.get(address);
+    const m = binding?.meta;
+    const status = m?.desired === "removed" ? " — pending removal" : m && !m.applied ? " — pending" : "";
+    const reason = m?.last_error ? ` — ${m.last_error}` : "";
+    return `<div class="secondary-ip-item"><span>${escapeHtml(`${address}/${prefix}${status}${reason}`)}</span>
+      ${binding || iface ? `<button class="btn-remove-ip" ${binding ? `data-remove-binding="${escapeHtml(binding.subnet)}"` : `data-remove-ip="${escapeHtml(address)}"`} title="Remove ${escapeHtml(`${address}/${prefix}`)}">Remove</button>` : ""}</div>`;
+  }).join("") : '<p class="placeholder-text" style="padding:8px">No secondary IPs</p>';
+  list.querySelectorAll<HTMLButtonElement>("[data-remove-binding], [data-remove-ip]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      if (selectingAdapter || addressBusy || dialogSaving) return;
+      const subnet = btn.dataset["removeBinding"];
+      const ip = btn.dataset["removeIp"];
+      if (!subnet && ip && iface) {
+        const prefix = rows.get(ip);
+        if (!window.confirm(`Remove ${ip}/${prefix} from ${iface.display_name || iface.name}? This may interrupt devices using this host address. Device history is retained.`)) return;
+        await mutateAddress("Removing address…", () => api.removeSecondaryIp(iface.name, ip), btn);
+        return;
       }
-      const addrEsc = escapeHtml(ip.address);
-      const cidrEsc = escapeHtml(`${ip.address}/${ip.prefix}`);
-      const titleAttr = tooltip ? ` title="${escapeHtml(tooltip)}"` : "";
-      return `<div class="secondary-ip-item">
-        <span${titleAttr}>${cidrEsc} ${badge}</span>
-        <button class="btn-remove-ip" data-remove-sec-ip="${addrEsc}" title="Remove">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
-        </button>
-      </div>`;
-    })
-    .join("");
-
-  // Wire remove buttons
-  list
-    .querySelectorAll<HTMLButtonElement>("[data-remove-sec-ip]")
-    .forEach((btn) => {
-      btn.addEventListener("click", async () => {
-        const ip = btn.dataset["removeSecIp"];
-        if (!ip) return;
-        const ifaceName = $<HTMLSelectElement>("#static-iface").value;
-        const spinner = $<HTMLElement>("#ip-config-spinner");
-        spinner.style.display = "";
-        try {
-          // An auto-adopted address must go through the adoption
-          // removal path: the generic secondary-IP delete only unbinds
-          // the OS address, leaving the backend adoption and its config
-          // entry intact — the row silently returned on the next
-          // launch's restore. Generic removal stays for user-owned
-          // secondaries, which have no backend registration.
-          let adoptedSubnet: string | null = null;
-          for (const [subnet, adoptedIp] of adoptedSubnets) {
-            if (adoptedIp === ip) {
-              adoptedSubnet = subnet;
-              break;
-            }
-          }
-          if (!adoptedSubnet) {
-            // The live map can be empty while the row's IP is still a
-            // persisted adoption: a disconnected cold start restores
-            // nothing, yet an unclean shutdown leaves the address bound.
-            // Those rows must also route through the adoption-aware
-            // removal, or the config entry survives and the adoption
-            // resurrects on the next connected launch.
-            const configured = await api.getConfiguredAdoptions();
-            for (const [subnet, adoptedIp] of Object.entries(configured)) {
-              if (adoptedIp === ip) {
-                adoptedSubnet = subnet;
-                break;
-              }
-            }
-          }
-          if (adoptedSubnet) {
-            await api.removeAdoptedSubnet(adoptedSubnet, ifaceName);
-            adoptedSubnets.delete(adoptedSubnet);
-            // The host card renders adopted rows too — keep it in step.
-            renderSubnetList();
-          } else {
-            await api.removeSecondaryIp(ifaceName, ip);
-          }
-          showToast(`Removed ${ip}`);
-          await reloadDialogInterfaces();
-        } catch (e) {
-          showToast("Failed: " + formatError(e), true);
-        }
-        spinner.style.display = "none";
-      });
+      const m = subnet ? adoptionMeta.get(subnet) : undefined;
+      if (!subnet || !m?.address) return;
+      if (!window.confirm(`Remove ${m.address}/${m.prefix ?? "?"} from its saved adapter? Nodes on ${subnet} may share this host address and lose connectivity. Device history is retained.`)) return;
+      await mutateAddress("Removing address…", () => api.removeAdoptedSubnet(subnet, iface?.name), btn);
     });
+  });
+  lockAddressControls();
 }
 
 /** Re-pull interfaces into the IP-config dialog when it's open. Used
@@ -857,14 +989,7 @@ export async function refreshIpDialogIfOpen(): Promise<void> {
 }
 
 /** Reload interfaces and refresh dialog fields without closing. */
-async function reloadDialogInterfaces(): Promise<void> {
-  try {
-    dialogInterfaces = ((await api.listInterfaces()) || []).filter(isWiredCandidate);
-    populateDialogFields();
-    // Also refresh the host card
-    await refreshInterfaces();
-  } catch (_) {}
-}
+async function reloadDialogInterfaces(): Promise<void> { await refreshInterfaces(); }
 
 /** Convert CIDR prefix to dotted mask (e.g. 24 → "255.255.255.0"). */
 function prefixToMask(prefix: number): string {

@@ -180,6 +180,9 @@ pub type PendingIps = Arc<Mutex<Vec<PendingIp>>>;
 /// real addresses or probing the wire.
 #[allow(async_fn_in_trait)]
 pub trait AdoptOps {
+    async fn observe(&self, _iface: &str) -> Result<super::InterfaceInfo, AppError> {
+        Err(AppError::Network("Adapter observation unavailable".into()))
+    }
     /// Bind a secondary IP (production: `New-NetIPAddress`).
     async fn add(&self, iface: &str, ip: Ipv4Addr, mask: &str) -> Result<(), AppError>;
     /// Remove a secondary IP (production: `netsh delete address`).
@@ -194,7 +197,28 @@ pub trait AdoptOps {
 /// adoption future takes its child process with it.
 pub struct RealAdoptOps;
 
+fn temporary_observation(
+    mut current: super::InterfaceInfo,
+    native: Option<(bool, Vec<super::interface::IpInfo>)>,
+) -> Result<super::InterfaceInfo, AppError> {
+    let (is_up, ips) = native
+        .ok_or_else(|| AppError::Network("Temporary adapter observation unavailable".into()))?;
+    current.is_up = is_up;
+    current.ips = ips;
+    Ok(current)
+}
+
 impl AdoptOps for RealAdoptOps {
+    async fn observe(&self, iface: &str) -> Result<super::InterfaceInfo, AppError> {
+        let current = super::interface::get_by_name(iface).await?;
+        if super::interface::index_for_mac(&current.mac).is_none() {
+            return Err(AppError::Network(
+                "Temporary adapter index is unavailable or ambiguous".into(),
+            ));
+        }
+        let native = super::interface::quick_status_by_mac(&current.mac);
+        temporary_observation(current, native)
+    }
     async fn add(&self, iface: &str, ip: Ipv4Addr, mask: &str) -> Result<(), AppError> {
         ip_config::add_secondary_ip(iface, &ip.to_string(), mask).await
     }
@@ -206,6 +230,126 @@ impl AdoptOps for RealAdoptOps {
         super::arp::send_arp_probe(target, source, std::time::Duration::from_secs(1))
             .await
             .unwrap_or(true)
+    }
+}
+
+/// Temporary writes use the existing config transaction before the OS call.
+/// Ordinary committed restore/removal continues to use RealAdoptOps directly.
+pub(crate) struct PendingAdoptOps<'a, O> {
+    pub config: &'a crate::config::AppConfig,
+    pub adapter_mac: &'a str,
+    pub ops: O,
+    pub persist: fn(&crate::config::AppSettings) -> Result<(), AppError>,
+}
+
+impl<'a, O: AdoptOps> PendingAdoptOps<'a, O> {
+    pub fn new(config: &'a crate::config::AppConfig, adapter_mac: &'a str, ops: O) -> Self {
+        Self {
+            config,
+            adapter_mac,
+            ops,
+            persist: crate::config::save_to_disk,
+        }
+    }
+
+    async fn observe_owned(&self, iface: &str) -> Result<super::InterfaceInfo, AppError> {
+        let current = self.ops.observe(iface).await?;
+        if super::device_registry::canonical_mac(&current.mac)
+            != super::device_registry::canonical_mac(self.adapter_mac)
+            || super::device_registry::canonical_mac(self.adapter_mac).is_none()
+        {
+            return Err(AppError::Network(
+                "Temporary address adapter changed".into(),
+            ));
+        }
+        Ok(current)
+    }
+}
+
+impl<O: AdoptOps> AdoptOps for PendingAdoptOps<'_, O> {
+    async fn add(&self, iface: &str, ip: Ipv4Addr, mask: &str) -> Result<(), AppError> {
+        let prefix = ip_config::mask_to_prefix(mask)?;
+        let owner = super::device_registry::canonical_mac(self.adapter_mac)
+            .ok_or_else(|| AppError::Network("Invalid temporary adapter owner".into()))?;
+        let row = crate::config::PendingAddress {
+            adapter_mac: owner,
+            address: ip.to_string(),
+            prefix,
+        };
+        let current = self.observe_owned(iface).await?;
+        if current.ips.iter().any(|a| a.address == row.address) {
+            return Err(AppError::Network(
+                "Address already exists; temporary ownership not claimed".into(),
+            ));
+        }
+        // An earlier failed remove can leave only its durable record. A fresh
+        // observation of absence retires it before reserving the next attempt.
+        if self.config.get().pending_addresses.contains(&row) {
+            self.config.forget_temporary_with(&row, self.persist)?;
+        }
+        self.config
+            .reserve_temporary_with(row.clone(), self.persist)?;
+        // Observe again after the save: an external address added before our
+        // OS operation must not be claimed or later removed by this attempt.
+        if self
+            .observe_owned(iface)
+            .await?
+            .ips
+            .iter()
+            .any(|a| a.address == row.address)
+        {
+            self.config.forget_temporary_with(&row, self.persist)?;
+            return Err(AppError::Network(
+                "Address appeared before temporary add; no OS change made".into(),
+            ));
+        }
+        // Any error is ambiguous until reconciliation observes OS state; keep
+        // the durable ownership even if the child timed out after applying.
+        self.ops.add(iface, ip, mask).await
+    }
+
+    async fn remove(&self, iface: &str, ip: Ipv4Addr) -> Result<(), AppError> {
+        let settings = self.config.get();
+        let row = settings.pending_addresses.into_iter().find(|p| {
+            p.address == ip.to_string()
+                && Some(p.adapter_mac.clone())
+                    == super::device_registry::canonical_mac(self.adapter_mac)
+        });
+        let Some(row) = row else {
+            return Ok(());
+        }; // committed/manual claim wins
+        if settings.adopted_meta.values().any(|m| {
+            m.address.as_ref() == Some(&row.address)
+                && m.adapter_mac.as_ref() == Some(&row.adapter_mac)
+        }) {
+            return self.config.forget_temporary_with(&row, self.persist);
+        }
+        let current = self.observe_owned(iface).await?;
+        let observed = current.ips.iter().find(|a| a.address == row.address);
+        if let Some(observed) = observed {
+            if observed.prefix != row.prefix {
+                return Err(AppError::Network(
+                    "Temporary address prefix changed; no removal made".into(),
+                ));
+            }
+            self.ops.remove(iface, ip).await?;
+            if self
+                .observe_owned(iface)
+                .await?
+                .ips
+                .iter()
+                .any(|a| a.address == row.address)
+            {
+                return Err(AppError::Network(
+                    "Temporary address remains after removal".into(),
+                ));
+            }
+        }
+        self.config.forget_temporary_with(&row, self.persist)
+    }
+
+    async fn probe(&self, target: Ipv4Addr, source: Option<Ipv4Addr>) -> bool {
+        self.ops.probe(target, source).await
     }
 }
 
@@ -228,15 +372,15 @@ async fn pending_remove(pending: &PendingIps, iface: &str, ip: Ipv4Addr, adoptio
 /// is owned. Does NOT touch the OS — the IP stays bound. Removes only the
 /// exact `(iface, ip, adoption_id)` entry, so a still-pending scratch from a
 /// failed release under the same id is left for reconciliation.
+#[cfg(test)]
 pub async fn pending_handover(pending: &PendingIps, iface: &str, ip: Ipv4Addr, adoption_id: u64) {
     pending_remove(pending, iface, ip, adoption_id).await;
 }
 
 /// Bind a standalone scratch address with the breadcrumb-first
 /// discipline `adopt_subnet` uses internally: the pending entry is
-/// registered before the bind, so a dropped future can never leave an
-/// untracked address. A failed bind removes its breadcrumb and reports
-/// the error.
+/// registered before the bind. Ambiguous failures keep their breadcrumb
+/// until reconciliation observes the OS; production ops persist it too.
 pub async fn bind_scratch<O: AdoptOps>(
     ops: &O,
     pending: &PendingIps,
@@ -248,7 +392,9 @@ pub async fn bind_scratch<O: AdoptOps>(
     match ops.add(iface, scratch, "255.255.255.0").await {
         Ok(()) => Ok(()),
         Err(e) => {
-            pending_remove(pending, iface, scratch, adoption_id).await;
+            // Production removal observes exact ownership/OS state. If that
+            // fails, both breadcrumbs remain for restart reconciliation.
+            release_scratch(ops, pending, iface, scratch, adoption_id).await;
             Err(e)
         }
     }
@@ -353,10 +499,8 @@ pub async fn adopt_subnet<O: AdoptOps>(
 
     // Temporarily bind a scratch address on the candidate /24 so the
     // conflict probes below route on-link. Without an address on this
-    // subnet the probe is structurally blind and reports every candidate
-    // free, risking a duplicate-IP assignment against a real camera-side
-    // device. If the scratch can't be bound, fall back to the (blind)
-    // gateway-routed probe rather than aborting.
+    // subnet the probe is structurally blind and risks a duplicate-IP
+    // assignment. A failed scratch bind aborts; never probe unbound.
     let scratch = pick_scratch(device_ip, &candidates);
     log::info!(
         "Auto-adopt {}: binding scratch {} on {} for on-link probe",
@@ -364,22 +508,8 @@ pub async fn adopt_subnet<O: AdoptOps>(
         scratch,
         interface_name
     );
-    // Register BEFORE binding: a drop between the bind and the release below
-    // must leave a breadcrumb for reconciliation.
-    pending_insert(pending, interface_name, scratch, adoption_id).await;
-    let scratch_bound = ops
-        .add(interface_name, scratch, "255.255.255.0")
-        .await
-        .is_ok();
-    if !scratch_bound {
-        log::warn!(
-            "Could not bind scratch {} for on-link conflict probe; probes may be blind",
-            scratch
-        );
-        // Nothing bound — drop the breadcrumb.
-        pending_remove(pending, interface_name, scratch, adoption_id).await;
-    }
-    let source = scratch_bound.then_some(scratch);
+    bind_scratch(ops, pending, interface_name, scratch, adoption_id).await?;
+    let source = Some(scratch);
 
     // Probe candidates on-link, then always release the scratch.
     let mut chosen = None;
@@ -391,7 +521,7 @@ pub async fn adopt_subnet<O: AdoptOps>(
         log::info!("Candidate {} is in use, trying next", candidate);
     }
 
-    if scratch_bound {
+    {
         match ops.remove(interface_name, scratch).await {
             Ok(()) => {
                 pending_remove(pending, interface_name, scratch, adoption_id).await;
@@ -439,23 +569,284 @@ pub async fn adopt_subnet<O: AdoptOps>(
     match ops.add(interface_name, candidate, "255.255.255.0").await {
         Ok(()) => Ok(Some(candidate)),
         Err(e) => {
-            // Add failed — nothing bound, drop the breadcrumb.
-            pending_remove(pending, interface_name, candidate, adoption_id).await;
+            release_scratch(ops, pending, interface_name, candidate, adoption_id).await;
             Err(e)
         }
     }
-}
-
-/// Remove a previously adopted secondary IP from the interface.
-pub async fn remove_adopted_ip(interface_name: &str, ip: &str) -> Result<(), AppError> {
-    log::info!("Removing adopted IP {} from {}", ip, interface_name);
-    ip_config::remove_secondary_ip(interface_name, ip).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    const OWNER: &str = "40:cd:3a:00:00:01";
+    fn no_save(_: &crate::config::AppSettings) -> Result<(), AppError> {
+        Ok(())
+    }
+    fn fail_save(_: &crate::config::AppSettings) -> Result<(), AppError> {
+        Err(AppError::Network("injected save failure".into()))
+    }
+    fn temporary_config() -> crate::config::AppConfig {
+        crate::config::AppConfig::temporary_test_config(crate::config::AppSettings {
+            selected_adapter_mac: Some(OWNER.into()),
+            network_mode: crate::config::NetworkMode::StaticAuto,
+            ..Default::default()
+        })
+    }
+    #[derive(Clone, Default)]
+    struct CrashOps {
+        addresses: Arc<std::sync::Mutex<Vec<super::super::interface::IpInfo>>>,
+        fail_observe: Arc<std::sync::atomic::AtomicBool>,
+        fail_after_add: Arc<std::sync::atomic::AtomicBool>,
+        fail_remove: Arc<std::sync::atomic::AtomicBool>,
+        writes: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+    impl AdoptOps for CrashOps {
+        async fn observe(&self, iface: &str) -> Result<super::super::InterfaceInfo, AppError> {
+            if self.fail_observe.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(AppError::Network("native observation unavailable".into()));
+            }
+            Ok(super::super::InterfaceInfo {
+                name: iface.into(),
+                display_name: iface.into(),
+                description: "test".into(),
+                mac: OWNER.into(),
+                ips: self.addresses.lock().unwrap().clone(),
+                is_up: true,
+                is_ethernet: true,
+                is_wifi: false,
+                is_vpn: false,
+                is_virtual: false,
+            })
+        }
+        async fn add(&self, _: &str, ip: Ipv4Addr, _: &str) -> Result<(), AppError> {
+            self.writes.lock().unwrap().push("add");
+            self.addresses
+                .lock()
+                .unwrap()
+                .push(super::super::interface::IpInfo {
+                    address: ip.to_string(),
+                    prefix: 24,
+                    subnet: "172.31.169.0/24".into(),
+                });
+            if self
+                .fail_after_add
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                Err(AppError::Network("applied then timed out".into()))
+            } else {
+                Ok(())
+            }
+        }
+        async fn remove(&self, _: &str, ip: Ipv4Addr) -> Result<(), AppError> {
+            self.writes.lock().unwrap().push("remove");
+            if self.fail_remove.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(AppError::Network("remove unavailable".into()));
+            }
+            self.addresses
+                .lock()
+                .unwrap()
+                .retain(|a| a.address != ip.to_string());
+            Ok(())
+        }
+        async fn probe(&self, _: Ipv4Addr, _: Option<Ipv4Addr>) -> bool {
+            false
+        }
+    }
+    fn tracked<'a>(
+        config: &'a crate::config::AppConfig,
+        ops: &CrashOps,
+    ) -> PendingAdoptOps<'a, CrashOps> {
+        PendingAdoptOps {
+            config,
+            adapter_mac: OWNER,
+            ops: ops.clone(),
+            persist: no_save,
+        }
+    }
+
+    #[tokio::test]
+    async fn temporary_native_observation_requires_success_and_replaces_metadata_addresses() {
+        let os = CrashOps::default();
+        let metadata = os.observe("USB").await.unwrap();
+        assert!(temporary_observation(metadata.clone(), None).is_err());
+        let ip = super::super::interface::IpInfo {
+            address: "172.31.169.254".into(),
+            prefix: 24,
+            subnet: "172.31.169.0/24".into(),
+        };
+        let current = temporary_observation(metadata, Some((false, vec![ip]))).unwrap();
+        assert!(!current.is_up);
+        assert_eq!(current.ips[0].address, "172.31.169.254");
+        assert_eq!(current.ips[0].prefix, 24);
+    }
+
+    #[tokio::test]
+    async fn temporary_observation_failure_retains_memory_and_durable_ownership() {
+        let config = temporary_config();
+        let os = CrashOps::default();
+        let pending = new_pending();
+        let ip = "172.31.169.254".parse().unwrap();
+        let ops = tracked(&config, &os);
+        bind_scratch(&ops, &pending, "USB", ip, 1).await.unwrap();
+        os.fail_observe
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        release_scratch(&ops, &pending, "USB", ip, 1).await;
+        assert_eq!(pending.lock().await.len(), 1);
+        assert_eq!(config.get().pending_addresses.len(), 1);
+        assert_eq!(os.addresses.lock().unwrap().len(), 1);
+        assert_eq!(os.writes.lock().unwrap().as_slice(), ["add"]);
+        os.fail_observe
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        release_scratch(&ops, &pending, "USB", ip, 1).await;
+        assert!(pending.lock().await.is_empty());
+        assert!(config.get().pending_addresses.is_empty());
+        assert!(os.addresses.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn temporary_restart_recovers_scratch_and_uncommitted_final_without_memory() {
+        for final_add in [false, true] {
+            let config = temporary_config();
+            let os = CrashOps::default();
+            let pending = new_pending();
+            let ops = tracked(&config, &os);
+            let ip = if final_add {
+                let (_tx, rx) = watch::channel(false);
+                adopt_subnet(
+                    &ops,
+                    "old name",
+                    "172.31.169.20".parse().unwrap(),
+                    &[],
+                    &[],
+                    &pending,
+                    1,
+                    &rx,
+                )
+                .await
+                .unwrap()
+                .unwrap()
+            } else {
+                let ip = "172.31.169.254".parse().unwrap();
+                bind_scratch(&ops, &pending, "old name", ip, 1)
+                    .await
+                    .unwrap();
+                ip
+            };
+            let saved = crate::config::test_support::serialize_for_test(&config.get());
+            drop(pending); // the entire process-local ownership list is lost
+            let restarted = crate::config::AppConfig::temporary_test_config(
+                crate::config::test_support::parse_for_test(&saved).unwrap(),
+            );
+            assert_eq!(restarted.get().pending_addresses.len(), 1);
+            tracked(&restarted, &os)
+                .remove("renamed adapter", ip)
+                .await
+                .unwrap();
+            assert!(os.addresses.lock().unwrap().is_empty());
+            assert!(restarted.get().pending_addresses.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn temporary_failed_save_and_existing_external_address_do_not_write() {
+        let config = temporary_config();
+        let os = CrashOps::default();
+        let ip = "172.31.169.254".parse().unwrap();
+        let mut ops = tracked(&config, &os);
+        ops.persist = fail_save;
+        assert!(ops.add("USB", ip, "255.255.255.0").await.is_err());
+        assert!(config.get().pending_addresses.is_empty());
+        assert!(os.writes.lock().unwrap().is_empty());
+        os.add("USB", ip, "255.255.255.0").await.unwrap();
+        os.writes.lock().unwrap().clear();
+        let pending = new_pending();
+        assert!(bind_scratch(&tracked(&config, &os), &pending, "USB", ip, 1)
+            .await
+            .is_err());
+        assert_eq!(os.addresses.lock().unwrap().len(), 1);
+        assert!(config.get().pending_addresses.is_empty());
+        assert!(pending.lock().await.is_empty());
+        assert!(os.writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn temporary_ambiguous_add_and_failed_cleanup_remain_recoverable_after_restart() {
+        let config = temporary_config();
+        let os = CrashOps::default();
+        let ip = "172.31.169.254".parse().unwrap();
+        os.fail_after_add
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        os.fail_remove
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let pending = new_pending();
+        assert!(bind_scratch(&tracked(&config, &os), &pending, "USB", ip, 1)
+            .await
+            .is_err());
+        assert_eq!(config.get().pending_addresses.len(), 1);
+        assert_eq!(pending.lock().await.len(), 1);
+        let restarted = crate::config::AppConfig::temporary_test_config(
+            crate::config::test_support::parse_for_test(
+                &crate::config::test_support::serialize_for_test(&config.get()),
+            )
+            .unwrap(),
+        );
+        os.fail_remove
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        tracked(&restarted, &os).remove("USB", ip).await.unwrap();
+        assert!(os.addresses.lock().unwrap().is_empty());
+        assert!(restarted.get().pending_addresses.is_empty());
+    }
+
+    #[tokio::test]
+    async fn temporary_commit_handoff_and_changed_prefix_protect_addresses() {
+        let config = temporary_config();
+        let os = CrashOps::default();
+        let ip = "172.31.169.100".parse().unwrap();
+        let ops = tracked(&config, &os);
+        ops.add("USB", ip, "255.255.255.0").await.unwrap();
+        os.addresses.lock().unwrap()[0].prefix = 25;
+        assert!(ops.remove("USB", ip).await.is_err());
+        assert_eq!(config.get().pending_addresses.len(), 1);
+        assert_eq!(os.writes.lock().unwrap().as_slice(), ["add"]);
+        os.addresses.lock().unwrap()[0].prefix = 24;
+        // Production set_binding performs this exact atomic config transaction.
+        config
+            .set_temporary_test_binding(
+                "172.31.169.0/24",
+                crate::config::AdoptedMeta {
+                    address: Some(ip.to_string()),
+                    prefix: Some(24),
+                    adapter_mac: Some(OWNER.into()),
+                    applied: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(config.get().pending_addresses.is_empty());
+        ops.remove("USB", ip).await.unwrap(); // late cleanup cannot remove a committed address
+        assert_eq!(os.addresses.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn temporary_status_save_failure_after_remove_retries_without_another_os_write() {
+        let config = temporary_config();
+        let os = CrashOps::default();
+        let ip = "172.31.169.254".parse().unwrap();
+        tracked(&config, &os)
+            .add("USB", ip, "255.255.255.0")
+            .await
+            .unwrap();
+        let mut ops = tracked(&config, &os);
+        ops.persist = fail_save;
+        assert!(ops.remove("USB", ip).await.is_err());
+        assert!(os.addresses.lock().unwrap().is_empty());
+        assert_eq!(config.get().pending_addresses.len(), 1);
+        tracked(&config, &os).remove("USB", ip).await.unwrap();
+        assert!(config.get().pending_addresses.is_empty());
+        assert_eq!(os.writes.lock().unwrap().as_slice(), ["add", "remove"]);
+    }
 
     // ── DwellTracker (two-observation adoption gate) ─────────────────
 

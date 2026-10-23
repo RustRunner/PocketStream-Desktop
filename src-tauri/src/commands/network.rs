@@ -2,7 +2,7 @@
 
 use tauri::State;
 
-use crate::config::{AppConfig, CachedDevice, ManualNode, NetworkMode};
+use crate::config::{AppConfig, ManualNode, NetworkMode};
 use crate::error::AppError;
 use crate::network::{DeviceRecord, DeviceStatus, InterfaceInfo, NetworkManager, ScanResult};
 use crate::validation::parse_cidr;
@@ -10,6 +10,7 @@ use crate::validation::parse_cidr;
 #[tauri::command]
 pub async fn scan_network(
     manager: State<'_, NetworkManager>,
+    config: State<'_, AppConfig>,
     subnet: String,
 ) -> Result<Vec<ScanResult>, AppError> {
     // Reject malformed CIDR at the boundary so the active-scans
@@ -17,9 +18,43 @@ pub async fn scan_network(
     // clean error instead of whatever scanner::scan() would emit
     // mid-iteration. Also reject subnets too wide to scan before any
     // scanning machinery spins up.
-    let (_, prefix) = parse_cidr(&subnet)?;
+    let (ip, prefix) = parse_cidr(&subnet)?;
     crate::network::scanner::check_scan_size(prefix)?;
-    manager.scan_subnet(&subnet).await
+    let network =
+        ipnetwork::Ipv4Network::new(ip, prefix).map_err(|e| AppError::Network(e.to_string()))?;
+    // Equivalent CIDRs share the manager's dedupe key, fence and TCP budget.
+    manager
+        .scan_subnet(&format!("{}/{}", network.network(), prefix), &config)
+        .await
+}
+
+#[tauri::command]
+pub async fn get_capture_state(
+    manager: State<'_, NetworkManager>,
+) -> Result<crate::network::CaptureState, AppError> {
+    Ok(manager.get_capture_state().await)
+}
+
+#[tauri::command]
+pub async fn get_adapter_selection(
+    manager: State<'_, NetworkManager>,
+    config: State<'_, AppConfig>,
+) -> Result<crate::network::AdapterSelection, AppError> {
+    // Display reads must not queue behind discovery/capture or address writes.
+    // Startup and the existing NIC watcher own selection and reconciliation.
+    manager.adapter_selection_view(&config).await
+}
+
+#[tauri::command]
+pub async fn select_adapter(
+    manager: State<'_, NetworkManager>,
+    config: State<'_, AppConfig>,
+    app: tauri::AppHandle,
+    mac: String,
+) -> Result<crate::network::AdapterSelection, AppError> {
+    let selection = manager.select_adapter(&config, &app, &mac).await?;
+    crate::network::watcher::emit_selection(&app, &selection);
+    Ok(selection)
 }
 
 #[tauri::command]
@@ -44,6 +79,7 @@ pub async fn get_interface_info(
 
 #[tauri::command]
 pub async fn set_static_ip(
+    app: tauri::AppHandle,
     manager: State<'_, NetworkManager>,
     config: State<'_, AppConfig>,
     name: String,
@@ -51,29 +87,26 @@ pub async fn set_static_ip(
     subnet_mask: String,
     gateway: Option<String>,
 ) -> Result<(), AppError> {
-    // Adopted rescue IPs must survive the primary set — pass them so the
-    // secondary re-add classifies by membership, not by enumeration order.
-    let preserve: Vec<std::net::Ipv4Addr> = manager
-        .get_adopted_ips()
+    let mode = match config.get_network_mode() {
+        NetworkMode::Dhcp => NetworkMode::StaticAuto,
+        mode => mode,
+    };
+    manager
+        .transition_mode(
+            app,
+            &config,
+            crate::network::ModeTransition {
+                name,
+                mode,
+                ip: Some(ip),
+                subnet_mask: Some(subnet_mask),
+                gateway,
+                previous_address: None,
+                confirmed: true,
+            },
+        )
         .await
-        .into_values()
-        .filter_map(|ip| ip.parse().ok())
-        .collect();
-    crate::network::ip_config::assign_static_ip(
-        &name,
-        &ip,
-        &subnet_mask,
-        gateway.as_deref(),
-        &preserve,
-    )
-    .await?;
-    // Manual ownership trumps auto-adopt: drop any registry entry for
-    // this IP so the "(auto)" badge stops shadowing a user-set IP, and
-    // persist the prune so the state survives a restart.
-    if manager.untrack_adopted_ip(&ip).await {
-        manager.save_adopted_to_config(&config).await;
-    }
-    Ok(())
+        .map(|_| ())
 }
 
 #[tauri::command]
@@ -83,22 +116,65 @@ pub async fn add_secondary_ip(
     name: String,
     ip: String,
     subnet_mask: String,
+) -> Result<crate::network::manual_address::AddressReply, AppError> {
+    Ok(manager
+        .address_operation(
+            &config,
+            crate::network::manual_address::AddressRequest::Add {
+                name,
+                ip,
+                mask: subnet_mask,
+            },
+        )
+        .await)
+}
+
+#[tauri::command]
+pub async fn remove_secondary_ip(
+    manager: State<'_, NetworkManager>,
+    config: State<'_, AppConfig>,
+    name: String,
+    ip: String,
+    primary: Option<bool>,
+) -> Result<crate::network::manual_address::AddressReply, AppError> {
+    Ok(manager
+        .address_operation(
+            &config,
+            if primary.unwrap_or(false) {
+                crate::network::manual_address::AddressRequest::RemovePrimary { name, ip }
+            } else {
+                crate::network::manual_address::AddressRequest::RemoveManual { name, ip }
+            },
+        )
+        .await)
+}
+
+#[tauri::command]
+pub async fn set_dhcp(
+    manager: State<'_, NetworkManager>,
+    config: State<'_, AppConfig>,
+    app: tauri::AppHandle,
+    name: String,
 ) -> Result<(), AppError> {
-    crate::network::ip_config::add_secondary_ip(&name, &ip, &subnet_mask).await?;
-    if manager.untrack_adopted_ip(&ip).await {
-        manager.save_adopted_to_config(&config).await;
+    let reply = manager
+        .transition_mode(
+            app,
+            &config,
+            crate::network::ModeTransition {
+                name,
+                mode: NetworkMode::Dhcp,
+                ip: None,
+                subnet_mask: None,
+                gateway: None,
+                previous_address: None,
+                confirmed: false,
+            },
+        )
+        .await?;
+    match reply.warning {
+        Some(warning) => Err(AppError::Network(warning)),
+        None => Ok(()),
     }
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn remove_secondary_ip(name: String, ip: String) -> Result<(), AppError> {
-    crate::network::ip_config::remove_secondary_ip(&name, &ip).await
-}
-
-#[tauri::command]
-pub async fn set_dhcp(name: String) -> Result<(), AppError> {
-    crate::network::ip_config::set_dhcp(&name).await
 }
 
 #[tauri::command]
@@ -107,8 +183,7 @@ pub async fn get_dhcp_state(name: String) -> Result<bool, AppError> {
 }
 
 // ── Network Mode ────────────────────────────────────────────────────
-// The user's chosen mode drives which discovery subsystems run. Slice 1
-// just persists the value; the subsystem gating lands in slice 2.
+// One fenced OS/config transition is shared by every mode change.
 
 #[tauri::command]
 pub fn get_network_mode(config: State<'_, AppConfig>) -> NetworkMode {
@@ -120,16 +195,9 @@ pub async fn set_network_mode(
     config: State<'_, AppConfig>,
     manager: State<'_, NetworkManager>,
     app: tauri::AppHandle,
-    mode: NetworkMode,
-) -> Result<(), AppError> {
-    let old_mode = config.get_network_mode();
-    if old_mode == mode {
-        return Ok(());
-    }
-    config.set_network_mode(mode)?;
-    manager
-        .apply_mode_change(app, &config, old_mode, mode)
-        .await
+    request: crate::network::ModeTransition,
+) -> Result<crate::network::ModeTransitionReply, AppError> {
+    manager.transition_mode(app, &config, request).await
 }
 
 // ── Manual Nodes ────────────────────────────────────────────────────
@@ -148,11 +216,27 @@ pub async fn add_manual_node(
     manager: State<'_, NetworkManager>,
     ip: String,
     alias: String,
+    expected_mac: Option<String>,
 ) -> Result<(), AppError> {
+    let mut node = validated_manual_node(ip, alias)?;
+    node.expected_mac = expected_mac
+        .map(|mac| {
+            crate::network::device_registry::canonical_mac(&mac)
+                .ok_or_else(|| AppError::Network("Invalid expected device MAC".into()))
+        })
+        .transpose()?;
+    config.add_manual_node(node)?;
+    // Reflect the new pin in the live registry so the Nodes panel
+    // updates without a full mode-switch. hydrate_manual_nodes patches
+    // an existing record at the same IP rather than spawning a dupe.
+    manager.hydrate_manual_nodes(&config).await;
+    Ok(())
+}
+
+fn validated_manual_node(ip: String, alias: String) -> Result<ManualNode, AppError> {
     // Validate IP shape at the boundary so a malformed string can't end
     // up persisted and re-served to the frontend.
-    ip.parse::<std::net::Ipv4Addr>()
-        .map_err(|_| AppError::Network(format!("Invalid IP: {}", ip)))?;
+    crate::validation::parse_camera_ip(&ip)?;
     // CAM/PTU are single-holder role designations with their own
     // assignment path; accepting them here would bypass the
     // single-holder enforcement.
@@ -161,12 +245,11 @@ pub async fn add_manual_node(
             "CAM and PTU are assigned from the Nodes panel".into(),
         ));
     }
-    config.add_manual_node(ManualNode { ip, alias })?;
-    // Reflect the new pin in the live registry so the Nodes panel
-    // updates without a full mode-switch. hydrate_manual_nodes patches
-    // an existing record at the same IP rather than spawning a dupe.
-    manager.hydrate_manual_nodes(&config).await;
-    Ok(())
+    Ok(ManualNode {
+        ip,
+        alias,
+        expected_mac: None,
+    })
 }
 
 #[tauri::command]
@@ -174,13 +257,24 @@ pub async fn remove_manual_node(
     config: State<'_, AppConfig>,
     manager: State<'_, NetworkManager>,
     ip: String,
+    expected_mac: Option<String>,
 ) -> Result<(), AppError> {
-    config.remove_manual_node(&ip)?;
-    // Drop the synthetic registry entry too. Real-MAC entries that the
-    // pin may have aliased stay in the registry — the user's "remove
-    // this row" intent only un-pins, not forget.
-    let synthetic_key = format!("manual:{}", ip);
-    if manager.registry().remove_by_mac(&synthetic_key) {
+    if !config.remove_manual_node(&ip, expected_mac.as_deref())? {
+        return Ok(());
+    }
+    let registry = manager.registry();
+    let key = expected_mac
+        .as_ref()
+        .and_then(|mac| {
+            registry
+                .snapshot()
+                .into_iter()
+                .find(|r| r.mac.eq_ignore_ascii_case(mac))
+                .map(|r| r.mac)
+        })
+        .unwrap_or_else(|| format!("manual:{}", ip));
+    config.remove_cached_device(&key)?;
+    if registry.remove_by_mac(&key) {
         if let Some(emitter) = manager.emitter().await {
             emitter.poke();
         }
@@ -202,6 +296,7 @@ pub async fn clear_manual_nodes(
     Ok(())
 }
 
+/// Diagnostic only: this legacy neighbor lookup never authorizes promotion.
 /// Look up the MAC at `ip`, bound to the wired path. Used by the
 /// cache-verify path to confirm a cached record at an IP is still the
 /// same physical device, not just *something else* with the same
@@ -215,9 +310,7 @@ pub async fn resolve_mac(
     manager: State<'_, NetworkManager>,
     ip: String,
 ) -> Result<Option<String>, AppError> {
-    let parsed: std::net::Ipv4Addr = ip
-        .parse()
-        .map_err(|_| AppError::Network(format!("Invalid IP: {}", ip)))?;
+    let parsed = crate::validation::parse_camera_ip(&ip)?;
     let source = manager.wired_source_for(parsed).await;
     crate::network::arp::resolve_mac_for_ip(parsed, source, std::time::Duration::from_secs(1)).await
 }
@@ -245,13 +338,20 @@ pub async fn start_arp_discovery(
     config: State<'_, AppConfig>,
     app: tauri::AppHandle,
     interface: String,
+    refresh: Option<bool>,
 ) -> Result<(), AppError> {
     if !crate::is_discovery_available() {
         return Err(AppError::DiscoveryUnavailable(
             "Packet capture is not available on this Windows build".into(),
         ));
     }
-    manager.start_arp_discovery(&interface, &config, app).await
+    if refresh.unwrap_or(false) {
+        manager
+            .refresh_arp_discovery(&interface, &config, app)
+            .await
+    } else {
+        manager.start_arp_discovery(&interface, &config, app).await
+    }
 }
 
 #[tauri::command]
@@ -272,41 +372,22 @@ pub async fn get_device_list(
     Ok(manager.registry().snapshot())
 }
 
-/// Apply the result of a successful port scan to the canonical registry.
-/// Updates the matching record's `open_ports` and flips its status to
-/// `Live`, then persists the change to `device_cache.toml` so cold-start
-/// hydration sees it. Emits a debounced `device-list-changed` event.
-///
-/// No-op if no record matches `ip` — discovery has to land first.
+/// Attach capability data to the requested identity, without promoting it.
 #[tauri::command]
 pub async fn report_scan_result(
     manager: State<'_, NetworkManager>,
     config: State<'_, AppConfig>,
-    app: tauri::AppHandle,
-    ip: String,
+    key: String,
     open_ports: Vec<u16>,
 ) -> Result<(), AppError> {
-    // A successful scan (any open port) is positive device evidence for
-    // the adoption lifecycle — even when the port set is unchanged and
-    // the registry merge below turns out to be a no-op. Stamp before
-    // the early return. A zero-port result is not evidence.
-    if !open_ports.is_empty() {
-        if let Ok(parsed) = ip.parse::<std::net::Ipv4Addr>() {
-            manager.note_positive_liveness(&app, parsed).await;
-        }
-    }
-    let registry = manager.registry();
-    if !registry.merge_scan_result(&ip, &open_ports) {
-        return Ok(());
-    }
-    persist_record_for_ip(&registry, &config, &ip)?;
-    if let Some(emitter) = manager.emitter().await {
-        emitter.poke();
-    }
+    // Results are now committed at scan completion with their original
+    // adapter epoch, source and identity. A later frontend echo has lost
+    // that provenance and cannot write capabilities into any record.
+    let _ = (manager, config, key, open_ports);
     Ok(())
 }
 
-/// Set or clear the user-assigned alias for the device with this IP.
+/// Set or clear the user-assigned alias for this record key.
 /// Empty string clears. Assigning CAM or PTU demotes any previous
 /// holder (single-holder invariant), so more than one record can
 /// change. Every changed record is written through to the cache and
@@ -320,11 +401,11 @@ pub async fn report_scan_result(
 pub async fn set_device_alias(
     manager: State<'_, NetworkManager>,
     config: State<'_, AppConfig>,
-    ip: String,
+    key: String,
     alias: String,
 ) -> Result<Vec<DeviceRecord>, AppError> {
     let registry = manager.registry();
-    let changed = registry.set_alias(&ip, &alias);
+    let changed = registry.set_alias(&key, &alias);
     if !changed.is_empty() {
         crate::network::persist_alias_writethrough(&registry, &config, &changed);
         if let Some(emitter) = manager.emitter().await {
@@ -353,34 +434,6 @@ pub async fn set_device_status(
     Ok(())
 }
 
-/// Evict a phantom cached device whose targeted verify found no open
-/// ports. The backend enforces the exemptions: user-pinned entries
-/// (any alias, manual nodes, the persisted stream target) and Live
-/// (ARP-confirmed) devices are never removed, so the frontend can call
-/// this unconditionally on a failed verify and a pinned device is left
-/// to keep re-verifying.
-/// Returns true if a device was evicted, false if `ip` was exempt (kept)
-/// or not tracked — the frontend keeps re-verifying only the kept ones.
-#[tauri::command]
-pub async fn evict_phantom_device(
-    manager: State<'_, NetworkManager>,
-    config: State<'_, AppConfig>,
-    ip: String,
-) -> Result<bool, AppError> {
-    let pins = crate::network::device_registry::configured_pins(&config.get());
-    match manager.registry().evict_phantom(&ip, &pins) {
-        Some(mac) => {
-            config.remove_cached_device(&mac)?;
-            if let Some(emitter) = manager.emitter().await {
-                emitter.poke();
-            }
-            log::info!("Evicted phantom device {} ({})", ip, mac);
-            Ok(true)
-        }
-        None => Ok(false),
-    }
-}
-
 /// Drop a device from the registry and the on-disk cache. Used by the
 /// "forget this device" affordance in the offline-cache dialog.
 #[tauri::command]
@@ -389,6 +442,15 @@ pub async fn forget_device(
     config: State<'_, AppConfig>,
     mac: String,
 ) -> Result<(), AppError> {
+    // A verified manual pin shares the discovered identity; explicit forget
+    // removes that matching pin too, so a later hydration cannot resurrect it.
+    for node in config.get_manual_nodes().iter().filter(|n| {
+        n.expected_mac
+            .as_ref()
+            .is_some_and(|m| m.eq_ignore_ascii_case(&mac))
+    }) {
+        config.remove_manual_node(&node.ip, node.expected_mac.as_deref())?;
+    }
     if !manager.registry().forget(&mac) {
         return Ok(());
     }
@@ -397,31 +459,6 @@ pub async fn forget_device(
         emitter.poke();
     }
     Ok(())
-}
-
-/// Look up the registry record for `ip` and persist it to the cache
-/// file (if it has open ports). No-op for records with no open ports
-/// since the cache only stores entries useful for cold-start render.
-fn persist_record_for_ip(
-    registry: &crate::network::DeviceRegistry,
-    config: &AppConfig,
-    ip: &str,
-) -> Result<(), AppError> {
-    let record = match registry.snapshot().into_iter().find(|r| r.ip == ip) {
-        Some(r) => r,
-        None => return Ok(()),
-    };
-    if record.open_ports.is_empty() {
-        return Ok(());
-    }
-    config.upsert_cached_device(CachedDevice {
-        mac: record.mac,
-        ip: record.ip,
-        subnet: record.subnet,
-        open_ports: record.open_ports,
-        alias: record.alias,
-        last_seen: record.last_seen,
-    })
 }
 
 /// Atomic adoption snapshot: the routing map plus per-subnet lifecycle
@@ -441,26 +478,21 @@ pub async fn remove_adopted_subnet(
     app: tauri::AppHandle,
     subnet: String,
     iface_hint: Option<String>,
-) -> Result<(), AppError> {
-    // The manager owns persistence for both routes: a snapshot-save for a
-    // live adoption, a surgical single-entry purge for a config-only one
-    // (a snapshot here would rebuild from empty live state and wipe every
-    // other adoption).
-    let ip = manager
-        .remove_adopted_subnet(&config, &subnet, iface_hint.as_deref())
-        .await?;
-    // Same event the lifecycle reaper emits, so every UI surface follows
-    // backend state through one listener whichever path removed the row.
-    use tauri::Emitter;
-    let _ = app.emit(
-        "subnet-removed",
-        serde_json::json!({
-            "subnet": subnet,
-            "adopted_ip": ip.to_string(),
-            "reason": "manual",
-        }),
-    );
-    Ok(())
+) -> Result<crate::network::manual_address::AddressReply, AppError> {
+    let reply = manager
+        .address_operation(
+            &config,
+            crate::network::manual_address::AddressRequest::RemoveSaved {
+                subnet: subnet.clone(),
+                hint: iface_hint,
+            },
+        )
+        .await;
+    if reply.outcome == crate::network::manual_address::AddressOutcome::Success {
+        use tauri::Emitter;
+        let _ = app.emit("subnet-removed", serde_json::json!({"subnet": subnet, "adopted_ip": reply.view.address, "reason": "manual"}));
+    }
+    Ok(reply)
 }
 
 /// Persisted adoption entries (subnet -> IP) straight from config, for
@@ -473,4 +505,20 @@ pub async fn get_configured_adoptions(
     config: State<'_, AppConfig>,
 ) -> Result<std::collections::HashMap<String, String>, AppError> {
     Ok(config.get().adopted_subnets)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manual_apipa_is_rejected_before_persistence_or_hydration() {
+        let error = validated_manual_node("169.254.20.7".into(), "bench PTU".into())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("give the camera a routable IPv4 address first"));
+        let node = validated_manual_node("192.168.1.204".into(), "bench PTU".into()).unwrap();
+        assert_eq!(node.ip, "192.168.1.204");
+        assert!(validated_manual_node("192.168.1.204".into(), "CAM".into()).is_err());
+    }
 }

@@ -119,7 +119,8 @@ export function escapeHtml(str: unknown): string {
 }
 
 export function showToast(message: string, isError = false): void {
-  // Write toast messages to the log file for diagnostics
+  // User actions, including recording and screenshots, retain their feedback.
+  // Ethernet and playback-loss status use their own persistent surfaces.
   logToFile(isError ? "error" : "info", `toast: ${message}`);
 
   // Never evict the update notification — it stays until the user acts on

@@ -41,6 +41,8 @@ pub struct RtspRuntimeProbe {
     active: Arc<Mutex<Option<ActiveRtspMedia>>>,
 }
 
+pub type UpstreamReady = Arc<dyn Fn() -> Result<(), AppError> + Send + Sync>;
+
 impl RtspRuntimeProbe {
     fn new(health: Arc<RelayRuntimeHealth>) -> Self {
         Self {
@@ -203,6 +205,21 @@ impl RtspRuntimeProbe {
         let media = media.upgrade()?;
         self.report_media_status(server_instance, data_generation, media.status())
     }
+}
+
+fn configure_upstream_target(
+    src: &gst::Element,
+    ready: UpstreamReady,
+    url: &str,
+) -> Result<(), AppError> {
+    ready()?;
+    // rtspsrc may create a new TCP connection for a subsequent request.
+    // Revalidate on its sending thread as well as at lazy media creation.
+    src.connect("before-send", false, move |_| {
+        Some(ready().is_ok().to_value())
+    });
+    src.set_property("location", url);
+    Ok(())
 }
 
 fn observed_probe_bytes(data: Option<&gst::PadProbeData<'_>>) -> u64 {
@@ -418,12 +435,24 @@ impl RtspRestreamer {
                             .map(|d| super::redact_relay_text(&d, &mount_for_messages))
                             .unwrap_or_default();
                         let friendly = super::rtsp_client::friendly_rtsp_error(&raw, &debug);
-                        let reason = super::redact_relay_text(&friendly, &mount_for_messages);
+                        let fault = super::classify::bus_fault(
+                            &error.error(),
+                            friendly,
+                            error
+                                .details()
+                                .and_then(|d| d.get::<u32>("rtsp-status-code").ok()),
+                            &debug,
+                        );
+                        let reason = super::redact_relay_text(&fault.reason, &mount_for_messages);
                         log::warn!("RTSP relay media error: {} | debug: {}", raw, debug);
                         probe_for_messages.report_fault(
                             server_instance,
                             data_generation,
-                            RelayFaultKind::GstError,
+                            if fault.retryable {
+                                RelayFaultKind::GstError
+                            } else {
+                                RelayFaultKind::PermanentGstError
+                            },
                             reason,
                         )
                     }
@@ -700,7 +729,13 @@ impl RtspRestreamer {
             health,
             event_tx,
             server_instance,
+            upstream_ready,
         } = runtime;
+        let upstream_ready = upstream_ready.ok_or_else(|| {
+            RestreamBuildFailure::configuration(AppError::Stream(
+                "RTSP upstream readiness guard unavailable".into(),
+            ))
+        })?;
         // The media factory is lazy, so validate the required runtime policy
         // now.  Without this preflight, an old runtime would panic or fail only
         // after a downstream viewer connected.
@@ -741,6 +776,22 @@ impl RtspRestreamer {
         let url_for_factory = input_url.to_string();
         let user_for_factory = username.to_string();
         let pw_for_factory = password.to_string();
+        let health_for_gate = health.clone();
+        let tx_for_gate = event_tx.clone();
+        let guarded: UpstreamReady = Arc::new(move || {
+            let result = if health_for_gate.loop_alive_for(server_instance) {
+                upstream_ready()
+            } else {
+                Err(AppError::Stream("Relay instance retired".into()))
+            };
+            if let Err(error) = &result {
+                health_for_gate.mark_build_failed(server_instance, error.to_string(), false);
+                let _ = tx_for_gate.send(RelaySupervisorEvent::RetryRequested {
+                    server_generation: health_for_gate.server_generation(),
+                });
+            }
+            result
+        });
         factory.connect_media_configure(move |_factory, media| {
             let element = media.element();
             if let Ok(bin) = element.downcast::<gst::Bin>() {
@@ -752,7 +803,12 @@ impl RtspRestreamer {
                         log::error!("RTSP relay TCP receive policy failed: {}", error);
                         return;
                     }
-                    src.set_property("location", &url_for_factory);
+                    if let Err(error) =
+                        configure_upstream_target(&src, guarded.clone(), &url_for_factory)
+                    {
+                        log::warn!("RTSP relay upstream refused: {error}");
+                        return; // location remains unset; no upstream connection
+                    }
                     if !user_for_factory.is_empty() {
                         src.set_property("user-id", &user_for_factory);
                         src.set_property("user-pw", &pw_for_factory);
@@ -841,6 +897,7 @@ impl RtspRestreamer {
             health,
             event_tx,
             server_instance,
+            upstream_ready: _,
         } = runtime;
         let server = gst_rtsp_server::RTSPServer::new();
         server.set_service(&server_port.to_string());
@@ -1104,6 +1161,44 @@ mod tests {
             bytes_sent: Arc::new(AtomicU64::new(0)),
             bw_prev: std::sync::Mutex::new((0, std::time::Instant::now())),
         }
+    }
+
+    #[test]
+    fn lazy_rtsp_source_requires_current_readiness_before_setting_location() {
+        init_gstreamer();
+        let ready = Arc::new(AtomicBool::new(false));
+        let current = ready.clone();
+        let gate: UpstreamReady = Arc::new(move || {
+            if current.load(Ordering::Acquire) {
+                Ok(())
+            } else {
+                Err(AppError::Stream("route or identity changed".into()))
+            }
+        });
+        let source = gst::ElementFactory::make("rtspsrc").build().unwrap();
+        assert!(configure_upstream_target(&source, gate.clone(), "rtsp://192.0.2.1/live").is_err());
+        assert!(source.property::<Option<String>>("location").is_none());
+        ready.store(true, Ordering::Release);
+        configure_upstream_target(&source, gate.clone(), "rtsp://192.0.2.1/live").unwrap();
+        assert_eq!(
+            source.property::<String>("location"),
+            "rtsp://192.0.2.1/live"
+        );
+        let mut raw = std::ptr::null_mut();
+        // A real boxed message exercises the GLib signal marshalling,
+        // without preparing media or making a network connection.
+        assert_eq!(
+            unsafe { gst_rtsp::ffi::gst_rtsp_message_new(&mut raw) },
+            gst_rtsp::ffi::GST_RTSP_OK
+        );
+        let message: gst_rtsp::rtsp_message::RTSPMessage =
+            unsafe { glib::translate::from_glib_full(raw) };
+        assert!(source.emit_by_name::<bool>("before-send", &[&message]));
+        ready.store(false, Ordering::Release);
+        assert!(!source.emit_by_name::<bool>("before-send", &[&message]));
+        let next_source = gst::ElementFactory::make("rtspsrc").build().unwrap();
+        assert!(configure_upstream_target(&next_source, gate, "rtsp://192.0.2.1/live").is_err());
+        assert!(next_source.property::<Option<String>>("location").is_none());
     }
 
     #[test]
