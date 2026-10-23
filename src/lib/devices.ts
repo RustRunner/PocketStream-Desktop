@@ -677,15 +677,19 @@ export function renderArpDeviceList(): void {
         const item = link.closest<HTMLElement>(".device-item");
         const record = deviceList.deviceByKey(item?.dataset["key"]);
         if (!record) return;
-        const conflict = ipConflicts.forIp(ip);
-        if (conflict) { showToast(conflict.message, true); return; }
-        // The backend checks current PC addresses again before opening, so a
-        // newly arrived conflict cannot fall back to ambiguous OS routing.
+        // The badge is a cached hint. Only the backend's fresh ownership and
+        // identity/route checks decide whether to open the real device URL.
         if (window.__TAURI__) {
           api.openDeviceBrowser(ip, deviceList.targetFor(record)).catch((error) => {
             showToast(`Unable to open device page: ${formatError(error)}`, true);
+          }).finally(() => {
+            void ipConflicts.refresh().catch((error) => {
+              log(`Failed to refresh PC address conflicts: ${formatError(error)}`);
+            });
           });
         } else {
+          const conflict = ipConflicts.forIp(ip);
+          if (conflict) { showToast(conflict.message, true); return; }
           window.open(`http://${ip}`, "_blank");
         }
       });

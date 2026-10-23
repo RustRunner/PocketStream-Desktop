@@ -9,8 +9,39 @@ pub struct HostIpOwner {
 
 pub fn local_ip_owners() -> Result<Vec<HostIpOwner>, AppError> {
     #[cfg(windows)]
-    let owners = super::interface::local_adapters_iphelper()?
+    {
+        Ok(owners_from_native(
+            super::interface::local_adapters_iphelper()?,
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        let owners = pnet::datalink::interfaces()
+            .into_iter()
+            .filter(|adapter| adapter.is_up())
+            .flat_map(|adapter| {
+                let name = adapter.name;
+                adapter
+                    .ips
+                    .into_iter()
+                    .filter(|ip| ip.is_ipv4())
+                    .map(move |ip| HostIpOwner {
+                        address: ip.ip().to_string(),
+                        adapter_name: name.clone(),
+                    })
+            })
+            .collect();
+        Ok(normalize(owners))
+    }
+}
+
+#[cfg(any(windows, test))]
+fn owners_from_native(adapters: Vec<super::interface::NativeAdapter>) -> Vec<HostIpOwner> {
+    // Windows can retain unicast addresses while Wi-Fi is disconnected or
+    // disabled. Those dormant addresses do not establish an active conflict.
+    let owners = adapters
         .into_iter()
+        .filter(|adapter| adapter.is_up)
         .flat_map(|adapter| {
             let name = if adapter.alias.is_empty() {
                 format!("Adapter {}", adapter.index)
@@ -23,22 +54,7 @@ pub fn local_ip_owners() -> Result<Vec<HostIpOwner>, AppError> {
             })
         })
         .collect();
-    #[cfg(not(windows))]
-    let owners = pnet::datalink::interfaces()
-        .into_iter()
-        .flat_map(|adapter| {
-            let name = adapter.name;
-            adapter
-                .ips
-                .into_iter()
-                .filter(|ip| ip.is_ipv4())
-                .map(move |ip| HostIpOwner {
-                    address: ip.ip().to_string(),
-                    adapter_name: name.clone(),
-                })
-        })
-        .collect();
-    Ok(normalize(owners))
+    normalize(owners)
 }
 
 fn normalize(mut owners: Vec<HostIpOwner>) -> Vec<HostIpOwner> {
@@ -65,7 +81,7 @@ pub fn start_monitor(handle: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         use tauri::Emitter;
         let mut previous = None;
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
@@ -82,6 +98,41 @@ pub fn start_monitor(handle: tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_wifi_address_stops_conflicting_when_adapter_goes_down_and_returns_when_up() {
+        use crate::network::interface::{IpInfo, NativeAdapter};
+        let wifi = NativeAdapter {
+            index: 8,
+            alias: "Wi-Fi 2".into(),
+            is_up: true,
+            ips: vec![IpInfo {
+                address: "192.168.1.204".into(),
+                prefix: 24,
+                subnet: "192.168.1.0/24".into(),
+            }],
+            ..Default::default()
+        };
+        assert!(
+            conflict_message("192.168.1.204", &owners_from_native(vec![wifi.clone()])).is_some()
+        );
+        let mut disabled = wifi.clone();
+        disabled.is_up = false; // IP Helper still supplies the very same address.
+        assert!(owners_from_native(vec![disabled.clone()]).is_empty());
+        // A fresh startup snapshot with Wi-Fi off is also clear; no prior
+        // monitor state, node clearing or settings deletion is required.
+        assert!(
+            conflict_message("192.168.1.204", &owners_from_native(vec![disabled.clone()]))
+                .is_none()
+        );
+        let mut vpn = wifi.clone();
+        vpn.alias = "VPN".into();
+        let owners = owners_from_native(vec![disabled, vpn]);
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].adapter_name, "VPN");
+        assert!(conflict_message("192.168.1.204", &owners).is_some());
+        assert!(conflict_message("192.168.1.204", &owners_from_native(vec![wifi])).is_some());
+    }
 
     #[test]
     fn conflict_matches_exact_pc_address_and_names_every_owner() {

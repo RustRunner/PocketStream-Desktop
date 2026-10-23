@@ -4,6 +4,7 @@ import type { HostIpOwner } from "./types.ts";
 
 let owners: HostIpOwner[] = [];
 let revision = 0;
+let refreshRequest = 0;
 let starting: Promise<void> | null = null;
 const subscribers = new Set<() => void>();
 
@@ -26,13 +27,17 @@ function accept(next: HostIpOwner[]): void {
   for (const callback of subscribers) callback();
 }
 
+export async function refresh(): Promise<void> {
+  const requested = revision, request = ++refreshRequest;
+  const snapshot = await api.getHostIpOwners();
+  // A later event or newer request must not be overwritten by an old reply.
+  if (revision === requested && request === refreshRequest) accept(snapshot);
+}
+
 export function start(): Promise<void> {
   starting ??= (async () => {
     await api.onEvent<HostIpOwner[]>("host-ip-owners-changed", accept);
-    const requested = revision;
-    const snapshot = await api.getHostIpOwners();
-    // A DHCP change arriving while the initial request is pending wins.
-    if (revision === requested) accept(snapshot);
+    await refresh();
   })();
   return starting;
 }

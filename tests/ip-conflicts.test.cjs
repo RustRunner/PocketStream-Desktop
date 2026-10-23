@@ -17,7 +17,7 @@ function fixture(snapshot) {
   vm.runInNewContext(ts.transpileModule(source, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   }).outputText, { exports, require(name) { assert.equal(name, "./tauri-api.ts"); return api; } });
-  return { ...exports, publish: (owners) => event(owners) };
+  return { ...exports, publish: (owners) => event(owners), snapshot: next => { snapshot = next; } };
 }
 
 test("Only an exact PC address match warns, and DHCP changes clear the warning", async () => {
@@ -42,4 +42,28 @@ test("A host address event wins over a stale initial snapshot", async () => {
   resolve([owner("192.168.1.204", "Wi-Fi 2")]); await pending;
   assert.equal(f.forIp("192.168.1.204"), null);
   assert(f.forIp("192.168.1.205"));
+});
+
+test("An explicit refresh clears a disabled Wi-Fi warning and cannot be overwritten by an older request", async () => {
+  const f = fixture([owner("192.168.1.204", "Wi-Fi 2")]);
+  await f.start();
+  assert(f.forIp("192.168.1.204"));
+  let resolve;
+  f.snapshot(new Promise(r => { resolve = r; }));
+  const old = f.refresh();
+  f.snapshot([]);
+  await f.refresh();
+  assert.equal(f.forIp("192.168.1.204"), null);
+  resolve([owner("192.168.1.204", "Wi-Fi 2")]); await old;
+  assert.equal(f.forIp("192.168.1.204"), null);
+});
+
+test("A failed explicit read retains the warning until a successful observation clears it", async () => {
+  const f = fixture([owner("192.168.1.204", "Wi-Fi 2")]);
+  await f.start();
+  f.snapshot(Promise.reject(Error("native adapter read failed")));
+  await assert.rejects(f.refresh(), /native adapter read failed/);
+  assert(f.forIp("192.168.1.204"));
+  f.publish([]);
+  assert.equal(f.forIp("192.168.1.204"), null);
 });
