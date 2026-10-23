@@ -212,6 +212,7 @@ export interface AdapterSelection {
 export interface HostIpOwner {
   address: string;
   adapter_name: string;
+  retained_route: boolean;
 }
 
 // ── Streaming (streaming/mod.rs) ─────────────────────────────────────

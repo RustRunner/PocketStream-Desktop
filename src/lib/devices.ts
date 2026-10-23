@@ -629,7 +629,7 @@ export function renderArpDeviceList(): void {
             <a class="device-ip${conflict ? " conflicting" : ""}" href="#" data-browse="${ipEsc}" title="${escapeHtml(conflict?.message ?? "Open in browser")}">${ipEsc}</a>
             <span class="device-ports">${portsEsc}</span>
           </div>
-          ${conflict ? `<div class="device-ip-conflict" title="${escapeHtml(conflict.message)}">IP conflict with PC: ${escapeHtml(conflict.adapters.join(", "))}</div>` : ""}
+          ${conflict ? `<div class="device-ip-conflict" title="${escapeHtml(conflict.message)}">${conflict.retainedAdapters?.length ? "IP still reserved by PC" : "IP conflict with PC"}: ${escapeHtml(conflict.adapters.join(", "))}</div>` : ""}
         </div>`;
     }
 

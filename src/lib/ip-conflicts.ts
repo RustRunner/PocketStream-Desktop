@@ -8,11 +8,16 @@ let refreshRequest = 0;
 let starting: Promise<void> | null = null;
 const subscribers = new Set<() => void>();
 
-export function forIp(ip: string): { adapters: string[]; message: string } | null {
-  const adapters = [...new Set(owners.filter((owner) => owner.address === ip).map((owner) => owner.adapter_name))].sort();
+export function forIp(ip: string): { adapters: string[]; retainedAdapters: string[]; message: string } | null {
+  const matches = owners.filter((owner) => owner.address === ip);
+  const adapters = [...new Set(matches.map((owner) => owner.adapter_name))].sort();
+  const retainedAdapters = [...new Set(matches.filter((owner) => owner.retained_route).map((owner) => owner.adapter_name))].sort();
   return adapters.length ? {
     adapters,
-    message: `IP conflict: ${ip} is also assigned to this PC (${adapters.join(", ")}). Change the device's IP or the PC's address to restore full access.`,
+    retainedAdapters,
+    message: retainedAdapters.length
+      ? `IP conflict: ${ip} is still reserved by this PC (${adapters.join(", ")}). Turning off Wi-Fi alone may not release the address. Fully disable ${retainedAdapters.join(", ")} in Windows Network Connections, or change the PC's address.`
+      : `IP conflict: ${ip} is also assigned to this PC (${adapters.join(", ")}). Change the device's IP or the PC's address to restore full access.`,
   } : null;
 }
 

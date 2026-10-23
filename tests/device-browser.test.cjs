@@ -97,7 +97,25 @@ test("An active PC IP conflict stays visible and the current backend check expla
   assert.equal(f.calls.length, 2, "normal browser access resumes after the conflict is resolved");
 });
 
-test("Turning Wi-Fi off permits a fresh browser request even before the orange badge refreshes", async () => {
+test("A retained Wi-Fi route shows an actionable warning and clears after fully disabling the adapter", async () => {
+  const f = fixture();
+  const conflict = { adapters: ["Wi-Fi 2"], retainedAdapters: ["Wi-Fi 2"],
+    message: "IP conflict: Fully disable Wi-Fi 2 in Windows Network Connections" };
+  f.conflict(conflict);
+  assert.match(f.list.innerHTML, /IP still reserved by PC: Wi-Fi 2/);
+  assert.match(f.list.innerHTML, /device-ip conflicting/);
+  await f.click();
+  assert(f.toasts[0][0].includes(conflict.message));
+  assert.deepEqual(f.opened, []);
+  f.liveConflict(null);
+  await f.click();
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.toasts.length, 1);
+  assert(!f.list.innerHTML.includes("IP still reserved by PC"));
+  assert(!f.list.innerHTML.includes("device-ip conflicting"));
+});
+
+test("Fully disabling Wi-Fi permits a fresh browser request even before the orange badge refreshes", async () => {
   const f = fixture();
   f.conflict({ adapters: ["Wi-Fi 2"], message: "IP conflict: change the device or PC address" });
   f.liveConflict(null);

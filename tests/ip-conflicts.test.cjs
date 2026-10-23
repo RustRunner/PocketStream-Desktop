@@ -5,7 +5,7 @@ const vm = require("node:vm");
 const { test } = require("node:test");
 const ts = require("typescript");
 const source = fs.readFileSync(path.join(__dirname, "../src/lib/ip-conflicts.ts"), "utf8");
-const owner = (address, adapter_name) => ({ address, adapter_name });
+const owner = (address, adapter_name, retained_route = false) => ({ address, adapter_name, retained_route });
 const flush = async () => { for (let i=0; i<5; i++) await Promise.resolve(); };
 
 function fixture(snapshot) {
@@ -32,6 +32,19 @@ test("Only an exact PC address match warns, and DHCP changes clear the warning",
   assert.equal(f.forIp("192.168.1.204"), null);
   assert(f.forIp("192.168.1.205"));
   assert.equal(changes, 2);
+});
+
+test("A retained radio-off address warns until fully disabling the adapter releases it", async () => {
+  const f = fixture([owner("192.168.1.204", "Wi-Fi 2", true)]);
+  await f.start();
+  assert.equal(f.forIp("192.168.1.204").retainedAdapters.join(", "), "Wi-Fi 2");
+  assert.match(f.forIp("192.168.1.204").message, /still reserved by this PC/);
+  assert.match(f.forIp("192.168.1.204").message, /Fully disable Wi-Fi 2 in Windows Network Connections/);
+  f.publish([]);
+  assert.equal(f.forIp("192.168.1.204"), null);
+  f.publish([owner("192.168.1.204", "Wi-Fi 2")]);
+  assert.equal(f.forIp("192.168.1.204").retainedAdapters.length, 0);
+  assert.match(f.forIp("192.168.1.204").message, /also assigned to this PC/);
 });
 
 test("A host address event wins over a stale initial snapshot", async () => {
