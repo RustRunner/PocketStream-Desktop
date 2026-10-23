@@ -1,0 +1,80 @@
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+const vm = require("node:vm");
+const { test } = require("node:test");
+const ts = require("typescript");
+
+function load(file, context) {
+  const source = fs.readFileSync(path.join(__dirname, "../src/lib", file), "utf8");
+  const exports = {};
+  vm.runInNewContext(ts.transpileModule(source, {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+  }).outputText, { exports, ...context });
+  return exports;
+}
+
+function fixture(tauri = true) {
+  const calls = [], opened = [], toasts = [];
+  const record = { mac: "40:cd:3a:03:8f:3f", ip: "192.168.1.204", subnet: "192.168.1.0/24",
+    alias: "CAM", status: "live", open_ports: [80, 554] };
+  const row = { dataset: { key: record.mac }, addEventListener() {} };
+  let click;
+  const link = { dataset: { browse: record.ip }, closest: () => row,
+    addEventListener: (event, fn) => { if (event === "click") click = fn; } };
+  const list = { innerHTML: "", querySelectorAll: selector =>
+    selector === ".device-item" ? [row] : selector.includes("data-browse") ? [link] : [] };
+  let fail = false;
+  let present = true;
+  const deps = {
+    "./tauri-api.ts": { openDeviceBrowser: async (ip, target) => {
+      calls.push({ ip, ...target });
+      if (fail) throw Error("Device identity changed");
+    } },
+    "./state.ts": { $: () => list, escapeHtml: String, showToast: (...args) => toasts.push(args) },
+    "./network.ts": {}, "./streaming.ts": {}, "./ptz.ts": {},
+    "./device-state.ts": { visibleDevices: rows => rows, presenceLabel: () => "Active" },
+    "./device-list.ts": { getDevices: () => [record], deviceByKey: key => present && key === record.mac ? record : undefined,
+      targetFor: row => ({ key: row.mac, expectedMac: row.mac }) },
+    "./store.ts": { selectedDevice: { get: () => null } },
+    "./errors.ts": { formatError: String },
+  };
+  const api = load("devices.ts", { window: { __TAURI__: tauri ? {} : undefined, open: url => opened.push(url) },
+    require(name) { assert(name in deps, name); return deps[name]; } });
+  api.renderArpDeviceList();
+  return { calls, opened, toasts, record, fail: () => { fail = true; }, remove: () => { present = false; },
+    click: async () => { click({ preventDefault() {} }); for (let i = 0; i < 5; i++) await Promise.resolve(); } };
+}
+
+test("Node browser link sends the clicked device identity with its address", async () => {
+  const f = fixture();
+  await f.click();
+  assert.deepEqual(f.calls, [{ ip: f.record.ip, key: f.record.mac, expectedMac: f.record.mac }]);
+  assert.deepEqual(f.opened, []);
+});
+
+test("A rejected device browser request reports the error without an unbound fallback", async () => {
+  const f = fixture();
+  f.fail();
+  await f.click();
+  assert.deepEqual(f.opened, []);
+  assert.match(f.toasts[0][0], /Device identity changed/);
+  assert.equal(f.toasts[0][1], true);
+});
+
+test("A removed node cannot open a stale browser link", async () => {
+  const f = fixture();
+  f.remove();
+  await f.click();
+  assert.deepEqual(f.calls, []);
+  assert.deepEqual(f.opened, []);
+});
+
+test("Device browser IPC preserves the expected MAC field", async () => {
+  const calls = [];
+  const api = load("tauri-api.ts", { window: { __TAURI__: { core: { invoke: async (...args) => calls.push(args) } } }, console });
+  await api.openDeviceBrowser("192.168.1.204", { key: "camera-key", expectedMac: "aa:bb:cc:dd:ee:ff" });
+  assert.equal(JSON.stringify(calls), JSON.stringify([["open_device_browser", {
+    target: { ip: "192.168.1.204", key: "camera-key", expected_mac: "aa:bb:cc:dd:ee:ff" },
+  }]]));
+});

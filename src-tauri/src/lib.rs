@@ -389,6 +389,7 @@ pub fn run() {
         .manage(app_config)
         .manage(stream_manager)
         .manage(network::NetworkManager::new())
+        .manage(network::device_browser::DeviceBrowser::default())
         .manage(camera::flir_ptu::PtuController::new())
         .invoke_handler(tauri::generate_handler![
             // Logging

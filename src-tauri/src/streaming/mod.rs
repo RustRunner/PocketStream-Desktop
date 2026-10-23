@@ -3221,33 +3221,27 @@ async fn resolve_explicit_bind(
 }
 
 /// Best client-facing IPv4 to advertise when no explicit bind interface is
-/// set: prefer a WiFi or VPN address (the camera occupies Ethernet), else
-/// any up interface, always skipping adopted secondaries and APIPA. Returns
+/// set: prefer physical WiFi (the camera occupies Ethernet), else physical
+/// Ethernet, always skipping adopted secondaries and APIPA. VPN addresses
+/// require an explicit selection. Returns
 /// `None` only if nothing usable exists (caller advertises 0.0.0.0).
 async fn get_display_ip(adopted: &std::collections::HashSet<String>) -> Option<String> {
     let interfaces = crate::network::interface::list_all().await.ok()?;
+    select_display_ip(&interfaces, adopted)
+}
 
-    // Prefer WiFi / VPN — a client-facing URL should advertise the WiFi or
-    // VPN address when there is one, not the Ethernet camera network.
-    let preferred = interfaces
+fn select_display_ip(
+    interfaces: &[crate::network::InterfaceInfo],
+    adopted: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let physical = interfaces
         .iter()
-        .filter(|i| i.is_up && (i.is_wifi || i.is_vpn))
-        .flat_map(|i| &i.ips)
-        .find(|ip| !adopted.contains(&ip.address) && !is_apipa(&ip.address))
-        .map(|ip| ip.address.clone());
-    if preferred.is_some() {
-        return preferred;
-    }
-
-    // Fallback: any up interface's first usable address — covers an
-    // Ethernet-only host, where the native client IP sits alongside the
-    // adopted camera secondary and we must advertise the native one.
-    interfaces
-        .iter()
-        .filter(|i| i.is_up)
-        .flat_map(|i| &i.ips)
-        .find(|ip| !adopted.contains(&ip.address) && !is_apipa(&ip.address))
-        .map(|ip| ip.address.clone())
+        .filter(|i| i.is_up && !i.is_vpn && !i.is_virtual);
+    physical
+        .clone()
+        .filter(|i| i.is_wifi)
+        .chain(physical.filter(|i| i.is_ethernet && !i.is_wifi))
+        .find_map(|i| first_usable_ip(&i.ips, adopted))
 }
 
 #[cfg(test)]
@@ -3688,6 +3682,58 @@ mod tests {
         assert!(first_usable_ip(&apipa_only, &adopted).is_none());
     }
 
+    #[test]
+    fn automatic_restream_url_never_selects_vpn_or_virtual_adapters() {
+        use crate::network::InterfaceInfo;
+        let ethernet = InterfaceInfo {
+            name: "Ethernet".into(),
+            display_name: "Ethernet".into(),
+            description: "Physical".into(),
+            mac: "aa:bb:cc:dd:ee:01".into(),
+            ips: vec![ip("192.168.0.100"), ip("192.168.1.100")],
+            is_up: true,
+            is_ethernet: true,
+            is_wifi: false,
+            is_vpn: false,
+            is_virtual: false,
+        };
+        let mut wifi = ethernet.clone();
+        wifi.is_ethernet = false;
+        wifi.is_wifi = true;
+        wifi.ips = vec![ip("192.168.1.204")];
+        let mut vpn = ethernet.clone();
+        vpn.is_vpn = true;
+        vpn.is_virtual = true;
+        vpn.ips = vec![ip("10.147.18.99")];
+        let mut virtual_adapter = ethernet.clone();
+        virtual_adapter.is_virtual = true;
+        virtual_adapter.ips = vec![ip("172.30.0.1")];
+        let adopted = adopted_set(&["192.168.1.100"]);
+        let mut interfaces = vec![vpn, virtual_adapter, ethernet, wifi];
+        // Enumeration order must not let a VPN win over the Wi-Fi LAN.
+        assert_eq!(
+            select_display_ip(&interfaces, &adopted).as_deref(),
+            Some("192.168.1.204")
+        );
+        interfaces.reverse();
+        assert_eq!(
+            select_display_ip(&interfaces, &adopted).as_deref(),
+            Some("192.168.1.204")
+        );
+        interfaces[0].is_up = false;
+        assert_eq!(
+            select_display_ip(&interfaces, &adopted).as_deref(),
+            Some("192.168.0.100")
+        );
+        interfaces[1].ips = vec![ip("169.254.1.10"), ip("192.168.1.100")];
+        assert!(select_display_ip(&interfaces, &adopted).is_none());
+        // Explicit VPN selection still has a usable bind/advertise address.
+        assert_eq!(
+            first_usable_ip(&interfaces[3].ips, &adopted).as_deref(),
+            Some("10.147.18.99")
+        );
+    }
+
     fn make_settings(
         protocol: StreamProtocol,
         camera_ip: &str,
@@ -3804,7 +3850,7 @@ mod tests {
             41,
             Arc::new(move || {
                 calls.fetch_add(1, Ordering::AcqRel);
-                Ok(rtsp_transport::test_path("192.0.2.1"))
+                Ok(crate::network::bound_tcp::test_path("192.0.2.1"))
             }),
         );
         guard().unwrap();

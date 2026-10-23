@@ -1,7 +1,9 @@
 pub mod adapter_refresh;
 pub mod arp;
 pub mod auto_adopt;
+pub(crate) mod bound_tcp;
 mod cache_probe;
+pub(crate) mod device_browser;
 pub mod device_registry;
 pub mod firewall;
 pub mod ghost;

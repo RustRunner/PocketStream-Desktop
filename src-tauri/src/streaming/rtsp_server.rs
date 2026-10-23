@@ -41,8 +41,7 @@ pub struct RtspRuntimeProbe {
     active: Arc<Mutex<Option<ActiveRtspMedia>>>,
 }
 
-pub type UpstreamReady =
-    Arc<dyn Fn() -> Result<crate::network::route::ReadyPath, AppError> + Send + Sync>;
+pub type UpstreamReady = crate::network::bound_tcp::PathReady;
 
 impl RtspRuntimeProbe {
     fn new(health: Arc<RelayRuntimeHealth>) -> Self {
@@ -1167,7 +1166,7 @@ mod tests {
         let current = ready.clone();
         let gate: UpstreamReady = Arc::new(move || {
             if current.load(Ordering::Acquire) {
-                Ok(super::super::rtsp_transport::test_path("192.0.2.1"))
+                Ok(crate::network::bound_tcp::test_path("192.0.2.1"))
             } else {
                 Err(AppError::Stream("route or identity changed".into()))
             }

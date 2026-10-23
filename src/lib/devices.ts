@@ -669,12 +669,14 @@ export function renderArpDeviceList(): void {
         e.preventDefault();
         const ip = link.dataset["browse"];
         if (!ip) return;
-        // Backend command validates the IP and opens http://<ip> —
-        // the webview no longer has a shell-open capability. Fall back
-        // to window.open only in a non-Tauri (dev) context.
+        const item = link.closest<HTMLElement>(".device-item");
+        const record = deviceList.deviceByKey(item?.dataset["key"]);
+        if (!record) return;
+        // Preserve the row's identity when the browser needs an Ethernet
+        // bridge. A backend failure must not fall back to ambiguous OS routing.
         if (window.__TAURI__) {
-          api.openDeviceBrowser(ip).catch(() => {
-            window.open(`http://${ip}`, "_blank");
+          api.openDeviceBrowser(ip, deviceList.targetFor(record)).catch((error) => {
+            showToast(`Unable to open device page: ${formatError(error)}`, true);
           });
         } else {
           window.open(`http://${ip}`, "_blank");

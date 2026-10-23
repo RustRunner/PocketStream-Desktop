@@ -336,11 +336,10 @@ export async function ptuSend(
   return await invoke<Record<string, string>>("ptu_send", { target: { ip, key: target.key, expected_mac: target.expectedMac }, cmd });
 }
 
-/** Open a discovered device's web UI in the system browser. Backend
- *  validates the IP against the known-device set and only ever opens
- *  `http://<ip>` — the webview no longer holds a shell-open capability. */
-export async function openDeviceBrowser(ip: string): Promise<void> {
-  return await invoke("open_device_browser", { ip });
+/** Open the verified Ethernet device's web UI, using a local bridge when
+ *  the OS would send the browser to another adapter with the same IP. */
+export async function openDeviceBrowser(ip: string, target: DeviceTarget): Promise<void> {
+  return await invoke("open_device_browser", { target: { ip, key: target.key, expected_mac: target.expectedMac } });
 }
 
 // ── Camera / PTZ ────────────────────────────────────────────────────

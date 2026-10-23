@@ -13,24 +13,47 @@ use crate::validation::{parse_camera_ip, parse_camera_url_host};
 /// Runs on the backend so the webview needs no shell-open capability —
 /// the shell plugin isn't installed at all, so the webview process
 /// can't be coerced into opening an arbitrary URL or path. The IP is
-/// validated by the strict camera-target guard (including APIPA exclusion),
-/// and the only thing that can be opened is
-/// `http://<validated-ipv4>`.
+/// validated with fresh device identity evidence on the selected Ethernet.
+/// If Windows routes that IP elsewhere, a loopback HTTP bridge provides the
+/// bound Ethernet connection without changing browser or network settings.
 #[tauri::command]
-pub async fn open_device_browser(ip: String) -> Result<(), AppError> {
-    let addr = parse_camera_ip(&ip)?;
-    let url = format!("http://{}", addr);
+pub async fn open_device_browser(
+    app: tauri::AppHandle,
+    target: CameraTarget,
+    browser: State<'_, crate::network::device_browser::DeviceBrowser>,
+) -> Result<(), AppError> {
+    use tauri::Manager;
+    let addr = parse_camera_ip(&target.ip)?;
+    let ready: crate::network::bound_tcp::PathReady = std::sync::Arc::new(move || {
+        app.state::<NetworkManager>()
+            .camera_ready_bound_now(&target, &app.state::<AppConfig>())
+    });
+    let path = ready()?;
+    let url = if crate::network::route::egress_index(addr).ok() == Some(path.index) {
+        format!("http://{addr}/")
+    } else {
+        browser.url_for(ready)?
+    };
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("explorer").arg(&url).spawn();
+        crate::network::cmd("explorer")
+            .arg(&url)
+            .spawn()
+            .map_err(|e| AppError::Network(format!("Unable to open device browser: {e}")))?;
     }
     #[cfg(target_os = "linux")]
     {
-        let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+        std::process::Command::new("xdg-open")
+            .arg(&url)
+            .spawn()
+            .map_err(|e| AppError::Network(format!("Unable to open device browser: {e}")))?;
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("open").arg(&url).spawn();
+        std::process::Command::new("open")
+            .arg(&url)
+            .spawn()
+            .map_err(|e| AppError::Network(format!("Unable to open device browser: {e}")))?;
     }
     Ok(())
 }
