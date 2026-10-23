@@ -138,26 +138,23 @@ pub fn classify_adoption(
 pub enum CacheReject {
     /// The row's IP falls inside a structural-ghost network.
     NonWiredSubnet,
-    /// The row's IP is currently assigned to this host — the row is the
-    /// host itself (e.g. captured before live discovery filtered our own
-    /// traffic), never a device.
-    HostOwnedIp,
+    /// The row's MAC belongs to a local adapter, so it represents the host.
+    HostOwnedMac,
 }
 
 /// Split cached device rows into `(allowed, rejected)`. A row is rejected
 /// only when its IP parses *and* is either inside a structural-ghost
-/// network or currently assigned to this host, so WiFi/VPN/virtual rows
-/// and stale self-rows are evicted while a foreign camera subnet
-/// (CAM/PTU, owned by no local interface) is always allowed — merely
-/// sharing a subnet with local addresses is not host-owned. Rows with an
+/// network or its MAC belongs to this host. A wired device may have exactly
+/// the same IP as a local Wi-Fi adapter and is still a different identity.
+/// Rows with an
 /// unparseable IP stay in `allowed` — `hydrate_from_cache` drops those on
 /// its own. Rejection never keys on offline status, so an
 /// offline-but-legitimate camera is never evicted here. Empty `ghosts` /
-/// `local_ips` disable their check (fail-open).
+/// `local_macs` disable their check (fail-open).
 pub fn partition_cached(
     cached: Vec<CachedDevice>,
     ghosts: &[Ipv4Network],
-    local_ips: &HashSet<Ipv4Addr>,
+    local_macs: &HashSet<[u8; 6]>,
 ) -> (Vec<CachedDevice>, Vec<(CachedDevice, CacheReject)>) {
     let mut allowed = Vec::new();
     let mut rejected = Vec::new();
@@ -166,8 +163,8 @@ pub fn partition_cached(
             Ok(ip) if is_structural_ghost_ip(ip, ghosts) => {
                 rejected.push((d, CacheReject::NonWiredSubnet));
             }
-            Ok(ip) if local_ips.contains(&ip) => {
-                rejected.push((d, CacheReject::HostOwnedIp));
+            Ok(_) if super::is_local_mac(&d.mac, local_macs) => {
+                rejected.push((d, CacheReject::HostOwnedMac));
             }
             _ => allowed.push(d),
         }
@@ -452,8 +449,10 @@ mod tests {
         }
     }
 
-    fn locals(ips: &[&str]) -> HashSet<Ipv4Addr> {
-        ips.iter().map(|s| s.parse().unwrap()).collect()
+    fn locals(macs: &[&str]) -> HashSet<[u8; 6]> {
+        macs.iter()
+            .map(|s| super::super::parse_mac_bytes(s).unwrap())
+            .collect()
     }
 
     #[test]
@@ -496,16 +495,20 @@ mod tests {
     }
 
     #[test]
-    fn partition_rejects_host_owned_ip() {
-        // A stale self-row (the host's own WiFi IP cached as a "device")
-        // is evicted even though its subnet is not a ghost — the wired
-        // port shares it, so the ghost carve-out keeps it un-excluded.
-        let locals = locals(&["192.168.1.101", "192.168.1.204"]);
-        let (allowed, rejected) =
-            partition_cached(vec![cached("aa", "192.168.1.204")], &[], &locals);
-        assert!(allowed.is_empty());
+    fn partition_distinguishes_host_and_peer_at_the_same_ip() {
+        let locals = locals(&["40:C2:BA:CF:D5:75", "AC:45:EF:38:F9:F5"]);
+        let (allowed, rejected) = partition_cached(
+            vec![
+                cached("40:cd:3a:03:8f:3f", "192.168.1.204"),
+                cached("ac-45-ef-38-f9-f5", "192.168.1.204"),
+            ],
+            &[],
+            &locals,
+        );
+        assert_eq!(allowed.len(), 1);
+        assert_eq!(allowed[0].mac, "40:cd:3a:03:8f:3f");
         assert_eq!(rejected.len(), 1);
-        assert_eq!(rejected[0].1, CacheReject::HostOwnedIp);
+        assert_eq!(rejected[0].1, CacheReject::HostOwnedMac);
     }
 
     #[test]
@@ -513,9 +516,12 @@ mod tests {
         // An IP that is both ours and inside a ghost network reports the
         // ghost reason — pins which eviction log line fires.
         let ghosts = vec![net("192.168.12.0/24")];
-        let locals = locals(&["192.168.12.103"]);
-        let (_, rejected) =
-            partition_cached(vec![cached("aa", "192.168.12.103")], &ghosts, &locals);
+        let locals = locals(&["AC:45:EF:38:F9:F5"]);
+        let (_, rejected) = partition_cached(
+            vec![cached("ac:45:ef:38:f9:f5", "192.168.12.103")],
+            &ghosts,
+            &locals,
+        );
         assert_eq!(rejected[0].1, CacheReject::NonWiredSubnet);
     }
 
@@ -525,17 +531,17 @@ mod tests {
         // host also numbers twice (wired static + WiFi DHCP) must never be
         // evicted — sharing a subnet with local addresses is not
         // host-owned. Same for a camera on a foreign adopted subnet.
-        let locals = locals(&["192.168.1.101", "192.168.1.204"]);
+        let locals = locals(&["40:C2:BA:CF:D5:75", "AC:45:EF:38:F9:F5"]);
         let rows = vec![
             cached("aa", "192.168.1.202"), // fixed wired device → allowed
             cached("bb", "10.194.200.24"), // foreign-subnet camera → allowed
-            cached("cc", "192.168.1.204"), // the host itself → rejected
+            cached("ac:45:ef:38:f9:f5", "192.168.1.204"), // the host itself → rejected
         ];
         let (allowed, rejected) = partition_cached(rows, &[], &locals);
         let allowed_macs: Vec<&str> = allowed.iter().map(|d| d.mac.as_str()).collect();
         assert_eq!(allowed_macs, vec!["aa", "bb"]);
         assert_eq!(rejected.len(), 1);
-        assert_eq!(rejected[0].0.mac, "cc");
-        assert_eq!(rejected[0].1, CacheReject::HostOwnedIp);
+        assert_eq!(rejected[0].0.mac, "ac:45:ef:38:f9:f5");
+        assert_eq!(rejected[0].1, CacheReject::HostOwnedMac);
     }
 }

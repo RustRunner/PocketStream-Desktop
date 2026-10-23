@@ -40,6 +40,8 @@ pub enum DeviceStatus {
     /// session. Render path scopes these to currently-routable subnets.
     CachedOnly,
     OfflineNonWiredSubnet,
+    /// Historical wire name retained for compatibility; determined by a local
+    /// adapter MAC match, never by IP equality alone.
     OfflineHostOwnedIp,
     OfflineDifferentDevice,
     OfflineAmbiguousRole,

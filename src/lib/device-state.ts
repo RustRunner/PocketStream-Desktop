@@ -135,7 +135,7 @@ export function presenceLabel(record: DeviceRecord): string {
     offline: "Inactive — no recent Ethernet verification",
     cached_only: "Inactive — awaiting Ethernet verification",
     offline_non_wired_subnet: "Inactive — subnet is on a non-Ethernet adapter",
-    offline_host_owned_ip: "Inactive — address belongs to this host",
+    offline_host_owned_ip: "Inactive — identity belongs to this PC",
     offline_different_device: "Inactive — different device at this address",
     offline_ambiguous_role: "Inactive — ambiguous role; reassign explicitly",
   };

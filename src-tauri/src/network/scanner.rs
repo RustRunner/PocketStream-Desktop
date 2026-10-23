@@ -127,6 +127,9 @@ async fn scan_hosts(network: ipnetwork::Ipv4Network, scope: ScanScope) -> Vec<Sc
 
     // Stream hosts into the JoinSet with bounded in-flight instead of
     // collecting every address into a Vec first.
+    // IP-based TCP scans can loop back into this PC when a peer shares a local
+    // address. Keep this routing guard; ARP discovery identifies those peers
+    // separately by MAC on the selected interface.
     let local_ips = super::interface::all_local_ipv4();
     let mut hosts = network
         .iter()

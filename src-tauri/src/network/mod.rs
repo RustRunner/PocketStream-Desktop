@@ -731,11 +731,10 @@ pub struct NetworkManager {
     address_work: Arc<Mutex<()>>,
     address_generation: Arc<AtomicU64>,
     address_active: Arc<AtomicBool>,
-    /// Every IPv4 currently assigned to any local adapter. Shared with
-    /// the capture callback and refreshed at every discovery start (and
-    /// each adopt-loop pass), so a listener retained across sessions
-    /// keeps an accurate self-filter.
-    local_ips: Arc<StdMutex<HashSet<Ipv4Addr>>>,
+    /// Local adapter MAC identities shared by capture and neighbor imports.
+    /// Refreshed at discovery start and each adoption pass so retained capture
+    /// sessions recognize newly attached adapters without hiding IP collisions.
+    local_macs: Arc<StdMutex<HashSet<[u8; 6]>>>,
     /// Legacy listener exclusions. Activated discovery clears these and
     /// uses selected-interface scope/verification even on overlapping subnets.
     excluded_subnets: Arc<StdMutex<Vec<ipnetwork::Ipv4Network>>>,
@@ -1004,8 +1003,8 @@ async fn provoke_sweep(params: &arp::ListenerParams, sweep_ips: &[String]) {
     // One brief-lock snapshot for the whole merge pass (never lock per
     // entry); a poisoned lock degrades to an empty set, which filters
     // nothing — fail-open.
-    let local_snapshot: HashSet<Ipv4Addr> = params
-        .local_ips
+    let local_snapshot: HashSet<[u8; 6]> = params
+        .local_macs
         .lock()
         .map(|s| s.clone())
         .unwrap_or_default();
@@ -1098,7 +1097,7 @@ struct AdoptionCtx {
     emitter: Arc<DeviceListEmitter>,
     fence: SweepFence,
     address_fence: SweepFence,
-    local_ips: Arc<std::sync::Mutex<HashSet<Ipv4Addr>>>,
+    local_macs: Arc<std::sync::Mutex<HashSet<[u8; 6]>>>,
 }
 
 /// Why an adoption attempt is justified. Logged only — `adopted_meta`
@@ -1207,8 +1206,8 @@ async fn attempt_adoption(
     let _gate = AdoptionGate::start(ctx.app_handle.clone(), adoption_id);
     // Fresh read at adoption time (not the shared filter set):
     // candidate-collision checking wants the newest possible view of our
-    // own addresses, and the name must not shadow the shared `local_ips`
-    // the post-adoption sweep clones below.
+    // own addresses. This allocation check intentionally uses IPs; discovery
+    // identity checks use the local adapter MACs instead.
     let host_ips_now = interface::all_local_ipv4();
     let started = std::time::Instant::now();
     let outcome = tokio::time::timeout(
@@ -1347,7 +1346,7 @@ async fn attempt_adoption(
             let sweep_handle = ctx.app_handle.clone();
             let sweep_fence = ctx.fence.clone();
             let sweep_candidates = ctx.candidates.clone();
-            let sweep_local = ctx.local_ips.clone();
+            let sweep_local = ctx.local_macs.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
                 if sweep_fence.is_stale() {
@@ -1355,7 +1354,7 @@ async fn attempt_adoption(
                 }
                 ping_sweep_subnets(std::slice::from_ref(&sweep_ip), &sweep_fence, &sweep_handle)
                     .await;
-                let local_snapshot: HashSet<Ipv4Addr> =
+                let local_snapshot: HashSet<[u8; 6]> =
                     sweep_local.lock().map(|s| s.clone()).unwrap_or_default();
                 merge_arp_table(
                     sweep_devices.clone(),
@@ -1632,6 +1631,15 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
             log_value(&self.ctx.adapter_mac), interface_index, target, scratch,
             matches!(&resolved, Ok(Some(_))), arp::diagnostic_counts());
         match resolved {
+            Ok(Some(mac)) if is_local_mac(&mac, &interface::local_adapter_macs()) => {
+                log::info!(
+                    "{}: {} resolved to local adapter {}; ignoring host traffic",
+                    self.origin.label(),
+                    target,
+                    mac
+                );
+                Ok(None)
+            }
             Ok(Some(mac)) => {
                 log::info!("{}: {} answered with {}", self.origin.label(), target, mac);
                 Ok(Some(mac))
@@ -1725,8 +1733,8 @@ async fn watch_window(
     Some((
         now.frames_seen
             .saturating_sub(solicitation.baseline.frames_seen),
-        now.self_ip_dropped
-            .saturating_sub(solicitation.baseline.self_ip_dropped),
+        now.local_mac_dropped
+            .saturating_sub(solicitation.baseline.local_mac_dropped),
     ))
 }
 
@@ -2001,12 +2009,12 @@ async fn watchdog_ladder(
     // then poll (bounded) for late recovery on the live session, if any.
     let missed = arp::missed_max();
     log::warn!(
-        "Discovery degraded: no ARP payload events and the capture self-heal is exhausted (payload_total={}, missed_max={}, tasks_dropped={}, noneth_dropped={}, self_ip_dropped={}, prohibited_dropped={})",
+        "Discovery degraded: no ARP payload events and the capture self-heal is exhausted (payload_total={}, missed_max={}, tasks_dropped={}, noneth_dropped={}, local_mac_dropped={}, prohibited_dropped={})",
         arp::frames_seen(),
         missed,
         arp::tasks_dropped(),
         arp::noneth_dropped(),
-        arp::self_ip_dropped(),
+        arp::local_mac_dropped(),
         arp::prohibited_dropped()
     );
     log::warn!(
@@ -2277,7 +2285,7 @@ impl NetworkManager {
             address_work: Arc::new(Mutex::new(())),
             address_generation: Arc::new(AtomicU64::new(1)),
             address_active: Arc::new(AtomicBool::new(true)),
-            local_ips: Arc::new(StdMutex::new(HashSet::new())),
+            local_macs: Arc::new(StdMutex::new(HashSet::new())),
             excluded_subnets: Arc::new(StdMutex::new(Vec::new())),
             auto_adopt_handle: Arc::new(Mutex::new(None)),
             pending_ips: Arc::new(Mutex::new(Vec::new())),
@@ -2430,11 +2438,10 @@ impl NetworkManager {
 
         // Failed topology enumeration leaves history cached/inactive.
         let ghosts = ghost::non_wired_interface_networks().await;
-        // Host-owned IPs: a cached row at one of our own current addresses
-        // is the host itself, not a device (e.g. a self-row captured before
-        // live discovery filtered our own traffic). Same fail-open contract.
-        let local_ips: HashSet<Ipv4Addr> = interface::all_local_ipv4().into_iter().collect();
-        hydrate_retained_history(&self.device_registry, cached, &ghosts, &local_ips);
+        // A cached row belongs to this host only if its MAC matches a local
+        // adapter. IPs can overlap across the Ethernet and Wi-Fi links.
+        let local_macs = interface::local_adapter_macs();
+        hydrate_retained_history(&self.device_registry, cached, &ghosts, &local_macs);
 
         // Keep conflicting legacy role identities for explicit reassignment.
         let camera_key = config.get().stream.camera_mac;
@@ -3844,17 +3851,13 @@ impl NetworkManager {
             description: iface_info.description.clone(),
         };
 
-        // Every IPv4 currently assigned to any local adapter — not just the
-        // camera port. The capture listener drops ARP sent from any of
-        // these so the host never lists itself as a node (its own WiFi
-        // traffic on a subnet shared with the wired port passes every other
-        // filter). Manager-owned: every start refreshes the same shared
-        // set (and the adopt loop refreshes it each pass), so a listener
-        // retained across sessions keeps an accurate self-filter.
-        if let Ok(mut set) = self.local_ips.lock() {
-            *set = interface::all_local_ipv4().into_iter().collect();
+        // Recognize this PC by all of its adapter MACs, not its IP addresses.
+        // A wired peer can share an IP with Wi-Fi on a separate link. The same
+        // shared set survives capture restarts and is refreshed each pass.
+        if let Ok(mut set) = self.local_macs.lock() {
+            *set = interface::local_adapter_macs();
         }
-        let local_ips = self.local_ips.clone();
+        let local_macs = self.local_macs.clone();
 
         // Activated discovery uses scope proof or fresh selected-interface
         // resolution, never subnet exclusion as an identity boundary. This
@@ -3908,7 +3911,7 @@ impl NetworkManager {
             registry: registry.clone(),
             emitter: emitter.clone(),
             app_handle: app_handle.clone(),
-            local_ips: local_ips.clone(),
+            local_macs: local_macs.clone(),
             own_mac,
             fence: placeholder_fence,
             excluded_subnets: self.excluded_subnets.clone(),
@@ -4054,7 +4057,7 @@ impl NetworkManager {
                     address_generation.clone(),
                     address_active.clone(),
                 ),
-                local_ips: local_ips.clone(),
+                local_macs: local_macs.clone(),
             };
             // Cached-device probe: at most one pass per discovery
             // session, deferred (not consumed) while the DHCP gate is
@@ -4141,17 +4144,15 @@ impl NetworkManager {
                 }
                 ctx.address_fence = next_address_fence;
 
-                // Refresh the local-IP set the capture listener filters
-                // against: addresses move under us (DHCP renew, WiFi roam)
-                // and a stale set would re-admit the host as a peer. Runs
+                // Refresh local MAC identities as adapters come and go. Runs
                 // before the DHCP gate below so the set stays fresh even
                 // while adoption is paused. In-memory IP Helper read — no
                 // process spawn, so no TTL cache is needed. An empty read
                 // (transient enumeration failure) keeps the previous set
                 // rather than blanking the filter mid-session.
-                let fresh: HashSet<Ipv4Addr> = interface::all_local_ipv4().into_iter().collect();
+                let fresh = interface::local_adapter_macs();
                 if !fresh.is_empty() {
-                    if let Ok(mut set) = local_ips.lock() {
+                    if let Ok(mut set) = local_macs.lock() {
                         *set = fresh;
                     }
                 }
@@ -4993,7 +4994,7 @@ async fn merge_arp_table(
     app_handle: tauri::AppHandle,
     interface_ip: &str,
     excluded: &[ipnetwork::Ipv4Network],
-    local_ips: &HashSet<Ipv4Addr>,
+    local_macs: &HashSet<[u8; 6]>,
     fence: &SweepFence,
     candidates: Option<&arp::CandidateIngress>,
 ) {
@@ -5011,7 +5012,7 @@ async fn merge_arp_table(
         entries,
         &mut *devices.lock().await,
         excluded,
-        local_ips,
+        local_macs,
         fence,
         candidates,
     );
@@ -5093,8 +5094,7 @@ async fn run_presence_job(
     if snapshot.fence.is_stale() || (job.source.is_none() && address_fence.is_stale()) {
         return None;
     }
-    let own_ips: HashSet<_> = interface::all_local_ipv4().into_iter().collect();
-    if own_ips.contains(&job.ip) {
+    if presence_target_is_host(&job, adapter, &interface::local_adapter_macs()) {
         return None;
     }
     // Even a prefix also used by Wi-Fi may contain an Ethernet peer.
@@ -5117,7 +5117,7 @@ async fn run_presence_job(
         emitter: emitter.clone(),
         fence: snapshot.fence.clone(),
         address_fence,
-        local_ips: manager.local_ips.clone(),
+        local_macs: manager.local_macs.clone(),
     };
     let mut cooldowns = HashMap::new();
     let mut known_subnets = HashSet::new();
@@ -5243,9 +5243,9 @@ fn hydrate_retained_history(
     registry: &DeviceRegistry,
     cached: Vec<crate::config::CachedDevice>,
     ghosts: &[ipnetwork::Ipv4Network],
-    local_ips: &HashSet<Ipv4Addr>,
+    local_macs: &HashSet<[u8; 6]>,
 ) {
-    let (mut allowed, rejected) = ghost::partition_cached(cached, ghosts, local_ips);
+    let (mut allowed, rejected) = ghost::partition_cached(cached, ghosts, local_macs);
     allowed.extend(rejected.iter().map(|(d, _)| d.clone()));
     registry.hydrate_from_cache(&allowed);
     for (d, reason) in rejected {
@@ -5253,17 +5253,38 @@ fn hydrate_retained_history(
             &d.mac,
             match reason {
                 ghost::CacheReject::NonWiredSubnet => DeviceStatus::OfflineNonWiredSubnet,
-                ghost::CacheReject::HostOwnedIp => DeviceStatus::OfflineHostOwnedIp,
+                ghost::CacheReject::HostOwnedMac => DeviceStatus::OfflineHostOwnedIp,
             },
         );
     }
+}
+
+fn is_local_mac(mac: &str, local_macs: &HashSet<[u8; 6]>) -> bool {
+    parse_mac_bytes(mac).is_some_and(|mac| local_macs.contains(&mac))
+}
+
+fn presence_target_is_host(
+    job: &presence::Job,
+    adapter: &InterfaceInfo,
+    local_macs: &HashSet<[u8; 6]>,
+) -> bool {
+    // Resolving this NIC's own address cannot verify a peer. Addresses on
+    // other adapters do not rule out a device on the selected Ethernet link.
+    adapter
+        .ips
+        .iter()
+        .any(|ip| ip.address == job.ip.to_string())
+        || job
+            .key
+            .as_ref()
+            .is_some_and(|key| is_local_mac(key, local_macs))
 }
 
 fn import_neighbors(
     entries: Vec<(Ipv4Addr, String)>,
     devices: &mut HashMap<String, ArpDevice>,
     excluded: &[ipnetwork::Ipv4Network],
-    local_ips: &HashSet<Ipv4Addr>,
+    local_macs: &HashSet<[u8; 6]>,
     fence: &SweepFence,
     candidates: Option<&arp::CandidateIngress>,
 ) -> Vec<ArpDevice> {
@@ -5273,7 +5294,7 @@ fn import_neighbors(
             break;
         }
         if crate::validation::prohibited_camera_ip(ip)
-            || local_ips.contains(&ip)
+            || is_local_mac(&mac, local_macs)
             || (candidates.is_none() && excluded.iter().any(|net| net.contains(ip)))
         {
             continue;
@@ -5443,7 +5464,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn shared_prefix_neighbors_require_fresh_ethernet_proof_and_never_persist_wifi() {
+    async fn overlapping_wifi_address_requires_ethernet_proof_and_never_imports_host_mac() {
         use cache_probe::tests::MockProbeIo;
         let manager = NetworkManager::new();
         let selection = discovery_selection(true);
@@ -5462,14 +5483,20 @@ mod tests {
         let wifi = "192.168.1.1".parse().unwrap();
         let peer = "40:cd:3a:03:8f:3f";
         let mut legacy = HashMap::new();
-        let local = ["192.168.1.100".parse().unwrap()].into_iter().collect();
+        let wired_mac = selection.selected_mac.as_deref().unwrap();
+        let wifi_mac = "ac:45:ef:38:f9:f5";
+        let local = HashSet::from([
+            parse_mac_bytes(wired_mac).unwrap(),
+            parse_mac_bytes(wifi_mac).unwrap(),
+        ]);
         let excluded = ["192.168.1.0/24".parse().unwrap()];
         let imported = import_neighbors(
             vec![
                 (camera, peer.into()),
                 (wifi, "aa:bb:cc:dd:ee:04".into()),
                 ("169.254.10.2".parse().unwrap(), peer.into()),
-                ("192.168.1.100".parse().unwrap(), peer.into()),
+                ("192.168.1.100".parse().unwrap(), wired_mac.into()),
+                (camera, wifi_mac.into()),
             ],
             &mut legacy,
             &excluded,
@@ -5497,6 +5524,11 @@ mod tests {
             let job = clock
                 .next(&snapshot, &manager.registry().snapshot(), &candidates)
                 .unwrap();
+            assert!(!presence_target_is_host(
+                &job,
+                snapshot.adapter.as_ref().unwrap(),
+                &local
+            ));
             assert_eq!(job.source, Some("192.168.1.100".parse().unwrap()));
             if let Some(proof) = presence::verify(&mut io, &job, &snapshot).await {
                 let device = ArpDevice {
@@ -7416,6 +7448,28 @@ mod tests {
     }
 
     #[test]
+    fn presence_distinguishes_ethernet_peer_from_local_adapters_at_the_same_ip() {
+        let adapter = discovery_selection(true).adapter.unwrap();
+        let wifi_mac = "ac:45:ef:38:f9:f5";
+        let local = HashSet::from([
+            parse_mac_bytes(&adapter.mac).unwrap(),
+            parse_mac_bytes(wifi_mac).unwrap(),
+        ]);
+        let mut job = presence::Job {
+            key: Some("40:cd:3a:03:8f:3f".into()),
+            ip: "192.168.1.204".parse().unwrap(),
+            source: Some("192.168.1.100".parse().unwrap()),
+        };
+        assert!(!presence_target_is_host(&job, &adapter, &local));
+        job.key = Some(wifi_mac.into());
+        assert!(presence_target_is_host(&job, &adapter, &local));
+        job.key = None;
+        assert!(!presence_target_is_host(&job, &adapter, &local));
+        job.ip = "192.168.1.100".parse().unwrap();
+        assert!(presence_target_is_host(&job, &adapter, &local));
+    }
+
+    #[test]
     fn topology_conflicts_retain_history_with_inactive_reasons() {
         let cached = |mac: &str, ip: &str| {
             serde_json::from_value::<crate::config::CachedDevice>(serde_json::json!({
@@ -7428,10 +7482,10 @@ mod tests {
             &registry,
             vec![
                 cached("AA:01", "10.0.0.2"),
-                cached("AA:02", "192.168.1.101"),
+                cached("AA:BB:CC:DD:EE:02", "192.168.1.101"),
             ],
             &["10.0.0.0/24".parse().unwrap()],
-            &["192.168.1.101".parse().unwrap()].into_iter().collect(),
+            &HashSet::from([parse_mac_bytes("AA:BB:CC:DD:EE:02").unwrap()]),
         );
         let records = registry.snapshot();
         assert_eq!(records.len(), 2);
@@ -7440,11 +7494,15 @@ mod tests {
             DeviceStatus::OfflineNonWiredSubnet
         );
         assert_eq!(
-            records.iter().find(|r| r.mac == "AA:02").unwrap().status,
+            records
+                .iter()
+                .find(|r| r.mac == "AA:BB:CC:DD:EE:02")
+                .unwrap()
+                .status,
             DeviceStatus::OfflineHostOwnedIp
         );
         assert!(registry.merge_scan_result("AA:01", &[80]));
-        assert!(registry.merge_scan_result("AA:02", &[80]));
+        assert!(registry.merge_scan_result("AA:BB:CC:DD:EE:02", &[80]));
         assert!(registry.snapshot().iter().all(|r| matches!(
             r.status,
             DeviceStatus::OfflineNonWiredSubnet | DeviceStatus::OfflineHostOwnedIp

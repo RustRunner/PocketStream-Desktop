@@ -1295,6 +1295,23 @@ pub fn all_local_ipv4() -> Vec<std::net::Ipv4Addr> {
         .collect()
 }
 
+/// Host identity for discovery. Include every adapter, even one without an IP
+/// or with its link down: an address collision on another interface does not
+/// make an Ethernet peer the host, and a DHCP change does not change its MAC.
+pub(crate) fn local_adapter_macs() -> std::collections::HashSet<[u8; 6]> {
+    #[cfg(windows)]
+    let macs = local_adapters_iphelper()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|a| super::parse_mac_bytes(&a.mac));
+    #[cfg(not(windows))]
+    let macs = pnet::datalink::interfaces()
+        .into_iter()
+        .filter_map(|a| a.mac.map(|mac| mac.octets()));
+    macs.filter(|mac| *mac != [0; 6] && mac[0] & 1 == 0)
+        .collect()
+}
+
 /// Get info for a specific interface by name.
 pub async fn get_by_name(name: &str) -> Result<InterfaceInfo, AppError> {
     #[cfg(windows)]
