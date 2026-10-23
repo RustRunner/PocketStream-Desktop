@@ -37,6 +37,7 @@ void $$;
 // unknown / not yet probed.
 let hostMode: NetworkMode | null = null;
 let adapterSelection: AdapterSelection | null = null;
+let adapterSelectionRevision = 0;
 let interfaceRefresh = 0;
 let selectingAdapter = false;
 let onDiscoveryReconnect = () => {};
@@ -97,6 +98,7 @@ function renderInterfaceName(): void {
 function rememberAdapterSelection(next: AdapterSelection): void {
   if (adapterSelection && (adapterSelection.selected_mac !== next.selected_mac ||
       adapterSelection.interface_index !== next.interface_index)) {
+    ++adapterSelectionRevision;
     if (addressBusy) addressBusy.retired = true;
     sessionAdoptedSubnets.clear();
     if (pendingDownTimer) clearTimeout(pendingDownTimer);
@@ -629,9 +631,15 @@ function applyAddressReply(reply: AddressReply): void {
   }
 }
 
-async function mutateAddress(progress: string, invoke: () => Promise<AddressReply>, button?: HTMLButtonElement): Promise<boolean> {
+async function mutateAddress(
+  progress: string,
+  invoke: () => Promise<AddressReply>,
+  button?: HTMLButtonElement,
+  confirmation?: { message: string; isCurrent: () => boolean },
+): Promise<boolean> {
   if (addressBusy || selectingAdapter || dialogSaving) return false;
   const operation = { retired: false };
+  const session = dialogSession;
   addressBusy = operation;
   ++interfaceRefresh; ++bindingRefresh;
   const started = performance.now();
@@ -641,6 +649,15 @@ async function mutateAddress(progress: string, invoke: () => Promise<AddressRepl
   const hostPointer = $("#host-title").style.pointerEvents;
   try {
     lockAddressControls();
+    if (confirmation) {
+      // Tauri replaces the browser's synchronous confirm with Promise<boolean>.
+      // Reserve the operation before awaiting, but send no mutation until confirmed.
+      if (await window.confirm(confirmation.message) !== true) return false;
+      if (operation.retired || dialogSession !== session || !$<HTMLDialogElement>("#ip-config-dialog").open || !confirmation.isCurrent()) {
+        showToast("Network configuration changed; review the address and try again", true);
+        return false;
+      }
+    }
     spinner.style.display = "";
     spinner.className = "";
     spinner.textContent = progress;
@@ -747,9 +764,13 @@ export function setupIpConfigDialog(
   $<HTMLButtonElement>("#btn-remove-primary-ip").addEventListener("click", async () => {
     if (addressBusy || dialogSaving || selectingAdapter) return;
     const iface = dialogInterfaces.find((i) => i.name === $<HTMLSelectElement>("#static-iface").value);
-    const ip = dialogSession?.previousAddress?.split("/")[0];
-    if (!iface || !ip || !window.confirm(`Remove ${ip} from ${iface.display_name || iface.name}?`)) return;
-    if (await mutateAddress("Removing address…", () => api.removeSecondaryIp(iface.name, ip, true), $<HTMLButtonElement>("#btn-remove-primary-ip"))) {
+    const previous = dialogSession?.previousAddress;
+    const ip = previous?.split("/")[0];
+    if (!iface || !ip) return;
+    if (await mutateAddress("Removing address…", () => api.removeSecondaryIp(iface.name, ip, true), $<HTMLButtonElement>("#btn-remove-primary-ip"), {
+      message: `Remove ${ip} from ${iface.display_name || iface.name}?`,
+      isCurrent: () => dialogSession?.previousAddress === previous,
+    })) {
       if (dialogSession) { dialogSession.previousAddress = null; dialogSession.primaryChosen = true; }
       renderNetwork();
     }
@@ -786,6 +807,7 @@ export function setupIpConfigDialog(
     if (addressBusy) { showToast("Wait for the address operation to finish", true); return; }
     const name = $<HTMLSelectElement>("#static-iface").value;
     const selectedMac = adapterSelection?.selected_mac;
+    const selectedRevision = adapterSelectionRevision;
     const mode = readSelectedMode();
     if (!name) { showToast("Select an interface", true); return; }
     const ip = mode === "dhcp" ? null : $<HTMLInputElement>("#static-ip").value.trim();
@@ -817,7 +839,12 @@ export function setupIpConfigDialog(
         spinner.style.display = "";
         let reply = await api.setNetworkMode(request);
         if (reply.warning) {
-          if (!window.confirm(reply.warning)) {
+          const confirmed = await window.confirm(reply.warning);
+          if (dialogSession !== session || !dialog.open || adapterSelectionRevision !== selectedRevision) {
+            showToast("Ethernet adapter changed; review the configuration before closing", true);
+            return;
+          }
+          if (confirmed !== true) {
             // Cancel the proposed mode, so Close/Escape can leave without
             // proposing the same DHCP change again. Keep other field edits.
             $<HTMLInputElement>("#ip-mode-dhcp").checked = reply.mode === "dhcp";
@@ -966,14 +993,21 @@ function renderSecondaryIps(iface: InterfaceInfo | undefined, primary: { address
       const ip = btn.dataset["removeIp"];
       if (!subnet && ip && iface) {
         const prefix = rows.get(ip);
-        if (!window.confirm(`Remove ${ip}/${prefix} from ${iface.display_name || iface.name}? This may interrupt devices using this host address. Device history is retained.`)) return;
-        await mutateAddress("Removing address…", () => api.removeSecondaryIp(iface.name, ip), btn);
+        await mutateAddress("Removing address…", () => api.removeSecondaryIp(iface.name, ip), btn, {
+          message: `Remove ${ip}/${prefix} from ${iface.display_name || iface.name}? This may interrupt devices using this host address. Device history is retained.`,
+          isCurrent: () => !!dialogInterfaces.find((i) => i.mac === iface.mac && i.name === iface.name)
+            ?.ips.some((current) => current.address === ip && current.prefix === prefix),
+        });
         return;
       }
       const m = subnet ? adoptionMeta.get(subnet) : undefined;
       if (!subnet || !m?.address) return;
-      if (!window.confirm(`Remove ${m.address}/${m.prefix ?? "?"} from its saved adapter? Nodes on ${subnet} may share this host address and lose connectivity. Device history is retained.`)) return;
-      await mutateAddress("Removing address…", () => api.removeAdoptedSubnet(subnet, iface?.name), btn);
+      const identity = (meta: typeof m | undefined) => JSON.stringify([meta?.adapter_mac, meta?.address, meta?.prefix, meta?.desired]);
+      const original = identity(m);
+      await mutateAddress("Removing address…", () => api.removeAdoptedSubnet(subnet, iface?.name), btn, {
+        message: `Remove ${m.address}/${m.prefix ?? "?"} from its saved adapter? Nodes on ${subnet} may share this host address and lose connectivity. Device history is retained.`,
+        isCurrent: () => identity(adoptionMeta.get(subnet)) === original,
+      });
     });
   });
   lockAddressControls();

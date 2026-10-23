@@ -94,6 +94,87 @@ test('Host card has no delete control while Configure retains exact-address Remo
   assert(f.$('#secondary-ip-list').buttons.some(b=>b.dataset.removeBinding===SUBNET));
 });
 
+async function removalFixture(kind) {
+  const f=fixture();
+  if(kind==='primary')f.state.config.primary_addresses={[MAC]:'192.0.2.10/24'};
+  if(kind==='unmanaged')f.iface.ips.push({address:'198.51.100.10',prefix:24,subnet:'198.51.100.0/24'});
+  await f.$('#btn-ip-config').fire('click');
+  f.button=kind==='primary'?f.$('#btn-remove-primary-ip'):f.$('#secondary-ip-list').buttons.find(b=>
+    kind==='saved'?b.dataset.removeBinding===SUBNET:b.dataset.removeIp==='198.51.100.10');
+  assert(f.button);
+  return f;
+}
+
+for(const kind of ['primary','unmanaged','saved'])for(const outcome of ['accept','cancel','error'])
+test(`${kind} removal waits for the asynchronous confirmation ${outcome}`,async()=>{
+  const f=await removalFixture(kind),confirmation=deferred();let prompts=0;
+  f.ui.confirm=()=>{prompts++;return confirmation.promise;};
+  const before=JSON.stringify({ips:f.state.activeInterface.ips,meta:[...f.adoptionMeta],adopted:[...f.adoptedSubnets]});
+  const pending=f.button.fire('click');
+  await flush();
+  assert.equal(f.calls.writes,0,'no backend removal before confirmation');
+  assert.equal(JSON.stringify({ips:f.state.activeInterface.ips,meta:[...f.adoptionMeta],adopted:[...f.adoptedSubnets]}),before);
+  assert.equal(f.button.disabled,true);
+  await f.button.fire('click');await f.$('#btn-add-sec-ip').fire('click');
+  assert.equal(prompts,1);assert.equal(f.calls.writes,0);
+  if(outcome==='error')confirmation.reject(Error('dialog unavailable'));
+  else confirmation.resolve(outcome==='accept');
+  await flush();
+  assert.equal(f.calls.writes,outcome==='accept'?1:0);
+  if(outcome==='accept')f.pending[0].resolve(f.reply());
+  await pending;
+  assert.equal(f.button.disabled,false);assert.equal(f.$('#btn-add-sec-ip').disabled,false);
+  if(outcome!=='accept')assert.equal(JSON.stringify({ips:f.state.activeInterface.ips,meta:[...f.adoptionMeta],adopted:[...f.adoptedSubnets]}),before);
+  if(outcome==='error')assert.match(f.feedback.at(-1).msg,/dialog unavailable/);
+});
+
+for(const change of ['adapter','close','binding'])test(`A ${change} change invalidates a pending removal confirmation`,async()=>{
+  const f=await removalFixture('saved'),confirmation=deferred();f.ui.confirm=()=>confirmation.promise;
+  const pending=f.button.fire('click');await flush();
+  assert.equal(f.calls.writes,0);
+  if(change==='adapter'){
+    f.setSelection({...f.selection,selected_mac:'40:cd:3a:00:00:02',interface_index:8});
+    f.setSelection(f.selection);
+  }else if(change==='close'){
+    f.$('#ip-config-dialog').close();await f.$('#btn-ip-config').fire('click');
+  }else{
+    f.adoptionMeta.set(SUBNET,{...f.adoptionMeta.get(SUBNET),address:'192.0.2.30'});
+  }
+  confirmation.resolve(true);await pending;
+  assert.equal(f.calls.writes,0,'an old confirmation cannot remove a changed target');
+  assert.equal(f.$('#btn-add-sec-ip').disabled,false);
+});
+
+for(const answer of [false,true])test(`DHCP warning waits for asynchronous ${answer?'acceptance':'cancellation'}`,async()=>{
+  const f=fixture(),confirmation=deferred();await f.$('#btn-ip-config').fire('click');
+  f.$('#ip-mode-static-auto').checked=false;f.$('#ip-mode-dhcp').checked=true;await f.$('#ip-mode-dhcp').fire('change');
+  f.ui.confirm=()=>confirmation.promise;
+  f.api.setNetworkMode=async request=>{f.transitions.push(request);return {mode:request.confirmed?'dhcp':'static_auto',warning:request.confirmed?null:'DHCP may interrupt cameras'};};
+  const pending=f.$('#ip-config-close').fire('click');await flush();
+  assert.deepEqual(f.transitions.map(r=>r.confirmed),[false]);
+  assert.equal(f.state.config.network_mode,'static_auto');
+  await f.$('#ip-config-close').fire('click');
+  confirmation.resolve(answer);await pending;
+  assert.deepEqual(f.transitions.map(r=>r.confirmed),answer?[false,true]:[false]);
+  assert.equal(f.state.config.network_mode,answer?'dhcp':'static_auto');
+});
+
+for(const change of ['adapter','error'])test(`DHCP confirmation cannot apply after ${change}`,async()=>{
+  const f=fixture(),confirmation=deferred();await f.$('#btn-ip-config').fire('click');
+  f.$('#ip-mode-static-auto').checked=false;f.$('#ip-mode-dhcp').checked=true;await f.$('#ip-mode-dhcp').fire('change');
+  f.ui.confirm=()=>confirmation.promise;
+  f.api.setNetworkMode=async request=>{f.transitions.push(request);return {mode:'static_auto',warning:'DHCP may interrupt cameras'};};
+  const pending=f.$('#ip-config-close').fire('click');await flush();
+  if(change==='adapter'){
+    f.setSelection({...f.selection,selected_mac:'40:cd:3a:00:00:02',interface_index:8});f.setSelection(f.selection);
+    confirmation.resolve(true);
+  }else confirmation.reject(Error('dialog unavailable'));
+  await pending;
+  assert.deepEqual(f.transitions.map(r=>r.confirmed),[false]);
+  assert.equal(f.state.config.network_mode,'static_auto');assert.equal(f.$('#ip-config-dialog').open,true);
+  assert.equal(f.$('#static-iface').disabled,false);assert.equal(f.$('#ip-config-close').disabled,false);
+});
+
 test('Primary edit carries the exact previous tuple and reopens with the saved primary, never as a secondary',async()=>{
   const f=fixture();await f.$('#btn-ip-config').fire('click');
   f.$('#static-ip').value='198.51.100.10';await f.$('#static-ip').fire('input');
@@ -131,7 +212,7 @@ test('Legacy ambiguous primary can be chosen explicitly without erasing the new 
 test('Primary Remove uses the same verified reply, clears its role and does not promote a secondary',async()=>{
   const f=fixture();f.state.config.primary_addresses={[MAC]:'192.0.2.10/24'};
   await f.$('#btn-ip-config').fire('click');const before={...f.calls};
-  const remove=f.$('#btn-remove-primary-ip').fire('click');assert.equal(f.calls.writes,1);
+  const remove=f.$('#btn-remove-primary-ip').fire('click');await flush();assert.equal(f.calls.writes,1);
   assert.equal(f.$('#btn-remove-primary-ip').disabled,true);assert.equal(f.$('#primary-existing-ip').disabled,true);
   assert.deepEqual(f.removals,[{name:'Ethernet',ip:'192.0.2.10',primary:true}]);
   const reply=f.reply();reply.view.address='192.0.2.10';reply.view.subnet=null;reply.view.binding=null;
@@ -546,7 +627,7 @@ test('Explicit removal of an observed host IP uses its exact address in either e
     if(reverse)f.iface.ips.reverse();
     await f.$('#btn-ip-config').fire('click');
     const btn=f.$('#secondary-ip-list').buttons.find(b=>b.dataset.removeIp===ip);assert(btn);
-    const one=btn.fire('click'),two=btn.fire('click');assert.equal(f.calls.writes,1);
+    const one=btn.fire('click'),two=btn.fire('click');await flush();assert.equal(f.calls.writes,1);
     assert.equal(btn.disabled,true);assert.deepEqual(f.removals,[{name:'Ethernet',ip}]);
     const reply=f.reply();reply.view.subnet=null;reply.view.binding=null;reply.view.address=ip;
     reply.view.selection={...f.selection,adapter:{...f.iface,ips:f.iface.ips.filter(i=>i.address!==ip)},
@@ -727,7 +808,7 @@ test('SP10 close/reopen retires old dialog-open continuations and pending fetche
 test('SP10 IP Config removal double click shares the same busy guard and coherent reply',async()=>{
   const f=fixture();await f.$('#btn-ip-config').fire('click');const before={...f.calls};
   const btn=f.$('#secondary-ip-list').buttons[0];assert(btn);
-  const one=btn.fire('click'),two=btn.fire('click');assert.equal(f.calls.writes,1);
+  const one=btn.fire('click'),two=btn.fire('click');await flush();assert.equal(f.calls.writes,1);
   f.pending[0].resolve(f.reply());await one;await two;assert(!f.$('#subnet-list').innerHTML.includes(IP));
   assert.equal(f.$('#btn-add-sec-ip').disabled,false);assert.equal(f.calls.selection,before.selection);
 });
