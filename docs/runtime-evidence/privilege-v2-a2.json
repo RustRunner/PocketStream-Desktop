@@ -1,0 +1,1897 @@
+{
+  "document": "Rev 2-A.1 A2 integration checkpoint",
+  "recorded_at_utc": "2026-10-24T16:39:42.332Z",
+  "status": "A2 integrated; automated/read-only and limited production workflow checks passed; native mutation, hardware and release qualification pending",
+  "baseline": {
+    "branch": "main",
+    "commit": "3d077ef7104721c21b328438c53305f343906609",
+    "worktree_clean_before_a2": true,
+    "a2_changes_uncommitted": true,
+    "co_author_trailers_added": false,
+    "pushed": false
+  },
+  "specification": {
+    "path": "C:\\Users\\joshu\\Documents\\Untracked\\23OCT26-A01-privilege-boundary-v2-A.md",
+    "sha256": "4af6b2f7924d8a9c29d9f63159ffd6f112ff4bed7f467111e62197d13465a2a9",
+    "revision": "2-A.1",
+    "prerequisites": {
+      "before_production_integration": true,
+      "narrative": {
+        "path": "docs/runtime-evidence/privilege-v2-native-prerequisites.md",
+        "sha256": "c14cfc745dc5b0a5d4012fb35844f582db267cb46bb0729280e163d1e770b09f",
+        "bytes": 4713
+      },
+      "machine_record": {
+        "path": "docs/runtime-evidence/privilege-v2-native-prerequisites.json",
+        "sha256": "f7bcff63fd76ea09577529a657e9ca0a45ff40c7bf4fb2e4e6e4fb345cc9f68a",
+        "bytes": 25982
+      },
+      "scope": "A-S2 and A-S4 ownership, same-account medium-integrity; bind proof remains separate"
+    },
+    "b_usage": "Referenced typed authority contracts only; B implementation deferred"
+  },
+  "constraints": {
+    "application_commands": 46,
+    "wrappers": 46,
+    "plugin_permissions": 9,
+    "interim_bind_command": "list_vpn_interfaces; end-of-A rename deferred with A3",
+    "shipping_manifest": "requireAdministrator",
+    "development_manifest": "asInvoker with Common Controls",
+    "address_serialization": "Existing address_work/discovery locks, AddressIo, StaticIpOps, AdoptOps and AppConfig seams",
+    "executor": "One process-local admission, no queue, one retained completion; complete manual/mode/refresh/selection transactions survive caller cancellation",
+    "native_or_firewall_mutation_in_qualification": false,
+    "installed_executable_replaced": false
+  },
+  "environment": {
+    "recorded_at_utc": "2026-10-24T16:37:16.7031633Z",
+    "os_registry": {
+      "product_name": "Windows 10 Pro",
+      "display_version": "25H2",
+      "current_build": "26200",
+      "ubr": 9711
+    },
+    "actual_application_build": 26200,
+    "powershell": "5.1.26100.9711",
+    "node": "v24.14.0",
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)",
+    "pocketstream_processes": 0
+  },
+  "artifacts": {
+    "development": {
+      "path": "src-tauri/target/privilege-a2/development-48f2dea10a97c47b5d61a68520bbd21164838b252edf5c2e03e4ffcef9bd72d0/pocketstream-desktop.exe",
+      "launch_path": "src-tauri/target/debug/pocketstream-desktop.exe",
+      "sha256": "48f2dea10a97c47b5d61a68520bbd21164838b252edf5c2e03e4ffcef9bd72d0",
+      "manifest_path": "src-tauri/target/privilege-a2/development-48f2dea10a97c47b5d61a68520bbd21164838b252edf5c2e03e4ffcef9bd72d0/application.manifest",
+      "manifest_sha256": "cd613330097d228ae01fce028e50954fe4595249d51edebc4461ec252b514517",
+      "execution_level": "asInvoker",
+      "common_controls": true
+    },
+    "release": {
+      "path": "src-tauri/target/privilege-a2/release-b77586f746eadcb63fdb7a2883f9ffd494bb5aff140f4ff963baccadd6b8ebed/pocketstream-desktop.exe",
+      "sha256": "b77586f746eadcb63fdb7a2883f9ffd494bb5aff140f4ff963baccadd6b8ebed",
+      "manifest_path": "src-tauri/target/privilege-a2/release-b77586f746eadcb63fdb7a2883f9ffd494bb5aff140f4ff963baccadd6b8ebed/application.manifest",
+      "manifest_sha256": "780c5f643a1faa7a7198a3114e470fe789beacf042ba7b0fcdf2e6b3e3e20221",
+      "execution_level": "requireAdministrator",
+      "common_controls": true,
+      "launched": false,
+      "installed": false
+    },
+    "test": {
+      "path": "src-tauri/target/privilege-a2/qualification-3b70c17ed215a4ba780165f5bd9e3583ce372617f26b7c1dfea981be568e92f0.exe",
+      "original_path": "src-tauri/target/debug/deps/pocketstream_desktop-10048f9d261ead52.exe",
+      "sha256": "3b70c17ed215a4ba780165f5bd9e3583ce372617f26b7c1dfea981be568e92f0"
+    }
+  },
+  "source_inputs": {
+    "convention": "SHA256 of raw qualification-time code/config/test input bytes. Documentation is recorded separately; ignored outputs, private profiles and logs are excluded.",
+    "canonical_list_sha256": "97efe3842d135dbe6ed25665d23cddf67df26d39a622d97ff30c6e6cc6691f69",
+    "count": 162,
+    "files": [
+      {
+        "path": "index.html",
+        "sha256": "8a9db01db2346737c397e2a358243479fae3f9c25a263d0b52b50ee0fbff679f",
+        "bytes": 32078
+      },
+      {
+        "path": "package-lock.json",
+        "sha256": "cb5fb8f71948ac0dadd0b982bc6bf976d51826023b9aa261a6c6d452630109a9",
+        "bytes": 75225
+      },
+      {
+        "path": "package.json",
+        "sha256": "915b3b643dfe6aa4e054c694a588b6ce81367c0783e3d4c938a1b607c686ef57",
+        "bytes": 1029
+      },
+      {
+        "path": "scripts/build-patched-libsrt.ps1",
+        "sha256": "36ecef6da3c69a169e0eebdbddd4fdb433b35977e0d125247aa6bcc8ce282e17",
+        "bytes": 26720
+      },
+      {
+        "path": "scripts/bump-version.ps1",
+        "sha256": "eab7fad86522c165f3ef6ba2041285bb872e25828b1cd15bf89927df2ca6aa3b",
+        "bytes": 4265
+      },
+      {
+        "path": "scripts/bundle-gstreamer.ps1",
+        "sha256": "30ad54e1d8cce5866640f9cc623f4c4da9c2d5a5e51ae28a17233efd50276268",
+        "bytes": 23671
+      },
+      {
+        "path": "scripts/check-dom-selectors.mjs",
+        "sha256": "cf56d1a220e07888daf696cb57a326b37d28d798807dcb8afb115ebab6415526",
+        "bytes": 2025
+      },
+      {
+        "path": "scripts/check-ipc-allowlist.mjs",
+        "sha256": "23db5daa033424f8e6fa3b5f34f385c3a67a94aea9632af2de60d2421ec218eb",
+        "bytes": 16127
+      },
+      {
+        "path": "scripts/check-restream-card.mjs",
+        "sha256": "329e957d4b7400425ee1ac1cbb52c47c43488bd5737d7cb88af19dbc44d1560b",
+        "bytes": 4707
+      },
+      {
+        "path": "scripts/check-restream-ui.mjs",
+        "sha256": "9871e00aae8c7a49b554c1e23b71693b5e93bf459fa509b0e0cdc10907835de3",
+        "bytes": 7049
+      },
+      {
+        "path": "scripts/check-third-party.ps1",
+        "sha256": "e7b0e3a684a1d5aad2ac450f2b1e5091bb24d80c8c276535868da25acde87266",
+        "bytes": 12935
+      },
+      {
+        "path": "scripts/check.ps1",
+        "sha256": "b3ac61f8e741a30db380289db1a914b89f6f3b195bf6b4a700e6283605f27214",
+        "bytes": 3816
+      },
+      {
+        "path": "scripts/complete-a1-hardware-smoke.ps1",
+        "sha256": "2ab72d1ca019f3f8c37c413a3278e8837967e0f38868d99ed5baf61497439d3d",
+        "bytes": 11226
+      },
+      {
+        "path": "scripts/gstreamer-manifest.psd1",
+        "sha256": "3be8a982ff04a2cbe67119d82c9a01c673b340f5ea3ec86fe7fbca160c47a1ae",
+        "bytes": 35008
+      },
+      {
+        "path": "scripts/mirror-gstreamer-src.ps1",
+        "sha256": "5cd5fcec0fb9311fec2d44080a074337e5a75a1da4be010908bc2e8758a675d7",
+        "bytes": 13288
+      },
+      {
+        "path": "scripts/patches/cerbero-srt-1.5.6.patch",
+        "sha256": "40d311f06bbf5f2911696b65769c51a8aaa744d07809c06291baa8bb30cf6430",
+        "bytes": 500
+      },
+      {
+        "path": "scripts/patches/cerbero-srt-1.5.7.patch",
+        "sha256": "d8d257e19403a8268628a877ef78a78cb94aa46605868bcf573197b5bbac84bf",
+        "bytes": 500
+      },
+      {
+        "path": "scripts/source-release-policy.ps1",
+        "sha256": "d401200377aa8ebeea916f72385b1cbda1176d4d96b06f8c5154c141bb66d549",
+        "bytes": 2684
+      },
+      {
+        "path": "scripts/start-a1-hardware-smoke.ps1",
+        "sha256": "65cc97b255edec90260ed7c9a2a0197d6ea9e0360a4bc9a685476419f36b9548",
+        "bytes": 6169
+      },
+      {
+        "path": "scripts/test-source-release-policy.ps1",
+        "sha256": "6b0b34d8576df7c7ab14c1fb0d6ac5ce9ca5e548bbf4e3341e1dd67cdc8d2ba6",
+        "bytes": 4004
+      },
+      {
+        "path": "scripts/verify-a1-production-smoke.mjs",
+        "sha256": "51a60031ae6e115894a15fe2a7665823c95f3f2eadb7104114f8a446547ccc72",
+        "bytes": 8568
+      },
+      {
+        "path": "scripts/verify-a1-production-smoke.ps1",
+        "sha256": "66684373dd5617e9523a2ad70282aa6d23abc4cab53060f18a8bda4e5303fa68",
+        "bytes": 17258
+      },
+      {
+        "path": "scripts/verify-g1r-srt.ps1",
+        "sha256": "27b7eab0626ec5bbf87503fe82af110527b0b6f9ec4125810926509cc1a0b143",
+        "bytes": 53177
+      },
+      {
+        "path": "scripts/verify-g2-srt.ps1",
+        "sha256": "c5a28b296919a3562340fe2637ac390c0df8caa80ff3861e12b10c41eeb8a793",
+        "bytes": 21853
+      },
+      {
+        "path": "scripts/verify-g3-srt.ps1",
+        "sha256": "c328845c41a5fe18c72cbe3ef0a504370bcdca3ad76feaf32a386e51a0583b81",
+        "bytes": 46381
+      },
+      {
+        "path": "src-tauri/Cargo.lock",
+        "sha256": "21935f69e57d24a299bb96b0ca2c7f20b3ddb5dd985e88a9f33fd69b75e477ac",
+        "bytes": 168969
+      },
+      {
+        "path": "src-tauri/Cargo.toml",
+        "sha256": "ca67aef73535cca2dc61d68beaa37e4864886df8e6d51e2af1f3e4e4f9c422bd",
+        "bytes": 2152
+      },
+      {
+        "path": "src-tauri/build.rs",
+        "sha256": "e83e5850fc39e3d0bc702d8702f34e160fbf21fa311766d719022d0354bacc82",
+        "bytes": 6785
+      },
+      {
+        "path": "src-tauri/capabilities/default.json",
+        "sha256": "ed034be3718b5b7143e412b16393ca92457fdc3c1e7a8d4997528370d549a4f1",
+        "bytes": 1883
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/add_manual_node.toml",
+        "sha256": "59c542d2f11c2dd04b0f9a156e54a855511a2d956eb94cdf0f723c096740ad67",
+        "bytes": 390
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/add_secondary_ip.toml",
+        "sha256": "55227e570fb8ab0853a6e218be1564752081ab0b224bf812dd336deb35d1e15f",
+        "bytes": 396
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/apply_restream_settings.toml",
+        "sha256": "f338dbbabc8ea7d188dd77971d9f20649c8ec9b555c4c5468eaf0765e744d338",
+        "bytes": 438
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/clear_manual_nodes.toml",
+        "sha256": "0e02ceb0f066d9d188baeeb6232484ff969d8e857fca17cfecf90c2fbf35317f",
+        "bytes": 408
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/control_cgi_zoom_direct.toml",
+        "sha256": "47b6c4688f191b2106ae00450015b9208b2fce524e6eefcb2235da48319cbd09",
+        "bytes": 438
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/create_video_window.toml",
+        "sha256": "371acdf00a1d9e9dbb3b48e1a0d4693574805b4b4e681ef381805fb8447e0342",
+        "bytes": 414
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/forget_device.toml",
+        "sha256": "447eaf7564c8e06dc85db48beac8c3dda320cb642e325008a3c06ce6f858ba18",
+        "bytes": 378
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/get_adapter_selection.toml",
+        "sha256": "308c796f8df6d8bdd784ddf712a3648f284e43c5b3eb5589aa1bd52c049828c2",
+        "bytes": 426
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/get_adoption_state.toml",
+        "sha256": "f0a1c1b7070490548179c0b926098e27d074302bd940b2eaa884440f354ed982",
+        "bytes": 408
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/get_capture_state.toml",
+        "sha256": "200966cbed0691348950f6c89650797d9a0078fe4ea0f95715a91ef1c4218d19",
+        "bytes": 402
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/get_config.toml",
+        "sha256": "815bcf8ce240536e89bf35037a68ac3fd27c56b7fb115e81466148c659bbf3b2",
+        "bytes": 360
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/get_device_list.toml",
+        "sha256": "37d400ef3102ba0df33450c45df51be21b831c28834204981622f5f682554afa",
+        "bytes": 390
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/get_dhcp_state.toml",
+        "sha256": "4ffe2cccdf4ec755d3ed70637ae1437cb73e883fdfe63537c50bccb37867bbcf",
+        "bytes": 384
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/get_host_ip_owners.toml",
+        "sha256": "9311ce28bf21443854b3e47b5fc92f9d378d68dac0fd3b49b0d07e03663ff82b",
+        "bytes": 408
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/get_license_document.toml",
+        "sha256": "da94be00b50fc7b8955876d7840f3939dba251e750d65a7c6d6e6db3d88aba8e",
+        "bytes": 420
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/get_network_mode.toml",
+        "sha256": "ff3641d02b2c593643bc92b281a45020a5fb6dd538e5d0346ca86aecc2470b14",
+        "bytes": 396
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/get_startup_notices.toml",
+        "sha256": "45c7dc9003a911dff9c6f597d65a34beec8097805a75fa9b9163d5e5dbb55e4f",
+        "bytes": 414
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/list_vpn_interfaces.toml",
+        "sha256": "ed8da0b596e3590d8b2c6df032c25c67abd48e6ee280d3f3d15560938949ef9a",
+        "bytes": 414
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/log_frontend.toml",
+        "sha256": "8746769c3dd0cdf1478a4ceb062c317dece01178095dbef3bbfb6bb8486b19ea",
+        "bytes": 372
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/open_device_browser.toml",
+        "sha256": "48018daae010cdb19f9106c5a7c1ea08c61a9ef46317f4c706c3f64fa030a9f6",
+        "bytes": 414
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/open_log_folder.toml",
+        "sha256": "92b7bf8551f080edfda6ab5f5b4c75e355fda588f969cc03fc9cb0b900d0ecf0",
+        "bytes": 390
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/ptu_send.toml",
+        "sha256": "5ae199f17f2cfc077ea248cc6fdffc1a29ada23d1195beee880b159ae6b9ffa8",
+        "bytes": 348
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/refresh_adapter.toml",
+        "sha256": "71fcdbce3fcfe6adf063483577913f57e98f9844a107aab0ded4547f87bb3a64",
+        "bytes": 390
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/remove_adopted_subnet.toml",
+        "sha256": "ee127dc59f5053146b6c677e7008c45067d519bb7a3180c8d5670927c0f75e59",
+        "bytes": 426
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/remove_manual_node.toml",
+        "sha256": "feee3599d3a9ff8a5e2b452990724758546da6a257d6e619e07e596e636c8f01",
+        "bytes": 408
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/remove_secondary_ip.toml",
+        "sha256": "4014e56ed462620bdb51adec61ad0617f4bddb54ed022cbd5d546c0a42e31d2c",
+        "bytes": 414
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/retry_playback.toml",
+        "sha256": "7f94319b2430e6f73d669bc0e730e34bdf10e0b800466512c41c9a6423547892",
+        "bytes": 384
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/scan_network.toml",
+        "sha256": "e1affbbda911c6ff4d0fdac80863a61e92d8c5971e01e9634f8a7419df797bef",
+        "bytes": 372
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/select_adapter.toml",
+        "sha256": "4dda702b57928967d6f48e445c9f2ae3642dd424c58948c49e6c707ee1160b70",
+        "bytes": 384
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/set_audio_muted.toml",
+        "sha256": "04a218a10f10287160683c3ee39a08baf69ff1edc30c95302d3e19ad6b682822",
+        "bytes": 390
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/set_device_alias.toml",
+        "sha256": "2c28507343b9b69b293c264b51c4a45519e945a31cae8cab7f28d02368728061",
+        "bytes": 396
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/set_network_mode.toml",
+        "sha256": "129823afd60fd2d1540b4f28cb0a0d10def3e0a6220380f1d7a137fc55bf850f",
+        "bytes": 396
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/set_video_visible.toml",
+        "sha256": "e439964f996736a75fed5aefc894cd4875e504e86209e45e9ec1015c0ac84367",
+        "bytes": 402
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/set_zoom_position.toml",
+        "sha256": "4bc89d0276388f4aeddcae4dbc4cea348efe3456ef3891d2a00544cd502b16b4",
+        "bytes": 402
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/start_arp_discovery.toml",
+        "sha256": "3e3a7e628f372d5d8b78cafd6403cd416b536b0fea55b8c73e9b92d1a6dcdf2e",
+        "bytes": 414
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/start_recording.toml",
+        "sha256": "4991db9dc57876facec4b12035507bf3a9551ef57ecc77aafd2e7bd68393dc36",
+        "bytes": 390
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/start_restream_server.toml",
+        "sha256": "50eb7e7a5566111937738bb39bf8f8e21c2fac315dfc764215e7bb8871e0114b",
+        "bytes": 426
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/start_stream.toml",
+        "sha256": "aa03b92df3d158dfce6d23e9101748918248f5e7af8fe828d3ecc33b1951b16d",
+        "bytes": 372
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/stop_recording.toml",
+        "sha256": "0008c014102cb1229dec7992bf95c546ee0f10b718652837848886403bbeb185",
+        "bytes": 384
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/stop_restream_server.toml",
+        "sha256": "71e4101ba34026e636e3d5bcabdc4d1933c842658067f255b7af5d4f702285de",
+        "bytes": 420
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/stop_stream.toml",
+        "sha256": "3a0e0c2c6a42be398cd4b874df00493757b96a05b14e36e0aeb79713885fd569",
+        "bytes": 366
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/switch_restream_protocol.toml",
+        "sha256": "32c78555735f3ad881f9c4c3f8b59d47ed2e6834da286395c7c1f46372142d66",
+        "bytes": 444
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/take_screenshot.toml",
+        "sha256": "43e66bcab846c043e11ce9a9b77492a7e4f884edbe019f198161e54125da4b5a",
+        "bytes": 390
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/update_credentials.toml",
+        "sha256": "bd45df0f0d581013a88284635463eef4a42d765ac75257db78c0933f0104451e",
+        "bytes": 408
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/update_stream_settings.toml",
+        "sha256": "3b08c2eba2a79834c6413f59e83b91198dfd830199505118c0a51463b7932b6b",
+        "bytes": 432
+      },
+      {
+        "path": "src-tauri/permissions/autogenerated/update_video_position.toml",
+        "sha256": "bca08c3ec612b838cf050968ec5de7498932e857733acdde1f131e3459da459e",
+        "bytes": 426
+      },
+      {
+        "path": "src-tauri/src/camera/flir_ptu.rs",
+        "sha256": "4ca268130f5214f2fa28b2a0d81445aa73daf9c69cc1edc86b939a4e8f9b0533",
+        "bytes": 8665
+      },
+      {
+        "path": "src-tauri/src/camera/mod.rs",
+        "sha256": "496f1cf97048b4deabe526a007a40a0df7d6c4c485983f7897e65d7e57b0b340",
+        "bytes": 19
+      },
+      {
+        "path": "src-tauri/src/commands/camera.rs",
+        "sha256": "3cc2e0eee02785365c1ca725d3f0c4a53f496cf306330348342f9f5139b7c9a6",
+        "bytes": 6309
+      },
+      {
+        "path": "src-tauri/src/commands/config.rs",
+        "sha256": "22ae6790aebe2da683edb7b5859c531df9cd3684fc93d3d4eea1004404847b74",
+        "bytes": 1915
+      },
+      {
+        "path": "src-tauri/src/commands/mod.rs",
+        "sha256": "e9bc3d9ba3853bcbb549b675a755fa42dc115556737d5b1682b6f18c9aebd8f4",
+        "bytes": 6853
+      },
+      {
+        "path": "src-tauri/src/commands/network.rs",
+        "sha256": "8086cdce6600378dd6c7f081607a3a3e90581870b7219f172e23d33b43c89883",
+        "bytes": 14631
+      },
+      {
+        "path": "src-tauri/src/commands/streaming.rs",
+        "sha256": "7d0fe550010cc32cac9a7e27706e557589d6b276237701c8a2d7fbb9be346b4c",
+        "bytes": 8745
+      },
+      {
+        "path": "src-tauri/src/config.rs",
+        "sha256": "572ddf30f41c48570d1e0050bc4bba03c5e24a54275ccd24e53046e082adbe0b",
+        "bytes": 160014
+      },
+      {
+        "path": "src-tauri/src/error.rs",
+        "sha256": "db1d00c3eebe6556691996315e8ae2f00a41f2cc9da0cb39adf4c0884c6f3b02",
+        "bytes": 7709
+      },
+      {
+        "path": "src-tauri/src/ipc_acl_tests.rs",
+        "sha256": "e177d8780c22e44ee2262c7d3f61c6d2957fb0e7447caf1c86cfd5fa5644e288",
+        "bytes": 4114
+      },
+      {
+        "path": "src-tauri/src/lib.rs",
+        "sha256": "9ab2ecc151bd1c68757812cd6b34fdbec2340bd25bf88e2ec7be90cec51f55a4",
+        "bytes": 29504
+      },
+      {
+        "path": "src-tauri/src/logging.rs",
+        "sha256": "e4ded520a1f6f00ba16a14082000b93a030768891df61b88f27530ee307f5bd4",
+        "bytes": 8725
+      },
+      {
+        "path": "src-tauri/src/main.rs",
+        "sha256": "bb38b569d453d7d5c7ba9da05d7600e709d9107529765dc991cd01e9f9626026",
+        "bytes": 119
+      },
+      {
+        "path": "src-tauri/src/network/adapter_refresh.rs",
+        "sha256": "9bc5721856b4f5bb73548fb099beff28022325d0a1c53e8738fdcd0ede4f621e",
+        "bytes": 1420
+      },
+      {
+        "path": "src-tauri/src/network/arp.rs",
+        "sha256": "ebd10ccd15a499b196172b97315d1d33da8ed30349059fe8311c07c9182000ee",
+        "bytes": 100710
+      },
+      {
+        "path": "src-tauri/src/network/auto_adopt.rs",
+        "sha256": "3b0a42e9c7482fbebacc8490aab0848abcd020af83756795f785d1e419465d16",
+        "bytes": 55150
+      },
+      {
+        "path": "src-tauri/src/network/bound_tcp.rs",
+        "sha256": "25d8ea77315e5f390714f7d49d27413f04eea9dcb9a27463adea5185f77a237c",
+        "bytes": 13915
+      },
+      {
+        "path": "src-tauri/src/network/cache_probe.rs",
+        "sha256": "0c9d67597e8f4c22407dd8638cbf35848a706f23c10406af2f4554cf9be4bf98",
+        "bytes": 26176
+      },
+      {
+        "path": "src-tauri/src/network/device_registry.rs",
+        "sha256": "3d9c82742d7ad0abb4aa6f2fc961bc6a8c314c9c52a8b9602c1e19b0f18af650",
+        "bytes": 70420
+      },
+      {
+        "path": "src-tauri/src/network/firewall.rs",
+        "sha256": "43d51e5bf77f90aaab3e5f5f52c97d2f2359cdb3324a61d6bd52654eb755d99e",
+        "bytes": 7764
+      },
+      {
+        "path": "src-tauri/src/network/ghost.rs",
+        "sha256": "30ad3c3b64954ff1b1dbf89a969bc6556d85f9b48ed1cb04033cd1d7b8be96cf",
+        "bytes": 20299
+      },
+      {
+        "path": "src-tauri/src/network/host_owner.rs",
+        "sha256": "f3c885d0d7ca498bc36d5ad97dcc132a45094c74ba69293441be4a0a172d1b3a",
+        "bytes": 8089
+      },
+      {
+        "path": "src-tauri/src/network/interface.rs",
+        "sha256": "f1dd207e88ad571518ac632bc80bcf5f5b237eaa017570d4681a9b15b083bd8f",
+        "bytes": 99494
+      },
+      {
+        "path": "src-tauri/src/network/ip_config.rs",
+        "sha256": "a71f8cd80ad672cb5f8973c6c706fa54eb5dfd15326977e79ec43e21e3d3ba9e",
+        "bytes": 22451
+      },
+      {
+        "path": "src-tauri/src/network/ip_conflict.rs",
+        "sha256": "0b17b1e12a9c9bc58988926ebffa9362164843260ca361cc1331a09413140209",
+        "bytes": 8705
+      },
+      {
+        "path": "src-tauri/src/network/local_executor.rs",
+        "sha256": "0835cead33614257b997c2cc799a26f338777c35641c21ce5bbf6af491011c36",
+        "bytes": 8724
+      },
+      {
+        "path": "src-tauri/src/network/manual_address.rs",
+        "sha256": "9dd88fbb949cd3428113a7d8e1369cc810d1749d60aa4861d988d39073e0b234",
+        "bytes": 82451
+      },
+      {
+        "path": "src-tauri/src/network/mod.rs",
+        "sha256": "76b61faad115f97d547ea8a7f7c3c80230e8aec89b375355383faf4af61c35a5",
+        "bytes": 302791
+      },
+      {
+        "path": "src-tauri/src/network/native-operations-v1.ps1",
+        "sha256": "5df29bdc431aa09fb8c3edb86f5af1dd7c823110d5e9115de8b4f8146dac4085",
+        "bytes": 15446
+      },
+      {
+        "path": "src-tauri/src/network/native_operations.rs",
+        "sha256": "5d73b45127904b6d0a276956ffae106a3e86d7ea7b830faaf541c1dfda5ec750",
+        "bytes": 43819
+      },
+      {
+        "path": "src-tauri/src/network/native_runner.rs",
+        "sha256": "1cfcee7af6b9b70769a1cb1f0203f8337a65d7d2b453b27161dac9c432dce04c",
+        "bytes": 20368
+      },
+      {
+        "path": "src-tauri/src/network/ping_dot.rs",
+        "sha256": "f73462a815ce1327ccbc366b502defe464a44a7fe53c9c8da839fdf9740b8c24",
+        "bytes": 9602
+      },
+      {
+        "path": "src-tauri/src/network/pktmon.rs",
+        "sha256": "f1219324b4cf298974e7be0a77be611938cfed63c5d8bce0749e477bcf442b23",
+        "bytes": 47973
+      },
+      {
+        "path": "src-tauri/src/network/presence.rs",
+        "sha256": "4fefe1687cc1b9071ea400c242f2aa521e9bb1578e6d5556668f2a2645ff136a",
+        "bytes": 31528
+      },
+      {
+        "path": "src-tauri/src/network/reaper.rs",
+        "sha256": "3b77b22281b504c4a3c775f18b70e4a0ac6a5800310bf8a059cea2c3bca45310",
+        "bytes": 12440
+      },
+      {
+        "path": "src-tauri/src/network/route.rs",
+        "sha256": "60e5a114c261be954b26699f4f411521af8313a3272a922750205d07be3fd48b",
+        "bytes": 9044
+      },
+      {
+        "path": "src-tauri/src/network/scanner.rs",
+        "sha256": "4b7bf89696370b9138cdc49e5a6f5f264cf3bdb9510e5935e01e17137648e724",
+        "bytes": 22965
+      },
+      {
+        "path": "src-tauri/src/network/watcher.rs",
+        "sha256": "ecacb7833980d7d58406fba90dd2d2fd33b4d0a7a49dbe7213770ab27bbcb1ee",
+        "bytes": 18601
+      },
+      {
+        "path": "src-tauri/src/settings_validation.rs",
+        "sha256": "b0dc546b1c3250f34fc90be4f3f5c522dd0c2de6cfae4d38734e48b52519b4cd",
+        "bytes": 15862
+      },
+      {
+        "path": "src-tauri/src/streaming/audio.rs",
+        "sha256": "6a062be232bbf576a5fba96cb4c57e6c5224da42d193cc58a6d5499e15a7dd9a",
+        "bytes": 20148
+      },
+      {
+        "path": "src-tauri/src/streaming/caller_registry.rs",
+        "sha256": "a79f3d850a2ab2422df17ac537e79b343292c7d728893f1b3cc161b9c60d3c93",
+        "bytes": 20919
+      },
+      {
+        "path": "src-tauri/src/streaming/classify.rs",
+        "sha256": "ea2aeba054b662fdd3ee94ed1b96821680f61df99817d093805747557e193422",
+        "bytes": 6175
+      },
+      {
+        "path": "src-tauri/src/streaming/mod.rs",
+        "sha256": "ec84b7884252aaea9ca17ac2ad08ff149399039ab6955af602d90c8bb34b4433",
+        "bytes": 193785
+      },
+      {
+        "path": "src-tauri/src/streaming/recorder.rs",
+        "sha256": "0be445183f47dfbe7345d2e9bdc74f57c507b74beeed8e60a1a66bbcc5313da3",
+        "bytes": 6051
+      },
+      {
+        "path": "src-tauri/src/streaming/relay.rs",
+        "sha256": "6d8813ac4f697c1cb63dea0bcf54da27e6d99123eb1f1ed8282117f8d02c3f43",
+        "bytes": 55775
+      },
+      {
+        "path": "src-tauri/src/streaming/rtsp_client.rs",
+        "sha256": "932293446b299dfb2e42c9486e28a29dfa4ac77419cbfca1146bb4c67b4799de",
+        "bytes": 46887
+      },
+      {
+        "path": "src-tauri/src/streaming/rtsp_server.rs",
+        "sha256": "7a0e0365cdc8cb6aa1dcb327af48c758524c3a7f4ce74bd6ae78e1ae2d3ac0da",
+        "bytes": 50096
+      },
+      {
+        "path": "src-tauri/src/streaming/rtsp_transport.rs",
+        "sha256": "270a14715835276abdac724d290d437ddab41bfca53bf718c20278b8fe18801c",
+        "bytes": 3331
+      },
+      {
+        "path": "src-tauri/src/streaming/srt_server.rs",
+        "sha256": "181b0c64e4f81ce39d5d5656604bd087d623594c8d3f216a5042af575856ed11",
+        "bytes": 46496
+      },
+      {
+        "path": "src-tauri/src/streaming/video_embed.rs",
+        "sha256": "a65d167685e73bb1584700452f25a591172234da3f5ccc0256c26b06c9f9b29b",
+        "bytes": 6893
+      },
+      {
+        "path": "src-tauri/src/validation.rs",
+        "sha256": "c85c7506da6f9bd5226a567e552a1bd898cb2856b3525239e4b6c2a245a609d6",
+        "bytes": 7040
+      },
+      {
+        "path": "src-tauri/tauri.conf.json",
+        "sha256": "61aa2b58dd34306d3397cd9b13470be60da8e3011b4833bde29b7cda3eeb6b85",
+        "bytes": 2038
+      },
+      {
+        "path": "src-tauri/tests/fixtures/acl-native-smoke.js",
+        "sha256": "2d9e6e2e605ef87f433ff802cac7392d4adcdc8146f6eb96b1fa1f2f41b22df4",
+        "bytes": 2208
+      },
+      {
+        "path": "src-tauri/tests/fixtures/native-runner-v1.ps1",
+        "sha256": "db47cb219ab4b7df79a278dd11254a583e645c5e5b0a105f84eb76289b2a36dc",
+        "bytes": 5084
+      },
+      {
+        "path": "src-tauri/tests/fixtures/native_foundation.rs",
+        "sha256": "d929c675988fe094ad1a80fafecae9036e92a70f79b7ced814f055f25c3bec49",
+        "bytes": 34013
+      },
+      {
+        "path": "src-tauri/tests/fixtures/production-native-failure-v1.ps1",
+        "sha256": "ee4a6243a7c01e960aacf75c98aabc0aafa42984e443c116d019b4779f6a5121",
+        "bytes": 1086
+      },
+      {
+        "path": "src/assets/ps_icon.png",
+        "sha256": "04c20e260bc571eb9c3b3be45199425129763d15cfed735532e452190eef44b7",
+        "bytes": 9389
+      },
+      {
+        "path": "src/lib/device-cache.ts",
+        "sha256": "cbcfbb106599c3437284ca68c46ac47f8c3ae7ae768657879df1ae319d360fcf",
+        "bytes": 11028
+      },
+      {
+        "path": "src/lib/device-list.ts",
+        "sha256": "f33ecdd483038c64b390009070eebb275a65054f8f6c53899c86ae8184a6664d",
+        "bytes": 7791
+      },
+      {
+        "path": "src/lib/device-state.ts",
+        "sha256": "6efc1251c5521a020ec8bb2969ee61000612c200a6f89706a7a435deee5ad93b",
+        "bytes": 6045
+      },
+      {
+        "path": "src/lib/devices.ts",
+        "sha256": "3258a40b1943a903bb7dd5fca0ec7411698d89707f1eb64a8442c5bc633cbdec",
+        "bytes": 35288
+      },
+      {
+        "path": "src/lib/errors.ts",
+        "sha256": "3a615bece363eb9b686ab87b3101c2d8d29d963138f266f51c23aaf5f4197721",
+        "bytes": 2045
+      },
+      {
+        "path": "src/lib/ip-conflicts.ts",
+        "sha256": "0cba28bb80fde2adbd02e498702343142e0e64266b9bc60779be052c3bf0a2f2",
+        "bytes": 2029
+      },
+      {
+        "path": "src/lib/markdown-lite.ts",
+        "sha256": "81af852d73db8533030d165f1ceb053efeae8ab4b90a30ab81c3f5b756a04392",
+        "bytes": 3288
+      },
+      {
+        "path": "src/lib/network.ts",
+        "sha256": "e14ea8b5d8f8871ebfa4c8e343aa1c5c7522db2e546b640adc87133cd721be48",
+        "bytes": 51246
+      },
+      {
+        "path": "src/lib/ptz.ts",
+        "sha256": "20047412e30ecdad819445c1832b01c2d41949616577687638ed8c678074b5c8",
+        "bytes": 29042
+      },
+      {
+        "path": "src/lib/restream-format.ts",
+        "sha256": "93d30f1a8eee8aa8ea4f1124185490ba8ee7399991168d8463ff5a729c1f5ba8",
+        "bytes": 445
+      },
+      {
+        "path": "src/lib/restream-settings.ts",
+        "sha256": "86c2683b3fd410cbb809756b6bc00c71af0ddb6805bfc5111408eedf13eef9ea",
+        "bytes": 4790
+      },
+      {
+        "path": "src/lib/state.ts",
+        "sha256": "5dc69b63aaf2728a74bf5d31f4ea2a69070e0f2294112a0726d145e08d6e89f2",
+        "bytes": 7774
+      },
+      {
+        "path": "src/lib/store.ts",
+        "sha256": "fffd3f258567d03608299000c2496cc80dfb1b2250bb1693f254fcb5c84180b6",
+        "bytes": 2504
+      },
+      {
+        "path": "src/lib/streaming.ts",
+        "sha256": "1a80ce11f5d493e2ec7da088bf0697c9dcbe007a32f9b1a407e428fffaa25367",
+        "bytes": 45851
+      },
+      {
+        "path": "src/lib/tauri-api.ts",
+        "sha256": "681da2cc2ddbb5a35d936f120b66541ec416181c7121696f91bef9b1a98966af",
+        "bytes": 12253
+      },
+      {
+        "path": "src/lib/tauri-global.d.ts",
+        "sha256": "024a3d3e0e92ba528d7501347df155a69fa658c516b8efbda039a17fa38abf76",
+        "bytes": 2830
+      },
+      {
+        "path": "src/lib/types.ts",
+        "sha256": "841e181c7b09a36c6c6aab9a53940acf61bf558d10bb9c7adb653ac93fa273bf",
+        "bytes": 15992
+      },
+      {
+        "path": "src/main.ts",
+        "sha256": "12c546700df683d0da61342eaa9330481412dc268167274437a7b7a0a694c41b",
+        "bytes": 32679
+      },
+      {
+        "path": "src/styles/components.css",
+        "sha256": "3267c5f5ffb86e9c97a2a46c8c6879a4ae68f11e1e0f78065768258cdd583b5e",
+        "bytes": 35667
+      },
+      {
+        "path": "src/styles/layout.css",
+        "sha256": "c1be3e0eb939897cfeadbd8dc5819c268782f4adfe7bfd3270558b058ca771d4",
+        "bytes": 4248
+      },
+      {
+        "path": "src/styles/theme.css",
+        "sha256": "ad648aa21ecd6ae984c2d42694046cd2ecb71b4e62786701ad0d4cd04cf5510e",
+        "bytes": 2211
+      },
+      {
+        "path": "tests/device-browser.test.cjs",
+        "sha256": "a5b0dd4f28daf158053ac7e8010441dd50d27aa1a8748ce808c069e4569debfd",
+        "bytes": 6833
+      },
+      {
+        "path": "tests/ip-conflicts.test.cjs",
+        "sha256": "03354927457c972ce70ab6e9164e2ba09da0b0c96c68f6c349f09149292bc79f",
+        "bytes": 3846
+      },
+      {
+        "path": "tests/ipc-allowlist.test.cjs",
+        "sha256": "97ecb0716f24d64dc82fd221a7141f9d80c06b66afccfcdf3c1b9e397d8e9bad",
+        "bytes": 8639
+      },
+      {
+        "path": "tests/launch-notice.test.cjs",
+        "sha256": "38b91aac4f2da32f5a282c8fbab0a42fc5883af62a13b295e24db2f836653dbd",
+        "bytes": 7527
+      },
+      {
+        "path": "tests/network-address-workflow.test.cjs",
+        "sha256": "d593ee0a7b8d2a0d26c6029598e88807c7020431ac202432ec30f5cec50418e6",
+        "bytes": 62207
+      },
+      {
+        "path": "tests/network-discovery.test.cjs",
+        "sha256": "54c3331d67a1dae0f306ba9833e2fa4943ae967ae0863fdf09b7e621d1789c84",
+        "bytes": 4776
+      },
+      {
+        "path": "tests/notification-behavior.test.cjs",
+        "sha256": "ea160c5d804771d60f4dbcec445f6a1840a1acf1fc56fc7f1f2fab03ab95e645",
+        "bytes": 33358
+      },
+      {
+        "path": "tests/ptu-workflow.test.cjs",
+        "sha256": "e70a9d6057caaf88f07157953f03b96646f3515f6a373665afb7573f9bb6b94c",
+        "bytes": 16068
+      },
+      {
+        "path": "tsconfig.json",
+        "sha256": "35d3bae3ac284c98036282c10ae5807407d6f8c06ac770eb4b809ce122f84bca",
+        "bytes": 705
+      }
+    ]
+  },
+  "validation": {
+    "commands": [
+      {
+        "name": "unit-transaction",
+        "command": [
+          "cargo",
+          "test",
+          "--lib",
+          "--locked",
+          "--offline"
+        ],
+        "cwd": "src-tauri",
+        "started": "2026-10-24T16:33:28.004Z",
+        "ended": "2026-10-24T16:33:51.142Z",
+        "status": 0,
+        "logs": [
+          {
+            "path": "src-tauri/target/privilege-a2/unit-transaction.stdout.log",
+            "sha256": "a1816279df8b248ec3974c01f226f35493e60b90f1c0368dd7e50cb993f521e3",
+            "bytes": 65538
+          },
+          {
+            "path": "src-tauri/target/privilege-a2/unit-transaction.stderr.log",
+            "sha256": "be64b8f3522b84a112f2c719858193335a3c995b4c0eda6c01df90ddc8140973",
+            "bytes": 1648
+          }
+        ]
+      },
+      {
+        "name": "native-transaction",
+        "command": [
+          "cargo",
+          "test",
+          "--lib",
+          "--locked",
+          "--offline",
+          "network::native_qualification::qualify_",
+          "--",
+          "--ignored",
+          "--test-threads=1",
+          "--nocapture"
+        ],
+        "cwd": "src-tauri",
+        "started": "2026-10-24T16:33:51.146Z",
+        "ended": "2026-10-24T16:34:09.803Z",
+        "status": 0,
+        "logs": [
+          {
+            "path": "src-tauri/target/privilege-a2/native-transaction.stdout.log",
+            "sha256": "47d5edecbe06d5c614ee63c25ac5725dc742a7376b8576e4444e18e6f02d568f",
+            "bytes": 697
+          },
+          {
+            "path": "src-tauri/target/privilege-a2/native-transaction.stderr.log",
+            "sha256": "9ff9ef356a5ff559e65d4640f3350ca2c419b20c3533be40cd93e11b9d897750",
+            "bytes": 1558
+          }
+        ]
+      },
+      {
+        "name": "clippy-transaction",
+        "command": [
+          "cargo",
+          "clippy",
+          "--all-targets",
+          "--no-deps",
+          "--locked",
+          "--offline",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "cwd": "src-tauri",
+        "started": "2026-10-24T16:34:09.804Z",
+        "ended": "2026-10-24T16:34:18.268Z",
+        "status": 0,
+        "logs": [
+          {
+            "path": "src-tauri/target/privilege-a2/clippy-transaction.stdout.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "bytes": 0
+          },
+          {
+            "path": "src-tauri/target/privilege-a2/clippy-transaction.stderr.log",
+            "sha256": "a267782b601892b79b1841a30b5ac0e75e78cf280d7965bd7d7819c343a3c912",
+            "bytes": 161
+          }
+        ]
+      },
+      {
+        "name": "format-transaction",
+        "command": [
+          "cargo",
+          "fmt",
+          "--check"
+        ],
+        "cwd": "src-tauri",
+        "started": "2026-10-24T16:34:18.269Z",
+        "ended": "2026-10-24T16:34:18.736Z",
+        "status": 0,
+        "logs": [
+          {
+            "path": "src-tauri/target/privilege-a2/format-transaction.stdout.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "bytes": 0
+          },
+          {
+            "path": "src-tauri/target/privilege-a2/format-transaction.stderr.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "bytes": 0
+          }
+        ]
+      },
+      {
+        "name": "development-transaction",
+        "command": [
+          "cargo",
+          "build",
+          "--bin",
+          "pocketstream-desktop",
+          "--locked",
+          "--offline"
+        ],
+        "cwd": "src-tauri",
+        "started": "2026-10-24T16:34:18.737Z",
+        "ended": "2026-10-24T16:34:39.705Z",
+        "status": 0,
+        "logs": [
+          {
+            "path": "src-tauri/target/privilege-a2/development-transaction.stdout.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "bytes": 0
+          },
+          {
+            "path": "src-tauri/target/privilege-a2/development-transaction.stderr.log",
+            "sha256": "537ca5e3210d75e292610801b668d58081455f0d817bd3fcecd4fc1bad95c393",
+            "bytes": 1795
+          }
+        ]
+      },
+      {
+        "name": "frontend-transaction",
+        "command": [
+          "npm",
+          "test"
+        ],
+        "cwd": ".",
+        "started": "2026-10-24T16:34:32.263Z",
+        "ended": "2026-10-24T16:34:43.556Z",
+        "status": 0,
+        "logs": [
+          {
+            "path": "src-tauri/target/privilege-a2/frontend-transaction.stdout.log",
+            "sha256": "04f28b755f8bf320af1c26f3323428c3caac4ef7fd575c8b5f9a05e4380af166",
+            "bytes": 16590
+          },
+          {
+            "path": "src-tauri/target/privilege-a2/frontend-transaction.stderr.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "bytes": 0
+          }
+        ]
+      },
+      {
+        "name": "typecheck-transaction",
+        "command": [
+          "npm",
+          "run",
+          "typecheck"
+        ],
+        "cwd": ".",
+        "started": "2026-10-24T16:34:43.559Z",
+        "ended": "2026-10-24T16:34:44.620Z",
+        "status": 0,
+        "logs": [
+          {
+            "path": "src-tauri/target/privilege-a2/typecheck-transaction.stdout.log",
+            "sha256": "f8959cdd7d37f6ecda3ed5496e7c543fe3d79a10dcdda021ff78ded4708f5ad0",
+            "bytes": 56
+          },
+          {
+            "path": "src-tauri/target/privilege-a2/typecheck-transaction.stderr.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "bytes": 0
+          }
+        ]
+      },
+      {
+        "name": "frontend-build-transaction",
+        "command": [
+          "npm",
+          "run",
+          "build"
+        ],
+        "cwd": ".",
+        "started": "2026-10-24T16:34:44.621Z",
+        "ended": "2026-10-24T16:34:47.728Z",
+        "status": 0,
+        "logs": [
+          {
+            "path": "src-tauri/target/privilege-a2/frontend-build-transaction.stdout.log",
+            "sha256": "9d20030f4d634a55ebaa4010c88bffdc5588e916e5916a3bfe8b3430bb96d6c3",
+            "bytes": 1113
+          },
+          {
+            "path": "src-tauri/target/privilege-a2/frontend-build-transaction.stderr.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "bytes": 0
+          }
+        ]
+      },
+      {
+        "name": "release-transaction",
+        "command": [
+          "cargo",
+          "build",
+          "--release",
+          "--bin",
+          "pocketstream-desktop",
+          "--locked",
+          "--offline"
+        ],
+        "cwd": "src-tauri",
+        "started": "2026-10-24T16:35:14.700Z",
+        "ended": "2026-10-24T16:36:10.183Z",
+        "status": 0,
+        "release_environment": "1",
+        "logs": [
+          {
+            "path": "src-tauri/target/privilege-a2/release-transaction.stdout.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "bytes": 0
+          },
+          {
+            "path": "src-tauri/target/privilege-a2/release-transaction.stderr.log",
+            "sha256": "38d9a6ae1ba1c027189f97067edb794aca56f181ab74bf8019e12da753525007",
+            "bytes": 2011
+          }
+        ]
+      }
+    ],
+    "results": {
+      "ordinary_rust": {
+        "passed": 775,
+        "failed": 0,
+        "ignored": 10
+      },
+      "ignored": "Seven opt-in Windows fixtures, two hardware tests and their process helper",
+      "explicit_windows": {
+        "passed": 7,
+        "failed": 0
+      },
+      "frontend": {
+        "passed": 184,
+        "failed": 0
+      },
+      "post_native_caller_abort_regression": {
+        "native_and_config": "Existing fake seams; no NetworkManager constructed",
+        "expected": "Parent retains admission and saves after caller abort; save failure is uncertain and cannot be acknowledged",
+        "observed": "Both successful bookkeeping and injected post-native save-failure cases passed"
+      },
+      "typecheck": "passed",
+      "contracts": "46 commands / 46 referenced wrappers / event helper / 9 plugin permissions",
+      "production_frontend_build": "passed",
+      "format": "passed",
+      "clippy_all_targets_deny_warnings": "passed",
+      "development_build": "passed",
+      "release_build": "passed with POCKETSTREAM_RELEASE=1",
+      "existing_diagnostics": "Delay-load linker warnings; nonfatal GLib GIO missing OS package AppxManifest warning in some runs"
+    }
+  },
+  "native_process_evidence": {
+    "records": [
+      {
+        "path": "src-tauri/target/privilege-a2-proofs/a2-transaction-20261024T163327963Z/caller-abort-and-barrier.json",
+        "sha256": "aaabbe3eddc309513fcc6b5c4aab90007508d017db2fd1578cec435402533d1e",
+        "bytes": 1513
+      },
+      {
+        "path": "src-tauri/target/privilege-a2-proofs/a2-transaction-20261024T163327963Z/child-tree-and-output.json",
+        "sha256": "6607c55f1b40ab6c0687b45a7c5f06ef76a25a12139e865da8aa71dd88a7d66d",
+        "bytes": 701
+      },
+      {
+        "path": "src-tauri/target/privilege-a2-proofs/a2-transaction-20261024T163327963Z/native-observation-paths.json",
+        "sha256": "8de39ce053f2c00ba9d923bf173ce8c680cea4784ec28f67e0d60e9667ae68f2",
+        "bytes": 574
+      },
+      {
+        "path": "src-tauri/target/privilege-a2-proofs/a2-transaction-20261024T163327963Z/production-native-required-failure.json",
+        "sha256": "e78ebb7ca01f4b911f0130ae1a7e7572f47549acdca5335d5a2d57e34d780e59",
+        "bytes": 385
+      },
+      {
+        "path": "src-tauri/target/privilege-a2-proofs/a2-transaction-20261024T163327963Z/script-data-and-required-failures.json",
+        "sha256": "e52f8f2a49053e2741b6275aece90dd9fb9e4245be7ce6bbbae49ad751474702",
+        "bytes": 1621
+      },
+      {
+        "path": "src-tauri/target/privilege-a2-proofs/a2-transaction-20261024T163327963Z/two-owners-and-lone-crash.json",
+        "sha256": "41e3997a7a3b03d8cbf0b88ecb91368393c58ab5a5008b044cc002de87e0f017",
+        "bytes": 1720
+      },
+      {
+        "path": "src-tauri/target/privilege-a2-proofs/a2-transaction-20261024T163327963Z/typed-production-inventory.json",
+        "sha256": "9d3e2a385318536d3da5ed6f376fac3619b8ca1009629c1b5af6f1022a8b5284",
+        "bytes": 7246
+      }
+    ],
+    "script_data": {
+      "expected": "Exact JSON round-trip and identical compile-time fixed script AST for all five inputs",
+      "cases": [
+        {
+          "input": "Ethernet",
+          "ast_unchanged": true,
+          "case": 0,
+          "elapsed_ms": 811,
+          "exit_code": 0,
+          "ps_version": "5.1.26100.9711",
+          "round_trip": true
+        },
+        {
+          "input": "ASCII 'single' and \"double\"; $(exit 96); `backtick`",
+          "ast_unchanged": true,
+          "case": 1,
+          "elapsed_ms": 803,
+          "exit_code": 0,
+          "ps_version": "5.1.26100.9711",
+          "round_trip": true
+        },
+        {
+          "input": "Smart ‘single’ “double”; Ω 中文 日本語 🛰️",
+          "ast_unchanged": true,
+          "case": 2,
+          "elapsed_ms": 793,
+          "exit_code": 0,
+          "ps_version": "5.1.26100.9711",
+          "round_trip": true
+        },
+        {
+          "input": "line one\r\nline two\nline three\rline four",
+          "ast_unchanged": true,
+          "case": 3,
+          "elapsed_ms": 807,
+          "exit_code": 0,
+          "ps_version": "5.1.26100.9711",
+          "round_trip": true
+        },
+        {
+          "input": "Ethernet*[?]'; exit 97; #",
+          "ast_unchanged": true,
+          "case": 4,
+          "elapsed_ms": 790,
+          "exit_code": 0,
+          "ps_version": "5.1.26100.9711",
+          "round_trip": true
+        }
+      ],
+      "required_failures": [
+        {
+          "failed_typed_result": true,
+          "native_exit_code": null,
+          "process_exit_code": 71,
+          "stage": "required_cmdlet"
+        },
+        {
+          "failed_typed_result": true,
+          "native_exit_code": 1,
+          "process_exit_code": 71,
+          "stage": "required_native"
+        }
+      ],
+      "stdin_limit_bytes": 16384,
+      "stdout_limit_bytes": 32768,
+      "stderr_limit_bytes": 32768
+    },
+    "child_tree_and_output": {
+      "gate": "A-S2",
+      "network_or_firewall_mutation": false,
+      "output": {
+        "both_truncated": true,
+        "exit_code": 0,
+        "oversized_structured_result_rejected": true,
+        "stderr_cap": 32768,
+        "stdout_cap": 32768
+      },
+      "recorded_at_utc": "2026-10-24T16:33:56.692659100+00:00",
+      "test_executable": "C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\debug\\deps\\pocketstream_desktop-10048f9d261ead52.exe",
+      "test_process_id": 4952,
+      "timeout": {
+        "all_retained_process_handles_signaled": true,
+        "assigned_while_suspended": true,
+        "elapsed_ms": 4039,
+        "observed_tree_pids": [
+          7332,
+          13296,
+          16112,
+          16244
+        ],
+        "termination": "timed_out"
+      }
+    },
+    "caller_abort_and_barrier": {
+      "address_seams": "existing FakeAddressIo, AddressOps, PendingAdoptOps and AppConfig serialization",
+      "admission_queue": 0,
+      "bounded_retained_completions": 1,
+      "cases": [
+        {
+          "actual_requesting_task_aborted": true,
+          "after_reconciliation_admission_restored": true,
+          "conflicting_write_refused": true,
+          "dispatched_pid": 12084,
+          "observation_available": false,
+          "pending_intent_retained_until_reconciliation": true,
+          "retained_outcome": "Uncertain",
+          "runner": {
+            "all_observed_children_exited": true,
+            "elapsed_ms": 35,
+            "runner_deadline_ms": 15000,
+            "termination": "Canceled"
+          },
+          "shutdown_drained": true
+        },
+        {
+          "actual_requesting_task_aborted": true,
+          "after_reconciliation_admission_restored": true,
+          "conflicting_write_refused": true,
+          "dispatched_pid": 19932,
+          "observation_available": true,
+          "pending_intent_retained_until_reconciliation": true,
+          "retained_outcome": "Completed",
+          "runner": {
+            "all_observed_children_exited": true,
+            "elapsed_ms": 31,
+            "runner_deadline_ms": 15000,
+            "termination": "Canceled"
+          },
+          "shutdown_drained": true
+        }
+      ],
+      "gate": "A-S2",
+      "network_or_firewall_mutation": false,
+      "recorded_at_utc": "2026-10-24T16:33:51.802310600+00:00",
+      "test_executable": "C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\debug\\deps\\pocketstream_desktop-10048f9d261ead52.exe",
+      "test_process_id": 4952
+    },
+    "ownership": {
+      "expected": "Contender cannot initialize; a lone-owner crash with no other mutex handles still reconciles before writes",
+      "contender": {
+        "busy": true,
+        "initialized": false,
+        "pid": 13744
+      },
+      "sole_owner_crash": true,
+      "no_parent_or_contender_mutex_handles_at_crash": true,
+      "acquisition": {
+        "abandoned": false,
+        "newly_created": true,
+        "security_descriptor": "D:P(A;;0x1f0001;;;SY)(A;;0x1f0001;;;BA)(A;;0x120001;;;IU)S:AI(ML;;NW;;;ME)"
+      },
+      "restarted": {
+        "acquisition": {
+          "abandoned": false,
+          "newly_created": true,
+          "security_descriptor": "D:P(A;;0x1f0001;;;SY)(A;;0x1f0001;;;BA)(A;;0x120001;;;IU)S:AI(ML;;NW;;;ME)"
+        },
+        "executor_drained_before_owner_release": true,
+        "fake_writes": [
+          [
+            false,
+            "192.0.2.254"
+          ]
+        ],
+        "identity_conflict_blocked": true,
+        "pending_reconciled_before_admission": true,
+        "pid": 19880,
+        "retained_binding_preserved": true,
+        "unknown_observation_blocked": true,
+        "writes_before_reconciliation": 0
+      },
+      "wrong_namespace_and_foreign_dacl_refused": true,
+      "actual_cross_account_or_logon": "not exercised; pending",
+      "scope_note": "Raw fixture uses private nonce-named mutexes and fake addresses, not the production namespace. Its legacy production_startup_integration field describes that fixture limit; real app smoke is separate."
+    },
+    "native_read_only": {
+      "address_firewall_install_mutation": false,
+      "capture_started": false,
+      "controlled_icmp": null,
+      "neighbor_entries": 0,
+      "neighbor_source": "169.254.189.173",
+      "recorded_at_utc": "2026-10-24T16:34:00.982332500+00:00",
+      "selected_state_observations": [
+        {
+          "addresses_dhcp_routes_dns_observed": true,
+          "index": 15,
+          "mutated": false
+        }
+      ],
+      "system_capture_dll_loaded": true,
+      "test_executable": "C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\debug\\deps\\pocketstream_desktop-10048f9d261ead52.exe",
+      "test_process_id": 4952
+    },
+    "production_native_required_failure": {
+      "address_firewall_install_mutation": false,
+      "native_exit": 1,
+      "process_exit": 71,
+      "production_helper_reused": true,
+      "ps_version": "5.1.26100.9711",
+      "recorded_at_utc": "2026-10-24T16:34:01.806758600+00:00",
+      "test_executable": "C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\debug\\deps\\pocketstream_desktop-10048f9d261ead52.exe",
+      "test_process_id": 4952
+    },
+    "typed_inventory": {
+      "record": {
+        "path": "src-tauri/target/privilege-a2-proofs/a2-transaction-20261024T163327963Z/typed-production-inventory.json",
+        "sha256": "9d3e2a385318536d3da5ed6f376fac3619b8ca1009629c1b5af6f1022a8b5284",
+        "bytes": 7246
+      },
+      "expected": "Exit zero and complete successful typed inventory, contained before resume",
+      "observed": {
+        "exit_code": 0,
+        "contained_before_resume": true,
+        "native_mutation": false
+      }
+    }
+  },
+  "production_workflow_smoke": {
+    "result": {
+      "path": "src-tauri/target/privilege-a2/production-workflows-20261024T163513Z/result.json",
+      "sha256": "99715ea4f9ef0efdcb82522570baffd494c7117415112a2dc3a2f8dfeb9f084a",
+      "bytes": 10081
+    },
+    "ui_record": {
+      "path": "src-tauri/target/privilege-a2/production-workflows-20261024T163513Z/ui-result.json",
+      "sha256": "84d2ff3e95f3e2f7ecb275376e26066010e79b8260f7e6821af617eeb524aa9c",
+      "bytes": 1475
+    },
+    "artifact_sha256": "48f2dea10a97c47b5d61a68520bbd21164838b252edf5c2e03e4ffcef9bd72d0",
+    "started_at_utc": "2026-10-24T16:35:17.3197077Z",
+    "finished_at_utc": "2026-10-24T16:35:29.0638839Z",
+    "production_assets_and_handlers": true,
+    "replaced_assets_or_handlers": false,
+    "fixture": {
+      "adapter_mac": "40:c2:ba:cf:d5:75",
+      "adapter_guid": "{812AD22F-3345-4817-B6D7-708D769E69AC}",
+      "alias": "Ethernet",
+      "interface_index": 15,
+      "initial_link_state": "Disconnected",
+      "primary_address": "192.168.1.100/24",
+      "native_mutation_policy": "both destructive confirmations Cancel; no listener starts"
+    },
+    "expected": "Save/read back/restore settings; cancel actual address-removal and backend DHCP warning dialogs; close normally; restore files and preserve native selected-adapter state",
+    "observed": {
+      "production_ui": true,
+      "replaced_assets_or_handlers": false,
+      "settings": {
+        "status": "passed",
+        "action": "Save Settings",
+        "field": "stream.rtsp_port",
+        "values": [
+          554,
+          13554,
+          554
+        ],
+        "readback": "real get_config IPC"
+      },
+      "address_removal_confirmation": {
+        "status": "passed",
+        "path": "Configure > Remove primary",
+        "native": {
+          "observed": true,
+          "owner_pid": 4520,
+          "text": "PocketStream Desktop\nMainInstructionIcon\nRemove 192.168.1.100 from Ethernet?\nOK\nCancel",
+          "action": "Cancel"
+        },
+        "observed": "dialog remained open; original address field preserved"
+      },
+      "dhcp_confirmation": {
+        "status": "passed",
+        "path": "Configure > DHCP > Close",
+        "native": {
+          "observed": true,
+          "owner_pid": 4520,
+          "text": "PocketStream Desktop\nMainInstructionIcon\nSwitching to DHCP removes manually configured addresses from this adapter. Saved managed secondaries will remain pending until a static mode returns. Continue?\nOK\nCancel",
+          "action": "Cancel"
+        },
+        "observed_mode": "static_manual"
+      },
+      "errors": [],
+      "startup_profile": {
+        "mode": "static_manual",
+        "primary": "192.168.1.100/24",
+        "output": false,
+        "notices": 0
+      },
+      "page": {
+        "url": "http://tauri.localhost/",
+        "settings_button": true,
+        "restream_enabled": false,
+        "interface": "Ethernet (Disconnected)"
+      },
+      "close_requested": "production #btn-close handler"
+    },
+    "graceful_exit": true,
+    "diagnostic": null,
+    "selected_native_state_unchanged": true,
+    "native_before": {
+      "adapter_guid": "{812AD22F-3345-4817-B6D7-708D769E69AC}",
+      "adapter_mac": "40:c2:ba:cf:d5:75",
+      "interface_index": 15,
+      "addresses": [
+        {
+          "IPAddress": "169.254.189.173",
+          "PrefixLength": 16,
+          "PrefixOrigin": 2
+        },
+        {
+          "IPAddress": "172.31.169.102",
+          "PrefixLength": 24,
+          "PrefixOrigin": 1
+        },
+        {
+          "IPAddress": "192.168.0.100",
+          "PrefixLength": 24,
+          "PrefixOrigin": 1
+        },
+        {
+          "IPAddress": "192.168.1.100",
+          "PrefixLength": 24,
+          "PrefixOrigin": 1
+        }
+      ],
+      "dhcp": "Disabled",
+      "dns": [],
+      "routes": [
+        {
+          "DestinationPrefix": "224.0.0.0/4",
+          "NextHop": "0.0.0.0",
+          "RouteMetric": 256,
+          "Protocol": 2
+        },
+        {
+          "DestinationPrefix": "255.255.255.255/32",
+          "NextHop": "0.0.0.0",
+          "RouteMetric": 256,
+          "Protocol": 2
+        }
+      ]
+    },
+    "native_after": {
+      "adapter_guid": "{812AD22F-3345-4817-B6D7-708D769E69AC}",
+      "adapter_mac": "40:c2:ba:cf:d5:75",
+      "interface_index": 15,
+      "addresses": [
+        {
+          "IPAddress": "169.254.189.173",
+          "PrefixLength": 16,
+          "PrefixOrigin": 2
+        },
+        {
+          "IPAddress": "172.31.169.102",
+          "PrefixLength": 24,
+          "PrefixOrigin": 1
+        },
+        {
+          "IPAddress": "192.168.0.100",
+          "PrefixLength": 24,
+          "PrefixOrigin": 1
+        },
+        {
+          "IPAddress": "192.168.1.100",
+          "PrefixLength": 24,
+          "PrefixOrigin": 1
+        }
+      ],
+      "dhcp": "Disabled",
+      "dns": [],
+      "routes": [
+        {
+          "DestinationPrefix": "224.0.0.0/4",
+          "NextHop": "0.0.0.0",
+          "RouteMetric": 256,
+          "Protocol": 2
+        },
+        {
+          "DestinationPrefix": "255.255.255.255/32",
+          "NextHop": "0.0.0.0",
+          "RouteMetric": 256,
+          "Protocol": 2
+        }
+      ]
+    },
+    "file_restoration": [
+      {
+        "file": "config.toml",
+        "sha256": "3f05496ba04ad9d682588526a2bcf40ca64deb00bd2fd4595020fe86540d6853",
+        "restored": true
+      },
+      {
+        "file": "device_cache.toml",
+        "sha256": "00b602bbd9866b31503e0aa91d862780209e34111c81241a39e19c2ab4fd10e4",
+        "restored": true
+      },
+      {
+        "file": ".key",
+        "sha256": "de463f270e487b898a27bb5e7b1586dc9b981855bd2811f038038551baa8b4bc",
+        "restored": true
+      },
+      {
+        "file": "pocketstream.log",
+        "sha256": "2f4f58a0c675609e6363885342039f6bf081fcb3836b27f0d63b1f504ccb512e",
+        "restored": true
+      },
+      {
+        "file": "pocketstream.log.1",
+        "sha256": "8a3c3091539b68ba8aa815ca3dcbcf90422949afb484401978cfd48265ae1c39",
+        "restored": true
+      }
+    ],
+    "all_test_processes_exited": true,
+    "raw_logs": [
+      {
+        "path": "src-tauri/target/privilege-a2/production-workflows-20261024T163513Z/production-app.log",
+        "sha256": "b294b7459424668fdd0e4f35bd8a49f011d86f94a842bd6170f8a958c3b1446d",
+        "bytes": 7437
+      },
+      {
+        "path": "src-tauri/target/privilege-a2/production-workflows-20261024T163513Z/application.stdout.log",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "bytes": 0
+      },
+      {
+        "path": "src-tauri/target/privilege-a2/production-workflows-20261024T163513Z/application.stderr.log",
+        "sha256": "b294b7459424668fdd0e4f35bd8a49f011d86f94a842bd6170f8a958c3b1446d",
+        "bytes": 7437
+      }
+    ],
+    "operator_scripts": [
+      {
+        "path": "src-tauri/target/privilege-a2/operator-workflow/verify-a1-production-smoke.ps1",
+        "sha256": "8320f1870196becdc4c1fe1f5bc0dd2974cc9c5bc95210d5eb8e9144d5da044f",
+        "bytes": 17635
+      },
+      {
+        "path": "src-tauri/target/privilege-a2/operator-workflow/verify-a1-production-smoke.mjs",
+        "sha256": "72e2bedbf1c099b88f9622db7d11b61da471f5f65eac7a77b16f8b95fcb18211",
+        "bytes": 8643
+      },
+      {
+        "path": "src-tauri/target/privilege-a2/operator-workflow/close-production.mjs",
+        "sha256": "c5faf66bfe9c1a6f13d400c33af3803c5a76e2f611e9ac335032ceaca0cf70e4",
+        "bytes": 883
+      }
+    ],
+    "fixture_origin": "Private copies of committed A1 production smoke, pinned to the final A2 development artifact, with startup-settle delay and real Close cleanup; second-instance experiment removed from this workflow run",
+    "hardware": {
+      "discovery": "pending",
+      "playback": "pending",
+      "ptu": "pending",
+      "reason": "Controlled connected hardware and explicit PTU identity required"
+    },
+    "earlier_attempts": [
+      {
+        "result": {
+          "path": "src-tauri/target/privilege-a1/a2-production-ui-20261024T155716Z/result.json",
+          "sha256": "edb37736d8d46a6a1fe8f5017191e94de414b0846e6ea035420bf3b172d798b8",
+          "bytes": 6845
+        },
+        "artifact_sha256": "84f8b8e906e9853437e64551f23bbd25d023c582980a6948e5b5cd81681fe777",
+        "started_at_utc": "2026-10-24T15:57:21.8896636Z",
+        "workflow_exercised": false,
+        "diagnostic": "Host did not exit cooperatively; no force-kill or profile restore was attempted. Private recovery backup is retained.",
+        "original_result_graceful_exit": false,
+        "original_result_profile_restored": false,
+        "native_state_unchanged": true,
+        "early_busy_diagnostic_observed": false,
+        "no_second_startup_banner": false,
+        "subsequent_recovery": {
+          "record": {
+            "path": "src-tauri/target/privilege-a1/a2-production-ui-20261024T155716Z/quiescent-recovery.json",
+            "sha256": "a05983eb2b3212a08aca83d2a896e6c5b76376e3feadbf2bf34e2b3dce9926ce",
+            "bytes": 5075
+          },
+          "method": "targeted quiescent fixture-process recovery after cooperative close stalled",
+          "graceful_exit": false,
+          "original_profile_and_logs_restored": true,
+          "restored_profile_sha256": "3f05496ba04ad9d682588526a2bcf40ca64deb00bd2fd4595020fe86540d6853",
+          "no_native_children": true,
+          "camera_empty": true,
+          "output_disabled": true,
+          "pending_addresses_empty": true,
+          "exact_test_image_verified": "84f8b8e906e9853437e64551f23bbd25d023c582980a6948e5b5cd81681fe777"
+        }
+      },
+      {
+        "result": {
+          "path": "src-tauri/target/privilege-a1/a2-production-ui-20261024T160807Z/result.json",
+          "sha256": "7f931d6fb6ceb503a9d2db5b4d5f2a560f7f8f19021f133a664e4b81dceb47f3",
+          "bytes": 6728
+        },
+        "artifact_sha256": "84f8b8e906e9853437e64551f23bbd25d023c582980a6948e5b5cd81681fe777",
+        "started_at_utc": "2026-10-24T16:08:11.8943321Z",
+        "workflow_exercised": false,
+        "diagnostic": "Second host did not exit after the ownership refusal.",
+        "original_result_graceful_exit": true,
+        "original_result_profile_restored": true,
+        "native_state_unchanged": true,
+        "early_busy_diagnostic_observed": true,
+        "no_second_startup_banner": true,
+        "second_stderr": {
+          "path": "src-tauri/target/privilege-a1/a2-production-ui-20261024T160807Z/second-instance.stderr.log",
+          "sha256": "9290b47736dd3a28fdeb7ba871bcc9e12759964bcba39dc54e3563a4a8a0b6c7",
+          "bytes": 38
+        }
+      },
+      {
+        "result": {
+          "path": "src-tauri/target/privilege-a1/a2-production-ui-20261024T161216Z/result.json",
+          "sha256": "3d9c4431e002085e12ffb3d47e291c0699eb5d8886fe6b15f7157749dcd078ea",
+          "bytes": 6729
+        },
+        "artifact_sha256": "84f8b8e906e9853437e64551f23bbd25d023c582980a6948e5b5cd81681fe777",
+        "started_at_utc": "2026-10-24T16:12:20.5173571Z",
+        "workflow_exercised": false,
+        "diagnostic": "Second host did not exit after the ownership refusal.",
+        "original_result_graceful_exit": true,
+        "original_result_profile_restored": true,
+        "native_state_unchanged": true,
+        "early_busy_diagnostic_observed": true,
+        "no_second_startup_banner": true,
+        "second_stderr": {
+          "path": "src-tauri/target/privilege-a1/a2-production-ui-20261024T161216Z/second-instance.stderr.log",
+          "sha256": "9290b47736dd3a28fdeb7ba871bcc9e12759964bcba39dc54e3563a4a8a0b6c7",
+          "bytes": 38
+        }
+      },
+      {
+        "result": {
+          "path": "src-tauri/target/privilege-a1/a2-production-ui-20261024T161837Z/result.json",
+          "sha256": "201e017502c2887d05b6bf374cd7523fc17e67805d9bf42796248f524e0225a8",
+          "bytes": 6729
+        },
+        "artifact_sha256": "84f8b8e906e9853437e64551f23bbd25d023c582980a6948e5b5cd81681fe777",
+        "started_at_utc": "2026-10-24T16:18:41.2716253Z",
+        "workflow_exercised": false,
+        "diagnostic": "Second host did not exit after the ownership refusal.",
+        "original_result_graceful_exit": true,
+        "original_result_profile_restored": true,
+        "native_state_unchanged": true,
+        "early_busy_diagnostic_observed": true,
+        "no_second_startup_banner": true,
+        "second_stderr": {
+          "path": "src-tauri/target/privilege-a1/a2-production-ui-20261024T161837Z/second-instance.stderr.log",
+          "sha256": "9290b47736dd3a28fdeb7ba871bcc9e12759964bcba39dc54e3563a4a8a0b6c7",
+          "bytes": 38
+        }
+      }
+    ],
+    "earlier_operator_scripts": [
+      {
+        "path": "src-tauri/target/privilege-a2/operator-ui-attempt1/verify-a1-production-smoke.ps1",
+        "sha256": "5c9f956d5ccceba73dc8428002240e047fb750a6e9443ca354f4a0358a56292d",
+        "bytes": 20120
+      },
+      {
+        "path": "src-tauri/target/privilege-a2/operator-ui-attempt1/verify-a1-production-smoke.mjs",
+        "sha256": "72e2bedbf1c099b88f9622db7d11b61da471f5f65eac7a77b16f8b95fcb18211",
+        "bytes": 8643
+      },
+      {
+        "path": "src-tauri/target/privilege-a2/operator-ui-attempt2/verify-a1-production-smoke.ps1",
+        "sha256": "100da9348e52c8b6d09a38d1fa3610bc921d23ffc18da398624556d1b381b146",
+        "bytes": 21027
+      },
+      {
+        "path": "src-tauri/target/privilege-a2/operator-ui-attempt2/verify-a1-production-smoke.mjs",
+        "sha256": "72e2bedbf1c099b88f9622db7d11b61da471f5f65eac7a77b16f8b95fcb18211",
+        "bytes": 8643
+      },
+      {
+        "path": "src-tauri/target/privilege-a2/operator-ui-attempt2/close-production.mjs",
+        "sha256": "c5faf66bfe9c1a6f13d400c33af3803c5a76e2f611e9ac335032ceaca0cf70e4",
+        "bytes": 883
+      },
+      {
+        "path": "src-tauri/target/privilege-a2/operator-ui-attempt3/verify-a1-production-smoke.ps1",
+        "sha256": "a6a8f89a3029a48520351cb732368175283e0ab3ec8922355e224df0499db91d",
+        "bytes": 21149
+      },
+      {
+        "path": "src-tauri/target/privilege-a2/operator-ui/verify-a1-production-smoke.ps1",
+        "sha256": "7aac44e1830439217694b49e688e50ddf9a5eff628105e68e57b9607968ded13",
+        "bytes": 21271
+      },
+      {
+        "path": "src-tauri/target/privilege-a2/operator-ui/verify-a1-production-smoke.mjs",
+        "sha256": "72e2bedbf1c099b88f9622db7d11b61da471f5f65eac7a77b16f8b95fcb18211",
+        "bytes": 8643
+      },
+      {
+        "path": "src-tauri/target/privilege-a2/operator-ui/close-production.mjs",
+        "sha256": "c5faf66bfe9c1a6f13d400c33af3803c5a76e2f611e9ac335032ceaca0cf70e4",
+        "bytes": 883
+      }
+    ],
+    "production_second_instance_dialog": "Earlier image produced Busy before its startup banner; automated dismissal/terminal behavior not qualified. Not repeated on final image."
+  },
+  "unsuccessful_checks": [
+    {
+      "record": {
+        "path": "src-tauri/target/privilege-a2/transaction-unit.json",
+        "sha256": "f31cca8200f9bbb5ba32053c9fd8a7313a9291189aefdc78e129ec1036ba0602",
+        "bytes": 189
+      },
+      "logs": [
+        {
+          "path": "src-tauri/target/privilege-a2/transaction-unit.stdout.log",
+          "sha256": "c4a792740a61d31811aae3ba38684dc825092e4acb2d56635651f34405a9e9ee",
+          "bytes": 67154
+        },
+        {
+          "path": "src-tauri/target/privilege-a2/transaction-unit.stderr.log",
+          "sha256": "e4168d0d472303fb956ebe34824fdf55ab63764361d4c888fb23d95a52fe26e2",
+          "bytes": 2066
+        }
+      ],
+      "observed": "771 passed, four failed, ten ignored. Three native-enumeration sandbox access failures and one new fake test with missing selected/static-auto config.",
+      "resolution": "Fix fixture config and rerun complete suite outside sandbox: 775 passed."
+    },
+    {
+      "observed": "Earlier local LASTEXITCODE shadow suppressed native exit evidence",
+      "resolution": "Read/reset global LASTEXITCODE and reuse actual production Native function in the contained invalid-ipconfig process regression: native 1 / process 71."
+    },
+    {
+      "observed": "Review found native child completion could precede IPC transaction persistence",
+      "resolution": "Retain complete IPC transaction under the same executor and add post-native caller-abort/save-failure regression."
+    },
+    {
+      "observed": "Earlier alias-sensitive assertion, fixture type annotation and sandbox parent/native access failures",
+      "resolution": "Identity excludes alias; corrected fixture annotation; reran with actual native access. Historical outputs remain local."
+    }
+  ],
+  "historical_artifacts": [
+    {
+      "path": "src-tauri/target/privilege-a2/development-artifact.json",
+      "sha256": "610d88bb6e929d980af9ab75510806b8b3694d85c1645441a0ad752f24564560",
+      "bytes": 726
+    },
+    {
+      "path": "src-tauri/target/privilege-a2/release-artifact.json",
+      "sha256": "4bea902456c82e13b291ea34054e4df9a124f08870042e73725a0225de3f837e",
+      "bytes": 661
+    },
+    {
+      "path": "src-tauri/target/privilege-a2/prior-development-artifact.json",
+      "sha256": "ea8bd3659459e66e102691600b942291919016eb38c6204e80cba24c81324c22",
+      "bytes": 286
+    }
+  ],
+  "pending_gates": [
+    {
+      "gate": "A2 native mutation and partial-provider qualification",
+      "reason": "Real add/remove/static/DHCP/DNS/route/renew/restart operations have not been run on a controlled native fixture."
+    },
+    {
+      "gate": "A2 elevated production/hardware workflow smoke",
+      "reason": "Selected Ethernet disconnected. Camera discovery/live video and corrected PTU .202 previously passed on distinct A1 artifacts, which do not qualify these new A2 images."
+    },
+    {
+      "gate": "A2 production second-instance dialog completion",
+      "reason": "Expected Busy stderr observed on earlier A2 image; automation failed to dismiss the message. Final development image not exercised for this gate."
+    },
+    {
+      "gate": "A-S4 cross-account/logon/integrity ownership",
+      "reason": "Process fixture ran under one account at medium integrity."
+    },
+    {
+      "gate": "A-S4 all-interface binding matrix",
+      "reason": "Wi-Fi/VPN/virtual address-change notifications and explicit/wildcard bind refresh proof belong before dependent A3 implementation."
+    },
+    {
+      "gate": "A-S3 firewall/install and dependent A3",
+      "reason": "User explicitly answered No isolated fixture available. Firewall policy, NSIS transaction/template and installer changes remain deferred; no policy mutation was attempted on this PC."
+    },
+    {
+      "gate": "A4 installed-package and G3 closure",
+      "reason": "A3 prerequisites and installed/hardware/resource matrices remain incomplete; inspected optimized executable was not launched or installed."
+    },
+    {
+      "gate": "B implementation",
+      "reason": "Explicitly deferred. No helper, transport, Grant access or manifest demotion is implemented."
+    }
+  ],
+  "security_boundary": "A remains an elevated host. This checkpoint does not close A01 or claim privilege separation."
+}
