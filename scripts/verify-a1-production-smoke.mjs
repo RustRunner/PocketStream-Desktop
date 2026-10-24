@@ -8,6 +8,8 @@ import { promisify } from "node:util";
 const exec = promisify(execFile);
 const contextPath = process.argv[2];
 const context = JSON.parse(fs.readFileSync(contextPath, "utf8").replace(/^\uFEFF/, ""));
+const readyOnly = process.argv[3] === "--ready-only";
+const closeOnly = process.argv[3] === "--close-only";
 const directory = path.dirname(contextPath);
 const result = { production_ui: true, replaced_assets_or_handlers: false, settings: "pending", address_removal_confirmation: "pending", dhcp_confirmation: "pending", errors: [] };
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -70,6 +72,9 @@ try {
   await until(`document.readyState === 'complete' && document.querySelector('#iface-name')?.textContent !== '--' && document.querySelector('#rtsp-port')?.value === '554'`, "real app initialization");
   result.page = await evaluate(`({ url: location.href, settings_button: !!document.querySelector('#save-settings'), restream_enabled: document.querySelector('#restream-server-enable').checked, interface: document.querySelector('#iface-name').textContent })`);
   if (result.page.restream_enabled) throw Error("Listener enablement must stay off in this UI phase");
+  if (readyOnly || closeOnly) {
+    result.ready = true;
+  } else {
   console.log("Production settings: save through #save-settings, verify native persistence, restore through the same handler");
   await evaluate(`document.querySelector('#rtsp-port').value = '13554'; document.querySelector('#save-settings').click();`);
   await until(`window.__TAURI__.core.invoke('get_config').then(c => c.stream.rtsp_port === 13554 && !c.rtsp_server.enabled)`, "settings native readback");
@@ -98,17 +103,18 @@ try {
   const shot = await send("Page.captureScreenshot", { format: "png" });
   fs.writeFileSync(path.join(directory, "production-ui.png"), Buffer.from(shot.data, "base64"));
   console.log("Production settings and both native Cancel workflows passed; discovery/playback/PTU remain separate gates");
+  }
 } catch (error) {
   result.errors.push(String(error)); process.exitCode = 1;
   console.error(String(error));
 } finally {
-  if (socket?.readyState === WebSocket.OPEN) {
+  if (!readyOnly && socket?.readyState === WebSocket.OPEN) {
     try {
       await evaluate(`document.querySelector('#btn-close').click();`);
       result.close_requested = "production #btn-close handler";
     } catch (error) { result.close_request_error = String(error); }
   }
-  fs.writeFileSync(path.join(directory, "ui-result.json"), JSON.stringify(result, null, 2) + "\n");
+  fs.writeFileSync(path.join(directory, readyOnly ? "ready-result.json" : closeOnly ? "close-result.json" : "ui-result.json"), JSON.stringify(result, null, 2) + "\n");
   socket?.close();
   for (const request of pending.values()) { clearTimeout(request.timeout); request.reject(Error("smoke ended")); }
 }

@@ -1,7 +1,7 @@
 {
   "document": "Rev 2-A.1 A2 integration checkpoint",
   "recorded_at_utc": "2026-10-24T16:39:42.332Z",
-  "status": "A2 integrated; automated/read-only and limited production workflow checks passed; native mutation, hardware and release qualification pending",
+  "status": "A2 integrated; automated/read-only and local development application workflow checks passed; native mutation, elevated hardware and release qualification pending",
   "baseline": {
     "branch": "main",
     "commit": "3d077ef7104721c21b328438c53305f343906609",
@@ -1805,7 +1805,7 @@
         "bytes": 883
       }
     ],
-    "production_second_instance_dialog": "Earlier image produced Busy before its startup banner; automated dismissal/terminal behavior not qualified. Not repeated on final image."
+    "production_second_instance_dialog": "Passed on the unchanged final development image in local_application_continuation: visible verified message, observed OK acknowledgement, second exit 0, original usability/normal exit 0, and verified restoration. Earlier attempts remain historical."
   },
   "unsuccessful_checks": [
     {
@@ -1869,10 +1869,6 @@
       "reason": "Selected Ethernet disconnected. Camera discovery/live video and corrected PTU .202 previously passed on distinct A1 artifacts, which do not qualify these new A2 images."
     },
     {
-      "gate": "A2 production second-instance dialog completion",
-      "reason": "Expected Busy stderr observed on earlier A2 image; automation failed to dismiss the message. Final development image not exercised for this gate."
-    },
-    {
       "gate": "A-S4 cross-account/logon/integrity ownership",
       "reason": "Process fixture ran under one account at medium integrity."
     },
@@ -1893,5 +1889,834 @@
       "reason": "Explicitly deferred. No helper, transport, Grant access or manifest demotion is implemented."
     }
   ],
-  "security_boundary": "A remains an elevated host. This checkpoint does not close A01 or claim privilege separation."
+  "security_boundary": "A remains an elevated host. This checkpoint does not close A01 or claim privilege separation.",
+  "last_updated_at_utc": "2026-10-24T17:26:32.746Z",
+  "local_application_continuation": {
+    "recorded_at_utc": "2026-10-24T17:26:32.746Z",
+    "checkpoint_commit": "2fe798f79f6f6e9d295f856444668b171802370a",
+    "worktree_clean_at_start": true,
+    "fixture_and_evidence_changes_uncommitted": true,
+    "status": "passed: Busy before initialization, verified native message dismissal, continuing original UI and normal exits",
+    "completed_gate": {
+      "gate": "A2 production second-instance dialog completion",
+      "prior_pending_state": {
+        "gate": "A2 production second-instance dialog completion",
+        "reason": "Expected Busy stderr observed on earlier A2 image; automation failed to dismiss the message. Final development image not exercised for this gate."
+      },
+      "prior_workflow_summary": "Earlier image produced Busy before its startup banner; automated dismissal/terminal behavior not qualified. Not repeated on final image."
+    },
+    "prior_checkpoint_records": [
+      {
+        "path": "src-tauri/target/privilege-a2/local-instance-qualification/prior-evidence/privilege-v2-a2.json",
+        "sha256": "cbc712de18bd0d61d1f940573885c9f5013cbc1351635046727bf6450a0e2cd4",
+        "bytes": 71401
+      },
+      {
+        "path": "src-tauri/target/privilege-a2/local-instance-qualification/prior-evidence/privilege-v2-a2.md",
+        "sha256": "23585b191424f6cb9f611ad1ae58522c2cb597f24f5343b445c18dc187af9f1f",
+        "bytes": 10245
+      }
+    ],
+    "artifact_sha256": "48f2dea10a97c47b5d61a68520bbd21164838b252edf5c2e03e4ffcef9bd72d0",
+    "artifact_hash_verified_before_and_after": true,
+    "application_rebuilt": false,
+    "production_code_changed": false,
+    "production_assets_or_handlers_replaced": false,
+    "command": [
+      "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+      "-NoLogo",
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      "scripts/verify-a1-production-smoke.ps1",
+      "-AdapterMac",
+      "40:c2:ba:cf:d5:75",
+      "-PrimaryAddress",
+      "192.168.1.100/24",
+      "-ArtifactRecord",
+      "docs/runtime-evidence/privilege-v2-a2.json",
+      "-CheckSecondInstance",
+      "-RunDirectory",
+      "src-tauri/target/privilege-a2/local-instance-20261024T172057Z"
+    ],
+    "command_exit_code": 0,
+    "started_at_utc": "2026-10-24T17:21:01.2986727Z",
+    "finished_at_utc": "2026-10-24T17:21:09.8462614Z",
+    "result": {
+      "path": "src-tauri/target/privilege-a2/local-instance-20261024T172057Z/result.json",
+      "sha256": "f434a2996e4a05783acd945e6769e8cf081ac7fc8cd84eff8df7267f574012ea",
+      "bytes": 15665
+    },
+    "ready_result": {
+      "path": "src-tauri/target/privilege-a2/local-instance-20261024T172057Z/ready-result.json",
+      "sha256": "892ba3b2f816a3051dee7bda2d196ac4c11c0f0982f543361823dc9bc09f6b8f",
+      "bytes": 490
+    },
+    "workflow_result": {
+      "path": "src-tauri/target/privilege-a2/local-instance-20261024T172057Z/ui-result.json",
+      "sha256": "797e8283b6347c038b4dfe0f04d923df14e464c98292da1263f80d54e47fe7c4",
+      "bytes": 1475
+    },
+    "fixture": {
+      "adapter_mac": "40:c2:ba:cf:d5:75",
+      "adapter_guid": "{812AD22F-3345-4817-B6D7-708D769E69AC}",
+      "alias": "Ethernet",
+      "interface_index": 15,
+      "initial_link_state": "Disconnected",
+      "primary_address": "192.168.1.100/24",
+      "native_mutation_policy": "both destructive confirmations Cancel; no listener starts"
+    },
+    "expected": "Second host reports Busy and shows the expected native message before initialization, leaves shared files unchanged, acknowledges its own OK button and exits. Original remains usable, closes normally, and files/adapter state are restored.",
+    "observed": {
+      "second_instance": {
+        "pid": 9120,
+        "artifact_sha256": "48f2dea10a97c47b5d61a68520bbd21164838b252edf5c2e03e4ffcef9bd72d0",
+        "windows": [
+          {
+            "Handle": 3278138,
+            "Class": "#32770",
+            "Text": "PocketStream Desktop",
+            "Id": 0,
+            "Visible": true,
+            "Children": [
+              {
+                "Handle": 853614,
+                "Class": "Button",
+                "Text": "OK",
+                "Id": 2,
+                "Visible": true,
+                "Children": []
+              },
+              {
+                "Handle": 329498,
+                "Class": "Static",
+                "Text": "",
+                "Id": 20,
+                "Visible": true,
+                "Children": []
+              },
+              {
+                "Handle": 984064,
+                "Class": "Static",
+                "Text": "PocketStream is already running",
+                "Id": 65535,
+                "Visible": true,
+                "Children": []
+              }
+            ]
+          },
+          {
+            "Handle": 526062,
+            "Class": "ConsoleWindowClass",
+            "Text": "C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\debug\\pocketstream-desktop.exe",
+            "Id": 0,
+            "Visible": false,
+            "Children": []
+          },
+          {
+            "Handle": 1246826,
+            "Class": "MSCTFIME UI",
+            "Text": "MSCTFIME UI",
+            "Id": 0,
+            "Visible": false,
+            "Children": []
+          },
+          {
+            "Handle": 1245472,
+            "Class": "IME",
+            "Text": "Default IME",
+            "Id": 0,
+            "Visible": false,
+            "Children": []
+          }
+        ],
+        "busy_observed": true,
+        "acknowledged": true,
+        "exited": true,
+        "dismissal": "verified native OK button BN_CLICKED",
+        "profile_unchanged": true,
+        "cache_unchanged": true,
+        "log_unchanged": true,
+        "no_initialization_banner": true,
+        "exit_code": 0
+      },
+      "second_stderr": "PocketStream is already running: Busy\n",
+      "second_stdout_bytes": 0,
+      "original_usable": "passed production settings/readback and both native Cancel workflows",
+      "original_workflows": {
+        "production_ui": true,
+        "replaced_assets_or_handlers": false,
+        "settings": {
+          "status": "passed",
+          "action": "Save Settings",
+          "field": "stream.rtsp_port",
+          "values": [
+            554,
+            13554,
+            554
+          ],
+          "readback": "real get_config IPC"
+        },
+        "address_removal_confirmation": {
+          "status": "passed",
+          "path": "Configure > Remove primary",
+          "native": {
+            "observed": true,
+            "owner_pid": 5820,
+            "text": "PocketStream Desktop\nMainInstructionIcon\nRemove 192.168.1.100 from Ethernet?\nOK\nCancel",
+            "action": "Cancel"
+          },
+          "observed": "dialog remained open; original address field preserved"
+        },
+        "dhcp_confirmation": {
+          "status": "passed",
+          "path": "Configure > DHCP > Close",
+          "native": {
+            "observed": true,
+            "owner_pid": 5820,
+            "text": "PocketStream Desktop\nMainInstructionIcon\nSwitching to DHCP removes manually configured addresses from this adapter. Saved managed secondaries will remain pending until a static mode returns. Continue?\nOK\nCancel",
+            "action": "Cancel"
+          },
+          "observed_mode": "static_manual"
+        },
+        "errors": [],
+        "startup_profile": {
+          "mode": "static_manual",
+          "primary": "192.168.1.100/24",
+          "output": false,
+          "notices": 0
+        },
+        "page": {
+          "url": "http://tauri.localhost/",
+          "settings_button": true,
+          "restream_enabled": false,
+          "interface": "Ethernet (Disconnected)"
+        },
+        "close_requested": "production #btn-close handler"
+      },
+      "original_pid": 5820,
+      "original_graceful_exit": true,
+      "original_exit_code": 0
+    },
+    "protected_files": [
+      {
+        "file": "config.toml",
+        "original_sha256": "3f05496ba04ad9d682588526a2bcf40ca64deb00bd2fd4595020fe86540d6853",
+        "restored_sha256": "3f05496ba04ad9d682588526a2bcf40ca64deb00bd2fd4595020fe86540d6853",
+        "restored": true
+      },
+      {
+        "file": "device_cache.toml",
+        "original_sha256": "00b602bbd9866b31503e0aa91d862780209e34111c81241a39e19c2ab4fd10e4",
+        "restored_sha256": "00b602bbd9866b31503e0aa91d862780209e34111c81241a39e19c2ab4fd10e4",
+        "restored": true
+      },
+      {
+        "file": ".key",
+        "original_sha256": "de463f270e487b898a27bb5e7b1586dc9b981855bd2811f038038551baa8b4bc",
+        "restored_sha256": "de463f270e487b898a27bb5e7b1586dc9b981855bd2811f038038551baa8b4bc",
+        "restored": true
+      },
+      {
+        "file": "pocketstream.log",
+        "original_sha256": "2f4f58a0c675609e6363885342039f6bf081fcb3836b27f0d63b1f504ccb512e",
+        "restored_sha256": "2f4f58a0c675609e6363885342039f6bf081fcb3836b27f0d63b1f504ccb512e",
+        "restored": true
+      },
+      {
+        "file": "pocketstream.log.1",
+        "original_sha256": "8a3c3091539b68ba8aa815ca3dcbcf90422949afb484401978cfd48265ae1c39",
+        "restored_sha256": "8a3c3091539b68ba8aa815ca3dcbcf90422949afb484401978cfd48265ae1c39",
+        "restored": true
+      }
+    ],
+    "selected_adapter_state_unchanged": true,
+    "native_before": {
+      "adapter_guid": "{812AD22F-3345-4817-B6D7-708D769E69AC}",
+      "adapter_mac": "40:c2:ba:cf:d5:75",
+      "interface_index": 15,
+      "addresses": [
+        {
+          "IPAddress": "169.254.189.173",
+          "PrefixLength": 16,
+          "PrefixOrigin": 2
+        },
+        {
+          "IPAddress": "172.31.169.102",
+          "PrefixLength": 24,
+          "PrefixOrigin": 1
+        },
+        {
+          "IPAddress": "192.168.0.100",
+          "PrefixLength": 24,
+          "PrefixOrigin": 1
+        },
+        {
+          "IPAddress": "192.168.1.100",
+          "PrefixLength": 24,
+          "PrefixOrigin": 1
+        }
+      ],
+      "dhcp": "Disabled",
+      "dns": [],
+      "routes": [
+        {
+          "DestinationPrefix": "224.0.0.0/4",
+          "NextHop": "0.0.0.0",
+          "RouteMetric": 256,
+          "Protocol": 2
+        },
+        {
+          "DestinationPrefix": "255.255.255.255/32",
+          "NextHop": "0.0.0.0",
+          "RouteMetric": 256,
+          "Protocol": 2
+        }
+      ]
+    },
+    "native_after": {
+      "adapter_guid": "{812AD22F-3345-4817-B6D7-708D769E69AC}",
+      "adapter_mac": "40:c2:ba:cf:d5:75",
+      "interface_index": 15,
+      "addresses": [
+        {
+          "IPAddress": "169.254.189.173",
+          "PrefixLength": 16,
+          "PrefixOrigin": 2
+        },
+        {
+          "IPAddress": "172.31.169.102",
+          "PrefixLength": 24,
+          "PrefixOrigin": 1
+        },
+        {
+          "IPAddress": "192.168.0.100",
+          "PrefixLength": 24,
+          "PrefixOrigin": 1
+        },
+        {
+          "IPAddress": "192.168.1.100",
+          "PrefixLength": 24,
+          "PrefixOrigin": 1
+        }
+      ],
+      "dhcp": "Disabled",
+      "dns": [],
+      "routes": [
+        {
+          "DestinationPrefix": "224.0.0.0/4",
+          "NextHop": "0.0.0.0",
+          "RouteMetric": 256,
+          "Protocol": 2
+        },
+        {
+          "DestinationPrefix": "255.255.255.255/32",
+          "NextHop": "0.0.0.0",
+          "RouteMetric": 256,
+          "Protocol": 2
+        }
+      ]
+    },
+    "all_test_processes_exited": true,
+    "force_termination_used_in_this_continuation": false,
+    "native_network_configuration_changes": false,
+    "firewall_changes": false,
+    "installation_changes": false,
+    "fixtures": [
+      {
+        "path": "scripts/verify-a1-production-smoke.ps1",
+        "sha256": "e83a0db9b9b4d1460b150028d238783a99944488f3f056c39069c8f29f664cc0",
+        "bytes": 27393
+      },
+      {
+        "path": "scripts/verify-a1-production-smoke.mjs",
+        "sha256": "11abd95d35c8fb619e11965301e05873721660fbbc1c242933aa2c1f0a28c132",
+        "bytes": 8830
+      }
+    ],
+    "tested_fixture_snapshots": [
+      {
+        "path": "src-tauri/target/privilege-a2/local-instance-20261024T172057Z/fixture.ps1",
+        "sha256": "e83a0db9b9b4d1460b150028d238783a99944488f3f056c39069c8f29f664cc0",
+        "bytes": 27393
+      },
+      {
+        "path": "src-tauri/target/privilege-a2/local-instance-20261024T172057Z/fixture.mjs",
+        "sha256": "11abd95d35c8fb619e11965301e05873721660fbbc1c242933aa2c1f0a28c132",
+        "bytes": 8830
+      }
+    ],
+    "source_verification": {
+      "original_inputs": 162,
+      "unchanged": 160,
+      "fixture_changes": [
+        {
+          "original_path": "scripts/verify-a1-production-smoke.mjs",
+          "archived_path": "src-tauri/target/privilege-a2/local-instance-qualification/prior-evidence/verify-a1-production-smoke.mjs",
+          "qualification_sha256": "51a60031ae6e115894a15fe2a7665823c95f3f2eadb7104114f8a446547ccc72",
+          "current_sha256": "11abd95d35c8fb619e11965301e05873721660fbbc1c242933aa2c1f0a28c132"
+        },
+        {
+          "original_path": "scripts/verify-a1-production-smoke.ps1",
+          "archived_path": "src-tauri/target/privilege-a2/local-instance-qualification/prior-evidence/verify-a1-production-smoke.ps1",
+          "qualification_sha256": "66684373dd5617e9523a2ad70282aa6d23abc4cab53060f18a8bda4e5303fa68",
+          "current_sha256": "e83a0db9b9b4d1460b150028d238783a99944488f3f056c39069c8f29f664cc0"
+        }
+      ],
+      "application_code_changed": false
+    },
+    "fixture_fixes": [
+      "Open live redirected logs with FileShare.ReadWrite; default ReadAllText sharing failed before the contender check.",
+      "Read cross-process controls through bounded WM_GETTEXT and match the owned dialog text/OK button; actual button ID was 2.",
+      "Retain process handles and read native exit codes; a recovered managed Process object had returned no exit code.",
+      "Wait for an already requested normal Close before requesting cleanup, avoiding a redundant lookup of the departed WebView.",
+      "Reuse the existing temporary static-manual profile, workflow driver, Cancel-only confirmations and restoration; add explicit artifact-record and second-instance options."
+    ],
+    "earlier_continuation_attempts": [
+      {
+        "result": {
+          "path": "src-tauri/target/privilege-a2/local-instance-20261024T171644Z/result.json",
+          "sha256": "7d4785cb30f17fb20d300113f10ff7d0e3af98e599a75039ec6214c256f3e087",
+          "bytes": 6987
+        },
+        "artifact_sha256": "48f2dea10a97c47b5d61a68520bbd21164838b252edf5c2e03e4ffcef9bd72d0",
+        "started_at_utc": "2026-10-24T17:16:49.5761684Z",
+        "finished_at_utc": "2026-10-24T17:16:50.4367504Z",
+        "status": "pending",
+        "diagnostic": "Exception calling \"ReadAllText\" with \"1\" argument(s): \"The process cannot access the file 'C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\privilege-a2\\local-instance-20261024T171644Z\\application.stderr.log' because it is being used by another process.\"",
+        "original_graceful_exit": true,
+        "profile_restored_at_original_fixture_exit": true,
+        "adapter_state_unchanged": true,
+        "raw_logs": [
+          {
+            "path": "src-tauri/target/privilege-a2/local-instance-20261024T171644Z/application.stdout.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "bytes": 0
+          },
+          {
+            "path": "src-tauri/target/privilege-a2/local-instance-20261024T171644Z/application.stderr.log",
+            "sha256": "824c1ea102c13db5c12080cef55b32831e8c47c7d2b9803fc9d72db4e943a1fb",
+            "bytes": 1300
+          }
+        ]
+      },
+      {
+        "result": {
+          "path": "src-tauri/target/privilege-a2/local-instance-20261024T171742Z/result.json",
+          "sha256": "e7b6bbf9f7edc39386ea56b8504aee6ac806aa2696e33c6000965c5ea75bb6f2",
+          "bytes": 12204
+        },
+        "artifact_sha256": "48f2dea10a97c47b5d61a68520bbd21164838b252edf5c2e03e4ffcef9bd72d0",
+        "started_at_utc": "2026-10-24T17:17:46.4631959Z",
+        "finished_at_utc": "2026-10-24T17:18:07.3642867Z",
+        "status": "failed: cleanup/native-state verification requires review",
+        "diagnostic": "Host did not exit cooperatively; no force-kill or profile restore was attempted. Private recovery backup is retained.",
+        "original_graceful_exit": true,
+        "profile_restored_at_original_fixture_exit": false,
+        "adapter_state_unchanged": true,
+        "second_instance": {
+          "pid": 22352,
+          "artifact_sha256": "48f2dea10a97c47b5d61a68520bbd21164838b252edf5c2e03e4ffcef9bd72d0",
+          "windows": [
+            {
+              "Handle": 2359846,
+              "Class": "#32770",
+              "Text": "PocketStream Desktop",
+              "Id": 0,
+              "Visible": true,
+              "Children": [
+                {
+                  "Handle": 722516,
+                  "Class": "Button",
+                  "Text": "OK",
+                  "Id": 2,
+                  "Visible": true,
+                  "Children": []
+                },
+                {
+                  "Handle": 786448,
+                  "Class": "Static",
+                  "Text": "",
+                  "Id": 20,
+                  "Visible": true,
+                  "Children": []
+                },
+                {
+                  "Handle": 788006,
+                  "Class": "Static",
+                  "Text": "PocketStream is already running",
+                  "Id": 65535,
+                  "Visible": true,
+                  "Children": []
+                }
+              ]
+            },
+            {
+              "Handle": 1771152,
+              "Class": "ConsoleWindowClass",
+              "Text": "C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\debug\\pocketstream-desktop.exe",
+              "Id": 0,
+              "Visible": false,
+              "Children": []
+            },
+            {
+              "Handle": 1246204,
+              "Class": "MSCTFIME UI",
+              "Text": "MSCTFIME UI",
+              "Id": 0,
+              "Visible": false,
+              "Children": []
+            },
+            {
+              "Handle": 1574116,
+              "Class": "IME",
+              "Text": "Default IME",
+              "Id": 0,
+              "Visible": false,
+              "Children": []
+            }
+          ],
+          "busy_observed": true,
+          "acknowledged": false,
+          "exited": false,
+          "profile_unchanged": true,
+          "cache_unchanged": true,
+          "log_unchanged": true,
+          "no_initialization_banner": true
+        },
+        "subsequent_cooperative_recovery": {
+          "record": {
+            "path": "src-tauri/target/privilege-a2/local-instance-20261024T171742Z/dialog-recovery.json",
+            "sha256": "85e658a31edadeedb702b768e30063e6876697824a65197c9aa4adb70056d7a5",
+            "bytes": 4245
+          },
+          "second_exited": true,
+          "second_exit_code": null,
+          "files_restored": true,
+          "force_terminated": false
+        },
+        "raw_logs": [
+          {
+            "path": "src-tauri/target/privilege-a2/local-instance-20261024T171742Z/application.stdout.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "bytes": 0
+          },
+          {
+            "path": "src-tauri/target/privilege-a2/local-instance-20261024T171742Z/application.stderr.log",
+            "sha256": "72525ec0f06d78de5205ba885cac27ccb17735d56659918d0469d6a3e1246bf2",
+            "bytes": 7048
+          },
+          {
+            "path": "src-tauri/target/privilege-a2/local-instance-20261024T171742Z/second-instance.stdout.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "bytes": 0
+          },
+          {
+            "path": "src-tauri/target/privilege-a2/local-instance-20261024T171742Z/second-instance.stderr.log",
+            "sha256": "9290b47736dd3a28fdeb7ba871bcc9e12759964bcba39dc54e3563a4a8a0b6c7",
+            "bytes": 38
+          }
+        ]
+      },
+      {
+        "result": {
+          "path": "src-tauri/target/privilege-a2/local-instance-20261024T171943Z/result.json",
+          "sha256": "efa200e320142ce55fec9d7b7f6eab74c431389d369377b5f970356665dd3222",
+          "bytes": 15636
+        },
+        "artifact_sha256": "48f2dea10a97c47b5d61a68520bbd21164838b252edf5c2e03e4ffcef9bd72d0",
+        "started_at_utc": "2026-10-24T17:19:47.6867191Z",
+        "finished_at_utc": "2026-10-24T17:20:21.2619329Z",
+        "status": "partial: production settings and confirmation Cancel paths passed; hardware gates pending",
+        "diagnostic": null,
+        "original_graceful_exit": true,
+        "profile_restored_at_original_fixture_exit": true,
+        "adapter_state_unchanged": true,
+        "second_instance": {
+          "pid": 14392,
+          "artifact_sha256": "48f2dea10a97c47b5d61a68520bbd21164838b252edf5c2e03e4ffcef9bd72d0",
+          "windows": [
+            {
+              "Handle": 1836580,
+              "Class": "#32770",
+              "Text": "PocketStream Desktop",
+              "Id": 0,
+              "Visible": true,
+              "Children": [
+                {
+                  "Handle": 525904,
+                  "Class": "Button",
+                  "Text": "OK",
+                  "Id": 2,
+                  "Visible": true,
+                  "Children": []
+                },
+                {
+                  "Handle": 329452,
+                  "Class": "Static",
+                  "Text": "",
+                  "Id": 20,
+                  "Visible": true,
+                  "Children": []
+                },
+                {
+                  "Handle": 984648,
+                  "Class": "Static",
+                  "Text": "PocketStream is already running",
+                  "Id": 65535,
+                  "Visible": true,
+                  "Children": []
+                }
+              ]
+            },
+            {
+              "Handle": 1048862,
+              "Class": "ConsoleWindowClass",
+              "Text": "C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\debug\\pocketstream-desktop.exe",
+              "Id": 0,
+              "Visible": false,
+              "Children": []
+            },
+            {
+              "Handle": 1181336,
+              "Class": "MSCTFIME UI",
+              "Text": "MSCTFIME UI",
+              "Id": 0,
+              "Visible": false,
+              "Children": []
+            },
+            {
+              "Handle": 1050218,
+              "Class": "IME",
+              "Text": "Default IME",
+              "Id": 0,
+              "Visible": false,
+              "Children": []
+            }
+          ],
+          "busy_observed": true,
+          "acknowledged": true,
+          "exited": true,
+          "dismissal": "verified native OK button BN_CLICKED",
+          "profile_unchanged": true,
+          "cache_unchanged": true,
+          "log_unchanged": true,
+          "no_initialization_banner": true,
+          "exit_code": 0
+        },
+        "cleanup_only_diagnostic": "Workflow and exits passed; a redundant second Close lookup reported the already-gone WebView. Corrected before the clean repeat.",
+        "cleanup_result": {
+          "path": "src-tauri/target/privilege-a2/local-instance-20261024T171943Z/close-result.json",
+          "sha256": "692bd4534565424fc64e0591301effb1df45e94fb65810eb44b2e2d34ab6f36e",
+          "bytes": 249
+        },
+        "raw_logs": [
+          {
+            "path": "src-tauri/target/privilege-a2/local-instance-20261024T171943Z/application.stdout.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "bytes": 0
+          },
+          {
+            "path": "src-tauri/target/privilege-a2/local-instance-20261024T171943Z/application.stderr.log",
+            "sha256": "a53d8ede117b192cc32831534313d0aede7f24656f6cb87c3090b00bce6689f7",
+            "bytes": 7234
+          },
+          {
+            "path": "src-tauri/target/privilege-a2/local-instance-20261024T171943Z/second-instance.stdout.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "bytes": 0
+          },
+          {
+            "path": "src-tauri/target/privilege-a2/local-instance-20261024T171943Z/second-instance.stderr.log",
+            "sha256": "9290b47736dd3a28fdeb7ba871bcc9e12759964bcba39dc54e3563a4a8a0b6c7",
+            "bytes": 38
+          }
+        ]
+      }
+    ],
+    "raw_logs": [
+      {
+        "path": "src-tauri/target/privilege-a2/local-instance-20261024T172057Z/application.stdout.log",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "bytes": 0
+      },
+      {
+        "path": "src-tauri/target/privilege-a2/local-instance-20261024T172057Z/application.stderr.log",
+        "sha256": "f8d84eff76e0a5f14c4917aa0144f9221215cec1074e1f66378476af47258fb9",
+        "bytes": 7234
+      },
+      {
+        "path": "src-tauri/target/privilege-a2/local-instance-20261024T172057Z/second-instance.stdout.log",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "bytes": 0
+      },
+      {
+        "path": "src-tauri/target/privilege-a2/local-instance-20261024T172057Z/second-instance.stderr.log",
+        "sha256": "9290b47736dd3a28fdeb7ba871bcc9e12759964bcba39dc54e3563a4a8a0b6c7",
+        "bytes": 38
+      },
+      {
+        "path": "src-tauri/target/privilege-a2/local-instance-20261024T172057Z/production-app.log",
+        "sha256": "f8d84eff76e0a5f14c4917aa0144f9221215cec1074e1f66378476af47258fb9",
+        "bytes": 7234
+      }
+    ],
+    "targeted_validation": {
+      "metadata": {
+        "path": "src-tauri/target/privilege-a2/local-instance-qualification/targeted-validation.json",
+        "sha256": "3b44bf5cd64af255e28fa7733cf72231c63ca674b6461d7c3f0e7a0bcf9eb1ed",
+        "bytes": 4027
+      },
+      "commands": [
+        {
+          "name": "powershell-fixture",
+          "command": [
+            "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-Command",
+            "$ErrorActionPreference='Stop'; $tokens=$null; $errors=$null; $null=[Management.Automation.Language.Parser]::ParseFile((Join-Path (Get-Location).Path 'scripts\\verify-a1-production-smoke.ps1'),[ref]$tokens,[ref]$errors); if ($errors) { throw ($errors | Out-String) }; 'PowerShell parser passed'; $script=Get-Content -LiteralPath scripts\\verify-a1-production-smoke.ps1 -Raw -Encoding UTF8; $cs=[regex]::Match($script,\"Add-Type -TypeDefinition @'\\r?\\n([\\s\\S]*?)\\r?\\n'@\").Groups[1].Value; Add-Type -TypeDefinition $cs; 'Native dialog helper compiled'"
+          ],
+          "started_at_utc": "2026-10-24T17:24:33.184Z",
+          "finished_at_utc": "2026-10-24T17:24:35.025Z",
+          "exit_code": 0,
+          "logs": [
+            {
+              "path": "src-tauri/target/privilege-a2/local-instance-qualification/powershell-fixture.stdout.log",
+              "sha256": "212b1ec821f0e6511a324f3487feec5119c975e626b8627e5d1b79c466011760",
+              "bytes": 57
+            },
+            {
+              "path": "src-tauri/target/privilege-a2/local-instance-qualification/powershell-fixture.stderr.log",
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "bytes": 0
+            }
+          ]
+        },
+        {
+          "name": "javascript-fixture",
+          "command": [
+            "C:\\Program Files\\nodejs\\node.exe",
+            "--check",
+            "scripts/verify-a1-production-smoke.mjs"
+          ],
+          "started_at_utc": "2026-10-24T17:24:35.028Z",
+          "finished_at_utc": "2026-10-24T17:24:35.111Z",
+          "exit_code": 0,
+          "logs": [
+            {
+              "path": "src-tauri/target/privilege-a2/local-instance-qualification/javascript-fixture.stdout.log",
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "bytes": 0
+            },
+            {
+              "path": "src-tauri/target/privilege-a2/local-instance-qualification/javascript-fixture.stderr.log",
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "bytes": 0
+            }
+          ]
+        },
+        {
+          "name": "ipc-contract",
+          "command": [
+            "C:\\Program Files\\nodejs\\node.exe",
+            "scripts/check-ipc-allowlist.mjs"
+          ],
+          "started_at_utc": "2026-10-24T17:24:35.113Z",
+          "finished_at_utc": "2026-10-24T17:24:36.527Z",
+          "exit_code": 0,
+          "logs": [
+            {
+              "path": "src-tauri/target/privilege-a2/local-instance-qualification/ipc-contract.stdout.log",
+              "sha256": "32a0a344b4c3fb92297e0984b75955703011bb54a2be7ed4b50ac080354c2282",
+              "bytes": 107
+            },
+            {
+              "path": "src-tauri/target/privilege-a2/local-instance-qualification/ipc-contract.stderr.log",
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "bytes": 0
+            }
+          ]
+        },
+        {
+          "name": "fixture-diff-check",
+          "command": [
+            "git",
+            "-c",
+            "core.safecrlf=false",
+            "diff",
+            "--check"
+          ],
+          "started_at_utc": "2026-10-24T17:24:36.528Z",
+          "finished_at_utc": "2026-10-24T17:24:36.588Z",
+          "exit_code": 0,
+          "logs": [
+            {
+              "path": "src-tauri/target/privilege-a2/local-instance-qualification/fixture-diff-check.stdout.log",
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "bytes": 0
+            },
+            {
+              "path": "src-tauri/target/privilege-a2/local-instance-qualification/fixture-diff-check.stderr.log",
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "bytes": 0
+            }
+          ]
+        },
+        {
+          "name": "development-manifest",
+          "command": [
+            "C:\\Program Files (x86)\\Windows Kits\\10\\bin\\10.0.26100.0\\x64\\mt.exe",
+            "-nologo",
+            "-inputresource:C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\privilege-a2\\development-48f2dea10a97c47b5d61a68520bbd21164838b252edf5c2e03e4ffcef9bd72d0\\pocketstream-desktop.exe;#1",
+            "-out:C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\privilege-a2\\local-instance-qualification\\development.manifest"
+          ],
+          "started_at_utc": "2026-10-24T17:24:36.659Z",
+          "finished_at_utc": "2026-10-24T17:24:36.701Z",
+          "exit_code": 0
+        },
+        {
+          "name": "release-manifest",
+          "command": [
+            "C:\\Program Files (x86)\\Windows Kits\\10\\bin\\10.0.26100.0\\x64\\mt.exe",
+            "-nologo",
+            "-inputresource:C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\privilege-a2\\release-b77586f746eadcb63fdb7a2883f9ffd494bb5aff140f4ff963baccadd6b8ebed\\pocketstream-desktop.exe;#1",
+            "-out:C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\privilege-a2\\local-instance-qualification\\release.manifest"
+          ],
+          "started_at_utc": "2026-10-24T17:24:36.714Z",
+          "finished_at_utc": "2026-10-24T17:24:36.741Z",
+          "exit_code": 0
+        }
+      ],
+      "manifests": [
+        {
+          "artifact": "development",
+          "artifact_sha256": "48f2dea10a97c47b5d61a68520bbd21164838b252edf5c2e03e4ffcef9bd72d0",
+          "extracted_manifest_path": "src-tauri/target/privilege-a2/local-instance-qualification/development.manifest",
+          "manifest_sha256": "cd613330097d228ae01fce028e50954fe4595249d51edebc4461ec252b514517",
+          "execution_level": "asInvoker",
+          "common_controls": true
+        },
+        {
+          "artifact": "release",
+          "artifact_sha256": "b77586f746eadcb63fdb7a2883f9ffd494bb5aff140f4ff963baccadd6b8ebed",
+          "extracted_manifest_path": "src-tauri/target/privilege-a2/local-instance-qualification/release.manifest",
+          "manifest_sha256": "780c5f643a1faa7a7198a3114e470fe789beacf042ba7b0fcdf2e6b3e3e20221",
+          "execution_level": "requireAdministrator",
+          "common_controls": true
+        }
+      ],
+      "rust_or_frontend_suites_rerun": false,
+      "reason": "Application code and images unchanged; targeted fixture/native application checks, syntax/compile checks, contract and manifests were verified."
+    },
+    "limits": [
+      "One Windows account, desktop and exact development image; different-copy, installed/elevated and cross-account/logon/integrity behavior not qualified here.",
+      "Native writes, controlled ICMP and camera/PTU discovery/playback/control are untested; no hardware is available.",
+      "Firewall/install qualification still requires an unavailable isolated Windows fixture; no native policy or installation changes were attempted.",
+      "Binding/address-change matrices, production crash recovery, installed-package and resource/endurance gates remain as previously recorded.",
+      "Only five protected profile/cache/key/log files and the selected physical adapter were checked for restoration; this is not a whole-machine image comparison.",
+      "The original broad-suite and prerequisite evidence stays historical. Its 162-input fingerprint is preserved; two fixture changes are qualified separately and their original bytes archived."
+    ]
+  }
 }

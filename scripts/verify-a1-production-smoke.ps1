@@ -11,13 +11,30 @@ param(
     [int]$OwnerPid,
     [string]$ExpectedText,
     [string]$RunDirectory,
-    [string]$Executable
+    [string]$Executable,
+    [string]$ArtifactRecord = 'docs\runtime-evidence\privilege-v2-a1.json',
+    [switch]$CheckSecondInstance
 )
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 if (-not $Executable) { $Executable = Join-Path $repoRoot 'src-tauri\target\debug\pocketstream-desktop.exe' }
 $Executable = (Resolve-Path -LiteralPath $Executable).Path
+
+function Read-LiveLog([string]$Path) {
+    # Start-Process keeps redirected output open for writing. ReadAllText's
+    # default sharing can fail while that process is still alive.
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+    $reader = New-Object IO.StreamReader $stream
+    try { $reader.ReadToEnd() } finally { $reader.Dispose() }
+}
+
+function Get-LiveLogHash([string]$Path) {
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try { ([BitConverter]::ToString($algorithm.ComputeHash($stream))).Replace('-', '').ToLowerInvariant() }
+    finally { $algorithm.Dispose(); $stream.Dispose() }
+}
 
 function Initialize-NativeWindowApi {
     if ('PocketStream.A1Smoke.Windows' -as [type]) { return }
@@ -36,6 +53,70 @@ namespace PocketStream.A1Smoke {
         [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr hwnd, StringBuilder text, int max);
         [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
         [DllImport("user32.dll")] static extern bool PostMessage(IntPtr hwnd, uint message, IntPtr wparam, IntPtr lparam);
+        [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+        static extern IntPtr SendMessageTimeoutW(IntPtr hwnd, uint message, UIntPtr wparam,
+            StringBuilder text, uint flags, uint timeout, out UIntPtr result);
+        [DllImport("user32.dll")] static extern int GetDlgCtrlID(IntPtr hwnd);
+        [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetExitCodeProcess(IntPtr process, out uint code);
+        public static uint ExitCode(IntPtr process) {
+            uint code;
+            if (!GetExitCodeProcess(process, out code)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            return code;
+        }
+        public class WindowInfo {
+            public long Handle;
+            public string Class;
+            public string Text;
+            public int Id;
+            public bool Visible;
+            public List<WindowInfo> Children = new List<WindowInfo>();
+        }
+        static bool Owned(IntPtr window, uint expected) {
+            uint actual; GetWindowThreadProcessId(window, out actual);
+            return actual == expected;
+        }
+        static WindowInfo Describe(IntPtr window) {
+            var kind = new StringBuilder(128); GetClassName(window, kind, kind.Capacity);
+            var text = new StringBuilder(4096); UIntPtr result;
+            // GetWindowText does not read another process's control text.
+            SendMessageTimeoutW(window, 0xD, new UIntPtr((uint)text.Capacity), text,
+                0x2, 300, out result);
+            return new WindowInfo {Handle=window.ToInt64(), Class=kind.ToString(),
+                Text=text.ToString(), Id=GetDlgCtrlID(window), Visible=IsWindowVisible(window)};
+        }
+        public static WindowInfo[] Snapshot(uint owner) {
+            var found = new List<WindowInfo>();
+            EnumWindows((window, _) => {
+                if (!Owned(window, owner) || found.Count >= 32) return true;
+                var info = Describe(window);
+                if (info.Class == "#32770") EnumChildWindows(window, (child, data) => {
+                    if (Owned(child, owner) && info.Children.Count < 32) info.Children.Add(Describe(child));
+                    return true;
+                }, IntPtr.Zero);
+                found.Add(info); return true;
+            }, IntPtr.Zero);
+            return found.ToArray();
+        }
+        public static bool AcknowledgeBusy(IntPtr dialog, uint owner) {
+            if (!Owned(dialog, owner)) throw new InvalidOperationException("Foreign dialog");
+            var text = Describe(dialog).Text;
+            EnumChildWindows(dialog, (child, _) => {
+                if (Owned(child, owner)) text += "\n" + Describe(child).Text;
+                return true;
+            }, IntPtr.Zero);
+            if (!text.Contains("PocketStream is already running")) return false;
+            IntPtr button = IntPtr.Zero;
+            EnumChildWindows(dialog, (child, _) => {
+                if (!Owned(child, owner)) return true;
+                var info = Describe(child);
+                if (info.Class == "Button" && info.Id > 0 && info.Id <= 65535 && info.Text.Replace("&", "") == "OK") button = child;
+                return true;
+            }, IntPtr.Zero);
+            if (button == IntPtr.Zero) return false;
+            // Send the actual verified OK button's BN_CLICKED notification.
+            // MainWindowHandle can name the development console instead.
+            return PostMessage(dialog, 0x111, new IntPtr(GetDlgCtrlID(button)), button);
+        }
         public static IntPtr[] Dialogs(uint owner) {
             var found = new List<IntPtr>();
             EnumWindows((window, _) => {
@@ -124,9 +205,11 @@ if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))
     throw 'This development UI phase runs at medium integrity; elevated production/hardware qualification is separate.'
 }
 if (@(Get-Process -Name 'pocketstream-desktop' -ErrorAction SilentlyContinue).Count) { throw 'Close the existing PocketStream host before the controlled smoke.' }
-$baseline = Get-Content -LiteralPath (Join-Path $repoRoot 'docs\runtime-evidence\privilege-v2-a1.json') -Raw | ConvertFrom-Json
+$baseline = Get-Content -LiteralPath (Join-Path $repoRoot $ArtifactRecord) -Raw | ConvertFrom-Json
+$recordedArtifact = $baseline.artifacts.development
+if ($null -eq $recordedArtifact) { $recordedArtifact = $baseline.artifacts.development_application }
 $artifactHash = (Get-FileHash -LiteralPath $Executable -Algorithm SHA256).Hash.ToLowerInvariant()
-if ($artifactHash -ne $baseline.artifacts.development_application.sha256) { throw 'Executable differs from the recorded A1 artifact; record and review it before running.' }
+if ($artifactHash -ne $recordedArtifact.sha256) { throw 'Executable differs from the recorded development artifact; record and review it before running.' }
 $adapters = @(Get-NetAdapter -ErrorAction Stop | Where-Object { $_.MacAddress.Replace('-', ':').ToLowerInvariant() -eq $AdapterMac })
 if ($adapters.Count -ne 1 -or -not $adapters[0].HardwareInterface -or $adapters[0].InterfaceDescription -match 'Wi-Fi|Wireless') {
     throw 'Controlled MAC must resolve uniquely to a physical Ethernet adapter.'
@@ -152,12 +235,15 @@ function Native-Snapshot {
     }
 }
 
-if (-not $RunDirectory) { $RunDirectory = Join-Path $repoRoot ('src-tauri\target\privilege-a1\production-smoke-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')) }
+$runFolder = if ($CheckSecondInstance) { 'src-tauri\target\privilege-a2' } else { 'src-tauri\target\privilege-a1' }
+if (-not $RunDirectory) { $RunDirectory = Join-Path $repoRoot ($runFolder + '\production-smoke-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')) }
 $RunDirectory = [IO.Path]::GetFullPath($RunDirectory)
-$allowedRunRoot = [IO.Path]::GetFullPath((Join-Path $repoRoot 'src-tauri\target\privilege-a1')) + [IO.Path]::DirectorySeparatorChar
-if (-not $RunDirectory.StartsWith($allowedRunRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'Run directory must stay under target/privilege-a1.' }
+$allowedRunRoot = [IO.Path]::GetFullPath((Join-Path $repoRoot $runFolder)) + [IO.Path]::DirectorySeparatorChar
+if (-not $RunDirectory.StartsWith($allowedRunRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'Run directory must stay under the selected target evidence folder.' }
 if (Test-Path -LiteralPath $RunDirectory) { throw 'Use a fresh run directory; existing evidence will not be overwritten.' }
 New-Item -ItemType Directory -Path $RunDirectory | Out-Null
+Copy-Item -LiteralPath $PSCommandPath -Destination (Join-Path $RunDirectory 'fixture.ps1')
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'verify-a1-production-smoke.mjs') -Destination (Join-Path $RunDirectory 'fixture.mjs')
 $backupDir = Join-Path $RunDirectory 'private-profile-backup'
 New-Item -ItemType Directory -Path $backupDir | Out-Null
 $profileDir = Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'PocketStream'
@@ -184,7 +270,9 @@ $record = [ordered]@{
     ui=$null; hardware=[ordered]@{ discovery='pending'; playback='pending'; ptu='pending'; reason='Controlled connected hardware and explicit PTU identity required' }
     diagnostic=$null
 }
+if ($CheckSecondInstance) { $record.gate = 'Local production second-instance dismissal and continuing workflows' }
 $app = $null
+$second = $null
 $profileChanged = $false
 $oldArgs = [Environment]::GetEnvironmentVariable('WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS', 'Process')
 $oldData = [Environment]::GetEnvironmentVariable('WEBVIEW2_USER_DATA_FOLDER', 'Process')
@@ -225,15 +313,67 @@ password = ""
     $env:WEBVIEW2_USER_DATA_FOLDER = Join-Path $RunDirectory 'webview-data'
     $app = Start-Process -FilePath $Executable -WorkingDirectory (Split-Path -Parent $Executable) -WindowStyle Hidden -PassThru `
         -RedirectStandardOutput (Join-Path $RunDirectory 'application.stdout.log') -RedirectStandardError (Join-Path $RunDirectory 'application.stderr.log')
+    $appHandle = $app.Handle
     $context = [ordered]@{ pid=$app.Id; executable=$Executable; port=$port; adapter_mac=$AdapterMac; expected_address=$address; expected_cidr=$PrimaryAddress; alias=[string]$adapter.Name; powershell=(Join-Path $PSHOME 'powershell.exe'); native_helper=$PSCommandPath }
     $contextPath = Join-Path $RunDirectory 'context.json'
     $context | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $contextPath -Encoding UTF8
+    if ($CheckSecondInstance) {
+        & node (Join-Path $PSScriptRoot 'verify-a1-production-smoke.mjs') $contextPath --ready-only
+        if ($LASTEXITCODE -ne 0) { throw 'Original production UI did not become ready.' }
+        $startupDeadline = [DateTime]::UtcNow.AddSeconds(15)
+        do {
+            $startupSettled = (Read-LiveLog (Join-Path $RunDirectory 'application.stderr.log')).Contains('Started ICMP ping-dot loop')
+            if ($startupSettled) { break }
+            Start-Sleep -Milliseconds 100
+        } while ([DateTime]::UtcNow -lt $startupDeadline)
+        if (-not $startupSettled) { throw 'Original startup/reconciliation did not finish before the contender.' }
+        Start-Sleep -Milliseconds 300
+        $profileBeforeSecond = (Get-FileHash -LiteralPath $files[0] -Algorithm SHA256).Hash.ToLowerInvariant()
+        $cacheBeforeSecond = (Get-FileHash -LiteralPath $files[1] -Algorithm SHA256).Hash.ToLowerInvariant()
+        $logBeforeSecond = Get-LiveLogHash $files[3]
+        $secondError = Join-Path $RunDirectory 'second-instance.stderr.log'
+        $second = Start-Process -FilePath $Executable -WorkingDirectory (Split-Path -Parent $Executable) -WindowStyle Hidden -PassThru `
+            -RedirectStandardOutput (Join-Path $RunDirectory 'second-instance.stdout.log') -RedirectStandardError $secondError
+        $secondHandle = $second.Handle
+        $record['second_instance'] = [ordered]@{pid=$second.Id; artifact_sha256=$artifactHash; windows=@(); busy_observed=$false; acknowledged=$false; exited=$false}
+        Initialize-NativeWindowApi
+        $deadline = [DateTime]::UtcNow.AddSeconds(12)
+        do {
+            if ($second.HasExited) { break }
+            if ((Get-Process -Id $second.Id -ErrorAction Stop).Path -ne $Executable) { throw 'Second-process image changed.' }
+            $windows = [PocketStream.A1Smoke.Windows]::Snapshot([uint32]$second.Id)
+            if ($windows.Count) { $record.second_instance.windows = @($windows) }
+            $diagnostic = Read-LiveLog $secondError
+            if ($diagnostic.Trim() -eq 'PocketStream is already running: Busy') {
+                $record.second_instance.busy_observed = $true
+                foreach ($window in $windows) {
+                    if ($window.Class -eq '#32770' -and [PocketStream.A1Smoke.Windows]::AcknowledgeBusy([IntPtr]$window.Handle, [uint32]$second.Id)) {
+                        $record.second_instance.acknowledged = $true
+                        $record.second_instance['dismissal'] = 'verified native OK button BN_CLICKED'
+                        break
+                    }
+                }
+            }
+            if ($second.WaitForExit(100)) { break }
+        } while ([DateTime]::UtcNow -lt $deadline)
+        $record.second_instance.exited = $second.HasExited
+        $record.second_instance['profile_unchanged'] = $profileBeforeSecond -eq (Get-FileHash -LiteralPath $files[0] -Algorithm SHA256).Hash.ToLowerInvariant()
+        $record.second_instance['cache_unchanged'] = $cacheBeforeSecond -eq (Get-FileHash -LiteralPath $files[1] -Algorithm SHA256).Hash.ToLowerInvariant()
+        $record.second_instance['log_unchanged'] = $logBeforeSecond -eq (Get-LiveLogHash $files[3])
+        $record.second_instance['no_initialization_banner'] = -not (Read-LiveLog $secondError).Contains('starting')
+        if (-not $record.second_instance.busy_observed -or -not $record.second_instance.acknowledged -or -not $second.HasExited) { throw 'Second-instance refusal/dismissal did not complete; inspect its window snapshot.' }
+        $record.second_instance['exit_code'] = [PocketStream.A1Smoke.Windows]::ExitCode($secondHandle)
+        if ($record.second_instance.exit_code -ne 0 -or -not $record.second_instance.profile_unchanged -or -not $record.second_instance.cache_unchanged -or -not $record.second_instance.log_unchanged) { throw 'Second-instance refusal changed shared files or returned an unexpected exit code.' }
+        if ($app.HasExited) { throw 'Original instance exited during second-instance refusal.' }
+        $record['original_usable_after_refusal'] = 'pending production settings and confirmation workflows below'
+    }
     Write-Output "Production UI smoke: PID $($app.Id), artifact $artifactHash, run $RunDirectory"
     & node (Join-Path $PSScriptRoot 'verify-a1-production-smoke.mjs') $contextPath
     $uiExit = $LASTEXITCODE
     $uiPath = Join-Path $RunDirectory 'ui-result.json'
     if (Test-Path -LiteralPath $uiPath) { $record.ui = Get-Content -LiteralPath $uiPath -Raw | ConvertFrom-Json }
     if ($uiExit -ne 0) { throw "Production UI smoke returned $uiExit; inspect the recorded workflow results." }
+    if ($CheckSecondInstance) { $record.original_usable_after_refusal = 'passed production settings/readback and both native Cancel workflows' }
     $record.status = 'partial: production settings and confirmation Cancel paths passed; hardware gates pending'
 } catch {
     $record.diagnostic = $_.Exception.Message
@@ -241,6 +381,9 @@ password = ""
 } finally {
     [Environment]::SetEnvironmentVariable('WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS', $oldArgs, 'Process')
     [Environment]::SetEnvironmentVariable('WEBVIEW2_USER_DATA_FOLDER', $oldData, 'Process')
+    if ($null -ne $app -and -not $app.WaitForExit(5000)) {
+        & node (Join-Path $PSScriptRoot 'verify-a1-production-smoke.mjs') $contextPath --close-only
+    }
     $stopped = $true
     if ($null -ne $app) {
         # The CDP driver requests the real #btn-close action first. WM_CLOSE is
@@ -252,6 +395,16 @@ password = ""
         }
         $record['application_pid'] = $app.Id
         $record['graceful_exit'] = $stopped
+        if ($CheckSecondInstance -and $stopped) {
+            $record['original_exit_code'] = [PocketStream.A1Smoke.Windows]::ExitCode($appHandle)
+        }
+    }
+    if ($null -ne $second -and -not $second.HasExited) {
+        Initialize-NativeWindowApi
+        foreach ($window in [PocketStream.A1Smoke.Windows]::Snapshot([uint32]$second.Id)) {
+            if ($window.Class -eq '#32770') { $null = [PocketStream.A1Smoke.Windows]::AcknowledgeBusy([IntPtr]$window.Handle, [uint32]$second.Id) }
+        }
+        if (-not $second.WaitForExit(3000)) { $stopped = $false; $record['second_instance_still_alive'] = $true }
     }
     if ($stopped -and $profileChanged) {
         # Preserve this run's app log before restoring the user's original log.
