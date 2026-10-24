@@ -75,8 +75,8 @@ function ptuOperationCurrent(operation: PtuOperation | null): operation is PtuOp
 }
 
 /** Include identity as well as endpoint: a replacement can reuse the same IP. */
-function targetStamp(target: DeviceTarget | null): string {
-  return JSON.stringify([target?.key, target?.expectedMac, deviceList.endpointFor(target)]);
+function targetStamp(target: DeviceTarget | null, ip = deviceList.endpointFor(target)): string {
+  return JSON.stringify([target?.key, target?.expectedMac, ip]);
 }
 
 // ── PTU command FIFO ────────────────────────────────────────────────
@@ -85,6 +85,12 @@ function targetStamp(target: DeviceTarget | null): string {
 // issued. Without it, a quick D-pad tap could deliver stop before move.
 // Each entry keeps its original key, expected MAC and endpoint, so
 // reassigning PTU cannot redirect delayed work to the new holder.
+
+type PtuMotionEffect = "motion" | "stop";
+
+// A lost motion reply is ambiguous. Retain the original identity/endpoint
+// until a full stop is acknowledged; initialization/queries do not add risk.
+const ptuUnconfirmedMotion = new Set<string>();
 
 interface QueuedPtuCmd {
   /** Command string, or a thunk evaluated at dequeue time — used by
@@ -101,6 +107,7 @@ interface QueuedPtuCmd {
    *  regardless of the current alias state (the farewell halt). */
   targetIp?: string;
   target?: DeviceTarget;
+  motionEffect?: PtuMotionEffect;
 }
 
 const ptuQueue: QueuedPtuCmd[] = [];
@@ -108,7 +115,7 @@ let ptuDraining = false;
 
 function enqueuePtuCmd(
   cmd: string | (() => string),
-  opts?: { stillWanted?: () => boolean; targetIp?: string; target?: DeviceTarget }
+  opts?: { stillWanted?: () => boolean; targetIp?: string; target?: DeviceTarget; motionEffect?: PtuMotionEffect }
 ): Promise<Record<string, string> | null> {
   return new Promise((resolve, reject) => {
     ptuQueue.push({
@@ -118,6 +125,7 @@ function enqueuePtuCmd(
       stillWanted: opts?.stillWanted,
       targetIp: opts?.targetIp ?? deviceList.endpointFor(opts?.target ?? getActivePtuTarget()) ?? undefined,
       target: opts?.target ?? getActivePtuTarget() ?? undefined,
+      motionEffect: opts?.motionEffect,
     });
     if (!ptuDraining) {
       ptuDraining = true;
@@ -140,8 +148,14 @@ async function drainPtuQueue(): Promise<void> {
       continue;
     }
     const cmdStr = typeof item.cmd === "function" ? item.cmd() : item.cmd;
+    const stamp = targetStamp(target, ip);
+    if (item.motionEffect === "motion") ptuUnconfirmedMotion.add(stamp);
     try {
-      item.resolve(await api.ptuSend(ip, cmdStr, target));
+      const result = await api.ptuSend(ip, cmdStr, target);
+      // Update before resolving or dequeuing a later move. An ACK continuation
+      // must not erase that later command's motion risk.
+      if (item.motionEffect === "stop") ptuUnconfirmedMotion.delete(stamp);
+      item.resolve(result);
     } catch (e) {
       item.reject(e);
     }
@@ -168,9 +182,9 @@ function purgePtuQueue(): void {
  *  target. The velocity-stop then rides the FIFO pinned to the
  *  outgoing IP so it cannot race the in-flight command on the unit's
  *  single-threaded control handler. Fire-and-track: the caller is
- *  never blocked; a failed halt retries once, then surfaces loudly —
- *  a possibly-still-moving PTU is the one physical-safety event in
- *  role reassignment. */
+ *  never blocked; a failed halt retries once. Only unconfirmed dispatched
+ *  movement warrants a physical-safety alarm; an idle stale selection's
+ *  failed precautionary stop remains a diagnostic. */
 export function haltPtuUnit(ip: string, target: DeviceTarget): void {
   // Purging the FIFO alone cannot cancel an ACK or timer still owned by a
   // Home/preset/init workflow. Retire those continuations as well.
@@ -179,10 +193,18 @@ export function haltPtuUnit(ip: string, target: DeviceTarget): void {
   void (async () => {
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        await enqueuePtuCmd("PS=0&TS=0", { targetIp: ip, target });
+        await enqueuePtuCmd("PS=0&TS=0", { targetIp: ip, target, motionEffect: "stop" });
         return;
       } catch (e) {
         if (attempt === 0) continue;
+        // A legacy manual target can acquire a MAC after its first send.
+        // Unconfirmed movement from that original binding remains a risk.
+        const manual = { key: `manual:${ip}`, expectedMac: null };
+        if (!ptuUnconfirmedMotion.has(targetStamp(target, ip))
+          && !ptuUnconfirmedMotion.has(targetStamp(manual, ip))) {
+          log(`PTU precautionary halt failed for previous selection ${ip} (no unconfirmed movement from this session): ${formatError(e)}`);
+          return;
+        }
         log(`PTU halt failed for ${ip}: ${formatError(e)}`);
         showToast(
           `PTU halt failed — ${ip} may still be moving; stop it via its web interface or power`,
@@ -195,13 +217,15 @@ export function haltPtuUnit(ip: string, target: DeviceTarget): void {
 
 async function ptuCmd(
   cmd: string,
-  operation: PtuOperation | null = capturePtuOperation()
+  operation: PtuOperation | null = capturePtuOperation(),
+  motionEffect?: PtuMotionEffect
 ): Promise<Record<string, string> | null> {
   if (!ptuOperationCurrent(operation)) return null;
   return enqueuePtuCmd(cmd, {
     target: operation.target,
     targetIp: operation.targetIp,
     stillWanted: () => ptuOperationCurrent(operation),
+    motionEffect,
   });
 }
 
@@ -330,7 +354,7 @@ export function setupPtzControls(): void {
         const camera = targetStamp(getActiveCamTarget());
         if (!operation) return;
         try {
-          await ptuCmd(`C=I&PS=${ptuSpeedBig}&TS=${ptuSpeedBig}&PP=0&TP=0`, operation);
+          await ptuCmd(`C=I&PS=${ptuSpeedBig}&TS=${ptuSpeedBig}&PP=0&TP=0`, operation, "motion");
           if (!ptuOperationCurrent(operation)) return;
           showToast("PTU homing");
           // Home is the full resting pose: zoom pulls back to wide while
@@ -371,6 +395,7 @@ export function setupPtzControls(): void {
           target: operation.target,
           targetIp: operation.targetIp,
           stillWanted: () => ptuReleasedThrough < seq && ptuOperationCurrent(operation),
+          motionEffect: "motion",
         }).catch((e) => log(`PTU ${action}: ${formatError(e)}`));
       }
     };
@@ -378,7 +403,7 @@ export function setupPtzControls(): void {
       ptuReleasedThrough = ptuPressSeq;
       const operation = pressOperation;
       pressOperation = null;
-      if (operation) ptuCmd("C=V&PS=0&TS=0", operation).catch(() => {});
+      if (operation) ptuCmd("C=V&PS=0&TS=0", operation, "stop").catch(() => {});
     };
 
     btn.addEventListener("pointerdown", (e) => {
@@ -452,7 +477,8 @@ export function setupPtzControls(): void {
               // its limits (observed in 0.2.9 as runaway pan).
               await ptuCmd(
                 `C=I&PS=${ptuSpeedBig}&TS=${ptuSpeedBig}&PP=${saved.pan}&TP=${saved.tilt}`,
-                operation
+                operation,
+                "motion"
               );
               if (!ptuOperationCurrent(operation)) return;
               waitForPtuTarget(

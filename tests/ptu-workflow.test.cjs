@@ -33,7 +33,8 @@ function button(dataset) {
 
 function fixture({ sameIp = false, hold = () => false, failHalt = false } = {}) {
   let current = A, camera = A, timerId = 0;
-  const calls = [], pending = [], timers = new Map(), subscribers = [], zooms = [];
+  let haltFailures = Number(failHalt);
+  const calls = [], pending = [], timers = new Map(), subscribers = [], zooms = [], toasts = [], logs = [];
   const home = button({ ptz: "home" }), right = button({ ptz: "right" });
   const preset = button({ preset: "1" });
   const endpoint = (target) => target
@@ -43,11 +44,11 @@ function fixture({ sameIp = false, hold = () => false, failHalt = false } = {}) 
     async ptuSend(ip, cmd, target) {
       const call = { ip, cmd, target: structuredClone(target) };
       calls.push(call);
-      if (cmd === "PS=0&TS=0" && failHalt) {
-        failHalt = false;
+      if (cmd === "PS=0&TS=0" && haltFailures > 0) {
+        haltFailures--;
         throw Error("transient refusal");
       }
-      if (hold(cmd)) return new Promise(resolve => pending.push({ call, resolve }));
+      if (hold(cmd)) return new Promise((resolve, reject) => pending.push({ call, resolve, reject }));
       return cmd === "PU&TU&PL&TL"
         ? { PU: "300", TU: "200", PL: "3", TL: "2" }
         : { PP: "0", TP: "0" };
@@ -55,7 +56,7 @@ function fixture({ sameIp = false, hold = () => false, failHalt = false } = {}) 
   };
   const deps = {
     "./tauri-api.ts": api,
-    "./state.ts": { $: () => null, state: {}, log() {}, showToast() {} },
+    "./state.ts": { $: () => null, state: {}, log(message) { logs.push(message); }, showToast(message, isError = false) { toasts.push({ message, isError }); } },
     "./errors.ts": { formatError: String },
     "./network.ts": {
       getActivePtuIp: () => endpoint(current), getActivePtuTarget: () => current,
@@ -85,7 +86,7 @@ function fixture({ sameIp = false, hold = () => false, failHalt = false } = {}) 
     value => zooms.push({ camera, value }),
   );
   return {
-    exports, hooks: exports.testHooks, calls, pending, timers, home, right, preset, zooms,
+    exports, hooks: exports.testHooks, calls, pending, timers, home, right, preset, zooms, toasts, logs,
     // No notification isolates continuation checks from the subscription.
     change(target = B, notify = false) {
       current = target;
@@ -96,6 +97,11 @@ function fixture({ sameIp = false, hold = () => false, failHalt = false } = {}) 
       const index = pending.findIndex(p => p.call.cmd === cmd);
       assert(index >= 0, `no pending ${cmd}`);
       pending.splice(index, 1)[0].resolve(data);
+    },
+    reject(cmd) {
+      const index = pending.findIndex(p => p.call.cmd === cmd);
+      assert(index >= 0, `no pending ${cmd}`);
+      pending.splice(index, 1)[0].reject(Error("response lost after dispatch"));
     },
     fireTimer(ms) {
       const entry = [...timers].find(([, t]) => t.ms === ms);
@@ -238,6 +244,140 @@ test("farewell halt retries on original identity and retires waiting workflows",
   assert.equal(f.calls.length, 2);
   assert(f.calls.every(c => c.cmd === "PS=0&TS=0" && c.target.key === A.key));
   assert.equal(await f.hooks.ptuCmd("C=V", operation), null);
+});
+
+test("replacing an idle PTU keeps its precautionary halt failure out of the error toast", async () => {
+  const f = fixture({ failHalt: 2 });
+  await f.hooks.queryPtuSpeed(); // Initialization is not a motion command.
+  f.change();
+  f.exports.haltPtuUnit("192.0.2.20", A);
+  await flush();
+  assert.equal(f.calls.filter(c => c.cmd === "PS=0&TS=0").length, 2);
+  assert(f.calls.every(c => c.target.key === A.key));
+  assert.deepEqual(f.toasts, []);
+  assert(f.logs.some(message => message.includes("192.0.2.20")));
+});
+
+test("a move purged before dispatch cannot make an idle outgoing PTU appear to be moving", async () => {
+  const f = fixture({ failHalt: 2, hold: cmd => cmd === "BLOCK" });
+  const block = f.hooks.enqueuePtuCmd("BLOCK");
+  f.right.fire("pointerdown");
+  f.change();
+  f.exports.haltPtuUnit("192.0.2.20", A);
+  f.release("BLOCK");
+  await block;
+  await flush();
+  assert.deepEqual(f.calls.map(c => c.cmd), ["BLOCK", "PS=0&TS=0", "PS=0&TS=0"]);
+  assert.deepEqual(f.toasts, []);
+});
+
+test("an in-flight move with a lost reply keeps a failed outgoing halt visible", async () => {
+  const f = fixture({ failHalt: 2, hold: cmd => cmd.startsWith("C=V&PS=-") });
+  await f.hooks.queryPtuSpeed();
+  f.right.fire("pointerdown");
+  await flush();
+  const move = f.calls.at(-1).cmd;
+  assert.match(move, /^C=V&PS=-/);
+  f.change();
+  f.exports.haltPtuUnit("192.0.2.20", A);
+  f.reject(move);
+  await flush();
+  assert.equal(f.toasts.length, 1);
+  assert.equal(f.toasts[0].isError, true);
+  assert.match(f.toasts[0].message, /192\.0\.2\.20 may still be moving/);
+  assert(f.calls.every(c => c.target.key === A.key));
+});
+
+for (const action of ["Home", "preset"]) {
+  test(`a dispatched ${action} keeps the outgoing halt warning even without D-pad use`, async () => {
+    const f = fixture({ failHalt: 2, hold: cmd => cmd.startsWith("C=I") });
+    f.hooks.seedPreset();
+    if (action === "preset") f.preset.fire("pointerdown");
+    const operation = action === "Home" ? f.home.fire("click") : f.preset.fire("pointerup");
+    const move = f.calls[0].cmd;
+    assert.match(move, /^C=I/);
+    f.change();
+    f.exports.haltPtuUnit("192.0.2.20", A);
+    f.release(move);
+    await operation;
+    await flush();
+    assert.equal(f.toasts.filter(t => t.isError && t.message.includes("may still be moving")).length, 1);
+  });
+}
+
+test("an acknowledged D-pad stop clears the outgoing unit's motion warning", async () => {
+  const f = fixture({ failHalt: 2 });
+  await f.hooks.queryPtuSpeed();
+  f.right.fire("pointerdown");
+  await flush();
+  f.right.fire("pointerup");
+  await flush();
+  assert(f.calls.some(c => c.cmd === "C=V&PS=0&TS=0"));
+  f.change();
+  f.exports.haltPtuUnit("192.0.2.20", A);
+  await flush();
+  assert.deepEqual(f.toasts, []);
+});
+
+test("a failed D-pad stop cannot clear the outgoing unit's motion warning", async () => {
+  const stop = "C=V&PS=0&TS=0";
+  const f = fixture({ failHalt: 2, hold: cmd => cmd === stop });
+  await f.hooks.queryPtuSpeed();
+  f.right.fire("pointerdown");
+  await flush();
+  f.right.fire("pointerup");
+  await flush();
+  f.change();
+  f.exports.haltPtuUnit("192.0.2.20", A);
+  f.reject(stop);
+  await flush();
+  assert.equal(f.toasts.filter(t => t.isError && t.message.includes("may still be moving")).length, 1);
+});
+
+test("motion at a reused IP belongs to its identity, not an idle outgoing record", async () => {
+  const f = fixture({ sameIp: true, failHalt: 4 });
+  f.change(B);
+  await f.hooks.queryPtuSpeed();
+  f.right.fire("pointerdown");
+  await flush();
+  f.exports.haltPtuUnit("192.0.2.20", A);
+  await flush();
+  assert.deepEqual(f.toasts, []);
+  f.change(A);
+  f.exports.haltPtuUnit("192.0.2.20", B);
+  await flush();
+  assert.equal(f.toasts.length, 1);
+  assert.equal(f.toasts[0].isError, true);
+  assert.deepEqual(f.calls.filter(c => c.cmd === "PS=0&TS=0").map(c => c.target.key), [A.key, A.key, B.key, B.key]);
+});
+
+test("a stop acknowledgement cannot erase a later FIFO move's motion warning", async () => {
+  const stop = "C=V&PS=0&TS=0";
+  const f = fixture({ failHalt: 2, hold: cmd => cmd === stop });
+  await f.hooks.queryPtuSpeed();
+  f.right.fire("pointerdown");
+  await flush();
+  f.right.fire("pointerup");
+  await flush();
+  f.right.fire("pointerdown");
+  f.release(stop);
+  await flush();
+  f.change();
+  f.exports.haltPtuUnit("192.0.2.20", A);
+  await flush();
+  assert.equal(f.toasts.filter(t => t.isError && t.message.includes("may still be moving")).length, 1);
+});
+
+test("binding a manual target's MAC cannot discard its unconfirmed motion warning", async () => {
+  const f = fixture({ sameIp: true, failHalt: 2 });
+  f.change({ key: "manual:192.0.2.20", expectedMac: null });
+  await f.hooks.queryPtuSpeed();
+  f.right.fire("pointerdown");
+  await flush();
+  f.change(A);
+  f.exports.haltPtuUnit("192.0.2.20", A);
+  await flush();
+  assert.equal(f.toasts.filter(t => t.isError && t.message.includes("may still be moving")).length, 1);
 });
 
 test("preset hold timer and save response cannot cross a role change", async () => {
