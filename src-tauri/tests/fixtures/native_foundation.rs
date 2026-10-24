@@ -55,7 +55,134 @@ fn config_for(io: &FakeAddressIo) -> Arc<AppConfig> {
     }))
 }
 fn new_executor() -> LocalExecutor {
-    LocalExecutor::new(Arc::new(tokio::sync::Mutex::new(())))
+    LocalExecutor::for_serialized_writers()
+}
+
+#[test]
+#[ignore = "A2 actual fixed-policy inventory; reads native adapters only"]
+fn qualify_typed_inventory_read_only() {
+    let process = NativeProcessRunner::run_operation(
+        super::native_operations::Operation::inventory(),
+        Cancellation::default(),
+    )
+    .unwrap();
+    assert_eq!(process.termination, Termination::Exited);
+    assert_eq!(
+        process.exit_code,
+        0,
+        "{}",
+        String::from_utf8_lossy(&process.stdout.bytes)
+    );
+    assert!(!process.stdout.truncated && !process.stderr.truncated);
+    let report: Value = serde_json::from_slice(&process.stdout.bytes).unwrap();
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["mutated"], false);
+    assert!(report["data"].is_array());
+    assert_eq!(report["steps"][0]["name"], "inventory");
+    record(
+        "typed-production-inventory",
+        json!({"exit_code":process.exit_code,
+        "contained_before_resume":process.containment_verified_before_resume,
+        "tree_exited":process.observed_tree_exited,"report":report,
+        "native_address_firewall_or_install_mutation":false}),
+    );
+}
+
+#[test]
+#[ignore = "A2 actual production native function; fixed invalid ipconfig option only"]
+fn qualify_production_native_exit_status() {
+    let process = NativeProcessRunner::run(
+        QualificationOperation::ProductionNativeFailure,
+        Cancellation::default(),
+        Duration::from_secs(10),
+        None,
+    )
+    .unwrap();
+    let report = process.structured().unwrap();
+    assert_eq!(process.exit_code, 71);
+    assert_eq!(report.native_exit, Some(1));
+    assert_eq!(report.stage, "required_native");
+    assert!(process.observed_tree_exited);
+    record(
+        "production-native-required-failure",
+        json!({"process_exit":process.exit_code,
+        "native_exit":report.native_exit,"ps_version":report.ps_version,
+        "production_helper_reused":true,"address_firewall_install_mutation":false}),
+    );
+}
+
+#[tokio::test]
+#[ignore = "A2 native system DLL/neighbor reads and optional controlled ICMP; no network configuration writes"]
+async fn qualify_native_observation_paths() {
+    interface::list_all_adapters().await.unwrap();
+    let _api = super::pktmon::PktMonApi::load().expect("trusted system capture DLL");
+    let adapters = interface::read_native().await.unwrap();
+    let mut observed = vec![];
+    for adapter in adapters.iter().filter(|a| {
+        interface::RealAddressIo
+            .descriptor(a)
+            .is_some_and(|i| interface::is_wired_physical(&i))
+    }) {
+        let operation = super::native_operations::Operation::observe(adapter).unwrap();
+        let request = operation.clone();
+        let process = tokio::task::spawn_blocking(move || {
+            NativeProcessRunner::run_operation(request, Cancellation::default())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let after = interface::read_native().await.unwrap();
+        let after = interface::select_native(&after, &adapter.mac).unwrap();
+        let (completion, reply) = super::native_operations::evaluate_result(
+            &operation,
+            Some(adapter),
+            Some(after),
+            &process,
+        );
+        assert_eq!(completion.outcome, Outcome::Completed, "{:?}", reply);
+        reply.unwrap();
+        observed.push(json!({"index":adapter.index,"addresses_dhcp_routes_dns_observed":true,"mutated":false}));
+    }
+    assert!(
+        !observed.is_empty(),
+        "No physical Ethernet state was qualified"
+    );
+    let source = adapters
+        .iter()
+        .flat_map(|a| &a.ips)
+        .filter_map(|ip| ip.address.parse::<std::net::Ipv4Addr>().ok())
+        .find(|ip| !ip.is_loopback() && !ip.is_unspecified());
+    let neighbors = if let Some(source) = source {
+        Some(super::arp::native_neighbors(source).await.unwrap().len())
+    } else {
+        None
+    };
+    let probe = match (
+        std::env::var("POCKETSTREAM_NATIVE_PROBE_SOURCE"),
+        std::env::var("POCKETSTREAM_NATIVE_PROBE_TARGET"),
+    ) {
+        (Ok(source), Ok(target)) => {
+            let source: std::net::Ipv4Addr = source.parse().unwrap();
+            let target: std::net::Ipv4Addr = target.parse().unwrap();
+            let owner = adapters
+                .iter()
+                .find(|a| a.ips.iter().any(|ip| ip.address == source.to_string()))
+                .expect("fixture source is applied");
+            let reply =
+                super::arp::bound_ping(target, source, owner.index, Duration::from_millis(1000))
+                    .await
+                    .unwrap();
+            Some(json!({"source":source,"target":target,"index":owner.index,"echo_reply":reply}))
+        }
+        _ => None,
+    };
+    record(
+        "native-observation-paths",
+        json!({"system_capture_dll_loaded":true,"capture_started":false,
+        "neighbor_source":source,"neighbor_entries":neighbors,"controlled_icmp":probe,
+            "selected_state_observations":observed,
+        "address_firewall_install_mutation":false}),
+    );
 }
 async fn initial_observation(executor: &LocalExecutor) {
     executor
@@ -283,7 +410,7 @@ async fn qualify_caller_abort_retains_completion_and_barrier() {
         let native_result = Arc::new(std::sync::Mutex::new(None));
         let runner_record = native_result.clone();
         let caller = tokio::spawn(async move {
-            let ticket = running_executor.submit(move |cancel| async move {
+            let ticket = running_executor.submit_managed(move |cancel| async move {
                 let native = effects.table.lock().unwrap()[0].clone();
                 // Simulate a provider applying an address before reporting an
                 // error. PendingAdoptOps retains the existing durable intent.

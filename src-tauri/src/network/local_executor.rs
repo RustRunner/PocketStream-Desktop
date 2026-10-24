@@ -1,9 +1,9 @@
-//! Process-local ownership, qualified before wiring any production writer.
+//! Process-local ownership across cancellation of a requesting future.
 //! One admitted operation and one retained completion; no admission queue.
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use tokio::sync::{oneshot, Notify, OwnedMutexGuard};
+use tokio::sync::{oneshot, Notify};
 
 use super::native_runner::Cancellation;
 
@@ -19,11 +19,18 @@ pub(super) enum Outcome {
 pub(super) struct Completion {
     pub outcome: Outcome,
     pub step: &'static str,
+    // Bounded structured native facts stay with a completion even after the
+    // requesting future and its response channel have gone away.
+    pub observation: Option<serde_json::Value>,
 }
 
 impl Completion {
     pub fn new(outcome: Outcome, step: &'static str) -> Self {
-        Self { outcome, step }
+        Self {
+            outcome,
+            step,
+            observation: None,
+        }
     }
 }
 
@@ -37,8 +44,15 @@ pub(super) enum AdmissionError {
 enum Phase {
     RecoveryRequired,
     Idle,
-    Running { id: u64, cancel: Cancellation },
-    Retained { id: u64, result: Completion },
+    Running {
+        id: u64,
+        cancel: Cancellation,
+        managed: bool,
+    },
+    Retained {
+        id: u64,
+        result: Completion,
+    },
 }
 
 struct State {
@@ -50,8 +64,6 @@ struct State {
 struct Shared {
     state: Mutex<State>,
     terminal: Notify,
-    // Reuses the manager's existing address serialization lock on integration.
-    serialization: Arc<tokio::sync::Mutex<()>>,
     worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
@@ -78,7 +90,9 @@ impl Drop for Pending {
 }
 
 impl LocalExecutor {
-    pub fn new(serialization: Arc<tokio::sync::Mutex<()>>) -> Self {
+    // Admission below fences every native writer. Higher-level transactions
+    // keep their existing address_work lock; reacquiring it here would deadlock.
+    pub fn for_serialized_writers() -> Self {
         Self(Arc::new(Shared {
             state: Mutex::new(State {
                 phase: Phase::RecoveryRequired,
@@ -86,7 +100,6 @@ impl LocalExecutor {
                 shutdown: false,
             }),
             terminal: Notify::new(),
-            serialization,
             worker: Mutex::new(None),
         }))
     }
@@ -96,7 +109,15 @@ impl LocalExecutor {
         F: FnOnce(Cancellation) -> Fut + Send + 'static,
         Fut: Future<Output = Completion> + Send + 'static,
     {
-        self.start(false, work)
+        self.start(false, false, work)
+    }
+
+    pub fn submit_managed<F, Fut>(&self, work: F) -> Result<Pending, AdmissionError>
+    where
+        F: FnOnce(Cancellation) -> Fut + Send + 'static,
+        Fut: Future<Output = Completion> + Send + 'static,
+    {
+        self.start(false, true, work)
     }
 
     pub fn reconcile<F, Fut>(&self, observe: F) -> Result<Pending, AdmissionError>
@@ -104,10 +125,15 @@ impl LocalExecutor {
         F: FnOnce(Cancellation) -> Fut + Send + 'static,
         Fut: Future<Output = Completion> + Send + 'static,
     {
-        self.start(true, observe)
+        self.start(true, true, observe)
     }
 
-    fn start<F, Fut>(&self, recovery: bool, work: F) -> Result<Pending, AdmissionError>
+    fn start<F, Fut>(
+        &self,
+        recovery: bool,
+        managed: bool,
+        work: F,
+    ) -> Result<Pending, AdmissionError>
     where
         F: FnOnce(Cancellation) -> Fut + Send + 'static,
         Fut: Future<Output = Completion> + Send + 'static,
@@ -121,29 +147,24 @@ impl LocalExecutor {
             (Phase::Idle, _) | (_, true) => (),
             _ => return Err(AdmissionError::ReconciliationRequired),
         }
-        let serial = self
-            .0
-            .serialization
-            .clone()
-            .try_lock_owned()
-            .map_err(|_| AdmissionError::Busy)?;
         state.next_id = state.next_id.checked_add(1).expect("operation counter");
         let id = state.next_id;
         let cancel = Cancellation::default();
         state.phase = Phase::Running {
             id,
             cancel: cancel.clone(),
+            managed,
         };
         let (tx, response) = oneshot::channel();
         let shared = self.0.clone();
         let signal = cancel.clone();
-        // This task owns admission, the serial guard, child runner and native
+        // This task owns admission, the transaction, child runner and native
         // observation before the requesting task can receive its ticket.
         let worker = tokio::spawn(async move {
             let result = tokio::spawn(async move { work(signal).await })
                 .await
                 .unwrap_or_else(|_| Completion::new(Outcome::Uncertain, "worker_panicked"));
-            Self::finish(shared, serial, id, recovery, result.clone());
+            Self::finish(shared, id, recovery, result.clone());
             let _ = tx.send(result); // Losing this reply never loses completion.
         });
         *self.0.worker.lock().unwrap() = Some(worker);
@@ -154,16 +175,9 @@ impl LocalExecutor {
         })
     }
 
-    fn finish(
-        shared: Arc<Shared>,
-        serial: OwnedMutexGuard<()>,
-        id: u64,
-        recovery: bool,
-        result: Completion,
-    ) {
+    fn finish(shared: Arc<Shared>, id: u64, recovery: bool, result: Completion) {
         let mut state = shared.state.lock().unwrap();
         assert!(matches!(state.phase, Phase::Running { id: running, .. } if running == id));
-        drop(serial); // Actual work/observation drained before publishing idle.
         state.phase = if recovery && result.outcome == Outcome::Completed {
             Phase::Idle
         } else {
@@ -176,6 +190,18 @@ impl LocalExecutor {
         match &self.0.state.lock().unwrap().phase {
             Phase::Retained { id, result } => Some((*id, result.clone())),
             _ => None,
+        }
+    }
+
+    pub fn available(&self) -> Result<(), AdmissionError> {
+        let state = self.0.state.lock().unwrap();
+        if state.shutdown {
+            return Err(AdmissionError::ShuttingDown);
+        }
+        match state.phase {
+            Phase::Idle => Ok(()),
+            Phase::Running { .. } => Err(AdmissionError::Busy),
+            _ => Err(AdmissionError::ReconciliationRequired),
         }
     }
 
@@ -193,13 +219,26 @@ impl LocalExecutor {
         }
     }
 
+    #[cfg(test)]
     pub async fn wait_terminal(&self) {
+        self.wait(true).await;
+    }
+
+    pub async fn wait_writer(&self) {
+        // Managed transactions own the manager's existing locks themselves. A
+        // watcher holding one of those locks must not wait for their acquisition.
+        // Ordinary writes remain blocked, and shutdown still joins all work.
+        self.wait(false).await;
+    }
+
+    async fn wait(&self, include_managed: bool) {
         loop {
             let notified = self.0.terminal.notified();
             // Register before inspecting state to avoid missing the transition.
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if !matches!(self.0.state.lock().unwrap().phase, Phase::Running { .. }) {
+            if !matches!(self.0.state.lock().unwrap().phase, Phase::Running { managed, .. } if include_managed || !managed)
+            {
                 return;
             }
             notified.await;
@@ -218,5 +257,31 @@ impl LocalExecutor {
         if let Some(worker) = worker {
             let _ = worker.await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn recovery_drain_does_not_wait_for_a_manager_lock_held_by_its_caller() {
+        let executor = LocalExecutor::for_serialized_writers();
+        let (release, wait) = oneshot::channel();
+        let ticket = executor
+            .reconcile(|_| async move {
+                let _ = wait.await;
+                Completion::new(Outcome::Completed, "startup_reconciled")
+            })
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            executor.wait_writer(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(executor.available(), Err(AdmissionError::Busy));
+        release.send(()).unwrap();
+        ticket.wait().await.unwrap();
+        assert_eq!(executor.available(), Ok(()));
     }
 }

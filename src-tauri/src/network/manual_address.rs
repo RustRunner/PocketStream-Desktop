@@ -223,6 +223,11 @@ impl NetworkManager {
             return tx.reply(self, config, &HashSet::new());
         };
         tx.trace.phase("admission");
+        if let Err(error) = self.address_io.check_writes_available() {
+            tx.outcome = AddressOutcome::Busy;
+            tx.reason = Some(error.to_string());
+            return tx.reply(self, config, &HashSet::new());
+        }
         let result = match self.validate_operation_context(config, &tx, &fence) {
             Ok(()) => {
                 self.run_address_operation(config, request, &fence, &mut tx)
@@ -279,9 +284,11 @@ impl NetworkManager {
         let remove_saved = matches!(&request, AddressRequest::RemoveSaved { .. });
         let (add, alias, mask) = match request {
             AddressRequest::Add { name, ip, mask } => {
-                ip.parse::<Ipv4Addr>()
+                let parsed = ip
+                    .parse::<Ipv4Addr>()
                     .map_err(|_| AppError::Network("Invalid IPv4 address".into()))?;
                 tx.prefix = Some(ip_config::mask_to_prefix(&mask)?);
+                crate::validation::validate_host(parsed, tx.prefix.unwrap())?;
                 tx.address = ip;
                 let rows: Vec<_> = settings
                     .adopted_meta

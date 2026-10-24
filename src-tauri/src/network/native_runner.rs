@@ -1,5 +1,4 @@
-//! Trusted Windows child ownership. Qualification operations are deliberately
-//! read-only. A2 will supply typed native policies through this same runner.
+//! Trusted Windows child ownership. Only fixed typed policies reach this runner.
 
 use std::collections::BTreeMap;
 use std::ffi::{c_void, OsString};
@@ -15,6 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
+#[cfg(test)]
 use serde::Deserialize;
 use windows_sys::Win32::Foundation::{
     CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0,
@@ -26,7 +26,9 @@ use windows_sys::Win32::System::JobObjects::{
     TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
-use windows_sys::Win32::System::SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW};
+use windows_sys::Win32::System::SystemInformation::{
+    GetSystemDirectoryW, GetSystemWindowsDirectoryW,
+};
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
     InitializeProcThreadAttributeList, OpenProcess, ResumeThread, TerminateProcess,
@@ -88,14 +90,17 @@ fn trusted_directory(
     Ok(PathBuf::from(OsString::from_wide(&buf[..count])))
 }
 
+#[cfg(test)]
 #[derive(Clone)]
 pub(super) enum QualificationOperation {
     Echo(String),
     RequiredCmdletFailure,
     RequiredNativeFailure,
+    ProductionNativeFailure,
     ChildTree,
     FloodOutput,
 }
+#[cfg(test)]
 impl QualificationOperation {
     fn payload(&self) -> Result<Vec<u8>, &'static str> {
         let (kind, value) = match self {
@@ -103,6 +108,7 @@ impl QualificationOperation {
             Self::Echo(_) => return Err("qualification value too large"),
             Self::RequiredCmdletFailure => ("cmdlet_failure", ""),
             Self::RequiredNativeFailure => ("native_failure", ""),
+            Self::ProductionNativeFailure => ("production_native_failure", ""),
             Self::ChildTree => ("child_tree", ""),
             Self::FloodOutput => ("flood_output", ""),
         };
@@ -117,6 +123,7 @@ impl QualificationOperation {
     }
 }
 
+#[cfg(test)]
 pub(super) const QUALIFICATION_SCRIPT: &str =
     include_str!("../../tests/fixtures/native-runner-v1.ps1");
 
@@ -134,6 +141,7 @@ pub(super) struct Captured {
     pub read_failed: bool,
 }
 
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct StepResult {
@@ -161,6 +169,7 @@ pub(super) struct ProcessResult {
     pub elapsed: Duration,
 }
 impl ProcessResult {
+    #[cfg(test)]
     pub fn structured(&self) -> Result<StepResult, &'static str> {
         if self.stdout.truncated || self.stderr.truncated {
             return Err("native output truncated");
@@ -323,39 +332,85 @@ pub(super) struct NativeProcessRunner;
 impl NativeProcessRunner {
     // There is no program/script/argument/environment-map entry point. The
     // qualification operation picks one fixed source and bounded JSON input.
+    #[cfg(test)]
     pub fn run(
         operation: QualificationOperation,
         cancel: Cancellation,
         budget: Duration,
         dispatched: Option<tokio::sync::oneshot::Sender<u32>>,
     ) -> Result<ProcessResult, String> {
-        Self::run_inner(operation, cancel, budget, dispatched)
+        let payload = operation.payload().map_err(str::to_string)?;
+        let source = if matches!(operation, QualificationOperation::ProductionNativeFailure) {
+            // Only compile-time fixed source contributes to this test script.
+            // Reuse the actual production function to catch PS scope regressions.
+            let production = super::native_operations::SCRIPT;
+            let start = production
+                .find("function Native(")
+                .ok_or("missing production native helper")?;
+            let end = production[start..]
+                .find("\nfunction Check-Host(")
+                .ok_or("missing production helper boundary")?
+                + start;
+            include_str!("../../tests/fixtures/production-native-failure-v1.ps1")
+                .replace("# @PRODUCTION_NATIVE_HELPER@", &production[start..end])
+        } else {
+            QUALIFICATION_SCRIPT.to_string()
+        };
+        Self::run_inner(&source, payload, cancel, budget, dispatched)
             .map_err(|_| "Trusted native process setup or containment failed".into())
     }
 
+    pub fn run_operation(
+        operation: super::native_operations::Operation,
+        cancel: Cancellation,
+    ) -> Result<ProcessResult, String> {
+        let payload = operation.payload().map_err(|e| e.to_string())?;
+        Self::run_inner(
+            super::native_operations::SCRIPT,
+            payload,
+            cancel,
+            Duration::from_secs(30),
+            None,
+        )
+        .map_err(|error| {
+            format!(
+                "Trusted native process setup or containment failed ({:?}, Windows code {:?})",
+                error.kind(),
+                error.raw_os_error()
+            )
+        })
+    }
+
     fn run_inner(
-        operation: QualificationOperation,
+        script: &str,
+        payload: Vec<u8>,
         cancel: Cancellation,
         budget: Duration,
         dispatched: Option<tokio::sync::oneshot::Sender<u32>>,
     ) -> std::io::Result<ProcessResult> {
         let start = Instant::now();
-        let payload = operation.payload().map_err(std::io::Error::other)?;
+        if payload.len() > INPUT_CAP {
+            return Err(std::io::Error::other("native input too large"));
+        }
         let system = system_directory()?;
-        let windows = trusted_directory(GetWindowsDirectoryW)?;
+        let windows = trusted_directory(GetSystemWindowsDirectoryW)?;
         let ps = system.join("WindowsPowerShell\\v1.0\\powershell.exe");
         let application = wide(ps.as_os_str());
-        let encoded = base64::engine::general_purpose::STANDARD.encode(
-            QUALIFICATION_SCRIPT
-                .encode_utf16()
-                .flat_map(u16::to_le_bytes)
-                .collect::<Vec<_>>(),
-        );
+        // Only compile-time fixed source enters this UTF-8 bootstrap. JSON
+        // operation data stays on stdin. One base64 layer leaves room under
+        // the Windows command-line bound without transforming the script AST.
+        let encoded = base64::engine::general_purpose::STANDARD.encode(script.as_bytes());
+        let bootstrap = format!("& ([scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded}'))))");
         let mut command = wide(std::ffi::OsStr::new(&format!(
-            "\"{}\" -NoLogo -NoProfile -NonInteractive -EncodedCommand {}",
+            "\"{}\" -NoLogo -NoProfile -NonInteractive -Command \"{}\"",
             ps.display(),
-            encoded
+            bootstrap
         )));
+        if command.len() > 32767 {
+            return Err(std::io::Error::other(
+                "fixed native source exceeds command-line limit",
+            ));
+        }
         let env = BTreeMap::from([
             ("PATH", system.as_os_str().to_owned()),
             // PS 5.1 otherwise shell-opens even an absolute .exe and can

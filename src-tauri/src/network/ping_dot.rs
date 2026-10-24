@@ -19,7 +19,9 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::network::{async_cmd, DeviceRegistry};
+#[cfg(not(windows))]
+use crate::network::async_cmd;
+use crate::network::DeviceRegistry;
 
 static APP: std::sync::OnceLock<AppHandle> = std::sync::OnceLock::new();
 
@@ -96,7 +98,7 @@ pub fn start(app_handle: AppHandle, registry: Arc<DeviceRegistry>) -> PingDotHan
                     let Ok(path) = manager.camera_ready(&target, &config).await else {
                         return;
                     };
-                    let reachable = probe_bound(&target.ip, path.source).await;
+                    let reachable = probe_bound(&target.ip, path.source, path.index).await;
                     let Ok(current) = manager.camera_ready(&target, &config).await else {
                         return;
                     };
@@ -171,26 +173,45 @@ pub(crate) async fn probe(ip: &str) -> bool {
     if !super::interface::source_matches_interface(index, source) {
         return false;
     }
-    let reachable = probe_bound(ip, source).await;
+    let reachable = probe_bound(ip, source, index).await;
     reachable && !fence.is_stale() && super::route::egress_index(target).ok() == Some(index)
 }
 
-async fn probe_bound(ip: &str, source: std::net::Ipv4Addr) -> bool {
-    let timeout = PING_TIMEOUT_MS.to_string();
-    let source = source.to_string();
-    let output = async_cmd("ping")
-        .args(["-n", "1", "-w", &timeout, "-S", &source, ip])
-        .output()
-        .await;
+async fn probe_bound(ip: &str, source: std::net::Ipv4Addr, index: u32) -> bool {
+    #[cfg(windows)]
+    {
+        let Some(target) = ip.parse().ok() else {
+            return false;
+        };
+        super::arp::bound_ping(
+            target,
+            source,
+            index,
+            std::time::Duration::from_millis(PING_TIMEOUT_MS as u64),
+        )
+        .await
+        .unwrap_or(false)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = index;
+        let timeout = PING_TIMEOUT_MS.to_string();
+        let source = source.to_string();
+        let output = async_cmd("ping")
+            .args(["-n", "1", "-w", &timeout, "-S", &source, ip])
+            .output()
+            .await;
 
-    match output {
-        Ok(o) => is_echo_reply(&String::from_utf8_lossy(&o.stdout)),
-        Err(_) => false,
+        match output {
+            Ok(o) => is_echo_reply(&String::from_utf8_lossy(&o.stdout)),
+            Err(_) => false,
+        }
     }
 }
 
 /// True only for output containing a genuine echo reply. See `probe`
 /// for why `TTL=` and not `Reply from`.
+#[cfg(any(not(windows), test))]
 fn is_echo_reply(stdout: &str) -> bool {
     stdout.contains("TTL=")
 }

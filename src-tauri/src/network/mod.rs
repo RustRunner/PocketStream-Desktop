@@ -23,16 +23,16 @@ pub mod route;
 pub mod scanner;
 pub mod watcher;
 
-// Prerequisite fixtures exercise these primitives before A2 entry-point
-// integration. They do not construct NetworkManager or mutate native adapters.
-#[cfg(all(test, windows))]
-mod host_owner;
-#[cfg(all(test, windows))]
+#[cfg(windows)]
+pub(crate) mod host_owner;
+#[cfg(windows)]
 mod local_executor;
+#[cfg(windows)]
+pub(crate) mod native_operations;
 #[cfg(all(test, windows))]
 #[path = "../../tests/fixtures/native_foundation.rs"]
 mod native_qualification;
-#[cfg(all(test, windows))]
+#[cfg(windows)]
 mod native_runner;
 
 use std::collections::{HashMap, HashSet};
@@ -123,8 +123,8 @@ struct AutoAdoptHandle {
 }
 
 /// How long a cooperative auto-adopt stop waits for the loop to exit before
-/// aborting it. Abort is safe because the add/remove children are
-/// kill-on-drop, so the dropped future takes any in-flight child with it.
+/// aborting its caller. The executor retains the child/job and write barrier
+/// until native completion/observation; pending intent survives uncertainty.
 const AUTO_ADOPT_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Handle to the capture-health watchdog. Like [`AutoAdoptHandle`], the
@@ -144,7 +144,8 @@ const WATCHDOG_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// ping + up to a 10 s neighbor lookup) across up to 11 candidates, so the
 /// natural worst case is tens of seconds; 45 s bounds a pathological run
 /// without thrashing the cooldown on a merely slow box. On timeout the adopt
-/// future is dropped (killing its child) and its pending IPs are reconciled.
+/// caller is dropped (requesting cancellation). Its child is drained before
+/// cleanup; uncertain effects keep conflicting writes blocked for recovery.
 const ADOPT_MAX_TOTAL: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// Settle delay before an adoption is announced finished, covering the NIC
@@ -1241,10 +1242,11 @@ async fn attempt_adoption(
 
     match outcome {
         Err(_elapsed) => {
-            // ADOPT_MAX_TOTAL hit: the adopt future is dropped now, so
-            // kill-on-drop took any in-flight child. Reconcile whatever
-            // it bound and re-arm the cooldown. Logged distinctly so the
-            // bound can be retuned from field data.
+            // Dropping the caller requests cancellation. Drain the executor
+            // before attempting cleanup; an uncertain result retains its
+            // barrier and durable intent rather than authorizing a retry.
+            #[cfg(windows)]
+            native_operations::drain().await;
             log::warn!(
                 "Adoption of {} exceeded the {}s bound (elapsed {}s) — dropped and reconciling",
                 device_subnet,
@@ -2073,6 +2075,16 @@ async fn watchdog_ladder(
 }
 
 impl interface::AddressIo for interface::RealAddressIo {
+    fn check_writes_available(&self) -> Result<(), AppError> {
+        #[cfg(windows)]
+        {
+            native_operations::check_writes_available()
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(())
+        }
+    }
     fn native(&self) -> interface::AddressFuture<'_, Vec<interface::NativeAdapter>> {
         Box::pin(async {
             tokio::task::spawn_blocking(|| {
@@ -2193,6 +2205,9 @@ struct AddressOps<'a>(
     Option<&'a interface::NativeAdapter>,
 );
 impl auto_adopt::AdoptOps for AddressOps<'_> {
+    fn check_writes_available(&self) -> Result<(), AppError> {
+        self.0.check_writes_available()
+    }
     async fn observe(&self, alias: &str) -> Result<InterfaceInfo, AppError> {
         let all = interface::read_native_with(self.0).await?;
         let native = interface::native_by_alias(&all, alias)?;
@@ -2594,6 +2609,8 @@ impl NetworkManager {
         request: ModeTransition,
     ) -> Result<ModeTransitionReply, AppError> {
         use crate::config::NetworkMode;
+        #[cfg(windows)]
+        native_operations::check_writes_available()?;
         let _op = self.discovery_op.lock().await;
         let iface = self.selected_write_adapter(config, &request.name).await?;
         // The warning response precedes even cancellation or a config mutation.
@@ -2634,6 +2651,8 @@ impl NetworkManager {
         }
         let address = self.address_work.lock().await;
         let result = async {
+            #[cfg(windows)]
+            native_operations::check_writes_available()?;
             // Refresh identity after waiting for in-flight scratch cleanup.
             let before = self.operation_snapshot(config).await?;
             if before.selected.alias != request.name
@@ -2699,7 +2718,11 @@ impl NetworkManager {
             }
         }
         self.hydrate_manual_nodes(config).await;
-        if mode != NetworkMode::StaticManual && crate::is_discovery_available() {
+        #[cfg(windows)]
+        let resume = !native_operations::request_canceled();
+        #[cfg(not(windows))]
+        let resume = true;
+        if resume && mode != NetworkMode::StaticManual && crate::is_discovery_available() {
             if let Err(e) = self
                 .start_arp_discovery_body(&iface.name, config, app.clone(), false, preserve_capture)
                 .await
@@ -2708,7 +2731,9 @@ impl NetworkManager {
             }
         }
         self.presence.bootstrap();
-        self.start_ping_dot(app).await;
+        if resume {
+            self.start_ping_dot(app).await;
+        }
         result?;
         Ok(ModeTransitionReply {
             warning: None,
@@ -2859,6 +2884,18 @@ impl NetworkManager {
         }
     }
 
+    #[cfg(windows)]
+    pub(super) fn hydrate_adoption_history(&self, config: &crate::config::AppConfig) {
+        let mut history = self.adopted_meta.lock().unwrap_or_else(|p| p.into_inner());
+        for (subnet, mut row) in config.get().adopted_meta {
+            row.last_error = Some(
+                "Waiting for native startup reconciliation; network changes remain unavailable"
+                    .into(),
+            );
+            history.insert(subnet, row);
+        }
+    }
+
     fn address_fence(&self) -> SweepFence {
         SweepFence::new(
             self.address_generation.load(Ordering::Acquire),
@@ -2930,6 +2967,7 @@ impl NetworkManager {
         session: &SweepFence,
         address: &SweepFence,
     ) -> Result<(), AppError> {
+        self.address_io.check_writes_available()?;
         let Some(row) = config.get().adopted_meta.get(subnet).cloned() else {
             return Ok(());
         };
@@ -2978,6 +3016,9 @@ impl NetworkManager {
         config: &crate::config::AppConfig,
         trace: Option<&AddressTrace>,
     ) {
+        if self.address_io.check_writes_available().is_err() {
+            return;
+        }
         let settings = config.get();
         let snapshot = self.operation_snapshot_traced(config, trace).await;
         if let Some(t) = trace {
@@ -3252,6 +3293,7 @@ impl NetworkManager {
         app: &tauri::AppHandle,
         mac: &str,
     ) -> Result<AdapterSelection, AppError> {
+        self.address_io.check_writes_available()?;
         {
             let _op = self.discovery_op.lock().await;
             let list = self.list_interfaces().await?;
@@ -3261,7 +3303,13 @@ impl NetworkManager {
             config.set_selected_adapter_mac(adapter_mac(&iface.mac).unwrap())?;
             self.resolve_adapter_locked(config, &list).await?;
         }
-        self.start_selected_adapter(config, app).await;
+        #[cfg(windows)]
+        let resume = !native_operations::request_canceled();
+        #[cfg(not(windows))]
+        let resume = true;
+        if resume {
+            self.start_selected_adapter(config, app).await;
+        }
         self.get_adapter_selection(config).await
     }
 
@@ -4161,6 +4209,10 @@ impl NetworkManager {
                     address_active.clone(),
                 );
                 let _address = address_work_for_adopt.lock().await;
+                #[cfg(windows)]
+                if native_operations::check_writes_available().is_err() {
+                    continue;
+                }
                 if next_address_fence.is_stale() {
                     continue;
                 }
@@ -4572,9 +4624,8 @@ impl NetworkManager {
         if let Some(h) = self.auto_adopt_handle.lock().await.take() {
             // Cooperative stop: ask the loop to exit at a select! point so an
             // in-flight adoption rolls back cleanly, then join with a bound.
-            // Abort only if it doesn't exit in time — safe because the
-            // add/remove children are kill-on-drop, so dropping the future
-            // takes any in-flight child with it.
+            // Abort only the caller on expiry. Its executor owns/drains the
+            // child tree and retains any uncertain result independently.
             let _ = h.shutdown.send(true);
             let abort = h.join.abort_handle();
             match tokio::time::timeout(AUTO_ADOPT_STOP_TIMEOUT, h.join).await {
@@ -4610,6 +4661,8 @@ impl NetworkManager {
         // Reconcile any secondary IP the (now-stopped) adoption left bound
         // but unrecorded — scratch probes and final adds that never reached
         // adopted_ips. Best-effort; failures are logged and retried next stop.
+        #[cfg(windows)]
+        native_operations::drain().await;
         if let Ok(_address) = self.address_work.try_lock() {
             let app = self.capture_signal.lock().await.app.clone();
             if let Some(app) = app {
@@ -4765,12 +4818,21 @@ impl NetworkManager {
     /// Only scratch and uncommitted final adds belong to shutdown cleanup.
     /// Committed addresses remain in Windows and in config, including APIPA.
     pub async fn cleanup_adopted_ips(&self, config: &crate::config::AppConfig) {
+        // Stop producers before cleanup; the executor retains a dropped
+        // request's child tree and barrier until the result is drained.
+        let _op = self.discovery_op.lock().await;
+        self.stop_locked().await;
+        #[cfg(windows)]
+        native_operations::drain().await;
         let _pause = self.pause_addresses();
         let _address = self.address_work.lock().await;
         self.reconcile_temporary_locked(config).await;
     }
 
     async fn reconcile_temporary_locked(&self, config: &crate::config::AppConfig) {
+        if self.address_io.check_writes_available().is_err() {
+            return;
+        }
         use auto_adopt::AdoptOps;
         let saved = config.get().pending_addresses;
         if saved.is_empty() {
@@ -4965,18 +5027,28 @@ async fn ping_sweep_subnets(interface_ips: &[String], fence: &SweepFence, app: &
             if fence.is_stale() || adapter_fence.is_stale() {
                 return;
             }
+            #[cfg(not(windows))]
             let source = ip_str.clone();
             join_set.spawn(async move {
                 let _permit = permit;
-                let mut command = async_cmd("ping");
-                command.kill_on_drop(true);
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    command
-                        .args(["-n", "1", "-w", "200", "-S", &source, &target.to_string()])
-                        .output(),
-                )
-                .await;
+                #[cfg(windows)]
+                {
+                    let _ =
+                        arp::bound_ping(target, ip, index, std::time::Duration::from_millis(200))
+                            .await;
+                }
+                #[cfg(not(windows))]
+                {
+                    let mut command = async_cmd("ping");
+                    command.kill_on_drop(true);
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        command
+                            .args(["-n", "1", "-w", "200", "-S", &source, &target.to_string()])
+                            .output(),
+                    )
+                    .await;
+                }
             });
         }
     }

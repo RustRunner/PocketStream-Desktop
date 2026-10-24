@@ -51,126 +51,79 @@ async fn assign_windows(
     assign_windows_with(&WindowsIpOps, interface, ip, subnet_mask, gateway, expected).await
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(windows)]
 trait StaticIpOps {
     async fn snapshot(&self, interface: &str) -> Result<super::interface::NativeAdapter, AppError>;
-    async fn gateway(&self, interface: &str) -> Result<Option<String>, AppError>;
-    async fn command(&self, args: &[&str]) -> Result<String, AppError>;
+    async fn apply(
+        &self,
+        adapter: &super::interface::NativeAdapter,
+        ip: &str,
+        prefix: u8,
+    ) -> Result<(), AppError>;
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(windows)]
 struct WindowsIpOps;
-
-#[cfg(target_os = "windows")]
+#[cfg(windows)]
 impl StaticIpOps for WindowsIpOps {
     async fn snapshot(&self, interface: &str) -> Result<super::interface::NativeAdapter, AppError> {
-        Ok(
-            super::interface::native_by_alias(&super::interface::read_native().await?, interface)?
-                .clone(),
-        )
+        let all = super::interface::read_native().await?;
+        Ok(super::interface::native_by_alias(&all, interface)?.clone())
     }
-    async fn gateway(&self, interface: &str) -> Result<Option<String>, AppError> {
-        current_default_gateway(interface).await
-    }
-    async fn command(&self, args: &[&str]) -> Result<String, AppError> {
-        run_command("netsh", args).await
+    async fn apply(
+        &self,
+        adapter: &super::interface::NativeAdapter,
+        ip: &str,
+        prefix: u8,
+    ) -> Result<(), AppError> {
+        super::native_operations::execute(super::native_operations::Operation::static_address(
+            adapter, ip, prefix,
+        )?)
+        .await
     }
 }
-
-#[cfg(target_os = "windows")]
+#[cfg(windows)]
 async fn assign_windows_with(
     ops: &impl StaticIpOps,
     interface: &str,
     ip: &str,
-    subnet_mask: &str,
+    mask: &str,
     gateway: Option<&str>,
     expected: &super::interface::NativeIdentity,
 ) -> Result<(), AppError> {
-    // Snapshot BEFORE the set. Propagate a snapshot failure instead of
-    // treating it as an empty adapter: the old unwrap_or_default() would
-    // then re-add nothing, silently wiping every secondary (including the
-    // adopted rescue IP) when the set below replaces all addresses.
-    // Preserve the existing default gateway when the caller didn't
-    // specify one. `netsh set address ... static <ip> <mask>` with no
-    // gateway argument CLEARS the interface's default gateway, so a
-    // re-apply that left the gateway field blank (e.g. just to flip
-    // program mode) would silently drop the configured gateway and
-    // with it off-subnet connectivity. Look the current one up and
-    // feed it back in. An explicit gateway from the caller still wins.
-    let preserved_gw: Option<String> = if gateway.is_none() {
-        ops.gateway(interface).await?
-    } else {
-        None
-    };
-    let effective_gw: Option<&str> = gateway.or(preserved_gw.as_deref());
-
-    let info = ops.snapshot(interface).await?;
-    if info.identity() != *expected {
+    let prefix = mask_to_prefix(mask)?;
+    let address = ip
+        .parse()
+        .map_err(|_| AppError::Network("Invalid static address".into()))?;
+    super::native_operations::validate_host(address, prefix)?;
+    let before = ops.snapshot(interface).await?;
+    if before.identity() != *expected {
         return Err(AppError::Network(
             "Selected adapter changed before primary write".into(),
         ));
     }
-    let to_restore: Vec<_> = info
-        .ips
-        .into_iter()
-        .filter(|sec| sec.address != ip)
-        .collect();
-
-    // Set primary static IP (replaces all existing IPs)
-    let mut args = vec![
-        "interface",
-        "ip",
-        "set",
-        "address",
-        interface,
-        "static",
-        ip,
-        subnet_mask,
-    ];
-    if let Some(gw) = effective_gw {
-        args.push(gw);
+    // A never accepts a new caller-selected gateway. The fixed native policy
+    // re-snapshots and preserves the compatible actual gateway in its worker.
+    if gateway.is_some_and(|gw| !before.gateways.iter().any(|native| native == gw)) {
+        return Err(AppError::Network(
+            "Gateway changes are unsupported; preserve the current Windows gateway".into(),
+        ));
     }
-    ops.command(&args).await?;
-
-    // Drain every restore even after an error. No detached task may keep
-    // changing addresses after the transition releases its serialization lock.
-    let mut first_error = None;
-    for sec in &to_restore {
-        let mask = prefix_to_mask(sec.prefix);
-        let name_arg = format!("name={}", interface);
-        if let Err(error) = ops
-            .command(&[
-                "interface",
-                "ip",
-                "add",
-                "address",
-                &name_arg,
-                &sec.address,
-                &mask,
-            ])
-            .await
-        {
-            first_error.get_or_insert(error);
-        }
+    if before.gateways.len() > 1
+        || before.gateways.iter().any(|gateway| {
+            gateway.parse::<std::net::Ipv4Addr>().map_or(true, |gw| {
+                gw == address
+                    || !ipnetwork::Ipv4Network::new(address, prefix)
+                        .unwrap()
+                        .contains(gw)
+            })
+        })
+    {
+        return Err(AppError::Network(
+            "Current default gateway cannot be preserved on the requested subnet".into(),
+        ));
     }
-    first_error.map_or(Ok(()), Err)
-}
-
-/// The interface's current IPv4 default gateway, if it has one.
-///
-/// Native IP Helper data keeps operation reads free of PowerShell/CIM. A
-/// valid empty gateway list is distinct from a failed or ambiguous query.
-#[cfg(target_os = "windows")]
-async fn current_default_gateway(interface: &str) -> Result<Option<String>, AppError> {
-    let native = super::interface::read_native().await?;
-    let adapter = super::interface::native_by_alias(&native, interface)?;
-    match adapter.gateways.as_slice() {
-        [] => Ok(None),
-        [gateway] => Ok(Some(gateway.clone())),
-        _ => Err(AppError::Network(
-            "Multiple IPv4 gateways; enter the intended gateway explicitly".into(),
-        )),
-    }
+    ops.apply(&before, ip, prefix).await
 }
 
 /// Convert a CIDR prefix length to a dotted subnet mask.
@@ -223,12 +176,14 @@ async fn assign_linux(
 /// `New-NetIPAddress` and `netsh delete address` normally return in well
 /// under a second; 30 s is a generous ceiling that turns a genuine hang
 /// into an error instead of a wedged adoption.
+#[cfg(not(windows))]
 const IP_CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Run a command with the default `IP_CMD_TIMEOUT` bound. Delegates to
 /// `run_command_killable` so every caller inherits kill-on-drop and the
 /// timeout — a hung child surfaces as an error instead of wedging the
 /// caller and leaking the process.
+#[cfg(not(windows))]
 pub(crate) async fn run_command(program: &str, args: &[&str]) -> Result<String, AppError> {
     run_command_killable(program, args, IP_CMD_TIMEOUT).await
 }
@@ -241,6 +196,7 @@ pub(crate) async fn run_command(program: &str, args: &[&str]) -> Result<String, 
 /// after reconciliation has already swept, which would be an untracked-IP
 /// leak the pending registry could not catch. The timeout is a
 /// complementary guard against a single hung invocation.
+#[cfg(not(windows))]
 pub(crate) async fn run_command_killable(
     program: &str,
     args: &[&str],
@@ -263,6 +219,7 @@ pub(crate) async fn run_command_killable(
     process_command_output(program, output)
 }
 
+#[cfg(not(windows))]
 fn process_command_output(program: &str, output: std::process::Output) -> Result<String, AppError> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -325,19 +282,13 @@ pub async fn add_secondary_ip(interface: &str, ip: &str, mask: &str) -> Result<(
         ));
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(windows)]
     {
-        let escaped = interface.replace('\'', "''");
-        let script = format!(
-            "New-NetIPAddress -InterfaceAlias '{}' -IPAddress '{}' -PrefixLength {} \
-             -ErrorAction Stop | Out-Null",
-            escaped, ip, prefix
-        );
-        run_command_killable(
-            "powershell",
-            &["-NoProfile", "-Command", &script],
-            IP_CMD_TIMEOUT,
-        )
+        let all = super::interface::read_native().await?;
+        let adapter = super::interface::native_by_alias(&all, interface)?;
+        super::native_operations::execute(super::native_operations::Operation::address(
+            adapter, ip, prefix, true, true,
+        )?)
         .await?;
     }
 
@@ -374,81 +325,11 @@ pub async fn set_dhcp(interface: &str) -> Result<(), AppError> {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(windows)]
 async fn set_dhcp_windows(interface: &str) -> Result<(), AppError> {
-    use tokio::time::{timeout, Duration};
-
-    let escaped = interface.replace('\'', "''");
-
-    // Multi-step: drop existing manual IPv4 addresses (DHCP doesn't displace
-    // them on its own), drop any static default route (a gateway set via
-    // `netsh set address` persists across the DHCP flip and — often at lower
-    // metric than the DHCP-provided route — blackholes all off-subnet
-    // traffic), flip the interface to DHCP, reset DNS to auto, then force an
-    // immediate lease renewal so the new state is visible right away.
-    // ErrorAction SilentlyContinue on the cleanup steps so an already-DHCP
-    // adapter with no manual IPs or static route doesn't fail the whole
-    // script.
-    let inner_script = format!(
-        "$alias='{}'; \
-         Get-NetIPAddress -InterfaceAlias $alias -AddressFamily IPv4 -PrefixOrigin Manual -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue; \
-         Remove-NetRoute -InterfaceAlias $alias -AddressFamily IPv4 -DestinationPrefix 0.0.0.0/0 -Confirm:$false -ErrorAction SilentlyContinue; \
-         Set-NetIPInterface -InterfaceAlias $alias -Dhcp Enabled; \
-         Set-DnsClientServerAddress -InterfaceAlias $alias -ResetServerAddresses; \
-         ipconfig /renew $alias | Out-Null",
-        escaped
-    );
-
-    // Fast path: try unelevated first. kill_on_drop matters here: the
-    // timeout below drops this future, and without it the orphaned
-    // PowerShell would keep mutating the adapter concurrently with the
-    // elevated attempt that follows.
-    let direct = super::async_cmd("powershell")
-        .args(["-NoProfile", "-Command", &inner_script])
-        .kill_on_drop(true)
-        .output();
-    if let Ok(Ok(out)) = timeout(Duration::from_secs(30), direct).await {
-        if out.status.success() {
-            log::info!("Switched '{}' to DHCP (unelevated)", interface);
-            return Ok(());
-        }
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        log::info!(
-            "Unelevated DHCP set failed, attempting elevation: {}",
-            stderr.trim()
-        );
-    }
-
-    // Slow path: spawn an elevated PowerShell via Start-Process -Verb RunAs.
-    // Double every single-quote inside the inner script so the outer
-    // PowerShell parser passes the original script through unchanged.
-    let inner_for_arglist = inner_script.replace('\'', "''");
-    let elevated_cmd = format!(
-        "$ErrorActionPreference='Stop'; \
-         Start-Process powershell.exe -Verb RunAs -WindowStyle Hidden -Wait \
-         -ArgumentList '-NoProfile','-Command','{}'",
-        inner_for_arglist
-    );
-    let elevated = super::async_cmd("powershell")
-        .args(["-NoProfile", "-Command", &elevated_cmd])
-        .kill_on_drop(true)
-        .output();
-
-    let out = timeout(Duration::from_secs(60), elevated)
-        .await
-        .map_err(|_| AppError::Network("DHCP toggle timed out after 60s".into()))?
-        .map_err(|e| AppError::Network(format!("Failed to launch elevation: {}", e)))?;
-
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(AppError::Network(format!(
-            "DHCP toggle failed (UAC may have been declined): {}",
-            stderr.trim()
-        )));
-    }
-
-    log::info!("Switched '{}' to DHCP (elevated)", interface);
-    Ok(())
+    let all = super::interface::read_native().await?;
+    let adapter = super::interface::native_by_alias(&all, interface)?;
+    super::native_operations::execute(super::native_operations::Operation::dhcp(adapter)?).await
 }
 
 /// Read whether the interface is currently in DHCP mode for IPv4. No admin
@@ -500,13 +381,9 @@ pub(super) async fn add_native_address(
     }
     #[cfg(windows)]
     {
-        let escaped = adapter.alias.replace('\'', "''");
-        let script = format!("New-NetIPAddress -InterfaceAlias '{escaped}' -IPAddress '{ip}' -PrefixLength {prefix} -ErrorAction Stop | Out-Null");
-        run_command_killable(
-            "powershell",
-            &["-NoProfile", "-Command", &script],
-            IP_CMD_TIMEOUT,
-        )
+        super::native_operations::execute(super::native_operations::Operation::address(
+            adapter, ip, prefix, true, false,
+        )?)
         .await?;
     }
     #[cfg(not(windows))]
@@ -535,14 +412,21 @@ pub(super) async fn remove_native_address(
     validate_native_writer(adapter)?;
     #[cfg(windows)]
     {
-        let name = format!("name={}", adapter.alias);
-        run_command_killable(
-            "netsh",
-            &["interface", "ip", "delete", "address", &name, ip],
-            IP_CMD_TIMEOUT,
-        )
-        .await?;
-        Ok(())
+        // Removal uses the exact observed prefix, including existing APIPA.
+        let prefix = adapter
+            .ips
+            .iter()
+            .find(|a| a.address == ip)
+            .map(|a| a.prefix)
+            .ok_or_else(|| {
+                AppError::Network(
+                    "Address removal requires a current address/prefix observation".into(),
+                )
+            })?;
+        super::native_operations::execute(super::native_operations::Operation::address(
+            adapter, ip, prefix, false, false,
+        )?)
+        .await
     }
     #[cfg(not(windows))]
     {
@@ -554,15 +438,14 @@ pub async fn remove_secondary_ip(interface: &str, ip: &str) -> Result<(), AppErr
     super::interface::validate_interface_name(interface).await?;
     validate_ip(ip)?;
 
-    #[cfg(target_os = "windows")]
+    #[cfg(windows)]
     {
-        let name_arg = format!("name={}", interface);
-        run_command_killable(
-            "netsh",
-            &["interface", "ip", "delete", "address", &name_arg, ip],
-            IP_CMD_TIMEOUT,
-        )
-        .await?;
+        let all = super::interface::read_native().await?;
+        let adapter = super::interface::native_by_alias(&all, interface)?;
+        // A successful absence is idempotent; a failed query never becomes absence.
+        if adapter.ips.iter().any(|a| a.address == ip) {
+            remove_native_address(adapter, ip).await?;
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -605,15 +488,17 @@ mod tests {
                 Ok(self.metadata.clone())
             }
         }
-        async fn gateway(&self, _: &str) -> Result<Option<String>, AppError> {
-            Ok(Some("192.0.2.1".into()))
-        }
-        async fn command(&self, args: &[&str]) -> Result<String, AppError> {
+        async fn apply(
+            &self,
+            _adapter: &super::super::interface::NativeAdapter,
+            ip: &str,
+            prefix: u8,
+        ) -> Result<(), AppError> {
             self.commands
                 .lock()
                 .unwrap()
-                .push(args.iter().map(|s| s.to_string()).collect());
-            Ok(String::new())
+                .push(vec![ip.into(), prefix.to_string()]);
+            Ok(())
         }
     }
 
@@ -665,31 +550,7 @@ mod tests {
                 );
             } else {
                 result.unwrap();
-                assert_eq!(
-                    *commands,
-                    vec![
-                        vec![
-                            "interface",
-                            "ip",
-                            "set",
-                            "address",
-                            "Ethernet",
-                            "static",
-                            "192.0.2.20",
-                            "255.255.255.0",
-                            "192.0.2.1"
-                        ],
-                        vec![
-                            "interface",
-                            "ip",
-                            "add",
-                            "address",
-                            "name=Ethernet",
-                            "198.51.100.99",
-                            "255.255.255.0"
-                        ],
-                    ]
-                );
+                assert_eq!(*commands, vec![vec!["192.0.2.20", "24"]]);
             }
         }
     }

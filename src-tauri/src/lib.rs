@@ -333,7 +333,57 @@ fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 pub fn run() {
+    // This precedes profile loading, log/config writes, capture and all native
+    // operations. Fresh mutex creation is never a clean-shutdown signal.
+    #[cfg(windows)]
+    let _host_owner = {
+        use network::host_owner::{MachineGuard, OwnershipError, Role};
+        use std::time::Duration;
+        let acquire = || {
+            let install = MachineGuard::acquire(Role::Installation, Duration::from_millis(250))
+                .map_err(|error| ("PocketStream installation is busy", error))?;
+            let owner = MachineGuard::acquire(Role::Host, Duration::ZERO).map_err(|error| {
+                (
+                    if error == OwnershipError::Busy {
+                        "PocketStream is already running"
+                    } else {
+                        "PocketStream cannot safely acquire network ownership"
+                    },
+                    error,
+                )
+            })?;
+            drop(install);
+            Ok::<_, (&str, OwnershipError)>(owner)
+        };
+        match acquire() {
+            Ok(owner) => owner,
+            Err((message, error)) => {
+                eprintln!("{message}: {error:?}");
+                let text: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
+                let title: Vec<u16> = "PocketStream Desktop"
+                    .encode_utf16()
+                    .chain(Some(0))
+                    .collect();
+                unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
+                        std::ptr::null_mut(),
+                        text.as_ptr(),
+                        title.as_ptr(),
+                        windows_sys::Win32::UI::WindowsAndMessaging::MB_OK
+                            | windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONINFORMATION,
+                    );
+                }
+                return;
+            }
+        }
+    };
     setup_logging();
+    #[cfg(windows)]
+    log::info!(
+        "Host network ownership acquired: new={} abandoned={}; startup reconciliation required",
+        _host_owner.acquisition.newly_created,
+        _host_owner.acquisition.abandoned
+    );
 
     // Version banner — first line of every session so a log file (which
     // survives across launches and silent auto-updates) can always be
@@ -488,6 +538,11 @@ pub fn run() {
                 manager.hydrate_device_registry(&config).await;
                 manager.hydrate_manual_nodes(&config).await;
                 manager.start_presence(handle.clone()).await;
+                #[cfg(windows)]
+                if let Err(error) = network::native_operations::startup_reconcile(handle.clone()).await {
+                    log::warn!("{error}");
+                }
+                #[cfg(not(windows))]
                 manager.load_adopted_from_config(&config, &handle).await;
 
                 match manager.get_adapter_selection(&config).await {
@@ -599,6 +654,17 @@ pub fn run() {
                         manager.cleanup_adopted_ips(&app_handle.state::<config::AppConfig>()),
                     )
                     .await
+                });
+                #[cfg(windows)]
+                tauri::async_runtime::block_on(async {
+                    network::native_operations::shutdown().await;
+                    // A retained transaction can outlive the bounded cleanup
+                    // above. Stop any producer it resumed before cancellation.
+                    manager.stop_ping_dot().await;
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        manager.cleanup_adopted_ips(&app_handle.state::<config::AppConfig>()),
+                    ).await;
                 });
             }
         });

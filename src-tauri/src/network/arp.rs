@@ -1434,7 +1434,19 @@ fn resolved_neighbor_mac(
 /// on a German or French Windows the old parser matched nothing and
 /// silently returned no neighbors.
 pub async fn read_system_arp_table(interface_ip: &str) -> Vec<(Ipv4Addr, String)> {
-    let script = format!(
+    #[cfg(windows)]
+    {
+        let Some(source) = interface_ip.parse::<Ipv4Addr>().ok() else {
+            return vec![];
+        };
+        native_neighbors(source).await.unwrap_or_else(|error| {
+            log::warn!("Neighbor observation unavailable: {error}");
+            vec![]
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let script = format!(
         "$idx=(Get-NetIPAddress -IPAddress '{ip}' -AddressFamily IPv4 -ErrorAction SilentlyContinue \
          | Select-Object -First 1).InterfaceIndex; \
          if ($null -ne $idx) {{ Get-NetNeighbor -AddressFamily IPv4 -InterfaceIndex $idx \
@@ -1442,18 +1454,20 @@ pub async fn read_system_arp_table(interface_ip: &str) -> Vec<(Ipv4Addr, String)
          | ConvertTo-Json -Compress }}",
         ip = interface_ip.replace('\'', "''"),
     );
-    let stdout = match run_powershell(&script).await {
-        Some(s) => s,
-        None => return vec![],
-    };
-    let entries = parse_neighbors_json(&stdout);
-    log::debug!("Neighbors for {}: {} entries", interface_ip, entries.len());
-    entries
+        let stdout = match run_powershell(&script).await {
+            Some(s) => s,
+            None => return vec![],
+        };
+        let entries = parse_neighbors_json(&stdout);
+        log::debug!("Neighbors for {}: {} entries", interface_ip, entries.len());
+        entries
+    }
 }
 
 /// Run a PowerShell script, returning stdout on success (exit 0), or
 /// None on spawn failure, non-zero exit, or timeout. Bounded so a hung
 /// PowerShell can't wedge the caller.
+#[cfg(not(windows))]
 async fn run_powershell(script: &str) -> Option<String> {
     let fut = super::async_cmd("powershell")
         .args(["-NoProfile", "-Command", script])
@@ -1479,6 +1493,7 @@ async fn run_powershell(script: &str) -> Option<String> {
 /// Parse `Get-NetNeighbor | ConvertTo-Json` output into dynamic
 /// (IP, MAC) pairs. ConvertTo-Json emits a bare object for one row and
 /// an array for many.
+#[cfg(any(not(windows), test))]
 pub(crate) fn parse_neighbors_json(stdout: &str) -> Vec<(Ipv4Addr, String)> {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
@@ -1509,6 +1524,7 @@ pub(crate) fn parse_neighbors_json(stdout: &str) -> Vec<(Ipv4Addr, String)> {
 /// covers multicast/broadcast rows — matching by MAC regex would newly
 /// admit those) and 0=Unreachable / 1=Incomplete (no usable MAC).
 /// Accepts either the numeric serialization or the invariant enum name.
+#[cfg(any(not(windows), test))]
 fn neighbor_state_is_dynamic(state: &serde_json::Value) -> bool {
     if let Some(n) = state.as_u64() {
         return (2..=5).contains(&n);
@@ -1546,27 +1562,209 @@ pub async fn send_arp_probe(
     source: Option<Ipv4Addr>,
     timeout: std::time::Duration,
 ) -> Result<bool, AppError> {
-    let timeout_ms = timeout.as_millis().to_string();
-    let target_str = target_ip.to_string();
-    let source_str = source.map(|s| s.to_string());
-    let mut ping_args = vec!["-n", "1", "-w", &timeout_ms];
-    if let Some(ref src) = source_str {
-        ping_args.push("-S");
-        ping_args.push(src);
+    #[cfg(windows)]
+    {
+        let source = source.ok_or_else(|| {
+            AppError::Network("A bound source is required for the conflict probe".into())
+        })?;
+        let index = native_source_index(source).await?;
+        // A non-reply is valid ICMP data; provider/identity failures remain
+        // errors and are conservatively treated as occupied by AdoptOps.
+        let _ = bound_ping(target_ip, source, index, timeout).await?;
+        Ok(native_neighbors(source)
+            .await?
+            .iter()
+            .any(|(ip, _)| *ip == target_ip))
     }
-    ping_args.push(&target_str);
-    let _ = super::async_cmd("ping").args(&ping_args).output().await;
+    #[cfg(not(windows))]
+    {
+        let timeout_ms = timeout.as_millis().to_string();
+        let target_str = target_ip.to_string();
+        let source_str = source.map(|s| s.to_string());
+        let mut ping_args = vec!["-n", "1", "-w", &timeout_ms];
+        if let Some(ref src) = source_str {
+            ping_args.push("-S");
+            ping_args.push(src);
+        }
+        ping_args.push(&target_str);
+        let _ = super::async_cmd("ping").args(&ping_args).output().await;
 
-    let script = format!(
-        "Get-NetNeighbor -AddressFamily IPv4 -IPAddress '{ip}' -ErrorAction SilentlyContinue \
+        let script = format!(
+            "Get-NetNeighbor -AddressFamily IPv4 -IPAddress '{ip}' -ErrorAction SilentlyContinue \
          | Select-Object IPAddress,LinkLayerAddress,State | ConvertTo-Json -Compress",
-        ip = target_ip
-    );
-    let stdout = run_powershell(&script)
-        .await
-        .ok_or_else(|| AppError::Network("Get-NetNeighbor failed".into()))?;
+            ip = target_ip
+        );
+        let stdout = run_powershell(&script)
+            .await
+            .ok_or_else(|| AppError::Network("Get-NetNeighbor failed".into()))?;
 
-    Ok(!parse_neighbors_json(&stdout).is_empty())
+        Ok(!parse_neighbors_json(&stdout).is_empty())
+    }
+}
+
+#[cfg(windows)]
+async fn native_source_index(source: Ipv4Addr) -> Result<u32, AppError> {
+    let all = super::interface::read_native().await?;
+    let owners: Vec<_> = all
+        .iter()
+        .filter(|a| a.ips.iter().any(|ip| ip.address == source.to_string()))
+        .collect();
+    match owners.as_slice() {
+        [owner] if owner.index != 0 => Ok(owner.index),
+        _ => Err(AppError::Network(
+            "Neighbor source ownership is unavailable or ambiguous".into(),
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn cached_neighbor(
+    row: &windows_sys::Win32::NetworkManagement::IpHelper::MIB_IPNET_ROW2,
+    index: u32,
+) -> Option<(Ipv4Addr, String)> {
+    use windows_sys::Win32::Networking::WinSock::AF_INET;
+    if row.InterfaceIndex != index
+        || unsafe { row.Address.si_family } != AF_INET
+        || !(2..=5).contains(&row.State)
+        || row.PhysicalAddressLength != 6
+    {
+        return None;
+    }
+    let mac: [u8; 6] = row.PhysicalAddress[..6].try_into().ok()?;
+    if mac == [0; 6] || mac[0] & 1 != 0 {
+        return None;
+    }
+    let ip = Ipv4Addr::from(unsafe { row.Address.Ipv4.sin_addr.S_un.S_addr }.to_ne_bytes());
+    Some((ip, format_mac(&mac)))
+}
+
+#[cfg(windows)]
+pub(super) async fn native_neighbors(
+    source: Ipv4Addr,
+) -> Result<Vec<(Ipv4Addr, String)>, AppError> {
+    let index = native_source_index(source).await?;
+    tokio::task::spawn_blocking(move || {
+        use windows_sys::Win32::Foundation::ERROR_NOT_FOUND;
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            FreeMibTable, GetIpNetTable2, MIB_IPNET_TABLE2,
+        };
+        use windows_sys::Win32::Networking::WinSock::AF_INET;
+        struct Table(*mut MIB_IPNET_TABLE2);
+        impl Drop for Table {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe {
+                        FreeMibTable(self.0.cast());
+                    }
+                }
+            }
+        }
+        let mut raw = std::ptr::null_mut();
+        let status = unsafe { GetIpNetTable2(AF_INET, &mut raw) };
+        let table = Table(raw);
+        if status == ERROR_NOT_FOUND {
+            return Ok(vec![]);
+        }
+        if status != 0 || table.0.is_null() {
+            return Err(AppError::Network(format!(
+                "Native neighbor observation failed: {status}"
+            )));
+        }
+        let count = unsafe { (*table.0).NumEntries } as usize;
+        if count > 65536 {
+            return Err(AppError::Network(
+                "Native neighbor table exceeds bound".into(),
+            ));
+        }
+        let rows = unsafe {
+            std::slice::from_raw_parts(std::ptr::addr_of!((*table.0).Table).cast(), count)
+        };
+        if !super::interface::source_matches_interface(index, source) {
+            return Err(AppError::Network(
+                "Neighbor source changed during observation".into(),
+            ));
+        }
+        Ok(rows
+            .iter()
+            .filter_map(|row| cached_neighbor(row, index))
+            .collect())
+    })
+    .await
+    .map_err(|_| AppError::Network("Native neighbor observation task failed".into()))?
+}
+
+/// Bounded native ICMP avoids launching an elevated shell/ping process. The
+/// unique source and egress index are checked before and after the call.
+#[cfg(windows)]
+pub(crate) async fn bound_ping(
+    target: Ipv4Addr,
+    source: Ipv4Addr,
+    index: u32,
+    timeout: std::time::Duration,
+) -> Result<bool, AppError> {
+    crate::validation::parse_camera_ip(&target.to_string())?;
+    tokio::task::spawn_blocking(move || {
+        use windows_sys::Win32::Foundation::{GetLastError, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho2Ex, ICMP_ECHO_REPLY,
+        };
+        struct Icmp(windows_sys::Win32::Foundation::HANDLE);
+        impl Drop for Icmp {
+            fn drop(&mut self) {
+                unsafe {
+                    IcmpCloseHandle(self.0);
+                }
+            }
+        }
+        if !super::interface::source_matches_interface(index, source)
+            || super::route::egress_index(target).ok() != Some(index)
+        {
+            return Err(AppError::Network("Bound ICMP source/route changed".into()));
+        }
+        let raw = unsafe { IcmpCreateFile() };
+        if raw == INVALID_HANDLE_VALUE || raw.is_null() {
+            return Err(AppError::Network("Native ICMP handle unavailable".into()));
+        }
+        let handle = Icmp(raw);
+        let data = [0u8; 16];
+        // usize alignment satisfies the native reply structure, including x64.
+        let mut reply = [0usize; 128];
+        let count = unsafe {
+            IcmpSendEcho2Ex(
+                handle.0,
+                std::ptr::null_mut(),
+                None,
+                std::ptr::null(),
+                u32::from_ne_bytes(source.octets()),
+                u32::from_ne_bytes(target.octets()),
+                data.as_ptr().cast(),
+                data.len() as u16,
+                std::ptr::null(),
+                reply.as_mut_ptr().cast(),
+                std::mem::size_of_val(&reply) as u32,
+                timeout.as_millis().clamp(1, 2000) as u32,
+            )
+        };
+        let native_error = unsafe { GetLastError() };
+        if !super::interface::source_matches_interface(index, source)
+            || super::route::egress_index(target).ok() != Some(index)
+        {
+            return Err(AppError::Network(
+                "Bound ICMP source/route changed during probe".into(),
+            ));
+        }
+        if count == 0 {
+            let error = native_error;
+            return match error {
+                11002..=11005 | 11010 => Ok(false),
+                _ => Err(AppError::Network(format!("Native ICMP failed: {error}"))),
+            };
+        }
+        let response = unsafe { &*reply.as_ptr().cast::<ICMP_ECHO_REPLY>() };
+        Ok(response.Status == 0 && response.Address == u32::from_ne_bytes(target.octets()))
+    })
+    .await
+    .map_err(|_| AppError::Network("Native ICMP task failed".into()))?
 }
 
 #[cfg(test)]

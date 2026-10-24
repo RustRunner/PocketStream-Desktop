@@ -486,68 +486,12 @@ fn parse_adapter(a: &serde_json::Value, force_vpn: bool) -> InterfaceInfo {
 }
 
 #[cfg(target_os = "windows")]
-async fn run_adapter_query(filter: &str) -> Result<String, AppError> {
+async fn run_adapter_query() -> Result<String, AppError> {
     PROVIDER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // Include both Up and Disconnected adapters. Disconnected adapters are
-    // surfaced in the UI as "detected but no link" so users can click
-    // Reset to provoke a driver re-probe — the workaround for the Windows
-    // quirk where the adapter stays marked disconnected after plug-in
-    // until someone opens its Properties dialog.
-    let script = format!(
-        r#"Get-NetAdapter | Where-Object {{ ($_.Status -eq 'Up' -or $_.Status -eq 'Disconnected') -and {} }} | ForEach-Object {{
-            $adapter = $_
-            $ips = @(Get-NetIPAddress -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue)
-            [PSCustomObject]@{{
-                Name = $adapter.Name
-                Guid = [string]$adapter.InterfaceGuid
-                Index = $adapter.ifIndex
-                Description = $adapter.InterfaceDescription
-                MacAddress = $adapter.MacAddress
-                MediaType = $adapter.MediaType
-                PhysicalMediaType = [string]$adapter.PhysicalMediaType
-                NdisPhysicalMedium = $adapter.NdisPhysicalMedium
-                Status = $adapter.Status
-                Virtual = $adapter.Virtual
-                IPs = @($ips | ForEach-Object {{
-                    [PSCustomObject]@{{
-                        Address = $_.IPAddress
-                        PrefixLength = $_.PrefixLength
-                    }}
-                }})
-            }}
-        }} | ConvertTo-Json -Depth 3 -Compress"#,
-        filter
-    );
-    // The deadline includes the shared provider-lock wait and drops/kills
-    // the child on expiry. The snapshot also bounds its refresh-lock wait.
-    let output = with_adapter_query_lock(&ADAPTER_QUERY_LOCK, || async {
-        super::async_cmd("powershell")
-            .args(["-NoProfile", "-Command", &script])
-            .kill_on_drop(true)
-            .output()
-            .await
-            .map_err(|e| AppError::Network(format!("Failed to run PowerShell: {e}")))
+    with_adapter_query_lock(&ADAPTER_QUERY_LOCK, || {
+        super::native_operations::inventory()
     })
-    .await?;
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !stderr.is_empty() {
-        log::warn!("PowerShell stderr: {}", stderr);
-    }
-
-    // A non-zero exit must NOT be treated as an empty adapter list —
-    // that made validators fail with "Unknown network interface", the
-    // watcher emit its no-adapter sentinel, and adopted-subnet restore
-    // silently skip. Surface it as an error instead.
-    if !output.status.success() {
-        return Err(AppError::Network(format!(
-            "Adapter enumeration failed (exit {}): {}",
-            output.status.code().unwrap_or(-1),
-            stderr.trim()
-        )));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    .await
 }
 
 /// Last-logged adapter-enumeration output plus the count of identical
@@ -596,7 +540,7 @@ async fn query_adapters_windows() -> Result<Vec<InterfaceInfo>, AppError> {
     let generation = ADAPTER_SNAPSHOT
         .generation
         .load(std::sync::atomic::Ordering::Acquire);
-    let stdout = run_adapter_query("$true").await?;
+    let stdout = run_adapter_query().await?;
     {
         let mut last = LAST_ENUM_LOG
             .lock()
@@ -682,6 +626,9 @@ pub(crate) type AddressFuture<'a, T> =
 
 /// One object-safe OS seam; NetworkManager remains non-generic.
 pub(crate) trait AddressIo: Send + Sync {
+    fn check_writes_available(&self) -> Result<(), AppError> {
+        Ok(())
+    }
     fn native(&self) -> AddressFuture<'_, Vec<NativeAdapter>>;
     fn add<'a>(
         &'a self,
@@ -764,12 +711,28 @@ pub(crate) async fn read_native() -> Result<Vec<NativeAdapter>, AppError> {
     read_native_with(&RealAddressIo).await
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct NativeIdentity {
     pub guid: String,
     pub index: u32,
     pub mac: String,
     pub alias: String,
+}
+impl PartialEq for NativeIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        (&self.guid, self.index, &self.mac) == (&other.guid, other.index, &other.mac)
+    }
+}
+impl Eq for NativeIdentity {}
+impl PartialOrd for NativeIdentity {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for NativeIdentity {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (&self.guid, self.index, &self.mac).cmp(&(&other.guid, other.index, &other.mac))
+    }
 }
 fn guid_key(guid: &str) -> String {
     guid.trim_matches(['{', '}']).to_ascii_lowercase()
@@ -1391,6 +1354,7 @@ pub(super) mod address_test_io {
         pub writes: Mutex<Vec<(bool, String)>>,
         pub saves: Mutex<Vec<String>>,
         pub fail_read: AtomicBool,
+        pub writes_blocked: AtomicBool,
         pub fail_read_at: AtomicUsize,
         pub fail_save_at: AtomicUsize,
         pub delay: Mutex<std::time::Duration>,
@@ -1447,6 +1411,7 @@ pub(super) mod address_test_io {
                 writes: Mutex::new(vec![]),
                 saves: Mutex::new(vec![]),
                 fail_read: AtomicBool::new(false),
+                writes_blocked: AtomicBool::new(false),
                 fail_read_at: AtomicUsize::new(0),
                 fail_save_at: AtomicUsize::new(0),
                 delay: Mutex::new(std::time::Duration::ZERO),
@@ -1511,6 +1476,16 @@ pub(super) mod address_test_io {
         }
     }
     impl AddressIo for FakeAddressIo {
+        fn check_writes_available(&self) -> Result<(), AppError> {
+            if self
+                .writes_blocked
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                Err(AppError::Network("Fake native recovery barrier".into()))
+            } else {
+                Ok(())
+            }
+        }
         fn native(&self) -> AddressFuture<'_, Vec<NativeAdapter>> {
             let read = self.reads.fetch_add(1, Ordering::Relaxed) + 1;
             let fail = self.fail_read.load(Ordering::Relaxed)
@@ -1645,6 +1620,14 @@ mod tests {
                 1 => changed.alias = "renamed".into(),
                 2 => changed.index = 8,
                 _ => changed.index = 0,
+            }
+            if kind == 1 {
+                assert_eq!(changed.identity(), s.selected.identity());
+                assert_eq!(io.descriptor(&changed).unwrap().name, "renamed");
+                assert!(
+                    snapshot_from_native(io.as_ref(), &changed.mac.clone(), vec![changed]).is_ok()
+                );
+                continue;
             }
             assert!(io.descriptor(&changed).is_none());
             assert!(

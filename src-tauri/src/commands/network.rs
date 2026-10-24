@@ -57,9 +57,17 @@ pub async fn select_adapter(
     app: tauri::AppHandle,
     mac: String,
 ) -> Result<crate::network::AdapterSelection, AppError> {
-    let selection = manager.select_adapter(&config, &app, &mac).await?;
-    crate::network::watcher::emit_selection(&app, &selection);
-    Ok(selection)
+    #[cfg(windows)]
+    {
+        let _ = (&manager, &config);
+        crate::network::native_operations::select_request(app, mac).await
+    }
+    #[cfg(not(windows))]
+    {
+        let selection = manager.select_adapter(&config, &app, &mac).await?;
+        crate::network::watcher::emit_selection(&app, &selection);
+        Ok(selection)
+    }
 }
 
 #[tauri::command]
@@ -71,40 +79,52 @@ pub async fn list_vpn_interfaces() -> Result<Vec<InterfaceInfo>, AppError> {
 pub async fn add_secondary_ip(
     manager: State<'_, NetworkManager>,
     config: State<'_, AppConfig>,
+    app: tauri::AppHandle,
     name: String,
     ip: String,
     subnet_mask: String,
 ) -> Result<crate::network::manual_address::AddressReply, AppError> {
-    Ok(manager
-        .address_operation(
-            &config,
-            crate::network::manual_address::AddressRequest::Add {
-                name,
-                ip,
-                mask: subnet_mask,
-            },
-        )
-        .await)
+    let request = crate::network::manual_address::AddressRequest::Add {
+        name,
+        ip,
+        mask: subnet_mask,
+    };
+    #[cfg(windows)]
+    {
+        let _ = (&manager, &config);
+        crate::network::native_operations::address_request(app, request).await
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+        Ok(manager.address_operation(&config, request).await)
+    }
 }
 
 #[tauri::command]
 pub async fn remove_secondary_ip(
     manager: State<'_, NetworkManager>,
     config: State<'_, AppConfig>,
+    app: tauri::AppHandle,
     name: String,
     ip: String,
     primary: Option<bool>,
 ) -> Result<crate::network::manual_address::AddressReply, AppError> {
-    Ok(manager
-        .address_operation(
-            &config,
-            if primary.unwrap_or(false) {
-                crate::network::manual_address::AddressRequest::RemovePrimary { name, ip }
-            } else {
-                crate::network::manual_address::AddressRequest::RemoveManual { name, ip }
-            },
-        )
-        .await)
+    let request = if primary.unwrap_or(false) {
+        crate::network::manual_address::AddressRequest::RemovePrimary { name, ip }
+    } else {
+        crate::network::manual_address::AddressRequest::RemoveManual { name, ip }
+    };
+    #[cfg(windows)]
+    {
+        let _ = (&manager, &config);
+        crate::network::native_operations::address_request(app, request).await
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+        Ok(manager.address_operation(&config, request).await)
+    }
 }
 
 #[tauri::command]
@@ -127,7 +147,15 @@ pub async fn set_network_mode(
     app: tauri::AppHandle,
     request: crate::network::ModeTransition,
 ) -> Result<crate::network::ModeTransitionReply, AppError> {
-    manager.transition_mode(app, &config, request).await
+    #[cfg(windows)]
+    {
+        let _ = (&manager, &config);
+        crate::network::native_operations::mode_request(app, request).await
+    }
+    #[cfg(not(windows))]
+    {
+        manager.transition_mode(app, &config, request).await
+    }
 }
 
 // ── Manual Nodes ────────────────────────────────────────────────────
@@ -222,7 +250,13 @@ pub async fn clear_manual_nodes(
 }
 
 #[tauri::command]
-pub async fn refresh_adapter(name: String, mode: String) -> Result<(), AppError> {
+pub async fn refresh_adapter(
+    manager: State<'_, NetworkManager>,
+    config: State<'_, AppConfig>,
+    app: tauri::AppHandle,
+    name: String,
+    mode: String,
+) -> Result<(), AppError> {
     let mode = match mode.as_str() {
         "soft" => crate::network::adapter_refresh::RefreshMode::Soft,
         "hard" => crate::network::adapter_refresh::RefreshMode::Hard,
@@ -233,7 +267,16 @@ pub async fn refresh_adapter(name: String, mode: String) -> Result<(), AppError>
             )))
         }
     };
-    crate::network::adapter_refresh::refresh_adapter(&name, mode).await
+    #[cfg(windows)]
+    {
+        let _ = (&manager, &config);
+        crate::network::native_operations::refresh_request(app, name, mode).await
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+        manager.refresh_native_adapter(&config, &name, mode).await
+    }
 }
 
 // ── ARP Discovery ───────────────────────────────────────────────────
@@ -345,20 +388,35 @@ pub async fn remove_adopted_subnet(
     subnet: String,
     iface_hint: Option<String>,
 ) -> Result<crate::network::manual_address::AddressReply, AppError> {
-    let reply = manager
-        .address_operation(
-            &config,
+    #[cfg(windows)]
+    {
+        let _ = (&manager, &config);
+        crate::network::native_operations::address_request(
+            app,
             crate::network::manual_address::AddressRequest::RemoveSaved {
-                subnet: subnet.clone(),
+                subnet,
                 hint: iface_hint,
             },
         )
-        .await;
-    if reply.outcome == crate::network::manual_address::AddressOutcome::Success {
-        use tauri::Emitter;
-        let _ = app.emit("subnet-removed", serde_json::json!({"subnet": subnet, "adopted_ip": reply.view.address, "reason": "manual"}));
+        .await
     }
-    Ok(reply)
+    #[cfg(not(windows))]
+    {
+        let reply = manager
+            .address_operation(
+                &config,
+                crate::network::manual_address::AddressRequest::RemoveSaved {
+                    subnet: subnet.clone(),
+                    hint: iface_hint,
+                },
+            )
+            .await;
+        if reply.outcome == crate::network::manual_address::AddressOutcome::Success {
+            use tauri::Emitter;
+            let _ = app.emit("subnet-removed", serde_json::json!({"subnet": subnet, "adopted_ip": reply.view.address, "reason": "manual"}));
+        }
+        Ok(reply)
+    }
 }
 
 #[cfg(test)]

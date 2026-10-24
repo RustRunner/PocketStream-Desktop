@@ -28,7 +28,10 @@ try {
     switch ($data.kind) {
         'echo' {
             $stage = 'echo'
-            $source = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String([Environment]::GetCommandLineArgs()[-1]))
+            $bootstrap = [Environment]::GetCommandLineArgs()[-1]
+            $fixed = [regex]::Match($bootstrap,"FromBase64String\('([A-Za-z0-9+/=]+)'\)")
+            if (-not $fixed.Success) { throw 'Fixed source bootstrap missing' }
+            $source = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($fixed.Groups[1].Value))
             $tokens = $null; $errors = $null
             $ast = [Management.Automation.Language.Parser]::ParseInput($source,[ref]$tokens,[ref]$errors)
             if ($errors.Count) { throw 'Fixed source failed AST parsing' }

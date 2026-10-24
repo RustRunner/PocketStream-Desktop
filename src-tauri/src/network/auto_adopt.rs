@@ -180,6 +180,9 @@ pub type PendingIps = Arc<Mutex<Vec<PendingIp>>>;
 /// real addresses or probing the wire.
 #[allow(async_fn_in_trait)]
 pub trait AdoptOps {
+    fn check_writes_available(&self) -> Result<(), AppError> {
+        Ok(())
+    }
     async fn observe(&self, _iface: &str) -> Result<super::InterfaceInfo, AppError> {
         Err(AppError::Network("Adapter observation unavailable".into()))
     }
@@ -192,9 +195,9 @@ pub trait AdoptOps {
     async fn probe(&self, target: Ipv4Addr, source: Option<Ipv4Addr>) -> bool;
 }
 
-/// Production `AdoptOps`: the real ip_config / ARP-probe calls. Both `add`
-/// and `remove` are kill-on-drop (via ip_config), so dropping an in-flight
-/// adoption future takes its child process with it.
+/// Production `AdoptOps`: delegates to typed native address operations and
+/// bound probes. Dropping an adoption requests cancellation; the executor
+/// retains its child, observation and conflicting-write barrier until drained.
 pub struct RealAdoptOps;
 
 fn temporary_observation(
@@ -209,6 +212,16 @@ fn temporary_observation(
 }
 
 impl AdoptOps for RealAdoptOps {
+    fn check_writes_available(&self) -> Result<(), AppError> {
+        #[cfg(windows)]
+        {
+            super::native_operations::check_writes_available()
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(())
+        }
+    }
     async fn observe(&self, iface: &str) -> Result<super::InterfaceInfo, AppError> {
         let current = super::interface::get_by_name(iface).await?;
         if super::interface::index_for_mac(&current.mac).is_none() {
@@ -267,7 +280,11 @@ impl<'a, O: AdoptOps> PendingAdoptOps<'a, O> {
 }
 
 impl<O: AdoptOps> AdoptOps for PendingAdoptOps<'_, O> {
+    fn check_writes_available(&self) -> Result<(), AppError> {
+        self.ops.check_writes_available()
+    }
     async fn add(&self, iface: &str, ip: Ipv4Addr, mask: &str) -> Result<(), AppError> {
+        self.check_writes_available()?;
         let prefix = ip_config::mask_to_prefix(mask)?;
         let owner = super::device_registry::canonical_mac(self.adapter_mac)
             .ok_or_else(|| AppError::Network("Invalid temporary adapter owner".into()))?;
@@ -309,6 +326,7 @@ impl<O: AdoptOps> AdoptOps for PendingAdoptOps<'_, O> {
     }
 
     async fn remove(&self, iface: &str, ip: Ipv4Addr) -> Result<(), AppError> {
+        self.check_writes_available()?;
         let settings = self.config.get();
         let row = settings.pending_addresses.into_iter().find(|p| {
             p.address == ip.to_string()

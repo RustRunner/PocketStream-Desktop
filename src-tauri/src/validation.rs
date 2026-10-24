@@ -63,6 +63,29 @@ pub fn parse_cidr(cidr: &str) -> Result<(Ipv4Addr, u8), AppError> {
     Ok((ip, prefix))
 }
 
+/// Host address policy is distinct from camera targets: existing APIPA and
+/// point-to-point /31-/32 addresses remain valid.
+pub(crate) fn validate_host(ip: Ipv4Addr, prefix: u8) -> Result<(), AppError> {
+    if !(1..=32).contains(&prefix)
+        || ip.octets()[0] == 0
+        || ip.is_loopback()
+        || ip.is_multicast()
+        || ip.octets()[0] >= 240
+    {
+        return Err(AppError::Network(
+            "Invalid host IPv4 address or prefix".into(),
+        ));
+    }
+    let network = ipnetwork::Ipv4Network::new(ip, prefix)
+        .map_err(|_| AppError::Network("Invalid address prefix".into()))?;
+    if prefix <= 30 && (network.network() == ip || network.broadcast() == ip) {
+        return Err(AppError::Network(
+            "Host address is a network or broadcast address".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -195,6 +195,16 @@ impl PktMonApi {
     /// the key field diagnostic for the Windows-floor question.
     pub fn load() -> Result<Self, String> {
         unsafe {
+            #[cfg(windows)]
+            let lib: libloading::Library = libloading::os::windows::Library::load_with_flags(
+                super::native_runner::system_directory()
+                    .map_err(|e| format!("Windows system directory unavailable: {e}"))?
+                    .join("PktMonApi.dll"),
+                windows_sys::Win32::System::LibraryLoader::LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+            .map_err(|e| format!("System PktMonApi.dll did not load: {e}"))?
+            .into();
+            #[cfg(not(windows))]
             let lib = libloading::Library::new("PktMonApi.dll")
                 .map_err(|e| format!("PktMonApi.dll did not load: {e}"))?;
 

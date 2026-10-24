@@ -30,7 +30,7 @@ const RIGHTS: u32 = READ_CONTROL | MUTEX_MODIFY_STATE | SYNCHRONIZATION_SYNCHRON
 const SDDL: &str = "D:P(A;;0x001f0001;;;SY)(A;;0x001f0001;;;BA)(A;;0x00120001;;;IU)S:(ML;;NW;;;ME)";
 
 #[derive(Clone, Copy)]
-pub(super) enum Role {
+pub(crate) enum Role {
     Host,
     Installation,
 }
@@ -44,7 +44,7 @@ impl Role {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum OwnershipError {
+pub(crate) enum OwnershipError {
     Busy,
     NamespaceOrSecurity(u32),
     DescriptorMismatch { expected: String, observed: String },
@@ -52,7 +52,7 @@ pub(super) enum OwnershipError {
 }
 
 #[derive(Debug, serde::Serialize)]
-pub(super) struct Acquisition {
+pub(crate) struct Acquisition {
     pub newly_created: bool,
     pub abandoned: bool,
     pub security_descriptor: String,
@@ -172,19 +172,18 @@ fn open_and_acquire(name: &str, wait: Duration) -> Result<(Handle, Acquisition),
     }
 }
 
-pub(super) struct MachineGuard {
+pub(crate) struct MachineGuard {
     stop: Option<mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
     pub acquisition: Acquisition,
 }
 impl MachineGuard {
-    // Fixed production names are retained here; entry-point integration waits
-    // for the fixture. No caller-supplied name is exposed to production.
-    #[allow(dead_code)] // A2 startup wiring is gated on these prerequisite proofs.
+    // Production accepts only fixed roles; arbitrary names exist only in tests.
     pub fn acquire(role: Role, wait: Duration) -> Result<Self, OwnershipError> {
         Self::acquire_name(role.name().to_string(), wait)
     }
 
+    #[cfg(test)]
     pub fn acquire_fixture(
         nonce: &str,
         role: Role,
