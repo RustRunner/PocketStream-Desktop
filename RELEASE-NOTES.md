@@ -2,6 +2,16 @@
 
 This local reliability checkpoint has software verification and a Windows application build. Physical camera, adapter, installer and resource qualification remains pending; it is not a hardware-qualified release.
 
+## Privilege boundary v2-A.1: A1 and prerequisite proofs
+
+The local main window now has an explicit application ACL with 46 command permissions and the required event, window, version, confirmation and updater permissions. Seventeen registrations and handlers and fifteen obsolete wrappers were removed. Scan completion continues to publish capabilities on the backend; the renderer no longer echoes them. The allowlist checker verifies registrations, build commands, capabilities, referenced wrappers and generated allow/deny payloads, with seeded drift tests.
+
+The generated-context ACL proof and isolated native confirmation bridge passed. [Production workflow evidence](docs/runtime-evidence/privilege-v2-a1-continuation.md) separately records settings, both confirmation Cancel paths, discovery, live playback and corrected PTU role/query smoke against their exact artifacts. The PTU handoff fix preserves precautionary stop/retry and reports a motion alarm when dispatched movement remains unconfirmed; idle stale selections no longer raise that alarm. The corrected candidate reconnected to the verified PTU at `192.168.1.202` without the red toast and closed normally.
+
+[Native prerequisites](docs/runtime-evidence/privilege-v2-native-prerequisites.md) passed for the fixed-script runner, caller abort, retained reconciliation, two-process exclusion and sole-owner crash recovery. Those primitives remain test-only. The recorded checks passed 764 ordinary Rust tests and four opt-in prerequisite fixtures; the final frontend suite passed all 184 tests, including 29 PTU workflows. Typecheck, contracts, production frontend/release builds, formatting and Clippy passed as recorded.
+
+The command retains the phase-A1 name `list_vpn_interfaces` until A3's bind contract is implemented. A2 production integration, A3 firewall/install/bind work, A4 release qualification and v2-B remain incomplete. Firewall/install qualification requires an isolated Windows fixture; cross-account/logon/integrity and bind matrices remain untested. The release manifest still requests `requireAdministrator`; renderer and media compromise still occurs in an elevated host. [Commit checkpoint](docs/runtime-evidence/privilege-v2-commit-checkpoint.md) records the source history and remaining gates.
+
 ## Re-streaming and camera transport
 
 The merged build offers RTSP or SRT output with RTSP or UDP input. SRT runs as a listener with configurable port, latency, Stream ID and optional passphrase encryption, with a limit of 10 callers. SRT input is not implemented.
@@ -36,7 +46,7 @@ Primary, saved secondary and unmanaged address removal, and DHCP mode changes, n
 
 Release preparation updates the native SRT library to 1.5.7 for the newly disclosed handshake vulnerability. The compiler, source recipe, DLL hashes and source archives are pinned, with a fresh [security review](docs/runtime-evidence/g3-security-review-2026-10-23.md). Dependency binaries and corresponding sources can be verified from authenticated GitHub drafts; the build does not publish them.
 
-The local Windows regression run passes 777 Rust tests with two hardware-dependent tests ignored, plus 151 frontend tests. TypeScript, UI contracts, formatting, Clippy and the production frontend build pass. Windows test executables now receive their Common Controls manifest at build time, so the standard Cargo test command needs no manual patch. CI and release checks now run the complete frontend suite through `npm test`.
+The baseline local Windows regression run passed Rust and frontend suites, TypeScript, UI contracts, formatting, Clippy and the production frontend build. Current v2-A.1 results and pending gates are recorded separately in the qualification record linked above. Windows test executables receive their Common Controls manifest at build time, so the standard Cargo test command needs no manual patch. CI and release checks run the complete frontend suite through `npm test`.
 
 On the tested Windows setup, switching off the Wi-Fi radio retained the conflicting local route and HTTP access timed out. Fully disabling the Wi-Fi adapter selected Ethernet instead; the camera returned HTTP 200 and its page opened. This targeted check does not complete the broader hardware qualification below.
 

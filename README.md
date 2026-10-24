@@ -104,6 +104,10 @@ npm run typecheck
 
 With the frontend built and the GStreamer SDK's `bin` directory on `PATH`, run `cargo test --lib --locked` from `src-tauri/`. Windows development and test executables embed their Common Controls manifest during linking; no manual executable patch is needed. Leave `POCKETSTREAM_RELEASE` unset for development and tests. Release packaging sets it to `1` to request administrator access.
 
+`npm run check:contracts` also checks the application IPC allowlist. It runs in both modes of `scripts/check.ps1`. The supported wrapper convention is documented with the [v2-A.1 qualification evidence](docs/runtime-evidence/privilege-v2-a1.md). Run the isolated native dialog bridge fixture with `cargo run --example acl_native_smoke --locked` from `src-tauri/`; it cancels only its own dialogs and does not initialize networking. Use a 45-second outer process bound when running this GUI fixture under automation.
+
+Privilege-boundary milestone A1 is implemented with 46 commands. [Production smoke](docs/runtime-evidence/privilege-v2-a1-continuation.md) exercised settings, both native confirmation Cancel paths, discovery, playback and the corrected PTU workflow on the recorded artifacts. [A-S2 and same-account A-S4 ownership prerequisites](docs/runtime-evidence/privilege-v2-native-prerequisites.md) passed; the new native primitives remain test-only. A2 production integration, A3–A4 and v2-B remain incomplete. Firewall/install qualification still requires an isolated Windows fixture. Release builds still request administrator access, so renderer or media compromise still compromises an elevated host.
+
 ## Architecture
 
 | Layer | Technology | Role |

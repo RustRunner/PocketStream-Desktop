@@ -1,0 +1,410 @@
+{
+  "schema_version": 1,
+  "recorded_at_utc": "2026-10-24T05:06:58.538Z",
+  "specification_revision": "2-A.1",
+  "status": "PTU handoff fix software-qualified; corrected A1 production .202 role/query, Home motion/stop and normal Close/exit smoke passed",
+  "baseline_commit": "d138965c9b6f9e3c53a916813a7376757f6ac727",
+  "user_report": {
+    "ptu_ip": "192.168.1.202",
+    "ptu_mac": "fc:68:3e:22:05:28",
+    "observation": "PTU works; .202 was visible in Nodes. Selecting PTU caused a red halt-failed toast before controls were touched.",
+    "connection": "Directly to the camera/PTU assembly",
+    "installed_image_sha256": "38e723e21eb0ffe9ee7315b862faefe06a7930e90fe92981b6f3706f3425b69f",
+    "qualifies_a1_artifact": false,
+    "stationary_and_controls_released_confirmed": true
+  },
+  "diagnosis": {
+    "actual_failed_halt_target": "192.168.1.74",
+    "correct_ptu": "192.168.1.202",
+    "log_local_time": "2026-10-23 23:28:36",
+    "backend_observation": "PTU limits big=1001 small=100 on incoming working selection; outgoing .74 halt failed its route/identity preflight",
+    "cause": "Unconditional failed-stop alarm for an outgoing saved PTU assignment, even without movement dispatched in the session"
+  },
+  "change": {
+    "files": [
+      "src/lib/ptz.ts",
+      "tests/ptu-workflow.test.cjs"
+    ],
+    "behavior": "Keep precautionary stop/retry and original-target FIFO ordering; track dispatched movement conservatively; log failed precautionary stop without a motion alarm when no unconfirmed session movement exists for that target",
+    "safety": [
+      "Motion risk added at dispatch, not enqueue",
+      "A lost motion reply retains risk",
+      "Full stop ACK clears risk before the next FIFO move",
+      "Home/preset/D-pad and same-IP identities covered",
+      "Unbound manual motion remains conservative after MAC binding"
+    ],
+    "commands_added": 0,
+    "b_implementation": false,
+    "a2_production_wiring": false
+  },
+  "checks": {
+    "before_fix": {
+      "tests": 28,
+      "passed": 24,
+      "failed": 4
+    },
+    "after_fix_ptu_workflows": {
+      "tests": 29,
+      "passed": 29,
+      "failed": 0
+    },
+    "all_frontend": {
+      "tests": 184,
+      "passed": 184,
+      "failed": 0
+    },
+    "typecheck": true,
+    "contracts": "passed: 46 commands, 46 referenced wrappers and 9 plugin permissions",
+    "frontend_build": true,
+    "optimized_release_build": true,
+    "release_build_command": "POCKETSTREAM_RELEASE=1 cargo build --manifest-path src-tauri/Cargo.toml --release --bin pocketstream-desktop --locked --offline",
+    "git_diff_check": true,
+    "native_prerequisite_sources_unchanged": true,
+    "earlier_rust_and_native_prerequisite_checks": "764 ordinary Rust tests plus four opt-in process prerequisites passed at the preceding checkpoint; no Rust production source changed in this PTU follow-up"
+  },
+  "artifact": {
+    "built_at_utc": "2026-10-24T04:40:17.5403001Z",
+    "executable": "C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\privilege-a1\\ptu-halt-fix-20261024T044016Z\\pocketstream-desktop.exe",
+    "sha256": "4337b1dca9a158a9e71c24d2c8b34079cdf2ac4e8b167d0f7e736ab0413e059e",
+    "manifest_path": "src-tauri/target/privilege-a1/ptu-halt-fix-20261024T044016Z/application.manifest.xml",
+    "manifest_sha256": "780c5f643a1faa7a7198a3114e470fe789beacf042ba7b0fcdf2e6b3e3e20221",
+    "execution_level": "requireAdministrator",
+    "common_controls": true,
+    "bundled_gstreamer": "1.26.11",
+    "gstreamer_dll_count": 76,
+    "libsrt_sha256": "8d58764b2d53df76b7e9b69e55cd3250d3bb0c14631224c0f16962c5317a5600",
+    "launched": true,
+    "hardware_smoke": "passed: .202 Clear/PTU reconnect, no halt-error toast, user-observed Home movement/stop, normal Close/exit",
+    "installed_copy_replaced": false,
+    "gstreamer_bin_dll_count": 47,
+    "path": "src-tauri/target/privilege-a1/ptu-halt-fix-20261024T044016Z/pocketstream-desktop.exe",
+    "application_pid": 25972,
+    "process_exited": true,
+    "finished_at_utc": "2026-10-24T05:00:11.2890292Z"
+  },
+  "live_fixture": {
+    "launch": {
+      "status": "running: exact A1 release artifact; interactive hardware smoke pending",
+      "at_utc": "2026-10-24T04:53:54.0196834Z",
+      "diagnostic": null,
+      "artifact": {
+        "path": "C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\privilege-a1\\ptu-halt-fix-20261024T044016Z\\pocketstream-desktop.exe",
+        "sha256": "4337b1dca9a158a9e71c24d2c8b34079cdf2ac4e8b167d0f7e736ab0413e059e",
+        "profile": "release",
+        "elevated": true,
+        "manifest": "requireAdministrator"
+      },
+      "profile": {
+        "path": "C:\\Users\\joshu\\AppData\\Roaming\\PocketStream\\config.toml",
+        "private_backup": "C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\privilege-a1\\ptu-halt-fix-20261024T044016Z\\private-original-config.toml",
+        "before_sha256": "3f05496ba04ad9d682588526a2bcf40ca64deb00bd2fd4595020fe86540d6853",
+        "original_output_enabled": true,
+        "qualification_output_enabled": false,
+        "restoration": "pending until this controlled hardware session ends"
+      },
+      "adapter": {
+        "alias": "Ethernet",
+        "mac": "40-C2-BA-CF-D5-75",
+        "guid": "{812AD22F-3345-4817-B6D7-708D769E69AC}",
+        "index": 15,
+        "status": "Up"
+      },
+      "native_addresses_before": [
+        {
+          "IPAddress": "192.168.1.100",
+          "PrefixLength": 24,
+          "PrefixOrigin": 1
+        },
+        {
+          "IPAddress": "192.168.0.100",
+          "PrefixLength": 24,
+          "PrefixOrigin": 1
+        },
+        {
+          "IPAddress": "172.31.169.102",
+          "PrefixLength": 24,
+          "PrefixOrigin": 1
+        }
+      ],
+      "application_pid": 25972
+    },
+    "output_during_smoke": false,
+    "profile_restoration": "exact original bytes restored after proving all 47 single-line TOML field values and table identities identical; only table ordering/format differed",
+    "motion_commands_by_agent": false,
+    "planned_ui": "Clear and reassign PTU only on .202; no D-pad, Home or presets",
+    "qualifies_failed_old_endpoint_regression": "software tests; no live .74 role assignment planned",
+    "status": "completed",
+    "final_result": {
+      "finished_at_utc": "2026-10-24T05:00:11.2890292Z",
+      "application_pid": 25972,
+      "artifact_sha256": "4337b1dca9a158a9e71c24d2c8b34079cdf2ac4e8b167d0f7e736ab0413e059e",
+      "user_role_observation": "Reconnects; no red toast",
+      "user_dpad_input": "User reported touching D-pad during the planned no-movement check",
+      "user_motion_observation": "Moved, then stopped",
+      "motion_by_agent": false,
+      "normal_close_by_user": true,
+      "process_exited": true,
+      "native_addresses_before": [
+        "172.31.169.102/24",
+        "192.168.0.100/24",
+        "192.168.1.100/24"
+      ],
+      "native_addresses_after": [
+        "172.31.169.102/24",
+        "192.168.0.100/24",
+        "192.168.1.100/24"
+      ],
+      "native_addresses_unchanged": true,
+      "original_output_enabled_restored": true,
+      "profile_restoration": "exact original bytes restored after proving all 47 single-line TOML field values and table identities identical; only table ordering/format differed",
+      "profile_after_sha256": "3f05496ba04ad9d682588526a2bcf40ca64deb00bd2fd4595020fe86540d6853",
+      "profile_matches_original_backup": true,
+      "production_log_sha256": "2f4f58a0c675609e6363885342039f6bf081fcb3836b27f0d63b1f504ccb512e",
+      "selected_observations": [
+        "2026-10-23 23:53:54 [INFO] pocketstream_desktop - PocketStream Desktop v0.6.7 starting",
+        "2026-10-23 23:53:54 [INFO] pocketstream_desktop - Found bundled GStreamer at C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\privilege-a1\\ptu-halt-fix-20261024T044016Z\\resources\\gstreamer\\bin",
+        "2026-10-23 23:53:55 [INFO] pocketstream_desktop - GStreamer GStreamer 1.26.11 initialized",
+        "2026-10-23 23:53:57 [INFO] pocketstream_desktop::commands - [frontend] PTU init failed: Network error: Ethernet not ready: expected MAC lacks fresh evidence at this endpoint",
+        "2026-10-23 23:53:57 [INFO] pocketstream_desktop::network - event=capture_state adapter_mac=\"40:c2:ba:cf:d5:75\" interface_index=15 scope=selected_interface source_id=Some(115) active=true",
+        "2026-10-23 23:54:00 [INFO] pocketstream_desktop::network::arp - ARP: 192.168.1.202 (fc:68:3e:22:05:28)",
+        "2026-10-23 23:55:47 [INFO] pocketstream_desktop::commands - [frontend] PTU limits: big=1001 small=100",
+        "2026-10-23 23:56:07 [INFO] pocketstream_desktop::commands - [frontend] toast: PTU homing",
+        "2026-10-23 23:59:23 [INFO] pocketstream_desktop::streaming - Re-stream server stopped (intent epoch=1)",
+        "2026-10-23 23:59:23 [INFO] pocketstream_desktop::network - Stopped ICMP ping-dot loop"
+      ],
+      "full_failed_old_endpoint_regression": "covered by workflow tests; no live .74 PTU-role assignment used",
+      "firewall_install": "not exercised",
+      "logged_motion_action": "User described D-pad input; log records PTU homing at 23:56:07 and back to speed mode at 23:56:08. Record as a Home movement/stop observation, not a separate directional-release test."
+    },
+    "user_observation": "Reconnects; no red toast",
+    "user_input_correction": {
+      "reported_input": "D-pad",
+      "log_evidence": [
+        "2026-10-23 23:56:07 toast: PTU homing",
+        "2026-10-23 23:56:08 PTU: back to speed mode"
+      ],
+      "user_observation": "Moved, then stopped",
+      "classification": "Additional Home motion/stop observation; no separate directional-release qualification claimed",
+      "agent_issued_movement": false
+    },
+    "software_failed_stop_regression": "Passed mock-IPC workflow tests. Production Clear/reassign on .202 did not recreate a live failed-old-endpoint handoff.",
+    "no_halt_error_toast_in_corrected_log": true,
+    "original_profile_restored_by_hash": true,
+    "native_bindings_preserved": true
+  },
+  "legacy_shutdown": {
+    "normal_close": {
+      "at_utc": "2026-10-24T04:49:49.8295634Z",
+      "status": "still running; no force-kill or second launch",
+      "normal_close_requested": true,
+      "force_kill": false,
+      "diagnostic": null,
+      "pid": 23688,
+      "windows": [
+        {
+          "handle": 7473080,
+          "title": "",
+          "cls": "Tauri Window",
+          "parent": 0,
+          "visible": true,
+          "minimized": false,
+          "width": 1293,
+          "height": 808
+        },
+        {
+          "handle": 1639270,
+          "title": "MSCTFIME UI",
+          "cls": "MSCTFIME UI",
+          "parent": 7209020,
+          "visible": false,
+          "minimized": false,
+          "width": 0,
+          "height": 0
+        },
+        {
+          "handle": 7209020,
+          "title": "Default IME",
+          "cls": "IME",
+          "parent": 7473080,
+          "visible": false,
+          "minimized": false,
+          "width": 0,
+          "height": 0
+        }
+      ],
+      "exited_after_normal_close": false
+    },
+    "quiescence": {
+      "at_utc": "2026-10-24T04:52:51.1753205Z",
+      "legacy_pid": 23688,
+      "process_running": true,
+      "native_window_classes": [],
+      "descendants": [],
+      "pending_address_sections": 0,
+      "explicit_empty_pending_field": true,
+      "recent_shutdown_log": [
+        "2026-10-23 23:49:50 [INFO] pocketstream_desktop::streaming - Re-stream server stopped (intent epoch=1)",
+        "2026-10-23 23:49:51 [INFO] pocketstream_desktop::network - Stopped ICMP ping-dot loop"
+      ],
+      "last_log_timestamp": "2026-10-23 23:49:51",
+      "profile_sha256": "3f05496ba04ad9d682588526a2bcf40ca64deb00bd2fd4595020fe86540d6853",
+      "addresses": [
+        "172.31.169.102/24",
+        "192.168.0.100/24",
+        "192.168.1.100/24"
+      ]
+    },
+    "recovery": {
+      "at_utc": "2026-10-24T04:53:53.2392106Z",
+      "status": "legacy process recovered after quiescence; corrected A1 launch independently verified",
+      "legacy_graceful_exit": false,
+      "recovered_legacy_process": true,
+      "diagnostic": null,
+      "recovered_pid": 23688,
+      "profile_unchanged": true,
+      "native_addresses_unchanged": true,
+      "launcher_exit_reporting": "The nested PS1 did not reset LASTEXITCODE; initial report interpreted a stale value as failure. Launch JSON and running image/hash independently verify success.",
+      "corrected_application_pid": 25972
+    },
+    "qualified_graceful_exit": false,
+    "note": "Manual recovery of the inspected windowless/childless legacy process after streaming/pinger stop, empty pending ownership and unchanged native/profile state. No production/installer force-kill fallback added."
+  },
+  "unknown_node": {
+    "ip": "192.168.1.74",
+    "mac": "08:df:ec:22:01:77",
+    "role": "none",
+    "open_ports": [],
+    "observed_in_arp": true,
+    "hardware_identity": "undetermined",
+    "local_pc_ipv4_or_adapter_mac": false,
+    "topology_inference": "Given direct assembly connection and selected-Ethernet observations, this is an identity advertised on that link; an internal interface/proxy is possible, not established",
+    "not_the_verified_ptu": true
+  },
+  "remaining_gates": {
+    "corrected_a1_ptu_production_smoke": "passed: real .202 limits query and role assignment; user-observed Home movement/stop",
+    "corrected_a1_normal_close": "passed: user Close and PID 25972 exit verified",
+    "historical_other_pc_arp_vs_adoption": "undetermined; log unavailable",
+    "cross_account_logon_integrity": "not exercised",
+    "a_s4_bind": "pending",
+    "a_s3_firewall_install": "pending: isolated Windows fixture required",
+    "a2_a4": "not complete",
+    "b": "deferred",
+    "directional_axis_release_matrix": "not exercised on hardware in this run; input logged as Home"
+  },
+  "evidence_sha256": {
+    "privilege-ptu-halt-before.log": "55c0d30967ca26bcaaab0d0514838562bdf40e723b271e0c30581f23449842dc",
+    "privilege-ptu-halt-after.log": "20f614b575800941f07aa94a9ce87e67f0c32328a225738023a03181a80f99c5",
+    "privilege-ptu-followup-frontend-tests.log": "1ab17bfa8a3f2cd43ee227be2b3bc5b922c1ff18570999641dce039124964484",
+    "privilege-ptu-followup-typecheck.log": "8d1aab0b73c62645422bc51a81484006544e94cfdd38b6e85c04fde0ac7df0ab",
+    "privilege-ptu-followup-build.log": "12cd58578d233a524b875a17fef996f50e10389b9a9908f01de4787d45e3ef19",
+    "privilege-ptu-followup-release-build.log": "05606ff1beaaff0ea2d0cd5092cdb42c0aae32d425c83feb9f22be159a76bc3e",
+    "src-tauri/target/privilege-a1/ptu-halt-fix-20261024T044016Z/artifact.json": "41297b65bf902f0e51d1e0950b48c9e63494ed173e2eed467e4d42bd306b7030",
+    "src-tauri/target/privilege-a1/ptu-halt-fix-20261024T044016Z/application.manifest.xml": "780c5f643a1faa7a7198a3114e470fe789beacf042ba7b0fcdf2e6b3e3e20221",
+    "src-tauri/target/privilege-a1/ptu-halt-fix-20261024T044016Z/installed-session.log": "919a8c54cc8a152e126e446fc9875fe5719c4dc9ed8c1bb715cafb70ad0a762a",
+    "src-tauri/target/privilege-a1/ptu-halt-fix-20261024T044016Z/installed-ptu-excerpt.log": "08e79b0c75423556157e49ee2d91a1bfd694a23771f0fa0af5033da424cd093b",
+    "src-tauri/target/privilege-a1/ptu-halt-fix-20261024T044016Z/installed-session-observations.json": "a7cb990006a17fe21a5669a902939bd8e564bec01b98473ec51c54d324fe084c",
+    "src-tauri/target/privilege-a1/ptu-halt-fix-20261024T044016Z/legacy-close-failure.log": "42300bc56dcd86e015916c55b960b810b3563e3f4dd3a8646d2179d7be724a37",
+    "src-tauri/target/privilege-a1/ptu-halt-fix-20261024T044016Z/legacy-normal-close.json": "6f344199b3980b2bf891e9820447fd9b84fe1fa8763e1d1f5e28990bdd611348",
+    "src-tauri/target/privilege-a1/ptu-halt-fix-20261024T044016Z/legacy-quiescence.json": "8b5bb9f5d7a500f0aaac073c9cf951213c05192e06c1a15fccac6db791fe2a7a",
+    "src-tauri/target/privilege-a1/ptu-halt-fix-20261024T044016Z/legacy-recovery.json": "8f0823a0348fffd467fe6d8b01bc195219eaef013055bf0f429ad432e9c06de9",
+    "src-tauri/target/privilege-a1/ptu-halt-fix-20261024T044016Z/legacy-recovery-initial-report.json": "83945b5f44ac5466aa56167a2ae73360b3e87687841a8552a6084a5d98c70960",
+    "src-tauri/target/privilege-a1/ptu-halt-fix-20261024T044016Z/launch-preflight-first.json": "d23ae77346377d0957a2034fb952bafca07a5b53cbd4c6ae9250b9a6c1cf4498",
+    "src-tauri/target/privilege-a1/ptu-halt-fix-20261024T044016Z/launch-result.json": "4461a5049c48b6f62ca0cac722543e46830d93f845f37d42e53c4ac53c2dfa9e",
+    "src-tauri/target/privilege-a1/ptu-halt-fix-20261024T044016Z/start-ptu-role-smoke.ps1": "d04d2008c54d5eaf5cbe9d3993ca8c8d479836073c193028524b1e6cb7b4e240",
+    "src-tauri/target/privilege-a1/ptu-halt-fix-20261024T044016Z/complete-ptu-role-smoke.ps1": "00a6ad879db3145d300c2ea12ce16afa0466b7b5df587abd8e6df8960b6d63c0",
+    "src-tauri/target/privilege-a1/ptu-halt-fix-20261024T044016Z/close-installed-legacy-normal.ps1": "6e5b518b492287453beea6c595526343413848757cea92e18172fe47ad0f9d03",
+    "src-tauri/target/privilege-a1/ptu-halt-fix-20261024T044016Z/recover-quiescent-legacy-and-launch.ps1": "35e4199e88ec7832877f488fb3647b79865cece8a2889af8b25999da8ef77290",
+    "src-tauri/target/privilege-a1/ptu-halt-fix-20261024T044016Z/hardware-observations.json": "21032a202b454cdbd03dc296acc1484d6328b2ce6398c38e863bb2f2ebd8e9fc",
+    "src-tauri/target/privilege-a1/ptu-halt-fix-20261024T044016Z/corrected-close-observation.json": "04e3cb43eac192ed0ece8087ef32f67c7bd1dd4d997b4e5001064668579f5808",
+    "src-tauri/target/privilege-a1/ptu-halt-fix-20261024T044016Z/corrected-production-session.log": "2f4f58a0c675609e6363885342039f6bf081fcb3836b27f0d63b1f504ccb512e",
+    "src-tauri/target/privilege-a1/ptu-halt-fix-20261024T044016Z/corrected-ptu-excerpt.log": "2772932563ae34e2137026e784ea75176354b1d4d3b469c0c7ee009ed7ce8ef4",
+    "src-tauri/target/privilege-a1/ptu-halt-fix-20261024T044016Z/corrected-ptu-result.json": "45472fb9059c0028975c608411a69ee5ec27f32490dae3b8f4c4633cbe63e760"
+  },
+  "source_sha256": {
+    "README.md": "4c086d73643a68caca800218c6c283cdf7b13972660f2b11ac6d623c276f4855",
+    "RELEASE-NOTES.md": "2d4fd6851fc62995a34b941e9c4c77144bb1dee67909236f5f1dac62fdc0a844",
+    "docs/runtime-evidence/privilege-v2-a1.md": "c02f5cf1fd9fc3a1f940edf3bbc544b1755120090d02adbc2ff9526c9bce5885",
+    "package-lock.json": "cb5fb8f71948ac0dadd0b982bc6bf976d51826023b9aa261a6c6d452630109a9",
+    "package.json": "915b3b643dfe6aa4e054c694a588b6ce81367c0783e3d4c938a1b607c686ef57",
+    "scripts/check-ipc-allowlist.mjs": "23db5daa033424f8e6fa3b5f34f385c3a67a94aea9632af2de60d2421ec218eb",
+    "scripts/check.ps1": "b3ac61f8e741a30db380289db1a914b89f6f3b195bf6b4a700e6283605f27214",
+    "src-tauri/Cargo.lock": "21935f69e57d24a299bb96b0ca2c7f20b3ddb5dd985e88a9f33fd69b75e477ac",
+    "src-tauri/Cargo.toml": "dd2614c4ae2341fc74b9009e6f232543451b2aeb7e04f7b52cc785ec949e7cd2",
+    "src-tauri/build.rs": "e83e5850fc39e3d0bc702d8702f34e160fbf21fa311766d719022d0354bacc82",
+    "src-tauri/capabilities/default.json": "ed034be3718b5b7143e412b16393ca92457fdc3c1e7a8d4997528370d549a4f1",
+    "src-tauri/examples/acl_native_smoke.rs": "50d096110426a66f9afb9481f3a56b7a0af8b27a30d8fed1a8fd35ae39cf8a61",
+    "src-tauri/permissions/autogenerated/add_manual_node.toml": "59c542d2f11c2dd04b0f9a156e54a855511a2d956eb94cdf0f723c096740ad67",
+    "src-tauri/permissions/autogenerated/add_secondary_ip.toml": "55227e570fb8ab0853a6e218be1564752081ab0b224bf812dd336deb35d1e15f",
+    "src-tauri/permissions/autogenerated/apply_restream_settings.toml": "f338dbbabc8ea7d188dd77971d9f20649c8ec9b555c4c5468eaf0765e744d338",
+    "src-tauri/permissions/autogenerated/clear_manual_nodes.toml": "0e02ceb0f066d9d188baeeb6232484ff969d8e857fca17cfecf90c2fbf35317f",
+    "src-tauri/permissions/autogenerated/control_cgi_zoom_direct.toml": "47b6c4688f191b2106ae00450015b9208b2fce524e6eefcb2235da48319cbd09",
+    "src-tauri/permissions/autogenerated/create_video_window.toml": "371acdf00a1d9e9dbb3b48e1a0d4693574805b4b4e681ef381805fb8447e0342",
+    "src-tauri/permissions/autogenerated/forget_device.toml": "447eaf7564c8e06dc85db48beac8c3dda320cb642e325008a3c06ce6f858ba18",
+    "src-tauri/permissions/autogenerated/get_adapter_selection.toml": "308c796f8df6d8bdd784ddf712a3648f284e43c5b3eb5589aa1bd52c049828c2",
+    "src-tauri/permissions/autogenerated/get_adoption_state.toml": "f0a1c1b7070490548179c0b926098e27d074302bd940b2eaa884440f354ed982",
+    "src-tauri/permissions/autogenerated/get_capture_state.toml": "200966cbed0691348950f6c89650797d9a0078fe4ea0f95715a91ef1c4218d19",
+    "src-tauri/permissions/autogenerated/get_config.toml": "815bcf8ce240536e89bf35037a68ac3fd27c56b7fb115e81466148c659bbf3b2",
+    "src-tauri/permissions/autogenerated/get_device_list.toml": "37d400ef3102ba0df33450c45df51be21b831c28834204981622f5f682554afa",
+    "src-tauri/permissions/autogenerated/get_dhcp_state.toml": "4ffe2cccdf4ec755d3ed70637ae1437cb73e883fdfe63537c50bccb37867bbcf",
+    "src-tauri/permissions/autogenerated/get_host_ip_owners.toml": "9311ce28bf21443854b3e47b5fc92f9d378d68dac0fd3b49b0d07e03663ff82b",
+    "src-tauri/permissions/autogenerated/get_license_document.toml": "da94be00b50fc7b8955876d7840f3939dba251e750d65a7c6d6e6db3d88aba8e",
+    "src-tauri/permissions/autogenerated/get_network_mode.toml": "ff3641d02b2c593643bc92b281a45020a5fb6dd538e5d0346ca86aecc2470b14",
+    "src-tauri/permissions/autogenerated/get_startup_notices.toml": "45c7dc9003a911dff9c6f597d65a34beec8097805a75fa9b9163d5e5dbb55e4f",
+    "src-tauri/permissions/autogenerated/list_vpn_interfaces.toml": "ed8da0b596e3590d8b2c6df032c25c67abd48e6ee280d3f3d15560938949ef9a",
+    "src-tauri/permissions/autogenerated/log_frontend.toml": "8746769c3dd0cdf1478a4ceb062c317dece01178095dbef3bbfb6bb8486b19ea",
+    "src-tauri/permissions/autogenerated/open_device_browser.toml": "48018daae010cdb19f9106c5a7c1ea08c61a9ef46317f4c706c3f64fa030a9f6",
+    "src-tauri/permissions/autogenerated/open_log_folder.toml": "92b7bf8551f080edfda6ab5f5b4c75e355fda588f969cc03fc9cb0b900d0ecf0",
+    "src-tauri/permissions/autogenerated/ptu_send.toml": "5ae199f17f2cfc077ea248cc6fdffc1a29ada23d1195beee880b159ae6b9ffa8",
+    "src-tauri/permissions/autogenerated/refresh_adapter.toml": "71fcdbce3fcfe6adf063483577913f57e98f9844a107aab0ded4547f87bb3a64",
+    "src-tauri/permissions/autogenerated/remove_adopted_subnet.toml": "ee127dc59f5053146b6c677e7008c45067d519bb7a3180c8d5670927c0f75e59",
+    "src-tauri/permissions/autogenerated/remove_manual_node.toml": "feee3599d3a9ff8a5e2b452990724758546da6a257d6e619e07e596e636c8f01",
+    "src-tauri/permissions/autogenerated/remove_secondary_ip.toml": "4014e56ed462620bdb51adec61ad0617f4bddb54ed022cbd5d546c0a42e31d2c",
+    "src-tauri/permissions/autogenerated/retry_playback.toml": "7f94319b2430e6f73d669bc0e730e34bdf10e0b800466512c41c9a6423547892",
+    "src-tauri/permissions/autogenerated/scan_network.toml": "e1affbbda911c6ff4d0fdac80863a61e92d8c5971e01e9634f8a7419df797bef",
+    "src-tauri/permissions/autogenerated/select_adapter.toml": "4dda702b57928967d6f48e445c9f2ae3642dd424c58948c49e6c707ee1160b70",
+    "src-tauri/permissions/autogenerated/set_audio_muted.toml": "04a218a10f10287160683c3ee39a08baf69ff1edc30c95302d3e19ad6b682822",
+    "src-tauri/permissions/autogenerated/set_device_alias.toml": "2c28507343b9b69b293c264b51c4a45519e945a31cae8cab7f28d02368728061",
+    "src-tauri/permissions/autogenerated/set_network_mode.toml": "129823afd60fd2d1540b4f28cb0a0d10def3e0a6220380f1d7a137fc55bf850f",
+    "src-tauri/permissions/autogenerated/set_video_visible.toml": "e439964f996736a75fed5aefc894cd4875e504e86209e45e9ec1015c0ac84367",
+    "src-tauri/permissions/autogenerated/set_zoom_position.toml": "4bc89d0276388f4aeddcae4dbc4cea348efe3456ef3891d2a00544cd502b16b4",
+    "src-tauri/permissions/autogenerated/start_arp_discovery.toml": "3e3a7e628f372d5d8b78cafd6403cd416b536b0fea55b8c73e9b92d1a6dcdf2e",
+    "src-tauri/permissions/autogenerated/start_recording.toml": "4991db9dc57876facec4b12035507bf3a9551ef57ecc77aafd2e7bd68393dc36",
+    "src-tauri/permissions/autogenerated/start_restream_server.toml": "50eb7e7a5566111937738bb39bf8f8e21c2fac315dfc764215e7bb8871e0114b",
+    "src-tauri/permissions/autogenerated/start_stream.toml": "aa03b92df3d158dfce6d23e9101748918248f5e7af8fe828d3ecc33b1951b16d",
+    "src-tauri/permissions/autogenerated/stop_recording.toml": "0008c014102cb1229dec7992bf95c546ee0f10b718652837848886403bbeb185",
+    "src-tauri/permissions/autogenerated/stop_restream_server.toml": "71e4101ba34026e636e3d5bcabdc4d1933c842658067f255b7af5d4f702285de",
+    "src-tauri/permissions/autogenerated/stop_stream.toml": "3a0e0c2c6a42be398cd4b874df00493757b96a05b14e36e0aeb79713885fd569",
+    "src-tauri/permissions/autogenerated/switch_restream_protocol.toml": "32c78555735f3ad881f9c4c3f8b59d47ed2e6834da286395c7c1f46372142d66",
+    "src-tauri/permissions/autogenerated/take_screenshot.toml": "43e66bcab846c043e11ce9a9b77492a7e4f884edbe019f198161e54125da4b5a",
+    "src-tauri/permissions/autogenerated/update_credentials.toml": "bd45df0f0d581013a88284635463eef4a42d765ac75257db78c0933f0104451e",
+    "src-tauri/permissions/autogenerated/update_stream_settings.toml": "3b08c2eba2a79834c6413f59e83b91198dfd830199505118c0a51463b7932b6b",
+    "src-tauri/permissions/autogenerated/update_video_position.toml": "bca08c3ec612b838cf050968ec5de7498932e857733acdde1f131e3459da459e",
+    "src-tauri/pocketstream.dev.manifest": "80bae5a84c03e1c426f638fc27064cc7ce1aacb403d8ee85b12453a470cf9917",
+    "src-tauri/pocketstream.exe.manifest": "c2cde06c274d7ed94b171a357a79976c296693c03926653ad7e304b29e6155ef",
+    "src-tauri/src/camera/mod.rs": "496f1cf97048b4deabe526a007a40a0df7d6c4c485983f7897e65d7e57b0b340",
+    "src-tauri/src/commands/camera.rs": "3cc2e0eee02785365c1ca725d3f0c4a53f496cf306330348342f9f5139b7c9a6",
+    "src-tauri/src/commands/config.rs": "22ae6790aebe2da683edb7b5859c531df9cd3684fc93d3d4eea1004404847b74",
+    "src-tauri/src/commands/network.rs": "5c9292ca0e2a68d8babee917c619af119f1a89c1e68d0e5b52f63589501962dc",
+    "src-tauri/src/ipc_acl_tests.rs": "e177d8780c22e44ee2262c7d3f61c6d2957fb0e7447caf1c86cfd5fa5644e288",
+    "src-tauri/src/lib.rs": "ccbe1c902087589c2061f4f46b0460d13f0172848a1523def844c7f33066011c",
+    "src-tauri/src/network/arp.rs": "b48ea3e25d03269290e18d7c23dcb3f194bc45b19056d94679bcb061c77ea31d",
+    "src-tauri/src/network/host_owner.rs": "04c08e4f5653795915f8453715a2bd88a5f7160474ef09973f5b622860de33cb",
+    "src-tauri/src/network/local_executor.rs": "ef8f3081f947fb0f1c3e132a1fe70e0fe1731e9e2b9770b6af78c1ce5aac7e40",
+    "src-tauri/src/network/mod.rs": "a34c9bf4ce18fce46b982c9af0cdbd9bec09eeb7395782d3d018169e15bbfdb9",
+    "src-tauri/src/network/native_runner.rs": "0ccaad15d6773ce2b133a00893d76fa85ecf1aad76b9e2cf37fe6b63837b6a8f",
+    "src-tauri/src/validation.rs": "61f62af92974f1235b53073eb7cd3a680c1c256ee503c4810ddc84c2a13f8a08",
+    "src-tauri/tauri.conf.json": "61aa2b58dd34306d3397cd9b13470be60da8e3011b4833bde29b7cda3eeb6b85",
+    "src-tauri/tests/fixtures/acl-native-smoke.js": "2d9e6e2e605ef87f433ff802cac7392d4adcdc8146f6eb96b1fa1f2f41b22df4",
+    "src-tauri/tests/fixtures/native-runner-v1.ps1": "ab0b9d039ea569095a8cdda4eee233c37460e7695d515317ff74e22fc640e067",
+    "src-tauri/tests/fixtures/native_foundation.rs": "a806dfc2508b8ff9526336c5501c8fbc76e26bde005e76f8ce0ed1189f65d2ed",
+    "src/lib/devices.ts": "3258a40b1943a903bb7dd5fca0ec7411698d89707f1eb64a8442c5bc633cbdec",
+    "src/lib/ptz.ts": "20047412e30ecdad819445c1832b01c2d41949616577687638ed8c678074b5c8",
+    "src/lib/tauri-api.ts": "681da2cc2ddbb5a35d936f120b66541ec416181c7121696f91bef9b1a98966af",
+    "tests/ipc-allowlist.test.cjs": "97ecb0716f24d64dc82fd221a7141f9d80c06b66afccfcdf3c1b9e397d8e9bad",
+    "tests/notification-behavior.test.cjs": "ea160c5d804771d60f4dbcec445f6a1840a1acf1fc56fc7f1f2fab03ab95e645",
+    "tests/ptu-workflow.test.cjs": "e70a9d6057caaf88f07157953f03b96646f3515f6a373665afb7573f9bb6b94c",
+    "tsconfig.json": "35d3bae3ac284c98036282c10ae5807407d6f8c06ac770eb4b809ce122f84bca"
+  },
+  "source_hash_format": "SHA256 of raw file bytes",
+  "worktree": "Uncommitted; existing A1 work and native prerequisites preserved; no commit/reset/stash"
+}

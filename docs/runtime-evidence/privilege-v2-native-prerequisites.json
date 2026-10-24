@@ -1,0 +1,435 @@
+{
+  "schema_version": 1,
+  "specification_revision": "2-A.1",
+  "recorded_at_utc": "2026-10-24T04:09:31.491Z",
+  "baseline_commit": "d138965c9b6f9e3c53a916813a7376757f6ac727",
+  "status": "A-S2 and same-account A-S4 ownership prerequisite fixtures passed; no dependent A2 production wiring",
+  "artifact": {
+    "path": "C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\debug\\deps\\pocketstream_desktop-ccea92dd92a66ea5.exe",
+    "sha256": "45f8d9adcd784a9fd22184398c7180efa42995762bab95a4357aae6418ef5004",
+    "execution_level": "asInvoker",
+    "common_controls": true,
+    "build_command": "cargo test --lib --locked (scripts/check.ps1 in src-tauri)",
+    "build_command_sha256": "40a2ee84b36116f64561d7872e331ee3de2e0c89bdaa7741c24f773e800dd9b0",
+    "qualification_command_sha256": "18826a767d26c0194c16281e0891be82e907f67c8af0dc97bbb5bee8de999830",
+    "qualification_run": {
+      "started_at_utc": "2026-10-24T04:07:25.1650273Z",
+      "finished_at_utc": "2026-10-24T04:07:37.6076966Z",
+      "executable": "C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\debug\\deps\\pocketstream_desktop-ccea92dd92a66ea5.exe",
+      "sha256_before": "45f8d9adcd784a9fd22184398c7180efa42995762bab95a4357aae6418ef5004",
+      "sha256_after": "45f8d9adcd784a9fd22184398c7180efa42995762bab95a4357aae6418ef5004",
+      "exit_code": 0,
+      "command": "pocketstream_desktop-ccea92dd92a66ea5.exe network::native_qualification::qualify_ --ignored --test-threads=1 --nocapture"
+    }
+  },
+  "environment": {
+    "recorded_at_utc": "2026-10-24T04:04:40.4378830Z",
+    "windows": "Microsoft Windows 11 Pro",
+    "version": "10.0.26200",
+    "build": "26200",
+    "architecture": "64-bit",
+    "powershell": "5.1.26100.9444",
+    "node": "v24.14.0",
+    "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)",
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "native_access": "medium integrity read-only process fixtures",
+    "desktop_account_elevated": false
+  },
+  "fixed_script": {
+    "path": "src-tauri/tests/fixtures/native-runner-v1.ps1",
+    "sha256": "ab0b9d039ea569095a8cdda4eee233c37460e7695d515317ff74e22fc640e067",
+    "input": "versioned bounded UTF-8 JSON stdin; no source interpolation",
+    "environment": "Trusted system-directory APIs and absolute PS5.1/ipconfig paths; fixed PATHEXT=.EXE; profiles disabled; autoload None; protected Utility/Management/CimCmdlets imports",
+    "temporary_writes": "No native temporary file required; evidence stored under repository target"
+  },
+  "prerequisite_gates": {
+    "A-S2": "passed: explicit read-only process prerequisites",
+    "A-S4_ownership": "passed: same-account two-process and lone-crash/reconciliation prerequisites",
+    "A-S4_cross_account_cross_logon_cross_integrity": "not exercised; ACL/label readback does not replace an execution matrix",
+    "A-S4_bind": "pending: all-interface watcher/inventory and explicit-bind matrices",
+    "A-S3": "pending: isolated Windows firewall/install fixture unavailable",
+    "A2_production_integration": "deferred while A1 PTU workflow remains unresolved",
+    "A3_A4": "pending",
+    "B": "deferred"
+  },
+  "results": {
+    "script-data-and-required-failures": {
+      "cases": [
+        {
+          "ast_unchanged": true,
+          "case": 0,
+          "elapsed_ms": 1147,
+          "exit_code": 0,
+          "ps_version": "5.1.26100.9444",
+          "round_trip": true
+        },
+        {
+          "ast_unchanged": true,
+          "case": 1,
+          "elapsed_ms": 1081,
+          "exit_code": 0,
+          "ps_version": "5.1.26100.9444",
+          "round_trip": true
+        },
+        {
+          "ast_unchanged": true,
+          "case": 2,
+          "elapsed_ms": 814,
+          "exit_code": 0,
+          "ps_version": "5.1.26100.9444",
+          "round_trip": true
+        },
+        {
+          "ast_unchanged": true,
+          "case": 3,
+          "elapsed_ms": 819,
+          "exit_code": 0,
+          "ps_version": "5.1.26100.9444",
+          "round_trip": true
+        },
+        {
+          "ast_unchanged": true,
+          "case": 4,
+          "elapsed_ms": 794,
+          "exit_code": 0,
+          "ps_version": "5.1.26100.9444",
+          "round_trip": true
+        }
+      ],
+      "failures": [
+        {
+          "failed_typed_result": true,
+          "native_exit_code": null,
+          "process_exit_code": 71,
+          "stage": "required_cmdlet"
+        },
+        {
+          "failed_typed_result": true,
+          "native_exit_code": 1,
+          "process_exit_code": 71,
+          "stage": "required_native"
+        }
+      ],
+      "gate": "A-S2",
+      "modules": "explicit protected Utility, Management and CimCmdlets; autoload None",
+      "network_or_firewall_mutation": false,
+      "oversized_input_rejected": true,
+      "recorded_at_utc": "2026-10-24T04:07:37.372737+00:00",
+      "system_directory": "C:\\WINDOWS\\system32",
+      "test_executable": "C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\debug\\deps\\pocketstream_desktop-ccea92dd92a66ea5.exe",
+      "test_process_id": 27496
+    },
+    "child-tree-and-output": {
+      "gate": "A-S2",
+      "network_or_firewall_mutation": false,
+      "output": {
+        "both_truncated": true,
+        "exit_code": 0,
+        "oversized_structured_result_rejected": true,
+        "stderr_cap": 32768,
+        "stdout_cap": 32768
+      },
+      "recorded_at_utc": "2026-10-24T04:07:31.087527900+00:00",
+      "test_executable": "C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\debug\\deps\\pocketstream_desktop-ccea92dd92a66ea5.exe",
+      "test_process_id": 27496,
+      "timeout": {
+        "all_retained_process_handles_signaled": true,
+        "assigned_while_suspended": true,
+        "elapsed_ms": 4063,
+        "observed_tree_pids": [
+          16512,
+          24660,
+          25888,
+          25916
+        ],
+        "termination": "timed_out"
+      }
+    },
+    "caller-abort-and-barrier": {
+      "address_seams": "existing FakeAddressIo, AddressOps, PendingAdoptOps and AppConfig serialization",
+      "admission_queue": 0,
+      "bounded_retained_completions": 1,
+      "cases": [
+        {
+          "actual_requesting_task_aborted": true,
+          "after_reconciliation_admission_restored": true,
+          "conflicting_write_refused": true,
+          "dispatched_pid": 27220,
+          "observation_available": false,
+          "pending_intent_retained_until_reconciliation": true,
+          "retained_outcome": "Uncertain",
+          "runner": {
+            "all_observed_children_exited": true,
+            "elapsed_ms": 452,
+            "runner_deadline_ms": 15000,
+            "termination": "Canceled"
+          },
+          "shutdown_drained": true
+        },
+        {
+          "actual_requesting_task_aborted": true,
+          "after_reconciliation_admission_restored": true,
+          "conflicting_write_refused": true,
+          "dispatched_pid": 3948,
+          "observation_available": true,
+          "pending_intent_retained_until_reconciliation": true,
+          "retained_outcome": "Completed",
+          "runner": {
+            "all_observed_children_exited": true,
+            "elapsed_ms": 46,
+            "runner_deadline_ms": 15000,
+            "termination": "Canceled"
+          },
+          "shutdown_drained": true
+        }
+      ],
+      "gate": "A-S2",
+      "network_or_firewall_mutation": false,
+      "recorded_at_utc": "2026-10-24T04:07:25.717965700+00:00",
+      "test_executable": "C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\debug\\deps\\pocketstream_desktop-ccea92dd92a66ea5.exe",
+      "test_process_id": 27496
+    },
+    "two-owners-and-lone-crash": {
+      "contender": {
+        "busy": true,
+        "initialized": false,
+        "pid": 10360
+      },
+      "cross_account_or_cross_logon_execution": "not exercised by this same-account fixture",
+      "gate": "A-S4 ownership",
+      "network_or_firewall_mutation": false,
+      "no_parent_or_contender_mutex_handles_at_crash": true,
+      "ordinary_interactive_rights": "SYNCHRONIZE | MUTEX_MODIFY_STATE | READ_CONTROL; explicit Medium label; exact ACL/label readback (SACL AI bookkeeping normalized)",
+      "owner": {
+        "acquisition": {
+          "abandoned": false,
+          "newly_created": true,
+          "security_descriptor": "D:P(A;;0x1f0001;;;SY)(A;;0x1f0001;;;BA)(A;;0x120001;;;IU)S:AI(ML;;NW;;;ME)"
+        },
+        "ownership_acquired_before_initialization": true,
+        "pending_addresses": 1,
+        "pid": 6436
+      },
+      "production_startup_integration": "deferred until prerequisite review",
+      "recorded_at_utc": "2026-10-24T04:07:37.558066400+00:00",
+      "restarted": {
+        "acquisition": {
+          "abandoned": false,
+          "newly_created": true,
+          "security_descriptor": "D:P(A;;0x1f0001;;;SY)(A;;0x1f0001;;;BA)(A;;0x120001;;;IU)S:AI(ML;;NW;;;ME)"
+        },
+        "executor_drained_before_owner_release": true,
+        "fake_writes": [
+          [
+            false,
+            "192.0.2.254"
+          ]
+        ],
+        "identity_conflict_blocked": true,
+        "pending_reconciled_before_admission": true,
+        "pid": 27148,
+        "retained_binding_preserved": true,
+        "unknown_observation_blocked": true,
+        "writes_before_reconciliation": 0
+      },
+      "sole_owner_crash": true,
+      "test_executable": "C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\debug\\deps\\pocketstream_desktop-ccea92dd92a66ea5.exe",
+      "test_process_id": 27496,
+      "wrong_namespace_and_foreign_dacl_refused": true
+    }
+  },
+  "regressions": {
+    "full_repository_check": {
+      "status": "passed",
+      "command": "WindowsPowerShell\\v1.0\\powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/check.ps1",
+      "rust": {
+        "passed": 764,
+        "failed": 0,
+        "ignored": 7
+      },
+      "frontend_typecheck": true,
+      "contracts": true,
+      "frontend_build": true,
+      "fmt": true,
+      "clippy_all_targets_deny_warnings": true,
+      "evidence": "Every Step OK and explicit All checks passed clean. terminal marker",
+      "launcher_exit_reporting": "WinPS5.1 Start-Process ExitCode was null; successful terminal marker reaches the script explicit exit-0 path. Separate direct all-targets clippy returned 0."
+    },
+    "frontend_tests": {
+      "command": "npm.cmd test",
+      "passed": 174,
+      "failed": 0,
+      "exit_code": 0
+    },
+    "prerequisite_tests": {
+      "passed": 4,
+      "failed": 0,
+      "exit_code": 0
+    },
+    "diff_and_fixture_syntax": {
+      "status": "passed",
+      "checks": [
+        "git diff --check",
+        "WinPS5.1 parser for qualification scripts",
+        "node --check production-smoke.mjs"
+      ]
+    }
+  },
+  "source_preservation": {
+    "uncommitted": true,
+    "commits_resets_stashes": false,
+    "original_inputs_verified_before_proofs": 76,
+    "changed_original_inputs": [
+      "src-tauri/Cargo.toml",
+      "src-tauri/src/network/mod.rs"
+    ],
+    "scope": "Only Windows dev feature flags and cfg(test) module wiring changed among original inputs; new primitives are test-only; original A1 production logic, IPC contract and manifests preserved",
+    "dependency_versions_or_lockfile_changed": false,
+    "new_test_constructs_network_manager": false
+  },
+  "source_hash_format": "SHA256 of raw bytes; fingerprint is SHA256 of UTF-8 <sha256>  <path> lines sorted by path, each ending LF",
+  "source_sha256": {
+    "README.md": "4c086d73643a68caca800218c6c283cdf7b13972660f2b11ac6d623c276f4855",
+    "RELEASE-NOTES.md": "2d4fd6851fc62995a34b941e9c4c77144bb1dee67909236f5f1dac62fdc0a844",
+    "docs/runtime-evidence/privilege-v2-a1.md": "c02f5cf1fd9fc3a1f940edf3bbc544b1755120090d02adbc2ff9526c9bce5885",
+    "package-lock.json": "cb5fb8f71948ac0dadd0b982bc6bf976d51826023b9aa261a6c6d452630109a9",
+    "package.json": "915b3b643dfe6aa4e054c694a588b6ce81367c0783e3d4c938a1b607c686ef57",
+    "scripts/check-ipc-allowlist.mjs": "23db5daa033424f8e6fa3b5f34f385c3a67a94aea9632af2de60d2421ec218eb",
+    "scripts/check.ps1": "b3ac61f8e741a30db380289db1a914b89f6f3b195bf6b4a700e6283605f27214",
+    "src-tauri/Cargo.lock": "21935f69e57d24a299bb96b0ca2c7f20b3ddb5dd985e88a9f33fd69b75e477ac",
+    "src-tauri/Cargo.toml": "dd2614c4ae2341fc74b9009e6f232543451b2aeb7e04f7b52cc785ec949e7cd2",
+    "src-tauri/build.rs": "e83e5850fc39e3d0bc702d8702f34e160fbf21fa311766d719022d0354bacc82",
+    "src-tauri/capabilities/default.json": "ed034be3718b5b7143e412b16393ca92457fdc3c1e7a8d4997528370d549a4f1",
+    "src-tauri/examples/acl_native_smoke.rs": "50d096110426a66f9afb9481f3a56b7a0af8b27a30d8fed1a8fd35ae39cf8a61",
+    "src-tauri/permissions/autogenerated/add_manual_node.toml": "59c542d2f11c2dd04b0f9a156e54a855511a2d956eb94cdf0f723c096740ad67",
+    "src-tauri/permissions/autogenerated/add_secondary_ip.toml": "55227e570fb8ab0853a6e218be1564752081ab0b224bf812dd336deb35d1e15f",
+    "src-tauri/permissions/autogenerated/apply_restream_settings.toml": "f338dbbabc8ea7d188dd77971d9f20649c8ec9b555c4c5468eaf0765e744d338",
+    "src-tauri/permissions/autogenerated/clear_manual_nodes.toml": "0e02ceb0f066d9d188baeeb6232484ff969d8e857fca17cfecf90c2fbf35317f",
+    "src-tauri/permissions/autogenerated/control_cgi_zoom_direct.toml": "47b6c4688f191b2106ae00450015b9208b2fce524e6eefcb2235da48319cbd09",
+    "src-tauri/permissions/autogenerated/create_video_window.toml": "371acdf00a1d9e9dbb3b48e1a0d4693574805b4b4e681ef381805fb8447e0342",
+    "src-tauri/permissions/autogenerated/forget_device.toml": "447eaf7564c8e06dc85db48beac8c3dda320cb642e325008a3c06ce6f858ba18",
+    "src-tauri/permissions/autogenerated/get_adapter_selection.toml": "308c796f8df6d8bdd784ddf712a3648f284e43c5b3eb5589aa1bd52c049828c2",
+    "src-tauri/permissions/autogenerated/get_adoption_state.toml": "f0a1c1b7070490548179c0b926098e27d074302bd940b2eaa884440f354ed982",
+    "src-tauri/permissions/autogenerated/get_capture_state.toml": "200966cbed0691348950f6c89650797d9a0078fe4ea0f95715a91ef1c4218d19",
+    "src-tauri/permissions/autogenerated/get_config.toml": "815bcf8ce240536e89bf35037a68ac3fd27c56b7fb115e81466148c659bbf3b2",
+    "src-tauri/permissions/autogenerated/get_device_list.toml": "37d400ef3102ba0df33450c45df51be21b831c28834204981622f5f682554afa",
+    "src-tauri/permissions/autogenerated/get_dhcp_state.toml": "4ffe2cccdf4ec755d3ed70637ae1437cb73e883fdfe63537c50bccb37867bbcf",
+    "src-tauri/permissions/autogenerated/get_host_ip_owners.toml": "9311ce28bf21443854b3e47b5fc92f9d378d68dac0fd3b49b0d07e03663ff82b",
+    "src-tauri/permissions/autogenerated/get_license_document.toml": "da94be00b50fc7b8955876d7840f3939dba251e750d65a7c6d6e6db3d88aba8e",
+    "src-tauri/permissions/autogenerated/get_network_mode.toml": "ff3641d02b2c593643bc92b281a45020a5fb6dd538e5d0346ca86aecc2470b14",
+    "src-tauri/permissions/autogenerated/get_startup_notices.toml": "45c7dc9003a911dff9c6f597d65a34beec8097805a75fa9b9163d5e5dbb55e4f",
+    "src-tauri/permissions/autogenerated/list_vpn_interfaces.toml": "ed8da0b596e3590d8b2c6df032c25c67abd48e6ee280d3f3d15560938949ef9a",
+    "src-tauri/permissions/autogenerated/log_frontend.toml": "8746769c3dd0cdf1478a4ceb062c317dece01178095dbef3bbfb6bb8486b19ea",
+    "src-tauri/permissions/autogenerated/open_device_browser.toml": "48018daae010cdb19f9106c5a7c1ea08c61a9ef46317f4c706c3f64fa030a9f6",
+    "src-tauri/permissions/autogenerated/open_log_folder.toml": "92b7bf8551f080edfda6ab5f5b4c75e355fda588f969cc03fc9cb0b900d0ecf0",
+    "src-tauri/permissions/autogenerated/ptu_send.toml": "5ae199f17f2cfc077ea248cc6fdffc1a29ada23d1195beee880b159ae6b9ffa8",
+    "src-tauri/permissions/autogenerated/refresh_adapter.toml": "71fcdbce3fcfe6adf063483577913f57e98f9844a107aab0ded4547f87bb3a64",
+    "src-tauri/permissions/autogenerated/remove_adopted_subnet.toml": "ee127dc59f5053146b6c677e7008c45067d519bb7a3180c8d5670927c0f75e59",
+    "src-tauri/permissions/autogenerated/remove_manual_node.toml": "feee3599d3a9ff8a5e2b452990724758546da6a257d6e619e07e596e636c8f01",
+    "src-tauri/permissions/autogenerated/remove_secondary_ip.toml": "4014e56ed462620bdb51adec61ad0617f4bddb54ed022cbd5d546c0a42e31d2c",
+    "src-tauri/permissions/autogenerated/retry_playback.toml": "7f94319b2430e6f73d669bc0e730e34bdf10e0b800466512c41c9a6423547892",
+    "src-tauri/permissions/autogenerated/scan_network.toml": "e1affbbda911c6ff4d0fdac80863a61e92d8c5971e01e9634f8a7419df797bef",
+    "src-tauri/permissions/autogenerated/select_adapter.toml": "4dda702b57928967d6f48e445c9f2ae3642dd424c58948c49e6c707ee1160b70",
+    "src-tauri/permissions/autogenerated/set_audio_muted.toml": "04a218a10f10287160683c3ee39a08baf69ff1edc30c95302d3e19ad6b682822",
+    "src-tauri/permissions/autogenerated/set_device_alias.toml": "2c28507343b9b69b293c264b51c4a45519e945a31cae8cab7f28d02368728061",
+    "src-tauri/permissions/autogenerated/set_network_mode.toml": "129823afd60fd2d1540b4f28cb0a0d10def3e0a6220380f1d7a137fc55bf850f",
+    "src-tauri/permissions/autogenerated/set_video_visible.toml": "e439964f996736a75fed5aefc894cd4875e504e86209e45e9ec1015c0ac84367",
+    "src-tauri/permissions/autogenerated/set_zoom_position.toml": "4bc89d0276388f4aeddcae4dbc4cea348efe3456ef3891d2a00544cd502b16b4",
+    "src-tauri/permissions/autogenerated/start_arp_discovery.toml": "3e3a7e628f372d5d8b78cafd6403cd416b536b0fea55b8c73e9b92d1a6dcdf2e",
+    "src-tauri/permissions/autogenerated/start_recording.toml": "4991db9dc57876facec4b12035507bf3a9551ef57ecc77aafd2e7bd68393dc36",
+    "src-tauri/permissions/autogenerated/start_restream_server.toml": "50eb7e7a5566111937738bb39bf8f8e21c2fac315dfc764215e7bb8871e0114b",
+    "src-tauri/permissions/autogenerated/start_stream.toml": "aa03b92df3d158dfce6d23e9101748918248f5e7af8fe828d3ecc33b1951b16d",
+    "src-tauri/permissions/autogenerated/stop_recording.toml": "0008c014102cb1229dec7992bf95c546ee0f10b718652837848886403bbeb185",
+    "src-tauri/permissions/autogenerated/stop_restream_server.toml": "71e4101ba34026e636e3d5bcabdc4d1933c842658067f255b7af5d4f702285de",
+    "src-tauri/permissions/autogenerated/stop_stream.toml": "3a0e0c2c6a42be398cd4b874df00493757b96a05b14e36e0aeb79713885fd569",
+    "src-tauri/permissions/autogenerated/switch_restream_protocol.toml": "32c78555735f3ad881f9c4c3f8b59d47ed2e6834da286395c7c1f46372142d66",
+    "src-tauri/permissions/autogenerated/take_screenshot.toml": "43e66bcab846c043e11ce9a9b77492a7e4f884edbe019f198161e54125da4b5a",
+    "src-tauri/permissions/autogenerated/update_credentials.toml": "bd45df0f0d581013a88284635463eef4a42d765ac75257db78c0933f0104451e",
+    "src-tauri/permissions/autogenerated/update_stream_settings.toml": "3b08c2eba2a79834c6413f59e83b91198dfd830199505118c0a51463b7932b6b",
+    "src-tauri/permissions/autogenerated/update_video_position.toml": "bca08c3ec612b838cf050968ec5de7498932e857733acdde1f131e3459da459e",
+    "src-tauri/pocketstream.dev.manifest": "80bae5a84c03e1c426f638fc27064cc7ce1aacb403d8ee85b12453a470cf9917",
+    "src-tauri/pocketstream.exe.manifest": "c2cde06c274d7ed94b171a357a79976c296693c03926653ad7e304b29e6155ef",
+    "src-tauri/src/camera/mod.rs": "496f1cf97048b4deabe526a007a40a0df7d6c4c485983f7897e65d7e57b0b340",
+    "src-tauri/src/commands/camera.rs": "3cc2e0eee02785365c1ca725d3f0c4a53f496cf306330348342f9f5139b7c9a6",
+    "src-tauri/src/commands/config.rs": "22ae6790aebe2da683edb7b5859c531df9cd3684fc93d3d4eea1004404847b74",
+    "src-tauri/src/commands/network.rs": "5c9292ca0e2a68d8babee917c619af119f1a89c1e68d0e5b52f63589501962dc",
+    "src-tauri/src/ipc_acl_tests.rs": "e177d8780c22e44ee2262c7d3f61c6d2957fb0e7447caf1c86cfd5fa5644e288",
+    "src-tauri/src/lib.rs": "ccbe1c902087589c2061f4f46b0460d13f0172848a1523def844c7f33066011c",
+    "src-tauri/src/network/arp.rs": "b48ea3e25d03269290e18d7c23dcb3f194bc45b19056d94679bcb061c77ea31d",
+    "src-tauri/src/network/host_owner.rs": "04c08e4f5653795915f8453715a2bd88a5f7160474ef09973f5b622860de33cb",
+    "src-tauri/src/network/local_executor.rs": "ef8f3081f947fb0f1c3e132a1fe70e0fe1731e9e2b9770b6af78c1ce5aac7e40",
+    "src-tauri/src/network/mod.rs": "a34c9bf4ce18fce46b982c9af0cdbd9bec09eeb7395782d3d018169e15bbfdb9",
+    "src-tauri/src/network/native_runner.rs": "0ccaad15d6773ce2b133a00893d76fa85ecf1aad76b9e2cf37fe6b63837b6a8f",
+    "src-tauri/src/validation.rs": "61f62af92974f1235b53073eb7cd3a680c1c256ee503c4810ddc84c2a13f8a08",
+    "src-tauri/tauri.conf.json": "61aa2b58dd34306d3397cd9b13470be60da8e3011b4833bde29b7cda3eeb6b85",
+    "src-tauri/tests/fixtures/acl-native-smoke.js": "2d9e6e2e605ef87f433ff802cac7392d4adcdc8146f6eb96b1fa1f2f41b22df4",
+    "src-tauri/tests/fixtures/native-runner-v1.ps1": "ab0b9d039ea569095a8cdda4eee233c37460e7695d515317ff74e22fc640e067",
+    "src-tauri/tests/fixtures/native_foundation.rs": "a806dfc2508b8ff9526336c5501c8fbc76e26bde005e76f8ce0ed1189f65d2ed",
+    "src/lib/devices.ts": "3258a40b1943a903bb7dd5fca0ec7411698d89707f1eb64a8442c5bc633cbdec",
+    "src/lib/tauri-api.ts": "681da2cc2ddbb5a35d936f120b66541ec416181c7121696f91bef9b1a98966af",
+    "tests/ipc-allowlist.test.cjs": "97ecb0716f24d64dc82fd221a7141f9d80c06b66afccfcdf3c1b9e397d8e9bad",
+    "tests/notification-behavior.test.cjs": "ea160c5d804771d60f4dbcec445f6a1840a1acf1fc56fc7f1f2fab03ab95e645",
+    "tsconfig.json": "35d3bae3ac284c98036282c10ae5807407d6f8c06ac770eb4b809ce122f84bca"
+  },
+  "source_fingerprint_sha256": "59c74928703ac408dcac08106c7f4642e77bae08b5cef7fcdc8db06ff3fad155",
+  "evidence_sha256": {
+    "privilege-a2-prerequisites-qualified.log": "4f1007b6fc82675c174929189fc2cbb6308993e364627ee81e0259c8dfc9c3da",
+    "privilege-a2-proof-clippy.log": "f11625bc5795843a366866c66a34583a1b4ffd9559c705a79e9b922d11eb736b",
+    "privilege-a1-continuation-check-final.stdout.log": "a8a7ca82d197c3cacd7c982263a71df9d9d2d9fd4717c309be02d964e4a3ce48",
+    "privilege-a1-continuation-check-final.stderr.log": "adda7be4491a40c9de350c274922d3a23a4ea0730bf39d683fb0408a896104c7",
+    "privilege-a1-continuation-frontend-tests.log": "cc80ac2bd9a88120f112afc95534eec5ac9590ca5b6fed7689f613fd596257fc",
+    "privilege-a1-continuation-diff.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "src-tauri/target/privilege-a2-proofs/20261024T040724Z/script-data-and-required-failures.json": "6f1411bc3012ee8eeaac70b01b136ded4a00c97f6e2909460d5f76f1a3571d77",
+    "src-tauri/target/privilege-a2-proofs/20261024T040724Z/child-tree-and-output.json": "dc848f88a3aa47092b332c560c026db39705218ac39077216bcaa12b3e5710a0",
+    "src-tauri/target/privilege-a2-proofs/20261024T040724Z/caller-abort-and-barrier.json": "5ff0bc18cef8c4577094b00583624b270ad253fbeee144173b15dba8f441431d",
+    "src-tauri/target/privilege-a2-proofs/20261024T040724Z/two-owners-and-lone-crash.json": "56b98876dd29465765233a3431434131c033933074227f1037c62092093be72f",
+    "src-tauri/target/privilege-a2-proofs/20261024T040724Z/run.json": "24514161c056bf37a2cd81b023f15497f973fa387356811735e9b9e61bc60df7",
+    "src-tauri/target/privilege-a2-proofs/20261024T040724Z/qualification-test.manifest.xml": "cd613330097d228ae01fce028e50954fe4595249d51edebc4461ec252b514517",
+    "src-tauri/target/privilege-a2-proofs/environment.json": "588a0a123be367e099948f6849df8b640c9d73358a98bec5cb319d9f0cf9c0a5"
+  },
+  "earlier_attempts": [
+    {
+      "log": "privilege-a2-proofs-first.log",
+      "sha256": "c486be8da1b1b9cf9d3fb7ed1ea534ae07180b4ca79588104b4da8c6e0696b15",
+      "status": "failed; resolved before final qualification",
+      "reason": "Encoding setup used New-Object before explicit module imports; mutex SDDL compared generic rights/SACL metadata literally."
+    },
+    {
+      "log": "privilege-a2-proofs-second.log",
+      "sha256": "627d78f58f56487eea22287d00057cc170a1b3842e9ca1673dd20a6bfb49111c",
+      "status": "failed; resolved before final qualification",
+      "reason": "Native ipconfig exit missing with PATHEXT removed; mutex readback still compared unmapped generic rights."
+    },
+    {
+      "log": "privilege-a2-owner-diagnostic.log",
+      "sha256": "7d6e589ea0450a44d7df6c617774c1aa1ed9e2bb19767574bdf6a9b1b8080b2f",
+      "status": "failed; resolved before final qualification",
+      "reason": "Captured native mutex access masks and SACL AI bookkeeping; explicit masks and narrow metadata normalization followed."
+    },
+    {
+      "log": "privilege-a2-proofs-third.log",
+      "sha256": "4b190c121467a35b9bf6c4e7cc610ac3a7726150061dc3fefea11f93d45733bf",
+      "status": "failed; resolved before final qualification",
+      "reason": "Three fixtures passed; native exit-code assertion failed. Read-only clean-environment control proved fixed PATHEXT necessary."
+    },
+    {
+      "log": "privilege-a1-continuation-check-full.log",
+      "sha256": "fa0f1637257781dc395c7cffd75041898b554a180f2896412c3c74c9385a66a2",
+      "status": "failed; resolved before final qualification",
+      "reason": "WinPS5.1 redirection with ErrorActionPreference Stop treated Cargo stderr progress as a terminating script error; OS-level capture used in final check."
+    },
+    {
+      "log": "privilege-a1-continuation-check.stderr.log",
+      "sha256": "64713cd3867c7e3a1a6dadf01aac5779119a8f1a32879d5452ce426b2b7e02b3",
+      "status": "failed; resolved before final qualification",
+      "reason": "All-targets discovered the private-seam module as a standalone test crate. It was moved under tests/fixtures."
+    }
+  ],
+  "technical_references": [
+    "https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute",
+    "https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-createmutexexw",
+    "https://learn.microsoft.com/en-us/windows/win32/secauthz/security-information",
+    "https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_command_precedence?view=powershell-5.1"
+  ],
+  "residual_risk": "Production release remains requireAdministrator; A2 startup/writers are not integrated; A1 PTU, firewall/install, bind and installed-package qualification remain pending. No privilege-separation claim."
+}

@@ -1,0 +1,616 @@
+{
+  "schema_version": 1,
+  "recorded_at_utc": "2026-10-24T05:06:58.635Z",
+  "specification_revision": "2-A.1",
+  "baseline_commit": "d138965c9b6f9e3c53a916813a7376757f6ac727",
+  "worktree": "A1 remains uncommitted. Native-prerequisite input hashes remain unchanged. This follow-up changes ptz.ts and its existing workflow tests to correct the stale-role halt alarm; earlier observations retain their original artifact hashes.",
+  "status": "A1 production workflows observed across recorded artifacts; PTU role-handoff correction passed production query/Home/normal-close smoke on exact rebuilt A1; A2-A4 and isolated gates remain incomplete",
+  "original_a1_evidence": "privilege-v2-a1.json",
+  "production_ui": {
+    "gate": "A1 production workflows",
+    "status": "partial: production settings and confirmation Cancel paths passed; hardware gates pending",
+    "started_at_utc": "2026-10-24T03:11:20.4623751Z",
+    "artifact": {
+      "path": "C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\debug\\pocketstream-desktop.exe",
+      "sha256": "be1be2c86338167fe4540124b72f005d94ad948f2ce23327323c52ea590dffc1",
+      "profile": "development",
+      "execution_level": "asInvoker",
+      "production_ui_and_handlers": true,
+      "replaced_assets_or_handlers": false
+    },
+    "fixture": {
+      "adapter_mac": "40:c2:ba:cf:d5:75",
+      "adapter_guid": "{812AD22F-3345-4817-B6D7-708D769E69AC}",
+      "alias": "Ethernet",
+      "interface_index": 15,
+      "initial_link_state": "Up",
+      "primary_address": "192.168.1.100/24",
+      "native_mutation_policy": "both destructive confirmations Cancel; no listener starts"
+    },
+    "native_before": {
+      "adapter_guid": "{812AD22F-3345-4817-B6D7-708D769E69AC}",
+      "adapter_mac": "40:c2:ba:cf:d5:75",
+      "interface_index": 15,
+      "addresses": [
+        {
+          "IPAddress": "192.168.0.100",
+          "PrefixLength": 24,
+          "PrefixOrigin": 1
+        },
+        {
+          "IPAddress": "192.168.1.100",
+          "PrefixLength": 24,
+          "PrefixOrigin": 1
+        }
+      ],
+      "dhcp": "Disabled",
+      "dns": [],
+      "routes": [
+        {
+          "DestinationPrefix": "192.168.0.0/24",
+          "NextHop": "0.0.0.0",
+          "RouteMetric": 256,
+          "Protocol": 2
+        },
+        {
+          "DestinationPrefix": "192.168.0.100/32",
+          "NextHop": "0.0.0.0",
+          "RouteMetric": 256,
+          "Protocol": 2
+        },
+        {
+          "DestinationPrefix": "192.168.0.255/32",
+          "NextHop": "0.0.0.0",
+          "RouteMetric": 256,
+          "Protocol": 2
+        },
+        {
+          "DestinationPrefix": "192.168.1.0/24",
+          "NextHop": "0.0.0.0",
+          "RouteMetric": 256,
+          "Protocol": 2
+        },
+        {
+          "DestinationPrefix": "192.168.1.100/32",
+          "NextHop": "0.0.0.0",
+          "RouteMetric": 256,
+          "Protocol": 2
+        },
+        {
+          "DestinationPrefix": "192.168.1.255/32",
+          "NextHop": "0.0.0.0",
+          "RouteMetric": 256,
+          "Protocol": 2
+        },
+        {
+          "DestinationPrefix": "224.0.0.0/4",
+          "NextHop": "0.0.0.0",
+          "RouteMetric": 256,
+          "Protocol": 2
+        },
+        {
+          "DestinationPrefix": "255.255.255.255/32",
+          "NextHop": "0.0.0.0",
+          "RouteMetric": 256,
+          "Protocol": 2
+        }
+      ]
+    },
+    "native_after": {
+      "adapter_guid": "{812AD22F-3345-4817-B6D7-708D769E69AC}",
+      "adapter_mac": "40:c2:ba:cf:d5:75",
+      "interface_index": 15,
+      "addresses": [
+        {
+          "IPAddress": "192.168.0.100",
+          "PrefixLength": 24,
+          "PrefixOrigin": 1
+        },
+        {
+          "IPAddress": "192.168.1.100",
+          "PrefixLength": 24,
+          "PrefixOrigin": 1
+        }
+      ],
+      "dhcp": "Disabled",
+      "dns": [],
+      "routes": [
+        {
+          "DestinationPrefix": "192.168.0.0/24",
+          "NextHop": "0.0.0.0",
+          "RouteMetric": 256,
+          "Protocol": 2
+        },
+        {
+          "DestinationPrefix": "192.168.0.100/32",
+          "NextHop": "0.0.0.0",
+          "RouteMetric": 256,
+          "Protocol": 2
+        },
+        {
+          "DestinationPrefix": "192.168.0.255/32",
+          "NextHop": "0.0.0.0",
+          "RouteMetric": 256,
+          "Protocol": 2
+        },
+        {
+          "DestinationPrefix": "192.168.1.0/24",
+          "NextHop": "0.0.0.0",
+          "RouteMetric": 256,
+          "Protocol": 2
+        },
+        {
+          "DestinationPrefix": "192.168.1.100/32",
+          "NextHop": "0.0.0.0",
+          "RouteMetric": 256,
+          "Protocol": 2
+        },
+        {
+          "DestinationPrefix": "192.168.1.255/32",
+          "NextHop": "0.0.0.0",
+          "RouteMetric": 256,
+          "Protocol": 2
+        },
+        {
+          "DestinationPrefix": "224.0.0.0/4",
+          "NextHop": "0.0.0.0",
+          "RouteMetric": 256,
+          "Protocol": 2
+        },
+        {
+          "DestinationPrefix": "255.255.255.255/32",
+          "NextHop": "0.0.0.0",
+          "RouteMetric": 256,
+          "Protocol": 2
+        }
+      ]
+    },
+    "native_state_unchanged": true,
+    "profile_restored": true,
+    "ui": {
+      "production_ui": true,
+      "replaced_assets_or_handlers": false,
+      "settings": {
+        "status": "passed",
+        "action": "Save Settings",
+        "field": "stream.rtsp_port",
+        "values": [
+          554,
+          13554,
+          554
+        ],
+        "readback": "real get_config IPC"
+      },
+      "address_removal_confirmation": {
+        "status": "passed",
+        "path": "Configure > Remove primary",
+        "native": {
+          "observed": true,
+          "owner_pid": 11460,
+          "text": "PocketStream Desktop\nMainInstructionIcon\nRemove 192.168.1.100 from Ethernet?\nOK\nCancel",
+          "action": "Cancel"
+        },
+        "observed": "dialog remained open; original address field preserved"
+      },
+      "dhcp_confirmation": {
+        "status": "passed",
+        "path": "Configure > DHCP > Close",
+        "native": {
+          "observed": true,
+          "owner_pid": 11460,
+          "text": "PocketStream Desktop\nMainInstructionIcon\nSwitching to DHCP removes manually configured addresses from this adapter. Saved managed secondaries will remain pending until a static mode returns. Continue?\nOK\nCancel",
+          "action": "Cancel"
+        },
+        "observed_mode": "static_manual"
+      },
+      "errors": [],
+      "startup_profile": {
+        "mode": "static_manual",
+        "primary": "192.168.1.100/24",
+        "output": false,
+        "notices": 0
+      },
+      "page": {
+        "url": "http://tauri.localhost/",
+        "settings_button": true,
+        "restream_enabled": false,
+        "interface": "Checking Ethernetâ€¦"
+      },
+      "close_requested": "production #btn-close handler"
+    },
+    "hardware": {
+      "discovery": "pending",
+      "playback": "pending",
+      "ptu": "pending",
+      "reason": "Controlled connected hardware and explicit PTU identity required"
+    },
+    "diagnostic": null,
+    "application_pid": 11460,
+    "graceful_exit": true,
+    "finished_at_utc": "2026-10-24T03:11:25.5919233Z"
+  },
+  "test_instrumentation": {
+    "method": "CDP drives real production DOM handlers; native TaskDialog text inspected through same-PID Win32/UI Automation; no replaced assets, window.confirm, invoke, app modules or backend handlers",
+    "profile": "Temporary valid static-manual profile, empty pending/retained/native recovery state, output disabled; original profile/cache/key/log files restored and verified by SHA256",
+    "destructive_confirmations": "Cancel only",
+    "medium_integrity_only": true
+  },
+  "evidence_files": {
+    "src-tauri/target/privilege-a1/production-smoke-20261024T031119Z/result.json": "0c6cb34f1ba81a030585bc74d65758995fef389c3a609f8acd6ee18c8fe6a6f9",
+    "src-tauri/target/privilege-a1/production-smoke-20261024T031119Z/ui-result.json": "8ed6934c272c4a2403ebcc47676fbcb6f5eeba650fe6e494fb2191886899cc63",
+    "src-tauri/target/privilege-a1/production-smoke-20261024T031119Z/application.stderr.log": "3858d288b784f17ecb2b08de4480e47924ceae45791c16fb4cefa77239984f4e",
+    "src-tauri/target/privilege-a1/production-smoke-20261024T031119Z/production-app.log": "3858d288b784f17ecb2b08de4480e47924ceae45791c16fb4cefa77239984f4e",
+    "src-tauri/target/privilege-a1/production-smoke-20261024T031119Z/production-ui.png": "3a67968863a1ea3ea2424d7afce4ad98cd2d3e2b53879f2d827d3bb6714f56cf",
+    "src-tauri/target/privilege-a1/hardware-stage-20261024T0335/launch-result.json": "73009c7b8a40fd142fc0ad7d0376365e984e31520b648f693cb4eb76ffb12e4f",
+    "src-tauri/target/privilege-a1/hardware-stage-20261024T0335/hardware-observations.json": "3a7a01351f5254a38d45b99e91124cfbf3b306c86a2016691a1bc4a0112b80a5",
+    "src-tauri/target/privilege-a1/hardware-stage-20261024T0335/hardware-observations.log": "7dc962d3d9a3801ac3bc651adc23d992cb9b93fc650675b52e5539306260daa6",
+    "src-tauri/target/privilege-a1/hardware-stage-20261024T0335/hardware-app-snapshot.log": "4408d421d9f3638e8a2da2b3eaa1abe8a70e1b063cc3a7590227ecbc6126f25e"
+  },
+  "fixture_sha256": {
+    "scripts/verify-a1-production-smoke.ps1": "66684373dd5617e9523a2ad70282aa6d23abc4cab53060f18a8bda4e5303fa68",
+    "scripts/verify-a1-production-smoke.mjs": "51a60031ae6e115894a15fe2a7665823c95f3f2eadb7104114f8a446547ccc72",
+    "scripts/start-a1-hardware-smoke.ps1": "65cc97b255edec90260ed7c9a2a0197d6ea9e0360a4bc9a685476419f36b9548",
+    "scripts/complete-a1-hardware-smoke.ps1": "2ab72d1ca019f3f8c37c413a3278e8837967e0f38868d99ed5baf61497439d3d"
+  },
+  "prior_attempts": [
+    {
+      "directory": "src-tauri/target/privilege-a1/production-smoke-20261024T030350Z",
+      "status": "not qualifying",
+      "reason": "Invalid fixture RTSP token was rejected and app loaded defaults. Corrected to 16 lowercase hexadecimal characters and added exact startup-profile/readback checks.",
+      "recovery": "Owned test host stopped only after verifying no network child/pending intent, capture unavailable, pinger stopped and unchanged selected-adapter state. Original profile/log bytes restored; rejected test profile retained privately."
+    },
+    {
+      "directory": "src-tauri/target/privilege-a1/production-smoke-20261024T030942Z",
+      "status": "not qualifying",
+      "reason": "Native DirectUI dialog body was not exposed by GetWindowText; switched to same-PID UI Automation text. App closed normally and original profile/native state verified."
+    }
+  ],
+  "replacement_fixture": {
+    "adapter": {
+      "alias": "Ethernet",
+      "index": 15,
+      "mac": "40:c2:ba:cf:d5:75",
+      "guid": "{812AD22F-3345-4817-B6D7-708D769E69AC}"
+    },
+    "camera": {
+      "ip": "172.31.169.84",
+      "mac": "40:cd:3a:03:28:e2",
+      "confirmed_by_user": true,
+      "observed_source": "172.31.169.102",
+      "http_root_status": 200,
+      "http_title": "FV2K-DCK-10",
+      "http_server": "Turbo.lua v2"
+    },
+    "ptu": {
+      "status": "pending: endpoint/connection not yet established",
+      "candidate_ip": "192.168.1.74",
+      "candidate_mac": "08:df:ec:22:01:77",
+      "observed": "Installed app saw the tuple, but fresh bound identity probes repeatedly fail/intermittently resolve. The verified encoder IP returns HTTP 405 to POST /API/PTCmd with PP&TP. No movement was commanded by this qualification run."
+    },
+    "running_installed_app": {
+      "path": "C:/Program Files/PocketStream Desktop/pocketstream-desktop.exe",
+      "sha256": "38e723e21eb0ffe9ee7315b862faefe06a7930e90fe92981b6f3706f3425b69f",
+      "pid": 16028,
+      "qualifies_a1": false,
+      "reason": "Different executable from the uncommitted A1 artifact; used only to identify replacement hardware.",
+      "binding": "Installed app adopted 172.31.169.102/24 before any A1 hardware test. This user-started session state must be preserved."
+    }
+  },
+  "newly_built_release": {
+    "path": "src-tauri/target/privilege-a1/hardware-stage-20261024T0335/pocketstream-desktop.exe",
+    "sha256": "c483047a2d962b153cc41069daa9041d6168a25c952672f295e71a80ab292d8f",
+    "command": "POCKETSTREAM_RELEASE=1 cargo build --release --bin pocketstream-desktop --locked --offline",
+    "exit_code": 0,
+    "build_log_sha256": "b0150f240d7a048c6bad6d9c6f0b512cc415aa3e54713385621ff2c0d13dabff",
+    "status": "elevated exact release exercised; discovery and visible initial playback passed, PTU pending; normal exit and output flag restoration verified",
+    "manifest": {
+      "path": "src-tauri/target/privilege-a1/hardware-stage-20261024T0335/application.manifest.xml",
+      "sha256": "780c5f643a1faa7a7198a3114e470fe789beacf042ba7b0fcdf2e6b3e3e20221",
+      "execution_level": "requireAdministrator",
+      "common_controls": true
+    },
+    "runtime": {
+      "gstreamer": "1.26.11",
+      "staged_dll_count": 76,
+      "libsrt_dll_sha256": "8d58764b2d53df76b7e9b69e55cd3250d3bb0c14631224c0f16962c5317a5600"
+    },
+    "original_build_output_path": "src-tauri/target/release/pocketstream-desktop.exe",
+    "preservation_note": "Original qualified image preserved here before later rebuilds of the release output."
+  },
+  "gates": {
+    "production_settings": "passed on unchanged development artifact",
+    "production_address_removal_cancel": "passed on unchanged development artifact",
+    "production_dhcp_cancel": "passed on unchanged development artifact",
+    "production_discovery": "passed on exact optimized A1 release c483047a2d962b153cc41069daa9041d6168a25c952672f295e71a80ab292d8f",
+    "production_playback": "passed initial workflow on same A1 release: actual user confirmed visible video; frame-stall recoveries recorded separately",
+    "production_ptu": "passed on corrected A1 4337b1dc...: real .202 initialization/limits query, Clear/reassign without red toast, user-observed Home movement/stop; no directional-release matrix claimed",
+    "A-S2": "passed prerequisite process fixtures; see privilege-v2-native-prerequisites.json; production writers not integrated",
+    "A-S4_ownership": "passed same-account two-process and lone-crash/reconciliation prerequisites; cross-account/logon/integrity execution not exercised",
+    "firewall_install": "pending; isolated Windows fixture required",
+    "A4": "pending",
+    "A-S4_bind": "pending",
+    "A2": "not implemented: prerequisite A-S2 and same-account A-S4 ownership fixtures passed; subsequent production wiring still pending",
+    "production_close_corrected": "passed: Close by user, exact test PID exited, original profile restored by SHA256 and bindings unchanged"
+  },
+  "technical_reference": "https://learn.microsoft.com/en-us/microsoft-edge/webview2/how-to/debug-visual-studio-code",
+  "residual_risk": "Release host remains requireAdministrator; renderer/media compromise still occurs in an elevated host until B.",
+  "release_hardware_smoke": {
+    "at_utc": "2026-10-24T03:47:17.2894749Z",
+    "artifact": {
+      "path": "C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\privilege-a1\\hardware-stage-20261024T0335\\pocketstream-desktop.exe",
+      "sha256": "c483047a2d962b153cc41069daa9041d6168a25c952672f295e71a80ab292d8f",
+      "profile": "release",
+      "elevated": true,
+      "manifest": "requireAdministrator"
+    },
+    "application_pid": 11420,
+    "started_at_utc": "2026-10-24T03:35:05.4634595Z",
+    "selected_observations": [
+      "2026-10-23 22:35:05 [INFO] pocketstream_desktop - PocketStream Desktop v0.6.7 starting",
+      "2026-10-23 22:35:05 [INFO] pocketstream_desktop - Found bundled GStreamer at C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\privilege-a1\\hardware-stage-20261024T0335\\resources\\gstreamer\\bin",
+      "2026-10-23 22:35:06 [INFO] pocketstream_desktop - GStreamer GStreamer 1.26.11 initialized",
+      "2026-10-23 22:35:08 [INFO] pocketstream_desktop::network::device_registry - event=node_transition identity=\"40:cd:3a:03:8f:3f\" adapter_mac=\"40:c2:ba:cf:d5:75\" interface_index=15 from=null to=\"cached_only\" reason=\"cache_hydration\" evidence_age_ms=26372135 evidence_clock=wall",
+      "2026-10-23 22:35:08 [INFO] pocketstream_desktop::network::device_registry - event=node_transition identity=\"08:df:ec:22:01:77\" adapter_mac=\"40:c2:ba:cf:d5:75\" interface_index=15 from=null to=\"cached_only\" reason=\"cache_hydration\" evidence_age_ms=12686 evidence_clock=wall",
+      "2026-10-23 22:35:08 [INFO] pocketstream_desktop::network::device_registry - event=node_transition identity=\"40:cd:3a:03:28:e2\" adapter_mac=\"40:c2:ba:cf:d5:75\" interface_index=15 from=null to=\"cached_only\" reason=\"cache_hydration\" evidence_age_ms=9198 evidence_clock=wall",
+      "2026-10-23 22:35:08 [INFO] pocketstream_desktop::commands - [frontend] PTU init failed: Network error: Ethernet not ready: OS route does not select the selected Ethernet adapter",
+      "2026-10-23 22:35:08 [INFO] pocketstream_desktop::network::device_registry - event=node_transition identity=\"40:cd:3a:03:28:e2\" adapter_mac=\"40:c2:ba:cf:d5:75\" interface_index=15 from=\"cached_only\" to=\"live\" reason=\"fresh_verification\" evidence_age_ms=3 evidence_clock=wall",
+      "2026-10-23 22:35:08 [INFO] pocketstream_desktop::network - event=capture_state adapter_mac=\"40:c2:ba:cf:d5:75\" interface_index=15 scope=selected_interface source_id=Some(115) active=true",
+      "2026-10-23 22:35:10 [INFO] pocketstream_desktop::network::device_registry - event=node_transition identity=\"08:df:ec:22:01:77\" adapter_mac=\"40:c2:ba:cf:d5:75\" interface_index=15 from=\"cached_only\" to=\"live\" reason=\"fresh_verification\" evidence_age_ms=1 evidence_clock=wall",
+      "2026-10-23 22:36:56 [DEBUG] pocketstream_desktop::streaming - event=playback_attempt generation=1 attempt=0",
+      "2026-10-23 22:36:56 [INFO] pocketstream_desktop::streaming::rtsp_client - Playback pipeline set to Playing",
+      "2026-10-23 22:36:56 [INFO] pocketstream_desktop::streaming - event=playback_recovery adapter_mac=\"40:c2:ba:cf:d5:75\" interface_index=15 state=\"starting\" cause=null attempt=0 duration_ms=0",
+      "2026-10-23 22:36:57 [INFO] pocketstream_desktop::streaming - event=playback_recovery adapter_mac=\"40:c2:ba:cf:d5:75\" interface_index=15 state=\"playing\" cause=null attempt=0 duration_ms=0",
+      "2026-10-23 22:42:51 [INFO] pocketstream_desktop::network::device_registry - event=node_transition identity=\"08:df:ec:22:01:77\" adapter_mac=\"40:c2:ba:cf:d5:75\" interface_index=15 from=\"live\" to=\"offline\" reason=\"evidence_expired\" evidence_age_ms=15009 evidence_clock=wall",
+      "2026-10-23 22:42:51 [INFO] pocketstream_desktop::network::device_registry - event=node_transition identity=\"08:df:ec:22:01:77\" adapter_mac=\"40:c2:ba:cf:d5:75\" interface_index=15 from=\"offline\" to=\"live\" reason=\"fresh_verification\" evidence_age_ms=13 evidence_clock=wall",
+      "2026-10-23 22:43:44 [INFO] pocketstream_desktop::commands - [frontend] PTU init failed: Network error: Ethernet not ready: OS route does not select the selected Ethernet adapter",
+      "2026-10-23 22:43:45 [INFO] pocketstream_desktop::commands - [frontend] PTU init failed: Network error: Ethernet not ready: OS route does not select the selected Ethernet adapter",
+      "2026-10-23 22:45:19 [DEBUG] pocketstream_desktop::streaming - event=playback_attempt generation=2 attempt=1",
+      "2026-10-23 22:45:19 [INFO] pocketstream_desktop::streaming::rtsp_client - Playback pipeline set to Playing",
+      "2026-10-23 22:45:19 [INFO] pocketstream_desktop::streaming - event=playback_recovery adapter_mac=\"40:c2:ba:cf:d5:75\" interface_index=15 state=\"recovering\" cause=\"frame_stall\" attempt=1 duration_ms=0",
+      "2026-10-23 22:45:20 [INFO] pocketstream_desktop::streaming - event=playback_recovery adapter_mac=\"40:c2:ba:cf:d5:75\" interface_index=15 state=\"playing\" cause=null attempt=1 duration_ms=890",
+      "2026-10-23 22:45:50 [INFO] pocketstream_desktop::streaming - event=playback_recovery adapter_mac=\"40:c2:ba:cf:d5:75\" interface_index=15 state=\"playing\" cause=null attempt=0 duration_ms=0",
+      "2026-10-23 22:46:07 [DEBUG] pocketstream_desktop::streaming - event=playback_attempt generation=3 attempt=1",
+      "2026-10-23 22:46:07 [INFO] pocketstream_desktop::streaming::rtsp_client - Playback pipeline set to Playing",
+      "2026-10-23 22:46:07 [INFO] pocketstream_desktop::streaming - event=playback_recovery adapter_mac=\"40:c2:ba:cf:d5:75\" interface_index=15 state=\"recovering\" cause=\"frame_stall\" attempt=1 duration_ms=0",
+      "2026-10-23 22:46:09 [INFO] pocketstream_desktop::streaming - event=playback_recovery adapter_mac=\"40:c2:ba:cf:d5:75\" interface_index=15 state=\"playing\" cause=null attempt=1 duration_ms=1773",
+      "2026-10-23 22:46:39 [INFO] pocketstream_desktop::streaming - event=playback_recovery adapter_mac=\"40:c2:ba:cf:d5:75\" interface_index=15 state=\"playing\" cause=null attempt=0 duration_ms=0",
+      "2026-10-23 22:47:05 [INFO] pocketstream_desktop::network - Cache probe: fresh resolve of 192.168.1.74 failed closed: Network error: ResolveIpNetEntry2 failed: 67",
+      "2026-10-23 22:47:07 [DEBUG] pocketstream_desktop::network - event=identity_probe adapter_mac=\"40:C2:BA:CF:D5:75\" interface_index=15 target=172.31.169.84 source=172.31.169.102 answered=true probes_started=275 probes_answered=132 probes_failed=143 candidates_rejected=4712 fence_drops=0",
+      "2026-10-23 22:47:11 [INFO] pocketstream_desktop::network - Cache probe: fresh resolve of 192.168.1.74 failed closed: Network error: ResolveIpNetEntry2 failed: 67",
+      "2026-10-23 22:47:13 [DEBUG] pocketstream_desktop::network - event=identity_probe adapter_mac=\"40:C2:BA:CF:D5:75\" interface_index=15 target=172.31.169.84 source=172.31.169.102 answered=true probes_started=277 probes_answered=133 probes_failed=144 candidates_rejected=4716 fence_drops=0"
+    ],
+    "camera_user_observation": "User confirmed: Live video is visible, after selecting 172.31.169.84 as CAM and pressing Start Stream in this A1 build.",
+    "output_enabled_during_smoke": false,
+    "native_addresses": [
+      {
+        "IPAddress": "192.168.1.100",
+        "PrefixLength": 24,
+        "PrefixOrigin": 1
+      },
+      {
+        "IPAddress": "192.168.0.100",
+        "PrefixLength": 24,
+        "PrefixOrigin": 1
+      },
+      {
+        "IPAddress": "172.31.169.102",
+        "PrefixLength": 24,
+        "PrefixOrigin": 1
+      }
+    ],
+    "neighbors": [
+      {
+        "IPAddress": "192.168.1.74",
+        "LinkLayerAddress": "00-00-00-00-00-00",
+        "state": "Incomplete"
+      },
+      {
+        "IPAddress": "172.31.169.84",
+        "LinkLayerAddress": "40-CD-3A-03-28-E2",
+        "state": "Reachable"
+      }
+    ],
+    "bound_tcp": [
+      {
+        "source": "172.31.169.102",
+        "target": "172.31.169.84",
+        "port": 80,
+        "status": "connected",
+        "elapsed_ms": 17
+      },
+      {
+        "source": "192.168.1.100",
+        "target": "192.168.1.74",
+        "port": 80,
+        "status": "timeout",
+        "elapsed_ms": 1999
+      }
+    ],
+    "listeners": [
+      {
+        "LocalAddress": "127.0.0.1",
+        "LocalPort": 58095
+      }
+    ],
+    "raw_log_sha256": "4408d421d9f3638e8a2da2b3eaa1abe8a70e1b063cc3a7590227ecbc6126f25e",
+    "profile_cleanup": "restored original output-enable flag; preserved all current credentials, camera and pending/retained binding records",
+    "firewall_install": "not exercised",
+    "graceful_exit": true,
+    "original_output_enabled_restored": true,
+    "finished_at_utc": "2026-10-24T03:47:17.6911192Z",
+    "native_addresses_after": [
+      {
+        "IPAddress": "192.168.1.100",
+        "PrefixLength": 24,
+        "PrefixOrigin": 1
+      },
+      {
+        "IPAddress": "192.168.0.100",
+        "PrefixLength": 24,
+        "PrefixOrigin": 1
+      },
+      {
+        "IPAddress": "172.31.169.102",
+        "PrefixLength": 24,
+        "PrefixOrigin": 1
+      }
+    ],
+    "discovery": {
+      "status": "passed",
+      "camera_ip": "172.31.169.84",
+      "camera_mac": "40:cd:3a:03:28:e2",
+      "selected_adapter_mac": "40:c2:ba:cf:d5:75",
+      "interface_index": 15,
+      "capture_scope": "selected_interface",
+      "capture_source_id": 115,
+      "method": "Production startup capture and fresh selected-Ethernet identity verification; user used actual Nodes/CAM workflow"
+    },
+    "playback": {
+      "status": "passed: initial workflow",
+      "user_observation": "Live video is visible",
+      "pipeline_state": "Playing",
+      "recovery_state": "playing",
+      "rtsp_port": 554,
+      "path": "/z3-1.sdp",
+      "soak_observation": "Frame-stall recovery was observed twice during the longer session, and each returned to playing. This is not an uninterrupted soak qualification."
+    },
+    "ptu": {
+      "status": "pending: no successful PTU connection",
+      "user_observation": "Won't connect/cant pan/tilt. Also cannot open its web page",
+      "candidate_ip": "192.168.1.74",
+      "candidate_mac": "08:df:ec:22:01:77",
+      "app_error": "Ethernet not ready: OS route does not select the selected Ethernet adapter",
+      "fresh_identity_result": "Repeated ResolveIpNetEntry2 error 67; intermittent positive observations do not establish a stable endpoint",
+      "http_result": {
+        "source": "192.168.1.100",
+        "target": "192.168.1.74",
+        "port": 80,
+        "status": "timeout",
+        "elapsed_ms": 1999
+      },
+      "identity_not_assumed": true,
+      "motion_qualification": false
+    },
+    "recorder_limitations": [
+      "Read-only recorder initially failed to project PowerShell 5.1 provider metadata; stopped only that recorder, not the app. Retried with primitive-only evidence fields.",
+      "Initial Finish found no Close button through Process.MainWindowHandle and left the session intact. Retry enumerated the exact PID's Tauri window and invoked its production Close button."
+    ]
+  },
+  "prerequisite_evidence": "privilege-v2-native-prerequisites.json",
+  "ptu_endpoint_followup": {
+    "observed_at_utc": "2026-10-24T04:20:09.8101115Z",
+    "endpoint": "192.168.1.202",
+    "source": "192.168.1.100",
+    "interface_index": 15,
+    "adapter_mac": "40:c2:ba:cf:d5:75",
+    "observed_neighbor_mac": "fc:68:3e:22:05:28",
+    "root_http": {
+      "status": 200,
+      "title": ":: FLIR Commercial Systems, Inc. ::",
+      "elapsed_ms": 137
+    },
+    "position_query": {
+      "method": "POST",
+      "path": "/API/PTCmd",
+      "body": "PP&TP",
+      "status": 200,
+      "response": {
+        "PP": "0",
+        "TP": "0",
+        "status": "*"
+      },
+      "elapsed_ms": 7
+    },
+    "method": "Direct TCP/HTTP diagnostic bound to the existing selected Ethernet address; no application handler invocation",
+    "movement_command_sent": false,
+    "application_launched": false,
+    "adapter_or_config_changes": false,
+    "qualifies_production_ptu": false,
+    "other_pc_user_report": {
+      "version": "0.6.7",
+      "artifact_hash": null,
+      "mode": "static_auto",
+      "primary_ip": "192.168.0.100",
+      "camera_adopted_host_ip": "172.31.169.98",
+      "observation": "PTU discovered only after manually configuring its subnet",
+      "log_available": false,
+      "log_unavailable_reason": "User confirmed they do not have the other PC log; no local/shared path was available."
+    },
+    "auto_adoption_cause": "Undetermined: the other PC startup-through-manual-subnet-change log is unavailable. Current-PC logs start with 192.168.1.100 already configured and cannot distinguish the historical other-PC observation/verification/adoption paths.",
+    "previous_candidate": "192.168.1.74; earlier failures retained as historical observations",
+    "next_qualification": "Exercise production PTU query and controlled motion through the recorded A1 artifact using the corrected verified endpoint",
+    "log_review": {
+      "reviewed_at_utc": "2026-10-24T04:30:29.644Z",
+      "available_local_logs": [
+        {
+          "snapshot_path": "src-tauri/target/privilege-a1/ptu-log-review-20261024T043004Z/pocketstream.log",
+          "sha256": "f48c3d027ecd676592488507bb73f3e82341383aa830bf9a2ef4bd4657fdc808",
+          "bytes": 62313,
+          "first_local_timestamp": "2026-10-23 23:28:07",
+          "last_local_timestamp": "2026-10-23 23:30:03",
+          "startup_ipv4_addresses": [
+            "172.31.169.102",
+            "192.168.0.100",
+            "192.168.1.100"
+          ],
+          "corrected_ptu_ip_or_mac_line_count": 75,
+          "other_pc_camera_host_address_present": false,
+          "qualifies_other_pc_history": false
+        },
+        {
+          "snapshot_path": "src-tauri/target/privilege-a1/ptu-log-review-20261024T043004Z/pocketstream.log.1",
+          "sha256": "0863ecb2069a7c0cfc5f5dd1c4036c7de3ef6f99d9f022bc6bc083376e907ce5",
+          "bytes": 235571,
+          "first_local_timestamp": "2026-10-23 22:35:05",
+          "last_local_timestamp": "2026-10-23 22:47:17",
+          "startup_ipv4_addresses": [
+            "172.31.169.102",
+            "192.168.0.100",
+            "192.168.1.100"
+          ],
+          "corrected_ptu_ip_or_mac_line_count": 0,
+          "other_pc_camera_host_address_present": false,
+          "qualifies_other_pc_history": false
+        }
+      ],
+      "remote_or_shared_log_found": false,
+      "limitations": [
+        "No matching IP/MAC line in an application log is not proof of no captured ARP: unscoped candidate insertion is silent, and rejection logs are rate limited.",
+        "A cache_hydration entry is not fresh ARP evidence; a directed verification attempt alone may originate from cache.",
+        "Existing current-PC logs do not cover the other PC manual subnet change."
+      ],
+      "next_evidence": "A new controlled other-PC run logged from startup before the manual subnet change through the completed change; include pocketstream.log.1 if rotation occurred. If application logs cannot distinguish the paths, use a paired capture on the selected Ethernet interface.",
+      "network_or_configuration_changes": false,
+      "application_launched": false,
+      "movement_command_sent": false,
+      "local_session_update": {
+        "source": "User-launched installed copy on current workspace PC; a new session appeared during review",
+        "artifact": {
+          "pid": 23688,
+          "started_at_utc": "2026-10-24T04:28:07.4000648Z",
+          "image": "C:\\Program Files\\PocketStream Desktop\\pocketstream-desktop.exe",
+          "sha256": "38e723e21eb0ffe9ee7315b862faefe06a7930e90fe92981b6f3706f3425b69f"
+        },
+        "qualifies_a1_artifact": false,
+        "reason": "Installed executable hash differs from tested A1 release",
+        "observed": "At 23:28:23 local, bound ARP/identity probes answered, the corrected MAC transitioned to live by fresh_verification, and ARP discovery was logged. Matching host subnet existed at startup.",
+        "historical_other_pc_diagnosis": "undetermined",
+        "qualifies_production_ptu_control": false,
+        "excerpt_path": "src-tauri/target/privilege-a1/ptu-log-review-20261024T043004Z/ptu-discovery-excerpt.log",
+        "excerpt_sha256": "ea811f2802ac381a2c83994f899f3eeb1b08c5331dcccc078e623ccdc9bcb1a8"
+      },
+      "identity_record": {
+        "path": "src-tauri/target/privilege-a1/ptu-log-review-20261024T043004Z/identity.json",
+        "sha256": "2107afc1b220aac854719f3d1adda7a4d67106ddb3614ef97ff5db7d43c4ff6f"
+      }
+    }
+  },
+  "ptu_handoff_followup": {
+    "record": "privilege-v2-ptu-handoff.json",
+    "artifact_sha256": "4337b1dca9a158a9e71c24d2c8b34079cdf2ac4e8b167d0f7e736ab0413e059e",
+    "status": "PTU handoff fix software-qualified; corrected A1 production .202 role/query, Home motion/stop and normal Close/exit smoke passed",
+    "application_pid": 25972,
+    "process_exited": true,
+    "profile_restored": true
+  }
+}
