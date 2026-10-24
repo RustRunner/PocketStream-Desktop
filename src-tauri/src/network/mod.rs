@@ -23,6 +23,18 @@ pub mod route;
 pub mod scanner;
 pub mod watcher;
 
+// Prerequisite fixtures exercise these primitives before A2 entry-point
+// integration. They do not construct NetworkManager or mutate native adapters.
+#[cfg(all(test, windows))]
+mod host_owner;
+#[cfg(all(test, windows))]
+mod local_executor;
+#[cfg(all(test, windows))]
+#[path = "../../tests/fixtures/native_foundation.rs"]
+mod native_qualification;
+#[cfg(all(test, windows))]
+mod native_runner;
+
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

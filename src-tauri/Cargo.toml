@@ -52,6 +52,10 @@ tempfile = "3"
 # crates, so the lockfile is unchanged.
 tokio = { version = "1", features = ["test-util"] }
 
+[target.'cfg(windows)'.dev-dependencies]
+# Qualification fixtures only; pinned windows-sys version and lockfile stay put.
+windows-sys = { version = "0.59", features = ["Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_Security_Authorization"] }
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
