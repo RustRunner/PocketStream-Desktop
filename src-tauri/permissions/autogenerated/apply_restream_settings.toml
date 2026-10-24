@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-apply-restream-settings"
+description = "Enables the apply_restream_settings command without any pre-configured scope."
+commands.allow = ["apply_restream_settings"]
+
+[[permission]]
+identifier = "deny-apply-restream-settings"
+description = "Denies the apply_restream_settings command without any pre-configured scope."
+commands.deny = ["apply_restream_settings"]

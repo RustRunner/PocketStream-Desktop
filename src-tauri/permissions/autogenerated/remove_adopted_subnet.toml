@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-remove-adopted-subnet"
+description = "Enables the remove_adopted_subnet command without any pre-configured scope."
+commands.allow = ["remove_adopted_subnet"]
+
+[[permission]]
+identifier = "deny-remove-adopted-subnet"
+description = "Denies the remove_adopted_subnet command without any pre-configured scope."
+commands.deny = ["remove_adopted_subnet"]

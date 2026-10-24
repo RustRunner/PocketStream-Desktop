@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-select-adapter"
+description = "Enables the select_adapter command without any pre-configured scope."
+commands.allow = ["select_adapter"]
+
+[[permission]]
+identifier = "deny-select-adapter"
+description = "Denies the select_adapter command without any pre-configured scope."
+commands.deny = ["select_adapter"]

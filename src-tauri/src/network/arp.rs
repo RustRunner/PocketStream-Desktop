@@ -1531,79 +1531,6 @@ pub(crate) fn normalize_mac(raw: &str) -> Option<String> {
     Some(mac)
 }
 
-/// Resolve the MAC address currently bound to `target_ip`, wired-bound:
-/// the refreshing ping is sourced from `source` (`ping -S`, routing out
-/// the adapter that owns it) and the neighbor lookup is scoped to that
-/// adapter's `InterfaceIndex`. A device that answers over a different
-/// interface — a WiFi gateway on a subnet the wired port also numbers —
-/// is invisible here by construction and cannot MAC-verify as a wired
-/// device.
-///
-/// `source == None` means no wired source IP exists for the target's
-/// subnet; verification fails immediately (`Ok(None)`) rather than
-/// probing unbound, because an unbound ping routes via the default
-/// gateway (possibly WiFi) — the exact path this binding closes. The
-/// policy lives here, in the probing function, so no caller can bypass
-/// it.
-///
-/// Used by the cache-verify path: a successful port scan only proves
-/// *something* answers at the IP — to claim a cached record is "still
-/// live" we additionally need the MAC to match. Otherwise an unrelated
-/// device that happens to have the same IP today will resurrect a stale
-/// record as a false-positive Live.
-pub async fn resolve_mac_for_ip(
-    target_ip: Ipv4Addr,
-    source: Option<(u32, Ipv4Addr)>,
-    timeout: std::time::Duration,
-) -> Result<Option<String>, AppError> {
-    crate::validation::parse_camera_ip(&target_ip.to_string())?;
-    let Some((_interface_index, source)) = source else {
-        log::debug!(
-            "MAC verify for {}: no wired source IP for its subnet — verification fails",
-            target_ip
-        );
-        return Ok(None);
-    };
-
-    let timeout_ms = timeout.as_millis().to_string();
-    let source_str = source.to_string();
-    let _ = super::async_cmd("ping")
-        .args([
-            "-n",
-            "1",
-            "-w",
-            &timeout_ms,
-            "-S",
-            &source_str,
-            &target_ip.to_string(),
-        ])
-        .output()
-        .await;
-
-    // Get-NetNeighbor scoped to the interface that owns the source IP
-    // (same InterfaceIndex pattern as `read_system_arp_table`), for the
-    // single target — locale-invariant, unlike the old `arp -a`
-    // "dynamic" text match. A null $idx yields no output ⇒ no MAC ⇒
-    // verification fails closed.
-    let script = format!(
-        "$idx=(Get-NetIPAddress -IPAddress '{src}' -AddressFamily IPv4 -ErrorAction SilentlyContinue \
-         | Select-Object -First 1).InterfaceIndex; \
-         if ($null -ne $idx) {{ Get-NetNeighbor -AddressFamily IPv4 -InterfaceIndex $idx \
-         -IPAddress '{ip}' -ErrorAction SilentlyContinue \
-         | Select-Object IPAddress,LinkLayerAddress,State | ConvertTo-Json -Compress }}",
-        src = source,
-        ip = target_ip
-    );
-    let stdout = run_powershell(&script)
-        .await
-        .ok_or_else(|| AppError::Network("Get-NetNeighbor failed".into()))?;
-
-    Ok(parse_neighbors_json(&stdout)
-        .into_iter()
-        .find(|(ip, _)| *ip == target_ip)
-        .map(|(_, mac)| mac))
-}
-
 /// Check if `target_ip` is in use by pinging it and checking the
 /// neighbor table.
 ///
@@ -1893,21 +1820,6 @@ mod tests {
         assert!(try_admit_arp_task(&sem).is_some());
     }
 
-    #[tokio::test]
-    async fn resolve_mac_without_source_returns_none() {
-        // No wired source ⇒ verification fails immediately, in the
-        // probing function itself — no ping, no neighbor query, so no
-        // unbound path a caller could accidentally re-open.
-        let result = resolve_mac_for_ip(
-            Ipv4Addr::new(192, 168, 1, 1),
-            None,
-            std::time::Duration::from_millis(10),
-        )
-        .await
-        .unwrap();
-        assert_eq!(result, None);
-    }
-
     // ── classify_sender ─────────────────────────────────────────────
     //
     // Reference topology: the wired port holds a static 192.168.1.101/24
@@ -1960,11 +1872,6 @@ mod tests {
     async fn apipa_verification_fails_before_any_native_or_ping_work() {
         let ip = ipv4("169.254.73.42");
         assert!(fresh_resolve_mac(ip, ipv4("169.254.73.99"), 0)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("routable IPv4 address first"));
-        assert!(resolve_mac_for_ip(ip, None, Duration::from_secs(1))
             .await
             .unwrap_err()
             .to_string()

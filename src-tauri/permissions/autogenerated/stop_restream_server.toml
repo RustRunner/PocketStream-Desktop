@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-stop-restream-server"
+description = "Enables the stop_restream_server command without any pre-configured scope."
+commands.allow = ["stop_restream_server"]
+
+[[permission]]
+identifier = "deny-stop-restream-server"
+description = "Denies the stop_restream_server command without any pre-configured scope."
+commands.deny = ["stop_restream_server"]

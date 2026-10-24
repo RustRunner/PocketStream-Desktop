@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-dhcp-state"
+description = "Enables the get_dhcp_state command without any pre-configured scope."
+commands.allow = ["get_dhcp_state"]
+
+[[permission]]
+identifier = "deny-get-dhcp-state"
+description = "Denies the get_dhcp_state command without any pre-configured scope."
+commands.deny = ["get_dhcp_state"]

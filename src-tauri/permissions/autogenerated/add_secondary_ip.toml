@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-add-secondary-ip"
+description = "Enables the add_secondary_ip command without any pre-configured scope."
+commands.allow = ["add_secondary_ip"]
+
+[[permission]]
+identifier = "deny-add-secondary-ip"
+description = "Denies the add_secondary_ip command without any pre-configured scope."
+commands.deny = ["add_secondary_ip"]

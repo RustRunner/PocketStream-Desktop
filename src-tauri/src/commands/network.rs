@@ -4,7 +4,7 @@ use tauri::State;
 
 use crate::config::{AppConfig, ManualNode, NetworkMode};
 use crate::error::AppError;
-use crate::network::{DeviceRecord, DeviceStatus, InterfaceInfo, NetworkManager, ScanResult};
+use crate::network::{DeviceRecord, InterfaceInfo, NetworkManager, ScanResult};
 use crate::validation::parse_cidr;
 
 #[tauri::command]
@@ -63,55 +63,8 @@ pub async fn select_adapter(
 }
 
 #[tauri::command]
-pub async fn list_interfaces(
-    manager: State<'_, NetworkManager>,
-) -> Result<Vec<InterfaceInfo>, AppError> {
-    manager.list_interfaces().await
-}
-
-#[tauri::command]
 pub async fn list_vpn_interfaces() -> Result<Vec<InterfaceInfo>, AppError> {
     crate::network::interface::list_vpn().await
-}
-
-#[tauri::command]
-pub async fn get_interface_info(
-    manager: State<'_, NetworkManager>,
-    name: String,
-) -> Result<InterfaceInfo, AppError> {
-    manager.get_interface(&name).await
-}
-
-#[tauri::command]
-pub async fn set_static_ip(
-    app: tauri::AppHandle,
-    manager: State<'_, NetworkManager>,
-    config: State<'_, AppConfig>,
-    name: String,
-    ip: String,
-    subnet_mask: String,
-    gateway: Option<String>,
-) -> Result<(), AppError> {
-    let mode = match config.get_network_mode() {
-        NetworkMode::Dhcp => NetworkMode::StaticAuto,
-        mode => mode,
-    };
-    manager
-        .transition_mode(
-            app,
-            &config,
-            crate::network::ModeTransition {
-                name,
-                mode,
-                ip: Some(ip),
-                subnet_mask: Some(subnet_mask),
-                gateway,
-                previous_address: None,
-                confirmed: true,
-            },
-        )
-        .await
-        .map(|_| ())
 }
 
 #[tauri::command]
@@ -155,34 +108,6 @@ pub async fn remove_secondary_ip(
 }
 
 #[tauri::command]
-pub async fn set_dhcp(
-    manager: State<'_, NetworkManager>,
-    config: State<'_, AppConfig>,
-    app: tauri::AppHandle,
-    name: String,
-) -> Result<(), AppError> {
-    let reply = manager
-        .transition_mode(
-            app,
-            &config,
-            crate::network::ModeTransition {
-                name,
-                mode: NetworkMode::Dhcp,
-                ip: None,
-                subnet_mask: None,
-                gateway: None,
-                previous_address: None,
-                confirmed: false,
-            },
-        )
-        .await?;
-    match reply.warning {
-        Some(warning) => Err(AppError::Network(warning)),
-        None => Ok(()),
-    }
-}
-
-#[tauri::command]
 pub async fn get_dhcp_state(name: String) -> Result<bool, AppError> {
     crate::network::ip_config::get_dhcp_state(&name).await
 }
@@ -209,11 +134,6 @@ pub async fn set_network_mode(
 // Pinned devices for `NetworkMode::StaticManual`. The list persists
 // across mode toggles so users can flip between Auto and Manual without
 // losing their pins.
-
-#[tauri::command]
-pub fn get_manual_nodes(config: State<'_, AppConfig>) -> Vec<ManualNode> {
-    config.get_manual_nodes()
-}
 
 #[tauri::command]
 pub async fn add_manual_node(
@@ -301,25 +221,6 @@ pub async fn clear_manual_nodes(
     Ok(())
 }
 
-/// Diagnostic only: this legacy neighbor lookup never authorizes promotion.
-/// Look up the MAC at `ip`, bound to the wired path. Used by the
-/// cache-verify path to confirm a cached record at an IP is still the
-/// same physical device, not just *something else* with the same
-/// address today. The probe and neighbor lookup are scoped to the
-/// wired source the backend resolves for the target's subnet, so a
-/// WiFi responder on a shared subnet can never verify a wired record.
-/// Returns null if no wired source exists, the IP doesn't respond over
-/// the wired path, or no ARP entry forms there.
-#[tauri::command]
-pub async fn resolve_mac(
-    manager: State<'_, NetworkManager>,
-    ip: String,
-) -> Result<Option<String>, AppError> {
-    let parsed = crate::validation::parse_camera_ip(&ip)?;
-    let source = manager.wired_source_for(parsed).await;
-    crate::network::arp::resolve_mac_for_ip(parsed, source, std::time::Duration::from_secs(1)).await
-}
-
 #[tauri::command]
 pub async fn refresh_adapter(name: String, mode: String) -> Result<(), AppError> {
     let mode = match mode.as_str() {
@@ -359,12 +260,6 @@ pub async fn start_arp_discovery(
     }
 }
 
-#[tauri::command]
-pub async fn stop_arp_discovery(manager: State<'_, NetworkManager>) -> Result<(), AppError> {
-    manager.stop_arp_discovery().await;
-    Ok(())
-}
-
 /// Snapshot of every device the backend currently knows about — the
 /// canonical replacement for the frontend's old patchwork of arpDevices
 /// + tcpScanResults + nodeAliases + cache file. Frontend calls this once
@@ -375,21 +270,6 @@ pub async fn get_device_list(
     manager: State<'_, NetworkManager>,
 ) -> Result<Vec<DeviceRecord>, AppError> {
     Ok(manager.registry().snapshot())
-}
-
-/// Attach capability data to the requested identity, without promoting it.
-#[tauri::command]
-pub async fn report_scan_result(
-    manager: State<'_, NetworkManager>,
-    config: State<'_, AppConfig>,
-    key: String,
-    open_ports: Vec<u16>,
-) -> Result<(), AppError> {
-    // Results are now committed at scan completion with their original
-    // adapter epoch, source and identity. A later frontend echo has lost
-    // that provenance and cannot write capabilities into any record.
-    let _ = (manager, config, key, open_ports);
-    Ok(())
 }
 
 /// Set or clear the user-assigned alias for this record key.
@@ -418,25 +298,6 @@ pub async fn set_device_alias(
         }
     }
     Ok(registry.snapshot())
-}
-
-/// Update the reachability status of a device by MAC. Used by the
-/// cache-verification path on the frontend to flip Verifying/Offline
-/// without changing scan results. Status is not persisted to the
-/// cache file — it's session-local.
-#[tauri::command]
-pub async fn set_device_status(
-    manager: State<'_, NetworkManager>,
-    mac: String,
-    status: DeviceStatus,
-) -> Result<(), AppError> {
-    if !manager.registry().set_status(&mac, status) {
-        return Ok(());
-    }
-    if let Some(emitter) = manager.emitter().await {
-        emitter.poke();
-    }
-    Ok(())
 }
 
 /// Drop a device from the registry and the on-disk cache. Used by the
@@ -498,18 +359,6 @@ pub async fn remove_adopted_subnet(
         let _ = app.emit("subnet-removed", serde_json::json!({"subnet": subnet, "adopted_ip": reply.view.address, "reason": "manual"}));
     }
     Ok(reply)
-}
-
-/// Persisted adoption entries (subnet -> IP) straight from config, for
-/// the Configure dialog's removal routing only. A config-only adoption
-/// (nothing restored this session) must still route through the
-/// adoption-aware removal — but an entry here is not necessarily bound,
-/// so this must never feed the frontend's live routing map.
-#[tauri::command]
-pub async fn get_configured_adoptions(
-    config: State<'_, AppConfig>,
-) -> Result<std::collections::HashMap<String, String>, AppError> {
-    Ok(config.get().adopted_subnets)
 }
 
 #[cfg(test)]

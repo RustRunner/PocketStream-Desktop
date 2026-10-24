@@ -1,4 +1,58 @@
+// The application ACL is opt-in in Tauri 2. Keep this list in lockstep with
+// generate_handler!, renderer wrappers and committed generated permissions.
+const COMMANDS: &[&str] = &[
+    "add_manual_node",
+    "add_secondary_ip",
+    "apply_restream_settings",
+    "clear_manual_nodes",
+    "control_cgi_zoom_direct",
+    "create_video_window",
+    "forget_device",
+    "get_adapter_selection",
+    "get_adoption_state",
+    "get_capture_state",
+    "get_config",
+    "get_device_list",
+    "get_dhcp_state",
+    "get_host_ip_owners",
+    "get_license_document",
+    "get_network_mode",
+    "get_startup_notices",
+    // Renamed with the bind-inventory contract in A3.
+    "list_vpn_interfaces",
+    "log_frontend",
+    "open_device_browser",
+    "open_log_folder",
+    "ptu_send",
+    "refresh_adapter",
+    "remove_adopted_subnet",
+    "remove_manual_node",
+    "remove_secondary_ip",
+    "retry_playback",
+    "scan_network",
+    "select_adapter",
+    "set_audio_muted",
+    "set_device_alias",
+    "set_network_mode",
+    "set_video_visible",
+    "set_zoom_position",
+    "start_arp_discovery",
+    "start_recording",
+    "start_restream_server",
+    "start_stream",
+    "stop_recording",
+    "stop_restream_server",
+    "stop_stream",
+    "switch_restream_protocol",
+    "take_screenshot",
+    "update_credentials",
+    "update_stream_settings",
+    "update_video_position",
+];
+
 fn main() {
+    let attributes = tauri_build::Attributes::new()
+        .app_manifest(tauri_build::AppManifest::new().commands(COMMANDS));
     // Native library search path for Packet.lib. The ARP capture backend
     // is now the in-box PacketMonitor API (runtime LoadLibrary, no import
     // library), but `pnet` still links Packet.lib on Windows for its
@@ -66,7 +120,7 @@ fn main() {
             let mut res = tauri_build::WindowsAttributes::new();
             res = res
                 .app_manifest(std::fs::read_to_string(&manifest).expect("failed to read manifest"));
-            tauri_build::try_build(tauri_build::Attributes::new().windows_attributes(res))
+            tauri_build::try_build(attributes.windows_attributes(res))
                 .expect("failed to run tauri-build");
         } else {
             // tauri-winres/embed-resource only links its resource into binary
@@ -81,12 +135,12 @@ fn main() {
             println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
             println!("cargo:rustc-link-arg=/MANIFESTINPUT:{}", manifest.display());
             let windows = tauri_build::WindowsAttributes::new_without_app_manifest();
-            tauri_build::try_build(tauri_build::Attributes::new().windows_attributes(windows))
+            tauri_build::try_build(attributes.windows_attributes(windows))
                 .expect("failed to run tauri-build");
         }
         return;
     }
 
     #[allow(unreachable_code)]
-    tauri_build::build()
+    tauri_build::try_build(attributes).expect("failed to run tauri-build")
 }

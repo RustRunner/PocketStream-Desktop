@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-update-stream-settings"
+description = "Enables the update_stream_settings command without any pre-configured scope."
+commands.allow = ["update_stream_settings"]
+
+[[permission]]
+identifier = "deny-update-stream-settings"
+description = "Denies the update_stream_settings command without any pre-configured scope."
+commands.deny = ["update_stream_settings"]

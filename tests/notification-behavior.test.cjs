@@ -348,7 +348,8 @@ for (const result of ["ports", "empty", "error"]) {
     assert.equal(scans.length, 2, "returning to Auto can scan the retained identity again");
     assert(f.$("#btn-refresh-nodes").classList.contains("discovery-active"));
     scans[1].resolve([{ reachable: true, open_ports: [554] }]); await flush();
-    assert.equal(reports.length, 1); assert.equal(JSON.stringify(mirror.getDevices()), history);
+    assert.equal(reports.length, 0, "scan completion is published by the backend without a renderer echo");
+    assert.equal(JSON.stringify(mirror.getDevices()), history);
   });
 }
 

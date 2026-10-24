@@ -24,7 +24,6 @@ import type {
   CaptureState,
   Credentials,
   DeviceRecord,
-  DeviceStatus,
   InterfaceInfo,
   HostIpOwner,
   LicenseDocumentId,
@@ -104,10 +103,6 @@ export async function scanNetwork(subnet: string): Promise<ScanResult[]> {
   return await invoke<ScanResult[]>("scan_network", { subnet });
 }
 
-export async function listInterfaces(): Promise<InterfaceInfo[]> {
-  return await invoke<InterfaceInfo[]>("list_interfaces");
-}
-
 export async function getHostIpOwners(): Promise<HostIpOwner[]> {
   return await invoke<HostIpOwner[]>("get_host_ip_owners");
 }
@@ -124,15 +119,6 @@ export async function listVpnInterfaces(): Promise<InterfaceInfo[]> {
   return await invoke<InterfaceInfo[]>("list_vpn_interfaces");
 }
 
-export async function setStaticIp(
-  name: string,
-  ip: string,
-  subnetMask: string,
-  gateway: string | null = null
-): Promise<void> {
-  return await invoke("set_static_ip", { name, ip, subnetMask, gateway });
-}
-
 export async function addSecondaryIp(
   name: string,
   ip: string,
@@ -145,27 +131,8 @@ export async function removeSecondaryIp(name: string, ip: string, primary = fals
   return await invoke("remove_secondary_ip", { name, ip, primary });
 }
 
-/**
- * Switch the interface to DHCP. Clears static IPs, enables DHCP for IPv4
- * and DNS, and renews the lease. May trigger a UAC prompt.
- */
-export async function setDhcp(name: string): Promise<void> {
-  return await invoke("set_dhcp", { name });
-}
-
 export async function getDhcpState(name: string): Promise<boolean> {
   return await invoke<boolean>("get_dhcp_state", { name });
-}
-
-/**
- * Look up the MAC currently bound to `ip` from the live ARP cache.
- * Returns null if the IP doesn't respond. Used by the cache verify
- * diagnostic path to compare the responder at a cached IP is the same physical
- * device (matching MAC), not an unrelated host that happens to share
- * the address today.
- */
-export async function resolveMac(ip: string): Promise<string | null> {
-  return await invoke<string | null>("resolve_mac", { ip });
 }
 
 /**
@@ -196,22 +163,8 @@ export async function getDeviceList(): Promise<DeviceRecord[]> {
   return await invoke<DeviceRecord[]>("get_device_list");
 }
 
-export async function reportScanResult(
-  key: string,
-  openPorts: number[]
-): Promise<void> {
-  return await invoke("report_scan_result", { key, openPorts });
-}
-
 export async function setDeviceAlias(key: string, alias: string): Promise<DeviceRecord[]> {
   return await invoke<DeviceRecord[]>("set_device_alias", { key, alias });
-}
-
-export async function setDeviceStatus(
-  mac: string,
-  status: DeviceStatus
-): Promise<void> {
-  return await invoke("set_device_status", { mac, status });
 }
 
 export async function forgetDevice(mac: string): Promise<void> {
@@ -224,15 +177,6 @@ export async function forgetDevice(mac: string): Promise<void> {
  *  pull now, so the two can't drift. */
 export async function getAdoptionState(): Promise<AdoptionSnapshot> {
   return await invoke<AdoptionSnapshot>("get_adoption_state");
-}
-
-/** Persisted adoption entries (subnet -> IP) straight from config. A
- *  routing aid for the Configure dialog's removal path only: an entry here
- *  is not necessarily bound this session (disconnected cold start), so it
- *  must never feed `adoptedSubnets` or anything else that treats that map
- *  as live on-link routes. */
-export async function getConfiguredAdoptions(): Promise<Record<string, string>> {
-  return await invoke<Record<string, string>>("get_configured_adoptions");
 }
 
 /** Save removal intent before unbinding the exact saved address on its
@@ -269,10 +213,6 @@ export async function startStream(
           ? windowHandle
           : parseInt(windowHandle, 10),
   });
-}
-
-export async function retryPlayback(): Promise<void> {
-  return await invoke("retry_playback", { manual: true });
 }
 
 export async function reassertPlayback(): Promise<void> {
@@ -348,67 +288,12 @@ export async function openDeviceBrowser(ip: string, target: DeviceTarget): Promi
 }
 
 // ── Camera / PTZ ────────────────────────────────────────────────────
-//
-// The generic ONVIF / multi-vendor camera surface below (discoverOnvif,
-// ptzMove/Stop/GotoPreset/SetPreset, sonyCgiZoom, controlCgiProbeStatus)
-// is intentionally retained but not yet wired to any UI. The live camera
-// path today is FLIR PTU (ptuSend) plus EV-7520 zoom (controlCgiZoomDirect
-// / setZoomPosition). These wrappers stay so a future ONVIF/multi-camera
-// impl lands without a frontend churn pass; keep them in sync with their
-// Rust commands during the IPC drift audit.
-
-/** ONVIF discovery currently returns Err("not yet implemented") —
- *  the wrapper is kept so a future ONVIF impl can land without a
- *  frontend churn pass. */
-export async function discoverOnvif(subnet: string | null = null): Promise<unknown> {
-  return await invoke("discover_onvif", { subnet });
-}
-
-export async function ptzMove(
-  cameraUrl: string,
-  pan: number,
-  tilt: number,
-  zoom: number
-): Promise<void> {
-  return await invoke("ptz_move", { cameraUrl, pan, tilt, zoom });
-}
-
-export async function ptzStop(cameraUrl: string): Promise<void> {
-  return await invoke("ptz_stop", { cameraUrl });
-}
-
-export async function ptzGotoPreset(cameraUrl: string, preset: number): Promise<void> {
-  return await invoke("ptz_goto_preset", { cameraUrl, preset });
-}
-
-export async function ptzSetPreset(
-  cameraUrl: string,
-  preset: number,
-  name: string
-): Promise<void> {
-  return await invoke("ptz_set_preset", { cameraUrl, preset, name });
-}
-
-export async function sonyCgiZoom(
-  ip: string,
-  zoomSpeed: number,
-  username: string,
-  password: string,
-  target: DeviceTarget
-): Promise<void> {
-  return await invoke("sony_cgi_zoom", { target: { ip, key: target.key, expected_mac: target.expectedMac }, zoomSpeed, username, password });
-}
-
 export async function controlCgiZoomDirect(
   ip: string,
   position: number,
   target: DeviceTarget
 ): Promise<void> {
   return await invoke("control_cgi_zoom_direct", { target: { ip, key: target.key, expected_mac: target.expectedMac }, position });
-}
-
-export async function controlCgiProbeStatus(ip: string, target: DeviceTarget): Promise<string> {
-  return await invoke<string>("control_cgi_probe_status", { target: { ip, key: target.key, expected_mac: target.expectedMac } });
 }
 
 export async function setZoomPosition(

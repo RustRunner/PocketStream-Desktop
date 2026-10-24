@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-switch-restream-protocol"
+description = "Enables the switch_restream_protocol command without any pre-configured scope."
+commands.allow = ["switch_restream_protocol"]
+
+[[permission]]
+identifier = "deny-switch-restream-protocol"
+description = "Denies the switch_restream_protocol command without any pre-configured scope."
+commands.deny = ["switch_restream_protocol"]

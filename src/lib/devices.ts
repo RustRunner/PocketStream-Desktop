@@ -489,8 +489,8 @@ async function scanDevicePorts(mac: string, ip: string, attempt = 0): Promise<vo
     if (results) {
       for (const r of results) {
         if (r.reachable && r.open_ports.length > 0) {
-          // Attach capabilities to the scheduled identity, without promoting it.
-          await api.reportScanResult(mac, r.open_ports);
+          // The backend publishes capabilities with the scan's original
+          // adapter epoch and identity before replying; no renderer echo.
           found = true;
         }
       }

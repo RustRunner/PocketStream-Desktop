@@ -60,6 +60,11 @@ Step "npm run typecheck" {
 }
 
 # ── Frontend build (mirrors `frontend` job) ────────────────────────
+Step "Frontend contracts (including IPC allowlist)" {
+    Push-Location $repoRoot
+    try { npm.cmd run check:contracts } finally { Pop-Location }
+}
+
 if (-not $Quick) {
     Step "Frontend build" {
         Push-Location $repoRoot
@@ -70,7 +75,7 @@ if (-not $Quick) {
 # ── Rust tests (mirrors `rust` job — blocking step) ────────────────
 Step "cargo test" {
     Push-Location "$repoRoot/src-tauri"
-    try { cargo test --lib } finally { Pop-Location }
+    try { cargo test --lib --locked } finally { Pop-Location }
 }
 
 # ── Format check (mirrors `cargo fmt` — blocking) ─────────────────
@@ -83,7 +88,7 @@ Step "cargo fmt --check" {
 if (-not $Quick) {
     Step "cargo clippy" {
         Push-Location "$repoRoot/src-tauri"
-        try { cargo clippy --all-targets --no-deps -- -D warnings } finally { Pop-Location }
+        try { cargo clippy --all-targets --no-deps --locked -- -D warnings } finally { Pop-Location }
     }
 }
 

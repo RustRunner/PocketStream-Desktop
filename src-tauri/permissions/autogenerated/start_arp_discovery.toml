@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-start-arp-discovery"
+description = "Enables the start_arp_discovery command without any pre-configured scope."
+commands.allow = ["start_arp_discovery"]
+
+[[permission]]
+identifier = "deny-start-arp-discovery"
+description = "Denies the start_arp_discovery command without any pre-configured scope."
+commands.deny = ["start_arp_discovery"]

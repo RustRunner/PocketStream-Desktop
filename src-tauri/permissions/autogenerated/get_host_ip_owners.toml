@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-host-ip-owners"
+description = "Enables the get_host_ip_owners command without any pre-configured scope."
+commands.allow = ["get_host_ip_owners"]
+
+[[permission]]
+identifier = "deny-get-host-ip-owners"
+description = "Denies the get_host_ip_owners command without any pre-configured scope."
+commands.deny = ["get_host_ip_owners"]

@@ -3345,10 +3345,6 @@ impl NetworkManager {
             .collect()
     }
 
-    pub async fn get_interface(&self, name: &str) -> Result<InterfaceInfo, AppError> {
-        interface::get_by_name(name).await
-    }
-
     /// Current selected-adapter addresses from IP Helper, never the saved map.
     fn probe_scope(&self) -> Option<(InterfaceInfo, u32, SweepFence)> {
         let snapshot = self.presence.snapshot();
@@ -4536,11 +4532,6 @@ impl NetworkManager {
         Ok(())
     }
 
-    pub async fn stop_arp_discovery(&self) {
-        let _op = self.discovery_op.lock().await;
-        self.stop_locked().await;
-    }
-
     /// Full stop — the session machinery plus the capture listener, in
     /// that order. Run with the discovery op lock already held.
     async fn stop_locked(&self) {
@@ -4658,28 +4649,6 @@ impl NetworkManager {
         map.iter()
             .map(|(k, v)| (k.clone(), v.to_string()))
             .collect()
-    }
-
-    /// Resolve the wired source IP for reaching `target`, for
-    /// wired-bound cache verification. `None` (discovery never started,
-    /// or no adopted/native wired subnet contains the target) means the
-    /// verification must fail rather than probe unbound. The adapter
-    /// re-read costs one PowerShell query per call — acceptable because
-    /// this only runs after a TCP scan already succeeded; cache the
-    /// selected adapter's IPs in memory if verify latency ever matters.
-    pub async fn wired_source_for(&self, target: Ipv4Addr) -> Option<(u32, Ipv4Addr)> {
-        let selection = self.adapter_selection_state().await;
-        let index = selection.interface_index?;
-        let mac = selection.selected_mac?;
-        let adopted = self.adopted_ips.lock().await.clone();
-        let iface = selection.adapter?.name;
-        let info = interface::get_by_name(&iface).await.ok()?;
-        if adapter_mac(&info.mac) != adapter_mac(&mac)
-            || interface::index_for_mac(&info.mac)? != index
-        {
-            return None;
-        }
-        select_wired_source(target, &adopted, &info.ips).map(|source| (index, source))
     }
 
     /// Explicit Apply/Add Secondary transfers ownership to the user, including

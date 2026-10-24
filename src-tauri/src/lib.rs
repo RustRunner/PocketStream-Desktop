@@ -8,6 +8,9 @@ mod settings_validation;
 mod streaming;
 mod validation;
 
+#[cfg(test)]
+mod ipc_acl_tests;
+
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use tauri::Manager;
@@ -404,36 +407,26 @@ pub fn run() {
             commands::update_credentials,
             // Network
             commands::scan_network,
-            commands::list_interfaces,
             commands::get_host_ip_owners,
             commands::list_vpn_interfaces,
-            commands::set_static_ip,
             commands::add_secondary_ip,
             commands::remove_secondary_ip,
-            commands::set_dhcp,
             commands::get_dhcp_state,
-            commands::resolve_mac,
             commands::get_network_mode,
             commands::set_network_mode,
-            commands::get_manual_nodes,
             commands::add_manual_node,
             commands::remove_manual_node,
             commands::clear_manual_nodes,
             commands::refresh_adapter,
-            commands::get_interface_info,
             // ARP Discovery
             commands::start_arp_discovery,
             commands::get_capture_state,
             commands::get_adapter_selection,
             commands::select_adapter,
-            commands::stop_arp_discovery,
             commands::get_device_list,
-            commands::report_scan_result,
             commands::set_device_alias,
-            commands::set_device_status,
             commands::forget_device,
             commands::get_adoption_state,
-            commands::get_configured_adoptions,
             commands::remove_adopted_subnet,
             // Streaming
             commands::start_stream,
@@ -454,14 +447,7 @@ pub fn run() {
             commands::ptu_send,
             commands::open_device_browser,
             // Camera / PTZ
-            commands::discover_onvif,
-            commands::ptz_move,
-            commands::ptz_stop,
-            commands::ptz_goto_preset,
-            commands::ptz_set_preset,
-            commands::sony_cgi_zoom,
             commands::control_cgi_zoom_direct,
-            commands::control_cgi_probe_status,
             commands::set_zoom_position,
         ])
         .setup(|app| {

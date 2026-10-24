@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-create-video-window"
+description = "Enables the create_video_window command without any pre-configured scope."
+commands.allow = ["create_video_window"]
+
+[[permission]]
+identifier = "deny-create-video-window"
+description = "Denies the create_video_window command without any pre-configured scope."
+commands.deny = ["create_video_window"]

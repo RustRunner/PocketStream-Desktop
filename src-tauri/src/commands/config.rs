@@ -2,8 +2,8 @@
 //!
 //! The device-cache IPC handlers that used to live here are gone — the
 //! cache is now exclusively a side-effect of DeviceRegistry mutations
-//! on the backend (see `commands/network.rs::report_scan_result`,
-//! `set_device_alias`, `forget_device`). Frontend reads device state
+//! on the backend (scan completion, `set_device_alias`, `forget_device`).
+//! Frontend reads device state
 //! via `get_device_list` and the `device-list-changed` event.
 
 use tauri::State;

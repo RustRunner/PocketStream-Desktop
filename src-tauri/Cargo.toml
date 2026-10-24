@@ -45,6 +45,7 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_Wind
 tauri-build = { version = "2", features = [] }
 
 [dev-dependencies]
+tauri = { version = "2", features = ["test"] }
 tempfile = "3"
 # test-util enables tokio's paused-clock tests (start_paused), so budget
 # logic can be exercised without real waits. Feature-only: pulls no new
