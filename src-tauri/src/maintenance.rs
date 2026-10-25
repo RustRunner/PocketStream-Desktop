@@ -14,6 +14,11 @@ use windows_sys::Win32::{
     System::Threading::{GetCurrentProcess, OpenProcessToken},
 };
 
+// Windows inherits this privileged service's grant into Program Files children.
+// It does not make an ordinary user/service a trusted writer or permitted owner.
+const TRUSTED_INSTALLER_SID: &str =
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+
 pub(crate) fn protected_root() -> Result<PathBuf, &'static str> {
     let mut token = null_mut();
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
@@ -115,7 +120,7 @@ fn protected_descriptor(s: &str) -> bool {
         let rights = fields[2];
         let writes = if let Some(hex) = rights.strip_prefix("0x") {
             u32::from_str_radix(hex, 16)
-                .map(|mask| mask & 0x500d0116 != 0)
+                .map(|mask| mask & 0x500d0156 != 0)
                 .unwrap_or(true)
         } else {
             rights
@@ -123,7 +128,7 @@ fn protected_descriptor(s: &str) -> bool {
                 .chunks(2)
                 .any(|r| !matches!(r, b"FR" | b"FX" | b"GR" | b"GX" | b"RC"))
         };
-        if writes && !matches!(fields[5], "BA" | "SY") {
+        if writes && !matches!(fields[5], "BA" | "SY" | TRUSTED_INSTALLER_SID) {
             return false;
         }
     }
@@ -146,5 +151,32 @@ mod tests {
         ] {
             assert!(!protected_descriptor(s));
         }
+    }
+
+    #[test]
+    fn protected_program_files_inheritance_accepts_only_privileged_service_writes() {
+        // Observed on the native Program Files child created by NSIS. The
+        // directory remains Administrators-owned; Windows inherits this grant.
+        let sid = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+        let descriptor = format!(
+            "O:BAD:(A;ID;FA;;;{sid})(A;CIIOID;GA;;;{sid})(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;0x1200a9;;;BU)"
+        );
+        assert!(protected_descriptor(&descriptor));
+        assert!(!protected_descriptor(
+            &descriptor.replace(sid, "S-1-5-80-1")
+        ));
+        assert!(!protected_descriptor(
+            &descriptor.replace("O:BA", "O:S-1-5-21-1-2-3-1001")
+        ));
+        assert!(!protected_descriptor(
+            &(descriptor + "(A;;FW;;;S-1-5-21-1-2-3-1001)")
+        ));
+    }
+
+    #[test]
+    fn protected_diagnostics_reject_unprivileged_delete_child() {
+        assert!(!protected_descriptor(
+            "O:BAD:(A;;FA;;;BA)(A;;0x1200e9;;;BU)"
+        ));
     }
 }

@@ -25,6 +25,10 @@ export function checkInstaller(source, hooks) {
   const install = source.match(/Section Install\s*\n([\s\S]*?)SectionEnd/)?.[1] ?? "";
   const uninstall = source.match(/Section Uninstall\s*\n([\s\S]*?)SectionEnd/)?.[1] ?? "";
   require(install.indexOf("PS_ValidateDestination") >= 0 && install.indexOf("PS_ValidateDestination") < install.indexOf('File "${MAINBINARYSRCPATH}"'), "destination not checked before replacement");
+  const destination = body(hooks, "PS_ValidateDestination");
+  require(destination.includes('GetFullPathNameW') && !/^\s*GetFullPathName\s/m.test(destination), "fresh destination must resolve before its directory exists");
+  require(destination.includes('${If} $0 = 0') && destination.includes('${OrIf} $0 >= ${NSIS_MAX_STRLEN}') && destination.includes('PS_FAIL \'Cannot resolve installation destination\''), "destination resolution must reject failure or truncation");
+  require(destination.indexOf('GetFullPathNameW') < destination.indexOf('StrCpy $INSTDIR $6') && destination.includes("${If} $1 != '$PROGRAMFILES64\\'") && destination.includes('GetFileAttributesW') && destination.includes('0x400'), "resolved destination must retain protected-root and reparse checks");
   require(install.includes('PS_MAINTENANCE "install"'), "install maintenance missing");
   require(uninstall.indexOf('PS_MAINTENANCE "uninstall"') >= 0 && uninstall.indexOf('PS_MAINTENANCE "uninstall"') < uninstall.indexOf("Delete "), "uninstall deletes before maintenance");
   const resources = install.slice(install.indexOf("; Copy resources"), install.indexOf("; Create file associations"));
@@ -62,6 +66,7 @@ export function checkCompiledInstallerTrace(trace) {
   if (success.indexOf("ReleaseMutex")<0 || success.indexOf("ReleaseMutex")>success.indexOf("RunAsUser")) failures.push("compiled relaunch precedes release");
   if (!(functions.get("RunMainBinary") ?? "").includes("$PSLaunchRequested") || (functions.get("RunMainBinary") ?? "").includes("RunAsUser")) failures.push("compiled finish-page relaunch is not queued");
   for (const mode of ["install","uninstall"]) if (!trace.includes(`--firewall-maintenance ${mode}`)) failures.push(`compiled fixed ${mode} entry missing`);
+  if (!(functions.get("PS_ValidateDestination") ?? "").includes('GetFullPathNameW')) failures.push('compiled destination cannot resolve a missing directory');
   return failures;
 }
 

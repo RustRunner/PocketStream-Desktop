@@ -27,3 +27,19 @@ test('installer rejects ignored payload failures and stale install registration'
     assert.notDeepEqual(checkInstaller(source.replace(from,to),hooks),[],from);
   }
 });
+test('fresh protected destinations resolve without requiring an existing directory',async()=>{
+  const {checkInstaller}=await import('../scripts/check-installer.mjs');
+  const read=p=>fs.readFileSync(path.join(__dirname,'..',p),'utf8');
+  const source=read('src-tauri/installer/installer.nsi'),hooks=read('src-tauri/installer/transaction.nsh');
+  assert.deepEqual(checkInstaller(source,hooks),[]);
+  const seeds=[
+    hooks.replace(/System::Call 'kernel32::GetFullPathNameW[^\r\n]+/, 'GetFullPathName $INSTDIR $INSTDIR'),
+    hooks.replace('${OrIf} $0 >= ${NSIS_MAX_STRLEN}', '; lost truncation check'),
+    hooks.replace("${If} $1 != '$PROGRAMFILES64\\'", '${If} 0 = 1'),
+    hooks.replace('GetFileAttributesW', 'MissingReparseCheck'),
+  ];
+  for(const seed of seeds){
+    assert.notEqual(seed,hooks,'regression seed did not change the hook');
+    assert.notDeepEqual(checkInstaller(source,seed),[]);
+  }
+});

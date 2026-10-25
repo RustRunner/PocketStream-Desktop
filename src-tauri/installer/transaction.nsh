@@ -171,7 +171,15 @@ Function PS_ValidateDestination
     !insertmacro PS_FAIL 'Relocation requires standalone uninstall before installing'
   ${EndIf}
   ; Per-machine executable and maintenance diagnostics stay below Program Files.
-  GetFullPathName $INSTDIR $INSTDIR
+  ; NSIS GetFullPathName requires the final component to exist. Resolve a
+  ; fresh destination lexically before applying the same root/reparse bounds.
+  StrCpy $5 $INSTDIR
+  System::Call 'kernel32::GetFullPathNameW(w r5, i${NSIS_MAX_STRLEN}, w.r6, p0)i.r0'
+  ${If} $0 = 0
+  ${OrIf} $0 >= ${NSIS_MAX_STRLEN}
+    !insertmacro PS_FAIL 'Cannot resolve installation destination'
+  ${EndIf}
+  StrCpy $INSTDIR $6
   StrLen $0 '$PROGRAMFILES64\'
   StrCpy $1 $INSTDIR $0
   ${If} $1 != '$PROGRAMFILES64\'
