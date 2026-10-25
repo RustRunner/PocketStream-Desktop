@@ -89,3 +89,76 @@ scenario movements are recorded below as implementation progresses.
    remain at the facade. Gates: 799 Rust passed / 10 ignored; 205 frontend
    passed; fmt, Clippy, typecheck, contracts and build passed.
 
+6. Network closure: readiness supplies playback/relay reads, selection watch,
+   verified wake and diagnostic probe; scan and pinger own their workflows and
+   handles. The former pinger APP global is gone, retaining its initialization
+   gate as an owner field. Snapshot reads remain nonblocking. Automatic route
+   publication/IDs and local-MAC refresh enter their owners. The binding snapshot
+   retains its original binding/liveness/session-clock read order. All retained
+   request/recovery adapters capture explicit owned dependencies and await the
+   same whole workflows. Topology returns an observation to the existing watcher
+   adapter, including its independent successful retry and failed-observation
+   suppression. No temporary network boundary exception remains; the staged
+   streaming path has zero permitted lookups. Added five focused regressions for
+   topology observation/routing, pinger join lifetime and readiness admission.
+   The [architecture record](../architecture/ownership.md) describes actual
+   ownership, callback/fence views, native routes and startup/exit order.
+
+   Final gates: **804 Rust passed, 0 failed, 10 ignored; 205 frontend passed**.
+   Fmt, all-target Clippy with warnings denied, typecheck, contracts and frontend
+   build passed. A Clippy test-module-placement issue was corrected before the
+   passing rerun. The additional `cargo build --locked` desktop development build
+   passed; it retains the existing LNK4199 unused delay-load-import warnings.
+   The built application was not launched for qualification.
+
+| Review slice | Local review commit | Rust pass / ignored | Frontend pass |
+| --- | --- | --- | --- |
+| 1 | `47d965e` | 792 / 10 | 205 |
+| 2 | `a46a222` | 795 / 10 | 205 |
+| 3 | `5b5ded8` | 796 / 10 | 205 |
+| 4 | `adc16b2` | 797 / 10 | 205 |
+| 5 | `73d82b9` | 799 / 10 | 205 |
+| 6 | Commit containing this completed record, titled “A03 slice 6: close network dependencies and record ownership” | 804 / 10 | 205 |
+
+Every slice passed all seven required gates. Machine-readable per-slice gate
+records, final gate output and the desktop build output are in
+[a03-revision3](a03-revision3). Captured PowerShell output was normalized to UTF-8
+and trailing log whitespace removed for review; no results were changed.
+
+The [scenario accounting](a03-revision3/scenario-accounting.json) reconciles the
+799 baseline declarations with 814 final declarations: 775 keep their exact
+test path, 24 move by preserved scenario name and 15 are new. No scenario is
+missing; all 10 ignored names/reasons are unchanged. This accounts for the
+789-to-804 passing count without claiming platform or hardware credit. Final
+inventory is [recorded separately](a03-revision3/final-rust-inventory.txt).
+
+The [contract comparison](a03-revision3/contracts-preserved.json) records the same
+16 emitted event names, the byte-equivalent normalized 27-field `StreamStatus`
+declaration, unchanged frontend mirrors/configuration and unchanged native
+executor/runner/host-owner/provider/maintenance inputs. The ordinary contract
+gate reports 46 commands, 46 referenced wrappers plus the event helper and 9
+plugin permissions. Payload construction and event points were reviewed with
+the moved code; aggregate name counts alone are not behavior evidence.
+
+Only `x86_64-pc-windows-msvc` is installed in this environment. The available
+Windows SDK include version is `10.0.26100.0`. No non-Windows target build was
+executed. Opt-in fixture operations were not enabled. The Windows source/unit
+checks do not establish the following outstanding A4 gates:
+
+- Full machine/installer predecessor, terminal, cross-account/session and
+  integrity-level ownership matrix.
+- Physical DHCP/static/DNS/routes/renew/restart, actual cancellation/uncertainty,
+  partial-provider mutation, crash recovery and unmodified-candidate repair.
+- Wider GUID/Any/firewall/listener races, unrelated-adapter physical topology,
+  migration/observation/persistence failures and GUID/alias reuse transitions.
+- Cable/reboot recovery, measured stop/notification timing, remaining PTU/operator
+  and relay cases, and longer or other-load endurance.
+- Installed-package hardware, signed-update success/failure/rollback, complete
+  G1-R/G2/G3 native/source closure and fresh security review.
+
+The existing [A4 remaining checklist](privilege-v2-a4-remaining.md) and frozen
+v2-A development evidence remain unchanged. New A03 source/builds inherit no
+artifact-specific binary qualification. **A4 remains incomplete/deferred; B
+and streaming slices 7–10 remain deferred.** No installation, publication,
+push, reboot or host network/firewall mutation was performed.
+

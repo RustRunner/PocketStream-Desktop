@@ -1,0 +1,27 @@
+cargo :    Compiling pocketstream-desktop v0.6.7 (C:\Users\joshu\PocketStream-Desktop\src-tauri)
+At line:2 char:143
++ ... EXITCODE }; cargo build --manifest-path src-tauri/Cargo.toml --locked ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (   Compiling po...ktop\src-tauri):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+warning: linker stdout: LINK : warning LNK4199: /DELAYLOAD:Packet.dll ignored; no imports found from Packet.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gmodule-2.0-0.dll ignored; no imports found from gmodule-2.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:intl-8.dll ignored; no imports found from intl-8.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gstaudio-1.0-0.dll ignored; no imports found from gstaudio-1.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gstpbutils-1.0-0.dll ignored; no imports found from gstpbutils-1.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gsttag-1.0-0.dll ignored; no imports found from gsttag-1.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gstrtp-1.0-0.dll ignored; no imports found from gstrtp-1.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gstrtsp-1.0-0.dll ignored; no imports found from gstrtsp-1.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gstsdp-1.0-0.dll ignored; no imports found from gstsdp-1.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gstgl-1.0-0.dll ignored; no imports found from gstgl-1.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gstallocators-1.0-0.dll ignored; no imports found from
+gstallocators-1.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gstcodecparsers-1.0-0.dll ignored; no imports found from
+gstcodecparsers-1.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gstmpegts-1.0-0.dll ignored; no imports found from gstmpegts-1.0-0.dll
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `pocketstream-desktop` (bin "pocketstream-desktop") generated 1 warning
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 16.64s

@@ -1,6 +1,8 @@
 mod adopt_loop;
 mod capture_session;
 mod discovery_session;
+pub(crate) mod readiness;
+mod scan;
 use capture_session::{current_session_counters, park_capture_handle};
 mod adapter_selector;
 mod binding_store;
@@ -194,23 +196,6 @@ pub struct AdapterSelection {
 /// DHCP already captures; enabling adoption does not need a new listener.
 fn mode_keeps_capture(from: crate::config::NetworkMode, to: crate::config::NetworkMode) -> bool {
     from == crate::config::NetworkMode::Dhcp && to == crate::config::NetworkMode::StaticAuto
-}
-
-/// RAII guard that removes a subnet from the active-scan set on drop, so a
-/// cancelled `scan_subnet` future can't leave the subnet permanently marked
-/// "scan in progress" (which would reject every later scan of it for the
-/// process lifetime). Uses the std mutex so `Drop` can remove synchronously.
-struct ScanGuard {
-    active: Arc<std::sync::Mutex<HashSet<String>>>,
-    subnet: String,
-}
-
-impl Drop for ScanGuard {
-    fn drop(&mut self) {
-        if let Ok(mut set) = self.active.lock() {
-            set.remove(&self.subnet);
-        }
-    }
 }
 
 /// Invalidate in-flight address work before waiting for its serialization lock.
@@ -508,7 +493,9 @@ pub struct NetworkManager {
     discovery: Arc<discovery_session::DiscoverySession>,
     bridge: Arc<dyn crate::bridge::AppBridge>,
     config: Arc<crate::config::AppConfig>,
-    active_scans: Arc<std::sync::Mutex<HashSet<String>>>,
+    scans: scan::ScanWorkflow,
+    readiness: Arc<readiness::CameraReadiness>,
+    pinger: ping_dot::Pinger,
     /// Canonical store of merged device records (ARP + scan + cache +
     /// alias + status). Mutated alongside `arp_devices` during the
     /// transition; once the frontend is fully migrated to subscribe-only
@@ -516,10 +503,6 @@ pub struct NetworkManager {
     device_registry: Arc<DeviceRegistry>,
     /// Constructed before hydration; its bridge is bound in setup.
     device_emitter: Arc<DeviceListEmitter>,
-    /// Handle to the ICMP pinger task (green/red dot driver). Started
-    /// by `start_ping_dot`, stopped on shutdown. Mode-independent: the
-    /// pinger watches whatever the registry contains.
-    ping_dot_handle: Arc<Mutex<Option<ping_dot::PingDotHandle>>>,
     /// Serializes the discovery lifecycle (start / stop / mode change /
     /// startup restore) so concurrent entry can't overwrite — and thereby
     /// orphan — the auto-adopt task handle. Non-reentrant: internal callers
@@ -921,6 +904,41 @@ impl auto_adopt::AdoptOps for AddressOps<'_> {
 }
 
 impl NetworkManager {
+    pub(crate) fn emit_selection(&self, selection: &AdapterSelection) {
+        self.selector.observe(selection);
+        let _ = crate::bridge::emit(self.bridge.as_ref(), "adapter-selection-changed", selection);
+        let _ = crate::bridge::emit(
+            self.bridge.as_ref(),
+            "interface-status-changed",
+            &watcher::selected_status(selection),
+        );
+    }
+
+    pub(crate) fn readiness(&self) -> Arc<readiness::CameraReadiness> {
+        self.readiness.clone()
+    }
+    pub async fn scan_subnet(
+        &self,
+        subnet: &str,
+        config: &crate::config::AppConfig,
+    ) -> Result<Vec<ScanResult>, AppError> {
+        self.scans
+            .scan_subnet(&self.readiness, subnet, config)
+            .await
+    }
+    pub async fn start_ping_dot(&self) {
+        self.pinger
+            .start(
+                self.readiness.clone(),
+                self.device_registry.clone(),
+                self.bridge.clone(),
+            )
+            .await;
+    }
+    pub async fn stop_ping_dot(&self) {
+        self.pinger.stop().await;
+    }
+
     fn discovery_deps(&self) -> discovery_session::DiscoveryDeps {
         discovery_session::DiscoveryDeps {
             selector: self.selector.clone(),
@@ -932,7 +950,7 @@ impl NetworkManager {
             emitter: self.device_emitter.clone(),
         }
     }
-    pub(crate) async fn start_presence(&self, _app: tauri::AppHandle) {
+    pub(crate) async fn start_presence(&self) {
         self.selector
             .start_presence(presence::PresenceDeps {
                 owners: self.discovery_deps(),
@@ -955,15 +973,9 @@ impl NetworkManager {
         self.bridge.clone()
     }
     pub async fn adoption_snapshot(&self) -> AdoptionSnapshot {
-        let elapsed = self
-            .discovery
-            .discovery_started
-            .lock()
-            .ok()
-            .and_then(|s| *s)
-            .map(|t| t.elapsed())
-            .unwrap_or_default();
-        self.bindings.adoption_snapshot(elapsed).await
+        self.bindings
+            .adoption_snapshot(&self.discovery.discovery_started)
+            .await
     }
 
     pub(crate) async fn pending_ip_strings(&self) -> HashSet<String> {
@@ -979,9 +991,11 @@ impl NetworkManager {
 
     #[cfg(test)]
     fn with_address_io(io: Arc<dyn interface::AddressIo>) -> Self {
-        let mut manager = Self::new();
-        Arc::get_mut(&mut manager.bindings).unwrap().address_io = io;
-        manager
+        Self::with_io(
+            Arc::new(crate::config::AppConfig::for_test(Default::default())),
+            Arc::new(crate::bridge::TauriBridge::<tauri::Wry>::default()),
+            io,
+        )
     }
 
     #[cfg(test)]
@@ -996,25 +1010,44 @@ impl NetworkManager {
         config: Arc<crate::config::AppConfig>,
         bridge: Arc<dyn crate::bridge::AppBridge>,
     ) -> Self {
+        Self::with_io(config, bridge, Arc::new(interface::RealAddressIo))
+    }
+    fn with_io(
+        config: Arc<crate::config::AppConfig>,
+        bridge: Arc<dyn crate::bridge::AppBridge>,
+        io: Arc<dyn interface::AddressIo>,
+    ) -> Self {
         let registry = Arc::new(DeviceRegistry::new());
         let emitter = DeviceListEmitter::new(bridge.clone(), registry.clone());
         let selector = Arc::new(adapter_selector::AdapterSelector::new());
-        let bindings = Arc::new(binding_store::BindingStore::new(
-            config.clone(),
-            selector.clone(),
-        ));
+        let mut store = binding_store::BindingStore::new(config.clone(), selector.clone());
+        store.address_io = io;
+        let bindings = Arc::new(store);
+        let discovery = Arc::new(discovery_session::DiscoverySession::new());
+        let pinger = ping_dot::Pinger::new();
+        let readiness = Arc::new(readiness::CameraReadiness {
+            selector: selector.clone(),
+            bindings: bindings.clone(),
+            discovery: discovery.clone(),
+            device_registry: registry.clone(),
+            device_emitter: emitter.clone(),
+            config: config.clone(),
+            diagnostic_ready: pinger.diagnostic_ready.clone(),
+        });
         Self {
             selector,
             bindings,
             capture: Arc::new(capture_session::CaptureSession::new()),
-            discovery: Arc::new(discovery_session::DiscoverySession::new()),
+            discovery,
             bridge,
             config,
-            active_scans: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            scans: scan::ScanWorkflow::new(),
+            readiness,
+            pinger,
 
             device_registry: registry,
             device_emitter: emitter,
-            ping_dot_handle: Arc::new(Mutex::new(None)),
+
             discovery_op: Arc::new(Mutex::new(())),
         }
     }
@@ -1063,12 +1096,6 @@ impl NetworkManager {
         );
     }
 
-    /// Borrow the device registry. Used by IPC handlers that need to
-    /// read snapshots or apply mutations.
-    pub(crate) fn sweep_fence(&self) -> SweepFence {
-        self.discovery.sweep_fence()
-    }
-
     pub fn registry(&self) -> Arc<DeviceRegistry> {
         self.device_registry.clone()
     }
@@ -1110,7 +1137,6 @@ impl NetworkManager {
     /// resulting state, then resume eligible work with a fresh DHCP cache.
     pub async fn transition_mode(
         &self,
-        app: tauri::AppHandle,
         config: &crate::config::AppConfig,
         request: ModeTransition,
     ) -> Result<ModeTransitionReply, AppError> {
@@ -1235,7 +1261,7 @@ impl NetworkManager {
         let resume = true;
         if resume && mode != NetworkMode::StaticManual && crate::is_discovery_available() {
             if let Err(e) = self
-                .start_arp_discovery_body(&iface.name, config, app.clone(), false, preserve_capture)
+                .start_arp_discovery_body(&iface.name, config, false, preserve_capture)
                 .await
             {
                 log::warn!("Discovery restart after mode transition: {}", e);
@@ -1243,7 +1269,7 @@ impl NetworkManager {
         }
         self.selector.presence.bootstrap();
         if resume {
-            self.start_ping_dot(app).await;
+            self.start_ping_dot().await;
         }
         result?;
         Ok(ModeTransitionReply {
@@ -1257,37 +1283,6 @@ impl NetworkManager {
         })
     }
 
-    /// Start the ICMP-based reachability pinger. Mode-independent — the
-    /// pinger reads the registry, so it works equally well for ARP-
-    /// populated entries (Static-Auto, DHCP) and manual hydrations
-    /// (Static-Manual). Safe to call multiple times; replaces any
-    /// previously-running pinger.
-    pub async fn start_ping_dot(&self, app_handle: tauri::AppHandle) {
-        // Take the previous handle out and release the lock BEFORE awaiting
-        // its stop — holding the guard across stop().await needlessly
-        // serializes start/stop and would self-deadlock if the pinger were
-        // ever changed to call back into this handle.
-        let prev = self.ping_dot_handle.lock().await.take();
-        if let Some(prev) = prev {
-            prev.stop().await;
-        }
-        let handle = ping_dot::start(app_handle, self.device_registry.clone());
-        *self.ping_dot_handle.lock().await = Some(handle);
-        log::info!("Started ICMP ping-dot loop");
-    }
-
-    /// Stop the pinger task and drain. No-op if not running.
-    pub async fn stop_ping_dot(&self) {
-        // Take the handle out and drop the lock guard before awaiting stop
-        // (the edition-2021 `if let` would otherwise keep the guard alive
-        // across the await).
-        let handle = self.ping_dot_handle.lock().await.take();
-        if let Some(handle) = handle {
-            handle.stop().await;
-            log::info!("Stopped ICMP ping-dot loop");
-        }
-    }
-
     /// Borrow the emitter constructed with the registry before hydration.
     /// Mutators that want to publish a `device-list-changed` event call
     /// `.poke()` on the result.
@@ -1297,11 +1292,7 @@ impl NetworkManager {
 
     /// Reconcile durable intent from actual selected-adapter addresses. Never
     /// prune malformed, unavailable, DHCP, or adapter-mismatched saved rows.
-    pub async fn load_adopted_from_config(
-        &self,
-        config: &crate::config::AppConfig,
-        app: &tauri::AppHandle,
-    ) {
+    pub async fn load_adopted_from_config(&self, config: &crate::config::AppConfig) {
         let _op = self.discovery_op.lock().await;
         let pause = self.bindings.pause_addresses();
         let _address = self.bindings.address_work.lock().await;
@@ -1310,11 +1301,12 @@ impl NetworkManager {
         drop(_address);
         drop(pause);
         self.selector.presence.bootstrap();
-        use tauri::Emitter;
         let snapshot = self.adoption_snapshot().await;
         for (subnet, ip) in &snapshot.adopted_subnets {
             let meta = &snapshot.meta[subnet];
-            let _ = app.emit("subnet-adopted", adoption_event(subnet, ip, meta, true));
+            let _ = self
+                .bridge
+                .emit("subnet-adopted", adoption_event(subnet, ip, meta, true));
         }
     }
 
@@ -1328,10 +1320,6 @@ impl NetworkManager {
 
     pub async fn adapter_selection_state(&self) -> AdapterSelection {
         self.selector.snapshot().await
-    }
-
-    pub(crate) fn selection_subscription(&self) -> tokio::sync::watch::Receiver<AdapterSelection> {
-        self.selector.subscribe()
     }
 
     pub(crate) fn selection_observed(&self, selection: &AdapterSelection) {
@@ -1348,10 +1336,6 @@ impl NetworkManager {
 
     pub(crate) async fn stop_presence(&self) {
         self.selector.stop_presence(&self.device_registry).await;
-    }
-
-    pub(crate) async fn expected_device_verified(&self) {
-        self.selector.expected_device_verified().await;
     }
 
     async fn native_interfaces(
@@ -1498,7 +1482,6 @@ impl NetworkManager {
     pub async fn select_adapter(
         &self,
         config: &crate::config::AppConfig,
-        app: &tauri::AppHandle,
         mac: &str,
     ) -> Result<AdapterSelection, AppError> {
         self.bindings.address_io.check_writes_available()?;
@@ -1516,26 +1499,19 @@ impl NetworkManager {
         #[cfg(not(windows))]
         let resume = true;
         if resume {
-            self.start_selected_adapter(config, app).await;
+            self.start_selected_adapter(config).await;
         }
         self.get_adapter_selection(config).await
     }
 
-    pub async fn start_selected_adapter(
-        &self,
-        config: &crate::config::AppConfig,
-        app: &tauri::AppHandle,
-    ) {
-        self.load_adopted_from_config(config, app).await;
+    pub async fn start_selected_adapter(&self, config: &crate::config::AppConfig) {
+        self.load_adopted_from_config(config).await;
         let selection = self.adapter_selection_state().await;
         if config.get_network_mode() != crate::config::NetworkMode::StaticManual
             && crate::is_discovery_available()
         {
             if let Some(iface) = selection.adapter {
-                if let Err(e) = self
-                    .start_arp_discovery(&iface.name, config, app.clone())
-                    .await
-                {
+                if let Err(e) = self.start_arp_discovery(&iface.name, config).await {
                     log::info!("Selected Ethernet discovery waiting: {e}");
                 }
             }
@@ -1547,7 +1523,6 @@ impl NetworkManager {
     pub(crate) async fn resume_discovery(
         &self,
         config: &crate::config::AppConfig,
-        app: &tauri::AppHandle,
     ) -> Result<bool, AppError> {
         let Ok(_op) = self.discovery_op.try_lock() else {
             return Ok(false); // a start, stop or mode transition already owns it
@@ -1585,9 +1560,9 @@ impl NetworkManager {
                     log_value(&iface.mac), selection.interface_index.unwrap_or(0), up);
                 selection.adapter = Some(iface);
                 self.update_presence_adapter(&selection, settings.network_mode);
-                watcher::emit_selection(app, &selection);
+                self.emit_selection(&selection);
                 let result = self
-                    .start_selected_discovery_locked(selection, config, app.clone(), false, true)
+                    .start_selected_discovery_locked(selection, config, false, true)
                     .await;
                 if let Err(error) = result {
                     if up || !self.capture.capture_signal.lock().await.state.active {
@@ -1602,16 +1577,12 @@ impl NetworkManager {
         }
     }
 
-    fn probe_scope(&self) -> Option<(InterfaceInfo, u32, SweepFence)> {
-        self.selector.probe_scope(&self.bindings.pending_ips)
-    }
-
     pub(crate) async fn camera_ready(
         &self,
         target: &route::CameraTarget,
         config: &crate::config::AppConfig,
     ) -> Result<route::ReadyPath, AppError> {
-        self.camera_ready_now(target, config)
+        self.readiness.camera_path_now(target, config, false)
     }
 
     /// Native/in-memory checks only; callable on the relay's GLib threads.
@@ -1620,175 +1591,7 @@ impl NetworkManager {
         target: &route::CameraTarget,
         config: &crate::config::AppConfig,
     ) -> Result<route::ReadyPath, AppError> {
-        self.camera_path_now(target, config, false)
-    }
-
-    /// Only for transports that bind both the source address and interface.
-    /// Unbound consumers must continue to use camera_ready[_now].
-    pub(crate) fn camera_ready_bound_now(
-        &self,
-        target: &route::CameraTarget,
-        config: &crate::config::AppConfig,
-    ) -> Result<route::ReadyPath, AppError> {
-        self.camera_path_now(target, config, true)
-    }
-
-    fn camera_path_now(
-        &self,
-        target: &route::CameraTarget,
-        config: &crate::config::AppConfig,
-        bound: bool,
-    ) -> Result<route::ReadyPath, AppError> {
-        if self.selector.presence.tick(&self.device_registry) {
-            self.device_emitter.poke();
-        }
-        let mut target = target.clone();
-        // A legacy manual key follows only its persisted first-verification
-        // binding. An IP match is never a substitute for an expected MAC.
-        if target.key.starts_with("manual:") {
-            let node = config.get_manual_nodes().into_iter().find(|n| {
-                crate::config::manual_node_key(n) == target.key
-                    || format!("manual:{}", n.ip) == target.key
-            });
-            if let Some(expected) = node.and_then(|n| n.expected_mac) {
-                if target
-                    .expected_mac
-                    .as_ref()
-                    .is_some_and(|m| !m.eq_ignore_ascii_case(&expected))
-                {
-                    return Err(AppError::Network("Manual expected identity changed".into()));
-                }
-                target.key = expected.clone();
-                target.expected_mac = Some(expected);
-            }
-        }
-        let (adapter, index, fence) = self
-            .probe_scope()
-            .ok_or_else(|| AppError::Network("Selected Ethernet adapter unavailable".into()))?;
-        let ip = crate::validation::parse_camera_ip(&target.ip)?;
-        let records = self.device_registry.snapshot();
-        let source = if bound {
-            route::check_bound_ready(&target, Some(&adapter), index, &records)
-        } else {
-            route::check_ready(
-                &target,
-                Some(&adapter),
-                index,
-                &records,
-                route::egress_index(ip).ok(),
-            )
-        }?;
-        #[cfg(windows)]
-        if !interface::source_matches_interface(index, source) {
-            return Err(AppError::Network(
-                "Ethernet source address is absent or ambiguous".into(),
-            ));
-        }
-        if fence.is_stale() {
-            return Err(AppError::Network("Ethernet adapter changed".into()));
-        }
-        Ok(route::ReadyPath {
-            target,
-            source,
-            index,
-            fence,
-        })
-    }
-
-    pub async fn scan_subnet(
-        &self,
-        subnet: &str,
-        config: &crate::config::AppConfig,
-    ) -> Result<Vec<ScanResult>, AppError> {
-        // RAII guard: the subnet is removed from the active set on drop —
-        // normal return OR a cancelled future — so a cancellation at the
-        // scan await below can't wedge the subnet as "scan in progress"
-        // forever. Insert + guard creation happen under one lock.
-        let _guard = {
-            let mut active = self.active_scans.lock().unwrap_or_else(|p| p.into_inner());
-            if !active.insert(subnet.to_string()) {
-                return Err(AppError::Network(format!(
-                    "Scan already in progress for {}",
-                    subnet
-                )));
-            }
-            ScanGuard {
-                active: self.active_scans.clone(),
-                subnet: subnet.to_string(),
-            }
-        };
-        if config.get_network_mode() == crate::config::NetworkMode::StaticManual {
-            return Err(AppError::Network(
-                "Port scanning is disabled in Static-Manual".into(),
-            ));
-        }
-        let (adapter, index, fence) = self
-            .probe_scope()
-            .ok_or_else(|| AppError::Network("Selected Ethernet adapter unavailable".into()))?;
-        self.device_registry
-            .expire_evidence(tokio::time::Instant::now());
-        let identities = self
-            .device_registry
-            .snapshot()
-            .into_iter()
-            .filter(|r| {
-                r.status == DeviceStatus::Live
-                    && r.verified_by_mac
-                        .as_ref()
-                        .is_some_and(|m| m.eq_ignore_ascii_case(&adapter.mac))
-            })
-            .filter_map(|r| r.ip.parse().ok().map(|ip| (ip, r.mac)))
-            .collect();
-        let discovery = self.sweep_fence();
-        if discovery.is_stale() {
-            return Err(AppError::Network("Discovery session unavailable".into()));
-        }
-        let scope = scanner::ScanScope {
-            index,
-            fence: Some(fence.clone()),
-            session: Some(discovery.clone()),
-            ips: adapter.ips,
-            identities,
-        };
-        let results = scanner::scan(subnet, scope).await?;
-        if fence.is_stale() || discovery.is_stale() {
-            arp::note_fence_drop("scan_results");
-            return Ok(Vec::new());
-        }
-        let mut accepted = Vec::new();
-        for result in results {
-            let Some(key) = result.key.as_ref() else {
-                continue;
-            };
-            let target = route::CameraTarget {
-                key: key.clone(),
-                expected_mac: Some(key.clone()),
-                ip: result.ip.clone(),
-            };
-            let Ok(path) = self.camera_ready(&target, config).await else {
-                continue;
-            };
-            if fence.is_stale()
-                || discovery.is_stale()
-                || path.index != result.interface_index
-                || Some(path.source.to_string()) != result.source
-            {
-                continue;
-            }
-            if self
-                .device_registry
-                .merge_scan_result_fenced(key, &result.open_ports, Some(&fence))
-            {
-                if let Some(row) = self.device_registry.cache_record(key) {
-                    config.upsert_cached_device_fenced(row, Some(&fence))?;
-                }
-                if let Some(emitter) = self.emitter().await {
-                    emitter.poke();
-                }
-            }
-            accepted.push(result);
-        }
-        Ok(accepted)
+        self.readiness.camera_path_now(target, config, false)
     }
 
     /// Start ARP discovery (PacketMonitor capture) on the Ethernet
@@ -1801,10 +1604,9 @@ impl NetworkManager {
         &self,
         interface_display_name: &str,
         config: &crate::config::AppConfig,
-        app_handle: tauri::AppHandle,
     ) -> Result<(), AppError> {
         let _op = self.discovery_op.lock().await;
-        self.start_arp_discovery_locked(interface_display_name, config, app_handle)
+        self.start_arp_discovery_locked(interface_display_name, config)
             .await
     }
 
@@ -1812,10 +1614,9 @@ impl NetworkManager {
         &self,
         interface: &str,
         config: &crate::config::AppConfig,
-        app: tauri::AppHandle,
     ) -> Result<(), AppError> {
         let _op = self.discovery_op.lock().await;
-        self.start_arp_discovery_body(interface, config, app, true, false)
+        self.start_arp_discovery_body(interface, config, true, false)
             .await
     }
 
@@ -1826,9 +1627,8 @@ impl NetworkManager {
         &self,
         interface_display_name: &str,
         config: &crate::config::AppConfig,
-        app_handle: tauri::AppHandle,
     ) -> Result<(), AppError> {
-        self.start_arp_discovery_body(interface_display_name, config, app_handle, false, false)
+        self.start_arp_discovery_body(interface_display_name, config, false, false)
             .await
     }
 
@@ -1836,7 +1636,6 @@ impl NetworkManager {
         &self,
         interface_display_name: &str,
         config: &crate::config::AppConfig,
-        app_handle: tauri::AppHandle,
         refresh: bool,
         preserve_capture: bool,
     ) -> Result<(), AppError> {
@@ -1859,14 +1658,8 @@ impl NetworkManager {
             ));
         }
 
-        self.start_selected_discovery_locked(
-            selection,
-            config,
-            app_handle,
-            refresh,
-            preserve_capture,
-        )
-        .await
+        self.start_selected_discovery_locked(selection, config, refresh, preserve_capture)
+            .await
     }
 
     /// Caller holds discovery_op and has resolved the selected MAC/index.
@@ -1876,7 +1669,6 @@ impl NetworkManager {
         &self,
         selection: AdapterSelection,
         config: &crate::config::AppConfig,
-        _app_handle: tauri::AppHandle,
         refresh: bool,
         preserve_capture: bool,
     ) -> Result<(), AppError> {
@@ -1945,9 +1737,7 @@ impl NetworkManager {
         // Recognize this PC by all of its adapter MACs, not its IP addresses.
         // A wired peer can share an IP with Wi-Fi on a separate link. The same
         // shared set survives capture restarts and is refreshed each pass.
-        if let Ok(mut set) = self.selector.local_macs.lock() {
-            *set = interface::local_adapter_macs();
-        }
+        self.selector.refresh_local_macs();
         let local_macs = self.selector.local_macs.clone();
 
         let registry = self.device_registry.clone();
@@ -2044,7 +1834,8 @@ impl NetworkManager {
         #[cfg(windows)]
         native_operations::drain().await;
         if let Ok(_address) = self.bindings.address_work.try_lock() {
-            if self.capture.capture_signal.lock().await.app.is_some() {
+            let initialized = self.capture.capture_signal.lock().await.app.is_some();
+            if initialized {
                 self.bindings.reconcile_temporary_locked(&self.config).await;
             }
         }
@@ -3813,23 +3604,6 @@ mod tests {
         assert_eq!(historical.status, DeviceStatus::Offline);
         assert_eq!(historical.alias, "bench PTU");
         assert!(!keep_prohibited_history_inactive(&registry));
-    }
-
-    #[test]
-    fn scan_guard_removes_subnet_on_drop() {
-        // A cancelled scan_subnet future drops its ScanGuard, which must
-        // clear the active-scan flag so later scans of that subnet aren't
-        // permanently rejected.
-        let active = Arc::new(std::sync::Mutex::new(HashSet::new()));
-        active.lock().unwrap().insert("10.0.0.0/24".to_string());
-        {
-            let _g = ScanGuard {
-                active: active.clone(),
-                subnet: "10.0.0.0/24".to_string(),
-            };
-            assert!(active.lock().unwrap().contains("10.0.0.0/24"));
-        }
-        assert!(!active.lock().unwrap().contains("10.0.0.0/24"));
     }
 
     #[test]

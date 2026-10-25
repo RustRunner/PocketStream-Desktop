@@ -32,6 +32,27 @@ pub(super) struct BindingStore {
 }
 
 impl BindingStore {
+    pub(super) fn next_adoption_id(&self) -> u64 {
+        self.adoption_seq.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// The existing automatic tail calls this only after durable commit and
+    /// pending handover, while still holding address_work and both fences.
+    pub(super) async fn publish_adoption(
+        &self,
+        subnet: &str,
+        ip: Ipv4Addr,
+        row: crate::config::AdoptedMeta,
+    ) {
+        self.adopted_ips.lock().await.insert(subnet.to_string(), ip);
+        if let Ok(mut liveness) = self.adoption_liveness.lock() {
+            liveness.insert(subnet.to_string(), std::time::Instant::now());
+        }
+        if let Ok(mut meta) = self.adopted_meta.lock() {
+            meta.insert(subnet.to_string(), row);
+        }
+    }
+
     pub(super) fn new(
         config: Arc<crate::config::AppConfig>,
         selector: Arc<adapter_selector::AdapterSelector>,
@@ -101,13 +122,20 @@ impl BindingStore {
     /// time from the same clocks the reap pass reads.
     pub async fn adoption_snapshot(
         &self,
-        session_elapsed: std::time::Duration,
+        // Read-only clock view; DiscoverySession alone starts/retires it.
+        session_started: &StdMutex<Option<std::time::Instant>>,
     ) -> AdoptionSnapshot {
         let (adopted, meta_map) = self.adopted_config_snapshot().await;
         let liveness = self
             .adoption_liveness
             .lock()
             .map(|l| l.clone())
+            .unwrap_or_default();
+        let session_elapsed = session_started
+            .lock()
+            .ok()
+            .and_then(|s| *s)
+            .map(|t| t.elapsed())
             .unwrap_or_default();
         let wall_now = chrono::Utc::now();
         let meta = meta_map

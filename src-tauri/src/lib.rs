@@ -230,7 +230,7 @@ fn setup_bundled_gstreamer() -> bool {
 /// Fallback watcher follows the same persisted selection as native events.
 async fn watch_interface(handle: tauri::AppHandle) {
     loop {
-        network::bindings::refresh(&handle).await;
+        network::watcher::refresh_bindings(&handle).await;
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         let manager = handle.state::<std::sync::Arc<network::NetworkManager>>();
         let selection = manager.adapter_selection_state().await;
@@ -523,7 +523,7 @@ pub fn run() {
             // emits `stream-status` to the frontend on every change.
             // Replaces the old 1Hz frontend poll of get_stream_status.
             let stream_mgr: tauri::State<'_, std::sync::Arc<streaming::StreamManager>> = handle.state();
-            stream_mgr.start_status_emitter(handle.clone(), handle.state::<std::sync::Arc<network::NetworkManager>>().selection_subscription());
+            stream_mgr.start_status_emitter(handle.clone(), handle.state::<std::sync::Arc<network::NetworkManager>>().readiness());
 
             // Start event-driven NIC watcher (Windows NotifyIpInterfaceChange +
             // NotifyUnicastIpAddressChange). If it fails to register — or on
@@ -547,13 +547,13 @@ pub fn run() {
 
                 manager.hydrate_device_registry(&config).await;
                 manager.hydrate_manual_nodes(&config).await;
-                manager.start_presence(handle.clone()).await;
+                manager.start_presence().await;
                 #[cfg(windows)]
-                if let Err(error) = network::native_operations::startup_reconcile(handle.clone()).await {
+                if let Err(error) = network::native_operations::startup_reconcile(manager.inner().clone(), handle.state::<std::sync::Arc<streaming::StreamManager>>().inner().clone(), config.inner().clone()).await {
                     log::warn!("{error}");
                 }
                 #[cfg(not(windows))]
-                manager.load_adopted_from_config(&config, &handle).await;
+                manager.load_adopted_from_config(&config).await;
 
                 match manager.get_adapter_selection(&config).await {
                     Ok(selection) => {
@@ -579,7 +579,7 @@ pub fn run() {
                                     }
 
                                     match manager
-                                        .start_arp_discovery(&name, &config, handle.clone())
+                                        .start_arp_discovery(&name, &config)
                                         .await
                                     {
                                         Ok(()) => {}
@@ -628,7 +628,7 @@ pub fn run() {
                 // ICMP pinger drives the green/red reachability dot in
                 // every mode. Starts after registry hydration so the
                 // first sweep has something to ping.
-                manager.start_ping_dot(handle.clone()).await;
+                manager.start_ping_dot().await;
             });
 
             Ok(())

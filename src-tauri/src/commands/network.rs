@@ -60,11 +60,16 @@ pub async fn select_adapter(
     #[cfg(windows)]
     {
         let _ = (&manager, &config, &app);
-        crate::network::native_operations::select_request(app, mac).await
+        crate::network::native_operations::select_request(
+            manager.inner().clone(),
+            config.inner().clone(),
+            mac,
+        )
+        .await
     }
     #[cfg(not(windows))]
     {
-        let selection = manager.select_adapter(&config, &app, &mac).await?;
+        let selection = manager.select_adapter(&config, &mac).await?;
         crate::network::watcher::emit_selection(&app, &selection);
         Ok(selection)
     }
@@ -165,11 +170,17 @@ pub async fn set_network_mode(
     #[cfg(windows)]
     {
         let _ = (&manager, &config, &app);
-        crate::network::native_operations::mode_request(app, request).await
+        crate::network::native_operations::mode_request(
+            manager.inner().clone(),
+            config.inner().clone(),
+            request,
+        )
+        .await
     }
     #[cfg(not(windows))]
     {
-        manager.transition_mode(app, &config, request).await
+        let _ = app;
+        manager.transition_mode(&config, request).await
     }
 }
 
@@ -310,17 +321,16 @@ pub async fn start_arp_discovery(
     interface: String,
     refresh: Option<bool>,
 ) -> Result<(), AppError> {
+    let _ = app;
     if !crate::is_discovery_available() {
         return Err(AppError::DiscoveryUnavailable(
             "Packet capture is not available on this Windows build".into(),
         ));
     }
     if refresh.unwrap_or(false) {
-        manager
-            .refresh_arp_discovery(&interface, &config, app)
-            .await
+        manager.refresh_arp_discovery(&interface, &config).await
     } else {
-        manager.start_arp_discovery(&interface, &config, app).await
+        manager.start_arp_discovery(&interface, &config).await
     }
 }
 

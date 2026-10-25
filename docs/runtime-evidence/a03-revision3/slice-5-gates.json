@@ -1,48 +1,58 @@
-﻿{
-    "recorded_at_utc":  "2026-10-25T20:37:23.4120732Z",
-    "slice":  5,
-    "results":  [
-                    {
-                        "gate":  "rust",
-                        "command":  "cargo test --manifest-path src-tauri/Cargo.toml --lib --locked",
-                        "log":  "src-tauri/target/a03-slice-5-rust.log",
-                        "exit_code":  0
-                    },
-                    {
-                        "gate":  "fmt",
-                        "command":  "cargo fmt --manifest-path src-tauri/Cargo.toml --check",
-                        "log":  "src-tauri/target/a03-slice-5-fmt.log",
-                        "exit_code":  0
-                    },
-                    {
-                        "gate":  "clippy",
-                        "command":  "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --no-deps --locked -- -D warnings",
-                        "log":  "src-tauri/target/a03-slice-5-clippy.log",
-                        "exit_code":  0
-                    },
-                    {
-                        "gate":  "frontend",
-                        "command":  "npm.cmd test",
-                        "log":  "src-tauri/target/a03-slice-5-frontend.log",
-                        "exit_code":  0
-                    },
-                    {
-                        "gate":  "typecheck",
-                        "command":  "npm.cmd run typecheck",
-                        "log":  "src-tauri/target/a03-slice-5-typecheck.log",
-                        "exit_code":  0
-                    },
-                    {
-                        "gate":  "contracts",
-                        "command":  "npm.cmd run check:contracts",
-                        "log":  "src-tauri/target/a03-slice-5-contracts.log",
-                        "exit_code":  0
-                    },
-                    {
-                        "gate":  "build",
-                        "command":  "npm.cmd run build",
-                        "log":  "src-tauri/target/a03-slice-5-build.log",
-                        "exit_code":  0
-                    }
-                ]
+{
+  "recorded_at_utc": "2026-10-25T20:37:23.4120732Z",
+  "slice": 5,
+  "results": [
+    {
+      "gate": "rust",
+      "command": "cargo test --manifest-path src-tauri/Cargo.toml --lib --locked",
+      "log": "src-tauri/target/a03-slice-5-rust.log",
+      "exit_code": 0
+    },
+    {
+      "gate": "fmt",
+      "command": "cargo fmt --manifest-path src-tauri/Cargo.toml --check",
+      "log": "src-tauri/target/a03-slice-5-fmt.log",
+      "exit_code": 0
+    },
+    {
+      "gate": "clippy",
+      "command": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --no-deps --locked -- -D warnings",
+      "log": "src-tauri/target/a03-slice-5-clippy.log",
+      "exit_code": 0
+    },
+    {
+      "gate": "frontend",
+      "command": "npm.cmd test",
+      "log": "src-tauri/target/a03-slice-5-frontend.log",
+      "exit_code": 0
+    },
+    {
+      "gate": "typecheck",
+      "command": "npm.cmd run typecheck",
+      "log": "src-tauri/target/a03-slice-5-typecheck.log",
+      "exit_code": 0
+    },
+    {
+      "gate": "contracts",
+      "command": "npm.cmd run check:contracts",
+      "log": "src-tauri/target/a03-slice-5-contracts.log",
+      "exit_code": 0
+    },
+    {
+      "gate": "build",
+      "command": "npm.cmd run build",
+      "log": "src-tauri/target/a03-slice-5-build.log",
+      "exit_code": 0
+    }
+  ],
+  "rust": {
+    "passed": 799,
+    "failed": 0,
+    "ignored": 10
+  },
+  "frontend": {
+    "passed": 205,
+    "failed": 0
+  },
+  "all_required_gates_passed": true
 }

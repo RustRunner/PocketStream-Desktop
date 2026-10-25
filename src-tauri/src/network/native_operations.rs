@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex, OnceLock};
-use tauri::Manager;
 
 pub(super) const SCRIPT: &str = include_str!("native-operations-v1.ps1");
 
@@ -420,20 +419,13 @@ pub(crate) async fn address_request(
 }
 
 pub(crate) async fn mode_request(
-    app: tauri::AppHandle,
+    manager: Arc<super::NetworkManager>,
+    config: Arc<crate::config::AppConfig>,
     operation: super::ModeTransition,
 ) -> Result<super::ModeTransitionReply, AppError> {
     request(
         executor(),
-        move || async move {
-            app.state::<std::sync::Arc<super::NetworkManager>>()
-                .transition_mode(
-                    app.clone(),
-                    &app.state::<std::sync::Arc<crate::config::AppConfig>>(),
-                    operation,
-                )
-                .await
-        },
+        move || async move { manager.transition_mode(&config, operation).await },
         result_outcome,
     )
     .await?
@@ -454,21 +446,15 @@ pub(crate) async fn refresh_request(
 }
 
 pub(crate) async fn select_request(
-    app: tauri::AppHandle,
+    manager: Arc<super::NetworkManager>,
+    config: Arc<crate::config::AppConfig>,
     mac: String,
 ) -> Result<super::AdapterSelection, AppError> {
     request(
         executor(),
         move || async move {
-            let selection = app
-                .state::<std::sync::Arc<super::NetworkManager>>()
-                .select_adapter(
-                    &app.state::<std::sync::Arc<crate::config::AppConfig>>(),
-                    &app,
-                    &mac,
-                )
-                .await?;
-            super::watcher::emit_selection(&app, &selection);
+            let selection = manager.select_adapter(&config, &mac).await?;
+            manager.emit_selection(&selection);
             Ok(selection)
         },
         result_outcome,
@@ -807,7 +793,11 @@ fn validate_recovery_settings(
     Ok(())
 }
 
-pub(crate) async fn startup_reconcile(app: tauri::AppHandle) -> Result<(), AppError> {
+pub(crate) async fn startup_reconcile(
+    manager: Arc<super::NetworkManager>,
+    stream: Arc<crate::streaming::StreamManager>,
+    config: Arc<crate::config::AppConfig>,
+) -> Result<(), AppError> {
     let ticket = executor()
         .reconcile(move |cancel| async move {
             let state = Arc::new(Mutex::new(ScopeState::default()));
@@ -815,9 +805,7 @@ pub(crate) async fn startup_reconcile(app: tauri::AppHandle) -> Result<(), AppEr
             let result = NATIVE_SCOPE
                 .scope((cancel, state), async move {
                     let firewall = super::firewall::startup().await;
-                    app.state::<std::sync::Arc<crate::streaming::StreamManager>>()
-                        .startup_firewall_status(firewall.clone())
-                        .await;
+                    stream.startup_firewall_status(firewall.clone()).await;
                     match firewall {
                         super::firewall::FirewallOutcome::Inactive => {}
                         result => {
@@ -826,8 +814,6 @@ pub(crate) async fn startup_reconcile(app: tauri::AppHandle) -> Result<(), AppEr
                             )))
                         }
                     }
-                    let manager = app.state::<std::sync::Arc<super::NetworkManager>>();
-                    let config = app.state::<std::sync::Arc<crate::config::AppConfig>>();
                     manager.hydrate_adoption_history(&config);
                     // A successful fresh read is required even when there are no rows.
                     interface::list_all_adapters().await?;
@@ -858,7 +844,7 @@ pub(crate) async fn startup_reconcile(app: tauri::AppHandle) -> Result<(), AppEr
                         execute(Operation::observe(adapter)?).await?;
                     }
 
-                    manager.load_adopted_from_config(&config, &app).await;
+                    manager.load_adopted_from_config(&config).await;
                     let after = interface::read_native().await?;
                     let settings = config.get();
                     validate_recovery_settings(&settings, &after, &interface::RealAddressIo)?;

@@ -1,0 +1,125 @@
+{
+  "recorded_at_utc": "2026-10-25T20:53:34.679Z",
+  "baseline_count": 799,
+  "final_count": 814,
+  "unchanged_paths": 775,
+  "moved_scenarios": [
+    {
+      "before": "network::tests::adoption_evidence_display_names_each_justification",
+      "after": "network::adopt_loop::tests::adoption_evidence_display_names_each_justification"
+    },
+    {
+      "before": "network::tests::automatic_selection_requires_one_eligible_physical_adapter",
+      "after": "network::adapter_selector::tests::automatic_selection_requires_one_eligible_physical_adapter"
+    },
+    {
+      "before": "network::tests::binding_on_another_adapter_is_pending_even_if_address_matches",
+      "after": "network::binding_store::tests::binding_on_another_adapter_is_pending_even_if_address_matches"
+    },
+    {
+      "before": "network::tests::capture_state_starts_inactive_without_an_outcome",
+      "after": "network::capture_session::tests::capture_state_starts_inactive_without_an_outcome"
+    },
+    {
+      "before": "network::tests::capture_stop_keeps_last_scope_outcome_for_the_query",
+      "after": "network::capture_session::tests::capture_stop_keeps_last_scope_outcome_for_the_query"
+    },
+    {
+      "before": "network::tests::dhcp_to_auto_preserves_only_valid_capture_and_other_modes_restart",
+      "after": "network::capture_session::tests::dhcp_to_auto_preserves_only_valid_capture_and_other_modes_restart"
+    },
+    {
+      "before": "network::tests::fence_fresh_session_is_not_stale",
+      "after": "network::discovery_session::tests::fence_fresh_session_is_not_stale"
+    },
+    {
+      "before": "network::tests::fence_inactive_discovery_is_stale",
+      "after": "network::discovery_session::tests::fence_inactive_discovery_is_stale"
+    },
+    {
+      "before": "network::tests::fence_superseded_generation_is_stale",
+      "after": "network::discovery_session::tests::fence_superseded_generation_is_stale"
+    },
+    {
+      "before": "network::tests::lifecycle_fence_stales_only_on_its_incarnation_flag",
+      "after": "network::capture_session::tests::lifecycle_fence_stales_only_on_its_incarnation_flag"
+    },
+    {
+      "before": "network::tests::listener_action_attaches_when_nothing_is_bound",
+      "after": "network::capture_session::tests::listener_action_attaches_when_nothing_is_bound"
+    },
+    {
+      "before": "network::tests::listener_action_keeps_a_healthy_binding",
+      "after": "network::capture_session::tests::listener_action_keeps_a_healthy_binding"
+    },
+    {
+      "before": "network::tests::listener_action_replaces_an_invalidated_binding",
+      "after": "network::capture_session::tests::listener_action_replaces_an_invalidated_binding"
+    },
+    {
+      "before": "network::tests::listener_action_unscoped_session_retries_scoped",
+      "after": "network::capture_session::tests::listener_action_unscoped_session_retries_scoped"
+    },
+    {
+      "before": "network::tests::persisted_adapter_survives_reordering_absence_and_return",
+      "after": "network::adapter_selector::tests::persisted_adapter_survives_reordering_absence_and_return"
+    },
+    {
+      "before": "network::tests::probe_evidence_maps_each_origin_to_its_variant",
+      "after": "network::adopt_loop::tests::probe_evidence_maps_each_origin_to_its_variant"
+    },
+    {
+      "before": "network::tests::removal_checks_exact_prefix_instead_of_enumeration_order",
+      "after": "network::binding_store::tests::removal_checks_exact_prefix_instead_of_enumeration_order"
+    },
+    {
+      "before": "network::tests::routes_exclude_removed_and_pending_saved_bindings",
+      "after": "network::binding_store::tests::routes_exclude_removed_and_pending_saved_bindings"
+    },
+    {
+      "before": "network::tests::routes_require_the_exact_saved_address",
+      "after": "network::binding_store::tests::routes_require_the_exact_saved_address"
+    },
+    {
+      "before": "network::tests::scan_guard_removes_subnet_on_drop",
+      "after": "network::scan::tests::scan_guard_removes_subnet_on_drop"
+    },
+    {
+      "before": "network::tests::stale_applied_flag_does_not_suppress_restore",
+      "after": "network::binding_store::tests::stale_applied_flag_does_not_suppress_restore"
+    },
+    {
+      "before": "network::tests::unavailable_binding_never_moves_to_a_different_adapter",
+      "after": "network::binding_store::tests::unavailable_binding_never_moves_to_a_different_adapter"
+    },
+    {
+      "before": "network::tests::watchdog_preserves_pre_send_baseline_and_idle_shutdown_wins",
+      "after": "network::discovery_session::tests::watchdog_preserves_pre_send_baseline_and_idle_shutdown_wins"
+    },
+    {
+      "before": "network::tests::watchdog_waits_for_solicitation_and_rejects_old_attempts",
+      "after": "network::discovery_session::tests::watchdog_waits_for_solicitation_and_rejects_old_attempts"
+    }
+  ],
+  "added_scenarios": [
+    "bridge::tests::bridge_binds_once",
+    "bridge::tests::unbound_bridge_drops_events_and_rejects_main_thread_work",
+    "network::adapter_selector::tests::proposals_do_not_commit_before_old_work_is_retired",
+    "network::adapter_selector::tests::selection_watch_retains_initial_latest_and_repeated_wakes",
+    "network::adopt_loop::tests::aborting_adoption_caller_keeps_paired_finish_after_settle",
+    "network::binding_store::tests::owner_pause_invalidates_old_work_even_when_admission_is_canceled",
+    "network::bindings::tests::observation_retries_unchanged_success_but_suppresses_repeated_failure",
+    "network::bindings::tests::unrelated_adapter_observation_advances_topology_without_camera_selection",
+    "network::capture_session::tests::stop_retires_callback_before_parking_join_without_waiting_for_it",
+    "network::device_registry::tests::bridge_emitter_coalesces_and_rearms_after_publication",
+    "network::discovery_session::tests::stop_retires_session_clock_before_joining_adopt_then_watchdog",
+    "network::ping_dot::tests::owner_stop_keeps_waiting_for_pinger_after_five_seconds",
+    "network::readiness::tests::readiness_and_diagnostic_decline_without_starting_native_work",
+    "network::watcher::tests::topology_adapter_publishes_revision_without_selected_camera",
+    "streaming::tests::closed_selection_subscription_does_not_spin_the_supervisor"
+  ],
+  "missing_scenarios": [],
+  "ignored_count": 10,
+  "ignored_names_and_reasons_unchanged": true,
+  "accounting": "Match exact test path first, then preserved function name/multiplicity across owner-module moves. Behavior preservation additionally reviewed against source and exercised by the complete suite."
+}

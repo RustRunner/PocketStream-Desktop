@@ -84,16 +84,19 @@ pub(super) struct AdoptionCtx {
     pub(super) config: Arc<crate::config::AppConfig>,
     pub(super) bridge: Arc<dyn crate::bridge::AppBridge>,
     pub(super) bindings: Arc<binding_store::BindingStore>,
+    /// Read-only live-route view for loop decisions; BindingStore publishes it.
     pub(super) adopted: Arc<Mutex<HashMap<String, Ipv4Addr>>>,
+    /// Existing mutable AdoptOps adapter; durable intent remains cleanup authority.
     pub(super) pending_ips: auto_adopt::PendingIps,
-    pub(super) adoption_seq: Arc<AtomicU64>,
-    pub(super) liveness: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
-    pub(super) meta: Arc<std::sync::Mutex<HashMap<String, crate::config::AdoptedMeta>>>,
+    /// Legacy callback map owned by DiscoverySession; adoption only reads it.
     pub(super) devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
     pub(super) registry: Arc<DeviceRegistry>,
     pub(super) emitter: Arc<DeviceListEmitter>,
+    /// Read-only session view; only DiscoverySession advances this epoch.
     pub(super) fence: SweepFence,
+    /// Read-only address pause view, refreshed at the existing iteration gate.
     pub(super) address_fence: SweepFence,
+    /// Synchronous callback view owned/refreshed by AdapterSelector.
     pub(super) local_macs: Arc<std::sync::Mutex<HashSet<[u8; 6]>>>,
 }
 
@@ -190,7 +193,7 @@ async fn attempt_adoption(
 
     log::info!("Foreign subnet {} — adopting ({})", device_subnet, evidence);
 
-    let adoption_id = ctx.adoption_seq.fetch_add(1, Ordering::Relaxed) + 1;
+    let adoption_id = ctx.bindings.next_adoption_id();
     // Bracket the adoption with started/finished so the frontend
     // suppresses restarts from its own IP churn. The guard emits
     // `adoption-finished` on drop, so every terminal path below
@@ -297,19 +300,9 @@ async fn attempt_adoption(
                 return AdoptionAttemptOutcome::Failed;
             }
             cooldowns.remove(device_subnet);
-            ctx.adopted
-                .lock()
-                .await
-                .insert(device_subnet.to_string(), adopted_ip);
-            // Fresh adoption: the triggering device was observed moments
-            // ago, so seed the session liveness clock and the persisted
-            // metadata together.
-            if let Ok(mut liveness) = ctx.liveness.lock() {
-                liveness.insert(device_subnet.to_string(), std::time::Instant::now());
-            }
-            if let Ok(mut meta) = ctx.meta.lock() {
-                meta.insert(device_subnet.to_string(), row.clone());
-            }
+            ctx.bindings
+                .publish_adoption(device_subnet, adopted_ip, row.clone())
+                .await;
             known_subnets.insert(device_subnet.to_string());
 
             let _ = ctx.bridge.emit(
@@ -516,7 +509,7 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
             return false;
         }
 
-        let id = self.ctx.adoption_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let id = self.ctx.bindings.next_adoption_id();
         match auto_adopt::bind_scratch(
             &ops,
             &self.ctx.pending_ips,
@@ -693,13 +686,13 @@ pub(super) async fn run(
 ) {
     ctx.address_fence = bindings.address_fence();
     let iface_name = ctx.iface_name.clone();
-    let local_macs = ctx.local_macs.clone();
     let devices = ctx.devices.clone();
     let adopted = ctx.adopted.clone();
     let address_work_for_adopt = bindings.address_work.clone();
     let address_generation = bindings.address_generation.clone();
     let address_active = bindings.address_active.clone();
-    let meta_for_adopt = ctx.meta.clone();
+    // Read-only metadata view for existing cache-probe admission; BindingStore publishes it.
+    let meta_for_adopt = bindings.adopted_meta.clone();
     // Cached-device probe: at most one pass per discovery
     // session, deferred (not consumed) while the DHCP gate is
     // closed. Identity misses land in the attempted set, never
@@ -794,12 +787,7 @@ pub(super) async fn run(
         // process spawn, so no TTL cache is needed. An empty read
         // (transient enumeration failure) keeps the previous set
         // rather than blanking the filter mid-session.
-        let fresh = interface::local_adapter_macs();
-        if !fresh.is_empty() {
-            if let Ok(mut set) = local_macs.lock() {
-                *set = fresh;
-            }
-        }
+        ctx.sweep.selector.refresh_observed_local_macs();
 
         // Committed bindings, including APIPA, live until explicit deletion.
         // Only PendingIps scratch/uncommitted entries are cleanup candidates.

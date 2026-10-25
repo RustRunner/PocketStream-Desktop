@@ -1,0 +1,8 @@
+cargo.exe :     Checking pocketstream-desktop v0.6.7 (C:\Users\joshu\PocketStream-Desktop\src-tauri)
+At C:\Users\joshu\PocketStream-Desktop\src-tauri\target\a03-gates.ps1:17 char:2
++  & $step.exe @($step.args) *> $log
++  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (    Checking po...ktop\src-tauri):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.46s

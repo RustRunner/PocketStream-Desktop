@@ -121,7 +121,6 @@ impl DiscoverySession {
 
         let adopted = deps.bindings.adopted_ips.clone();
         let pending_ips = deps.bindings.pending_ips.clone();
-        let adoption_seq = deps.bindings.adoption_seq.clone();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let iface_name = interface_display_name.to_string();
         let adopt_sweep = deps.sweep(self);
@@ -164,8 +163,6 @@ impl DiscoverySession {
         let binding_mac = config.get().selected_adapter_mac.unwrap_or_default();
         let address_generation = deps.bindings.address_generation.clone();
         let address_active = deps.bindings.address_active.clone();
-        let liveness_for_adopt = deps.bindings.adoption_liveness.clone();
-        let meta_for_adopt = deps.bindings.adopted_meta.clone();
         // One session-start instant shared by the loop's reap pass and
         // the adoption snapshot's staleness derivation. Anchors the
         // startup grace; restarts with discovery, so an interface
@@ -185,9 +182,7 @@ impl DiscoverySession {
             bindings: deps.bindings.clone(),
             adopted: adopted.clone(),
             pending_ips: pending_ips.clone(),
-            adoption_seq: adoption_seq.clone(),
-            liveness: liveness_for_adopt.clone(),
-            meta: meta_for_adopt.clone(),
+
             devices: devices_for_adopt.clone(),
             registry: registry_for_adopt.clone(),
             emitter: emitter_for_adopt.clone(),

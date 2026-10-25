@@ -15,15 +15,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tauri::{AppHandle, Emitter};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 #[cfg(not(windows))]
 use crate::network::async_cmd;
 use crate::network::DeviceRegistry;
-
-static APP: std::sync::OnceLock<AppHandle> = std::sync::OnceLock::new();
 
 /// Cadence between full registry sweeps once steady state is reached.
 const PING_INTERVAL: Duration = Duration::from_secs(30);
@@ -50,8 +47,14 @@ impl PingDotHandle {
 
 /// Spawn the pinger task. Returns a handle so the caller (typically
 /// `NetworkManager`) can stop it on shutdown or mode change.
-pub fn start(app_handle: AppHandle, registry: Arc<DeviceRegistry>) -> PingDotHandle {
-    APP.get_or_init(|| app_handle.clone());
+fn start(
+    readiness: Arc<super::readiness::CameraReadiness>,
+    bridge: Arc<dyn crate::bridge::AppBridge>,
+    registry: Arc<DeviceRegistry>,
+) -> PingDotHandle {
+    readiness
+        .diagnostic_ready
+        .store(true, std::sync::atomic::Ordering::Release);
     let (cancel_tx, mut cancel_rx) = watch::channel(false);
 
     let task = tokio::spawn(async move {
@@ -85,21 +88,19 @@ pub fn start(app_handle: AppHandle, registry: Arc<DeviceRegistry>) -> PingDotHan
                 if *cancel_rx.borrow() {
                     return;
                 }
-                let ah = app_handle.clone();
+                let readiness = readiness.clone();
+                let bridge = bridge.clone();
                 tokio::spawn(async move {
-                    use tauri::Manager;
-                    let manager = ah.state::<std::sync::Arc<crate::network::NetworkManager>>();
-                    let config = ah.state::<std::sync::Arc<crate::config::AppConfig>>();
                     let target = super::route::CameraTarget {
                         key: row.mac.clone(),
                         expected_mac: Some(row.mac),
                         ip: row.ip,
                     };
-                    let Ok(path) = manager.camera_ready(&target, &config).await else {
+                    let Ok(path) = readiness.ready(&target).await else {
                         return;
                     };
                     let reachable = probe_bound(&target.ip, path.source, path.index).await;
-                    let Ok(current) = manager.camera_ready(&target, &config).await else {
+                    let Ok(current) = readiness.ready(&target).await else {
                         return;
                     };
                     if path.fence.is_stale()
@@ -116,7 +117,7 @@ pub fn start(app_handle: AppHandle, registry: Arc<DeviceRegistry>) -> PingDotHan
                         path.index,
                         reachable
                     );
-                    let _ = ah.emit(
+                    let _ = bridge.emit(
                         "device-ping-result",
                         serde_json::json!({
                             "ip": target.ip,
@@ -155,19 +156,20 @@ pub fn start(app_handle: AppHandle, registry: Arc<DeviceRegistry>) -> PingDotHan
 /// — a "reply" from ourselves or a router saying the target is dead.
 /// Only real echo replies carry a `TTL=` field, and localized Windows
 /// keeps that token untranslated, so it's the discriminator.
-pub(crate) async fn probe(ip: &str) -> bool {
+pub(super) async fn probe(readiness: &super::readiness::CameraReadiness, ip: &str) -> bool {
     // The existing stall diagnostic has only an endpoint. Keep that API,
     // but decline unless selected-adapter context and an applied source
     // exist. Its result is diagnostic only, never a record/presence write.
-    use tauri::Manager;
     let Ok(target) = crate::validation::parse_camera_ip(ip) else {
         return false;
     };
-    let Some(app) = APP.get() else {
+    if !readiness
+        .diagnostic_ready
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
         return false;
-    };
-    let manager = app.state::<std::sync::Arc<super::NetworkManager>>();
-    let Some((adapter, index, fence)) = manager.probe_scope() else {
+    }
+    let Some((adapter, index, fence)) = readiness.probe_scope() else {
         return false;
     };
     let Some(source) = super::select_wired_source(target, &Default::default(), &adapter.ips) else {
@@ -223,9 +225,69 @@ fn is_echo_reply(stdout: &str) -> bool {
     stdout.contains("TTL=")
 }
 
+/// Handle authority lives here; diagnostic_ready preserves the previous
+/// process-lifetime APP initialization point without retaining an AppHandle.
+pub(super) struct Pinger {
+    handle: tokio::sync::Mutex<Option<PingDotHandle>>,
+    pub(super) diagnostic_ready: Arc<std::sync::atomic::AtomicBool>,
+}
+impl Pinger {
+    pub(super) fn new() -> Self {
+        Self {
+            handle: tokio::sync::Mutex::new(None),
+            diagnostic_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+    pub(super) async fn start(
+        &self,
+        readiness: Arc<super::readiness::CameraReadiness>,
+        registry: Arc<DeviceRegistry>,
+        bridge: Arc<dyn crate::bridge::AppBridge>,
+    ) {
+        let prev = self.handle.lock().await.take();
+        if let Some(prev) = prev {
+            prev.stop().await;
+        }
+        let handle = start(readiness, bridge, registry);
+        *self.handle.lock().await = Some(handle);
+        log::info!("Started ICMP ping-dot loop");
+    }
+    pub(super) async fn stop(&self) {
+        let handle = self.handle.lock().await.take();
+        if let Some(handle) = handle {
+            handle.stop().await;
+            log::info!("Stopped ICMP ping-dot loop");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::is_echo_reply;
+
+    #[tokio::test(start_paused = true)]
+    async fn owner_stop_keeps_waiting_for_pinger_after_five_seconds() {
+        let pinger = std::sync::Arc::new(super::Pinger::new());
+        let (cancel, mut canceled) = tokio::sync::watch::channel(false);
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let (seen, received) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            canceled.changed().await.unwrap();
+            seen.send(()).unwrap();
+            wait.await.unwrap();
+        });
+        *pinger.handle.lock().await = Some(super::PingDotHandle { cancel, task });
+        let owner = pinger.clone();
+        let stop = tokio::spawn(async move {
+            owner.stop().await;
+        });
+        received.await.unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+        assert!(!stop.is_finished());
+        release.send(()).unwrap();
+        stop.await.unwrap();
+        assert!(pinger.handle.lock().await.is_none());
+    }
 
     #[test]
     fn real_echo_reply_is_reachable() {

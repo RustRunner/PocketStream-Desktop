@@ -9,11 +9,11 @@ const permanent = new Set([
   'network/watcher.rs', 'network/ip_conflict.rs', 'streaming/video_embed.rs',
 ]);
 // Temporary migration exceptions. Counts prevent adding lookup sites while
-// moving the existing ones. Network exceptions close by slice 6.
+// moving the existing ones. All network exceptions are closed after slice 6.
 const temporary = new Map([
-  ['network/mod.rs', 0],
-  ['network/native_operations.rs', 7], ['network/bindings.rs', 1],
-  ['network/ping_dot.rs', 3], ['streaming/mod.rs', 6],
+  // Status publication/main-thread streaming surface extraction is slices 7-10.
+  // Its network reads already use CameraReadiness; no lookup sites remain.
+  ['streaming/mod.rs', 0],
 ]);
 
 export function violations(source) {
@@ -21,7 +21,7 @@ export function violations(source) {
   // as well as turbofish, qualified State and grouped Tauri imports.
   const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
   const lookups = [...code.matchAll(/\.\s*(?:try_)?state\s*(?:::<[^;]*?>\s*)?\(\s*\)/g)].length;
-  const imports = /\btauri\s*::\s*(?:Manager|State|AppHandle)|\buse\s+tauri\s*::\s*\{[^}]*\b(?:Manager|State|AppHandle)\b/s.test(code);
+  const imports = /\btauri\s*::\s*(?:Manager|State|AppHandle)|\buse\s+tauri\s*::\s*\*|\buse\s+tauri\s*::\s*\{[^}]*\b(?:Manager|State|AppHandle)\b/s.test(code);
   return { lookups, imports };
 }
 

@@ -906,9 +906,7 @@ pub(super) async fn run_presence_job(
         bindings: deps.owners.bindings.clone(),
         adopted: deps.owners.bindings.adopted_ips.clone(),
         pending_ips: deps.owners.bindings.pending_ips.clone(),
-        adoption_seq: deps.owners.bindings.adoption_seq.clone(),
-        liveness: deps.owners.bindings.adoption_liveness.clone(),
-        meta: deps.owners.bindings.adopted_meta.clone(),
+
         devices: deps.session.arp_devices.clone(),
         registry: deps.owners.registry.clone(),
         emitter: emitter.clone(),

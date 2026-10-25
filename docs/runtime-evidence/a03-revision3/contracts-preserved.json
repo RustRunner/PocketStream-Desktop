@@ -1,0 +1,145 @@
+{
+  "baseline": "b849dfc0e073a1503c439585386d5665b7d07230",
+  "recorded_at_utc": "2026-10-25T20:51:55.777Z",
+  "events": {
+    "baseline": [
+      "adapter-selection-changed",
+      "adoption-failed",
+      "adoption-finished",
+      "adoption-started",
+      "arp-device-discovered",
+      "binding-topology-changed",
+      "capture-active",
+      "device-list-changed",
+      "device-ping-result",
+      "discovery-degraded",
+      "discovery-recovered",
+      "host-ip-owners-changed",
+      "interface-status-changed",
+      "stream-status",
+      "subnet-adopted",
+      "subnet-removed"
+    ],
+    "current": [
+      "adapter-selection-changed",
+      "adoption-failed",
+      "adoption-finished",
+      "adoption-started",
+      "arp-device-discovered",
+      "binding-topology-changed",
+      "capture-active",
+      "device-list-changed",
+      "device-ping-result",
+      "discovery-degraded",
+      "discovery-recovered",
+      "host-ip-owners-changed",
+      "interface-status-changed",
+      "stream-status",
+      "subnet-adopted",
+      "subnet-removed"
+    ],
+    "unchanged": true
+  },
+  "stream_status": {
+    "fields": [
+      "bind_scope",
+      "firewall",
+      "playing",
+      "playback_desired",
+      "playback_state",
+      "playback_fault",
+      "playback_recovery_attempt",
+      "playback_next_retry_secs",
+      "recording_report",
+      "recording_finalized_path",
+      "selected_protocol",
+      "active_protocol",
+      "server_running",
+      "desired",
+      "relay_state",
+      "relay_error",
+      "recovery_attempt",
+      "server_url",
+      "display_url",
+      "recording",
+      "uptime_secs",
+      "bandwidth_kbps",
+      "connected_clients",
+      "client_limit",
+      "error",
+      "audio_present",
+      "audio_codec"
+    ],
+    "unchanged": true
+  },
+  "retained": [
+    {
+      "path": "src/lib/types.ts",
+      "unchanged": true
+    },
+    {
+      "path": "src/lib/tauri-api.ts",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/config.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/Cargo.lock",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/Cargo.toml",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/build.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/pocketstream.exe.manifest",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/pocketstream.dev.manifest",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/local_executor.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/native_runner.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/host_owner.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/firewall.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/firewall-policy-v2.ps1",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/native-operations-v1.ps1",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/entry.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/maintenance.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/tests/fixtures/native_foundation.rs",
+      "unchanged": true
+    }
+  ]
+}

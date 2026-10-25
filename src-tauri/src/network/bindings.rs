@@ -227,18 +227,28 @@ pub(crate) async fn migrate(config: &crate::config::AppConfig) -> Result<(), App
     Ok(())
 }
 
-/// Runs independently of selected-camera refresh success and on its retry tick.
-pub(crate) async fn refresh(handle: &tauri::AppHandle) {
-    use tauri::{Emitter, Manager};
+/// Existing native observation is independent of selected-camera refresh.
+pub(crate) async fn refresh() -> Option<TopologyObservation> {
     let rows = native().await;
+    topology_observation(&TOPOLOGY, rows)
+}
+
+pub(crate) struct TopologyObservation {
+    pub(crate) changed: bool,
+    pub(crate) revision: u64,
+    pub(crate) scope: BindScope,
+}
+
+fn topology_observation(
+    topology: &Mutex<Topology>,
+    rows: Result<Vec<NativeAdapter>, AppError>,
+) -> Option<TopologyObservation> {
     let (changed, revision) = {
-        let mut t = TOPOLOGY.lock().unwrap();
-        (record(&mut t, &rows), t.revision)
+        let mut topology = topology.lock().unwrap();
+        (record(&mut topology, &rows), topology.revision)
     };
     if !changed && rows.is_err() {
-        // Keep retrying the observation without queuing the same failed
-        // explicit rebind on every tick of an ongoing recovery.
-        return;
+        return None;
     }
     let scope = match rows {
         Ok(rows) => exposure(&rows, revision),
@@ -246,23 +256,48 @@ pub(crate) async fn refresh(handle: &tauri::AppHandle) {
             reason: error.to_string(),
         },
     };
-    if changed {
-        let _ = handle.emit(
-            "binding-topology-changed",
-            serde_json::json!({"topology_revision":revision}),
-        );
-    }
-    // A listener's independent resolution may have failed since our last
-    // successful snapshot. Retry Unknown even when the inventory is unchanged.
-    handle
-        .state::<std::sync::Arc<crate::streaming::StreamManager>>()
-        .binding_topology_changed(scope, revision)
-        .await;
+    Some(TopologyObservation {
+        changed,
+        revision,
+        scope,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observation_retries_unchanged_success_but_suppresses_repeated_failure() {
+        let topology = Mutex::new(Topology::default());
+        let inventory = vec![row("ethernet", "Camera", &["192.0.2.1"])];
+        let first = topology_observation(&topology, Ok(inventory.clone())).unwrap();
+        assert!(first.changed);
+        let retry = topology_observation(&topology, Ok(inventory)).unwrap();
+        assert!(!retry.changed);
+        assert_eq!(retry.revision, first.revision);
+        let failed =
+            topology_observation(&topology, Err(AppError::Network("unavailable".into()))).unwrap();
+        assert!(failed.changed);
+        assert!(matches!(failed.scope, BindScope::Unknown { .. }));
+        assert!(
+            topology_observation(&topology, Err(AppError::Network("unavailable".into()))).is_none()
+        );
+    }
+
+    #[test]
+    fn unrelated_adapter_observation_advances_topology_without_camera_selection() {
+        let topology = Mutex::new(Topology::default());
+        let camera = row("ethernet", "Camera", &["192.0.2.1"]);
+        let first = topology_observation(&topology, Ok(vec![camera.clone()])).unwrap();
+        let unrelated = row("vpn", "Unrelated", &["198.51.100.1"]);
+        let next = topology_observation(&topology, Ok(vec![camera, unrelated])).unwrap();
+        assert!(next.changed && next.revision > first.revision);
+        let BindScope::AllAddresses { addresses, .. } = next.scope else {
+            panic!("native exposure required");
+        };
+        assert_eq!(addresses.len(), 2);
+    }
     fn row(id: &str, alias: &str, ips: &[&str]) -> NativeAdapter {
         NativeAdapter {
             guid: id.into(),

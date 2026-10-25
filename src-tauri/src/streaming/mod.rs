@@ -276,7 +276,7 @@ fn publish_status_if_changed(tx: &watch::Sender<StreamStatus>, snapshot: StreamS
 }
 
 pub struct StreamManager {
-    app_handle: std::sync::Mutex<Option<tauri::AppHandle>>,
+    readiness: std::sync::Mutex<Option<Arc<crate::network::readiness::CameraReadiness>>>,
     state: Arc<Mutex<StreamState>>,
     video_hwnd: Arc<std::sync::atomic::AtomicIsize>,
     status_tx: Arc<watch::Sender<StreamStatus>>,
@@ -366,7 +366,7 @@ struct RelaySupervisorContext {
     relay_lifecycle: Arc<Mutex<()>>,
     relay_wake: Arc<Notify>,
     relay_event_tx: RelayEventSender,
-    app_handle: tauri::AppHandle,
+    readiness: Arc<crate::network::readiness::CameraReadiness>,
     restream_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -380,7 +380,7 @@ impl StreamManager {
         let (status_tx, _) = watch::channel(StreamStatus::idle(selected_protocol));
         let (relay_event_tx, relay_event_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
-            app_handle: std::sync::Mutex::new(None),
+            readiness: std::sync::Mutex::new(None),
             state: Arc::new(Mutex::new(StreamState {
                 playback_target: None,
                 restream_target: None,
@@ -1003,7 +1003,7 @@ impl StreamManager {
         preserve_prior_desired: bool,
     ) -> Result<RestreamServerInfo, AppError> {
         let handle = self
-            .app_handle
+            .readiness
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
@@ -1340,7 +1340,7 @@ impl StreamManager {
                 Ok((spec.bind_identity.clone(), scope))
             } else {
                 let handle = self
-                    .app_handle
+                    .readiness
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .clone();
@@ -1949,9 +1949,9 @@ impl StreamManager {
     pub fn start_status_emitter(
         &self,
         handle: tauri::AppHandle,
-        selection: watch::Receiver<crate::network::AdapterSelection>,
+        readiness: Arc<crate::network::readiness::CameraReadiness>,
     ) {
-        *self.app_handle.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle.clone());
+        *self.readiness.lock().unwrap_or_else(|p| p.into_inner()) = Some(readiness.clone());
         let relay_events = self
             .relay_event_rx
             .lock()
@@ -1965,7 +1965,7 @@ impl StreamManager {
                 relay_lifecycle: self.relay_lifecycle.clone(),
                 relay_wake: self.relay_wake.clone(),
                 relay_event_tx: self.relay_event_tx.clone(),
-                app_handle: handle.clone(),
+                readiness: readiness.clone(),
                 restream_generation: self.restream_generation.clone(),
             };
             tauri::async_runtime::spawn(run_relay_supervisor(relay_events, supervisor));
@@ -1980,8 +1980,8 @@ impl StreamManager {
             lifecycle: self.playback_lifecycle.clone(),
             wake: self.playback_wake.clone(),
             diagnostic: self.playback_diagnostic.clone(),
-            app: Some(handle.clone()),
-            selection: Some(selection),
+            readiness: Some(readiness.clone()),
+            selection: Some(readiness.subscribe()),
         };
         tauri::async_runtime::spawn(run_playback_supervisor(playback));
 
@@ -2283,7 +2283,7 @@ struct PlaybackSupervisorContext {
     lifecycle: Arc<Mutex<()>>,
     wake: Arc<Notify>,
     diagnostic: PlaybackDiagnostic,
-    app: Option<tauri::AppHandle>,
+    readiness: Option<Arc<crate::network::readiness::CameraReadiness>>,
     selection: Option<watch::Receiver<crate::network::AdapterSelection>>,
 }
 
@@ -2368,12 +2368,9 @@ async fn publish_playback_status(ctx: &PlaybackSupervisorContext) {
     publish_status_if_changed(ctx.status_tx.as_ref(), compute_status(&ctx.state).await);
 }
 
-async fn expected_device_wake(app: Option<&tauri::AppHandle>) {
-    use tauri::Manager;
+async fn expected_device_wake(app: Option<&Arc<crate::network::readiness::CameraReadiness>>) {
     if let Some(app) = app {
-        app.state::<std::sync::Arc<crate::network::NetworkManager>>()
-            .expected_device_verified()
-            .await;
+        app.verified().await;
     } else {
         std::future::pending::<()>().await;
     }
@@ -2402,7 +2399,7 @@ async fn run_playback_supervisor(mut ctx: PlaybackSupervisorContext) {
         tokio::select! {
             _ = tick.tick() => {},
             _ = selection_wake(&mut ctx.selection) => {},
-            _ = wait_playback_ready(&ctx.wake, expected_device_wake(ctx.app.as_ref())) => {},
+            _ = wait_playback_ready(&ctx.wake, expected_device_wake(ctx.readiness.as_ref())) => {},
         }
         playback_step(&ctx).await;
         {
@@ -2472,7 +2469,6 @@ fn update_playback_readiness(
 
 async fn playback_step(ctx: &PlaybackSupervisorContext) {
     use std::sync::atomic::Ordering;
-    use tauri::Manager;
     let _lifecycle = ctx.lifecycle.lock().await;
     let (mut epoch, health, settings, target, window) = {
         let s = ctx.state.lock().await;
@@ -2497,11 +2493,8 @@ async fn playback_step(ctx: &PlaybackSupervisorContext) {
     // Selected identity/index changes cancel prior work even if a replacement
     // adapter already has a usable route. No old-incarnation buffer is accepted.
     if target.is_some() {
-        if let Some(app) = &ctx.app {
-            let selection = app
-                .state::<std::sync::Arc<crate::network::NetworkManager>>()
-                .adapter_selection_state()
-                .await;
+        if let Some(app) = &ctx.readiness {
+            let selection = app.selection().await;
             let identity = (selection.selected_mac, selection.interface_index);
             let mut s = ctx.state.lock().await;
             if ctx.epoch.load(Ordering::Acquire) != epoch || s.playback_intent_epoch != Some(epoch)
@@ -2541,7 +2534,7 @@ async fn playback_step(ctx: &PlaybackSupervisorContext) {
         // Recheck readiness on wake/tick, including a legacy manual target's
         // first learned identity. Repeated successful verification is not a
         // transition and cannot collapse transport backoff to the 5 s cadence.
-        let checked = preflight_target(ctx.app.as_ref(), target.as_ref()).await;
+        let checked = preflight_target(ctx.readiness.as_ref(), target.as_ref()).await;
         if !playback_is_current(ctx, epoch, &health).await {
             return;
         }
@@ -2583,10 +2576,14 @@ async fn playback_step(ctx: &PlaybackSupervisorContext) {
                         }
                         let ip = target.ip.clone();
                         let authority = ctx.epoch.clone();
+                        let readiness = ctx.readiness.clone();
                         *slot = Some(tokio::spawn(async move {
                             // Preserve the existing bound diagnostic. It never
                             // changes presence, readiness or retry policy.
-                            let reachable = crate::network::ping_dot::probe(&ip).await;
+                            let reachable = match readiness {
+                                Some(readiness) => readiness.diagnostic_probe(&ip).await,
+                                None => false,
+                            };
                             if authority.load(Ordering::Acquire) == epoch {
                                 log::info!("Playback stall diagnostic ip={ip} icmp={reachable}");
                             }
@@ -2619,7 +2616,7 @@ async fn playback_step(ctx: &PlaybackSupervisorContext) {
         generation,
         health.snapshot().attempt
     );
-    let path = match preflight_target(ctx.app.as_ref(), target.as_ref()).await {
+    let path = match preflight_target(ctx.readiness.as_ref(), target.as_ref()).await {
         Ok(path) => path,
         Err(e) => {
             health.record_fault(
@@ -2653,7 +2650,7 @@ async fn playback_step(ctx: &PlaybackSupervisorContext) {
                 .as_ref()
                 .map(|p| p.target.clone())
                 .ok_or_else(|| AppError::Stream("Camera Ethernet path unavailable".into()))?;
-            let handle = ctx.app.clone();
+            let handle = ctx.readiness.clone();
             let current_epoch = ctx.epoch.clone();
             pipeline.bind_rtsp_transport(
                 &url,
@@ -2683,7 +2680,7 @@ async fn playback_step(ctx: &PlaybackSupervisorContext) {
     };
     // Recheck after construction and immediately before any connection.
     let final_path = preflight_target(
-        ctx.app.as_ref(),
+        ctx.readiness.as_ref(),
         path.as_ref().map(|p| &p.target).or(target.as_ref()),
     )
     .await;
@@ -2777,7 +2774,7 @@ fn require_cam_role(
 }
 
 async fn preflight_target(
-    handle: Option<&tauri::AppHandle>,
+    handle: Option<&Arc<crate::network::readiness::CameraReadiness>>,
     target: Option<&CameraTarget>,
 ) -> Result<Option<ReadyPath>, AppError> {
     let Some(target) = target else {
@@ -2787,23 +2784,18 @@ async fn preflight_target(
 }
 
 fn camera_stream_path(
-    handle: Option<&tauri::AppHandle>,
+    handle: Option<&Arc<crate::network::readiness::CameraReadiness>>,
     target: &CameraTarget,
 ) -> Result<ReadyPath, AppError> {
-    use tauri::Manager;
     let handle =
         handle.ok_or_else(|| AppError::Stream("Ethernet readiness service unavailable".into()))?;
-    let manager = handle.state::<std::sync::Arc<crate::network::NetworkManager>>();
-    let path = manager.camera_ready_bound_now(
-        target,
-        &handle.state::<std::sync::Arc<crate::config::AppConfig>>(),
-    )?;
-    require_cam_role(&path.target, &manager.registry().snapshot())?;
+    let path = handle.bound_now(target)?;
+    require_cam_role(&path.target, &handle.records())?;
     Ok(path)
 }
 
 fn relay_preflight(
-    handle: Option<tauri::AppHandle>,
+    handle: Option<Arc<crate::network::readiness::CameraReadiness>>,
     target: Option<CameraTarget>,
     health: Arc<RelayRuntimeHealth>,
     generation: Arc<std::sync::atomic::AtomicU64>,
@@ -3041,12 +3033,10 @@ async fn run_relay_supervisor(mut events: RelayEventReceiver, ctx: RelaySupervis
     }
 }
 
-async fn adopted_ip_set(app_handle: &tauri::AppHandle) -> std::collections::HashSet<String> {
-    use tauri::Manager;
-
-    let manager: tauri::State<'_, std::sync::Arc<crate::network::NetworkManager>> =
-        app_handle.state();
-    manager.get_adopted_ips().await.into_values().collect()
+async fn adopted_ip_set(
+    readiness: &Arc<crate::network::readiness::CameraReadiness>,
+) -> std::collections::HashSet<String> {
+    readiness.adopted_addresses().await
 }
 
 async fn recover_relay_generation(
@@ -3055,7 +3045,6 @@ async fn recover_relay_generation(
     server_generation: u64,
     cause: &'static str,
 ) {
-    use tauri::Manager;
     let recovery_started = tokio::time::Instant::now();
     // Retire and fully release the failed listener before applying backoff.
     // The lifecycle gate is also the Stop completion barrier.
@@ -3116,11 +3105,7 @@ async fn recover_relay_generation(
         }
 
         let (attempt, delay) = health.schedule_recovery_attempt();
-        let selection = ctx
-            .app_handle
-            .state::<std::sync::Arc<crate::network::NetworkManager>>()
-            .adapter_selection_state()
-            .await;
+        let selection = ctx.readiness.selection().await;
         log::info!("event=relay_recovery adapter_mac={} interface_index={} generation={} cause={} attempt={} phase=backoff delay_ms={} duration_ms={}",
             crate::network::log_value(selection.selected_mac.as_deref().unwrap_or("unknown")), selection.interface_index.unwrap_or(0),
             server_generation, cause, attempt, delay.as_millis(), recovery_started.elapsed().as_millis());
@@ -3160,7 +3145,7 @@ async fn recover_relay_generation(
 
         if base_spec.bind_identity.is_some() || health.should_reresolve_explicit_bind() {
             if let Some(interface_name) = base_spec.bind_interface.as_deref() {
-                let adopted = adopted_ip_set(&ctx.app_handle).await;
+                let adopted = adopted_ip_set(&ctx.readiness).await;
                 if !relay_is_current(
                     &ctx.state,
                     &ctx.restream_epoch,
@@ -3254,7 +3239,7 @@ async fn recover_relay_generation(
         }
 
         let target = ctx.state.lock().await.restream_target.clone();
-        if let Err(error) = preflight_target(Some(&ctx.app_handle), target.as_ref()).await {
+        if let Err(error) = preflight_target(Some(&ctx.readiness), target.as_ref()).await {
             health.mark_resolution_failed(error.to_string());
             drop(_lifecycle);
             publish_relay_status(ctx).await;
@@ -3292,7 +3277,7 @@ async fn recover_relay_generation(
             ctx.relay_event_tx.clone(),
             true,
             relay_preflight(
-                Some(ctx.app_handle.clone()),
+                Some(ctx.readiness.clone()),
                 target,
                 health.clone(),
                 ctx.restream_generation.clone(),
@@ -3911,7 +3896,7 @@ mod tests {
             lifecycle: manager.playback_lifecycle.clone(),
             wake: manager.playback_wake.clone(),
             diagnostic: manager.playback_diagnostic.clone(),
-            app: None,
+            readiness: None,
             selection: None,
         }
     }

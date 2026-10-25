@@ -13,6 +13,21 @@ pub(super) struct AdapterSelector {
 }
 
 impl AdapterSelector {
+    pub(super) fn refresh_local_macs(&self) {
+        if let Ok(mut set) = self.local_macs.lock() {
+            *set = interface::local_adapter_macs();
+        }
+    }
+
+    pub(super) fn refresh_observed_local_macs(&self) {
+        let fresh = interface::local_adapter_macs();
+        if !fresh.is_empty() {
+            if let Ok(mut set) = self.local_macs.lock() {
+                *set = fresh;
+            }
+        }
+    }
+
     pub(crate) async fn start_presence(&self, deps: presence::PresenceDeps) {
         let mut handle = self.presence_handle.lock().await;
         if handle.is_some() {

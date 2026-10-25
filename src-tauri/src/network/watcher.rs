@@ -70,13 +70,39 @@ pub(super) fn emit_link_change(
     imp::wake(2);
 }
 
+/// Binding observation always precedes camera refresh, including retry ticks.
+pub(crate) async fn refresh_bindings(handle: &AppHandle) {
+    if let Some(observation) = super::bindings::refresh().await {
+        let manager = handle.state::<std::sync::Arc<NetworkManager>>();
+        let stream = handle.state::<std::sync::Arc<crate::streaming::StreamManager>>();
+        publish_topology_observation(observation, manager.event_bridge().as_ref(), &stream).await;
+    }
+}
+
+async fn publish_topology_observation(
+    observation: super::bindings::TopologyObservation,
+    bridge: &dyn crate::bridge::AppBridge,
+    stream: &crate::streaming::StreamManager,
+) {
+    if observation.changed {
+        let _ = bridge.emit(
+            "binding-topology-changed",
+            serde_json::json!({"topology_revision":observation.revision}),
+        );
+    }
+    // An unchanged successful inventory still retries an independently Unknown listener.
+    stream
+        .binding_topology_changed(observation.scope, observation.revision)
+        .await;
+}
+
 /// Shared by native notifications, the fallback poller and the UI query.
 pub(crate) async fn refresh(handle: &AppHandle) -> Result<(), crate::AppError> {
     let manager = handle.state::<std::sync::Arc<NetworkManager>>();
     let config = handle.state::<std::sync::Arc<crate::config::AppConfig>>();
     // Complete a known adapter's link-up before a slow provider refresh.
     // Unknown metadata/index changes still go through selection below.
-    manager.resume_discovery(&config, handle).await?;
+    manager.resume_discovery(&config).await?;
     let previous = manager.adapter_selection_state().await;
     let mut selection = manager.get_adapter_selection(&config).await?;
     manager.update_presence_adapter(&selection, config.get_network_mode());
@@ -85,7 +111,7 @@ pub(crate) async fn refresh(handle: &AppHandle) -> Result<(), crate::AppError> {
         && selection.adapter.is_some()
         && selection.interface_index.is_some()
     {
-        manager.start_selected_adapter(&config, handle).await;
+        manager.start_selected_adapter(&config).await;
         selection = manager.get_adapter_selection(&config).await?;
     }
     retry_discovery(handle).await?;
@@ -98,7 +124,7 @@ pub(crate) async fn refresh(handle: &AppHandle) -> Result<(), crate::AppError> {
 async fn retry_discovery(handle: &AppHandle) -> Result<(), crate::AppError> {
     let manager = handle.state::<std::sync::Arc<NetworkManager>>();
     let config = handle.state::<std::sync::Arc<crate::config::AppConfig>>();
-    if manager.resume_discovery(&config, handle).await? {
+    if manager.resume_discovery(&config).await? {
         // Missing metadata or a changed index goes through the existing
         // selection/restore path. The next tick completes capture/session setup.
         let previous = manager.adapter_selection_state().await;
@@ -106,7 +132,7 @@ async fn retry_discovery(handle: &AppHandle) -> Result<(), crate::AppError> {
         if previous.selected_mac != selection.selected_mac
             || previous.interface_index != selection.interface_index
         {
-            manager.start_selected_adapter(&config, handle).await;
+            manager.start_selected_adapter(&config).await;
         }
         emit_selection(handle, &selection);
     }
@@ -296,7 +322,7 @@ mod imp {
         super::watch_changes(rx, |changed| {
             let handle = handle.clone();
             async move {
-                super::super::bindings::refresh(&handle).await;
+                super::refresh_bindings(&handle).await;
                 let result = if changed {
                     let _kinds = DIRTY.swap(0, Ordering::AcqRel);
                     // Both callback kinds can accompany an IP write. Only a
@@ -323,6 +349,44 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn topology_adapter_publishes_revision_without_selected_camera() {
+        let bridge = crate::bridge::RecordingBridge::default();
+        let stream = crate::streaming::StreamManager::new();
+        publish_topology_observation(
+            super::super::bindings::TopologyObservation {
+                changed: true,
+                revision: 12,
+                scope: super::super::bindings::BindScope::Unknown {
+                    reason: "inventory unavailable".into(),
+                },
+            },
+            &bridge,
+            &stream,
+        )
+        .await;
+        assert_eq!(
+            *bridge.0.lock().unwrap(),
+            [(
+                "binding-topology-changed".into(),
+                serde_json::json!({"topology_revision":12})
+            )]
+        );
+        publish_topology_observation(
+            super::super::bindings::TopologyObservation {
+                changed: false,
+                revision: 12,
+                scope: super::super::bindings::BindScope::Unknown {
+                    reason: "independent listener retry".into(),
+                },
+            },
+            &bridge,
+            &stream,
+        )
+        .await;
+        assert_eq!(bridge.0.lock().unwrap().len(), 1);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn observed_link_wakes_worker_before_retry_and_coalesces_notifications() {
