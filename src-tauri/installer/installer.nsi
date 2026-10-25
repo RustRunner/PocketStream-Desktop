@@ -88,6 +88,7 @@ VIAddVersionKey "ProductVersion" "${VERSION}"
 
 {{#if installer_hooks}}
 !include "{{installer_hooks}}"
+!include '${PS_INSTALLER_SOURCE_DIR}\vc-runtime.nsh'
 {{/if}}
 
 
@@ -420,6 +421,7 @@ SectionEnd
 Section Install
   Call PS_ValidateDestination
   !insertmacro PS_CHECK_PROCESSES
+  !insertmacro PS_ENSURE_VC
   StrCpy $PSReplacementStarted 1
   StrCpy $PSPhase 'replacement'
   SetOutPath $INSTDIR
@@ -471,6 +473,10 @@ Section Install
 
   ; Create uninstaller
   ClearErrors
+  File '/oname=uninstall-bootstrap.ps1' '${PS_INSTALLER_SOURCE_DIR}\uninstall-bootstrap.ps1'
+  ${If} ${Errors}
+    !insertmacro PS_FAIL 'Standalone bootstrap extraction failed; installation is incomplete'
+  ${EndIf}
   WriteUninstaller "$INSTDIR\uninstall.exe"
   ${If} ${Errors}
     !insertmacro PS_FAIL "Uninstaller creation failed; installation is incomplete"
@@ -510,7 +516,8 @@ Section Install
   WriteRegStr SHCTX "${UNINSTKEY}" "DisplayVersion" "${VERSION}"
   WriteRegStr SHCTX "${UNINSTKEY}" "Publisher" "${MANUFACTURER}"
   WriteRegStr SHCTX "${UNINSTKEY}" "InstallLocation" "$\"$INSTDIR$\""
-  WriteRegStr SHCTX "${UNINSTKEY}" "UninstallString" "$\"$INSTDIR\uninstall.exe$\""
+  WriteRegStr SHCTX "${UNINSTKEY}" "UninstallString" '$\"$WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe$\" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $\"$INSTDIR\uninstall-bootstrap.ps1$\"'
+  WriteRegStr SHCTX "${UNINSTKEY}" "QuietUninstallString" '$\"$WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe$\" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $\"$INSTDIR\uninstall-bootstrap.ps1$\" -Silent'
   WriteRegDWORD SHCTX "${UNINSTKEY}" "NoModify" "1"
   WriteRegDWORD SHCTX "${UNINSTKEY}" "NoRepair" "1"
   ${If} ${Errors}
@@ -558,6 +565,10 @@ SectionEnd
 Function .onInstSuccess
   StrCpy $PSReplacementStarted 0
   !insertmacro PS_RELEASE_TRANSACTION
+  ${If} $PSInstallGate P<> 0
+    SetErrorLevel 71
+    Quit
+  ${EndIf}
   ; Check for `/R` flag only in silent and passive installers because
   ; GUI installer has a toggle for the user to (re)start the app
   ${If} $PassiveMode = 1
@@ -645,6 +656,7 @@ Section Uninstall
 
   ; Delete uninstaller
   ClearErrors
+  Delete "$INSTDIR\uninstall-bootstrap.ps1"
   Delete "$INSTDIR\uninstall.exe"
   ${If} ${Errors}
     !insertmacro PS_FAIL "Uninstaller deletion failed; uninstallation is incomplete"

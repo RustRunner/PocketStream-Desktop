@@ -43,3 +43,18 @@ test('fresh protected destinations resolve without requiring an existing directo
     assert.notDeepEqual(checkInstaller(source,seed),[]);
   }
 });
+
+test('installer retains ownership when a worker cannot release the GUI thread mutex',async()=>{
+  const {checkInstaller}=await import('../scripts/check-installer.mjs');
+  const read=p=>fs.readFileSync(path.join(__dirname,'..',p),'utf8');
+  const source=read('src-tauri/installer/installer.nsi'),hooks=read('src-tauri/installer/transaction.nsh');
+  assert.deepEqual(checkInstaller(source,hooks),[]);
+  const oldRelease=`!macro PS_RELEASE_TRANSACTION
+  System::Call 'kernel32::ReleaseMutex(p $PSInstallGate)'
+  System::Call 'kernel32::CloseHandle(p $PSInstallGate)'
+  StrCpy $PSInstallGate 0
+!macroend`;
+  const unsafe=hooks.replace(/!macro PS_RELEASE_TRANSACTION\s*\n[\s\S]*?!macroend/,oldRelease);
+  assert.notDeepEqual(checkInstaller(source,unsafe),[]);
+  assert.notDeepEqual(checkInstaller(source,hooks.replace('i.r4 ?e','i.r4')),[]);
+});

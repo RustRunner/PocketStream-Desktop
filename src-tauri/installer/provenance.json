@@ -7,7 +7,10 @@
   "delta": [
     "Remove the reinstall page and every chained previous-uninstaller path; accept only in-place supported NSIS predecessors and protected fresh destinations.",
     "Hold the installation gate from onInit through terminal callbacks and maintenance; bound host/process checks and remove stock process-kill calls.",
-    "Run fixed install/uninstall maintenance, propagate failure with a machine-readable result, and release the transaction before relaunch."
+    "Run fixed install/uninstall maintenance, propagate failure with a machine-readable result, and release the transaction before relaunch.",
+    "Embed and verify Microsoft VC runtime 14.50.35719 x64, install it without reboot when missing, and verify all required native runtime versions before replacing payloads.",
+    "Register a protected fixed PowerShell standalone entry that imports only trusted system modules, waits for a verified NSIS child and propagates the real child exit; raw NSIS bootstrap remains an internal child implementation.",
+    "Retain a gate handle after worker-thread ERROR_NOT_OWNER and release it on the acquiring GUI thread; capture native errors immediately and emit fixed non-secret ownership debug traces."
   ],
   "qualification": "Static/generated-script checks do not prove native mutex lifetime or installation behavior; isolated Windows qualification is pending."
 }

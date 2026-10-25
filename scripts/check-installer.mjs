@@ -30,11 +30,13 @@ export function checkInstaller(source, hooks) {
   require(destination.includes('${If} $0 = 0') && destination.includes('${OrIf} $0 >= ${NSIS_MAX_STRLEN}') && destination.includes('PS_FAIL \'Cannot resolve installation destination\''), "destination resolution must reject failure or truncation");
   require(destination.indexOf('GetFullPathNameW') < destination.indexOf('StrCpy $INSTDIR $6') && destination.includes("${If} $1 != '$PROGRAMFILES64\\'") && destination.includes('GetFileAttributesW') && destination.includes('0x400'), "resolved destination must retain protected-root and reparse checks");
   require(install.includes('PS_MAINTENANCE "install"'), "install maintenance missing");
+  require(install.includes('PS_ENSURE_VC') && install.indexOf('PS_ENSURE_VC') < install.indexOf('File "${MAINBINARYSRCPATH}"'), "VC runtime prerequisite must precede payload replacement");
+  require(install.includes('uninstall-bootstrap.ps1') && install.includes('QuietUninstallString'), "registered standalone bootstrap missing");
   require(uninstall.indexOf('PS_MAINTENANCE "uninstall"') >= 0 && uninstall.indexOf('PS_MAINTENANCE "uninstall"') < uninstall.indexOf("Delete "), "uninstall deletes before maintenance");
   const resources = install.slice(install.indexOf("; Copy resources"), install.indexOf("; Create file associations"));
   require(resources.includes('${If} ${Errors}') && resources.includes('PS_FAIL "Resource replacement failed'), "resource extraction errors must fail installation");
   const uninstaller = install.slice(install.indexOf("; Create uninstaller"), install.indexOf("; Save $INSTDIR"));
-  require(uninstaller.includes('${If} ${Errors}') && uninstaller.includes('PS_FAIL'), "uninstaller creation errors must fail installation");
+  require(uninstaller.includes('${If} ${Errors}') && uninstaller.includes('PS_FAIL "Uninstaller creation failed'), "uninstaller creation errors must fail installation");
   const deletion = uninstall.slice(uninstall.indexOf('; Delete the app directory'), uninstall.indexOf('; Delete app associations'));
   require(deletion.includes('ClearErrors') && deletion.includes('${If} ${Errors}') && deletion.includes('PS_FAIL "Payload deletion failed'), "payload deletion errors must fail before unregistering");
   require(deletion.indexOf('PS_FAIL "Payload deletion failed') < deletion.indexOf('Delete "$INSTDIR\\${MAINBINARYNAME}.exe"') && deletion.includes('PS_FAIL "Executable deletion failed'), "resource deletion must succeed before deleting the maintenance image");
@@ -46,6 +48,11 @@ export function checkInstaller(source, hooks) {
   require(/PS_OPEN_MUTEX 'Global\\PocketStream\.Desktop\.InstallGate\.v2' 5000/.test(hooks), "installation gate must be bounded");
   require(/PS_OPEN_MUTEX 'Global\\PocketStream\.Desktop\.HostOwner\.v2' 5000/.test(hooks), "host wait must be bounded");
   require(hooks.includes("!define MUI_CUSTOMFUNCTION_ABORT PS_UserAbort") && hooks.includes("!define MUI_CUSTOMFUNCTION_UNABORT un.PS_UserAbort"), "MUI cancellation callbacks must invoke gate release hooks");
+  const release = hooks.match(/!macro PS_RELEASE_TRANSACTION\s*\n([\s\S]*?)!macroend/)?.[1] ?? '';
+  const releaseSuccess = release.slice(release.indexOf('${If} $4 <> 0'), release.indexOf('${Else}'));
+  const releaseFailure = release.slice(release.indexOf('${Else}'));
+  require(release.includes('ReleaseMutex(p $PSInstallGate)i.r4 ?e') && /\?e'\s*\n\s*Pop \$5/.test(release), "gate release must capture its native result and error immediately");
+  require(releaseSuccess.includes('CloseHandle(p $PSInstallGate)') && releaseSuccess.includes('StrCpy $PSInstallGate 0') && !releaseFailure.includes('CloseHandle(p $PSInstallGate)') && !releaseFailure.includes('StrCpy $PSInstallGate 0') && releaseFailure.includes('$5 <> 288'), "worker-thread release failure must retain the gate for its acquiring thread");
   require(!/ExecToStack[^\r\n]*-Verb|runas/i.test(hooks), "maintenance cannot launch nested elevation");
   return failures;
 }
@@ -76,6 +83,12 @@ export function checkRepository(generated, trace) {
   const record = JSON.parse(read("src-tauri/installer/provenance.json"));
   const upstream = read("src-tauri/installer/installer.upstream.nsi").replaceAll("\r\n", "\n");
   const failures = checkInstaller(source, hooks);
+  const vc = read('src-tauri/installer/vc-runtime.nsh');
+  if (!vc.includes('-VerifyOnly') || !vc.includes('/norestart') || !vc.includes('PS_ObserveVc') || !vc.includes('pocketstream-prerequisite.json')) failures.push('fixed verified VC prerequisite contract missing');
+  const bootstrap = read('src-tauri/installer/uninstall-bootstrap.ps1');
+  for (const required of ['Assert-Protected', 'InheritOnly', '0x500d0156', "'_?='", 'WaitForExit()', 'exit $exitCode', 'EnvironmentVariables.Clear()', 'Create($security)', '$env:PSModulePath=$moduleRoot', 'Import-Module -Name ([IO.Path]::Combine($moduleRoot']) {
+    if (!bootstrap.includes(required)) failures.push(`standalone bootstrap contract missing: ${required}`);
+  }
   if (source.indexOf('!include "{{installer_hooks}}"') < source.indexOf("!addplugindir")) failures.push("transaction functions must follow plugin registration and template constants");
   if (crypto.createHash("sha256").update(upstream).digest("hex") !== record.source_sha256_lf) failures.push("upstream source hash drift");
   const config = JSON.parse(read("src-tauri/tauri.conf.json"));

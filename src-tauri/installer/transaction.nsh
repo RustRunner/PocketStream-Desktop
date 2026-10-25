@@ -1,5 +1,6 @@
 ; Transaction ownership only. No shell, previous uninstaller or force termination.
 !include LogicLib.nsh
+!define PS_INSTALLER_SOURCE_DIR '${__FILEDIR__}'
 !define MUI_CUSTOMFUNCTION_ABORT PS_UserAbort
 !define MUI_CUSTOMFUNCTION_UNABORT un.PS_UserAbort
 Var PSInstallGate
@@ -8,11 +9,43 @@ Var PSReplacementStarted
 Var PSLaunchRequested
 Var PSPhase
 
+; Fixed, non-secret diagnostic strings. A fixture can collect these through
+; Windows debug output without adding privileged filesystem writes.
+!macro PS_OWNERSHIP_TRACE event name result
+  Push $0
+  Push $1
+  Push $2
+  System::Call 'kernel32::GetCurrentProcessId()i.r0'
+  System::Call 'kernel32::GetCurrentThreadId()i.r1'
+  System::Call 'kernel32::GetTickCount()i.r2'
+  System::Call 'kernel32::OutputDebugStringW(w "PSOWN:v1 event=${event} pid=$0 tid=$1 tick=$2 name=${name} result=${result}")'
+  Pop $2
+  Pop $1
+  Pop $0
+!macroend
+
 !macro PS_RELEASE_TRANSACTION
   ${If} $PSInstallGate P<> 0
-    System::Call 'kernel32::ReleaseMutex(p $PSInstallGate)'
-    System::Call 'kernel32::CloseHandle(p $PSInstallGate)'
-    StrCpy $PSInstallGate 0
+    Push $4
+    Push $5
+    System::Call 'kernel32::ReleaseMutex(p $PSInstallGate)i.r4 ?e'
+    Pop $5
+    ${If} $4 <> 0
+      !insertmacro PS_OWNERSHIP_TRACE 'released' 'InstallGate' '$4'
+      System::Call 'kernel32::CloseHandle(p $PSInstallGate)i.r4'
+      !insertmacro PS_OWNERSHIP_TRACE 'closed' 'InstallGate' '$4'
+      StrCpy $PSInstallGate 0
+    ${Else}
+      !insertmacro PS_OWNERSHIP_TRACE 'release_deferred' 'InstallGate' '$5'
+      ; Sections execute on a worker in GUI mode. Retain the handle so the
+      ; acquiring GUI thread can release it in its terminal callback.
+      ${If} $5 <> 288
+        SetErrorLevel 71
+        DetailPrint 'Installation ownership release failed; do not relaunch.'
+      ${EndIf}
+    ${EndIf}
+    Pop $5
+    Pop $4
   ${EndIf}
 !macroend
 
@@ -76,14 +109,22 @@ Var PSPhase
     System::Call 'kernel32::CloseHandle(p r9)'
     !insertmacro PS_FAIL 'PocketStream is busy; close the application and retry'
   ${EndIf}
+  Push $4
+  StrCpy $4 $0
+  !insertmacro PS_OWNERSHIP_TRACE 'acquired' '${name}' '$4'
+  Pop $4
 !macroend
 
 !macro PS_ACQUIRE_TRANSACTION
   !insertmacro PS_OPEN_MUTEX 'Global\PocketStream.Desktop.InstallGate.v2' 5000
   StrCpy $PSInstallGate $9
   !insertmacro PS_OPEN_MUTEX 'Global\PocketStream.Desktop.HostOwner.v2' 5000
-  System::Call 'kernel32::ReleaseMutex(p r9)'
-  System::Call 'kernel32::CloseHandle(p r9)'
+  Push $4
+  System::Call 'kernel32::ReleaseMutex(p r9)i.r4'
+  !insertmacro PS_OWNERSHIP_TRACE 'probe_released' 'HostOwner' '$4'
+  System::Call 'kernel32::CloseHandle(p r9)i.r4'
+  !insertmacro PS_OWNERSHIP_TRACE 'probe_closed' 'HostOwner' '$4'
+  Pop $4
 !macroend
 
 !macro PS_CHECK_PROCESSES
@@ -138,6 +179,7 @@ Function PS_PreflightInstall
   ${EndIf}
   ${If} $PSExistingRoot != ''
     ${If} $0 != '$\"$PSExistingRoot\uninstall.exe$\"'
+    ${AndIf} $0 != '$\"$WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe$\" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $\"$PSExistingRoot\uninstall-bootstrap.ps1$\"'
       !insertmacro PS_FAIL 'Unsupported predecessor; complete standalone uninstall before installing'
     ${EndIf}
     ${If} $INSTDIR != '${PLACEHOLDER_INSTALL_DIR}'

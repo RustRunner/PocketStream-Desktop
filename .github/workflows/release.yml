@@ -172,6 +172,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: pwsh -File scripts/bundle-gstreamer.ps1 -AllowDraftDependencyRelease
 
+      - name: Prepare pinned installer prerequisite
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-installer-prerequisites.ps1
+
       # Verify the complete source asset set, including an authenticated draft.
       # Nothing is published here. Full G3 completion still requires public
       # sources; installed draft readiness is recorded separately below.

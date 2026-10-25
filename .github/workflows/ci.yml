@@ -214,6 +214,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: pwsh -ExecutionPolicy Bypass -File scripts/bundle-gstreamer.ps1 -AllowDraftDependencyRelease
 
+      - name: Prepare pinned installer prerequisite
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-installer-prerequisites.ps1
+
       - name: Bundle smoke check (isolated plugin path)
         shell: pwsh
         run: |
