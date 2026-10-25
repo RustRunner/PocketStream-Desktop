@@ -1,12 +1,12 @@
 # Deferred Windows qualification procedure
 
-These checks require a disposable, isolated Windows fixture. Do not run installation, uninstallation, firewall mutation, address/DHCP changes or fault injection on the development PC. Automated policy fakes and generated-installer inspection do not satisfy these checks. A4 and overall v2-A qualification remain incomplete.
+These checks require a disposable, isolated Windows fixture. Windows Sandbox can qualify the supported subset after its prerequisites pass; missing services or unsupported device/session behavior remain pending. Do not run installation, uninstallation, firewall mutation, address/DHCP changes or fault injection on the development PC. Automated policy fakes and generated-installer inspection do not satisfy these checks. A4 and overall v2-A qualification remain incomplete.
 
 The operator authorized implementing firewall/install/binding integration before the isolated prerequisites on 24 October 2026. This is a sequencing exception, not a passing result. Earlier [prerequisite](privilege-v2-native-prerequisites.md) and [application/hardware](privilege-v2-a2.md) evidence remains historical evidence for its recorded images.
 
 ## Artifact and fixture preparation
 
-1. Use the candidate identified by [the integration record](privilege-v2-a3.json). Hash the executable, installer, generated NSIS, expanded NSIS, template and transaction include. Record the source-input digest, Windows build, PowerShell 5.1 version, NSIS version, account, logon session and token integrity. The local inspection package is unsigned and has updater-artifact creation disabled; signed update/G3 closure is a separate release gate.
+1. Use the latest candidate identified by [the integration review](privilege-v2-a3-review.json), superseding the normal output aliases in [the original integration record](privilege-v2-a3.json). Hash the executable, installer, generated NSIS, expanded NSIS, template and transaction include. Combine the original application/validation source inventory with the review's overriding entries and verify each file. Record the source-input digest, Windows build, PowerShell 5.1 version, NSIS version, account, logon session and token integrity. The local inspection package is unsigned and has updater-artifact creation disabled; signed update/G3 closure is a separate release gate.
 2. Snapshot a clean Windows VM. Provide two accounts and separate interactive logon sessions for ownership tests, physical/virtual Ethernet, Wi-Fi and VPN/virtual adapters for binding tests, and camera/PTU hardware for the production matrix. Save native addresses/prefixes, DHCP, DNS, routes, adapters and complete firewall rules/filters before each scenario. Keep the fixture's state and snapshots separate from this PC's profile.
 3. Reproduce safe build checks using the repository's GStreamer SDK/runtime setup:
 
@@ -29,6 +29,26 @@ The operator authorized implementing firewall/install/binding integration before
    ```
 
    The latter command trace-compiles the actual generated script with the cached NSIS compiler and MUI logging enabled, then checks the expanded callback paths. It does not run the installer. Preserve `target/release/nsis/x64/installer.nsi`, `installer.compile.log` and `compile-inspection.json` alongside the executable/installer hashes. Extract resource `#1` using Windows SDK `mt.exe`; the host must contain `requireAdministrator` and Common Controls v6. Extract the package without executing it. Record staged and embedded executable hashes separately: this pinned toolchain patches `__TAURI_BUNDLE_TYPE_VAR_UNK` to `__TAURI_BUNDLE_TYPE_VAR_NSS` in the package. Require every other byte to match and qualify the exact intended image.
+
+## Reusable Windows Sandbox fixture
+
+The [resume checkpoint](privilege-v2-sandbox-resume.md) identifies the prepared launcher and restart prerequisite. The generator performs only file/hash/resource/package inspection on the host:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-privilege-sandbox.ps1 -Mode Preflight
+# To include the supported automated subset after the same guest preflight:
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-privilege-sandbox.ps1 -Mode Supported
+```
+
+Supply `-LegacyInstaller <path> -LegacySha256 <independently recorded hash>` to include an actual predecessor upgrade. Each invocation requires a new run directory and preserves earlier attempts. The generated `.wsb` maps only installer/script inputs read-only and a dedicated sibling results directory writable. It disables clipboard, audio/video and printer redirection. Networking uses Sandbox's virtual switch so the unmodified candidate can obtain its WebView2 prerequisite; no registry spoof or fake prerequisite is used. These options follow [Microsoft's configuration contract](https://learn.microsoft.com/en-us/windows/security/application-security/application-isolation/windows-sandbox/windows-sandbox-configure-using-wsb-file).
+
+If Sandbox is disabled, an administrator can run `Enable-WindowsOptionalFeature -Online -FeatureName Containers-DisposableClientVM -All -NoRestart`, following [Microsoft's installation instructions](https://learn.microsoft.com/en-us/windows/security/application-security/application-isolation/windows-sandbox/windows-sandbox-install). Record `RestartNeeded`. Save the launcher, evidence and resume instructions and obtain operator confirmation before restarting; enabling the feature does not establish that Sandbox can boot.
+
+The guest script first verifies its real WDAGUtilityAccount token, a different computer identity, fixed mapping paths, read-only access and every input hash. It rejects host execution, including its mutex-helper modes. Before native scenarios it records PowerShell 5.1/x64/elevation, BFE/MpsSvc/Winmgmt, trusted system modules, the firewall provider, adapters and WebView2/installer bootstrap prerequisites. Missing or stopped required services/modules stop the matrix with pending results. Virtual adapters do not satisfy physical-adapter eligibility; the production selector is unchanged.
+
+The supported automated subset covers fresh silent install, silent/passive/updater reinstall without relaunch, strict entry refusal, legacy/custom/duplicate/disabled/program-scoped rule migration, repeated recovery, preserved Block/foreign rules and filters, migration conflict/collision failure and retry, HostOwner Busy, image-in-use refusal, standalone uninstall and installation afterward. An independently hashed predecessor enables a real installer upgrade with explicitly seeded historical rule shapes. Complete native rule/filter and adapter/address/DHCP/DNS/route snapshots and protected journals accompany each scenario. The installed executable and extracted payload are independently hashed. These cases are **prepared, not qualified**, until exported guest results establish each outcome.
+
+The full matrix below still applies. Interactive cancellation, every fresh/passive/silent/updater/uninstall combination, continuous ownership timing, queued launch, payload Ignore/delete failures, uninstaller-child error propagation, actual partial-provider injection, physical adapter changes, multiple accounts/sessions and hardware are not replaced by the automated subset. Exported success for one subset must not mark those gates passed. Before closing Sandbox, verify `results.json`, transcript, per-process records, before/after snapshots, journals and post-run input hashes exist on the host's dedicated results mapping; hash and retain that evidence. The fixture leaves the Sandbox open for inspection and does not delete host results.
 
 ## Firewall and maintenance matrix — isolated fixture only
 
