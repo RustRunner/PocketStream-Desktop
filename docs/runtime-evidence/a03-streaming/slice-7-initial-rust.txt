@@ -1,0 +1,26 @@
+cargo :    Compiling pocketstream-desktop v0.6.7 (C:\Users\joshu\PocketStream-Desktop\src-tauri)
+At C:\Users\joshu\PocketStream-Desktop\scripts\verify-a03-streaming.ps1:25 char:44
++ ... nvoke-Gate 'rust' "$repoRoot/src-tauri" { cargo test --lib --locked }
++                                               ~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (   Compiling po...ktop\src-tauri):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+error[E0716]: temporary value dropped while borrowed
+    --> src\streaming\mod.rs:5521:61
+     |
+5519 |           let (preview, relay) = tokio::join!(
+     |  ________________________________-
+5520 | |             manager.start_playback(&settings, None),
+5521 | |             manager.start_restream_server_inner(&settings, &Default::default(), epoch, preserve)
+     | |                                                             ^^^^^^^^^^^^^^^^^^ creates a temporary value
+which is freed while still in use
+5522 | |         );
+     | |         -
+     | |         |
+     | |_________temporary value is freed at the end of this statement
+     |           borrow later used here
+     |
+     = note: consider using a `let` binding to create a longer lived value
+
+For more information about this error, try `rustc --explain E0716`.
+error: could not compile `pocketstream-desktop` (lib test) due to 1 previous error

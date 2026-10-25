@@ -445,8 +445,9 @@ pub fn run() {
         app_config.clone(),
         bridge.clone(),
     ));
-    let stream_manager = std::sync::Arc::new(streaming::StreamManager::with_selected_protocol(
+    let stream_manager = std::sync::Arc::new(streaming::StreamManager::with_bridge(
         app_config.get().restream_protocol,
+        bridge.clone(),
     ));
 
     tauri::Builder::default()
@@ -523,7 +524,7 @@ pub fn run() {
             // emits `stream-status` to the frontend on every change.
             // Replaces the old 1Hz frontend poll of get_stream_status.
             let stream_mgr: tauri::State<'_, std::sync::Arc<streaming::StreamManager>> = handle.state();
-            stream_mgr.start_status_emitter(handle.clone(), handle.state::<std::sync::Arc<network::NetworkManager>>().readiness());
+            stream_mgr.start_status_emitter( handle.state::<std::sync::Arc<network::NetworkManager>>().readiness());
 
             // Start event-driven NIC watcher (Windows NotifyIpInterfaceChange +
             // NotifyUnicastIpAddressChange). If it fails to register — or on

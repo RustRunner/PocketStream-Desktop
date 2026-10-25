@@ -1,10 +1,14 @@
 # Runtime ownership after A03 slices 1–6
 
 This describes the implementation following the Revision 3 early-start track
-from `b849dfc`. **Streaming extraction (slices 7–10) is pending. A4 remains
+from `b849dfc`. The user explicitly rescheduled streaming slices 7–10 on
+2026-10-25 before A4; slice 7 preparation is implemented, with playback/relay
+extraction in progress. **A4 remains
 incomplete/deferred; B remains deferred.** Source checks do not qualify hardware,
 physical timing, recovery, installation, firewall behavior or release artifacts.
 See the [implementation record](../runtime-evidence/a03-revision3-implementation.md).
+The [streaming record](../runtime-evidence/a03-streaming-implementation.md)
+tracks the separately authorized slices, starting at `6f8a727`.
 
 The composition root in `lib.rs` shares one `Arc<AppConfig>`, one
 `Arc<NetworkManager>` and one `Arc<StreamManager>`. Rust command extractors use

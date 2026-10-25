@@ -7,7 +7,11 @@ pub mod rtsp_client;
 pub mod rtsp_server;
 mod rtsp_transport;
 mod srt_server;
+mod status;
+mod udp;
 pub mod video_embed;
+mod video_surface;
+use status::{compute_status, publish_status_if_changed};
 
 use serde::Serialize;
 use std::sync::Arc;
@@ -264,21 +268,11 @@ impl StreamStatus {
     }
 }
 
-fn publish_status_if_changed(tx: &watch::Sender<StreamStatus>, snapshot: StreamStatus) {
-    tx.send_if_modified(|current| {
-        if *current == snapshot {
-            false
-        } else {
-            *current = snapshot;
-            true
-        }
-    });
-}
-
 pub struct StreamManager {
     readiness: std::sync::Mutex<Option<Arc<crate::network::readiness::CameraReadiness>>>,
     state: Arc<Mutex<StreamState>>,
-    video_hwnd: Arc<std::sync::atomic::AtomicIsize>,
+    surface: Arc<video_surface::VideoSurface>,
+    bridge: Arc<dyn crate::bridge::AppBridge>,
     status_tx: Arc<watch::Sender<StreamStatus>>,
     /// Bumped when a user Start or Stop establishes a new desired-state
     /// intent. The intent is published before waiting on transaction or
@@ -376,7 +370,18 @@ impl StreamManager {
         Self::with_selected_protocol(RestreamProtocol::Rtsp)
     }
 
+    #[cfg(test)]
     pub fn with_selected_protocol(selected_protocol: RestreamProtocol) -> Self {
+        Self::with_bridge(
+            selected_protocol,
+            Arc::new(crate::bridge::RecordingBridge::default()),
+        )
+    }
+
+    pub(crate) fn with_bridge(
+        selected_protocol: RestreamProtocol,
+        bridge: Arc<dyn crate::bridge::AppBridge>,
+    ) -> Self {
         let (status_tx, _) = watch::channel(StreamStatus::idle(selected_protocol));
         let (relay_event_tx, relay_event_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
@@ -408,7 +413,8 @@ impl StreamManager {
                 restream_start_time: None,
                 playback_source: None,
             })),
-            video_hwnd: Arc::new(std::sync::atomic::AtomicIsize::new(0)),
+            surface: Arc::new(video_surface::VideoSurface::new(bridge.clone())),
+            bridge,
             status_tx: Arc::new(status_tx),
             restream_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             restream_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -483,20 +489,8 @@ impl StreamManager {
         Self::build_input_url(settings)?;
         crate::ensure_gstreamer()?;
         let mut state = self.state.lock().await;
-        if settings.stream.protocol == StreamProtocol::Udp
-            && ((state.restream_desired
-                && state
-                    .restream_spec
-                    .as_ref()
-                    .and_then(ResolvedStartSpec::udp_ingest_port)
-                    == Some(settings.stream.udp_port))
-                || state
-                    .restream_server
-                    .as_ref()
-                    .and_then(|s| s.udp_ingest_port())
-                    == Some(settings.stream.udp_port))
-        {
-            return Err(AppError::Stream(format!("UDP port {} is already claimed by the re-stream server. Stop it first or switch the input to RTSP.", settings.stream.udp_port)));
+        if settings.stream.protocol == StreamProtocol::Udp {
+            udp::guard_playback(&state, settings.stream.udp_port)?;
         }
         if state
             .playback_settings
@@ -1085,11 +1079,7 @@ impl StreamManager {
             }
 
             if let Some(udp_port) = spec.udp_ingest_port() {
-                if state.playback_source == Some(SourceMode::Udp { port: udp_port }) {
-                    let error = AppError::Stream(format!(
-                        "UDP port {} is already claimed by the running preview - only one consumer can receive a UDP stream. Stop the stream first, or switch the input to RTSP.",
-                        udp_port
-                    ));
+                if let Err(error) = udp::guard_relay(&state, udp_port) {
                     drop(state);
                     self.cancel_restream_start_intent(start_epoch, preserve_prior_desired)
                         .await;
@@ -1946,11 +1936,7 @@ impl StreamManager {
     /// because Tauri's `setup` hook runs on the main thread before any
     /// tokio runtime is bound to the current thread; a bare `tokio::spawn`
     /// here panics with "no reactor running."
-    pub fn start_status_emitter(
-        &self,
-        handle: tauri::AppHandle,
-        readiness: Arc<crate::network::readiness::CameraReadiness>,
-    ) {
+    pub fn start_status_emitter(&self, readiness: Arc<crate::network::readiness::CameraReadiness>) {
         *self.readiness.lock().unwrap_or_else(|p| p.into_inner()) = Some(readiness.clone());
         let relay_events = self
             .relay_event_rx
@@ -1985,14 +1971,10 @@ impl StreamManager {
         };
         tauri::async_runtime::spawn(run_playback_supervisor(playback));
 
-        let mut rx = self.status_tx.subscribe();
-        tauri::async_runtime::spawn(async move {
-            use tauri::Emitter;
-            while rx.changed().await.is_ok() {
-                let snap = rx.borrow().clone();
-                let _ = handle.emit("stream-status", &snap);
-            }
-        });
+        tauri::async_runtime::spawn(status::broadcast(
+            self.status_tx.subscribe(),
+            self.bridge.clone(),
+        ));
     }
 
     pub async fn take_screenshot(&self) -> Result<String, AppError> {
@@ -2170,39 +2152,11 @@ impl StreamManager {
         }
     }
 
-    #[allow(dead_code)] // called from commands.rs behind #[cfg(windows)]
-    pub fn set_video_child_hwnd(&self, hwnd: isize) {
-        self.video_hwnd
-            .store(hwnd, std::sync::atomic::Ordering::Relaxed);
+    pub(crate) fn video_surface(&self) -> &video_surface::VideoSurface {
+        &self.surface
     }
-
     pub fn get_video_child_hwnd(&self) -> Option<isize> {
-        let val = self.video_hwnd.load(std::sync::atomic::Ordering::Relaxed);
-        if val == 0 {
-            None
-        } else {
-            Some(val)
-        }
-    }
-
-    pub fn clear_video_child_hwnd(&self) {
-        self.video_hwnd
-            .store(0, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Clear the native video handle only when it is still `expected`.
-    /// A stop can spend time finalizing recording or transitioning an old
-    /// GStreamer pipeline while a replacement window is created. An
-    /// unconditional clear at the end of that stop would lose the new HWND.
-    pub fn clear_video_child_hwnd_if(&self, expected: isize) -> bool {
-        self.video_hwnd
-            .compare_exchange(
-                expected,
-                0,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            )
-            .is_ok()
+        self.surface.hwnd()
     }
 }
 
@@ -3447,128 +3401,6 @@ async fn retire_firewall(state: &Arc<Mutex<StreamState>>, generation: u64) -> bo
     }
 }
 
-async fn compute_status(state: &Arc<Mutex<StreamState>>) -> StreamStatus {
-    let state = state.lock().await;
-    let uptime = state
-        .restream_start_time
-        .map(|t| t.elapsed().as_secs())
-        .unwrap_or(0);
-
-    let health = state
-        .restream_health
-        .as_ref()
-        .map(|health| health.snapshot());
-    let current_generation = health.as_ref().map(|health| health.server_generation);
-    let current_server = state
-        .restream_server
-        .as_ref()
-        .filter(|server| Some(server.server_generation()) == current_generation);
-    let (bandwidth, connected_clients, client_limit, listener_alive) = match current_server {
-        Some(server) => (
-            server.bandwidth_kbps(),
-            server.connected_clients(),
-            server.client_limit(),
-            server.loop_alive() && health.as_ref().is_some_and(|health| health.loop_alive),
-        ),
-        None => (0.0, 0, MAX_RTSP_CLIENTS, false),
-    };
-
-    let playback = state.playback_health.as_ref().map(|h| h.snapshot());
-    let playing = playback
-        .as_ref()
-        .is_some_and(|h| h.state == PlaybackState::Playing);
-    let error = playback
-        .as_ref()
-        .and_then(|h| h.fault.as_ref().map(|f| f.reason.clone()));
-
-    // Idle/stopped playback reports no audio; the cells live on the
-    // pipeline instance, so stop and camera-switch resets are
-    // structural rather than an explicit clear.
-    let (audio_present, audio_codec) = state
-        .playback
-        .as_ref()
-        .map(|p| p.audio_status())
-        .unwrap_or((false, None));
-
-    StreamStatus {
-        bind_scope: if listener_alive {
-            state
-                .restream_spec
-                .as_ref()
-                .map(|s| s.bind_scope.clone())
-                .unwrap_or_default()
-        } else {
-            BindScope::default()
-        },
-        firewall: state.firewall.clone(),
-        playing,
-        playback_desired: state.playback_settings.is_some(),
-        playback_state: playback
-            .as_ref()
-            .map_or(PlaybackState::Stopped, |h| h.state),
-        playback_fault: playback.as_ref().and_then(|h| h.fault.clone()),
-        playback_recovery_attempt: playback.as_ref().map_or(0, |h| h.attempt),
-        playback_next_retry_secs: playback.as_ref().and_then(|h| h.next_retry_secs),
-        recording_report: state.recording_report.clone(),
-        recording_finalized_path: state.recording_finalized_path.clone(),
-        selected_protocol: state.selected_protocol,
-        active_protocol: state
-            .restream_spec
-            .as_ref()
-            .map(ResolvedStartSpec::protocol)
-            .or_else(|| state.restream_server.as_ref().map(RestreamServer::protocol)),
-        server_running: listener_alive,
-        desired: state.restream_desired,
-        relay_state: if state.restream_desired {
-            health
-                .as_ref()
-                .map(|health| health.state)
-                .unwrap_or(RelayState::Starting)
-        } else {
-            RelayState::Stopped
-        },
-        relay_error: if state.restream_desired {
-            health.as_ref().and_then(|health| health.error.clone())
-        } else {
-            None
-        },
-        recovery_attempt: if state.restream_desired {
-            health
-                .as_ref()
-                .map(|health| health.recovery_attempt)
-                .unwrap_or(0)
-        } else {
-            0
-        },
-        server_url: state
-            .restream_desired
-            .then(|| {
-                state
-                    .restream_spec
-                    .as_ref()
-                    .map(ResolvedStartSpec::client_url)
-            })
-            .flatten(),
-        display_url: state
-            .restream_desired
-            .then(|| {
-                state
-                    .restream_spec
-                    .as_ref()
-                    .map(ResolvedStartSpec::display_url)
-            })
-            .flatten(),
-        recording: state.recording,
-        uptime_secs: uptime,
-        bandwidth_kbps: bandwidth,
-        connected_clients,
-        client_limit,
-        error,
-        audio_present,
-        audio_codec,
-    }
-}
-
 /// True if `addr` is an APIPA (169.254.0.0/16) address — a DHCP-failure
 /// fallback that can't carry usable client traffic.
 fn is_apipa(addr: &str) -> bool {
@@ -4766,58 +4598,6 @@ mod tests {
 
     // ── StreamStatus ────────────────────────────────────────────────
 
-    #[test]
-    fn stream_status_serializes() {
-        let status = StreamStatus {
-            playing: true,
-            selected_protocol: RestreamProtocol::Rtsp,
-            active_protocol: Some(RestreamProtocol::Rtsp),
-            server_running: false,
-            desired: true,
-            relay_state: RelayState::Recovering,
-            relay_error: Some("camera unavailable".into()),
-            recovery_attempt: 2,
-            server_url: Some("rtsp://127.0.0.1:8554/stream-abc".into()),
-            display_url: Some("rtsp://127.0.0.1:8554".into()),
-            recording: false,
-            uptime_secs: 120,
-            bandwidth_kbps: 0.0,
-            connected_clients: 3,
-            client_limit: MAX_RTSP_CLIENTS,
-            error: None,
-            audio_present: true,
-            audio_codec: Some("PCMU".into()),
-            ..StreamStatus::idle(RestreamProtocol::Rtsp)
-        };
-        let json = serde_json::to_string(&status).unwrap();
-        assert!(json.contains("\"playing\":true"));
-        assert!(json.contains("\"selected_protocol\":\"rtsp\""));
-        assert!(json.contains("\"active_protocol\":\"rtsp\""));
-        assert!(json.contains("\"uptime_secs\":120"));
-        assert!(json.contains("\"display_url\":"));
-        assert!(json.contains("\"relay_state\":\"recovering\""));
-        assert!(json.contains("\"recovery_attempt\":2"));
-        assert!(json.contains("\"connected_clients\":3"));
-        assert!(json.contains("\"client_limit\":10"));
-        assert!(json.contains("\"audio_present\":true"));
-        assert!(json.contains("\"audio_codec\":\"PCMU\""));
-    }
-
-    #[test]
-    fn stream_status_default_values() {
-        let status = StreamStatus::idle(RestreamProtocol::Rtsp);
-        let json = serde_json::to_string(&status).unwrap();
-        assert!(json.contains("\"server_url\":null"));
-        assert!(json.contains("\"selected_protocol\":\"rtsp\""));
-        assert!(json.contains("\"active_protocol\":null"));
-        assert!(json.contains("\"display_url\":null"));
-        assert!(json.contains("\"connected_clients\":0"));
-        assert!(json.contains("\"client_limit\":10"));
-        // Idle/stopped/video-only playback: no audio, no codec.
-        assert!(json.contains("\"audio_present\":false"));
-        assert!(json.contains("\"audio_codec\":null"));
-    }
-
     // ── StreamManager ───────────────────────────────────────────────
 
     #[tokio::test]
@@ -5634,40 +5414,81 @@ mod tests {
         assert!(!rx.has_changed().unwrap());
     }
 
-    #[test]
-    fn status_publisher_emits_when_only_client_count_changes() {
-        let initial = StreamStatus::idle(RestreamProtocol::Rtsp);
-        let (tx, mut rx) = watch::channel(initial.clone());
-        rx.borrow_and_update();
-
-        let mut updated = initial;
-        updated.connected_clients = 1;
-        publish_status_if_changed(&tx, updated.clone());
-
-        assert!(rx.has_changed().unwrap());
-        assert_eq!(rx.borrow_and_update().connected_clients, 1);
-
-        publish_status_if_changed(&tx, updated);
-        assert!(!rx.has_changed().unwrap());
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_udp_starts_admit_only_one_owner() {
+        init_gstreamer();
+        let manager = StreamManager::new();
+        let settings = restream_test_settings(RestreamProtocol::Rtsp);
+        let (epoch, preserve) = manager.begin_restream_start_intent().await.unwrap();
+        let adopted = Default::default();
+        let (preview, relay) = tokio::join!(
+            manager.start_playback(&settings, None),
+            manager.start_restream_server_inner(&settings, &adopted, epoch, preserve)
+        );
+        assert_ne!(
+            preview.is_ok(),
+            relay.is_ok(),
+            "preview={preview:?} relay={relay:?}"
+        );
+        let error = match preview {
+            Err(error) => error,
+            Ok(()) => relay.unwrap_err(),
+        };
+        assert!(error.to_string().contains("already claimed"), "{error}");
+        manager.stop_playback().await.unwrap();
+        manager.stop_restream_server().await.unwrap();
     }
 
-    #[test]
-    fn stream_manager_video_hwnd_roundtrip() {
-        let mgr = StreamManager::new();
-        assert!(mgr.get_video_child_hwnd().is_none());
-        mgr.set_video_child_hwnd(0x12345);
-        assert_eq!(mgr.get_video_child_hwnd(), Some(0x12345));
+    #[tokio::test]
+    async fn udp_failed_build_keeps_desired_claim_until_stop_and_stale_stop_preserves_replacement()
+    {
+        init_gstreamer();
+        let manager = StreamManager::new();
+        let settings = restream_test_settings(RestreamProtocol::Rtsp);
+        seed_desired_relay_state(&manager, &settings, RelayState::Failed).await;
+        assert!(manager
+            .start_playback(&settings, None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("already claimed by the re-stream server"));
+        let old_stop = manager.begin_restream_stop_intent().await.unwrap();
+        seed_desired_relay_state(&manager, &settings, RelayState::Recovering).await;
+        let (epoch, _) = manager.begin_restream_start_intent().await.unwrap();
+        manager.state.lock().await.restream_intent_epoch = Some(epoch);
+        manager.finish_restream_stop(old_stop).await.unwrap();
+        assert!(manager.start_playback(&settings, None).await.is_err());
+        manager.stop_restream_server().await.unwrap();
+        manager.start_playback(&settings, None).await.unwrap();
+        manager.stop_playback().await.unwrap();
+        let state = manager.state.lock().await;
+        udp::guard_relay(&state, settings.stream.udp_port).unwrap();
     }
 
-    #[test]
-    fn stale_stop_does_not_clear_replacement_video_hwnd() {
-        let mgr = StreamManager::new();
-        mgr.set_video_child_hwnd(0x12345);
-        mgr.set_video_child_hwnd(0x67890);
-
-        assert!(!mgr.clear_video_child_hwnd_if(0x12345));
-        assert_eq!(mgr.get_video_child_hwnd(), Some(0x67890));
-        assert!(mgr.clear_video_child_hwnd_if(0x67890));
-        assert!(mgr.get_video_child_hwnd().is_none());
+    #[tokio::test]
+    async fn coherent_status_waits_for_whole_cross_owner_transition() {
+        let manager = StreamManager::new();
+        let mut state = manager.state.lock().await;
+        state.playback_settings = Some(AppSettings::default());
+        let snapshot = compute_status(&manager.state);
+        tokio::pin!(snapshot);
+        use std::{
+            future::{poll_fn, Future},
+            task::Poll,
+        };
+        assert!(poll_fn(|cx| Poll::Ready(snapshot.as_mut().poll(cx)))
+            .await
+            .is_pending());
+        state.restream_desired = true;
+        state.selected_protocol = RestreamProtocol::Srt;
+        state.recording_report = Some("transition completed".into());
+        drop(state);
+        let snapshot = snapshot.await;
+        assert!(snapshot.playback_desired && snapshot.desired);
+        assert_eq!(snapshot.selected_protocol, RestreamProtocol::Srt);
+        assert_eq!(
+            snapshot.recording_report.as_deref(),
+            Some("transition completed")
+        );
     }
 }

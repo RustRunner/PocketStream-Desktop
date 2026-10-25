@@ -1,0 +1,114 @@
+cargo : warn: could not canonicalize path C:\Users\joshu
+At line:73 char:1
++ cargo test --manifest-path src-tauri/Cargo.toml --lib --locked stream ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warn: could not... C:\Users\joshu:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+   Compiling pocketstream-desktop v0.6.7 (C:\Users\joshu\PocketStream-Desktop\src-tauri)
+error[E0425]: cannot find function `init_gstreamer` in this scope
+    --> src\streaming\mod.rs:5516:5
+     |
+5516 |     init_gstreamer();
+     |     ^^^^^^^^^^^^^^ not found in this scope
+     |
+note: these functions exist but are inaccessible
+    --> src\streaming\rtsp_server.rs:1023:5
+     |
+1023 |     fn init_gstreamer() {
+     |     ^^^^^^^^^^^^^^^^^^^ `crate::streaming::rtsp_server::tests::init_gstreamer`: not accessible
+     |
+    ::: src\streaming\srt_server.rs:1063:5
+     |
+1063 |     fn init_gstreamer() {
+     |     ^^^^^^^^^^^^^^^^^^^ `crate::streaming::srt_server::tests::init_gstreamer`: not accessible
+     |
+    ::: src\streaming\mod.rs:3623:5
+     |
+3623 |     fn init_gstreamer() {
+     |     ^^^^^^^^^^^^^^^^^^^ `crate::streaming::tests::init_gstreamer`: not accessible
+
+error[E0425]: cannot find function `restream_test_settings` in this scope
+    --> src\streaming\mod.rs:5518:20
+     |
+5518 |     let settings = restream_test_settings(RestreamProtocol::Rtsp);
+     |                    ^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+     |
+note: function `crate::streaming::tests::restream_test_settings` exists but is inaccessible
+    --> src\streaming\mod.rs:4150:5
+     |
+4150 |     fn restream_test_settings(protocol: RestreamProtocol) -> AppSettings {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not accessible
+
+error[E0425]: cannot find function `init_gstreamer` in this scope
+    --> src\streaming\mod.rs:5541:5
+     |
+5541 |     init_gstreamer();
+     |     ^^^^^^^^^^^^^^ not found in this scope
+     |
+note: these functions exist but are inaccessible
+    --> src\streaming\rtsp_server.rs:1023:5
+     |
+1023 |     fn init_gstreamer() {
+     |     ^^^^^^^^^^^^^^^^^^^ `crate::streaming::rtsp_server::tests::init_gstreamer`: not accessible
+     |
+    ::: src\streaming\srt_server.rs:1063:5
+     |
+1063 |     fn init_gstreamer() {
+     |     ^^^^^^^^^^^^^^^^^^^ `crate::streaming::srt_server::tests::init_gstreamer`: not accessible
+     |
+    ::: src\streaming\mod.rs:3623:5
+     |
+3623 |     fn init_gstreamer() {
+     |     ^^^^^^^^^^^^^^^^^^^ `crate::streaming::tests::init_gstreamer`: not accessible
+
+error[E0425]: cannot find function `restream_test_settings` in this scope
+    --> src\streaming\mod.rs:5543:20
+     |
+5543 |     let settings = restream_test_settings(RestreamProtocol::Rtsp);
+     |                    ^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+     |
+note: function `crate::streaming::tests::restream_test_settings` exists but is inaccessible
+    --> src\streaming\mod.rs:4150:5
+     |
+4150 |     fn restream_test_settings(protocol: RestreamProtocol) -> AppSettings {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not accessible
+
+error[E0425]: cannot find function `seed_desired_relay_state` in this scope
+    --> src\streaming\mod.rs:5544:5
+     |
+5544 |     seed_desired_relay_state(&manager, &settings, RelayState::Failed).await;
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+     |
+note: function `crate::streaming::tests::seed_desired_relay_state` exists but is inaccessible
+    --> src\streaming\mod.rs:4261:5
+     |
+4261 | /     async fn seed_desired_relay_state(
+4262 | |         manager: &StreamManager,
+4263 | |         settings: &AppSettings,
+4264 | |         relay_state: RelayState,
+...    |
+4297 | |         state.restream_start_time = Some(std::time::Instant::now());
+4298 | |     }
+     | |_____^ not accessible
+
+error[E0425]: cannot find function `seed_desired_relay_state` in this scope
+    --> src\streaming\mod.rs:5552:5
+     |
+5552 |     seed_desired_relay_state(&manager, &settings, RelayState::Recovering).await;
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+     |
+note: function `crate::streaming::tests::seed_desired_relay_state` exists but is inaccessible
+    --> src\streaming\mod.rs:4261:5
+     |
+4261 | /     async fn seed_desired_relay_state(
+4262 | |         manager: &StreamManager,
+4263 | |         settings: &AppSettings,
+4264 | |         relay_state: RelayState,
+...    |
+4297 | |         state.restream_start_time = Some(std::time::Instant::now());
+4298 | |     }
+     | |_____^ not accessible
+
+For more information about this error, try `rustc --explain E0425`.
+error: could not compile `pocketstream-desktop` (lib test) due to 6 previous errors

@@ -3,8 +3,6 @@ use std::sync::OnceLock;
 
 pub(crate) trait AppBridge: Send + Sync {
     fn emit(&self, event: &str, payload: serde_json::Value) -> Result<(), String>;
-    // Video surface extraction is pending in slices 7–10.
-    #[allow(dead_code)]
     fn run_on_main_thread(&self, work: Box<dyn FnOnce() + Send>) -> Result<(), String>;
 }
 
