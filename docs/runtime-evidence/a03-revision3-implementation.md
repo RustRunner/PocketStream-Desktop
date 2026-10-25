@@ -77,3 +77,15 @@ scenario movements are recorded below as implementation progresses.
    AppHandle use. Gates: 797 Rust passed / 10 ignored; 205 frontend passed;
    fmt, Clippy, typecheck, contracts and build passed.
 
+
+5. DiscoverySession owns generation/clock, legacy ARP map and adopt/watchdog
+   handles; adoption loop/probes moved into adopt_loop.rs with concrete owner
+   dependencies. Presence owns verification execution without service lookups.
+   The verified liveness no-op and both callers were removed; live liveness
+   stamping remains. Existing watchdog/fence/evidence tests moved by name.
+   Added cooperative stop-order/clock retirement and aborted-caller paired-event
+   regressions. The sweep still starts after 500 ms and uses its existing fence;
+   no sweep join/abort was added. Native drain and best-effort temporary cleanup
+   remain at the facade. Gates: 799 Rust passed / 10 ignored; 205 frontend
+   passed; fmt, Clippy, typecheck, contracts and build passed.
+

@@ -1,5 +1,10 @@
 //! Selected-adapter presence scheduling, independent of capture sessions.
-use std::collections::HashMap;
+use super::adopt_loop::{AdoptionCtx, ProbeOrigin, RealProbeIo};
+use super::{
+    device_registry, interface, log_value, parse_mac_bytes, presence_target_is_host,
+    subnet_key_for, AppError, ArpDevice,
+};
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -852,4 +857,196 @@ mod tests {
             assert_eq!(r.snapshot().len(), 1);
         }
     }
+}
+
+#[derive(Clone)]
+pub(super) struct PresenceDeps {
+    pub(super) owners: super::discovery_session::DiscoveryDeps,
+    pub(super) session: Arc<super::discovery_session::DiscoverySession>,
+}
+pub(super) async fn run_presence_job(
+    deps: PresenceDeps,
+    job: Job,
+    snapshot: Snapshot,
+) -> Option<String> {
+    let adapter = snapshot.adapter.as_ref()?;
+    if snapshot.fence.is_stale() {
+        return None;
+    }
+    let address_fence = deps.owners.bindings.address_fence();
+    if job.source.is_none() && address_fence.is_stale() {
+        return None;
+    }
+    let _address = if job.source.is_none() {
+        Some(deps.owners.bindings.address_work.lock().await)
+    } else {
+        None
+    };
+    if snapshot.fence.is_stale() || (job.source.is_none() && address_fence.is_stale()) {
+        return None;
+    }
+    if presence_target_is_host(&job, adapter, &interface::local_adapter_macs()) {
+        return None;
+    }
+    // Even a prefix also used by Wi-Fi may contain an Ethernet peer.
+    // Foreign candidates still require mode-gated scratch work and fresh
+    // selected-index resolution below; a Wi-Fi-only sender cannot promote.
+    let emitter = deps.owners.emitter.clone();
+    let ctx = AdoptionCtx {
+        sweep: deps.owners.sweep(&deps.session),
+        iface_name: adapter.name.clone(),
+        adapter_mac: adapter.mac.clone(),
+        interface_index: snapshot.index,
+        candidates: deps
+            .owners
+            .capture
+            .candidate_ingress(snapshot.index, parse_mac_bytes(&adapter.mac)),
+        config: deps.owners.config.clone(),
+        bridge: deps.owners.bridge.clone(),
+        bindings: deps.owners.bindings.clone(),
+        adopted: deps.owners.bindings.adopted_ips.clone(),
+        pending_ips: deps.owners.bindings.pending_ips.clone(),
+        adoption_seq: deps.owners.bindings.adoption_seq.clone(),
+        liveness: deps.owners.bindings.adoption_liveness.clone(),
+        meta: deps.owners.bindings.adopted_meta.clone(),
+        devices: deps.session.arp_devices.clone(),
+        registry: deps.owners.registry.clone(),
+        emitter: emitter.clone(),
+        fence: snapshot.fence.clone(),
+        address_fence,
+        local_macs: deps.owners.selector.local_macs.clone(),
+    };
+    let mut cooldowns = HashMap::new();
+    let mut known_subnets = HashSet::new();
+    let (_tx, shutdown) = tokio::sync::watch::channel(false);
+    let mut io = RealProbeIo {
+        ctx: &ctx,
+        cooldowns: &mut cooldowns,
+        known_subnets: &mut known_subnets,
+        shutdown_rx: &shutdown,
+        scratch_id: None,
+        stop: false,
+        origin: ProbeOrigin::CacheProbe,
+    };
+    let proof = verify(&mut io, &job, &snapshot).await?;
+    log::debug!("event=evidence adapter_mac={} interface_index={} identity={} ip={} evidence_age_ms={} origin=presence",
+        log_value(&adapter.mac), snapshot.index, log_value(&proof.mac), proof.ip, proof.at.elapsed().as_millis());
+    let mutation_fence = ctx.address_fence.clone();
+    drop(_address);
+    let cache_deps = deps.clone();
+    let fence = snapshot.fence.clone();
+    let adapter_mac = adapter.mac.clone();
+    let commit_fence = fence.clone();
+    let key = tokio::task::spawn_blocking(move || {
+        let config = cache_deps.owners.config.clone();
+        if commit_fence.is_stale() || mutation_fence.is_stale() || proof.at.elapsed() >= FRESHNESS {
+            arp::note_fence_drop("presence_commit");
+            return None;
+        }
+        let registry = cache_deps.owners.registry.clone();
+        if job
+            .key
+            .as_ref()
+            .is_some_and(|key| !registry.snapshot().iter().any(|r| r.mac == *key))
+        {
+            return None;
+        }
+        let device = ArpDevice {
+            mac: proof.mac.clone(),
+            ip: proof.ip.to_string(),
+            subnet: subnet_key_for(proof.ip),
+            first_seen: proof.wall.clone(),
+            last_seen: proof.wall.clone(),
+        };
+        let pin = config.get_manual_nodes().into_iter().find(|n| {
+            n.ip == device.ip
+                && job.key.as_ref().is_some_and(|key| {
+                    key == &crate::config::manual_node_key(n) || key == &format!("manual:{}", n.ip)
+                })
+        });
+        let result = if let Some(node) = pin {
+            merge_manual_verified(
+                &registry,
+                &config,
+                &node.ip,
+                &device,
+                &adapter_mac,
+                &proof.wall,
+                &commit_fence,
+            )
+            .ok()?
+        } else {
+            registry.merge_verified(&device, &adapter_mac, &proof.wall, &commit_fence)
+        };
+        if !result.changed || commit_fence.is_stale() || mutation_fence.is_stale() {
+            return None;
+        }
+        registry.remember_verified_at(&proof.mac, &proof.wall, proof.at, &commit_fence);
+        let key = registry
+            .snapshot()
+            .iter()
+            .find(|r| r.mac.eq_ignore_ascii_case(&proof.mac))?
+            .mac
+            .clone();
+        if let Some(row) = registry.cache_record(&key) {
+            if let Err(e) = config.upsert_cached_device_fenced(row, Some(&commit_fence)) {
+                log::warn!("Presence cache write failed: {e}");
+            }
+        }
+        if commit_fence.is_stale() || mutation_fence.is_stale() || proof.at.elapsed() >= FRESHNESS {
+            return None;
+        }
+        let target = config.get().stream.camera_mac;
+        if target
+            .as_ref()
+            .is_some_and(|m| m.eq_ignore_ascii_case(&proof.mac))
+        {
+            cache_deps.owners.selector.presence.verified.notify_one();
+        }
+        Some(key)
+    })
+    .await
+    .ok()
+    .flatten()?;
+    deps.owners
+        .bindings
+        .note_verified_liveness(job_ip_from_key(&deps.owners.registry, &key)?, &fence)
+        .await;
+    emitter.poke();
+    Some(key)
+}
+/// S5a calls this only after fresh selected-adapter verification. Persist
+/// the first manual binding before exposing it as a verified identity.
+#[allow(dead_code)]
+pub(crate) fn merge_manual_verified(
+    registry: &DeviceRegistry,
+    config: &crate::config::AppConfig,
+    ip: &str,
+    device: &ArpDevice,
+    adapter: &str,
+    verified_at: &str,
+    fence: &SweepFence,
+) -> Result<device_registry::MergeResult, AppError> {
+    if ip != device.ip
+        || fence.is_stale()
+        || !DeviceRegistry::verification_valid(device, adapter, verified_at)
+    {
+        return Ok(device_registry::MergeResult::default());
+    }
+    let mac = device_registry::canonical_mac(&device.mac).expect("validated MAC");
+    let node = config.bind_manual_node(ip, &mac, fence)?;
+    let mut result = registry.merge_manual_verified(&node, device, adapter, verified_at, fence);
+    if !fence.is_stale() {
+        result.changed |= !registry.normalize_role_duplicates(None).is_empty();
+    }
+    Ok(result)
+}
+fn job_ip_from_key(registry: &DeviceRegistry, key: &str) -> Option<Ipv4Addr> {
+    registry
+        .snapshot()
+        .iter()
+        .find(|r| r.mac == key)?
+        .ip
+        .parse()
+        .ok()
 }

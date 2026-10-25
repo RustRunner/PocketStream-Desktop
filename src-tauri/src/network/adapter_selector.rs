@@ -13,6 +13,57 @@ pub(super) struct AdapterSelector {
 }
 
 impl AdapterSelector {
+    pub(crate) async fn start_presence(&self, deps: presence::PresenceDeps) {
+        let mut handle = self.presence_handle.lock().await;
+        if handle.is_some() {
+            return;
+        }
+        deps.owners.registry.set_verification_scope(None);
+        let emitter = deps.owners.emitter.clone();
+        let control = self.presence.clone();
+        let registry = deps.owners.registry.clone();
+        let candidates = deps.owners.capture.candidates.clone();
+        *handle = Some(tokio::spawn(async move {
+            let mut clock = presence::Clock::default();
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+            loop {
+                if control.stopped() {
+                    break;
+                }
+                if let Some(selection) = control.observe_link(interface::quick_link_by_mac) {
+                    watcher::emit_link_change(
+                        deps.owners.bridge.as_ref(),
+                        &deps.owners.selector,
+                        &selection,
+                    );
+                }
+                if control.tick(&registry) {
+                    emitter.poke();
+                }
+                let snapshot = control.snapshot();
+                let observations = candidates.snapshot(std::time::Instant::now());
+                if let Some(job) = clock.next(&snapshot, &registry.snapshot(), &observations) {
+                    let work = presence::run_presence_job(deps.clone(), job, snapshot);
+                    tokio::pin!(work);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = tick.tick() => {
+                                if let Some(selection) = control.observe_link(interface::quick_link_by_mac) {
+                                    watcher::emit_link_change(deps.owners.bridge.as_ref(), &deps.owners.selector, &selection);
+                                }
+                                if control.tick(&registry) { emitter.poke(); }
+                            }
+                            result = &mut work => { if let Some(key) = result { clock.verified(&key); } break; }
+                            _ = control.wake.notified() => { if control.tick(&registry) { emitter.poke(); } }
+                        }
+                    }
+                } else {
+                    tokio::select! { _ = tick.tick() => {}, _ = control.wake.notified() => {} }
+                }
+            }
+        }));
+    }
     /// Current selected-adapter addresses from IP Helper, never the saved map.
     pub(super) fn probe_scope(
         &self,

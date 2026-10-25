@@ -1003,8 +1003,6 @@ async fn on_arp_seen(
         is_new
     };
 
-    super::note_positive_liveness_fenced(ip, fence).await;
-
     // Merge into the canonical registry outside the `devices` lock.
     // Other identities at the same IP stay inactive with their own aliases.
     let result = match verified_by {

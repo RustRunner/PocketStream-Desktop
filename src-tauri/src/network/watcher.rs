@@ -45,7 +45,11 @@ pub(crate) fn emit_selection(handle: &AppHandle, selection: &AdapterSelection) {
 /// The existing 250ms native observer can see a cable before Windows sends an
 /// IP-interface notification. Wake this same worker instead of leaving capture
 /// activation/reconciliation waiting for the five-second retry timer.
-pub(crate) fn emit_link_change(handle: &AppHandle, selection: &AdapterSelection) {
+pub(super) fn emit_link_change(
+    bridge: &dyn crate::bridge::AppBridge,
+    selector: &super::adapter_selector::AdapterSelector,
+    selection: &AdapterSelection,
+) {
     log::info!(
         "event=ethernet_link adapter_mac={} interface_index={} link_up={}",
         super::log_value(selection.selected_mac.as_deref().unwrap_or("unknown")),
@@ -55,7 +59,13 @@ pub(crate) fn emit_link_change(handle: &AppHandle, selection: &AdapterSelection)
             .as_ref()
             .is_some_and(|adapter| adapter.is_up)
     );
-    emit_selection(handle, selection);
+    selector.observe(selection);
+    let _ = crate::bridge::emit(bridge, "adapter-selection-changed", selection);
+    let _ = crate::bridge::emit(
+        bridge,
+        "interface-status-changed",
+        &selected_status(selection),
+    );
     #[cfg(target_os = "windows")]
     imp::wake(2);
 }
