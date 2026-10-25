@@ -59,7 +59,7 @@ pub async fn select_adapter(
 ) -> Result<crate::network::AdapterSelection, AppError> {
     #[cfg(windows)]
     {
-        let _ = (&manager, &config);
+        let _ = (&manager, &config, &app);
         crate::network::native_operations::select_request(app, mac).await
     }
     #[cfg(not(windows))]
@@ -94,8 +94,14 @@ pub async fn add_secondary_ip(
     };
     #[cfg(windows)]
     {
-        let _ = (&manager, &config);
-        crate::network::native_operations::address_request(app, request).await
+        let _ = (&manager, &config, &app);
+        crate::network::native_operations::address_request(
+            manager.inner().clone(),
+            config.inner().clone(),
+            manager.event_bridge(),
+            request,
+        )
+        .await
     }
     #[cfg(not(windows))]
     {
@@ -120,8 +126,14 @@ pub async fn remove_secondary_ip(
     };
     #[cfg(windows)]
     {
-        let _ = (&manager, &config);
-        crate::network::native_operations::address_request(app, request).await
+        let _ = (&manager, &config, &app);
+        crate::network::native_operations::address_request(
+            manager.inner().clone(),
+            config.inner().clone(),
+            manager.event_bridge(),
+            request,
+        )
+        .await
     }
     #[cfg(not(windows))]
     {
@@ -152,7 +164,7 @@ pub async fn set_network_mode(
 ) -> Result<crate::network::ModeTransitionReply, AppError> {
     #[cfg(windows)]
     {
-        let _ = (&manager, &config);
+        let _ = (&manager, &config, &app);
         crate::network::native_operations::mode_request(app, request).await
     }
     #[cfg(not(windows))]
@@ -272,8 +284,14 @@ pub async fn refresh_adapter(
     };
     #[cfg(windows)]
     {
-        let _ = (&manager, &config);
-        crate::network::native_operations::refresh_request(app, name, mode).await
+        let _ = (&manager, &config, &app);
+        crate::network::native_operations::refresh_request(
+            manager.inner().clone(),
+            config.inner().clone(),
+            name,
+            mode,
+        )
+        .await
     }
     #[cfg(not(windows))]
     {
@@ -393,9 +411,11 @@ pub async fn remove_adopted_subnet(
 ) -> Result<crate::network::manual_address::AddressReply, AppError> {
     #[cfg(windows)]
     {
-        let _ = (&manager, &config);
+        let _ = (&manager, &config, &app);
         crate::network::native_operations::address_request(
-            app,
+            manager.inner().clone(),
+            config.inner().clone(),
+            manager.event_bridge(),
             crate::network::manual_address::AddressRequest::RemoveSaved {
                 subnet,
                 hint: iface_hint,

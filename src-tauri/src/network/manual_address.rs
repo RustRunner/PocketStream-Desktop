@@ -93,7 +93,7 @@ struct Transaction {
 impl Transaction {
     fn reply(
         self,
-        manager: &NetworkManager,
+        selector: &adapter_selector::AdapterSelector,
         config: &AppConfig,
         pending: &HashSet<String>,
     ) -> AddressReply {
@@ -119,8 +119,7 @@ impl Transaction {
         } else {
             // No empty-success fallback. Unknown addresses are explicitly marked;
             // the consumer retains its last known view until a fresh event/read.
-            let cached = manager
-                .selector
+            let cached = selector
                 .adapter_selection
                 .try_lock()
                 .ok()
@@ -176,104 +175,7 @@ impl Transaction {
     }
 }
 
-impl NetworkManager {
-    /// One admission timeout covers both locks. Guards already acquired, including
-    /// the pause guard, are dropped on timeout. Nothing is queued after Busy.
-    pub async fn address_operation(
-        &self,
-        config: &AppConfig,
-        request: AddressRequest,
-    ) -> AddressReply {
-        let removing = !matches!(&request, AddressRequest::Add { .. });
-        let primary_removal = matches!(&request, AddressRequest::RemovePrimary { .. });
-        let (action, address) = match &request {
-            AddressRequest::Add { ip, .. } => ("add", ip.clone()),
-            AddressRequest::RemoveManual { ip, .. } | AddressRequest::RemovePrimary { ip, .. } => {
-                ("remove_manual", ip.clone())
-            }
-            AddressRequest::RemoveSaved { subnet, .. } => ("remove_managed", subnet.clone()),
-        };
-        let fence = self.selector.presence.snapshot().fence;
-        let initial = config.get();
-        let mut tx = Transaction {
-            trace: AddressTrace::new(action, &address),
-            mac: initial.selected_adapter_mac,
-            mode: initial.network_mode,
-            address,
-            prefix: None,
-            subnet: None,
-            row: None,
-            observed: None,
-            observation_error: None,
-            intent_saved: false,
-            outcome: AddressOutcome::Failed,
-            reason: None,
-        };
-        let admitted = tokio::time::timeout(Duration::from_secs(10), async {
-            let op = self.discovery_op.lock().await;
-            let pause = self.pause_addresses();
-            let address = self.address_work.lock().await;
-            (op, pause, address)
-        })
-        .await;
-        let Ok((_op, _pause, _address)) = admitted else {
-            tx.trace.phase("admission_timeout");
-            tx.outcome = AddressOutcome::Busy;
-            tx.reason = Some("Waiting for current network operation; try again".into());
-            tx.observation_error = tx.reason.clone();
-            return tx.reply(self, config, &HashSet::new());
-        };
-        tx.trace.phase("admission");
-        if let Err(error) = self.address_io.check_writes_available() {
-            tx.outcome = AddressOutcome::Busy;
-            tx.reason = Some(error.to_string());
-            return tx.reply(self, config, &HashSet::new());
-        }
-        let result = match self.validate_operation_context(config, &tx, &fence) {
-            Ok(()) => {
-                self.run_address_operation(config, request, &fence, &mut tx)
-                    .await
-            }
-            Err(error) => Err(error),
-        };
-        if let Err(error) = result {
-            let reason = error.to_string();
-            if tx.observed.is_none() {
-                tx.observation_error = Some(reason.clone());
-            }
-            if tx.intent_saved {
-                if let (Some(subnet), Some(mut row)) = (tx.subnet.as_deref(), tx.row.clone()) {
-                    row.last_error = Some(reason.clone());
-                    tx.row = Some(self.publish_binding(config, subnet, row).await);
-                    tx.trace.phase("status_save");
-                }
-                tx.outcome = AddressOutcome::Pending;
-            }
-            tx.reason = Some(reason);
-        }
-        if tx.outcome == AddressOutcome::Success
-            && removing
-            && (primary_removal
-                || config
-                    .get()
-                    .primary_addresses
-                    .get(tx.mac.as_deref().unwrap_or(""))
-                    .is_some_and(|cidr| cidr.split('/').next() == Some(tx.address.as_str())))
-        {
-            if let Err(error) =
-                self.address_io
-                    .persist_primary(config, tx.mac.as_deref().unwrap(), "")
-            {
-                tx.outcome = AddressOutcome::Failed;
-                tx.reason = Some(error.to_string());
-            }
-        }
-        if tx.outcome == AddressOutcome::Success {
-            tx.trace.succeeded();
-        }
-        tx.reply(self, config, &self.pending_ip_strings().await)
-    }
-
+impl binding_store::BindingStore {
     async fn run_address_operation(
         &self,
         config: &AppConfig,
@@ -905,6 +807,110 @@ fn requested_state(snapshot: &OperationSnapshot, ip: &str, prefix: Option<u8>, a
     }
 }
 
+impl NetworkManager {
+    /// One admission timeout covers both locks. Guards already acquired, including
+    /// the pause guard, are dropped on timeout. Nothing is queued after Busy.
+    pub async fn address_operation(
+        &self,
+        config: &AppConfig,
+        request: AddressRequest,
+    ) -> AddressReply {
+        let removing = !matches!(&request, AddressRequest::Add { .. });
+        let primary_removal = matches!(&request, AddressRequest::RemovePrimary { .. });
+        let (action, address) = match &request {
+            AddressRequest::Add { ip, .. } => ("add", ip.clone()),
+            AddressRequest::RemoveManual { ip, .. } | AddressRequest::RemovePrimary { ip, .. } => {
+                ("remove_manual", ip.clone())
+            }
+            AddressRequest::RemoveSaved { subnet, .. } => ("remove_managed", subnet.clone()),
+        };
+        let fence = self.selector.presence.snapshot().fence;
+        let initial = config.get();
+        let mut tx = Transaction {
+            trace: AddressTrace::new(action, &address),
+            mac: initial.selected_adapter_mac,
+            mode: initial.network_mode,
+            address,
+            prefix: None,
+            subnet: None,
+            row: None,
+            observed: None,
+            observation_error: None,
+            intent_saved: false,
+            outcome: AddressOutcome::Failed,
+            reason: None,
+        };
+        let admitted = tokio::time::timeout(Duration::from_secs(10), async {
+            let op = self.discovery_op.lock().await;
+            let pause = self.bindings.pause_addresses();
+            let address = self.bindings.address_work.lock().await;
+            (op, pause, address)
+        })
+        .await;
+        let Ok((_op, _pause, _address)) = admitted else {
+            tx.trace.phase("admission_timeout");
+            tx.outcome = AddressOutcome::Busy;
+            tx.reason = Some("Waiting for current network operation; try again".into());
+            tx.observation_error = tx.reason.clone();
+            return tx.reply(&self.selector, config, &HashSet::new());
+        };
+        tx.trace.phase("admission");
+        if let Err(error) = self.bindings.address_io.check_writes_available() {
+            tx.outcome = AddressOutcome::Busy;
+            tx.reason = Some(error.to_string());
+            return tx.reply(&self.selector, config, &HashSet::new());
+        }
+        let result = match self
+            .bindings
+            .validate_operation_context(config, &tx, &fence)
+        {
+            Ok(()) => {
+                self.bindings
+                    .run_address_operation(config, request, &fence, &mut tx)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            let reason = error.to_string();
+            if tx.observed.is_none() {
+                tx.observation_error = Some(reason.clone());
+            }
+            if tx.intent_saved {
+                if let (Some(subnet), Some(mut row)) = (tx.subnet.as_deref(), tx.row.clone()) {
+                    row.last_error = Some(reason.clone());
+                    tx.row = Some(self.bindings.publish_binding(config, subnet, row).await);
+                    tx.trace.phase("status_save");
+                }
+                tx.outcome = AddressOutcome::Pending;
+            }
+            tx.reason = Some(reason);
+        }
+        if tx.outcome == AddressOutcome::Success
+            && removing
+            && (primary_removal
+                || config
+                    .get()
+                    .primary_addresses
+                    .get(tx.mac.as_deref().unwrap_or(""))
+                    .is_some_and(|cidr| cidr.split('/').next() == Some(tx.address.as_str())))
+        {
+            if let Err(error) =
+                self.bindings
+                    .address_io
+                    .persist_primary(config, tx.mac.as_deref().unwrap(), "")
+            {
+                tx.outcome = AddressOutcome::Failed;
+                tx.reason = Some(error.to_string());
+            }
+        }
+        if tx.outcome == AddressOutcome::Success {
+            tx.trace.succeeded();
+        }
+        tx.reply(&self.selector, config, &self.pending_ip_strings().await)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1078,8 +1084,9 @@ mod tests {
                     .primary_addresses
                     .insert("40:cd:3a:00:00:01".into(), "192.0.2.10/24".into());
             }
-            *m.adopted_meta.lock().unwrap() = c.get().adopted_meta.clone();
-            m.adopted_ips
+            *m.bindings.adopted_meta.lock().unwrap() = c.get().adopted_meta.clone();
+            m.bindings
+                .adopted_ips
                 .lock()
                 .await
                 .insert(TARGET.into(), IP.parse().unwrap());
@@ -1101,8 +1108,8 @@ mod tests {
             assert_eq!(result.view.subnet.as_deref(), Some(TARGET));
             assert!(result.view.binding.is_none());
             assert!(result.view.observation_error.is_none());
-            assert!(!m.adopted_meta.lock().unwrap().contains_key(TARGET));
-            assert!(!m.adopted_ips.lock().await.contains_key(TARGET));
+            assert!(!m.bindings.adopted_meta.lock().unwrap().contains_key(TARGET));
+            assert!(!m.bindings.adopted_ips.lock().await.contains_key(TARGET));
             assert!(io.os.writes.lock().unwrap().is_empty());
             assert_eq!(io.os.reads.load(Ordering::Relaxed), 2);
             assert_eq!(io.saves.load(Ordering::Relaxed), 1);
@@ -1112,7 +1119,7 @@ mod tests {
                 crate::config::test_support::serialize_for_test(&restarted),
                 crate::config::test_support::serialize_for_test(&expected),
             );
-            m.reconcile_bindings_locked(&c).await;
+            m.bindings.reconcile_bindings_locked(&c).await;
             assert!(!c.get().adopted_meta.contains_key(TARGET));
             assert!(!io.os.writes.lock().unwrap().iter().any(|(_, ip)| ip == IP));
         }
@@ -1277,15 +1284,21 @@ mod tests {
                     c
                 };
                 let manager = NetworkManager::with_address_io(io.clone());
-                *manager.adopted_meta.lock().unwrap() = c.get().adopted_meta.clone();
+                *manager.bindings.adopted_meta.lock().unwrap() = c.get().adopted_meta.clone();
                 let session = adoption_test_fence();
-                let address = manager.address_fence();
+                let address = manager.bindings.address_fence();
                 manager
+                    .bindings
                     .prepare_subnet_adoption(&c, TARGET, "40:cd:3a:00:00:01", 7, &session, &address)
                     .await
                     .unwrap();
                 assert!(!c.get().adopted_meta.contains_key(TARGET));
-                assert!(!manager.adopted_meta.lock().unwrap().contains_key(TARGET));
+                assert!(!manager
+                    .bindings
+                    .adopted_meta
+                    .lock()
+                    .unwrap()
+                    .contains_key(TARGET));
                 assert!(c.get().adopted_subnets.is_empty());
                 assert_eq!(c.get().primary_addresses, before.primary_addresses);
                 assert_eq!(*io.os.writes.lock().unwrap(), [(false, IP.into())]);
@@ -1361,7 +1374,7 @@ mod tests {
                 settings.adopted_meta.insert(TARGET.into(), row.clone());
             }
             assert!(
-                m.prepare_subnet_adoption(&c, TARGET, "40:cd:3a:00:00:01", 7, &session, &address,)
+                m.bindings.prepare_subnet_adoption(&c, TARGET, "40:cd:3a:00:00:01", 7, &session, &address,)
                     .await
                     .is_err(),
                 "case {case}"
@@ -1389,14 +1402,16 @@ mod tests {
         io.fail_save.store(saves + 1, Ordering::Relaxed);
         let fence = adoption_test_fence();
         assert!(m
+            .bindings
             .prepare_subnet_adoption(&c, TARGET, "40:cd:3a:00:00:01", 7, &fence, &fence,)
             .await
             .is_err());
         assert_eq!(c.get().adopted_meta[TARGET], before);
-        assert_eq!(m.adopted_meta.lock().unwrap()[TARGET], before);
+        assert_eq!(m.bindings.adopted_meta.lock().unwrap()[TARGET], before);
         assert_eq!(*io.os.writes.lock().unwrap(), [(false, IP.into())]);
         io.fail_save.store(0, Ordering::Relaxed);
-        m.prepare_subnet_adoption(&c, TARGET, "40:cd:3a:00:00:01", 7, &fence, &fence)
+        m.bindings
+            .prepare_subnet_adoption(&c, TARGET, "40:cd:3a:00:00:01", 7, &fence, &fence)
             .await
             .unwrap();
         assert!(!c.get().adopted_meta.contains_key(TARGET));
@@ -1429,11 +1444,15 @@ mod tests {
                 if reverse {
                     io.os.table.lock().unwrap()[0].ips.reverse();
                 }
-                let before = m.operation_snapshot(&c).await.unwrap();
+                let before = m.bindings.operation_snapshot(&c).await.unwrap();
                 let request = primary_request(Some(&format!("{old}/24")));
-                let previous = m.primary_to_replace(&c, &before, &request).unwrap();
+                let previous = m
+                    .bindings
+                    .primary_to_replace(&c, &before, &request)
+                    .unwrap();
                 establish_new_primary(&io);
-                m.finish_primary_change(&c, &before, &request, previous)
+                m.bindings
+                    .finish_primary_change(&c, &before, &request, previous)
                     .await
                     .unwrap();
                 assert_eq!(*io.os.writes.lock().unwrap(), vec![(false, old.into())]);
@@ -1456,11 +1475,12 @@ mod tests {
                         BindingDesired::Present
                     );
                 }
-                let snapshot = m.operation_snapshot(&c).await.unwrap();
+                let snapshot = m.bindings.operation_snapshot(&c).await.unwrap();
                 let mut next = primary_request(None);
                 next.ip = Some("203.0.113.10".into());
                 assert_eq!(
-                    m.primary_to_replace(&c, &snapshot, &next)
+                    m.bindings
+                        .primary_to_replace(&c, &snapshot, &next)
                         .unwrap()
                         .unwrap()
                         .address,
@@ -1474,11 +1494,15 @@ mod tests {
     async fn unknown_or_unestablished_primary_never_removes_the_old_address() {
         for fail_native in [false, true] {
             let (m, c, io) = fixture(1);
-            let before = m.operation_snapshot(&c).await.unwrap();
+            let before = m.bindings.operation_snapshot(&c).await.unwrap();
             let request = primary_request(Some("192.0.2.10/24"));
-            let previous = m.primary_to_replace(&c, &before, &request).unwrap();
+            let previous = m
+                .bindings
+                .primary_to_replace(&c, &before, &request)
+                .unwrap();
             io.os.fail_read.store(fail_native, Ordering::Relaxed);
             assert!(m
+                .bindings
                 .finish_primary_change(&c, &before, &request, previous)
                 .await
                 .is_err());
@@ -1491,9 +1515,12 @@ mod tests {
     async fn primary_replacement_save_errors_and_failed_deletes_are_not_success() {
         for case in 0..7 {
             let (m, c, io) = fixture(1);
-            let before = m.operation_snapshot(&c).await.unwrap();
+            let before = m.bindings.operation_snapshot(&c).await.unwrap();
             let request = primary_request(Some(&format!("{IP}/24")));
-            let previous = m.primary_to_replace(&c, &before, &request).unwrap();
+            let previous = m
+                .bindings
+                .primary_to_replace(&c, &before, &request)
+                .unwrap();
             establish_new_primary(&io);
             match case {
                 0..=3 => io.fail_save.store(case + 1, Ordering::Relaxed),
@@ -1502,7 +1529,8 @@ mod tests {
                 _ => *io.os.effect.lock().unwrap() = Effect::TimeoutAfter,
             }
             assert!(
-                m.finish_primary_change(&c, &before, &request, previous)
+                m.bindings
+                    .finish_primary_change(&c, &before, &request, previous)
                     .await
                     .is_err(),
                 "case {case}"
@@ -1528,11 +1556,13 @@ mod tests {
     #[tokio::test]
     async fn legacy_ambiguous_primary_requires_a_choice_and_prefix_change_is_refused() {
         let (m, c, io) = fixture(0);
-        let before = m.operation_snapshot(&c).await.unwrap();
+        let before = m.bindings.operation_snapshot(&c).await.unwrap();
         assert!(m
+            .bindings
             .primary_to_replace(&c, &before, &primary_request(None))
             .is_err());
         assert!(m
+            .bindings
             .primary_to_replace(&c, &before, &primary_request(Some("192.0.2.10/25")))
             .is_err());
         assert!(io.os.writes.lock().unwrap().is_empty());
@@ -1548,6 +1578,7 @@ mod tests {
         });
         conflicting.all.push(other);
         assert!(m
+            .bindings
             .primary_to_replace(&c, &conflicting, &primary_request(Some("192.0.2.10/24")))
             .is_err());
         c.settings.lock().unwrap().adopted_meta.insert(
@@ -1560,6 +1591,7 @@ mod tests {
             },
         );
         assert!(m
+            .bindings
             .primary_to_replace(&c, &before, &primary_request(Some("192.0.2.10/24")))
             .is_err());
     }
@@ -1660,13 +1692,13 @@ mod tests {
     async fn sp08_targeted_remove_one_or_three_rows_preserves_unrelated_routes_and_save_order() {
         for count in [1, 3] {
             let (m, c, io) = fixture(count);
-            *m.adopted_ips.lock().await = c
+            *m.bindings.adopted_ips.lock().await = c
                 .get()
                 .adopted_subnets
                 .iter()
                 .map(|(k, v)| (k.clone(), v.parse().unwrap()))
                 .collect();
-            *m.adopted_meta.lock().unwrap() = c.get().adopted_meta.clone();
+            *m.bindings.adopted_meta.lock().unwrap() = c.get().adopted_meta.clone();
             let original = c.get();
             let reply = m.address_operation(&c, removal()).await;
             assert_eq!(reply.outcome, AddressOutcome::Success);
@@ -1691,13 +1723,13 @@ mod tests {
                 .filter(|(s, _)| s.as_str() != TARGET)
             {
                 assert_eq!(now.adopted_meta[subnet], *row);
-                assert_eq!(m.adopted_meta.lock().unwrap()[subnet], *row);
+                assert_eq!(m.bindings.adopted_meta.lock().unwrap()[subnet], *row);
                 assert_eq!(
-                    m.adopted_ips.lock().await[subnet].to_string(),
+                    m.bindings.adopted_ips.lock().await[subnet].to_string(),
                     original.adopted_subnets[subnet]
                 );
             }
-            assert_eq!(m.adopted_ips.lock().await.len(), count - 1);
+            assert_eq!(m.bindings.adopted_ips.lock().await.len(), count - 1);
             assert!(reply
                 .view
                 .selection
@@ -1864,34 +1896,42 @@ mod tests {
             address: IP.into(),
             prefix: 24,
         }];
-        m.pending_ips.lock().await.push(auto_adopt::PendingIp {
-            iface: "Ethernet".into(),
-            ip: IP.parse().unwrap(),
-            adoption_id: 1,
-        });
-        m.pending_ips.lock().await.push(auto_adopt::PendingIp {
-            iface: "Other".into(),
-            ip: IP.parse().unwrap(),
-            adoption_id: 2,
-        });
+        m.bindings
+            .pending_ips
+            .lock()
+            .await
+            .push(auto_adopt::PendingIp {
+                iface: "Ethernet".into(),
+                ip: IP.parse().unwrap(),
+                adoption_id: 1,
+            });
+        m.bindings
+            .pending_ips
+            .lock()
+            .await
+            .push(auto_adopt::PendingIp {
+                iface: "Other".into(),
+                ip: IP.parse().unwrap(),
+                adoption_id: 2,
+            });
         let pending = m.address_operation(&c, removal()).await;
         assert_eq!(pending.outcome, AddressOutcome::Pending);
         assert!(io.os.writes.lock().unwrap().is_empty());
         assert_eq!(c.get().pending_addresses.len(), 1);
-        assert_eq!(m.pending_ips.lock().await.len(), 2);
+        assert_eq!(m.bindings.pending_ips.lock().await.len(), 2);
         let claimed = m.address_operation(&c, addition()).await;
         assert_eq!(claimed.outcome, AddressOutcome::Success);
         assert!(c.get().pending_addresses.is_empty());
         assert!(!c.get().adopted_meta.contains_key(TARGET));
-        assert_eq!(m.pending_ips.lock().await.len(), 1);
-        assert_eq!(m.pending_ips.lock().await[0].iface, "Other");
+        assert_eq!(m.bindings.pending_ips.lock().await.len(), 1);
+        assert_eq!(m.bindings.pending_ips.lock().await[0].iface, "Other");
     }
 
     #[tokio::test(start_paused = true)]
     async fn sp14_two_lock_waits_share_ten_seconds_release_pause_and_enqueue_nothing() {
         let (m, c, io) = fixture(1);
         let held_op = m.discovery_op.lock().await;
-        let held_address = m.address_work.lock().await;
+        let held_address = m.bindings.address_work.lock().await;
         let task = {
             let m = m.clone();
             let c = c.clone();
@@ -1902,12 +1942,12 @@ mod tests {
         c.settings.lock().unwrap().network_mode = NetworkMode::Dhcp;
         drop(held_op);
         tokio::task::yield_now().await;
-        assert!(!m.address_active.load(Ordering::Acquire));
+        assert!(!m.bindings.address_active.load(Ordering::Acquire));
         tokio::time::advance(Duration::from_secs(2)).await;
         let reply = task.await.unwrap();
         assert_eq!(reply.outcome, AddressOutcome::Busy);
         assert_eq!(reply.view.mode, NetworkMode::Dhcp);
-        assert!(m.address_active.load(Ordering::Acquire));
+        assert!(m.bindings.address_active.load(Ordering::Acquire));
         drop(held_address);
         tokio::time::advance(Duration::from_secs(30)).await;
         assert!(io.events.lock().unwrap().is_empty());
@@ -2067,16 +2107,22 @@ mod tests {
             s.adopted_meta.insert(foreign.into(), row);
             s.adopted_subnets.insert(foreign.into(), IP.into());
         }
-        *m.adopted_meta.lock().unwrap() = c.get().adopted_meta.clone();
-        m.adopted_ips
+        *m.bindings.adopted_meta.lock().unwrap() = c.get().adopted_meta.clone();
+        m.bindings
+            .adopted_ips
             .lock()
             .await
             .insert(foreign.into(), IP.parse().unwrap());
         let reply = m.address_operation(&c, addition()).await;
         assert_eq!(reply.outcome, AddressOutcome::Success);
         assert!(c.get().adopted_meta.contains_key(foreign));
-        assert!(m.adopted_meta.lock().unwrap().contains_key(foreign));
-        assert_eq!(m.adopted_ips.lock().await[foreign].to_string(), IP);
+        assert!(m
+            .bindings
+            .adopted_meta
+            .lock()
+            .unwrap()
+            .contains_key(foreign));
+        assert_eq!(m.bindings.adopted_ips.lock().await[foreign].to_string(), IP);
         assert!(!c.get().adopted_meta.contains_key(TARGET));
         assert!(io.os.writes.lock().unwrap().is_empty());
     }

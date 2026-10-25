@@ -12,7 +12,7 @@ const permanent = new Set([
 // moving the existing ones. Network exceptions close by slice 6.
 const temporary = new Map([
   ['network/mod.rs', 15], ['network/arp.rs', 3],
-  ['network/native_operations.rs', 11], ['network/bindings.rs', 1],
+  ['network/native_operations.rs', 7], ['network/bindings.rs', 1],
   ['network/ping_dot.rs', 3], ['streaming/mod.rs', 6],
 ]);
 

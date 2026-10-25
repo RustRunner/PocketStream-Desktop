@@ -54,3 +54,15 @@ scenario movements are recorded below as implementation progresses.
    in slice 5. Gates: 795 Rust passed / 10 ignored; 205 frontend passed; fmt,
    Clippy, typecheck, contracts and build passed. Three focused tests added.
 
+
+3. BindingStore owns AddressIo, address serialization/pause generations, live
+   routes, durable temporary adapters, metadata/liveness and manual helpers.
+   Facade retains timed lifecycle admission and mode/refresh sequencing; helpers
+   run inline within NATIVE_SCOPE. Address/refresh retained adapters now capture
+   owned config/facade/bridge references. Cleanup uses the shared config at the
+   existing capture-initialization guard. Six existing binding scenarios moved;
+   pause-cancellation regression added. Gates: 796 Rust passed / 10 ignored;
+   205 frontend passed; fmt, Clippy, typecheck, contracts and build passed.
+   Existing caller-abort persistence, uncertain barrier, single-budget admission,
+   temporary recovery and managed-drain deadlock regressions remain passing.
+

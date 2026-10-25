@@ -18,10 +18,10 @@ impl super::NetworkManager {
         #[cfg(windows)]
         super::native_operations::check_writes_available()?;
         let _op = self.discovery_op.lock().await;
-        let _pause = self.pause_addresses();
+        let _pause = self.bindings.pause_addresses();
         self.stop_locked().await;
-        let _address = self.address_work.lock().await;
-        let before = self.operation_snapshot(config).await?;
+        let _address = self.bindings.address_work.lock().await;
+        let before = self.bindings.operation_snapshot(config).await?;
         if before.selected.alias != name {
             return Err(AppError::Network(
                 "Selected adapter changed before refresh".into(),

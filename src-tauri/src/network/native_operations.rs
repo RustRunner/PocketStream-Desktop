@@ -395,7 +395,9 @@ fn result_outcome<T>(result: &Result<T, AppError>) -> Outcome {
 }
 
 pub(crate) async fn address_request(
-    app: tauri::AppHandle,
+    manager: Arc<super::NetworkManager>,
+    config: Arc<crate::config::AppConfig>,
+    bridge: Arc<dyn crate::bridge::AppBridge>,
     operation: super::manual_address::AddressRequest,
 ) -> Result<super::manual_address::AddressReply, AppError> {
     request(executor(), move || async move {
@@ -403,12 +405,10 @@ pub(crate) async fn address_request(
             super::manual_address::AddressRequest::RemoveSaved { subnet, .. } => Some(subnet.clone()),
             _ => None,
         };
-        let reply = app.state::<std::sync::Arc<super::NetworkManager>>()
-            .address_operation(&app.state::<std::sync::Arc<crate::config::AppConfig>>(), operation).await;
+        let reply = manager.address_operation(&config, operation).await;
         if reply.outcome == super::manual_address::AddressOutcome::Success {
             if let Some(subnet) = subnet {
-                use tauri::Emitter;
-                let _ = app.emit("subnet-removed", serde_json::json!({"subnet":subnet,"adopted_ip":reply.view.address,"reason":"manual"}));
+                let _ = bridge.emit("subnet-removed", serde_json::json!({"subnet":subnet,"adopted_ip":reply.view.address,"reason":"manual"}));
             }
         }
         reply
@@ -440,21 +440,14 @@ pub(crate) async fn mode_request(
 }
 
 pub(crate) async fn refresh_request(
-    app: tauri::AppHandle,
+    manager: Arc<super::NetworkManager>,
+    config: Arc<crate::config::AppConfig>,
     name: String,
     mode: super::adapter_refresh::RefreshMode,
 ) -> Result<(), AppError> {
     request(
         executor(),
-        move || async move {
-            app.state::<std::sync::Arc<super::NetworkManager>>()
-                .refresh_native_adapter(
-                    &app.state::<std::sync::Arc<crate::config::AppConfig>>(),
-                    &name,
-                    mode,
-                )
-                .await
-        },
+        move || async move { manager.refresh_native_adapter(&config, &name, mode).await },
         result_outcome,
     )
     .await?
