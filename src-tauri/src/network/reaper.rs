@@ -4,8 +4,7 @@
 //! `Keep` it, badge it as `StaleOnly` (informational, UI-only), or
 //! `Reap` it (unbind and forget). The decision is deliberately a pure
 //! function over pre-gathered inputs so the whole policy matrix is
-//! unit-testable — `NetworkManager` cannot be constructed in lib
-//! tests, so nothing here may touch it.
+//! unit-testable without constructing a manager or invoking native operations.
 //!
 //! Policy boundaries encoded structurally rather than as stored state:
 //!

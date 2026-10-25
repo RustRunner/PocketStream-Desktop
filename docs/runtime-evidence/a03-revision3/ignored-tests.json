@@ -1,0 +1,52 @@
+[
+  {
+    "file": "src-tauri/src/network/ip_conflict.rs",
+    "name": "detects_actual_pc_address_conflict",
+    "reason": "requires an explicitly selected address currently assigned to this PC"
+  },
+  {
+    "file": "src-tauri/src/streaming/rtsp_transport.rs",
+    "name": "camera_video_through_bound_transport",
+    "reason": "requires an explicitly selected H.264 camera and Ethernet source"
+  },
+  {
+    "file": "src-tauri/tests/fixtures/native_foundation.rs",
+    "name": "qualify_typed_inventory_read_only",
+    "reason": "A2 actual fixed-policy inventory; reads native adapters only"
+  },
+  {
+    "file": "src-tauri/tests/fixtures/native_foundation.rs",
+    "name": "qualify_production_native_exit_status",
+    "reason": "A2 actual production native function; fixed invalid ipconfig option only"
+  },
+  {
+    "file": "src-tauri/tests/fixtures/native_foundation.rs",
+    "name": "qualify_native_observation_paths",
+    "reason": "A2 native system DLL/neighbor reads and optional controlled ICMP; no network configuration writes"
+  },
+  {
+    "file": "src-tauri/tests/fixtures/native_foundation.rs",
+    "name": "qualify_script_data_and_required_failures",
+    "reason": "A-S2 read-only Windows PowerShell process fixture"
+  },
+  {
+    "file": "src-tauri/tests/fixtures/native_foundation.rs",
+    "name": "qualify_child_tree_and_bounded_output",
+    "reason": "A-S2 private child-job timeout/output fixture"
+  },
+  {
+    "file": "src-tauri/tests/fixtures/native_foundation.rs",
+    "name": "qualify_caller_abort_retains_completion_and_barrier",
+    "reason": "A-S2 actual Tokio caller abort after contained native dispatch"
+  },
+  {
+    "file": "src-tauri/tests/fixtures/native_foundation.rs",
+    "name": "qualify_two_owners_and_lone_crash_recovery",
+    "reason": "A-S4 two processes and sole-owner crash; private nonce namespace"
+  },
+  {
+    "file": "src-tauri/tests/fixtures/native_foundation.rs",
+    "name": "owner_child",
+    "reason": "internal subprocess of A-S4; not a standalone qualification"
+  }
+]

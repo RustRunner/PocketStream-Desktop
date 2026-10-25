@@ -727,6 +727,7 @@ pub struct ModeTransitionReply {
 }
 
 pub struct NetworkManager {
+    config: Arc<crate::config::AppConfig>,
     address_io: Arc<dyn interface::AddressIo>,
     active_scans: Arc<std::sync::Mutex<HashSet<String>>>,
     solicitations: tokio::sync::watch::Sender<Option<Solicitation>>,
@@ -777,10 +778,8 @@ pub struct NetworkManager {
     /// transition; once the frontend is fully migrated to subscribe-only
     /// snapshots the legacy map can be deleted.
     device_registry: Arc<DeviceRegistry>,
-    /// Late-bound emitter that turns registry mutations into debounced
-    /// `device-list-changed` events. None until `start_arp_discovery`
-    /// (which receives the AppHandle) wires it up.
-    device_emitter: Arc<Mutex<Option<Arc<DeviceListEmitter>>>>,
+    /// Constructed before hydration; its bridge is bound in setup.
+    device_emitter: Arc<DeviceListEmitter>,
     /// Handle to the ICMP pinger task (green/red dot driver). Started
     /// by `start_ping_dot`, stopped on shutdown. Mode-independent: the
     /// pinger watches whatever the registry contains.
@@ -1184,7 +1183,9 @@ async fn attempt_adoption(
     use tauri::Emitter;
     use tauri::Manager;
 
-    let config = ctx.app_handle.state::<crate::config::AppConfig>();
+    let config = ctx
+        .app_handle
+        .state::<std::sync::Arc<crate::config::AppConfig>>();
     let ops = auto_adopt::PendingAdoptOps::new(&config, &ctx.adapter_mac, auto_adopt::RealAdoptOps);
     if ctx.fence.is_stale()
         || ctx.address_fence.is_stale()
@@ -1197,7 +1198,7 @@ async fn attempt_adoption(
     }
     if let Err(error) = ctx
         .app_handle
-        .state::<NetworkManager>()
+        .state::<std::sync::Arc<NetworkManager>>()
         .prepare_subnet_adoption(
             &config,
             device_subnet,
@@ -1497,7 +1498,10 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
 
     async fn bind_scratch(&mut self, subnet: &str, scratch: Ipv4Addr) -> bool {
         use tauri::Manager;
-        let config = self.ctx.app_handle.state::<crate::config::AppConfig>();
+        let config = self
+            .ctx
+            .app_handle
+            .state::<std::sync::Arc<crate::config::AppConfig>>();
         let ops = auto_adopt::PendingAdoptOps::new(
             &config,
             &self.ctx.adapter_mac,
@@ -1516,7 +1520,7 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
         if let Err(error) = self
             .ctx
             .app_handle
-            .state::<NetworkManager>()
+            .state::<std::sync::Arc<NetworkManager>>()
             .prepare_subnet_adoption(
                 &config,
                 subnet,
@@ -1581,7 +1585,10 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
 
     async fn release_scratch(&mut self, _subnet: &str, scratch: Ipv4Addr) {
         use tauri::Manager;
-        let config = self.ctx.app_handle.state::<crate::config::AppConfig>();
+        let config = self
+            .ctx
+            .app_handle
+            .state::<std::sync::Arc<crate::config::AppConfig>>();
         let ops = auto_adopt::PendingAdoptOps::new(
             &config,
             &self.ctx.adapter_mac,
@@ -1626,7 +1633,7 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
         }
         self.ctx
             .app_handle
-            .state::<NetworkManager>()
+            .state::<std::sync::Arc<NetworkManager>>()
             .note_solicitation(&self.ctx.fence)
             .await;
         if self.ctx.fence.is_stale() {
@@ -1790,7 +1797,7 @@ async fn watchdog_ladder(
     let (mut activation_rx, mut solicitations) = activation;
     let capture_signal = params
         .app_handle
-        .state::<NetworkManager>()
+        .state::<std::sync::Arc<NetworkManager>>()
         .capture_signal
         .clone();
     // The deadline starts at the solicitation, not at activation.
@@ -2299,8 +2306,22 @@ impl NetworkManager {
         }
         Ok(after)
     }
+    #[cfg(test)]
     pub fn new() -> Self {
+        Self::with_dependencies(
+            Arc::new(crate::config::AppConfig::for_test(Default::default())),
+            Arc::new(crate::bridge::TauriBridge::<tauri::Wry>::default()),
+        )
+    }
+
+    pub(crate) fn with_dependencies(
+        config: Arc<crate::config::AppConfig>,
+        bridge: Arc<dyn crate::bridge::AppBridge>,
+    ) -> Self {
+        let registry = Arc::new(DeviceRegistry::new());
+        let emitter = DeviceListEmitter::new(bridge, registry.clone());
         Self {
+            config,
             address_io: Arc::new(interface::RealAddressIo),
             active_scans: Arc::new(std::sync::Mutex::new(HashSet::new())),
             solicitations: tokio::sync::watch::channel(None).0,
@@ -2325,8 +2346,8 @@ impl NetworkManager {
             interface_name: Arc::new(Mutex::new(None)),
             interface_index: Arc::new(Mutex::new(None)),
             adapter_selection: Arc::new(Mutex::new(AdapterSelection::default())),
-            device_registry: Arc::new(DeviceRegistry::new()),
-            device_emitter: Arc::new(Mutex::new(None)),
+            device_registry: registry,
+            device_emitter: emitter,
             ping_dot_handle: Arc::new(Mutex::new(None)),
             discovery_op: Arc::new(Mutex::new(())),
             discovery_generation: Arc::new(AtomicU64::new(0)),
@@ -2426,19 +2447,14 @@ impl NetworkManager {
     }
 
     /// Persist liveness stamps only; late flushes cannot change saved intent.
-    pub async fn flush_adoption_state(&self, app_handle: &tauri::AppHandle) {
+    pub async fn flush_adoption_state(&self, _app_handle: &tauri::AppHandle) {
         let meta = self
             .adopted_meta
             .lock()
             .map(|m| m.clone())
             .unwrap_or_default();
-        let handle = app_handle.clone();
-        let res = tokio::task::spawn_blocking(move || {
-            use tauri::Manager;
-            let config: tauri::State<'_, crate::config::AppConfig> = handle.state();
-            config.update_adoption_liveness(meta)
-        })
-        .await;
+        let config = self.config.clone();
+        let res = tokio::task::spawn_blocking(move || config.update_adoption_liveness(meta)).await;
         match res {
             Ok(Ok(())) => {}
             Ok(Err(e)) => log::warn!("Failed to persist adoption metadata: {}", e),
@@ -2552,21 +2568,6 @@ impl NetworkManager {
         Ok(result)
     }
 
-    /// Create the device-list emitter if not already initialized. Safe
-    /// to call multiple times — the first call wins so all subsequent
-    /// callers see the same emitter. Decoupled from `start_arp_discovery`
-    /// so Static-Manual (which never starts ARP) still has a working
-    /// emitter for registry-change events.
-    pub async fn init_emitter(&self, app_handle: tauri::AppHandle) -> Arc<DeviceListEmitter> {
-        let mut slot = self.device_emitter.lock().await;
-        if let Some(existing) = slot.as_ref() {
-            return existing.clone();
-        }
-        let emitter = DeviceListEmitter::new(app_handle, self.device_registry.clone());
-        *slot = Some(emitter.clone());
-        emitter
-    }
-
     /// Hydrate the device registry from the user's pinned manual-nodes
     /// list. Used by `NetworkMode::StaticManual` startup to populate the
     /// Nodes panel without going through ARP discovery.
@@ -2596,9 +2597,7 @@ impl NetworkManager {
 
         if hydrated || !demoted.is_empty() {
             self.presence.bootstrap();
-            if let Some(emitter) = self.device_emitter.lock().await.clone() {
-                emitter.poke();
-            }
+            self.device_emitter.poke();
         }
     }
 
@@ -2754,7 +2753,7 @@ impl NetworkManager {
             return;
         }
         self.device_registry.set_verification_scope(None);
-        let emitter = self.init_emitter(app.clone()).await;
+        let emitter = self.device_emitter.clone();
         let control = self.presence.clone();
         let registry = self.device_registry.clone();
         let candidates = self.candidates.clone();
@@ -2855,12 +2854,11 @@ impl NetworkManager {
         }
     }
 
-    /// Borrow the device-list emitter. None before the first call to
-    /// `start_arp_discovery` (which initializes it with the AppHandle).
+    /// Borrow the emitter constructed with the registry before hydration.
     /// Mutators that want to publish a `device-list-changed` event call
     /// `.poke()` on the result.
     pub async fn emitter(&self) -> Option<Arc<DeviceListEmitter>> {
-        self.device_emitter.lock().await.clone()
+        Some(self.device_emitter.clone())
     }
 
     /// Reconcile durable intent from actual selected-adapter addresses. Never
@@ -3460,18 +3458,7 @@ impl NetworkManager {
         bound: bool,
     ) -> Result<route::ReadyPath, AppError> {
         if self.presence.tick(&self.device_registry) {
-            if let Ok(emitter) = self.device_emitter.try_lock() {
-                if let Some(emitter) = emitter.as_ref() {
-                    emitter.poke();
-                }
-            } else {
-                let slot = self.device_emitter.clone();
-                tauri::async_runtime::spawn(async move {
-                    if let Some(emitter) = slot.lock().await.as_ref() {
-                        emitter.poke();
-                    }
-                });
-            }
+            self.device_emitter.poke();
         }
         let mut target = target.clone();
         // A legacy manual key follows only its persisted first-verification
@@ -3952,22 +3939,7 @@ impl NetworkManager {
 
         let registry = self.device_registry.clone();
 
-        // Late-bind the emitter now that we have an AppHandle. Reuse the
-        // existing one if `init_emitter` already wired it at startup — two
-        // live emitters poking the same registry would double every
-        // device-list-changed event. Only create + store when the slot is
-        // empty (the app handle is the same across interface switches).
-        let emitter = {
-            let mut slot = self.device_emitter.lock().await;
-            match slot.as_ref() {
-                Some(existing) => existing.clone(),
-                None => {
-                    let e = DeviceListEmitter::new(app_handle.clone(), registry.clone());
-                    *slot = Some(e.clone());
-                    e
-                }
-            }
-        };
+        let emitter = self.device_emitter.clone();
         // Emit the initial snapshot so any frontend that's already
         // subscribed sees cache-hydrated devices without having to
         // separately call get_device_list.
@@ -4313,7 +4285,7 @@ impl NetworkManager {
                 if !cache_probe_done {
                     cache_probe_done = true;
                     let cached_records = {
-                        let config: tauri::State<'_, crate::config::AppConfig> =
+                        let config: tauri::State<'_, std::sync::Arc<crate::config::AppConfig>> =
                             app_handle_for_adopt.state();
                         config.get_cache()
                     };
@@ -4669,8 +4641,10 @@ impl NetworkManager {
             let app = self.capture_signal.lock().await.app.clone();
             if let Some(app) = app {
                 use tauri::Manager;
-                self.reconcile_temporary_locked(&app.state::<crate::config::AppConfig>())
-                    .await;
+                self.reconcile_temporary_locked(
+                    &app.state::<std::sync::Arc<crate::config::AppConfig>>(),
+                )
+                .await;
             }
         }
     }
@@ -4990,7 +4964,7 @@ async fn ping_sweep_subnets(interface_ips: &[String], fence: &SweepFence, app: &
     const MAX_CONCURRENT_PINGS: usize = 32;
     let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_PINGS));
     let mut join_set = JoinSet::new();
-    let manager = app.state::<NetworkManager>();
+    let manager = app.state::<std::sync::Arc<NetworkManager>>();
     let Some((_, index, adapter_fence)) = manager.probe_scope() else {
         return;
     };
@@ -5106,7 +5080,7 @@ async fn merge_arp_table(
         // neighbor-table row accepted here is device evidence just like
         // a captured frame.
         if let Ok(device_ip) = device.ip.parse::<Ipv4Addr>() {
-            let manager: tauri::State<'_, NetworkManager> = app_handle.state();
+            let manager: tauri::State<'_, std::sync::Arc<NetworkManager>> = app_handle.state();
             manager
                 .note_positive_liveness_fenced(&app_handle, device_ip, fence)
                 .await;
@@ -5126,7 +5100,8 @@ async fn merge_arp_table(
             let survivor = device.mac.clone();
             let cache_handle = app_handle.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                let config: tauri::State<'_, crate::config::AppConfig> = cache_handle.state();
+                let config: tauri::State<'_, std::sync::Arc<crate::config::AppConfig>> =
+                    cache_handle.state();
                 for mac in &dropped {
                     if let Err(e) = config.remove_cached_device(mac) {
                         log::warn!(
@@ -5159,7 +5134,7 @@ async fn run_presence_job(
 ) -> Option<String> {
     use tauri::Manager;
     let adapter = snapshot.adapter.as_ref()?;
-    let manager = app.state::<NetworkManager>();
+    let manager = app.state::<std::sync::Arc<NetworkManager>>();
     if snapshot.fence.is_stale() {
         return None;
     }
@@ -5222,8 +5197,8 @@ async fn run_presence_job(
     let adapter_mac = adapter.mac.clone();
     let commit_fence = fence.clone();
     let key = tokio::task::spawn_blocking(move || {
-        let manager = cache_app.state::<NetworkManager>();
-        let config = cache_app.state::<crate::config::AppConfig>();
+        let manager = cache_app.state::<std::sync::Arc<NetworkManager>>();
+        let config = cache_app.state::<std::sync::Arc<crate::config::AppConfig>>();
         if commit_fence.is_stale()
             || mutation_fence.is_stale()
             || proof.at.elapsed() >= presence::FRESHNESS

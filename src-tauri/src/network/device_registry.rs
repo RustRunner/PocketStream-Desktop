@@ -848,21 +848,19 @@ fn subnet_for(ip: &str) -> String {
 /// enough to amortize a burst.
 const EMIT_COALESCE_WINDOW: Duration = Duration::from_millis(150);
 
-/// Tauri-aware companion that turns registry mutations into
-/// `device-list-changed` events on a debounced schedule.
-///
-/// Construction requires an `AppHandle`, so this type lives outside
-/// the registry itself (which is deliberately tauri-free for testing).
-/// Wired up in `NetworkManager::start_arp_discovery` once the handle
-/// is available.
+/// Coalesces registry events through the application bridge. Construction
+/// starts no task; poke runs only after startup has entered the runtime.
 pub struct DeviceListEmitter {
-    handle: tauri::AppHandle,
+    handle: Arc<dyn crate::bridge::AppBridge>,
     registry: Arc<DeviceRegistry>,
     dirty: AtomicBool,
 }
 
 impl DeviceListEmitter {
-    pub fn new(handle: tauri::AppHandle, registry: Arc<DeviceRegistry>) -> Arc<Self> {
+    pub(crate) fn new(
+        handle: Arc<dyn crate::bridge::AppBridge>,
+        registry: Arc<DeviceRegistry>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             handle,
             registry,
@@ -888,8 +886,7 @@ impl DeviceListEmitter {
                 // released the flag) and gets its own emission window.
                 me.dirty.store(false, Ordering::Release);
                 let snapshot = me.registry.snapshot();
-                use tauri::Emitter;
-                let _ = me.handle.emit("device-list-changed", &snapshot);
+                let _ = crate::bridge::emit(me.handle.as_ref(), "device-list-changed", &snapshot);
             });
         }
     }
@@ -898,6 +895,30 @@ impl DeviceListEmitter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn bridge_emitter_coalesces_and_rearms_after_publication() {
+        let bridge = Arc::new(crate::bridge::RecordingBridge::default());
+        let emitter = DeviceListEmitter::new(bridge.clone(), Arc::new(DeviceRegistry::new()));
+        emitter.poke();
+        emitter.poke();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(149)).await;
+        assert!(bridge.0.lock().unwrap().is_empty());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(bridge.0.lock().unwrap().len(), 1);
+        emitter.poke();
+        tokio::task::yield_now().await;
+        tokio::time::advance(EMIT_COALESCE_WINDOW).await;
+        tokio::task::yield_now().await;
+        let events = bridge.0.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .all(|(name, payload)| name == "device-list-changed"
+                && payload == &serde_json::json!([])));
+    }
 
     fn arp(mac: &str, ip: &str, subnet: &str) -> ArpDevice {
         ArpDevice {

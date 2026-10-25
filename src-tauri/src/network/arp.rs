@@ -1006,7 +1006,8 @@ async fn on_arp_seen(
     // frame is proof a device exists on the sender's subnet. Cheap
     // no-op unless that subnet is adopted.
     {
-        let manager: tauri::State<'_, crate::network::NetworkManager> = app_handle.state();
+        let manager: tauri::State<'_, std::sync::Arc<crate::network::NetworkManager>> =
+            app_handle.state();
         manager
             .note_positive_liveness_fenced(&app_handle, ip, fence)
             .await;
@@ -1028,7 +1029,8 @@ async fn on_arp_seen(
             let cache_handle = app_handle.clone();
             let cache_fence = fence.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                let config: tauri::State<'_, crate::config::AppConfig> = cache_handle.state();
+                let config: tauri::State<'_, std::sync::Arc<crate::config::AppConfig>> =
+                    cache_handle.state();
                 if let Err(e) = config.upsert_cached_device_fenced(record, Some(&cache_fence)) {
                     log::warn!("Failed to persist verified capture identity: {e}");
                 }
@@ -1037,7 +1039,7 @@ async fn on_arp_seen(
         }
     }
     if !result.dropped_macs.is_empty() {
-        let cfg: tauri::State<'_, crate::config::AppConfig> = app_handle.state();
+        let cfg: tauri::State<'_, std::sync::Arc<crate::config::AppConfig>> = app_handle.state();
         for dropped in &result.dropped_macs {
             if let Err(e) = cfg.remove_cached_device(dropped) {
                 log::warn!(

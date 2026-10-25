@@ -255,7 +255,7 @@ pub(crate) async fn refresh(handle: &tauri::AppHandle) {
     // A listener's independent resolution may have failed since our last
     // successful snapshot. Retry Unknown even when the inventory is unchanged.
     handle
-        .state::<crate::streaming::StreamManager>()
+        .state::<std::sync::Arc<crate::streaming::StreamManager>>()
         .binding_topology_changed(scope, revision)
         .await;
 }

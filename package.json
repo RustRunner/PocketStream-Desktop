@@ -14,11 +14,12 @@
     "check:dom": "node scripts/check-dom-selectors.mjs",
     "check:restream": "node scripts/check-restream-card.mjs && node scripts/check-restream-ui.mjs",
     "check:ipc": "node scripts/check-ipc-allowlist.mjs",
-    "check:contracts": "npm run check:dom && npm run check:restream && npm run check:ipc && npm run check:installer",
+    "check:contracts": "npm run check:dom && npm run check:restream && npm run check:ipc && npm run check:installer && npm run check:rust-boundaries",
     "test:ptu": "node --test tests/ptu-workflow.test.cjs",
     "test:network-addresses": "node --test tests/network-address-workflow.test.cjs",
     "check:installer": "node scripts/check-installer.mjs",
-    "check:installer:generated": "node scripts/check-installer.mjs src-tauri/target/release/nsis/x64/installer.nsi --compile-trace"
+    "check:installer:generated": "node scripts/check-installer.mjs src-tauri/target/release/nsis/x64/installer.nsi --compile-trace",
+    "check:rust-boundaries": "node scripts/check-rust-boundaries.mjs"
   },
   "dependencies": {
     "qrcode": "^1.5.4"

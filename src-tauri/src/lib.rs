@@ -1,3 +1,4 @@
+mod bridge;
 mod camera;
 mod commands;
 mod config;
@@ -231,7 +232,7 @@ async fn watch_interface(handle: tauri::AppHandle) {
     loop {
         network::bindings::refresh(&handle).await;
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        let manager = handle.state::<network::NetworkManager>();
+        let manager = handle.state::<std::sync::Arc<network::NetworkManager>>();
         let selection = manager.adapter_selection_state().await;
         if let Some(iface) = &selection.adapter {
             if let Some((is_up, ips)) = network::interface::quick_status_by_mac(&iface.mac) {
@@ -438,9 +439,15 @@ pub fn run() {
         }
     });
 
-    let app_config = config::AppConfig::load_or_default();
-    let stream_manager =
-        streaming::StreamManager::with_selected_protocol(app_config.get().restream_protocol);
+    let app_config = std::sync::Arc::new(config::AppConfig::load_or_default());
+    let bridge = std::sync::Arc::new(bridge::TauriBridge::default());
+    let network_manager = std::sync::Arc::new(network::NetworkManager::with_dependencies(
+        app_config.clone(),
+        bridge.clone(),
+    ));
+    let stream_manager = std::sync::Arc::new(streaming::StreamManager::with_selected_protocol(
+        app_config.get().restream_protocol,
+    ));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -448,7 +455,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(app_config)
         .manage(stream_manager)
-        .manage(network::NetworkManager::new())
+        .manage(network_manager)
         .manage(camera::flir_ptu::PtuController::new())
         .invoke_handler(tauri::generate_handler![
             // Logging
@@ -507,14 +514,15 @@ pub fn run() {
             commands::control_cgi_zoom_direct,
             commands::set_zoom_position,
         ])
-        .setup(|app| {
+        .setup(move |app| {
             let handle = app.handle().clone();
+            bridge.bind(handle.clone()).expect("bind application bridge once");
 
             // Spawn the stream-status emitter: a 1Hz internal ticker that
             // refreshes the watch channel snapshot, plus a broadcaster that
             // emits `stream-status` to the frontend on every change.
             // Replaces the old 1Hz frontend poll of get_stream_status.
-            let stream_mgr: tauri::State<'_, streaming::StreamManager> = handle.state();
+            let stream_mgr: tauri::State<'_, std::sync::Arc<streaming::StreamManager>> = handle.state();
             stream_mgr.start_status_emitter(handle.clone());
 
             // Start event-driven NIC watcher (Windows NotifyIpInterfaceChange +
@@ -530,14 +538,9 @@ pub fn run() {
             // Load adopted subnets from config, then start discovery
             // subsystems gated on the user's chosen network mode.
             tauri::async_runtime::spawn(async move {
-                let config: tauri::State<'_, config::AppConfig> = handle.state();
-                let manager: tauri::State<'_, network::NetworkManager> = handle.state();
+                let config: tauri::State<'_, std::sync::Arc<config::AppConfig>> = handle.state();
+                let manager: tauri::State<'_, std::sync::Arc<network::NetworkManager>> = handle.state();
 
-                // Init the emitter before any registry mutation so
-                // hydration pokes land on a real emitter — required
-                // for Static-Manual which never reaches start_arp_discovery
-                // (the historic emitter init site).
-                manager.init_emitter(handle.clone()).await;
 
                 let mode = config.get_network_mode();
                 log::info!("Network mode: {:?}", mode);
@@ -646,19 +649,19 @@ pub fn run() {
             // its own 5 s wait. block_on is safe here — the event loop is
             // already exiting and there's no UI to keep responsive.
             if let tauri::RunEvent::ExitRequested { .. } = event {
-                let stream: tauri::State<'_, streaming::StreamManager> = app_handle.state();
+                let stream: tauri::State<'_, std::sync::Arc<streaming::StreamManager>> = app_handle.state();
                 let _ = tauri::async_runtime::block_on(async {
                     tokio::time::timeout(std::time::Duration::from_secs(5), async {
                         let _ = tokio::join!(stream.stop_playback(), stream.stop_restream_server());
                     }).await
                 });
-                let manager: tauri::State<'_, network::NetworkManager> = app_handle.state();
+                let manager: tauri::State<'_, std::sync::Arc<network::NetworkManager>> = app_handle.state();
                 let _ = tauri::async_runtime::block_on(async {
                     manager.stop_presence().await;
                     manager.stop_ping_dot().await;
                     tokio::time::timeout(
                         std::time::Duration::from_secs(5),
-                        manager.cleanup_adopted_ips(&app_handle.state::<config::AppConfig>()),
+                        manager.cleanup_adopted_ips(&app_handle.state::<std::sync::Arc<config::AppConfig>>()),
                     )
                     .await
                 });
@@ -670,7 +673,7 @@ pub fn run() {
                     manager.stop_ping_dot().await;
                     let _ = tokio::time::timeout(
                         std::time::Duration::from_secs(5),
-                        manager.cleanup_adopted_ips(&app_handle.state::<config::AppConfig>()),
+                        manager.cleanup_adopted_ips(&app_handle.state::<std::sync::Arc<config::AppConfig>>()),
                     ).await;
                 });
             }

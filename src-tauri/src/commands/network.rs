@@ -14,8 +14,8 @@ pub fn get_host_ip_owners() -> Result<Vec<crate::network::ip_conflict::HostIpOwn
 
 #[tauri::command]
 pub async fn scan_network(
-    manager: State<'_, NetworkManager>,
-    config: State<'_, AppConfig>,
+    manager: State<'_, std::sync::Arc<NetworkManager>>,
+    config: State<'_, std::sync::Arc<AppConfig>>,
     subnet: String,
 ) -> Result<Vec<ScanResult>, AppError> {
     // Reject malformed CIDR at the boundary so the active-scans
@@ -35,15 +35,15 @@ pub async fn scan_network(
 
 #[tauri::command]
 pub async fn get_capture_state(
-    manager: State<'_, NetworkManager>,
+    manager: State<'_, std::sync::Arc<NetworkManager>>,
 ) -> Result<crate::network::CaptureState, AppError> {
     Ok(manager.get_capture_state().await)
 }
 
 #[tauri::command]
 pub async fn get_adapter_selection(
-    manager: State<'_, NetworkManager>,
-    config: State<'_, AppConfig>,
+    manager: State<'_, std::sync::Arc<NetworkManager>>,
+    config: State<'_, std::sync::Arc<AppConfig>>,
 ) -> Result<crate::network::AdapterSelection, AppError> {
     // Display reads must not queue behind discovery/capture or address writes.
     // Startup and the existing NIC watcher own selection and reconciliation.
@@ -52,8 +52,8 @@ pub async fn get_adapter_selection(
 
 #[tauri::command]
 pub async fn select_adapter(
-    manager: State<'_, NetworkManager>,
-    config: State<'_, AppConfig>,
+    manager: State<'_, std::sync::Arc<NetworkManager>>,
+    config: State<'_, std::sync::Arc<AppConfig>>,
     app: tauri::AppHandle,
     mac: String,
 ) -> Result<crate::network::AdapterSelection, AppError> {
@@ -72,7 +72,7 @@ pub async fn select_adapter(
 
 #[tauri::command]
 pub async fn list_bind_interfaces(
-    config: State<'_, AppConfig>,
+    config: State<'_, std::sync::Arc<AppConfig>>,
 ) -> Result<Vec<crate::network::bindings::BindInterface>, AppError> {
     let adopted = config.get().adopted_subnets.into_values().collect();
     crate::network::bindings::list(&adopted).await
@@ -80,8 +80,8 @@ pub async fn list_bind_interfaces(
 
 #[tauri::command]
 pub async fn add_secondary_ip(
-    manager: State<'_, NetworkManager>,
-    config: State<'_, AppConfig>,
+    manager: State<'_, std::sync::Arc<NetworkManager>>,
+    config: State<'_, std::sync::Arc<AppConfig>>,
     app: tauri::AppHandle,
     name: String,
     ip: String,
@@ -106,8 +106,8 @@ pub async fn add_secondary_ip(
 
 #[tauri::command]
 pub async fn remove_secondary_ip(
-    manager: State<'_, NetworkManager>,
-    config: State<'_, AppConfig>,
+    manager: State<'_, std::sync::Arc<NetworkManager>>,
+    config: State<'_, std::sync::Arc<AppConfig>>,
     app: tauri::AppHandle,
     name: String,
     ip: String,
@@ -139,14 +139,14 @@ pub async fn get_dhcp_state(name: String) -> Result<bool, AppError> {
 // One fenced OS/config transition is shared by every mode change.
 
 #[tauri::command]
-pub fn get_network_mode(config: State<'_, AppConfig>) -> NetworkMode {
+pub fn get_network_mode(config: State<'_, std::sync::Arc<AppConfig>>) -> NetworkMode {
     config.get_network_mode()
 }
 
 #[tauri::command]
 pub async fn set_network_mode(
-    config: State<'_, AppConfig>,
-    manager: State<'_, NetworkManager>,
+    config: State<'_, std::sync::Arc<AppConfig>>,
+    manager: State<'_, std::sync::Arc<NetworkManager>>,
     app: tauri::AppHandle,
     request: crate::network::ModeTransition,
 ) -> Result<crate::network::ModeTransitionReply, AppError> {
@@ -168,8 +168,8 @@ pub async fn set_network_mode(
 
 #[tauri::command]
 pub async fn add_manual_node(
-    config: State<'_, AppConfig>,
-    manager: State<'_, NetworkManager>,
+    config: State<'_, std::sync::Arc<AppConfig>>,
+    manager: State<'_, std::sync::Arc<NetworkManager>>,
     ip: String,
     alias: String,
     expected_mac: Option<String>,
@@ -210,8 +210,8 @@ fn validated_manual_node(ip: String, alias: String) -> Result<ManualNode, AppErr
 
 #[tauri::command]
 pub async fn remove_manual_node(
-    config: State<'_, AppConfig>,
-    manager: State<'_, NetworkManager>,
+    config: State<'_, std::sync::Arc<AppConfig>>,
+    manager: State<'_, std::sync::Arc<NetworkManager>>,
     ip: String,
     expected_mac: Option<String>,
 ) -> Result<(), AppError> {
@@ -240,8 +240,8 @@ pub async fn remove_manual_node(
 
 #[tauri::command]
 pub async fn clear_manual_nodes(
-    config: State<'_, AppConfig>,
-    manager: State<'_, NetworkManager>,
+    config: State<'_, std::sync::Arc<AppConfig>>,
+    manager: State<'_, std::sync::Arc<NetworkManager>>,
 ) -> Result<(), AppError> {
     config.clear_manual_nodes()?;
     if manager.registry().remove_manual_entries() {
@@ -254,8 +254,8 @@ pub async fn clear_manual_nodes(
 
 #[tauri::command]
 pub async fn refresh_adapter(
-    manager: State<'_, NetworkManager>,
-    config: State<'_, AppConfig>,
+    manager: State<'_, std::sync::Arc<NetworkManager>>,
+    config: State<'_, std::sync::Arc<AppConfig>>,
     app: tauri::AppHandle,
     name: String,
     mode: String,
@@ -286,8 +286,8 @@ pub async fn refresh_adapter(
 
 #[tauri::command]
 pub async fn start_arp_discovery(
-    manager: State<'_, NetworkManager>,
-    config: State<'_, AppConfig>,
+    manager: State<'_, std::sync::Arc<NetworkManager>>,
+    config: State<'_, std::sync::Arc<AppConfig>>,
     app: tauri::AppHandle,
     interface: String,
     refresh: Option<bool>,
@@ -313,7 +313,7 @@ pub async fn start_arp_discovery(
 /// updates.
 #[tauri::command]
 pub async fn get_device_list(
-    manager: State<'_, NetworkManager>,
+    manager: State<'_, std::sync::Arc<NetworkManager>>,
 ) -> Result<Vec<DeviceRecord>, AppError> {
     Ok(manager.registry().snapshot())
 }
@@ -330,8 +330,8 @@ pub async fn get_device_list(
 /// its role dropdown.
 #[tauri::command]
 pub async fn set_device_alias(
-    manager: State<'_, NetworkManager>,
-    config: State<'_, AppConfig>,
+    manager: State<'_, std::sync::Arc<NetworkManager>>,
+    config: State<'_, std::sync::Arc<AppConfig>>,
     key: String,
     alias: String,
 ) -> Result<Vec<DeviceRecord>, AppError> {
@@ -350,8 +350,8 @@ pub async fn set_device_alias(
 /// "forget this device" affordance in the offline-cache dialog.
 #[tauri::command]
 pub async fn forget_device(
-    manager: State<'_, NetworkManager>,
-    config: State<'_, AppConfig>,
+    manager: State<'_, std::sync::Arc<NetworkManager>>,
+    config: State<'_, std::sync::Arc<AppConfig>>,
     mac: String,
 ) -> Result<(), AppError> {
     // A verified manual pin shares the discovered identity; explicit forget
@@ -378,15 +378,15 @@ pub async fn forget_device(
 /// the removal policy share one implementation.
 #[tauri::command]
 pub async fn get_adoption_state(
-    manager: State<'_, NetworkManager>,
+    manager: State<'_, std::sync::Arc<NetworkManager>>,
 ) -> Result<crate::network::AdoptionSnapshot, AppError> {
     Ok(manager.adoption_snapshot().await)
 }
 
 #[tauri::command]
 pub async fn remove_adopted_subnet(
-    manager: State<'_, NetworkManager>,
-    config: State<'_, AppConfig>,
+    manager: State<'_, std::sync::Arc<NetworkManager>>,
+    config: State<'_, std::sync::Arc<AppConfig>>,
     app: tauri::AppHandle,
     subnet: String,
     iface_hint: Option<String>,

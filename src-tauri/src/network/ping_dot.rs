@@ -88,8 +88,8 @@ pub fn start(app_handle: AppHandle, registry: Arc<DeviceRegistry>) -> PingDotHan
                 let ah = app_handle.clone();
                 tokio::spawn(async move {
                     use tauri::Manager;
-                    let manager = ah.state::<crate::network::NetworkManager>();
-                    let config = ah.state::<crate::config::AppConfig>();
+                    let manager = ah.state::<std::sync::Arc<crate::network::NetworkManager>>();
+                    let config = ah.state::<std::sync::Arc<crate::config::AppConfig>>();
                     let target = super::route::CameraTarget {
                         key: row.mac.clone(),
                         expected_mac: Some(row.mac),
@@ -166,7 +166,7 @@ pub(crate) async fn probe(ip: &str) -> bool {
     let Some(app) = APP.get() else {
         return false;
     };
-    let manager = app.state::<super::NetworkManager>();
+    let manager = app.state::<std::sync::Arc<super::NetworkManager>>();
     let Some((adapter, index, fence)) = manager.probe_scope() else {
         return false;
     };

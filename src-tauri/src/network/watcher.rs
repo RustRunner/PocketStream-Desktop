@@ -59,8 +59,8 @@ pub(crate) fn emit_link_change(handle: &AppHandle, selection: &AdapterSelection)
 
 /// Shared by native notifications, the fallback poller and the UI query.
 pub(crate) async fn refresh(handle: &AppHandle) -> Result<(), crate::AppError> {
-    let manager = handle.state::<NetworkManager>();
-    let config = handle.state::<crate::config::AppConfig>();
+    let manager = handle.state::<std::sync::Arc<NetworkManager>>();
+    let config = handle.state::<std::sync::Arc<crate::config::AppConfig>>();
     // Complete a known adapter's link-up before a slow provider refresh.
     // Unknown metadata/index changes still go through selection below.
     manager.resume_discovery(&config, handle).await?;
@@ -83,8 +83,8 @@ pub(crate) async fn refresh(handle: &AppHandle) -> Result<(), crate::AppError> {
 }
 
 async fn retry_discovery(handle: &AppHandle) -> Result<(), crate::AppError> {
-    let manager = handle.state::<NetworkManager>();
-    let config = handle.state::<crate::config::AppConfig>();
+    let manager = handle.state::<std::sync::Arc<NetworkManager>>();
+    let config = handle.state::<std::sync::Arc<crate::config::AppConfig>>();
     if manager.resume_discovery(&config, handle).await? {
         // Missing metadata or a changed index goes through the existing
         // selection/restore path. The next tick completes capture/session setup.

@@ -2372,7 +2372,7 @@ async fn publish_playback_status(ctx: &PlaybackSupervisorContext) {
 async fn expected_device_wake(app: Option<&tauri::AppHandle>) {
     use tauri::Manager;
     if let Some(app) = app {
-        app.state::<crate::network::NetworkManager>()
+        app.state::<std::sync::Arc<crate::network::NetworkManager>>()
             .expected_device_verified()
             .await;
     } else {
@@ -2485,7 +2485,7 @@ async fn playback_step(ctx: &PlaybackSupervisorContext) {
     if target.is_some() {
         if let Some(app) = &ctx.app {
             let selection = app
-                .state::<crate::network::NetworkManager>()
+                .state::<std::sync::Arc<crate::network::NetworkManager>>()
                 .adapter_selection_state()
                 .await;
             let identity = (selection.selected_mac, selection.interface_index);
@@ -2779,9 +2779,11 @@ fn camera_stream_path(
     use tauri::Manager;
     let handle =
         handle.ok_or_else(|| AppError::Stream("Ethernet readiness service unavailable".into()))?;
-    let manager = handle.state::<crate::network::NetworkManager>();
-    let path =
-        manager.camera_ready_bound_now(target, &handle.state::<crate::config::AppConfig>())?;
+    let manager = handle.state::<std::sync::Arc<crate::network::NetworkManager>>();
+    let path = manager.camera_ready_bound_now(
+        target,
+        &handle.state::<std::sync::Arc<crate::config::AppConfig>>(),
+    )?;
     require_cam_role(&path.target, &manager.registry().snapshot())?;
     Ok(path)
 }
@@ -3028,7 +3030,8 @@ async fn run_relay_supervisor(mut events: RelayEventReceiver, ctx: RelaySupervis
 async fn adopted_ip_set(app_handle: &tauri::AppHandle) -> std::collections::HashSet<String> {
     use tauri::Manager;
 
-    let manager: tauri::State<'_, crate::network::NetworkManager> = app_handle.state();
+    let manager: tauri::State<'_, std::sync::Arc<crate::network::NetworkManager>> =
+        app_handle.state();
     manager.get_adopted_ips().await.into_values().collect()
 }
 
@@ -3101,7 +3104,7 @@ async fn recover_relay_generation(
         let (attempt, delay) = health.schedule_recovery_attempt();
         let selection = ctx
             .app_handle
-            .state::<crate::network::NetworkManager>()
+            .state::<std::sync::Arc<crate::network::NetworkManager>>()
             .adapter_selection_state()
             .await;
         log::info!("event=relay_recovery adapter_mac={} interface_index={} generation={} cause={} attempt={} phase=backoff delay_ms={} duration_ms={}",

@@ -9,8 +9,8 @@ use crate::streaming::{RestreamOperationResult, RestreamServerInfo, StreamManage
 #[tauri::command]
 pub async fn start_stream(
     window: tauri::WebviewWindow,
-    stream: State<'_, StreamManager>,
-    config: State<'_, AppConfig>,
+    stream: State<'_, std::sync::Arc<StreamManager>>,
+    config: State<'_, std::sync::Arc<AppConfig>>,
     window_handle: Option<usize>,
 ) -> Result<(), AppError> {
     let settings = config.get();
@@ -36,7 +36,7 @@ pub async fn start_stream(
 #[tauri::command]
 pub async fn stop_stream(
     window: tauri::WebviewWindow,
-    stream: State<'_, StreamManager>,
+    stream: State<'_, std::sync::Arc<StreamManager>>,
 ) -> Result<(), AppError> {
     // Capture HWND before stopping (stop clears it)
     let hwnd = stream.get_video_child_hwnd();
@@ -66,8 +66,8 @@ pub async fn stop_stream(
 /// Retry existing desired playback; never choose a replacement by address.
 #[tauri::command]
 pub async fn retry_playback(
-    stream: State<'_, StreamManager>,
-    config: State<'_, AppConfig>,
+    stream: State<'_, std::sync::Arc<StreamManager>>,
+    config: State<'_, std::sync::Arc<AppConfig>>,
     manual: Option<bool>,
 ) -> Result<(), AppError> {
     stream
@@ -77,8 +77,8 @@ pub async fn retry_playback(
 
 #[tauri::command]
 pub async fn set_audio_muted(
-    stream: State<'_, StreamManager>,
-    config: State<'_, AppConfig>,
+    stream: State<'_, std::sync::Arc<StreamManager>>,
+    config: State<'_, std::sync::Arc<AppConfig>>,
     muted: bool,
 ) -> Result<(), AppError> {
     // Persist first: a failed save errors out before the live pipeline
@@ -91,9 +91,9 @@ pub async fn set_audio_muted(
 
 #[tauri::command]
 pub async fn start_restream_server(
-    stream: State<'_, StreamManager>,
-    config: State<'_, AppConfig>,
-    network: State<'_, crate::network::NetworkManager>,
+    stream: State<'_, std::sync::Arc<StreamManager>>,
+    config: State<'_, std::sync::Arc<AppConfig>>,
+    network: State<'_, std::sync::Arc<crate::network::NetworkManager>>,
 ) -> Result<RestreamServerInfo, AppError> {
     // Adopted camera-network secondaries must never be chosen as the RTSP
     // bind or advertise IP — pass them so selection can skip them. Tauri
@@ -105,15 +105,17 @@ pub async fn start_restream_server(
 }
 
 #[tauri::command]
-pub async fn stop_restream_server(stream: State<'_, StreamManager>) -> Result<(), AppError> {
+pub async fn stop_restream_server(
+    stream: State<'_, std::sync::Arc<StreamManager>>,
+) -> Result<(), AppError> {
     stream.stop_restream_server().await
 }
 
 #[tauri::command]
 pub async fn switch_restream_protocol(
-    stream: State<'_, StreamManager>,
-    config: State<'_, AppConfig>,
-    network: State<'_, crate::network::NetworkManager>,
+    stream: State<'_, std::sync::Arc<StreamManager>>,
+    config: State<'_, std::sync::Arc<AppConfig>>,
+    network: State<'_, std::sync::Arc<crate::network::NetworkManager>>,
     protocol: RestreamProtocol,
 ) -> Result<RestreamOperationResult, AppError> {
     let adopted = network.get_adopted_ips().await.into_values().collect();
@@ -123,17 +125,23 @@ pub async fn switch_restream_protocol(
 }
 
 #[tauri::command]
-pub async fn take_screenshot(stream: State<'_, StreamManager>) -> Result<String, AppError> {
+pub async fn take_screenshot(
+    stream: State<'_, std::sync::Arc<StreamManager>>,
+) -> Result<String, AppError> {
     stream.take_screenshot().await
 }
 
 #[tauri::command]
-pub async fn start_recording(stream: State<'_, StreamManager>) -> Result<(), AppError> {
+pub async fn start_recording(
+    stream: State<'_, std::sync::Arc<StreamManager>>,
+) -> Result<(), AppError> {
     stream.start_recording().await
 }
 
 #[tauri::command]
-pub async fn stop_recording(stream: State<'_, StreamManager>) -> Result<String, AppError> {
+pub async fn stop_recording(
+    stream: State<'_, std::sync::Arc<StreamManager>>,
+) -> Result<String, AppError> {
     stream.stop_recording().await
 }
 
@@ -145,7 +153,7 @@ pub async fn stop_recording(stream: State<'_, StreamManager>) -> Result<String, 
 #[tauri::command]
 pub async fn create_video_window(
     window: tauri::WebviewWindow,
-    stream: State<'_, StreamManager>,
+    stream: State<'_, std::sync::Arc<StreamManager>>,
     x: i32,
     y: i32,
     width: i32,
@@ -203,7 +211,7 @@ pub async fn create_video_window(
 #[tauri::command]
 pub async fn update_video_position(
     window: tauri::WebviewWindow,
-    stream: State<'_, StreamManager>,
+    stream: State<'_, std::sync::Arc<StreamManager>>,
     x: i32,
     y: i32,
     width: i32,
@@ -227,7 +235,7 @@ pub async fn update_video_position(
 #[tauri::command]
 pub async fn set_video_visible(
     window: tauri::WebviewWindow,
-    stream: State<'_, StreamManager>,
+    stream: State<'_, std::sync::Arc<StreamManager>>,
     visible: bool,
 ) -> Result<(), AppError> {
     let Some(hwnd) = stream.get_video_child_hwnd() else {

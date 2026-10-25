@@ -403,8 +403,8 @@ pub(crate) async fn address_request(
             super::manual_address::AddressRequest::RemoveSaved { subnet, .. } => Some(subnet.clone()),
             _ => None,
         };
-        let reply = app.state::<super::NetworkManager>()
-            .address_operation(&app.state::<crate::config::AppConfig>(), operation).await;
+        let reply = app.state::<std::sync::Arc<super::NetworkManager>>()
+            .address_operation(&app.state::<std::sync::Arc<crate::config::AppConfig>>(), operation).await;
         if reply.outcome == super::manual_address::AddressOutcome::Success {
             if let Some(subnet) = subnet {
                 use tauri::Emitter;
@@ -426,10 +426,10 @@ pub(crate) async fn mode_request(
     request(
         executor(),
         move || async move {
-            app.state::<super::NetworkManager>()
+            app.state::<std::sync::Arc<super::NetworkManager>>()
                 .transition_mode(
                     app.clone(),
-                    &app.state::<crate::config::AppConfig>(),
+                    &app.state::<std::sync::Arc<crate::config::AppConfig>>(),
                     operation,
                 )
                 .await
@@ -447,8 +447,12 @@ pub(crate) async fn refresh_request(
     request(
         executor(),
         move || async move {
-            app.state::<super::NetworkManager>()
-                .refresh_native_adapter(&app.state::<crate::config::AppConfig>(), &name, mode)
+            app.state::<std::sync::Arc<super::NetworkManager>>()
+                .refresh_native_adapter(
+                    &app.state::<std::sync::Arc<crate::config::AppConfig>>(),
+                    &name,
+                    mode,
+                )
                 .await
         },
         result_outcome,
@@ -464,8 +468,12 @@ pub(crate) async fn select_request(
         executor(),
         move || async move {
             let selection = app
-                .state::<super::NetworkManager>()
-                .select_adapter(&app.state::<crate::config::AppConfig>(), &app, &mac)
+                .state::<std::sync::Arc<super::NetworkManager>>()
+                .select_adapter(
+                    &app.state::<std::sync::Arc<crate::config::AppConfig>>(),
+                    &app,
+                    &mac,
+                )
                 .await?;
             super::watcher::emit_selection(&app, &selection);
             Ok(selection)
@@ -814,7 +822,7 @@ pub(crate) async fn startup_reconcile(app: tauri::AppHandle) -> Result<(), AppEr
             let result = NATIVE_SCOPE
                 .scope((cancel, state), async move {
                     let firewall = super::firewall::startup().await;
-                    app.state::<crate::streaming::StreamManager>()
+                    app.state::<std::sync::Arc<crate::streaming::StreamManager>>()
                         .startup_firewall_status(firewall.clone())
                         .await;
                     match firewall {
@@ -825,8 +833,8 @@ pub(crate) async fn startup_reconcile(app: tauri::AppHandle) -> Result<(), AppEr
                             )))
                         }
                     }
-                    let manager = app.state::<super::NetworkManager>();
-                    let config = app.state::<crate::config::AppConfig>();
+                    let manager = app.state::<std::sync::Arc<super::NetworkManager>>();
+                    let config = app.state::<std::sync::Arc<crate::config::AppConfig>>();
                     manager.hydrate_adoption_history(&config);
                     // A successful fresh read is required even when there are no rows.
                     interface::list_all_adapters().await?;

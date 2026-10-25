@@ -19,8 +19,8 @@ use crate::validation::parse_camera_ip;
 #[tauri::command]
 pub async fn open_device_browser(
     target: CameraTarget,
-    manager: State<'_, NetworkManager>,
-    config: State<'_, AppConfig>,
+    manager: State<'_, std::sync::Arc<NetworkManager>>,
+    config: State<'_, std::sync::Arc<AppConfig>>,
 ) -> Result<(), AppError> {
     let addr = parse_camera_ip(&target.ip)?;
     let owners = crate::network::ip_conflict::local_ip_owners()?;
@@ -59,8 +59,8 @@ pub async fn open_device_browser(
 pub async fn ptu_send(
     ptu: State<'_, crate::camera::flir_ptu::PtuController>,
     target: CameraTarget,
-    manager: State<'_, NetworkManager>,
-    config: State<'_, AppConfig>,
+    manager: State<'_, std::sync::Arc<NetworkManager>>,
+    config: State<'_, std::sync::Arc<AppConfig>>,
     cmd: String,
 ) -> Result<std::collections::HashMap<String, String>, AppError> {
     parse_camera_ip(&target.ip)?;
@@ -79,8 +79,8 @@ pub async fn ptu_send(
 #[tauri::command]
 pub async fn control_cgi_zoom_direct(
     target: CameraTarget,
-    manager: State<'_, NetworkManager>,
-    config: State<'_, AppConfig>,
+    manager: State<'_, std::sync::Arc<NetworkManager>>,
+    config: State<'_, std::sync::Arc<AppConfig>>,
     position: i32,
 ) -> Result<(), AppError> {
     let addr = parse_camera_ip(&target.ip)?;
@@ -149,7 +149,7 @@ pub async fn control_cgi_zoom_direct(
 /// in our adopted/discovered set by the time the slider is in use.
 #[tauri::command]
 pub async fn set_zoom_position(
-    config: State<'_, AppConfig>,
+    config: State<'_, std::sync::Arc<AppConfig>>,
     camera_ip: String,
     percent: i32,
 ) -> Result<(), AppError> {

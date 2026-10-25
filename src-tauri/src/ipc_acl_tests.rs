@@ -37,10 +37,12 @@ fn generated_acl_denies_registered_canary_and_dispatches_allowed_command() {
     // than mock_context (whose application authority would be empty).
     let app = tauri::test::mock_builder()
         .manage(CanaryExecutions::default())
-        .manage(AppConfig::temporary_test_config(AppSettings {
-            network_mode: NetworkMode::StaticManual,
-            ..AppSettings::default()
-        }))
+        .manage(std::sync::Arc::new(AppConfig::temporary_test_config(
+            AppSettings {
+                network_mode: NetworkMode::StaticManual,
+                ..AppSettings::default()
+            },
+        )))
         .invoke_handler(minimal_handler())
         .build(tauri::generate_context!())
         .expect("real generated context must build on MockRuntime");

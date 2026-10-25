@@ -15,7 +15,9 @@ use crate::error::AppError;
 use crate::streaming::{RestreamOperationResult, StreamManager};
 
 #[tauri::command]
-pub async fn get_config(config: State<'_, AppConfig>) -> Result<AppSettingsView, AppError> {
+pub async fn get_config(
+    config: State<'_, std::sync::Arc<AppConfig>>,
+) -> Result<AppSettingsView, AppError> {
     crate::network::bindings::migrate(&config).await?;
     let settings = config.get();
     Ok(AppSettingsView::from(&settings))
@@ -23,7 +25,7 @@ pub async fn get_config(config: State<'_, AppConfig>) -> Result<AppSettingsView,
 
 #[tauri::command]
 pub async fn update_stream_settings(
-    config: State<'_, AppConfig>,
+    config: State<'_, std::sync::Arc<AppConfig>>,
     stream: StreamConfig,
 ) -> Result<(), AppError> {
     config.update_stream(stream)
@@ -31,9 +33,9 @@ pub async fn update_stream_settings(
 
 #[tauri::command]
 pub async fn apply_restream_settings(
-    config: State<'_, AppConfig>,
-    stream: State<'_, StreamManager>,
-    network: State<'_, crate::network::NetworkManager>,
+    config: State<'_, std::sync::Arc<AppConfig>>,
+    stream: State<'_, std::sync::Arc<StreamManager>>,
+    network: State<'_, std::sync::Arc<crate::network::NetworkManager>>,
     update: RestreamSettingsUpdate,
 ) -> Result<RestreamOperationResult, AppError> {
     let adopted = network.get_adopted_ips().await.into_values().collect();
@@ -44,7 +46,7 @@ pub async fn apply_restream_settings(
 
 #[tauri::command]
 pub async fn update_credentials(
-    config: State<'_, AppConfig>,
+    config: State<'_, std::sync::Arc<AppConfig>>,
     credentials: Credentials,
 ) -> Result<(), AppError> {
     config.update_credentials(credentials)
@@ -54,6 +56,8 @@ pub async fn update_credentials(
 /// resets). The frontend fetches this once at init and shows each entry
 /// as an error toast.
 #[tauri::command]
-pub async fn get_startup_notices(config: State<'_, AppConfig>) -> Result<Vec<String>, AppError> {
+pub async fn get_startup_notices(
+    config: State<'_, std::sync::Arc<AppConfig>>,
+) -> Result<Vec<String>, AppError> {
     Ok(config.startup_notices())
 }
