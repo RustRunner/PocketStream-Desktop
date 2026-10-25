@@ -1,5 +1,7 @@
 # Windows release qualification procedure
 
+The current work is a [bounded development checkpoint](privilege-v2-development-checkpoint.md). The operator stopped full A4 qualification; only demonstrated fixes and the requested listener fixture regression continue. This procedure remains a future requirement, not the current execution plan.
+
 These checks require a disposable, isolated Windows fixture. Windows Sandbox can qualify the supported subset after its prerequisites pass; missing services or unsupported device/session behavior remain pending. Do not run installation, uninstallation, firewall mutation, address/DHCP changes or fault injection on the development PC. Automated policy fakes and generated-installer inspection do not satisfy these checks. A4 and overall v2-A qualification remain incomplete.
 
 The [latest qualification record](privilege-v2-final-qualification.md) reports 28 passing Sandbox scenarios and limited elevated camera/PTU smoke against its exact rebuilt images, with failures and remaining gates preserved. The matrix below remains the full release requirement; passing a subset does not close it.

@@ -36,7 +36,7 @@ for (const args of [
 test('Sandbox fixture scripts parse in Windows PowerShell 5.1', { skip: !windows }, () => {
   const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `
     $ErrorActionPreference='Stop'
-    foreach($path in @('scripts/prepare-privilege-sandbox.ps1','scripts/qualification/Invoke-PrivilegeSandbox.ps1','scripts/qualification/Invoke-PrivilegeSandboxFailures.ps1')) {
+    foreach($path in @('scripts/prepare-privilege-sandbox.ps1','scripts/qualification/Invoke-PrivilegeSandbox.ps1','scripts/qualification/Invoke-PrivilegeSandboxFailures.ps1','scripts/qualification/Invoke-PrivilegeSandboxRemaining.ps1','scripts/qualification/Invoke-PrivilegeSandboxControl.ps1','scripts/qualification/Inspect-A4Host.ps1','scripts/qualification/Invoke-A4HostSession.ps1','scripts/qualification/Invoke-A4HostUi.ps1','scripts/qualification/Observe-A4Host.ps1','src-tauri/installer/uninstall-bootstrap.ps1','scripts/prepare-installer-prerequisites.ps1')) {
       $tokens=$null; $errors=$null
       $null=[Management.Automation.Language.Parser]::ParseFile((Join-Path (Get-Location) $path),[ref]$tokens,[ref]$errors)
       if($errors.Count) { throw ($errors.Message -join '; ') }
@@ -44,6 +44,27 @@ test('Sandbox fixture scripts parse in Windows PowerShell 5.1', { skip: !windows
   `], { cwd: repository, encoding: 'utf8', timeout: 15000, windowsHide: true });
   assert.ifError(result.error);
   assert.equal(result.status, 0, result.stderr);
+});
+
+test('Remaining A4 scenarios reject the host before prerequisite or policy access', { skip: !windows }, () => {
+  const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+    '-File', path.join(repository, 'scripts/qualification/Invoke-PrivilegeSandboxRemaining.ps1')], {
+    cwd: repository, encoding: 'utf8', timeout: 15000, windowsHide: true,
+    env: { ...process.env, USERNAME: 'WDAGUtilityAccount' },
+  });
+  assert.ifError(result.error);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /only inside Windows Sandbox/);
+});
+
+test('Standalone bootstrap rejects an unprotected repository copy before elevation or mutation', { skip: !windows }, () => {
+  const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+    '-File', path.join(repository, 'src-tauri/installer/uninstall-bootstrap.ps1'), '-Silent'], {
+    cwd: repository, encoding: 'utf8', timeout: 15000, windowsHide: true,
+  });
+  assert.ifError(result.error);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /protected installation root/);
 });
 
 test('Supplemental payload failures reject host execution before accessing native state', { skip: !windows }, () => {
@@ -93,4 +114,24 @@ test('uninstall fixture waits for registry and rules after the image disappears'
   assert.ifError(result.error);
   assert.equal(result.status, 0, result.stderr);
   assert.ok(Number(result.stdout.trim()) >= 5);
+});
+
+test('listener fixture resets the output protocol independently of its UDP input', { skip: !windows }, () => {
+  const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `
+    $ErrorActionPreference='Stop'
+    function Assert([bool]$Condition,[string]$Reason){if(!$Condition){throw $Reason}}
+    $tokens=$null; $errors=$null
+    $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path (Get-Location) 'scripts/qualification/Invoke-PrivilegeSandboxRemaining.ps1'),[ref]$tokens,[ref]$errors)
+    $fn=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Set-Section'},$true)
+    . ([scriptblock]::Create($fn.Extent.Text))
+    $config=[IO.Path]::GetTempFileName()
+    try {
+      [IO.File]::WriteAllText($config, 'restream_protocol = "srt"'+[Environment]::NewLine+'[stream]'+[Environment]::NewLine+'protocol = "udp"'+[Environment]::NewLine)
+      Set-Section '' 'restream_protocol' '"rtsp"'
+      $actual=[IO.File]::ReadAllText($config)
+      if($actual -notmatch '(?m)^restream_protocol = "rtsp"\\s*$' -or $actual -notmatch '(?m)^protocol = "udp"\\s*$'){throw 'Output reset changed the input protocol or left SRT selected.'}
+    } finally { [IO.File]::Delete($config) }
+  `], { cwd: repository, encoding: 'utf8', timeout: 15000, windowsHide: true });
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stderr);
 });

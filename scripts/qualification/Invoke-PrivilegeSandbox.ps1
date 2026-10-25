@@ -101,11 +101,25 @@ function Native([string]$Label, [string]$Image, [string]$Arguments, [int[]]$Expe
     $process = Start-Process -FilePath $Image -ArgumentList $Arguments -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $run ($Label + '.stdout.log')) -RedirectStandardError (Join-Path $run ($Label + '.stderr.log'))
     # Retain the process handle before WaitForExit so its exit code is reliable.
     $null = $process.Handle
-    if (!$process.WaitForExit(120000)) { throw "$Label timed out; process $($process.Id) was left for inspection, not killed." }
+    if (!$process.WaitForExit(600000)) { throw "$Label timed out; process $($process.Id) was left for inspection, not killed." }
     $result = [ordered]@{image=$Image;arguments=$Arguments;pid=$process.Id;exit=$process.ExitCode;elapsed_ms=$watch.ElapsedMilliseconds;expected=$Expected}
     $result | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $run ($Label + '.process.json')) -Encoding UTF8
     Assert ($process.ExitCode -in $Expected) "$Label exit $($process.ExitCode), expected $($Expected -join ',')."
     return $result
+}
+function Standalone([string]$Label,[string]$Switches='',[int[]]$Expected=@(0)) {
+    Assert ($Switches -in @('','/S','/P')) 'Unsupported standalone fixture mode.'
+    $bootstrap=Join-Path $installRoot 'uninstall-bootstrap.ps1'
+    if(Test-Path -LiteralPath $bootstrap){
+        $shell=Join-Path $PSHOME 'powershell.exe'
+        $registered=(Get-ItemProperty -LiteralPath $uninstallKey).UninstallString
+        $prefix='"'+$shell+'" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "'+$bootstrap+'"'
+        Assert ($registered -ieq $prefix) 'Registered standalone command differs from the fixed bootstrap.'
+        $arguments='-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "'+$bootstrap+'"'
+        if($Switches -eq '/S'){$arguments+=' -Silent'}elseif($Switches -eq '/P'){$arguments+=' -Passive'}
+        return Native $Label $shell $arguments $Expected
+    }
+    return Native $Label (Join-Path $installRoot 'uninstall.exe') $Switches $Expected
 }
 function Scenario([string]$Name, [scriptblock]$Action) {
     $entry = [ordered]@{name=$Name;started_utc=[DateTime]::UtcNow.ToString('o');status='running'}

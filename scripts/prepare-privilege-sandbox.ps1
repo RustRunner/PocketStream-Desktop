@@ -7,11 +7,13 @@ param(
     [string]$EvidencePath = 'docs/runtime-evidence/privilege-v2-final-qualification.json',
     [string]$LegacyInstaller,
     [string]$LegacySha256,
-    [ValidateSet('Preflight', 'Supported')][string]$Mode = 'Preflight'
+    [ValidateSet('Preflight', 'Supported', 'Remaining')][string]$Mode = 'Preflight',
+    [switch]$ListenerOnly
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $repository = Split-Path -Parent $PSScriptRoot
+if($ListenerOnly -and $Mode -ne 'Remaining'){throw 'ListenerOnly requires the remaining-case fixture.'}
 function Read-Json([string]$Path) { Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json }
 function Hash([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
 function Verify($Reference) {
@@ -62,6 +64,7 @@ $copies = [ordered]@{
     'candidate-packaged.exe' = (Join-Path $repository $review.artifacts.embedded.path)
     'Invoke-PrivilegeSandbox.ps1' = (Join-Path $PSScriptRoot 'qualification\Invoke-PrivilegeSandbox.ps1')
     'Invoke-PrivilegeSandboxFailures.ps1' = (Join-Path $PSScriptRoot 'qualification\Invoke-PrivilegeSandboxFailures.ps1')
+    'Invoke-PrivilegeSandboxRemaining.ps1' = (Join-Path $PSScriptRoot 'qualification\Invoke-PrivilegeSandboxRemaining.ps1')
     'verify-a1-production-smoke.ps1' = (Join-Path $PSScriptRoot 'verify-a1-production-smoke.ps1')
     'review.json' = $EvidencePath
 }
@@ -97,7 +100,7 @@ $extracted = Join-Path $inspection 'extracted'
 if ($LASTEXITCODE -ne 0) { throw 'Package extraction failed.' }
 $payload = @(Get-ChildItem -LiteralPath $extracted -File -Recurse | ForEach-Object {
     $relative = $_.FullName.Substring($extracted.Length + 1)
-    if ($relative -eq 'pocketstream-desktop.exe' -or $relative.StartsWith('resources\', [StringComparison]::OrdinalIgnoreCase)) { [ordered]@{path=$relative;sha256=(Hash $_.FullName);bytes=$_.Length} }
+    if ($relative -in @('pocketstream-desktop.exe','uninstall-bootstrap.ps1') -or $relative.StartsWith('resources\', [StringComparison]::OrdinalIgnoreCase)) { [ordered]@{path=$relative;sha256=(Hash $_.FullName);bytes=$_.Length} }
 })
 if (@($payload | Where-Object path -eq 'pocketstream-desktop.exe').Count -ne 1 -or $payload.Count -lt 90) { throw 'Unexpected extracted payload inventory.' }
 $manifest = [ordered]@{
@@ -125,6 +128,10 @@ $mapped = $document.SelectNodes('/Configuration/MappedFolders/MappedFolder/HostF
 $mapped[0].InnerText = [string]$inputs
 $mapped[1].InnerText = [string]$results
 $document.SelectSingleNode('/Configuration/LogonCommand/Command').InnerText = 'powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File C:\PocketStreamQualification\Inputs\Invoke-PrivilegeSandbox.ps1 -Mode ' + $Mode
+if ($Mode -eq 'Remaining') {
+    $document.SelectSingleNode('/Configuration/LogonCommand/Command').InnerText = 'powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File C:\PocketStreamQualification\Inputs\Invoke-PrivilegeSandboxRemaining.ps1'
+    if($ListenerOnly){$document.SelectSingleNode('/Configuration/LogonCommand/Command').InnerText += ' -ListenerOnly'}
+}
 $launcher = Join-Path $RunRoot 'PocketStream.wsb'
 $document.Save($launcher)
 Write-Json ([ordered]@{launcher=$launcher;launcher_sha256=(Hash $launcher);fixture_sha256=(Hash (Join-Path $inputs 'fixture.json'));source_count=$sources.Count;effective_source_sha256=$sourceDigest;inputs_read_only=$true;results=$results;mode=$Mode;launched=$false;installer_executed_on_host=$false}) (Join-Path $RunRoot 'prepared.json')
