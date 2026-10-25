@@ -1,3 +1,5 @@
+mod adapter_selector;
+use adapter_selector::{adapter_candidate, adapter_mac, pick_adapter};
 pub mod adapter_refresh;
 pub mod arp;
 pub mod auto_adopt;
@@ -282,32 +284,6 @@ pub struct AdapterSelection {
     pub interface_index: Option<u32>,
     pub selection_required: bool,
     pub candidates: Vec<InterfaceInfo>,
-}
-
-fn adapter_mac(mac: &str) -> Option<String> {
-    let bytes = parse_mac_bytes(mac)?;
-    (bytes != [0; 6] && bytes[0] & 1 == 0).then(|| mac.replace('-', ":").to_ascii_lowercase())
-}
-
-fn adapter_candidate(iface: &InterfaceInfo) -> bool {
-    interface::is_wired_physical(iface) && !iface.is_wifi && adapter_mac(&iface.mac).is_some()
-}
-
-/// A saved identity wins even when absent; enumeration order never selects.
-pub(crate) fn pick_adapter<'a>(
-    list: &'a [InterfaceInfo],
-    mac: Option<&str>,
-) -> Option<&'a InterfaceInfo> {
-    let mut candidates = list.iter().filter(|iface| adapter_candidate(iface));
-    if let Some(mac) = mac {
-        let mac = adapter_mac(mac)?;
-        let mut matching =
-            candidates.filter(|iface| adapter_mac(&iface.mac).as_ref() == Some(&mac));
-        let found = matching.next()?;
-        return matching.next().is_none().then_some(found);
-    }
-    let found = candidates.next()?;
-    candidates.next().is_none().then_some(found)
 }
 
 #[derive(Default)]
@@ -727,6 +703,7 @@ pub struct ModeTransitionReply {
 }
 
 pub struct NetworkManager {
+    selector: Arc<adapter_selector::AdapterSelector>,
     config: Arc<crate::config::AppConfig>,
     address_io: Arc<dyn interface::AddressIo>,
     active_scans: Arc<std::sync::Mutex<HashSet<String>>>,
@@ -744,15 +721,9 @@ pub struct NetworkManager {
     capture_identity: Arc<Mutex<Option<CaptureIdentity>>>,
     capture_signal: Arc<Mutex<CaptureSignal>>,
     candidates: Arc<arp::CandidateSet>,
-    presence: Arc<presence::Control>,
-    presence_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     address_work: Arc<Mutex<()>>,
     address_generation: Arc<AtomicU64>,
     address_active: Arc<AtomicBool>,
-    /// Local adapter MAC identities shared by capture and neighbor imports.
-    /// Refreshed at discovery start and each adoption pass so retained capture
-    /// sessions recognize newly attached adapters without hiding IP collisions.
-    local_macs: Arc<StdMutex<HashSet<[u8; 6]>>>,
     /// Legacy listener exclusions. Activated discovery clears these and
     /// uses selected-interface scope/verification even on overlapping subnets.
     excluded_subnets: Arc<StdMutex<Vec<ipnetwork::Ipv4Network>>>,
@@ -770,9 +741,6 @@ pub struct NetworkManager {
     /// exhausted emits `discovery-degraded`, then `discovery-recovered`
     /// on the first frame — the pre-ladder event contract, unchanged.
     discovery_watchdog_handle: Arc<Mutex<Option<WatchdogHandle>>>,
-    interface_name: Arc<Mutex<Option<String>>>,
-    interface_index: Arc<Mutex<Option<u32>>>,
-    adapter_selection: Arc<Mutex<AdapterSelection>>,
     /// Canonical store of merged device records (ARP + scan + cache +
     /// alias + status). Mutated alongside `arp_devices` during the
     /// transition; once the frontend is fully migrated to subscribe-only
@@ -2321,6 +2289,7 @@ impl NetworkManager {
         let registry = Arc::new(DeviceRegistry::new());
         let emitter = DeviceListEmitter::new(bridge, registry.clone());
         Self {
+            selector: Arc::new(adapter_selector::AdapterSelector::new()),
             config,
             address_io: Arc::new(interface::RealAddressIo),
             active_scans: Arc::new(std::sync::Mutex::new(HashSet::new())),
@@ -2332,20 +2301,14 @@ impl NetworkManager {
             capture_identity: Arc::new(Mutex::new(None)),
             capture_signal: Arc::new(Mutex::new(CaptureSignal::default())),
             candidates: Arc::new(arp::CandidateSet::default()),
-            presence: Arc::new(presence::Control::default()),
-            presence_handle: Mutex::new(None),
             address_work: Arc::new(Mutex::new(())),
             address_generation: Arc::new(AtomicU64::new(1)),
             address_active: Arc::new(AtomicBool::new(true)),
-            local_macs: Arc::new(StdMutex::new(HashSet::new())),
             excluded_subnets: Arc::new(StdMutex::new(Vec::new())),
             auto_adopt_handle: Arc::new(Mutex::new(None)),
             pending_ips: Arc::new(Mutex::new(Vec::new())),
             adoption_seq: Arc::new(AtomicU64::new(0)),
             discovery_watchdog_handle: Arc::new(Mutex::new(None)),
-            interface_name: Arc::new(Mutex::new(None)),
-            interface_index: Arc::new(Mutex::new(None)),
-            adapter_selection: Arc::new(Mutex::new(AdapterSelection::default())),
             device_registry: registry,
             device_emitter: emitter,
             ping_dot_handle: Arc::new(Mutex::new(None)),
@@ -2596,7 +2559,7 @@ impl NetworkManager {
         }
 
         if hydrated || !demoted.is_empty() {
-            self.presence.bootstrap();
+            self.selector.presence.bootstrap();
             self.device_emitter.poke();
         }
     }
@@ -2695,7 +2658,7 @@ impl NetworkManager {
         self.reconcile_bindings_locked(config).await;
         let mode = config.get_network_mode();
         self.update_presence_adapter(&self.adapter_selection_state().await, mode);
-        self.presence.tick(&self.device_registry);
+        self.selector.presence.tick(&self.device_registry);
         drop(address);
         drop(pause);
         if mode == NetworkMode::StaticManual && old_mode != mode {
@@ -2731,7 +2694,7 @@ impl NetworkManager {
                 log::warn!("Discovery restart after mode transition: {}", e);
             }
         }
-        self.presence.bootstrap();
+        self.selector.presence.bootstrap();
         if resume {
             self.start_ping_dot(app).await;
         }
@@ -2748,13 +2711,13 @@ impl NetworkManager {
     }
 
     pub(crate) async fn start_presence(&self, app: tauri::AppHandle) {
-        let mut handle = self.presence_handle.lock().await;
+        let mut handle = self.selector.presence_handle.lock().await;
         if handle.is_some() {
             return;
         }
         self.device_registry.set_verification_scope(None);
         let emitter = self.device_emitter.clone();
-        let control = self.presence.clone();
+        let control = self.selector.presence.clone();
         let registry = self.device_registry.clone();
         let candidates = self.candidates.clone();
         *handle = Some(tokio::spawn(async move {
@@ -2793,34 +2756,6 @@ impl NetworkManager {
                 }
             }
         }));
-    }
-
-    pub(crate) fn update_presence_adapter(
-        &self,
-        selection: &AdapterSelection,
-        mode: crate::config::NetworkMode,
-    ) {
-        self.presence
-            .update_native(selection, mode, interface::quick_link_by_mac);
-    }
-
-    pub(crate) async fn stop_presence(&self) {
-        self.presence.stop();
-        self.device_registry.set_verification_scope(None);
-        if let Some(mut handle) = self.presence_handle.lock().await.take() {
-            if tokio::time::timeout(std::time::Duration::from_secs(5), &mut handle)
-                .await
-                .is_err()
-            {
-                handle.abort();
-            }
-        }
-    }
-
-    /// S9 consumes this wake; notifications carry no identity or liveness of their own.
-    #[allow(dead_code)]
-    pub(crate) async fn expected_device_verified(&self) {
-        self.presence.verified.notified().await;
     }
 
     /// Start the ICMP-based reachability pinger. Mode-independent — the
@@ -2875,7 +2810,7 @@ impl NetworkManager {
         self.reconcile_bindings_locked(config).await;
         drop(_address);
         drop(pause);
-        self.presence.bootstrap();
+        self.selector.presence.bootstrap();
         use tauri::Emitter;
         let snapshot = self.adoption_snapshot().await;
         for (subnet, ip) in &snapshot.adopted_subnets {
@@ -2930,7 +2865,7 @@ impl NetworkManager {
         if changed {
             log::info!("event=binding_change adapter_mac={} interface_index={} subnet={} address={} desired={:?} applied={} error={} reason={}",
                 log_value(row.adapter_mac.as_deref().unwrap_or("unknown")),
-                self.adapter_selection.lock().await.interface_index.unwrap_or(0),
+                self.selector.adapter_selection.lock().await.interface_index.unwrap_or(0),
                 log_value(subnet), log_value(row.address.as_deref().unwrap_or("unknown")),
                 row.desired, row.applied, row.last_error.is_some(),
                 if row.last_error.is_some() { "pending" } else if row.applied { "applied" } else { "removed" });
@@ -3118,7 +3053,31 @@ impl NetworkManager {
     }
 
     pub async fn adapter_selection_state(&self) -> AdapterSelection {
-        self.adapter_selection.lock().await.clone()
+        self.selector.snapshot().await
+    }
+
+    pub(crate) fn selection_subscription(&self) -> tokio::sync::watch::Receiver<AdapterSelection> {
+        self.selector.subscribe()
+    }
+
+    pub(crate) fn selection_observed(&self, selection: &AdapterSelection) {
+        self.selector.observe(selection);
+    }
+
+    pub(crate) fn update_presence_adapter(
+        &self,
+        selection: &AdapterSelection,
+        mode: crate::config::NetworkMode,
+    ) {
+        self.selector.update_presence_adapter(selection, mode);
+    }
+
+    pub(crate) async fn stop_presence(&self) {
+        self.selector.stop_presence(&self.device_registry).await;
+    }
+
+    pub(crate) async fn expected_device_verified(&self) {
+        self.selector.expected_device_verified().await;
     }
 
     async fn native_interfaces(
@@ -3208,7 +3167,7 @@ impl NetworkManager {
             let _address = self.address_work.lock().await;
             self.reconcile_temporary_locked(config).await;
             self.reconcile_bindings_locked(config).await;
-            self.presence.bootstrap();
+            self.selector.presence.bootstrap();
         }
         Ok(selection)
     }
@@ -3218,17 +3177,10 @@ impl NetworkManager {
         config: &crate::config::AppConfig,
         list: &[InterfaceInfo],
     ) -> Result<AdapterSelection, AppError> {
-        let mut mac = config.get().selected_adapter_mac;
-        let adapter = pick_adapter(list, mac.as_deref()).cloned();
-        if mac.is_none() {
-            if let Some(iface) = &adapter {
-                mac = adapter_mac(&iface.mac);
-                config.set_selected_adapter_mac(mac.clone().unwrap())?;
-            }
-        }
-        let index = adapter
-            .as_ref()
-            .and_then(|i| interface::index_for_mac(&i.mac));
+        let selection = self.selector.propose(config, list)?;
+        let mac = selection.selected_mac.clone();
+        let adapter = selection.adapter.clone();
+        let index = selection.interface_index;
         let previous = self.adapter_selection_state().await;
         let pending_selection = AdapterSelection {
             selected_mac: mac.clone(),
@@ -3237,7 +3189,7 @@ impl NetworkManager {
             ..Default::default()
         };
         self.update_presence_adapter(&pending_selection, config.get_network_mode());
-        self.presence.tick(&self.device_registry);
+        self.selector.presence.tick(&self.device_registry);
         if previous.selected_mac != mac || previous.interface_index != index {
             if let Some(identity) = self.capture_identity.lock().await.as_ref() {
                 identity.active.store(false, Ordering::Release);
@@ -3257,11 +3209,6 @@ impl NetworkManager {
                 }
             }
         }
-        let candidates: Vec<_> = list
-            .iter()
-            .filter(|i| adapter_candidate(i))
-            .cloned()
-            .collect();
         if previous.selected_mac != mac || previous.interface_index != index {
             log::info!(
                 "event=adapter_selection adapter_mac={} interface_index={} available={}",
@@ -3270,20 +3217,7 @@ impl NetworkManager {
                 adapter.is_some()
             );
         }
-        let selection = AdapterSelection {
-            selection_required: mac.is_none() && candidates.len() > 1,
-            selected_mac: mac,
-            adapter,
-            interface_index: index,
-            candidates,
-        };
-        *self.interface_name.lock().await = selection
-            .adapter
-            .as_ref()
-            .filter(|_| index.is_some())
-            .map(|i| i.name.clone());
-        *self.interface_index.lock().await = index;
-        *self.adapter_selection.lock().await = selection.clone();
+        self.selector.commit(&selection).await;
         Ok(selection)
     }
 
@@ -3347,7 +3281,7 @@ impl NetworkManager {
         let settings = config.get();
         if settings.network_mode == crate::config::NetworkMode::StaticManual
             || !crate::is_discovery_available()
-            || self.presence.stopped()
+            || self.selector.presence.stopped()
         {
             return Ok(false);
         }
@@ -3407,7 +3341,7 @@ impl NetworkManager {
 
     /// Current selected-adapter addresses from IP Helper, never the saved map.
     fn probe_scope(&self) -> Option<(InterfaceInfo, u32, SweepFence)> {
-        let snapshot = self.presence.snapshot();
+        let snapshot = self.selector.presence.snapshot();
         let mut adapter = snapshot.adapter?;
         if snapshot.fence.is_stale() || interface::index_for_mac(&adapter.mac)? != snapshot.index {
             return None;
@@ -3457,7 +3391,7 @@ impl NetworkManager {
         config: &crate::config::AppConfig,
         bound: bool,
     ) -> Result<route::ReadyPath, AppError> {
-        if self.presence.tick(&self.device_registry) {
+        if self.selector.presence.tick(&self.device_registry) {
             self.device_emitter.poke();
         }
         let mut target = target.clone();
@@ -3911,7 +3845,6 @@ impl NetworkManager {
                 interface_display_name
             ))
         })?;
-        *self.interface_index.lock().await = Some(interface_index);
         // Capture identity for attach-time scoping: the same MAC that
         // feeds the own-frame filter, plus the display name for logs. A
         // None MAC (unparseable) makes the join fail and the capture
@@ -3925,10 +3858,10 @@ impl NetworkManager {
         // Recognize this PC by all of its adapter MACs, not its IP addresses.
         // A wired peer can share an IP with Wi-Fi on a separate link. The same
         // shared set survives capture restarts and is refreshed each pass.
-        if let Ok(mut set) = self.local_macs.lock() {
+        if let Ok(mut set) = self.selector.local_macs.lock() {
             *set = interface::local_adapter_macs();
         }
-        let local_macs = self.local_macs.clone();
+        let local_macs = self.selector.local_macs.clone();
 
         // Activated discovery uses scope proof or fresh selected-interface
         // resolution, never subnet exclusion as an identity boundary. This
@@ -4021,7 +3954,6 @@ impl NetworkManager {
         // consumer below (sweeps, watchdog).
         let listener_params = listener_params.with_fence(fence.clone());
 
-        *self.interface_name.lock().await = Some(interface_display_name.to_string());
         log::info!(
             "Starting ARP discovery on '{}' (IPs: {:?}, mac: {})",
             interface_display_name,
@@ -4710,7 +4642,8 @@ impl NetworkManager {
         log::info!(
             "event=binding_change adapter_mac={} interface_index={} address={} reason=manual_claim",
             log_value(adapter.as_deref().unwrap_or("unknown")),
-            self.adapter_selection
+            self.selector
+                .adapter_selection
                 .lock()
                 .await
                 .interface_index
@@ -5173,7 +5106,7 @@ async fn run_presence_job(
         emitter: emitter.clone(),
         fence: snapshot.fence.clone(),
         address_fence,
-        local_macs: manager.local_macs.clone(),
+        local_macs: manager.selector.local_macs.clone(),
     };
     let mut cooldowns = HashMap::new();
     let mut known_subnets = HashSet::new();
@@ -5267,7 +5200,7 @@ async fn run_presence_job(
             .as_ref()
             .is_some_and(|m| m.eq_ignore_ascii_case(&proof.mac))
         {
-            manager.presence.verified.notify_one();
+            manager.selector.presence.verified.notify_one();
         }
         Some(key)
     })
@@ -5525,10 +5458,11 @@ mod tests {
         let manager = NetworkManager::new();
         let selection = discovery_selection(true);
         manager
+            .selector
             .presence
             .update(&selection, crate::config::NetworkMode::StaticAuto);
-        manager.presence.tick(&manager.registry());
-        let snapshot = manager.presence.snapshot();
+        manager.selector.presence.tick(&manager.registry());
+        let snapshot = manager.selector.presence.snapshot();
         let ingress = manager
             .candidate_ingress(
                 7,
@@ -5634,9 +5568,9 @@ mod tests {
             let manager = NetworkManager::new();
             let mut selection = discovery_selection(true);
             selection.adapter.as_mut().unwrap().ips = saved_adapter(&["10.3.1.10"]).ips;
-            manager.presence.update(&selection, mode);
-            manager.presence.tick(&manager.registry());
-            let snapshot = manager.presence.snapshot();
+            manager.selector.presence.update(&selection, mode);
+            manager.selector.presence.tick(&manager.registry());
+            let snapshot = manager.selector.presence.snapshot();
             let ingress = manager
                 .candidate_ingress(
                     7,
@@ -5761,7 +5695,7 @@ mod tests {
                 .await
                 .insert("192.0.2.0/24".into(), ip("192.0.2.20"));
             if previously_selected {
-                *manager.adapter_selection.lock().await = discovery_selection(true);
+                *manager.selector.adapter_selection.lock().await = discovery_selection(true);
             }
 
             let selection = manager
@@ -6848,58 +6782,6 @@ mod tests {
             is_vpn: false,
             is_virtual: false,
         }
-    }
-
-    #[test]
-    fn persisted_adapter_survives_reordering_absence_and_return() {
-        let mut dock = adapter("Dock", &["192.168.1.101"]);
-        dock.mac = "40:cd:3a:00:00:01".into();
-        let mut usb = adapter("USB", &["192.168.1.102"]);
-        usb.mac = "40:cd:3a:00:00:02".into();
-        for list in [
-            vec![dock.clone(), usb.clone()],
-            vec![usb.clone(), dock.clone()],
-        ] {
-            assert_eq!(
-                pick_adapter(&list, Some("40-CD-3A-00-00-02")).unwrap().name,
-                "USB"
-            );
-        }
-        assert!(pick_adapter(&[dock], Some(&usb.mac)).is_none());
-        assert_eq!(
-            pick_adapter(&[usb], Some("40:cd:3a:00:00:02"))
-                .unwrap()
-                .name,
-            "USB"
-        );
-    }
-
-    #[test]
-    fn automatic_selection_requires_one_eligible_physical_adapter() {
-        let mut wired = adapter("Wired", &[]);
-        wired.mac = "40:cd:3a:00:00:01".into();
-        wired.is_up = false; // the only disconnected port can pre-attach
-        assert_eq!(pick_adapter(&[wired.clone()], None).unwrap().name, "Wired");
-        assert!(pick_adapter(&[], None).is_none());
-        let mut other = wired.clone();
-        other.mac = "40:cd:3a:00:00:02".into();
-        other.is_up = true;
-        assert!(pick_adapter(&[wired.clone(), other.clone()], None).is_none());
-        assert!(pick_adapter(&[other.clone(), wired.clone()], None).is_none());
-        for kind in ["wifi", "vpn", "virtual", "invalid_mac"] {
-            let mut excluded = other.clone();
-            match kind {
-                "wifi" => excluded.is_wifi = true,
-                "vpn" => excluded.is_vpn = true,
-                "virtual" => excluded.is_virtual = true,
-                _ => excluded.mac.clear(),
-            }
-            assert_eq!(
-                pick_adapter(&[excluded, wired.clone()], None).unwrap().mac,
-                wired.mac
-            );
-        }
-        assert!(pick_adapter(&[wired], Some("invalid-mac")).is_none());
     }
 
     #[test]

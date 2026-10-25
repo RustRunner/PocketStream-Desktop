@@ -1946,7 +1946,11 @@ impl StreamManager {
     /// because Tauri's `setup` hook runs on the main thread before any
     /// tokio runtime is bound to the current thread; a bare `tokio::spawn`
     /// here panics with "no reactor running."
-    pub fn start_status_emitter(&self, handle: tauri::AppHandle) {
+    pub fn start_status_emitter(
+        &self,
+        handle: tauri::AppHandle,
+        selection: watch::Receiver<crate::network::AdapterSelection>,
+    ) {
         *self.app_handle.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle.clone());
         let relay_events = self
             .relay_event_rx
@@ -1977,14 +1981,8 @@ impl StreamManager {
             wake: self.playback_wake.clone(),
             diagnostic: self.playback_diagnostic.clone(),
             app: Some(handle.clone()),
+            selection: Some(selection),
         };
-        // Consume the backend watcher's selected-adapter events. Presence's
-        // verified Notify independently wakes a camera reboot behind a switch.
-        use tauri::Listener;
-        let wake = playback.wake.clone();
-        handle.listen("adapter-selection-changed", move |_| {
-            wake.notify_one();
-        });
         tauri::async_runtime::spawn(run_playback_supervisor(playback));
 
         let mut rx = self.status_tx.subscribe();
@@ -2286,6 +2284,7 @@ struct PlaybackSupervisorContext {
     wake: Arc<Notify>,
     diagnostic: PlaybackDiagnostic,
     app: Option<tauri::AppHandle>,
+    selection: Option<watch::Receiver<crate::network::AdapterSelection>>,
 }
 
 type PlaybackDiagnostic = Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>;
@@ -2380,7 +2379,21 @@ async fn expected_device_wake(app: Option<&tauri::AppHandle>) {
     }
 }
 
-async fn run_playback_supervisor(ctx: PlaybackSupervisorContext) {
+async fn selection_wake(rx: &mut Option<watch::Receiver<crate::network::AdapterSelection>>) {
+    if let Some(receiver) = rx {
+        if receiver.changed().await.is_ok() {
+            receiver.borrow_and_update();
+            return;
+        }
+        *rx = None;
+    }
+    std::future::pending::<()>().await;
+}
+
+async fn run_playback_supervisor(mut ctx: PlaybackSupervisorContext) {
+    if let Some(rx) = &mut ctx.selection {
+        rx.borrow_and_update();
+    }
     let mut logged = None;
     let mut recovery_started = None;
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -2388,6 +2401,7 @@ async fn run_playback_supervisor(ctx: PlaybackSupervisorContext) {
     loop {
         tokio::select! {
             _ = tick.tick() => {},
+            _ = selection_wake(&mut ctx.selection) => {},
             _ = wait_playback_ready(&ctx.wake, expected_device_wake(ctx.app.as_ref())) => {},
         }
         playback_step(&ctx).await;
@@ -3616,6 +3630,22 @@ fn select_display_ip(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn closed_selection_subscription_does_not_spin_the_supervisor() {
+        let (tx, rx) = watch::channel(crate::network::AdapterSelection::default());
+        let mut selection = Some(rx);
+        tx.send_replace(crate::network::AdapterSelection::default());
+        selection_wake(&mut selection).await;
+        drop(tx);
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            selection_wake(&mut selection)
+        )
+        .await
+        .is_err());
+        assert!(selection.is_none());
+    }
     use crate::config::*;
 
     #[tokio::test]
@@ -3882,6 +3912,7 @@ mod tests {
             wake: manager.playback_wake.clone(),
             diagnostic: manager.playback_diagnostic.clone(),
             app: None,
+            selection: None,
         }
     }
 

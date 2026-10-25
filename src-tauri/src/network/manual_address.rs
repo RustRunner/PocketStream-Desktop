@@ -120,6 +120,7 @@ impl Transaction {
             // No empty-success fallback. Unknown addresses are explicitly marked;
             // the consumer retains its last known view until a fresh event/read.
             let cached = manager
+                .selector
                 .adapter_selection
                 .try_lock()
                 .ok()
@@ -192,7 +193,7 @@ impl NetworkManager {
             }
             AddressRequest::RemoveSaved { subnet, .. } => ("remove_managed", subnet.clone()),
         };
-        let fence = self.presence.snapshot().fence;
+        let fence = self.selector.presence.snapshot().fence;
         let initial = config.get();
         let mut tx = Transaction {
             trace: AddressTrace::new(action, &address),
@@ -669,7 +670,7 @@ impl NetworkManager {
         };
         // Reuse the exact same intent-save, native verification and targeted
         // removal path as the modal. The caller already holds both locks.
-        let fence = self.presence.snapshot().fence;
+        let fence = self.selector.presence.snapshot().fence;
         let mut tx = Transaction {
             trace: AddressTrace::new("replace_primary", &previous.address),
             mac: Some(mac),

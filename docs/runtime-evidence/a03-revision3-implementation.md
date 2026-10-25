@@ -44,3 +44,13 @@ scenario movements are recorded below as implementation progresses.
    205 frontend passed (1 new boundary test). Fmt, Clippy, typecheck, contracts
    and frontend build passed. No existing scenario was removed or ignored.
 
+
+2. AdapterSelector owns selection, presence control/task handle and shared local
+   MAC callback view. It proposes without committing; facade retirement precedes
+   commit. Playback consumes the selection watch in its existing supervisor wait;
+   repeated/latest/closed-channel behavior is covered. Frontend event points
+   remain. Verified write-only manager name/index fields were removed. Existing
+   selection policy tests moved by name; presence task dependency closure follows
+   in slice 5. Gates: 795 Rust passed / 10 ignored; 205 frontend passed; fmt,
+   Clippy, typecheck, contracts and build passed. Three focused tests added.
+

@@ -1765,8 +1765,11 @@ mod tests {
             interface_index: Some(7),
             ..Default::default()
         };
-        manager.presence.update(&selection, NetworkMode::Dhcp);
-        let fence = manager.presence.snapshot().fence;
+        manager
+            .selector
+            .presence
+            .update(&selection, NetworkMode::Dhcp);
+        let fence = manager.selector.presence.snapshot().fence;
         let device = super::super::ArpDevice {
             mac: "aa:bb:cc:dd:ee:02".into(),
             ip: "192.0.2.20".into(),
@@ -1781,15 +1784,15 @@ mod tests {
         let provider_wait = with_adapter_query_lock(&ADAPTER_QUERY_LOCK, || async { Ok(()) });
         let discovery_wait = manager.discovery_op.lock();
         tokio::pin!(provider_wait, discovery_wait);
-        manager.presence.observe_link(|_| Some((7, false)));
+        manager.selector.presence.observe_link(|_| Some((7, false)));
         for _ in 0..9 {
             tokio::select! {
                 _ = &mut provider_wait => panic!("provider wait unexpectedly completed"),
                 _ = &mut discovery_wait => panic!("discovery wait unexpectedly completed"),
                 _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
             }
-            manager.presence.observe_link(|_| Some((7, false)));
-            manager.presence.tick(&registry);
+            manager.selector.presence.observe_link(|_| Some((7, false)));
+            manager.selector.presence.tick(&registry);
         }
         assert_eq!(registry.snapshot()[0].status, DeviceStatus::Offline);
         assert!(fence.is_stale());

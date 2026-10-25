@@ -523,7 +523,7 @@ pub fn run() {
             // emits `stream-status` to the frontend on every change.
             // Replaces the old 1Hz frontend poll of get_stream_status.
             let stream_mgr: tauri::State<'_, std::sync::Arc<streaming::StreamManager>> = handle.state();
-            stream_mgr.start_status_emitter(handle.clone());
+            stream_mgr.start_status_emitter(handle.clone(), handle.state::<std::sync::Arc<network::NetworkManager>>().selection_subscription());
 
             // Start event-driven NIC watcher (Windows NotifyIpInterfaceChange +
             // NotifyUnicastIpAddressChange). If it fails to register — or on

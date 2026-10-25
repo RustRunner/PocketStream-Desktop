@@ -35,6 +35,9 @@ pub(crate) fn selected_status(selection: &AdapterSelection) -> InterfaceInfo {
 }
 
 pub(crate) fn emit_selection(handle: &AppHandle, selection: &AdapterSelection) {
+    handle
+        .state::<std::sync::Arc<NetworkManager>>()
+        .selection_observed(selection);
     let _ = handle.emit("adapter-selection-changed", selection);
     let _ = handle.emit("interface-status-changed", selected_status(selection));
 }
