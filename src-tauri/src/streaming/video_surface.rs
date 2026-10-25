@@ -83,14 +83,24 @@ impl VideoSurface {
 
     pub(crate) fn release(&self, expected: Option<SurfaceToken>) {
         let Some(expected) = expected else { return };
+        {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            if state.current != Some(expected) {
+                return;
+            }
+            // Preserve the command's synchronous conditional release point.
+            state.current = None;
+        }
         let state = self.state.clone();
         let ops = self.ops.clone();
-        // Best effort, like the original command cleanup. Replacement already
-        // destroys the prior child. Stale cleanup must not touch a recycled HWND.
+        // The detached child stays alive until queued destruction. Never touch
+        // its numeric handle if a replacement incarnation now owns that value.
         let _ = self.bridge.run_on_main_thread(Box::new(move || {
-            let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
-            if state.current == Some(expected) {
-                state.current = None;
+            let state = state.lock().unwrap_or_else(|p| p.into_inner());
+            if !state
+                .current
+                .is_some_and(|current| current.hwnd == expected.hwnd)
+            {
                 ops.destroy(expected.hwnd);
             }
         }));
@@ -235,14 +245,13 @@ mod tests {
         let s = surface.clone();
         let visibility = tokio::spawn(async move { s.set_visible(false).await });
         bridge.wait_for(2).await;
-        surface.release(old);
         let s = surface.clone();
         let create = tokio::spawn(async move { s.create(1, [0, 0, 1, 1]).await });
-        bridge.wait_for(4).await;
-        bridge.run(3); // replacement runs before previously queued old work
+        bridge.wait_for(3).await;
+        bridge.run(2); // replacement runs before previously queued old work
         assert_eq!(create.await.unwrap().unwrap(), "42");
         assert_ne!(surface.capture(), old);
-        bridge.run(0);
+        surface.release(old);
         bridge.run(0);
         bridge.run(0);
         position.await.unwrap().unwrap();
@@ -253,6 +262,24 @@ mod tests {
         bridge.run(0);
         assert!(surface.hwnd().is_none());
         assert_eq!(*ops.calls.lock().unwrap(), ["destroy", "create", "destroy"]);
+    }
+
+    #[tokio::test]
+    async fn conditional_release_is_immediate_and_stale_destroy_preserves_recycled_hwnd() {
+        let (surface, bridge, ops) = fixture();
+        surface.set_hwnd(42);
+        let old = surface.capture();
+        surface.release(old);
+        assert!(surface.hwnd().is_none());
+        surface.set_hwnd(42); // model reuse before queued old destruction
+        assert_ne!(surface.capture(), old);
+        bridge.run(0);
+        assert_eq!(surface.hwnd(), Some(42));
+        assert!(ops.calls.lock().unwrap().is_empty());
+        surface.release(surface.capture());
+        assert!(surface.hwnd().is_none());
+        bridge.run(0);
+        assert_eq!(*ops.calls.lock().unwrap(), ["destroy"]);
     }
     #[tokio::test]
     async fn failed_surface_replacement_retires_previous_handle() {

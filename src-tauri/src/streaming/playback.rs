@@ -1,5 +1,18 @@
 //! Playback/recording state, lifecycle and supervisor. No relay mutation authority.
-use super::*;
+use super::{
+    recorder,
+    relay::{PlaybackFault, PlaybackFaultKind, PlaybackHealth, PlaybackState},
+    rtsp_client::PlaybackPipeline,
+    source::{build_input_url, camera_stream_path, preflight_target, redact_url, stream_target},
+    state, status, video_surface,
+};
+use crate::{
+    config::{AppSettings, StreamProtocol},
+    error::AppError,
+    network::route::CameraTarget,
+};
+use std::sync::Arc;
+use tokio::sync::{watch, Mutex, Notify};
 
 /// What a running consumer is ingesting, captured at start time. The
 /// double-bind guard compares "what's running" against "what's being
@@ -31,34 +44,35 @@ pub(super) struct PlaybackData {
 }
 
 pub(super) struct PlaybackService {
-    pub(super) state: state::PlaybackSlot,
+    state: state::PlaybackSlot,
     status: status::StatusPublisher,
     surface: Arc<video_surface::VideoSurface>,
-    pub(super) playback_epoch: Arc<std::sync::atomic::AtomicU64>,
-    pub(super) playback_lifecycle: Arc<Mutex<()>>,
-    pub(super) playback_wake: Arc<Notify>,
-    pub(super) playback_diagnostic: PlaybackDiagnostic,
+    readiness: Option<Arc<crate::network::readiness::CameraReadiness>>,
+    playback_epoch: Arc<std::sync::atomic::AtomicU64>,
+    playback_lifecycle: Arc<Mutex<()>>,
+    playback_wake: Arc<Notify>,
+    playback_diagnostic: PlaybackDiagnostic,
 }
 impl PlaybackService {
     pub(super) fn new(
         state: state::PlaybackSlot,
         status: status::StatusPublisher,
         surface: Arc<video_surface::VideoSurface>,
+        readiness: Option<Arc<crate::network::readiness::CameraReadiness>>,
     ) -> Self {
         Self {
             state,
             status,
             surface,
+            readiness,
             playback_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             playback_lifecycle: Arc::new(Mutex::new(())),
             playback_wake: Arc::new(Notify::new()),
             playback_diagnostic: Arc::new(std::sync::Mutex::new(None)),
         }
     }
-    pub(super) fn context(
-        &self,
-        readiness: Option<Arc<crate::network::readiness::CameraReadiness>>,
-    ) -> PlaybackSupervisorContext {
+    pub(super) fn context(&self) -> PlaybackSupervisorContext {
+        let readiness = self.readiness.clone();
         PlaybackSupervisorContext {
             state: self.state.clone(),
             status: self.status.clone(),
@@ -423,25 +437,25 @@ impl PlaybackService {
 
 #[derive(Clone)]
 pub(super) struct PlaybackSupervisorContext {
-    pub(super) state: state::PlaybackSlot,
-    pub(super) status: status::StatusPublisher,
-    pub(super) epoch: Arc<std::sync::atomic::AtomicU64>,
-    pub(super) lifecycle: Arc<Mutex<()>>,
-    pub(super) wake: Arc<Notify>,
-    pub(super) diagnostic: PlaybackDiagnostic,
-    pub(super) readiness: Option<Arc<crate::network::readiness::CameraReadiness>>,
-    pub(super) selection: Option<watch::Receiver<crate::network::AdapterSelection>>,
+    state: state::PlaybackSlot,
+    status: status::StatusPublisher,
+    epoch: Arc<std::sync::atomic::AtomicU64>,
+    lifecycle: Arc<Mutex<()>>,
+    wake: Arc<Notify>,
+    diagnostic: PlaybackDiagnostic,
+    readiness: Option<Arc<crate::network::readiness::CameraReadiness>>,
+    selection: Option<watch::Receiver<crate::network::AdapterSelection>>,
 }
 
 type PlaybackDiagnostic = Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>;
 
-pub(super) fn cancel_playback_diagnostic(slot: &PlaybackDiagnostic) {
+fn cancel_playback_diagnostic(slot: &PlaybackDiagnostic) {
     if let Some(task) = slot.lock().unwrap_or_else(|p| p.into_inner()).take() {
         task.abort();
     }
 }
 
-pub(super) fn same_playback_source(a: &AppSettings, b: &AppSettings) -> bool {
+fn same_playback_source(a: &AppSettings, b: &AppSettings) -> bool {
     a.stream.protocol == b.stream.protocol
         && a.stream.camera_ip == b.stream.camera_ip
         && a.stream.camera_mac == b.stream.camera_mac
@@ -452,7 +466,7 @@ pub(super) fn same_playback_source(a: &AppSettings, b: &AppSettings) -> bool {
         && a.credentials.password == b.credentials.password
 }
 
-pub(super) async fn playback_is_current(
+async fn playback_is_current(
     ctx: &PlaybackSupervisorContext,
     epoch: u64,
     health: &Arc<PlaybackHealth>,
@@ -467,7 +481,7 @@ pub(super) async fn playback_is_current(
 }
 
 /// Caller holds the lifecycle gate. Recording never follows a replacement.
-pub(super) async fn retire_playback(state: &state::PlaybackSlot, lost: bool) {
+async fn retire_playback(state: &state::PlaybackSlot, lost: bool) {
     let (pipeline, recording, path) = {
         let mut s = state.lock().await;
         let recording = std::mem::take(&mut s.recording);
@@ -507,13 +521,11 @@ pub(super) async fn retire_playback(state: &state::PlaybackSlot, lost: bool) {
     }
 }
 
-pub(super) async fn publish_playback_status(ctx: &PlaybackSupervisorContext) {
+async fn publish_playback_status(ctx: &PlaybackSupervisorContext) {
     ctx.status.refresh().await;
 }
 
-pub(super) async fn expected_device_wake(
-    app: Option<&Arc<crate::network::readiness::CameraReadiness>>,
-) {
+async fn expected_device_wake(app: Option<&Arc<crate::network::readiness::CameraReadiness>>) {
     if let Some(app) = app {
         app.verified().await;
     } else {
@@ -521,9 +533,7 @@ pub(super) async fn expected_device_wake(
     }
 }
 
-pub(super) async fn selection_wake(
-    rx: &mut Option<watch::Receiver<crate::network::AdapterSelection>>,
-) {
+async fn selection_wake(rx: &mut Option<watch::Receiver<crate::network::AdapterSelection>>) {
     if let Some(receiver) = rx {
         if receiver.changed().await.is_ok() {
             receiver.borrow_and_update();
@@ -597,14 +607,11 @@ pub(super) async fn run_playback_supervisor(mut ctx: PlaybackSupervisorContext) 
     }
 }
 
-pub(super) async fn wait_playback_ready(
-    wake: &Notify,
-    verified: impl std::future::Future<Output = ()>,
-) {
+async fn wait_playback_ready(wake: &Notify, verified: impl std::future::Future<Output = ()>) {
     tokio::select! { _ = wake.notified() => {}, _ = verified => {} }
 }
 
-pub(super) fn update_playback_readiness(
+fn update_playback_readiness(
     previous: &mut Option<(u32, std::net::Ipv4Addr)>,
     next: Option<(u32, std::net::Ipv4Addr)>,
     health: &PlaybackHealth,
@@ -617,7 +624,7 @@ pub(super) fn update_playback_readiness(
     changed
 }
 
-pub(super) async fn playback_step(ctx: &PlaybackSupervisorContext) {
+async fn playback_step(ctx: &PlaybackSupervisorContext) {
     use std::sync::atomic::Ordering;
     let _lifecycle = ctx.lifecycle.lock().await;
     let (mut epoch, health, settings, target, window) = {
@@ -895,7 +902,39 @@ pub(super) async fn playback_step(ctx: &PlaybackSupervisorContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::streaming::tests::{init_gstreamer, seed_desired_relay};
+
+    #[tokio::test]
+    async fn old_stop_preserves_replacement_udp_source() {
+        use std::{
+            future::{poll_fn, Future},
+            task::Poll,
+        };
+        init_gstreamer();
+        let manager = StreamManager::new();
+        let mut settings = AppSettings::default();
+        settings.stream.protocol = StreamProtocol::Udp;
+        settings.stream.udp_port = 8600;
+        manager.start_playback(&settings, None).await.unwrap();
+        let lifecycle = manager.playback.playback_lifecycle.lock().await;
+        let stop = manager.stop_playback();
+        tokio::pin!(stop);
+        assert!(poll_fn(|cx| Poll::Ready(stop.as_mut().poll(cx)))
+            .await
+            .is_pending());
+        settings.stream.udp_port = 8601;
+        manager.start_playback(&settings, None).await.unwrap();
+        drop(lifecycle);
+        stop.await.unwrap();
+        let joint = manager.state.lock().await;
+        crate::streaming::udp::guard_relay(&joint, 8600).unwrap();
+        assert!(crate::streaming::udp::guard_relay(&joint, 8601).is_err());
+        assert_eq!(
+            joint.playback_data.playback_source,
+            Some(SourceMode::Udp { port: 8601 })
+        );
+    }
+    use crate::streaming::test_support::{init_gstreamer, seed_desired_relay};
+    use crate::streaming::{relay::RelayState, status::compute_status, StreamManager};
 
     #[test]
     fn playback_construction_does_not_require_a_runtime() {
@@ -1007,7 +1046,7 @@ mod tests {
     }
 
     fn playback_context(manager: &StreamManager) -> PlaybackSupervisorContext {
-        manager.playback.context(None)
+        manager.playback.context()
     }
 
     async fn seed_playback(manager: &StreamManager) -> Arc<PlaybackHealth> {
@@ -1034,7 +1073,7 @@ mod tests {
         );
         let ctx = playback_context(&manager);
         publish_playback_status(&ctx).await;
-        let mut status = manager.status.tx.subscribe();
+        let mut status = manager.status.subscribe();
         status.borrow_and_update();
         publish_playback_status(&ctx).await;
         assert!(!status.has_changed().unwrap());
@@ -1045,11 +1084,11 @@ mod tests {
         tokio::time::advance(std::time::Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
         assert!(h.snapshot().generation > g); // attempted readiness without another error event
-        assert!(!manager.status.tx.borrow().desired);
+        assert!(!manager.status.latest().desired);
         manager.stop_playback().await.unwrap();
         tokio::time::advance(std::time::Duration::from_secs(120)).await;
         tokio::task::yield_now().await;
-        assert!(!manager.status.tx.borrow().playback_desired);
+        assert!(!manager.status.latest().playback_desired);
         assert!(manager.state.lock().await.playback_data.playback.is_none());
         owner.abort();
     }

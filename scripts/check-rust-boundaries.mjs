@@ -8,13 +8,8 @@ const permanent = new Set([
   'lib.rs', 'bridge.rs', 'ipc_acl_tests.rs',
   'network/watcher.rs', 'network/ip_conflict.rs', 'streaming/video_embed.rs',
 ]);
-// Temporary migration exceptions. Counts prevent adding lookup sites while
-// moving the existing ones. All network exceptions are closed after slice 6.
-const temporary = new Map([
-  // Status publication/main-thread streaming surface extraction is slices 7-10.
-  // Its network reads already use CameraReadiness; no lookup sites remain.
-  ['streaming/mod.rs', 0],
-]);
+// A03 network and streaming extraction is closed. The remaining adapters above
+// are narrowly permanent; no owner or facade has a temporary exception.
 
 export function violations(source) {
   // Strip comments so examples do not create exceptions. Match inferred calls
@@ -37,14 +32,12 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     const relative = path.relative(src, file).replaceAll('\\', '/');
     const { lookups, imports } = violations(fs.readFileSync(file, 'utf8'));
     if (permanent.has(relative) || relative.startsWith('commands/')) continue;
-    if (temporary.has(relative)) {
-      if (lookups > temporary.get(relative)) errors.push(`${relative}: ${lookups} lookups exceed staged limit ${temporary.get(relative)}`);
-    } else if (lookups || imports) {
+    if (lookups || imports) {
       errors.push(`${relative}: owner depends on Tauri managed state/handle (${lookups} lookups)`);
     }
   }
   if (errors.length) {
     console.error(errors.join('\n'));
     process.exitCode = 1;
-  } else console.log(`Rust dependency boundaries passed (${temporary.size} temporary paths; permanent composition/OS adapters separate).`);
+  } else console.log('Rust dependency boundaries passed (0 temporary paths; permanent composition/OS adapters separate).');
 }

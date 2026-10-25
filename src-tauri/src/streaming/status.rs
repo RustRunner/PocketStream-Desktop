@@ -1,10 +1,91 @@
 //! One status watch, coherent snapshots and deduplicated publication.
-use super::*;
+use super::{
+    relay::{PlaybackFault, PlaybackState, RelayState, ResolvedStartSpec},
+    relay_service::RestreamServer,
+    rtsp_server::MAX_RTSP_CLIENTS,
+    state::StreamState,
+};
+use crate::{
+    config::RestreamProtocol,
+    network::{bindings::BindScope, firewall::FirewallOutcome},
+};
+use serde::Serialize;
+use std::sync::Arc;
+use tokio::sync::{watch, Mutex};
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StreamStatus {
+    pub bind_scope: BindScope,
+    pub firewall: FirewallOutcome,
+    pub playing: bool,
+    pub playback_desired: bool,
+    pub playback_state: PlaybackState,
+    pub playback_fault: Option<PlaybackFault>,
+    pub playback_recovery_attempt: u32,
+    pub playback_next_retry_secs: Option<u64>,
+    pub recording_report: Option<String>,
+    pub recording_finalized_path: Option<String>,
+    pub selected_protocol: RestreamProtocol,
+    pub active_protocol: Option<RestreamProtocol>,
+    pub server_running: bool,
+    pub desired: bool,
+    pub relay_state: RelayState,
+    pub relay_error: Option<String>,
+    pub recovery_attempt: u32,
+    pub server_url: Option<String>,
+    pub display_url: Option<String>,
+    pub recording: bool,
+    pub uptime_secs: u64,
+    pub bandwidth_kbps: f64,
+    pub connected_clients: u32,
+    pub client_limit: u32,
+    pub error: Option<String>,
+    /// True while the playback pipeline has a linked audio branch.
+    pub audio_present: bool,
+    /// Last recognized audio codec the camera offered. May be `Some`
+    /// with `audio_present == false` when the codec was recognized but
+    /// skipped (decoder chain unavailable).
+    pub audio_codec: Option<String>,
+}
+
+impl StreamStatus {
+    pub(super) fn idle(selected_protocol: RestreamProtocol) -> Self {
+        Self {
+            bind_scope: BindScope::default(),
+            firewall: FirewallOutcome::Inactive,
+            playing: false,
+            playback_desired: false,
+            playback_state: PlaybackState::Stopped,
+            playback_fault: None,
+            playback_recovery_attempt: 0,
+            playback_next_retry_secs: None,
+            recording_report: None,
+            recording_finalized_path: None,
+            selected_protocol,
+            active_protocol: None,
+            server_running: false,
+            desired: false,
+            relay_state: RelayState::Stopped,
+            relay_error: None,
+            recovery_attempt: 0,
+            server_url: None,
+            display_url: None,
+            recording: false,
+            uptime_secs: 0,
+            bandwidth_kbps: 0.0,
+            connected_clients: 0,
+            client_limit: MAX_RTSP_CLIENTS,
+            error: None,
+            audio_present: false,
+            audio_codec: None,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct StatusPublisher {
     state: Arc<Mutex<StreamState>>,
-    pub(super) tx: Arc<watch::Sender<StreamStatus>>,
+    tx: Arc<watch::Sender<StreamStatus>>,
 }
 
 impl StatusPublisher {
@@ -17,6 +98,13 @@ impl StatusPublisher {
     }
     pub(super) async fn refresh(&self) {
         publish_status_if_changed(self.tx.as_ref(), compute_status(&self.state).await);
+    }
+    pub(super) fn subscribe(&self) -> watch::Receiver<StreamStatus> {
+        self.tx.subscribe()
+    }
+    #[cfg(test)]
+    pub(super) fn latest(&self) -> StreamStatus {
+        self.tx.borrow().clone()
     }
 }
 
@@ -186,6 +274,39 @@ pub(super) async fn broadcast(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn status_broadcaster_preserves_payload_and_deduplicates_the_single_watch() {
+        let manager = StreamManager::new();
+        let bridge = Arc::new(crate::bridge::RecordingBridge::default());
+        let task = tokio::spawn(broadcast(manager.status.subscribe(), bridge.clone()));
+        manager.state.lock().await.playback_data.recording_report = Some("finalized".into());
+        manager.status.refresh().await;
+        while bridge.0.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        manager.status.refresh().await;
+        tokio::task::yield_now().await;
+        assert_eq!(bridge.0.lock().unwrap().len(), 1);
+        let outcome = FirewallOutcome::Unavailable {
+            reason: "reported policy outcome".into(),
+        };
+        manager.state.lock().await.relay_data.firewall = outcome;
+        manager.status.refresh().await;
+        while bridge.0.lock().unwrap().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+        let expected = serde_json::to_value(compute_status(&manager.state).await).unwrap();
+        {
+            let events = bridge.0.lock().unwrap();
+            assert_eq!(events[1].0, "stream-status");
+            assert_eq!(events[1].1, expected);
+            assert_eq!(events[1].1.as_object().unwrap().len(), 27);
+        }
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+    use crate::streaming::StreamManager;
     #[test]
     fn stream_status_serializes() {
         let status = StreamStatus {
@@ -252,6 +373,33 @@ mod tests {
         assert_eq!(rx.borrow_and_update().connected_clients, 1);
 
         publish_status_if_changed(&tx, updated);
+        assert!(!rx.has_changed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn refresh_status_updates_watch_channel() {
+        let mgr = StreamManager::new();
+        let mut rx = mgr.status.subscribe();
+        // Mark recording without going through start_recording so we can
+        // verify refresh_status actually publishes the new state.
+        {
+            let mut state = mgr.state.lock().await;
+            state.playback_data.recording = true;
+        }
+        mgr.status.refresh().await;
+        let snap = rx.borrow_and_update().clone();
+        assert!(snap.recording);
+    }
+
+    #[tokio::test]
+    async fn refresh_status_dedupes_identical_snapshots() {
+        let mgr = StreamManager::new();
+        let mut rx = mgr.status.subscribe();
+        // Drain initial value so `has_changed` reflects only post-init events.
+        rx.borrow_and_update();
+        mgr.status.refresh().await;
+        // No mutation happened — snapshot is identical to the initial one,
+        // so the watch channel must not have ticked.
         assert!(!rx.has_changed().unwrap());
     }
 }

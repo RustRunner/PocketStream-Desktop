@@ -1,0 +1,42 @@
+﻿[
+    {
+        "gate":  "rust",
+        "exit_code":  0,
+        "seconds":  8.9465645
+    },
+    {
+        "gate":  "fmt",
+        "exit_code":  0,
+        "seconds":  0.5239395
+    },
+    {
+        "gate":  "clippy",
+        "exit_code":  0,
+        "seconds":  4.4451807
+    },
+    {
+        "gate":  "frontend",
+        "exit_code":  0,
+        "seconds":  10.3595575
+    },
+    {
+        "gate":  "typecheck",
+        "exit_code":  0,
+        "seconds":  1.0156933
+    },
+    {
+        "gate":  "contracts",
+        "exit_code":  0,
+        "seconds":  2.8407016
+    },
+    {
+        "gate":  "build",
+        "exit_code":  0,
+        "seconds":  3.6715098
+    },
+    {
+        "gate":  "desktop-build",
+        "exit_code":  0,
+        "seconds":  7.1549480999999995
+    }
+]

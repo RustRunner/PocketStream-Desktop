@@ -1,6 +1,10 @@
 //! UDP admission is atomic with intent publication under the common state lock.
 //! Keeping that lock avoids a second claim that could outlive its real consumer.
-use super::*;
+use super::{
+    playback::SourceMode, relay::ResolvedStartSpec, relay_service::RestreamServer,
+    state::StreamState,
+};
+use crate::error::AppError;
 
 pub(super) fn guard_playback(state: &StreamState, port: u16) -> Result<(), AppError> {
     if (state.relay_data.restream_desired

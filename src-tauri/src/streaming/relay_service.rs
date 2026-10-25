@@ -1,5 +1,52 @@
 //! Relay listener, settings transactions, topology and firewall-lease ownership.
-use super::*;
+use super::{
+    relay::{
+        RelayEventReceiver, RelayEventSender, RelayFaultEvent, RelayRuntimeHealth, RelayState,
+        RelaySupervisorEvent, ResolvedOutput, ResolvedSource, ResolvedStartSpec,
+        RestreamBuildFailure, RestreamBuildFailureKind, RestreamRuntimeContext,
+    },
+    rtsp_server,
+    rtsp_server::{RtspRestreamer, RtspRuntimeProbe},
+    source::{
+        build_input_url, camera_stream_path, configure_tcp_rtspsrc, preflight_target,
+        redact_relay_text, stream_target,
+    },
+    srt_server,
+    srt_server::{SrtRestreamer, SrtRuntimeProbe},
+    state, status,
+};
+use crate::{
+    config::{
+        AppConfig, AppSettings, RestreamProtocol, RestreamSettingsUpdate, SrtPassphraseState,
+        StreamProtocol,
+    },
+    error::AppError,
+    network::{
+        bindings::{self, BindScope},
+        firewall::{self, FirewallOutcome, FirewallRule},
+        route::CameraTarget,
+    },
+};
+use gstreamer as gst;
+use serde::Serialize;
+use std::sync::Arc;
+use tokio::sync::{Mutex, Notify};
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RestreamServerInfo {
+    pub bind_scope: BindScope,
+    pub firewall: FirewallOutcome,
+    pub protocol: RestreamProtocol,
+    pub server_url: String,
+    pub display_url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RestreamOperationResult {
+    pub selected_protocol: RestreamProtocol,
+    pub desired: bool,
+    pub server_info: Option<RestreamServerInfo>,
+}
 
 pub(super) enum RestreamServer {
     Rtsp(RtspRestreamer),
@@ -117,15 +164,15 @@ impl RelayData {
 }
 
 pub(super) struct RelayService {
-    pub(super) state: state::RelaySlot,
+    state: state::RelaySlot,
     status: status::StatusPublisher,
-    readiness: std::sync::Mutex<Option<Arc<crate::network::readiness::CameraReadiness>>>,
-    pub(super) restream_epoch: Arc<std::sync::atomic::AtomicU64>,
-    pub(super) restream_generation: Arc<std::sync::atomic::AtomicU64>,
-    pub(super) restream_transaction: Arc<Mutex<()>>,
-    pub(super) relay_lifecycle: Arc<Mutex<()>>,
-    pub(super) relay_wake: Arc<Notify>,
-    pub(super) relay_event_tx: RelayEventSender,
+    readiness: Option<Arc<crate::network::readiness::CameraReadiness>>,
+    restream_epoch: Arc<std::sync::atomic::AtomicU64>,
+    restream_generation: Arc<std::sync::atomic::AtomicU64>,
+    restream_transaction: Arc<Mutex<()>>,
+    relay_lifecycle: Arc<Mutex<()>>,
+    relay_wake: Arc<Notify>,
+    relay_event_tx: RelayEventSender,
     relay_event_rx: std::sync::Mutex<Option<RelayEventReceiver>>,
 }
 
@@ -150,12 +197,21 @@ pub(super) struct RelaySupervisorContext {
 }
 
 impl RelayService {
-    pub(super) fn new(state: state::RelaySlot, status: status::StatusPublisher) -> Self {
+    #[cfg(test)]
+    pub(super) fn test_epoch(&self) -> u64 {
+        self.restream_epoch
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub(super) fn new(
+        state: state::RelaySlot,
+        status: status::StatusPublisher,
+        readiness: Option<Arc<crate::network::readiness::CameraReadiness>>,
+    ) -> Self {
         let (relay_event_tx, relay_event_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             state,
             status,
-            readiness: std::sync::Mutex::new(None),
+            readiness,
             restream_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             restream_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             restream_transaction: Arc::new(Mutex::new(())),
@@ -165,11 +221,8 @@ impl RelayService {
             relay_event_rx: std::sync::Mutex::new(Some(relay_event_rx)),
         }
     }
-    pub(super) fn supervisor(
-        &self,
-        readiness: Arc<crate::network::readiness::CameraReadiness>,
-    ) -> Option<(RelayEventReceiver, RelaySupervisorContext)> {
-        *self.readiness.lock().unwrap_or_else(|p| p.into_inner()) = Some(readiness.clone());
+    pub(super) fn supervisor(&self) -> Option<(RelayEventReceiver, RelaySupervisorContext)> {
+        let readiness = self.readiness.clone()?;
         let events = self
             .relay_event_rx
             .lock()
@@ -549,11 +602,7 @@ impl RelayService {
         start_epoch: u64,
         preserve_prior_desired: bool,
     ) -> Result<RestreamServerInfo, AppError> {
-        let handle = self
-            .readiness
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
+        let handle = self.readiness.clone();
         let mut target = stream_target(settings);
         match preflight_target(handle.as_ref(), target.as_ref()).await {
             Ok(Some(path)) => target = Some(path.target),
@@ -882,11 +931,7 @@ impl RelayService {
             if spec.bind_interface.is_none() || matches!(scope, BindScope::Unknown { .. }) {
                 Ok((spec.bind_identity.clone(), scope))
             } else {
-                let handle = self
-                    .readiness
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .clone();
+                let handle = self.readiness.clone();
                 let adopted = match handle {
                     Some(handle) => adopted_ip_set(&handle).await,
                     None => Default::default(),
@@ -1481,7 +1526,7 @@ impl RelayService {
     }
 }
 
-pub(super) fn optional_bind_interface(value: &str) -> Option<String> {
+fn optional_bind_interface(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
@@ -1509,7 +1554,7 @@ pub(super) fn resolve_selected_restream_output(
     }
 }
 
-pub(super) fn resolved_srt_passphrase(passphrase: &SrtPassphraseState) -> Result<String, AppError> {
+fn resolved_srt_passphrase(passphrase: &SrtPassphraseState) -> Result<String, AppError> {
     match passphrase {
         SrtPassphraseState::Unencrypted => Ok(String::new()),
         SrtPassphraseState::Available(value) => Ok(value.clone()),
@@ -1520,14 +1565,14 @@ pub(super) fn resolved_srt_passphrase(passphrase: &SrtPassphraseState) -> Result
     }
 }
 
-pub(super) fn validate_selected_restream_startable(settings: &AppSettings) -> Result<(), AppError> {
+fn validate_selected_restream_startable(settings: &AppSettings) -> Result<(), AppError> {
     if settings.restream_protocol == RestreamProtocol::Srt {
         crate::settings_validation::validate_srt_startable(settings)?;
     }
     Ok(())
 }
 
-pub(super) fn validate_restream_switch_target(
+fn validate_restream_switch_target(
     settings: &AppSettings,
     was_desired: bool,
 ) -> Result<(), AppError> {
@@ -1542,10 +1587,7 @@ pub(super) fn validate_restream_switch_target(
     validate_selected_restream_startable(settings)
 }
 
-pub(super) fn selected_restream_runtime_changed(
-    old: &AppSettings,
-    prospective: &AppSettings,
-) -> bool {
+fn selected_restream_runtime_changed(old: &AppSettings, prospective: &AppSettings) -> bool {
     debug_assert_eq!(old.restream_protocol, prospective.restream_protocol);
     match old.restream_protocol {
         RestreamProtocol::Rtsp => old.rtsp_server != prospective.rtsp_server,
@@ -1553,7 +1595,7 @@ pub(super) fn selected_restream_runtime_changed(
     }
 }
 
-pub(super) fn relay_preflight(
+fn relay_preflight(
     handle: Option<Arc<crate::network::readiness::CameraReadiness>>,
     target: Option<CameraTarget>,
     health: Arc<RelayRuntimeHealth>,
@@ -1569,7 +1611,7 @@ pub(super) fn relay_preflight(
     ))
 }
 
-pub(super) fn guard_relay_upstream(
+fn guard_relay_upstream(
     health: Arc<RelayRuntimeHealth>,
     generation: Arc<std::sync::atomic::AtomicU64>,
     expected_generation: u64,
@@ -1590,7 +1632,7 @@ pub(super) fn guard_relay_upstream(
     })
 }
 
-pub(super) fn resolved_start_is_healthy_noop(
+fn resolved_start_is_healthy_noop(
     desired: bool,
     current_spec: Option<&ResolvedStartSpec>,
     candidate_spec: &ResolvedStartSpec,
@@ -1614,7 +1656,7 @@ pub(super) fn resolved_start_is_healthy_noop(
         && listener_loop_alive
 }
 
-pub(super) fn restream_stop_target(
+fn restream_stop_target(
     stops_desired: bool,
     desired_generation: Option<u64>,
     live_generation: Option<u64>,
@@ -1634,7 +1676,7 @@ pub(super) fn restream_stop_target(
     }
 }
 
-pub(super) fn relay_state_is_generation(state: &RelayData, server_generation: u64) -> bool {
+fn relay_state_is_generation(state: &RelayData, server_generation: u64) -> bool {
     state.restream_desired
         && state
             .restream_health
@@ -1642,7 +1684,7 @@ pub(super) fn relay_state_is_generation(state: &RelayData, server_generation: u6
             .is_some_and(|health| health.server_generation() == server_generation)
 }
 
-pub(super) async fn relay_is_current(
+async fn relay_is_current(
     state: &state::RelaySlot,
     epoch: &Arc<std::sync::atomic::AtomicU64>,
     expected_epoch: u64,
@@ -1657,7 +1699,7 @@ pub(super) async fn relay_is_current(
         && relay_state_is_generation(&state, server_generation)
 }
 
-pub(super) async fn wait_relay_backoff(
+async fn wait_relay_backoff(
     state: &state::RelaySlot,
     epoch: &Arc<std::sync::atomic::AtomicU64>,
     wake: &Arc<Notify>,
@@ -1684,7 +1726,7 @@ pub(super) async fn wait_relay_backoff(
     relay_is_current(state, epoch, expected_epoch, server_generation).await
 }
 
-pub(super) async fn current_relay_context(
+async fn current_relay_context(
     ctx: &RelaySupervisorContext,
     server_generation: u64,
 ) -> Option<(u64, Arc<RelayRuntimeHealth>)> {
@@ -1703,11 +1745,11 @@ pub(super) async fn current_relay_context(
     Some((expected_epoch, state.restream_health.as_ref()?.clone()))
 }
 
-pub(super) async fn publish_relay_status(ctx: &RelaySupervisorContext) {
+async fn publish_relay_status(ctx: &RelaySupervisorContext) {
     ctx.status.refresh().await;
 }
 
-pub(super) async fn poll_relay_fault(ctx: &RelaySupervisorContext) -> Option<RelayFaultEvent> {
+async fn poll_relay_fault(ctx: &RelaySupervisorContext) -> Option<RelayFaultEvent> {
     let (health, probe) = {
         let state = ctx.state.lock().await;
         if !state.restream_desired {
@@ -1794,13 +1836,13 @@ pub(super) async fn run_relay_supervisor(
     }
 }
 
-pub(super) async fn adopted_ip_set(
+async fn adopted_ip_set(
     readiness: &Arc<crate::network::readiness::CameraReadiness>,
 ) -> std::collections::HashSet<String> {
     readiness.adopted_addresses().await
 }
 
-pub(super) async fn recover_relay_generation(
+async fn recover_relay_generation(
     ctx: &RelaySupervisorContext,
     expected_epoch: u64,
     server_generation: u64,
@@ -2104,7 +2146,7 @@ pub(super) async fn recover_relay_generation(
     }
 }
 
-pub(super) fn scope_revision(scope: &BindScope) -> u64 {
+fn scope_revision(scope: &BindScope) -> u64 {
     match scope {
         BindScope::AllAddresses {
             topology_revision, ..
@@ -2116,7 +2158,7 @@ pub(super) fn scope_revision(scope: &BindScope) -> u64 {
     }
 }
 
-pub(super) fn preflight_restream(spec: &ResolvedStartSpec) -> Result<(), AppError> {
+fn preflight_restream(spec: &ResolvedStartSpec) -> Result<(), AppError> {
     crate::ensure_gstreamer()?;
     let input: &[&str] = match spec.source {
         ResolvedSource::Rtsp { .. } => &["rtspsrc", "rtph264depay"],
@@ -2145,7 +2187,7 @@ pub(super) fn preflight_restream(spec: &ResolvedStartSpec) -> Result<(), AppErro
     Ok(())
 }
 
-pub(super) fn firewall_role(protocol: RestreamProtocol) -> FirewallRule {
+fn firewall_role(protocol: RestreamProtocol) -> FirewallRule {
     match protocol {
         RestreamProtocol::Rtsp => FirewallRule::Rtsp,
         RestreamProtocol::Srt => FirewallRule::Srt,
@@ -2154,7 +2196,7 @@ pub(super) fn firewall_role(protocol: RestreamProtocol) -> FirewallRule {
 
 // All callers hold relay_lifecycle. The lease is installed before dispatch, so
 // cancellation cannot hide an enabled rule from Stop/startup reconciliation.
-pub(super) async fn apply_firewall(
+async fn apply_firewall(
     state: &state::RelaySlot,
     spec: &ResolvedStartSpec,
     generation: u64,
@@ -2197,7 +2239,7 @@ where
     outcome
 }
 
-pub(super) async fn retire_firewall(state: &state::RelaySlot, generation: u64) -> bool {
+async fn retire_firewall(state: &state::RelaySlot, generation: u64) -> bool {
     retire_firewall_with(state, generation, firewall::disable).await
 }
 
@@ -2234,7 +2276,7 @@ where
 
 /// True if `addr` is an APIPA (169.254.0.0/16) address — a DHCP-failure
 /// fallback that can't carry usable client traffic.
-pub(super) fn is_apipa(addr: &str) -> bool {
+fn is_apipa(addr: &str) -> bool {
     addr.starts_with("169.254.")
 }
 
@@ -2242,7 +2284,7 @@ pub(super) fn is_apipa(addr: &str) -> bool {
 /// nor APIPA. `None` if the interface carries only such addresses — the
 /// caller turns that into a clear error rather than binding the output socket
 /// to the camera network.
-pub(super) fn first_usable_ip(
+fn first_usable_ip(
     ips: &[crate::network::interface::IpInfo],
     adopted: &std::collections::HashSet<String>,
 ) -> Option<String> {
@@ -2256,12 +2298,12 @@ pub(super) fn first_usable_ip(
 /// Ethernet, always skipping adopted secondaries and APIPA. VPN addresses
 /// require an explicit selection. Returns
 /// `None` only if nothing usable exists (caller advertises 0.0.0.0).
-pub(super) async fn get_display_ip(adopted: &std::collections::HashSet<String>) -> Option<String> {
+async fn get_display_ip(adopted: &std::collections::HashSet<String>) -> Option<String> {
     let interfaces = crate::network::interface::list_all().await.ok()?;
     select_display_ip(&interfaces, adopted)
 }
 
-pub(super) fn select_display_ip(
+fn select_display_ip(
     interfaces: &[crate::network::InterfaceInfo],
     adopted: &std::collections::HashSet<String>,
 ) -> Option<String> {
@@ -2278,8 +2320,41 @@ pub(super) fn select_display_ip(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn old_stop_preserves_replacement_listener_udp_and_firewall_lease() {
+        init_gstreamer();
+        let manager = StreamManager::new();
+        let old_settings = restream_test_settings(RestreamProtocol::Rtsp);
+        seed_desired_relay_state(&manager, &old_settings, RelayState::Recovering).await;
+        manager.relay.state.lock().await.firewall_generation = Some((41, FirewallRule::Rtsp));
+        let stop = manager.relay.begin_restream_stop_intent().await.unwrap();
+        let mut replacement = restream_test_settings(RestreamProtocol::Rtsp);
+        while replacement.stream.udp_port == old_settings.stream.udp_port {
+            replacement.stream.udp_port = unused_udp_port();
+        }
+        let (epoch, preserve) = manager.relay.begin_restream_start_intent().await.unwrap();
+        manager
+            .relay
+            .start_restream_server_inner(&replacement, &Default::default(), epoch, preserve)
+            .await
+            .unwrap();
+        let newer_lease = manager.relay.state.lock().await.firewall_generation;
+        assert!(newer_lease.is_some_and(|(generation, _)| generation != 41));
+        manager.relay.finish_restream_stop(stop).await.unwrap();
+        assert_eq!(
+            manager.relay.state.lock().await.firewall_generation,
+            newer_lease
+        );
+        assert!(manager.relay.state.lock().await.restream_server.is_some());
+        assert!(manager.start_playback(&replacement, None).await.is_err());
+        manager.start_playback(&old_settings, None).await.unwrap();
+        manager.stop_playback().await.unwrap();
+        manager.stop_restream_server().await.unwrap();
+    }
     use crate::config::*;
-    use crate::streaming::tests::*;
+    use crate::streaming::test_support::*;
+    use crate::streaming::{relay, status::compute_status, StreamManager};
 
     fn uncertain_policy() -> FirewallOutcome {
         FirewallOutcome::Failed {

@@ -1,0 +1,46 @@
+cargo : warn: could not canonicalize path C:\Users\joshu
+At line:2 char:82
++ ... pserver:6'; cargo test --manifest-path src-tauri/Cargo.toml --lib --l ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warn: could not... C:\Users\joshu:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+   Compiling pocketstream-desktop v0.6.7 (C:\Users\joshu\PocketStream-Desktop\src-tauri)
+warning: linker stdout: LINK : warning LNK4199: /DELAYLOAD:Packet.dll ignored; no imports found from Packet.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gmodule-2.0-0.dll ignored; no imports found from gmodule-2.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:intl-8.dll ignored; no imports found from intl-8.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gstaudio-1.0-0.dll ignored; no imports found from gstaudio-1.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gstpbutils-1.0-0.dll ignored; no imports found from gstpbutils-1.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gsttag-1.0-0.dll ignored; no imports found from gsttag-1.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gstrtp-1.0-0.dll ignored; no imports found from gstrtp-1.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gstgl-1.0-0.dll ignored; no imports found from gstgl-1.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gstallocators-1.0-0.dll ignored; no imports found from
+gstallocators-1.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gstcodecparsers-1.0-0.dll ignored; no imports found from
+gstcodecparsers-1.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gstmpegts-1.0-0.dll ignored; no imports found from gstmpegts-1.0-0.dll
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `pocketstream-desktop` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.90s
+     Running unittests src\lib.rs (src-tauri\target\debug\deps\pocketstream_desktop-10048f9d261ead52.exe)
+
+running 1 test
+0:00:01.774945100      19952      18228 DEBUG             rtspserver
+rtsp-server.c:883:gst_rtsp_server_create_socket:<GstRTSPServer@0000023D27C1B380> getting address info of 0.0.0.0/65468
+0:00:01.777035200      19952      18228 DEBUG             rtspserver
+rtsp-server.c:954:gst_rtsp_server_create_socket:<GstRTSPServer@0000023D27C1B380> failed to bind socket (Error binding
+to address 0.0.0.0:65468: Only one usage of each socket address (protocol/network address/port) is normally
+permitted.), try next
+0:00:01.777198000      19952      18228 DEBUG             rtspserver
+rtsp-server.c:905:gst_rtsp_server_create_socket:<GstRTSPServer@0000023D27C1B380> no more addresses
+0:00:01.777261900      19952      18228 ERROR             rtspserver
+rtsp-server.c:1004:gst_rtsp_server_create_socket:<GstRTSPServer@0000023D27C1B380> failed to create socket
+0:00:01.777325300      19952      18228 ERROR             rtspserver
+rtsp-server.c:1375:gst_rtsp_server_create_source:<GstRTSPServer@0000023D27C1B380> failed to create socket
+0:00:01.777541400      19952      18228 DEBUG             rtspserver
+rtsp-server.c:277:gst_rtsp_server_finalize:<GstRTSPServer@0000023D27C1B380> finalize server
+test streaming::tests::failed_listener_construction_keeps_udp_occupancy_until_stop ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 832 filtered out; finished in 1.78s

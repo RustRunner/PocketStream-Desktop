@@ -1,0 +1,726 @@
+{
+  "baseline": "6f8a727c33de7e722040aeb97ab7aff6538ba277",
+  "commands": {
+    "baseline_count": 46,
+    "current_count": 46,
+    "unchanged": true
+  },
+  "events": {
+    "baseline": [
+      "adapter-selection-changed",
+      "adoption-failed",
+      "adoption-finished",
+      "adoption-started",
+      "arp-device-discovered",
+      "binding-topology-changed",
+      "capture-active",
+      "device-list-changed",
+      "device-ping-result",
+      "discovery-degraded",
+      "discovery-recovered",
+      "host-ip-owners-changed",
+      "interface-status-changed",
+      "stream-status",
+      "subnet-adopted",
+      "subnet-removed"
+    ],
+    "current": [
+      "adapter-selection-changed",
+      "adoption-failed",
+      "adoption-finished",
+      "adoption-started",
+      "arp-device-discovered",
+      "binding-topology-changed",
+      "capture-active",
+      "device-list-changed",
+      "device-ping-result",
+      "discovery-degraded",
+      "discovery-recovered",
+      "host-ip-owners-changed",
+      "interface-status-changed",
+      "stream-status",
+      "subnet-adopted",
+      "subnet-removed"
+    ],
+    "unchanged": true
+  },
+  "contracts": [
+    {
+      "name": "StreamStatus",
+      "fields": [
+        {
+          "name": "bind_scope",
+          "type": "BindScope"
+        },
+        {
+          "name": "firewall",
+          "type": "FirewallOutcome"
+        },
+        {
+          "name": "playing",
+          "type": "bool"
+        },
+        {
+          "name": "playback_desired",
+          "type": "bool"
+        },
+        {
+          "name": "playback_state",
+          "type": "PlaybackState"
+        },
+        {
+          "name": "playback_fault",
+          "type": "Option<PlaybackFault>"
+        },
+        {
+          "name": "playback_recovery_attempt",
+          "type": "u32"
+        },
+        {
+          "name": "playback_next_retry_secs",
+          "type": "Option<u64>"
+        },
+        {
+          "name": "recording_report",
+          "type": "Option<String>"
+        },
+        {
+          "name": "recording_finalized_path",
+          "type": "Option<String>"
+        },
+        {
+          "name": "selected_protocol",
+          "type": "RestreamProtocol"
+        },
+        {
+          "name": "active_protocol",
+          "type": "Option<RestreamProtocol>"
+        },
+        {
+          "name": "server_running",
+          "type": "bool"
+        },
+        {
+          "name": "desired",
+          "type": "bool"
+        },
+        {
+          "name": "relay_state",
+          "type": "RelayState"
+        },
+        {
+          "name": "relay_error",
+          "type": "Option<String>"
+        },
+        {
+          "name": "recovery_attempt",
+          "type": "u32"
+        },
+        {
+          "name": "server_url",
+          "type": "Option<String>"
+        },
+        {
+          "name": "display_url",
+          "type": "Option<String>"
+        },
+        {
+          "name": "recording",
+          "type": "bool"
+        },
+        {
+          "name": "uptime_secs",
+          "type": "u64"
+        },
+        {
+          "name": "bandwidth_kbps",
+          "type": "f64"
+        },
+        {
+          "name": "connected_clients",
+          "type": "u32"
+        },
+        {
+          "name": "client_limit",
+          "type": "u32"
+        },
+        {
+          "name": "error",
+          "type": "Option<String>"
+        },
+        {
+          "name": "audio_present",
+          "type": "bool"
+        },
+        {
+          "name": "audio_codec",
+          "type": "Option<String>"
+        }
+      ],
+      "unchanged": true
+    },
+    {
+      "name": "RestreamServerInfo",
+      "fields": [
+        {
+          "name": "bind_scope",
+          "type": "BindScope"
+        },
+        {
+          "name": "firewall",
+          "type": "FirewallOutcome"
+        },
+        {
+          "name": "protocol",
+          "type": "RestreamProtocol"
+        },
+        {
+          "name": "server_url",
+          "type": "String"
+        },
+        {
+          "name": "display_url",
+          "type": "String"
+        }
+      ],
+      "unchanged": true
+    },
+    {
+      "name": "RestreamOperationResult",
+      "fields": [
+        {
+          "name": "selected_protocol",
+          "type": "RestreamProtocol"
+        },
+        {
+          "name": "desired",
+          "type": "bool"
+        },
+        {
+          "name": "server_info",
+          "type": "Option<RestreamServerInfo>"
+        }
+      ],
+      "unchanged": true
+    }
+  ],
+  "state_representations": {
+    "baseline": [
+      {
+        "name": "firewall",
+        "type": "FirewallOutcome"
+      },
+      {
+        "name": "firewall_generation",
+        "type": "Option<(u64,FirewallRule)>"
+      },
+      {
+        "name": "playback",
+        "type": "Option<Arc<PlaybackPipeline>>"
+      },
+      {
+        "name": "playback_adapter",
+        "type": "Option<(Option<String>,Option<u32>)>"
+      },
+      {
+        "name": "playback_health",
+        "type": "Option<Arc<PlaybackHealth>>"
+      },
+      {
+        "name": "playback_instance",
+        "type": "Option<(u64,u64)>"
+      },
+      {
+        "name": "playback_intent_epoch",
+        "type": "Option<u64>"
+      },
+      {
+        "name": "playback_ready",
+        "type": "Option<(u32,std::net::Ipv4Addr)>"
+      },
+      {
+        "name": "playback_settings",
+        "type": "Option<AppSettings>"
+      },
+      {
+        "name": "playback_source",
+        "type": "Option<SourceMode>"
+      },
+      {
+        "name": "playback_target",
+        "type": "Option<CameraTarget>"
+      },
+      {
+        "name": "playback_window",
+        "type": "Option<usize>"
+      },
+      {
+        "name": "recording",
+        "type": "bool"
+      },
+      {
+        "name": "recording_finalized_path",
+        "type": "Option<String>"
+      },
+      {
+        "name": "recording_path",
+        "type": "Option<String>"
+      },
+      {
+        "name": "recording_report",
+        "type": "Option<String>"
+      },
+      {
+        "name": "restream_desired",
+        "type": "bool"
+      },
+      {
+        "name": "restream_health",
+        "type": "Option<Arc<RelayRuntimeHealth>>"
+      },
+      {
+        "name": "restream_intent_epoch",
+        "type": "Option<u64>"
+      },
+      {
+        "name": "restream_server",
+        "type": "Option<RestreamServer>"
+      },
+      {
+        "name": "restream_spec",
+        "type": "Option<ResolvedStartSpec>"
+      },
+      {
+        "name": "restream_start_time",
+        "type": "Option<std::time::Instant>"
+      },
+      {
+        "name": "restream_target",
+        "type": "Option<CameraTarget>"
+      },
+      {
+        "name": "selected_protocol",
+        "type": "RestreamProtocol"
+      },
+      {
+        "name": "start_time",
+        "type": "Option<std::time::Instant>"
+      }
+    ],
+    "current": [
+      {
+        "name": "firewall",
+        "type": "FirewallOutcome"
+      },
+      {
+        "name": "firewall_generation",
+        "type": "Option<(u64,FirewallRule)>"
+      },
+      {
+        "name": "playback",
+        "type": "Option<Arc<PlaybackPipeline>>"
+      },
+      {
+        "name": "playback_adapter",
+        "type": "Option<(Option<String>,Option<u32>)>"
+      },
+      {
+        "name": "playback_health",
+        "type": "Option<Arc<PlaybackHealth>>"
+      },
+      {
+        "name": "playback_instance",
+        "type": "Option<(u64,u64)>"
+      },
+      {
+        "name": "playback_intent_epoch",
+        "type": "Option<u64>"
+      },
+      {
+        "name": "playback_ready",
+        "type": "Option<(u32,std::net::Ipv4Addr)>"
+      },
+      {
+        "name": "playback_settings",
+        "type": "Option<AppSettings>"
+      },
+      {
+        "name": "playback_source",
+        "type": "Option<SourceMode>"
+      },
+      {
+        "name": "playback_target",
+        "type": "Option<CameraTarget>"
+      },
+      {
+        "name": "playback_window",
+        "type": "Option<usize>"
+      },
+      {
+        "name": "recording",
+        "type": "bool"
+      },
+      {
+        "name": "recording_finalized_path",
+        "type": "Option<String>"
+      },
+      {
+        "name": "recording_path",
+        "type": "Option<String>"
+      },
+      {
+        "name": "recording_report",
+        "type": "Option<String>"
+      },
+      {
+        "name": "restream_desired",
+        "type": "bool"
+      },
+      {
+        "name": "restream_health",
+        "type": "Option<Arc<RelayRuntimeHealth>>"
+      },
+      {
+        "name": "restream_intent_epoch",
+        "type": "Option<u64>"
+      },
+      {
+        "name": "restream_server",
+        "type": "Option<RestreamServer>"
+      },
+      {
+        "name": "restream_spec",
+        "type": "Option<ResolvedStartSpec>"
+      },
+      {
+        "name": "restream_start_time",
+        "type": "Option<std::time::Instant>"
+      },
+      {
+        "name": "restream_target",
+        "type": "Option<CameraTarget>"
+      },
+      {
+        "name": "selected_protocol",
+        "type": "RestreamProtocol"
+      },
+      {
+        "name": "start_time",
+        "type": "Option<std::time::Instant>"
+      }
+    ],
+    "unchanged": true
+  },
+  "retained": [
+    {
+      "path": "docs/runtime-evidence/a03-revision3-implementation.md",
+      "unchanged": true
+    },
+    {
+      "path": "docs/runtime-evidence/privilege-v2-a1-continuation.md",
+      "unchanged": true
+    },
+    {
+      "path": "docs/runtime-evidence/privilege-v2-a1-production-smoke.json",
+      "unchanged": true
+    },
+    {
+      "path": "docs/runtime-evidence/privilege-v2-a1.json",
+      "unchanged": true
+    },
+    {
+      "path": "docs/runtime-evidence/privilege-v2-a1.md",
+      "unchanged": true
+    },
+    {
+      "path": "docs/runtime-evidence/privilege-v2-a2.json",
+      "unchanged": true
+    },
+    {
+      "path": "docs/runtime-evidence/privilege-v2-a2.md",
+      "unchanged": true
+    },
+    {
+      "path": "docs/runtime-evidence/privilege-v2-a3-review.json",
+      "unchanged": true
+    },
+    {
+      "path": "docs/runtime-evidence/privilege-v2-a3-review.md",
+      "unchanged": true
+    },
+    {
+      "path": "docs/runtime-evidence/privilege-v2-a3.json",
+      "unchanged": true
+    },
+    {
+      "path": "docs/runtime-evidence/privilege-v2-a3.md",
+      "unchanged": true
+    },
+    {
+      "path": "docs/runtime-evidence/privilege-v2-a4-remaining.md",
+      "unchanged": true
+    },
+    {
+      "path": "docs/runtime-evidence/privilege-v2-commit-checkpoint.md",
+      "unchanged": true
+    },
+    {
+      "path": "docs/runtime-evidence/privilege-v2-development-checkpoint.json",
+      "unchanged": true
+    },
+    {
+      "path": "docs/runtime-evidence/privilege-v2-development-checkpoint.md",
+      "unchanged": true
+    },
+    {
+      "path": "docs/runtime-evidence/privilege-v2-final-qualification.json",
+      "unchanged": true
+    },
+    {
+      "path": "docs/runtime-evidence/privilege-v2-final-qualification.md",
+      "unchanged": true
+    },
+    {
+      "path": "docs/runtime-evidence/privilege-v2-native-prerequisites.json",
+      "unchanged": true
+    },
+    {
+      "path": "docs/runtime-evidence/privilege-v2-native-prerequisites.md",
+      "unchanged": true
+    },
+    {
+      "path": "docs/runtime-evidence/privilege-v2-ptu-handoff.json",
+      "unchanged": true
+    },
+    {
+      "path": "docs/runtime-evidence/privilege-v2-ptu-handoff.md",
+      "unchanged": true
+    },
+    {
+      "path": "docs/runtime-evidence/privilege-v2-release-qualification.md",
+      "unchanged": true
+    },
+    {
+      "path": "docs/runtime-evidence/privilege-v2-sandbox-checkpoint.json",
+      "unchanged": true
+    },
+    {
+      "path": "docs/runtime-evidence/privilege-v2-sandbox-checkpoint.md",
+      "unchanged": true
+    },
+    {
+      "path": "docs/runtime-evidence/privilege-v2-sandbox-resume.md",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/Cargo.lock",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/Cargo.toml",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/build.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/pocketstream.dev.manifest",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/pocketstream.exe.manifest",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/config.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/entry.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/maintenance.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/adapter_refresh.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/adapter_selector.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/adopt_loop.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/arp.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/auto_adopt.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/binding_store.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/bindings.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/bound_tcp.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/cache_probe.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/capture_session.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/device_registry.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/discovery_session.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/firewall-policy-v2.ps1",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/firewall.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/ghost.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/host_owner.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/interface.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/ip_config.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/ip_conflict.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/local_executor.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/manual_address.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/mod.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/native-operations-v1.ps1",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/native_operations.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/native_runner.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/ping_dot.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/pktmon.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/presence.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/readiness.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/reaper.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/route.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/scan.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/scanner.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/src/network/watcher.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src-tauri/tests/fixtures/native_foundation.rs",
+      "unchanged": true
+    },
+    {
+      "path": "src/lib/tauri-api.ts",
+      "unchanged": true
+    },
+    {
+      "path": "src/lib/types.ts",
+      "unchanged": true
+    }
+  ],
+  "environment_configuration": {
+    "path": ".cargo/config.toml",
+    "tracked": false,
+    "sha256": "61a792c04548fcc908b38fb03a0012e0830aba62ba116b5c8c228682153306b5"
+  },
+  "exit_order_unchanged": true,
+  "baseline_error_literals": 307,
+  "missing_error_literals": [],
+  "media_inputs": [
+    {
+      "path": "src-tauri/src/streaming/rtsp_server.rs",
+      "production_unchanged": true
+    },
+    {
+      "path": "src-tauri/src/streaming/srt_server.rs",
+      "production_unchanged": true
+    },
+    {
+      "path": "src-tauri/src/streaming/recorder.rs",
+      "production_unchanged": true
+    },
+    {
+      "path": "src-tauri/src/streaming/audio.rs",
+      "production_unchanged": true
+    },
+    {
+      "path": "src-tauri/src/streaming/rtsp_client.rs",
+      "production_unchanged_except_redaction_dependency": true
+    }
+  ]
+}
