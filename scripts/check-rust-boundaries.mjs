@@ -11,7 +11,7 @@ const permanent = new Set([
 // Temporary migration exceptions. Counts prevent adding lookup sites while
 // moving the existing ones. Network exceptions close by slice 6.
 const temporary = new Map([
-  ['network/mod.rs', 15], ['network/arp.rs', 3],
+  ['network/mod.rs', 10],
   ['network/native_operations.rs', 7], ['network/bindings.rs', 1],
   ['network/ping_dot.rs', 3], ['streaming/mod.rs', 6],
 ]);

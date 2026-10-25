@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tauri::{Emitter, Manager};
 use tokio::sync::Mutex;
 
 use super::pktmon;
@@ -496,6 +495,21 @@ async fn drain_prior_capture_within(
 }
 
 impl ArpListenerHandle {
+    #[cfg(test)]
+    pub(super) fn for_test(
+        join: tokio::task::JoinHandle<()>,
+    ) -> (Self, tokio::sync::watch::Receiver<bool>) {
+        let (shutdown_tx, rx) = tokio::sync::watch::channel(false);
+        (
+            Self {
+                shutdown_tx,
+                join,
+                counters: Arc::new(SessionCounters::default()),
+            },
+            rx,
+        )
+    }
+
     /// Signal shutdown and surrender the blocking thread's JoinHandle so
     /// the caller can bounded-join it or park it in the prior-capture
     /// guard. The shutdown is already sent when this returns; dropping
@@ -629,7 +643,8 @@ struct CallbackContext {
     devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
     registry: Arc<DeviceRegistry>,
     emitter: Arc<DeviceListEmitter>,
-    app_handle: tauri::AppHandle,
+    bridge: Arc<dyn crate::bridge::AppBridge>,
+    config: Arc<crate::config::AppConfig>,
     /// Session fence: a live capture frame from a prior discovery session
     /// (or one still firing after a stop) drops itself before merging or
     /// emitting into the shared registry.
@@ -646,13 +661,6 @@ struct CallbackContext {
     noneth_logged: AtomicBool,
     /// One-shot latch for the "filtering a local adapter" notice.
     localmac_logged: AtomicBool,
-    /// Subnets owned exclusively by non-Ethernet interfaces (WiFi/VPN). An
-    /// ARP whose sender IP falls in one of these is dropped, so only the
-    /// wired Ethernet port's peers become nodes. Empty ⇒ no filtering
-    /// (interface enumeration failed, or there were no such subnets).
-    /// Shared with the manager, which refreshes it at every discovery
-    /// start; read under a brief per-frame lock, poison fails open.
-    excluded_subnets: Arc<StdMutex<Vec<ipnetwork::Ipv4Network>>>,
     /// This session's liveness counters, shared with the returned handle.
     counters: Arc<SessionCounters>,
 }
@@ -791,23 +799,13 @@ unsafe fn data_cb_inner(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor
         return;
     };
     // Scope proof or fresh selected-interface verification owns admission.
-    // The subnet exclusion remains only for a legacy listener with no
-    // candidate verifier. Self/prohibited senders are rejected in every scope.
-    // Snapshot the exclusion set first (brief lock; poison fails open to
-    // "no filtering", the same tolerance as the local-MAC set) so the two
-    // locks are never held together.
-    let excluded: Vec<ipnetwork::Ipv4Network> = ctx
-        .excluded_subnets
-        .lock()
-        .map(|v| v.clone())
-        .unwrap_or_default();
     let verdict = match ctx.local_macs.lock() {
         Ok(local) => classify_sender(
             ip,
             mac,
             ctx.own_mac,
             &local,
-            &excluded,
+            &[],
             &ctx.counters,
             ctx.candidates.is_some(),
         ),
@@ -816,7 +814,7 @@ unsafe fn data_cb_inner(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor
             mac,
             ctx.own_mac,
             &HashSet::new(),
-            &excluded,
+            &[],
             &ctx.counters,
             ctx.candidates.is_some(),
         ),
@@ -925,7 +923,8 @@ unsafe fn data_cb_inner(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor
     let devices = ctx.devices.clone();
     let registry = ctx.registry.clone();
     let emitter = ctx.emitter.clone();
-    let app_handle = ctx.app_handle.clone();
+    let bridge = ctx.bridge.clone();
+    let config = ctx.config.clone();
     let fence = ctx.fence.clone();
     // Only the D1 input wired by S5a can authorize the new verified path.
     let verified_by = ctx.candidates.as_ref().map(|ingress| ingress.adapter_mac);
@@ -939,7 +938,8 @@ unsafe fn data_cb_inner(ctx: *mut c_void, d: *const pktmon::StreamDataDescriptor
             devices,
             registry,
             emitter,
-            app_handle,
+            bridge,
+            config,
             &fence,
             verified_by,
         )
@@ -957,7 +957,8 @@ async fn on_arp_seen(
     devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
     registry: Arc<DeviceRegistry>,
     emitter: Arc<DeviceListEmitter>,
-    app_handle: tauri::AppHandle,
+    bridge: Arc<dyn crate::bridge::AppBridge>,
+    config: Arc<crate::config::AppConfig>,
     fence: &super::SweepFence,
     verified_by: Option<[u8; 6]>,
 ) {
@@ -1002,16 +1003,7 @@ async fn on_arp_seen(
         is_new
     };
 
-    // Positive-liveness stamp for the adoption lifecycle: an accepted
-    // frame is proof a device exists on the sender's subnet. Cheap
-    // no-op unless that subnet is adopted.
-    {
-        let manager: tauri::State<'_, std::sync::Arc<crate::network::NetworkManager>> =
-            app_handle.state();
-        manager
-            .note_positive_liveness_fenced(&app_handle, ip, fence)
-            .await;
-    }
+    super::note_positive_liveness_fenced(ip, fence).await;
 
     // Merge into the canonical registry outside the `devices` lock.
     // Other identities at the same IP stay inactive with their own aliases.
@@ -1026,11 +1018,9 @@ async fn on_arp_seen(
     }
     if verified_by.is_some() {
         if let Some(record) = registry.cache_record(&device.mac) {
-            let cache_handle = app_handle.clone();
+            let config = config.clone();
             let cache_fence = fence.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                let config: tauri::State<'_, std::sync::Arc<crate::config::AppConfig>> =
-                    cache_handle.state();
                 if let Err(e) = config.upsert_cached_device_fenced(record, Some(&cache_fence)) {
                     log::warn!("Failed to persist verified capture identity: {e}");
                 }
@@ -1039,9 +1029,8 @@ async fn on_arp_seen(
         }
     }
     if !result.dropped_macs.is_empty() {
-        let cfg: tauri::State<'_, std::sync::Arc<crate::config::AppConfig>> = app_handle.state();
         for dropped in &result.dropped_macs {
-            if let Err(e) = cfg.remove_cached_device(dropped) {
+            if let Err(e) = config.remove_cached_device(dropped) {
                 log::warn!(
                     "Failed to evict dupe cache row {} (same IP as {}): {}",
                     dropped,
@@ -1054,7 +1043,7 @@ async fn on_arp_seen(
 
     if is_new {
         log::info!("ARP: {} ({})", device.ip, device.mac);
-        let _ = app_handle.emit("arp-device-discovered", &device);
+        let _ = crate::bridge::emit(bridge.as_ref(), "arp-device-discovered", &device);
     }
 }
 
@@ -1066,7 +1055,8 @@ pub(crate) struct ListenerParams {
     pub devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
     pub registry: Arc<DeviceRegistry>,
     pub emitter: Arc<DeviceListEmitter>,
-    pub app_handle: tauri::AppHandle,
+    pub bridge: Arc<dyn crate::bridge::AppBridge>,
+    pub config: Arc<crate::config::AppConfig>,
     /// MAC identities of every local adapter, refreshed by the discovery loop.
     /// A matching sender is the host; an IP match alone is not sufficient.
     pub local_macs: Arc<StdMutex<HashSet<[u8; 6]>>>,
@@ -1074,12 +1064,6 @@ pub(crate) struct ListenerParams {
     /// (see [`on_arp_seen`]'s phantom-peer note).
     pub own_mac: Option<[u8; 6]>,
     pub fence: super::SweepFence,
-    /// Subnets owned exclusively by non-Ethernet interfaces; a captured
-    /// ARP whose sender IP is in one is dropped. Shared with the
-    /// manager, which refreshes it at every discovery start — the
-    /// callback reads it per frame, so a listener retained across
-    /// sessions picks up new exclusions without re-attaching.
-    pub excluded_subnets: Arc<StdMutex<Vec<ipnetwork::Ipv4Network>>>,
     /// The selected wired adapter's capture identity.
     pub scope: pktmon::CaptureScope,
 }
@@ -1120,11 +1104,12 @@ pub(crate) async fn start_listener(
         devices,
         registry,
         emitter,
-        app_handle,
+        bridge,
+        config,
         local_macs,
         own_mac,
         fence,
-        excluded_subnets,
+
         scope,
     } = params;
 
@@ -1156,7 +1141,8 @@ pub(crate) async fn start_listener(
             devices,
             registry,
             emitter,
-            app_handle,
+            bridge,
+            config,
             fence,
             arp_task_sem: Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_ARP_TASKS)),
             missed_logged: AtomicBool::new(false),
@@ -1164,7 +1150,7 @@ pub(crate) async fn start_listener(
             flood_logged: AtomicBool::new(false),
             noneth_logged: AtomicBool::new(false),
             localmac_logged: AtomicBool::new(false),
-            excluded_subnets,
+
             counters: counters_for_ctx,
         });
 

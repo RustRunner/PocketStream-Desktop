@@ -66,3 +66,14 @@ scenario movements are recorded below as implementation progresses.
    Existing caller-abort persistence, uncertain barrier, single-budget admission,
    temporary recovery and managed-drain deadlock regressions remain passing.
 
+
+4. CaptureSession owns listener/incarnation/candidates/signal/solicitation and
+   prior joins; keep/replace/restart decisions and eight existing scenarios moved.
+   Capture callbacks receive bridge/config plus documented fence/map adapters.
+   Verified unpopulated manager/listener exclusion storage removed; pure legacy
+   classifier scenarios remain. A new stop test proves retirement, stale callback
+   rejection and parking an unfinished join before the existing drain. No new
+   wait/deadline was added. Explicit sweep/watchdog dependencies replace listener
+   AppHandle use. Gates: 797 Rust passed / 10 ignored; 205 frontend passed;
+   fmt, Clippy, typecheck, contracts and build passed.
+

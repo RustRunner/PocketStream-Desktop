@@ -674,7 +674,10 @@ mod tests {
             &snapshot.fence,
             std::time::Instant::now(),
         );
-        let observations = manager.candidates.snapshot(std::time::Instant::now());
+        let observations = manager
+            .capture
+            .candidates
+            .snapshot(std::time::Instant::now());
         let r = manager.registry();
         let mut clock = Clock::default();
         assert!(r.snapshot().is_empty());

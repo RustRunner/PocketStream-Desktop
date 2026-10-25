@@ -13,6 +13,27 @@ pub(super) struct AdapterSelector {
 }
 
 impl AdapterSelector {
+    /// Current selected-adapter addresses from IP Helper, never the saved map.
+    pub(super) fn probe_scope(
+        &self,
+        pending_ips: &auto_adopt::PendingIps,
+    ) -> Option<(InterfaceInfo, u32, SweepFence)> {
+        let snapshot = self.presence.snapshot();
+        let mut adapter = snapshot.adapter?;
+        if snapshot.fence.is_stale() || interface::index_for_mac(&adapter.mac)? != snapshot.index {
+            return None;
+        }
+        let (up, ips) = interface::quick_status_by_mac(&adapter.mac)?;
+        if !up {
+            return None;
+        }
+        adapter.ips = ips;
+        let pending = pending_ips.try_lock().ok()?;
+        adapter
+            .ips
+            .retain(|ip| !pending.iter().any(|p| p.ip.to_string() == ip.address));
+        Some((adapter, snapshot.index, snapshot.fence))
+    }
     pub(super) fn new() -> Self {
         Self {
             adapter_selection: Arc::new(Mutex::new(AdapterSelection::default())),

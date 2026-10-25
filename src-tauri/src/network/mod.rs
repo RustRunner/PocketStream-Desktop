@@ -1,3 +1,5 @@
+mod capture_session;
+use capture_session::{current_session_counters, park_capture_handle};
 mod adapter_selector;
 mod binding_store;
 use adapter_selector::{adapter_candidate, adapter_mac, pick_adapter};
@@ -287,115 +289,9 @@ pub struct AdapterSelection {
     pub candidates: Vec<InterfaceInfo>,
 }
 
-#[derive(Default)]
-struct CaptureSignal {
-    state: CaptureState,
-    app: Option<tauri::AppHandle>,
-}
-
-impl CaptureSignal {
-    fn activate(&mut self, params: &arp::ListenerParams, outcome: pktmon::ScopeOutcome) {
-        let scope = match &outcome {
-            pktmon::ScopeOutcome::SelectedInterface { .. } => "selected_interface",
-            pktmon::ScopeOutcome::ScopedByName { .. } => "scoped_by_name",
-            pktmon::ScopeOutcome::UnscopedFallback { .. } => "unscoped",
-        };
-        log::info!("event=capture_state adapter_mac={} interface_index={} scope={} source_id={:?} active=true",
-            log_value(&params.scope.mac.map(|m| arp::format_mac(&m)).unwrap_or_default()),
-            params.candidates.as_ref().map_or(0, |c| c.interface_index), scope, outcome.source_id());
-        self.app = Some(params.app_handle.clone());
-        self.state = CaptureState {
-            active: true,
-            candidate_count: params
-                .candidates
-                .as_ref()
-                .map_or(0, |i| i.store.count(std::time::Instant::now())),
-            adapter_name: Some(params.scope.display_name.clone()),
-            outcome: Some(outcome),
-        };
-        self.emit();
-    }
-
-    fn deactivate(&mut self) {
-        if self.state.active {
-            self.state.active = false;
-            self.emit();
-        }
-    }
-
-    fn emit(&self) {
-        use tauri::Emitter;
-        if let Some(app) = &self.app {
-            let _ = app.emit("capture-active", &self.state);
-        }
-    }
-}
-
-/// A fresh look at the data source the capture scope would bind today.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LiveSourceId {
-    /// Native enumeration found this id for the adapter.
-    Enumerated(u32),
-    /// Enumeration was unavailable or failed. Fails open — a transient
-    /// enumeration fault must never churn a healthy listener.
-    EnumFailed,
-}
-
-/// What `ensure_capture_listener` does with the listener slot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ListenerAction {
-    Attach,
-    Keep,
-    Replace(&'static str),
-}
-
-/// Pure decision for the capture-listener slot: keep a healthy binding,
-/// replace an invalidated one, attach when none exists. `has_listener`
-/// is the handle slot's occupancy — a recorded identity without a live
-/// handle (a torn-down session whose reinstall failed) must attach, not
-/// keep.
-pub(crate) fn listener_action(
-    current: Option<&CaptureIdentity>,
-    has_listener: bool,
-    desired_iface: &str,
-    desired_mac: Option<[u8; 6]>,
-    live: LiveSourceId,
-) -> ListenerAction {
-    let Some(current) = current else {
-        return ListenerAction::Attach;
-    };
-    if !has_listener {
-        return ListenerAction::Attach;
-    }
-    if !current.active.load(Ordering::Acquire) {
-        return ListenerAction::Replace("capture inactive");
-    }
-    if current.iface_name != desired_iface || current.mac != desired_mac {
-        return ListenerAction::Replace("adapter changed");
-    }
-    match (current.source_id, live) {
-        // No live id to compare against — keep what runs.
-        (_, LiveSourceId::EnumFailed) => ListenerAction::Keep,
-        // An unscoped-fallback session never outlives the next start:
-        // every ensure re-attempts the scoped join.
-        (None, LiveSourceId::Enumerated(_)) => ListenerAction::Replace("retry scoped attach"),
-        (Some(bound), LiveSourceId::Enumerated(live_id)) if bound != live_id => {
-            ListenerAction::Replace("data source changed")
-        }
-        _ => ListenerAction::Keep,
-    }
-}
-
 /// DHCP already captures; enabling adoption does not need a new listener.
 fn mode_keeps_capture(from: crate::config::NetworkMode, to: crate::config::NetworkMode) -> bool {
     from == crate::config::NetworkMode::Dhcp && to == crate::config::NetworkMode::StaticAuto
-}
-
-fn mode_capture_action(action: ListenerAction, preserve: bool) -> ListenerAction {
-    match (action, preserve) {
-        (ListenerAction::Replace("retry scoped attach"), true) => ListenerAction::Keep,
-        _ => action,
-    }
 }
 
 /// RAII guard that removes a subnet from the active-scan set on drop, so a
@@ -706,25 +602,11 @@ pub struct ModeTransitionReply {
 pub struct NetworkManager {
     selector: Arc<adapter_selector::AdapterSelector>,
     bindings: Arc<binding_store::BindingStore>,
+    capture: Arc<capture_session::CaptureSession>,
     bridge: Arc<dyn crate::bridge::AppBridge>,
     config: Arc<crate::config::AppConfig>,
     active_scans: Arc<std::sync::Mutex<HashSet<String>>>,
-    solicitations: tokio::sync::watch::Sender<Option<Solicitation>>,
     arp_devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
-    arp_listener_handle: Arc<Mutex<Option<arp::ArpListenerHandle>>>,
-    /// Capture threads told to stop but not yet observed dead. Every
-    /// capture start drains this (bounded join) before attaching — the
-    /// session name is fixed, so two live sessions must never overlap.
-    prior_capture_joins: arp::PriorCaptureJoins,
-    /// What the persistent capture listener is bound to (adapter, data
-    /// source, incarnation lifecycle flag). `None` when no listener is
-    /// attached.
-    capture_identity: Arc<Mutex<Option<CaptureIdentity>>>,
-    capture_signal: Arc<Mutex<CaptureSignal>>,
-    candidates: Arc<arp::CandidateSet>,
-    /// Legacy listener exclusions. Activated discovery clears these and
-    /// uses selected-interface scope/verification even on overlapping subnets.
-    excluded_subnets: Arc<StdMutex<Vec<ipnetwork::Ipv4Network>>>,
     auto_adopt_handle: Arc<Mutex<Option<AutoAdoptHandle>>>,
     /// Capture-health watchdog: restarts a provably deaf capture session
     /// (scoped retry, then forced-unscoped), and only when that ladder is
@@ -956,12 +838,12 @@ fn select_sweep_ips(
 /// short delay so the capture attach lands first) and the capture-restart
 /// ladder, which re-provokes so a fresh session has traffic to prove
 /// itself against.
-async fn provoke_sweep(params: &arp::ListenerParams, sweep_ips: &[String]) {
+async fn provoke_sweep(params: &arp::ListenerParams, sweep_ips: &[String], deps: &SweepDeps) {
     if params.fence.is_stale() {
         return;
     }
     log::info!("Ping sweeping selected subnets to populate ARP");
-    ping_sweep_subnets(sweep_ips, &params.fence, &params.app_handle).await;
+    ping_sweep_subnets(sweep_ips, &params.fence, deps).await;
 
     // One brief-lock snapshot for the whole merge pass (never lock per
     // entry); a poisoned lock degrades to an empty set, which filters
@@ -970,11 +852,6 @@ async fn provoke_sweep(params: &arp::ListenerParams, sweep_ips: &[String]) {
         .local_macs
         .lock()
         .map(|s| s.clone())
-        .unwrap_or_default();
-    let excluded_snapshot: Vec<ipnetwork::Ipv4Network> = params
-        .excluded_subnets
-        .lock()
-        .map(|v| v.clone())
         .unwrap_or_default();
 
     // Neighbor observations from the selected pass still enter through the
@@ -990,33 +867,15 @@ async fn provoke_sweep(params: &arp::ListenerParams, sweep_ips: &[String]) {
             params.devices.clone(),
             params.registry.clone(),
             params.emitter.clone(),
-            params.app_handle.clone(),
+            params.bridge.clone(),
+            params.config.clone(),
             sweep_iface_ip,
-            &excluded_snapshot,
+            &[],
             &local_snapshot,
             &params.fence,
             params.candidates.as_ref(),
         )
         .await;
-    }
-}
-
-/// The current capture session's counters, if a session is installed.
-async fn current_session_counters(
-    slot: &Arc<Mutex<Option<arp::ArpListenerHandle>>>,
-) -> Option<Arc<arp::SessionCounters>> {
-    slot.lock().await.as_ref().map(|h| h.counters())
-}
-
-/// Take the installed capture handle, signal it to stop, and park its
-/// join in the prior-capture guard — ownership is retained; the next
-/// capture start bounded-joins it there.
-async fn park_capture_handle(
-    slot: &Arc<Mutex<Option<arp::ArpListenerHandle>>>,
-    prior: &arp::PriorCaptureJoins,
-) {
-    if let Some(h) = slot.lock().await.take() {
-        prior.lock().await.push(h.stop_into_join());
     }
 }
 
@@ -1045,6 +904,7 @@ pub(crate) fn strip_pending_ips(
 /// broadcast dwell path and the cache probe drive one tail without a
 /// dozen-argument signature.
 struct AdoptionCtx {
+    sweep: SweepDeps,
     iface_name: String,
     adapter_mac: String,
     interface_index: u32,
@@ -1310,7 +1170,9 @@ async fn attempt_adoption(
             let sweep_devices = ctx.devices.clone();
             let sweep_registry = ctx.registry.clone();
             let sweep_emitter = ctx.emitter.clone();
-            let sweep_handle = ctx.app_handle.clone();
+            let sweep_bridge = ctx.sweep.bridge.clone();
+            let sweep_config = ctx.sweep.config.clone();
+            let sweep_deps = ctx.sweep.clone();
             let sweep_fence = ctx.fence.clone();
             let sweep_candidates = ctx.candidates.clone();
             let sweep_local = ctx.local_macs.clone();
@@ -1319,7 +1181,7 @@ async fn attempt_adoption(
                 if sweep_fence.is_stale() {
                     return;
                 }
-                ping_sweep_subnets(std::slice::from_ref(&sweep_ip), &sweep_fence, &sweep_handle)
+                ping_sweep_subnets(std::slice::from_ref(&sweep_ip), &sweep_fence, &sweep_deps)
                     .await;
                 let local_snapshot: HashSet<[u8; 6]> =
                     sweep_local.lock().map(|s| s.clone()).unwrap_or_default();
@@ -1327,7 +1189,8 @@ async fn attempt_adoption(
                     sweep_devices.clone(),
                     sweep_registry.clone(),
                     sweep_emitter.clone(),
-                    sweep_handle.clone(),
+                    sweep_bridge.clone(),
+                    sweep_config.clone(),
                     &sweep_ip,
                     &[],
                     &local_snapshot,
@@ -1561,7 +1424,6 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
         scratch: Ipv4Addr,
         interface_index: u32,
     ) -> Result<Option<String>, ()> {
-        use tauri::Manager;
         if interface_index != self.ctx.interface_index || self.ctx.fence.is_stale() {
             return Err(());
         }
@@ -1581,9 +1443,9 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
             return Err(());
         }
         self.ctx
-            .app_handle
-            .state::<std::sync::Arc<NetworkManager>>()
-            .note_solicitation(&self.ctx.fence)
+            .sweep
+            .capture
+            .note_solicitation(&self.ctx.fence, &self.ctx.sweep.fence())
             .await;
         if self.ctx.fence.is_stale() {
             return Err(());
@@ -1733,22 +1595,18 @@ async fn watch_window(
 async fn watchdog_ladder(
     params: arp::ListenerParams,
     sweep_ips: Vec<String>,
-    listener_slot: Arc<Mutex<Option<arp::ArpListenerHandle>>>,
-    prior_joins: arp::PriorCaptureJoins,
-    capture_identity: Arc<Mutex<Option<CaptureIdentity>>>,
+    deps: SweepDeps,
     activation: (
         arp::ActivationRx,
         tokio::sync::watch::Receiver<Option<Solicitation>>,
     ),
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
-    use tauri::{Emitter, Manager};
     let (mut activation_rx, mut solicitations) = activation;
-    let capture_signal = params
-        .app_handle
-        .state::<std::sync::Arc<NetworkManager>>()
-        .capture_signal
-        .clone();
+    let capture_signal = deps.capture.capture_signal.clone();
+    let listener_slot = deps.capture.arp_listener_handle.clone();
+    let prior_joins = deps.capture.prior_capture_joins.clone();
+    let capture_identity = deps.capture.capture_identity.clone();
     // The deadline starts at the solicitation, not at activation.
     const INITIAL_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
     const POLL: std::time::Duration = std::time::Duration::from_secs(2);
@@ -1788,7 +1646,7 @@ async fn watchdog_ladder(
                         // provoke only native subnets; otherwise wait for ARP
                         // presence/cache verification or explicit Refresh.
                         if restarts_used > 0 {
-                            provoke_sweep(&params, &sweep_ips).await;
+                            provoke_sweep(&params, &sweep_ips, &deps).await;
                         }
                         match watch_window(
                             &counters,
@@ -2003,7 +1861,7 @@ async fn watchdog_ladder(
         params.candidates.as_ref().map_or(0, |c| c.interface_index),
         arp::diagnostic_counts()
     );
-    let _ = params.app_handle.emit(
+    let _ = params.bridge.emit(
         "discovery-degraded",
         serde_json::json!({
             "reason": "no-payload-events",
@@ -2025,7 +1883,7 @@ async fn watchdog_ladder(
         if counters.snapshot().frames_seen > baseline {
             log::info!("Discovery recovered: ARP payload events resumed");
             let _ = params
-                .app_handle
+                .bridge
                 .emit("discovery-recovered", serde_json::json!({}));
             return;
         }
@@ -2096,6 +1954,11 @@ struct AddressTrace {
     success: AtomicBool,
 }
 impl AddressTrace {
+    fn identity(&self, snapshot: &interface::OperationSnapshot, prefix: Option<u8>) {
+        log::info!("event=address_operation operation={} adapter_guid={} adapter_mac={} interface_index={} alias={} prefix={}",
+            self.id, log_value(&snapshot.selected.guid), log_value(&snapshot.selected.mac), snapshot.selected.index,
+            log_value(&snapshot.selected.alias), prefix.map_or_else(|| "unknown".into(), |p| p.to_string()));
+    }
     fn new(action: &str, address: &str) -> Self {
         let now = std::time::Instant::now();
         let value = Self {
@@ -2128,11 +1991,7 @@ impl AddressTrace {
     fn provider_call(&self) {
         self.provider.fetch_add(1, Ordering::Relaxed);
     }
-    fn identity(&self, snapshot: &interface::OperationSnapshot, prefix: Option<u8>) {
-        log::info!("event=address_operation operation={} adapter_guid={} adapter_mac={} interface_index={} alias={} prefix={}",
-            self.id, log_value(&snapshot.selected.guid), log_value(&snapshot.selected.mac), snapshot.selected.index,
-            log_value(&snapshot.selected.alias), prefix.map_or_else(|| "unknown".into(), |p| p.to_string()));
-    }
+
     fn succeeded(&self) {
         self.success.store(true, Ordering::Relaxed);
     }
@@ -2208,6 +2067,27 @@ impl auto_adopt::AdoptOps for AddressOps<'_> {
 }
 
 impl NetworkManager {
+    async fn stop_capture_locked(&self) {
+        self.capture.stop_capture_locked().await;
+    }
+    fn candidate_ingress(&self, index: u32, mac: Option<[u8; 6]>) -> Option<arp::CandidateIngress> {
+        self.capture.candidate_ingress(index, mac)
+    }
+    pub async fn get_capture_state(&self) -> CaptureState {
+        self.capture.get_capture_state().await
+    }
+    fn sweep_deps(&self) -> SweepDeps {
+        SweepDeps {
+            selector: self.selector.clone(),
+            capture: self.capture.clone(),
+            pending: self.bindings.pending_ips.clone(),
+            generation: self.discovery_generation.clone(),
+            active: self.discovery_active.clone(),
+            bridge: self.bridge.clone(),
+            config: self.config.clone(),
+        }
+    }
+
     pub(crate) fn event_bridge(&self) -> Arc<dyn crate::bridge::AppBridge> {
         self.bridge.clone()
     }
@@ -2270,17 +2150,11 @@ impl NetworkManager {
         Self {
             selector,
             bindings,
+            capture: Arc::new(capture_session::CaptureSession::new()),
             bridge,
             config,
             active_scans: Arc::new(std::sync::Mutex::new(HashSet::new())),
-            solicitations: tokio::sync::watch::channel(None).0,
             arp_devices: Arc::new(Mutex::new(HashMap::new())),
-            arp_listener_handle: Arc::new(Mutex::new(None)),
-            prior_capture_joins: Arc::new(Mutex::new(Vec::new())),
-            capture_identity: Arc::new(Mutex::new(None)),
-            capture_signal: Arc::new(Mutex::new(CaptureSignal::default())),
-            candidates: Arc::new(arp::CandidateSet::default()),
-            excluded_subnets: Arc::new(StdMutex::new(Vec::new())),
             auto_adopt_handle: Arc::new(Mutex::new(None)),
             discovery_watchdog_handle: Arc::new(Mutex::new(None)),
             device_registry: registry,
@@ -2291,14 +2165,6 @@ impl NetworkManager {
             discovery_active: Arc::new(AtomicBool::new(false)),
             discovery_started: Arc::new(std::sync::Mutex::new(None)),
         }
-    }
-
-    pub(crate) async fn note_positive_liveness_fenced(
-        &self,
-        _app: &tauri::AppHandle,
-        _ip: Ipv4Addr,
-        _fence: &SweepFence,
-    ) {
     }
 
     /// Hydrate the device registry from the on-disk cache. Idempotent
@@ -2353,22 +2219,6 @@ impl NetworkManager {
             self.discovery_generation.clone(),
             self.discovery_active.clone(),
         )
-    }
-
-    async fn note_solicitation(&self, work: &SweepFence) {
-        let fence = self.sweep_fence();
-        if work.is_stale() || fence.is_stale() {
-            return;
-        }
-        if let Some(counters) = current_session_counters(&self.arp_listener_handle).await {
-            if !work.is_stale() && !fence.is_stale() {
-                self.solicitations.send_replace(Some(Solicitation {
-                    generation: fence.generation,
-                    at: tokio::time::Instant::now(),
-                    baseline: counters.snapshot(),
-                }));
-            }
-        }
     }
 
     pub fn registry(&self) -> Arc<DeviceRegistry> {
@@ -2600,7 +2450,7 @@ impl NetworkManager {
         let emitter = self.device_emitter.clone();
         let control = self.selector.presence.clone();
         let registry = self.device_registry.clone();
-        let candidates = self.candidates.clone();
+        let candidates = self.capture.candidates.clone();
         *handle = Some(tokio::spawn(async move {
             let mut clock = presence::Clock::default();
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
@@ -2847,7 +2697,7 @@ impl NetworkManager {
         self.update_presence_adapter(&pending_selection, config.get_network_mode());
         self.selector.presence.tick(&self.device_registry);
         if previous.selected_mac != mac || previous.interface_index != index {
-            if let Some(identity) = self.capture_identity.lock().await.as_ref() {
+            if let Some(identity) = self.capture.capture_identity.lock().await.as_ref() {
                 identity.active.store(false, Ordering::Release);
             }
             self.stop_locked().await;
@@ -2954,7 +2804,7 @@ impl NetworkManager {
             settings.selected_adapter_mac.as_deref(),
             &selection,
             native,
-            self.capture_signal.lock().await.state.active,
+            self.capture.capture_signal.lock().await.state.active,
         );
         match action {
             DiscoveryResume::Idle => Ok(false),
@@ -2972,7 +2822,7 @@ impl NetworkManager {
                     .start_selected_discovery_locked(selection, config, app.clone(), false, true)
                     .await;
                 if let Err(error) = result {
-                    if up || !self.capture_signal.lock().await.state.active {
+                    if up || !self.capture.capture_signal.lock().await.state.active {
                         return Err(error);
                     }
                     log::info!("event=discovery_resume phase=waiting_for_link");
@@ -2984,23 +2834,8 @@ impl NetworkManager {
         }
     }
 
-    /// Current selected-adapter addresses from IP Helper, never the saved map.
     fn probe_scope(&self) -> Option<(InterfaceInfo, u32, SweepFence)> {
-        let snapshot = self.selector.presence.snapshot();
-        let mut adapter = snapshot.adapter?;
-        if snapshot.fence.is_stale() || interface::index_for_mac(&adapter.mac)? != snapshot.index {
-            return None;
-        }
-        let (up, ips) = interface::quick_status_by_mac(&adapter.mac)?;
-        if !up {
-            return None;
-        }
-        adapter.ips = ips;
-        let pending = self.bindings.pending_ips.try_lock().ok()?;
-        adapter
-            .ips
-            .retain(|ip| !pending.iter().any(|p| p.ip.to_string() == ip.address));
-        Some((adapter, snapshot.index, snapshot.fence))
+        self.selector.probe_scope(&self.bindings.pending_ips)
     }
 
     pub(crate) async fn camera_ready(
@@ -3216,167 +3051,6 @@ impl NetworkManager {
             .await
     }
 
-    /// Attach, keep, or replace the persistent capture listener so it
-    /// matches the requested adapter. Runs under `discovery_op` (every
-    /// caller holds it). Returns an already-resolved activation channel
-    /// for the watchdog: on attach/replace this method awaited the real
-    /// activation itself; on keep the retained listener proved
-    /// activation when it originally attached.
-    async fn ensure_capture_listener(
-        &self,
-        iface_name: &str,
-        own_mac: Option<[u8; 6]>,
-        iface_is_up: bool,
-        base_params: &arp::ListenerParams,
-        preserve_capture: bool,
-    ) -> Result<arp::ActivationRx, AppError> {
-        let has_listener = self.arp_listener_handle.lock().await.is_some();
-        let same_adapter = {
-            let identity = self.capture_identity.lock().await;
-            identity
-                .as_ref()
-                .is_some_and(|c| c.iface_name == iface_name && c.mac == own_mac)
-        };
-        // Probe the live data-source id only when a matching listener
-        // could be kept — its sole job is catching the source being
-        // re-created underneath a retained binding (id churn after
-        // driver-level adapter events).
-        let live = if has_listener && same_adapter {
-            let scope = base_params.scope.clone();
-            match tokio::task::spawn_blocking(move || pktmon::live_source_id_for(&scope)).await {
-                Ok(Ok(id)) => LiveSourceId::Enumerated(id),
-                Ok(Err(e)) => {
-                    log::debug!(
-                        "Data-source liveness probe failed ({}) — keeping the listener",
-                        e
-                    );
-                    LiveSourceId::EnumFailed
-                }
-                Err(e) => {
-                    log::debug!(
-                        "Data-source liveness probe did not complete ({}) — keeping the listener",
-                        e
-                    );
-                    LiveSourceId::EnumFailed
-                }
-            }
-        } else {
-            LiveSourceId::EnumFailed
-        };
-        let action = {
-            let identity = self.capture_identity.lock().await;
-            mode_capture_action(
-                listener_action(identity.as_ref(), has_listener, iface_name, own_mac, live),
-                preserve_capture,
-            )
-        };
-
-        let retained_outcome = self.capture_signal.lock().await.state.outcome.clone();
-        if let (ListenerAction::Keep, Some(outcome)) = (action, retained_outcome) {
-            log::info!("ARP capture retained across discovery restart");
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            // The watchdog only cares that activation succeeded; the
-            // retained session proved that when it attached.
-            let _ = tx.send(Ok(outcome));
-            return Ok(rx);
-        }
-        if let ListenerAction::Replace(reason) = action {
-            log::info!("ARP capture replaced ({})", reason);
-        }
-
-        // Retire the old incarnation before tearing it down: with the
-        // flag already false, even a wedged capture thread can never
-        // merge again once the replacement attaches.
-        if let Some(old) = self.capture_identity.lock().await.take() {
-            old.active.store(false, Ordering::Relaxed);
-        }
-        self.capture_signal.lock().await.deactivate();
-        self.candidates.clear();
-        park_capture_handle(&self.arp_listener_handle, &self.prior_capture_joins).await;
-
-        let incarnation = Arc::new(AtomicBool::new(true));
-        let lifecycle_fence = SweepFence::new(0, Arc::new(AtomicU64::new(0)), incarnation.clone());
-        let (handle, activation_rx) = arp::start_listener(
-            base_params.with_fence(lifecycle_fence),
-            pktmon::CaptureMode::PreferScoped,
-            &self.prior_capture_joins,
-        )
-        .await?;
-        *self.arp_listener_handle.lock().await = Some(handle);
-
-        // Confirm activation here rather than leaving it to the
-        // watchdog: the recorded identity must describe a live binding,
-        // and an unconfirmed session is parked exactly as the watchdog's
-        // activation-timeout arm parks one. The incarnation flag goes
-        // false on every failure path so a late-activating stray can
-        // never merge.
-        let outcome =
-            match tokio::time::timeout(arp::CAPTURE_ACTIVATION_TIMEOUT, activation_rx).await {
-                Ok(Ok(Ok(outcome))) => outcome,
-                Ok(Ok(Err(start_error))) => {
-                    incarnation.store(false, Ordering::Relaxed);
-                    park_capture_handle(&self.arp_listener_handle, &self.prior_capture_joins).await;
-                    return Err(AppError::Network(format!(
-                        "ARP capture session failed to start: {}",
-                        start_error
-                    )));
-                }
-                Ok(Err(_channel_closed)) => {
-                    incarnation.store(false, Ordering::Relaxed);
-                    park_capture_handle(&self.arp_listener_handle, &self.prior_capture_joins).await;
-                    return Err(AppError::Network(
-                        "ARP capture thread died before confirming activation".into(),
-                    ));
-                }
-                Err(_elapsed) => {
-                    incarnation.store(false, Ordering::Relaxed);
-                    park_capture_handle(&self.arp_listener_handle, &self.prior_capture_joins).await;
-                    return Err(AppError::Network(
-                        "ARP capture session did not confirm activation in time".into(),
-                    ));
-                }
-            };
-
-        if !iface_is_up {
-            if !matches!(outcome, pktmon::ScopeOutcome::SelectedInterface { .. }) {
-                // A media-disconnected attach must be scoped-only: an
-                // unscoped session hears every adapter, and with the
-                // wire down nothing refreshes the shared self/ghost
-                // filters — WiFi-side ARP could leak in as phantom
-                // nodes. Park it and wait for the next trigger.
-                incarnation.store(false, Ordering::Relaxed);
-                park_capture_handle(&self.arp_listener_handle, &self.prior_capture_joins).await;
-                log::info!(
-                    "ARP pre-attach skipped: MAC-scoped join unavailable ({:?}) — retrying on the next discovery trigger",
-                    outcome
-                );
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let _ = tx.send(Ok(outcome));
-                return Ok(rx);
-            }
-            log::info!(
-                "ARP capture pre-attached on '{}' — listening before link-up",
-                iface_name
-            );
-        }
-
-        let source_id = outcome.source_id();
-        *self.capture_identity.lock().await = Some(CaptureIdentity {
-            iface_name: iface_name.to_string(),
-            mac: own_mac,
-            source_id,
-            active: incarnation,
-        });
-        self.capture_signal
-            .lock()
-            .await
-            .activate(base_params, outcome.clone());
-
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = tx.send(Ok(outcome));
-        Ok(rx)
-    }
-
     /// Start body, run with the discovery op lock already held. Callers
     /// that already hold it (`apply_mode_change`) delegate here so the
     /// non-reentrant lock isn't acquired twice.
@@ -3508,13 +3182,6 @@ impl NetworkManager {
         }
         let local_macs = self.selector.local_macs.clone();
 
-        // Activated discovery uses scope proof or fresh selected-interface
-        // resolution, never subnet exclusion as an identity boundary. This
-        // also avoids a second slow provider query before capture can listen.
-        if let Ok(mut shared) = self.excluded_subnets.lock() {
-            shared.clear();
-        }
-
         let registry = self.device_registry.clone();
 
         let emitter = self.device_emitter.clone();
@@ -3544,17 +3211,18 @@ impl NetworkManager {
             devices: devices.clone(),
             registry: registry.clone(),
             emitter: emitter.clone(),
-            app_handle: app_handle.clone(),
+            bridge: self.bridge.clone(),
+            config: self.config.clone(),
             local_macs: local_macs.clone(),
             own_mac,
             fence: placeholder_fence,
-            excluded_subnets: self.excluded_subnets.clone(),
             scope: capture_scope,
         };
         // Attach, keep, or replace the persistent listener. The listener
         // runs under the capture-lifecycle fence that
         // `ensure_capture_listener` builds per incarnation.
         let activation_rx = self
+            .capture
             .ensure_capture_listener(
                 interface_display_name,
                 own_mac,
@@ -3612,15 +3280,17 @@ impl NetworkManager {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let iface_name = interface_display_name.to_string();
         let app_handle_for_adopt = app_handle.clone();
+        let adopt_sweep = self.sweep_deps();
 
         // Startup sweeps only native /24s. Explicit Refresh also includes
         // actually bound adopted /24s, through the same session fence.
         let sweep_params = listener_params.clone();
-        let solicitations = self.solicitations.subscribe();
+        let sweep_deps = self.sweep_deps();
+        let solicitations = self.capture.solicitations.subscribe();
         tokio::spawn(async move {
             // Give a freshly attached capture time to start.
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            provoke_sweep(&sweep_params, &sweep_ips).await;
+            provoke_sweep(&sweep_params, &sweep_ips, &sweep_deps).await;
         });
 
         // Capture-health watchdog. The ping sweep above provokes ARP; if
@@ -3632,9 +3302,7 @@ impl NetworkManager {
         let watchdog = tokio::spawn(watchdog_ladder(
             listener_params.clone(),
             native_sweep_ips,
-            self.arp_listener_handle.clone(),
-            self.prior_capture_joins.clone(),
-            self.capture_identity.clone(),
+            self.sweep_deps(),
             (activation_rx, solicitations),
             watchdog_shutdown_rx,
         ));
@@ -3671,6 +3339,7 @@ impl NetworkManager {
             // clones this task already owns, used by both the broadcast
             // path below and the cache probe.
             let mut ctx = AdoptionCtx {
+                sweep: adopt_sweep,
                 iface_name: iface_name.clone(),
                 adapter_mac: binding_mac,
                 interface_index,
@@ -4215,46 +3884,10 @@ impl NetworkManager {
         #[cfg(windows)]
         native_operations::drain().await;
         if let Ok(_address) = self.bindings.address_work.try_lock() {
-            if self.capture_signal.lock().await.app.is_some() {
+            if self.capture.capture_signal.lock().await.app.is_some() {
                 self.bindings.reconcile_temporary_locked(&self.config).await;
             }
         }
-    }
-
-    /// Stop the capture half: retire the incarnation's fence flag, park
-    /// the capture thread's join, clear the recorded identity.
-    async fn stop_capture_locked(&self) {
-        // Flag first, park second — a wedged thread that outlives the
-        // park can never merge once its incarnation is retired.
-        if let Some(identity) = self.capture_identity.lock().await.take() {
-            identity.active.store(false, Ordering::Relaxed);
-        }
-        self.capture_signal.lock().await.deactivate();
-        self.candidates.clear();
-        if let Some(h) = self.arp_listener_handle.lock().await.take() {
-            // Signal shutdown and park the capture thread's join in the
-            // guard — the next capture start bounded-joins it there, so
-            // stop itself never blocks on the blocking thread.
-            self.prior_capture_joins
-                .lock()
-                .await
-                .push(h.stop_into_join());
-            log::info!("ARP capture stopped");
-        }
-    }
-
-    fn candidate_ingress(&self, index: u32, mac: Option<[u8; 6]>) -> Option<arp::CandidateIngress> {
-        Some(arp::CandidateIngress {
-            store: self.candidates.clone(),
-            interface_index: index,
-            adapter_mac: mac.unwrap_or([0; 6]),
-        })
-    }
-
-    pub async fn get_capture_state(&self) -> CaptureState {
-        let mut state = self.capture_signal.lock().await.state.clone();
-        state.candidate_count = self.candidates.count(std::time::Instant::now());
-        state
     }
 
     #[cfg(test)]
@@ -4383,8 +4016,7 @@ async fn get_interface_ips(name: &str) -> Vec<Ipv4Addr> {
 /// 192.168.1.0/24 on both Ethernet-camera-network and home WiFi) can
 /// silently route out the wrong NIC — the Ethernet capture listener
 /// never sees the replies and passive devices on that subnet stay invisible.
-async fn ping_sweep_subnets(interface_ips: &[String], fence: &SweepFence, app: &tauri::AppHandle) {
-    use tauri::Manager;
+async fn ping_sweep_subnets(interface_ips: &[String], fence: &SweepFence, deps: &SweepDeps) {
     use tokio::sync::Semaphore;
     use tokio::task::JoinSet;
 
@@ -4392,8 +4024,7 @@ async fn ping_sweep_subnets(interface_ips: &[String], fence: &SweepFence, app: &
     const MAX_CONCURRENT_PINGS: usize = 32;
     let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_PINGS));
     let mut join_set = JoinSet::new();
-    let manager = app.state::<std::sync::Arc<NetworkManager>>();
-    let Some((_, index, adapter_fence)) = manager.probe_scope() else {
+    let Some((_, index, adapter_fence)) = deps.selector.probe_scope(&deps.pending) else {
         return;
     };
     let mut solicited = false;
@@ -4425,7 +4056,7 @@ async fn ping_sweep_subnets(interface_ips: &[String], fence: &SweepFence, app: &
                 continue;
             }
             if !solicited {
-                manager.note_solicitation(fence).await;
+                deps.capture.note_solicitation(fence, &deps.fence()).await;
                 solicited = true;
             }
             if fence.is_stale() || adapter_fence.is_stale() {
@@ -4474,15 +4105,14 @@ async fn merge_arp_table(
     devices: Arc<Mutex<HashMap<String, ArpDevice>>>,
     registry: Arc<DeviceRegistry>,
     emitter: Arc<DeviceListEmitter>,
-    app_handle: tauri::AppHandle,
+    bridge: Arc<dyn crate::bridge::AppBridge>,
+    config: Arc<crate::config::AppConfig>,
     interface_ip: &str,
     excluded: &[ipnetwork::Ipv4Network],
     local_macs: &HashSet<[u8; 6]>,
     fence: &SweepFence,
     candidates: Option<&arp::CandidateIngress>,
 ) {
-    use tauri::{Emitter, Manager};
-
     // Fence stale-session merges: a sweep from a prior discovery session
     // (or one still running after a stop) must not merge or emit into the
     // current session's shared registry.
@@ -4503,15 +4133,12 @@ async fn merge_arp_table(
     let mut registry_changed = false;
     for device in &new_devices {
         log::info!("ARP table: {} ({})", device.ip, device.mac);
-        let _ = app_handle.emit("arp-device-discovered", device);
+        let _ = crate::bridge::emit(bridge.as_ref(), "arp-device-discovered", device);
         // Positive-liveness stamp for the adoption lifecycle — a
         // neighbor-table row accepted here is device evidence just like
         // a captured frame.
         if let Ok(device_ip) = device.ip.parse::<Ipv4Addr>() {
-            let manager: tauri::State<'_, std::sync::Arc<NetworkManager>> = app_handle.state();
-            manager
-                .note_positive_liveness_fenced(&app_handle, device_ip, fence)
-                .await;
+            note_positive_liveness_fenced(device_ip, fence).await;
         }
         let result = registry.merge_arp_fenced(device, fence);
         if result.changed {
@@ -4526,10 +4153,8 @@ async fn merge_arp_table(
             // blocking thread with owned copies of the keys.
             let dropped = result.dropped_macs.clone();
             let survivor = device.mac.clone();
-            let cache_handle = app_handle.clone();
+            let config = config.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                let config: tauri::State<'_, std::sync::Arc<crate::config::AppConfig>> =
-                    cache_handle.state();
                 for mac in &dropped {
                     if let Err(e) = config.remove_cached_device(mac) {
                         log::warn!(
@@ -4586,6 +4211,7 @@ async fn run_presence_job(
     // selected-index resolution below; a Wi-Fi-only sender cannot promote.
     let emitter = manager.emitter().await?;
     let ctx = AdoptionCtx {
+        sweep: manager.sweep_deps(),
         iface_name: adapter.name.clone(),
         adapter_mac: adapter.mac.clone(),
         interface_index: snapshot.index,
@@ -4991,7 +4617,10 @@ mod tests {
         );
         assert!(imported.is_empty() && legacy.is_empty());
         assert!(manager.registry().snapshot().is_empty());
-        let candidates = manager.candidates.snapshot(std::time::Instant::now());
+        let candidates = manager
+            .capture
+            .candidates
+            .snapshot(std::time::Instant::now());
         assert_eq!(candidates.len(), 2);
         import_neighbors(
             vec![("192.168.1.205".parse().unwrap(), peer.into())],
@@ -5001,7 +4630,10 @@ mod tests {
             &fence(1, 2, true),
             Some(&ingress),
         );
-        assert_eq!(manager.candidates.count(std::time::Instant::now()), 2);
+        assert_eq!(
+            manager.capture.candidates.count(std::time::Instant::now()),
+            2
+        );
         let mut clock = presence::Clock::default();
         let mut io = MockProbeIo::new();
         io.answers.insert(camera, peer.into());
@@ -5082,7 +4714,10 @@ mod tests {
                 &snapshot.fence,
                 Some(&ingress),
             );
-            let candidates = manager.candidates.snapshot(std::time::Instant::now());
+            let candidates = manager
+                .capture
+                .candidates
+                .snapshot(std::time::Instant::now());
             let job = presence::Clock::default().next(&snapshot, &[], &candidates);
             if mode != StaticAuto {
                 assert!(job.is_none());
@@ -5973,226 +5608,6 @@ mod tests {
 
     // ── capture-listener retention ────────────────────────────────
 
-    #[tokio::test]
-    async fn capture_state_starts_inactive_without_an_outcome() {
-        let manager = NetworkManager::new();
-        let state = manager.get_capture_state().await;
-        assert!(!state.active);
-        assert!(state.outcome.is_none());
-        assert!(state.adapter_name.is_none());
-    }
-
-    #[test]
-    fn capture_stop_keeps_last_scope_outcome_for_the_query() {
-        let mut signal = CaptureSignal {
-            state: CaptureState {
-                active: true,
-                candidate_count: 0,
-                adapter_name: Some("Ethernet".into()),
-                outcome: Some(pktmon::ScopeOutcome::ScopedByName { source_id: 42 }),
-            },
-            app: None,
-        };
-        signal.deactivate();
-        signal.deactivate();
-        let state = serde_json::to_value(&signal.state).unwrap();
-        assert_eq!(state["active"], false);
-        assert_eq!(state["adapter_name"], "Ethernet");
-        assert_eq!(state["outcome"]["scope"], "scoped_by_name");
-        assert_eq!(state["outcome"]["source_id"], 42);
-    }
-
-    fn identity(source_id: Option<u32>) -> CaptureIdentity {
-        CaptureIdentity {
-            iface_name: "Ethernet".into(),
-            mac: Some([0x40, 0xcd, 0x3a, 0x00, 0x00, 0x01]),
-            source_id,
-            active: Arc::new(AtomicBool::new(true)),
-        }
-    }
-
-    #[test]
-    fn dhcp_to_auto_preserves_only_valid_capture_and_other_modes_restart() {
-        use crate::config::NetworkMode::{Dhcp, StaticAuto, StaticManual};
-        for from in [Dhcp, StaticAuto, StaticManual] {
-            for to in [Dhcp, StaticAuto, StaticManual] {
-                assert_eq!(
-                    mode_keeps_capture(from, to),
-                    from == Dhcp && to == StaticAuto
-                );
-            }
-        }
-        let current = identity(None);
-        let decide = |current: Option<&CaptureIdentity>, has_handle| {
-            mode_capture_action(
-                listener_action(
-                    current,
-                    has_handle,
-                    "Ethernet",
-                    identity(None).mac,
-                    LiveSourceId::Enumerated(42),
-                ),
-                true,
-            )
-        };
-        assert_eq!(decide(Some(&current), true), ListenerAction::Keep);
-        assert_eq!(decide(Some(&current), false), ListenerAction::Attach);
-        assert_eq!(decide(None, false), ListenerAction::Attach);
-        let changed = identity(Some(41));
-        assert_eq!(
-            decide(Some(&changed), true),
-            ListenerAction::Replace("data source changed")
-        );
-        let mut other = identity(None);
-        other.iface_name = "Dock".into();
-        assert_eq!(
-            decide(Some(&other), true),
-            ListenerAction::Replace("adapter changed")
-        );
-        current.active.store(false, Ordering::Release);
-        assert_eq!(
-            decide(Some(&current), true),
-            ListenerAction::Replace("capture inactive")
-        );
-        assert_eq!(
-            mode_capture_action(ListenerAction::Replace("retry scoped attach"), false),
-            ListenerAction::Replace("retry scoped attach")
-        );
-    }
-
-    #[test]
-    fn listener_action_attaches_when_nothing_is_bound() {
-        let current = identity(Some(101));
-        // No identity at all → attach.
-        assert_eq!(
-            listener_action(
-                None,
-                false,
-                "Ethernet",
-                current.mac,
-                LiveSourceId::EnumFailed
-            ),
-            ListenerAction::Attach
-        );
-        // Identity without a live handle (a torn-down session whose
-        // reinstall failed) must attach, never keep.
-        assert_eq!(
-            listener_action(
-                Some(&current),
-                false,
-                "Ethernet",
-                current.mac,
-                LiveSourceId::Enumerated(101)
-            ),
-            ListenerAction::Attach
-        );
-    }
-
-    #[test]
-    fn listener_action_keeps_a_healthy_binding() {
-        let current = identity(Some(101));
-        assert_eq!(
-            listener_action(
-                Some(&current),
-                true,
-                "Ethernet",
-                current.mac,
-                LiveSourceId::Enumerated(101)
-            ),
-            ListenerAction::Keep
-        );
-        // Enumeration failure fails open to Keep — a transient fault
-        // must never churn a healthy listener.
-        assert_eq!(
-            listener_action(
-                Some(&current),
-                true,
-                "Ethernet",
-                current.mac,
-                LiveSourceId::EnumFailed
-            ),
-            ListenerAction::Keep
-        );
-    }
-
-    #[test]
-    fn listener_action_replaces_an_invalidated_binding() {
-        let current = identity(Some(101));
-        // Renamed adapter.
-        assert_eq!(
-            listener_action(
-                Some(&current),
-                true,
-                "Ethernet 2",
-                current.mac,
-                LiveSourceId::Enumerated(101)
-            ),
-            ListenerAction::Replace("adapter changed")
-        );
-        // Same name, different MAC (hardware swapped under the name).
-        assert_eq!(
-            listener_action(
-                Some(&current),
-                true,
-                "Ethernet",
-                Some([0x2c, 0xa5, 0x9c, 0x00, 0x00, 0x02]),
-                LiveSourceId::Enumerated(101)
-            ),
-            ListenerAction::Replace("adapter changed")
-        );
-        // Data-source churn under the same adapter.
-        assert_eq!(
-            listener_action(
-                Some(&current),
-                true,
-                "Ethernet",
-                current.mac,
-                LiveSourceId::Enumerated(115)
-            ),
-            ListenerAction::Replace("data source changed")
-        );
-    }
-
-    #[test]
-    fn listener_action_unscoped_session_retries_scoped() {
-        let unscoped = identity(None);
-        // A live id exists → re-attempt the scoped join.
-        assert_eq!(
-            listener_action(
-                Some(&unscoped),
-                true,
-                "Ethernet",
-                unscoped.mac,
-                LiveSourceId::Enumerated(101)
-            ),
-            ListenerAction::Replace("retry scoped attach")
-        );
-        // No live id → keep the unscoped session over churning.
-        assert_eq!(
-            listener_action(
-                Some(&unscoped),
-                true,
-                "Ethernet",
-                unscoped.mac,
-                LiveSourceId::EnumFailed
-            ),
-            ListenerAction::Keep
-        );
-    }
-
-    #[test]
-    fn lifecycle_fence_stales_only_on_its_incarnation_flag() {
-        // The listener's fence pins generation zero against a
-        // permanently-zero counter, so staleness is exactly the
-        // incarnation flag — a discovery restart (generation advance)
-        // must not fence out a retained listener.
-        let flag = Arc::new(AtomicBool::new(true));
-        let lifecycle = SweepFence::new(0, Arc::new(AtomicU64::new(0)), flag.clone());
-        assert!(!lifecycle.is_stale());
-        flag.store(false, Ordering::Relaxed);
-        assert!(lifecycle.is_stale());
-    }
-
     // ── adoption-removal routing ──────────────────────────────────
 
     #[test]
@@ -6765,7 +6180,7 @@ mod tests {
         );
         assert_eq!(rows.len(), 1);
         let ingress = arp::CandidateIngress {
-            store: manager.candidates.clone(),
+            store: manager.capture.candidates.clone(),
             interface_index: 7,
             adapter_mac: [0x40, 0xcd, 0x3a, 0, 0, 1],
         };
@@ -6782,7 +6197,10 @@ mod tests {
         assert!(imported.is_empty());
         assert!(devices.is_empty());
         assert!(manager.registry().snapshot().is_empty());
-        assert_eq!(manager.candidates.count(std::time::Instant::now()), 1);
+        assert_eq!(
+            manager.capture.candidates.count(std::time::Instant::now()),
+            1
+        );
         assert_eq!(
             import_neighbors(
                 rows,
@@ -6858,5 +6276,27 @@ mod tests {
             r.status,
             DeviceStatus::OfflineNonWiredSubnet | DeviceStatus::OfflineHostOwnedIp
         )));
+    }
+}
+
+async fn note_positive_liveness_fenced(_ip: Ipv4Addr, _fence: &SweepFence) {}
+
+#[derive(Clone)]
+struct SweepDeps {
+    selector: Arc<adapter_selector::AdapterSelector>,
+    capture: Arc<capture_session::CaptureSession>,
+    pending: auto_adopt::PendingIps,
+    generation: Arc<AtomicU64>,
+    active: Arc<AtomicBool>,
+    config: Arc<crate::config::AppConfig>,
+    bridge: Arc<dyn crate::bridge::AppBridge>,
+}
+impl SweepDeps {
+    fn fence(&self) -> SweepFence {
+        SweepFence::new(
+            self.generation.load(Ordering::Relaxed),
+            self.generation.clone(),
+            self.active.clone(),
+        )
     }
 }
