@@ -354,6 +354,7 @@ struct StreamState {
 struct RestreamStopIntent {
     epoch: u64,
     target_generation: Option<u64>,
+    firewall_generation: Option<u64>,
     was_desired: bool,
 }
 
@@ -1312,7 +1313,7 @@ impl StreamManager {
     }
 
     pub(crate) async fn binding_topology_changed(&self, scope: BindScope, revision: u64) {
-        let (spec, generation, health) = {
+        let (spec, generation, instance, health) = {
             let state = self.state.lock().await;
             let (Some(spec), Some(health)) = (&state.restream_spec, &state.restream_health) else {
                 return;
@@ -1320,9 +1321,17 @@ impl StreamManager {
             if !state.restream_desired {
                 return;
             }
+            if !matches!(scope, BindScope::Unknown { .. })
+                && !matches!(spec.bind_scope, BindScope::Unknown { .. })
+                && scope_revision(&spec.bind_scope) == revision
+            {
+                return;
+            }
+            let snapshot = health.snapshot();
             (
                 spec.clone(),
-                health.snapshot().server_generation,
+                snapshot.server_generation,
+                snapshot.server_instance,
                 health.clone(),
             )
         };
@@ -1369,7 +1378,9 @@ impl StreamManager {
             };
         {
             let mut state = self.state.lock().await;
-            if !relay_state_is_generation(&state, generation) || !state.restream_desired {
+            if !relay_state_is_generation(&state, generation)
+                || health.snapshot().server_instance != instance
+            {
                 return;
             }
             if let Some(spec) = state.restream_spec.as_mut() {
@@ -1399,7 +1410,7 @@ impl StreamManager {
     async fn publish_restream_stop_intent(&self, stop_epoch: u64) -> Option<RestreamStopIntent> {
         self.relay_wake.notify_waiters();
 
-        let (target_generation, was_desired) = {
+        let (target_generation, firewall_generation, was_desired) = {
             let mut state = self.state.lock().await;
             // A newer intent owns desired state and listener replacement.
             // This stale Stop must neither clear it nor tear down its server.
@@ -1434,13 +1445,18 @@ impl StreamManager {
                 state.restream_start_time = None;
                 state.restream_target = None;
             }
-            (target, stops_desired)
+            (
+                target,
+                state.firewall_generation.map(|(generation, _)| generation),
+                stops_desired,
+            )
         };
         self.refresh_status().await;
 
         Some(RestreamStopIntent {
             epoch: stop_epoch,
             target_generation,
+            firewall_generation,
             was_desired,
         })
     }
@@ -1488,6 +1504,14 @@ impl StreamManager {
         }
         if let Some(generation) = intent.target_generation {
             retire_firewall(&self.state, generation).await;
+        }
+        // A failed prior retirement can survive a replacement listener whose
+        // automation is unavailable. Stop must retry that captured lease too;
+        // retire_firewall still rejects a newer generation's lease.
+        if intent.firewall_generation != intent.target_generation {
+            if let Some(generation) = intent.firewall_generation {
+                retire_firewall(&self.state, generation).await;
+            }
         }
         drop(_lifecycle);
         self.refresh_status().await;
@@ -3635,6 +3659,106 @@ mod tests {
         let intent = manager.begin_restream_stop_intent().await.unwrap();
         assert_eq!(intent.target_generation, Some(12));
         manager.finish_restream_stop(intent).await.unwrap();
+        assert!(manager.state.lock().await.firewall_generation.is_none());
+    }
+
+    #[tokio::test]
+    async fn delayed_topology_observation_cannot_overwrite_a_recovered_instance() {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+
+        let manager = StreamManager::new();
+        let settings = restream_test_settings(RestreamProtocol::Rtsp);
+        seed_desired_relay_state(&manager, &settings, RelayState::Recovering).await;
+        let lifecycle = manager.relay_lifecycle.lock().await;
+        let observation = manager.binding_topology_changed(
+            BindScope::Unknown {
+                reason: "earlier observation failed".into(),
+            },
+            bindings::revision(),
+        );
+        tokio::pin!(observation);
+        // The observer has captured the old instance and waits for recovery.
+        assert!(poll_fn(|cx| Poll::Ready(observation.as_mut().poll(cx)))
+            .await
+            .is_pending());
+        let recovered_scope = BindScope::AllAddresses {
+            family: bindings::SocketFamily::Ipv4,
+            addresses: vec![],
+            topology_revision: bindings::revision(),
+        };
+        {
+            let mut state = manager.state.lock().await;
+            let health = state.restream_health.as_ref().unwrap();
+            let instance = health.begin_server_instance(true);
+            health.mark_listener_bound(instance);
+            state.restream_spec.as_mut().unwrap().bind_scope = recovered_scope.clone();
+        }
+        drop(lifecycle);
+        observation.await;
+        assert_eq!(
+            manager
+                .state
+                .lock()
+                .await
+                .restream_spec
+                .as_ref()
+                .unwrap()
+                .bind_scope,
+            recovered_scope
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_reobservation_repairs_unknown_binding_at_the_same_revision() {
+        let manager = StreamManager::new();
+        let settings = restream_test_settings(RestreamProtocol::Rtsp);
+        seed_desired_relay_state(&manager, &settings, RelayState::Listening).await;
+        let revision = bindings::revision();
+        let scope = BindScope::AllAddresses {
+            family: bindings::SocketFamily::Ipv4,
+            addresses: vec![],
+            topology_revision: revision,
+        };
+        // The watcher already recorded this inventory before Start's separate
+        // read failed. Its next identical observation must still repair Unknown.
+        manager
+            .binding_topology_changed(scope.clone(), revision)
+            .await;
+        let state = manager.state.lock().await;
+        assert_eq!(state.restream_spec.as_ref().unwrap().bind_scope, scope);
+        assert_eq!(
+            state.restream_health.as_ref().unwrap().snapshot().state,
+            RelayState::Listening
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_retries_a_retained_policy_lease_from_an_older_listener() {
+        init_gstreamer();
+        let manager = StreamManager::new();
+        let settings = restream_test_settings(RestreamProtocol::Rtsp);
+        let mut spec = resolved_spec_for_test(&settings);
+        spec.bind_address = Some("127.0.0.1".into());
+        seed_desired_relay_state(&manager, &settings, RelayState::Listening).await;
+        let health = manager.state.lock().await.restream_health.clone().unwrap();
+        let (_, built) = StreamManager::build_restream_server(
+            &spec,
+            health,
+            manager.relay_event_tx.clone(),
+            false,
+            None,
+        );
+        {
+            let mut state = manager.state.lock().await;
+            state.restream_server =
+                Some(built.unwrap_or_else(|failure| panic!("{}", failure.error)));
+            // The prior SRT cleanup failed, so Start continued with unavailable
+            // automation while retaining that older lease for a later retry.
+            state.firewall_generation = Some((40, FirewallRule::Srt));
+        }
+        manager.stop_restream_server().await.unwrap();
+        assert!(manager.state.lock().await.restream_server.is_none());
         assert!(manager.state.lock().await.firewall_generation.is_none());
     }
 

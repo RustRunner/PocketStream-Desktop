@@ -256,6 +256,7 @@ fn encode_query_value(value: &str) -> String {
 #[derive(Clone)]
 pub struct RelayHealthSnapshot {
     pub server_generation: u64,
+    pub server_instance: u64,
     pub state: RelayState,
     pub error: Option<String>,
     pub recovery_attempt: u32,
@@ -349,6 +350,7 @@ impl RelayRuntimeHealth {
         let inner = self.lock();
         RelayHealthSnapshot {
             server_generation: inner.server_generation,
+            server_instance: inner.server_instance,
             state: inner.state,
             error: inner.error.clone(),
             recovery_attempt: inner.recovery_attempt,

@@ -235,7 +235,9 @@ pub(crate) async fn refresh(handle: &tauri::AppHandle) {
         let mut t = TOPOLOGY.lock().unwrap();
         (record(&mut t, &rows), t.revision)
     };
-    if !changed {
+    if !changed && rows.is_err() {
+        // Keep retrying the observation without queuing the same failed
+        // explicit rebind on every tick of an ongoing recovery.
         return;
     }
     let scope = match rows {
@@ -244,10 +246,14 @@ pub(crate) async fn refresh(handle: &tauri::AppHandle) {
             reason: error.to_string(),
         },
     };
-    let _ = handle.emit(
-        "binding-topology-changed",
-        serde_json::json!({"topology_revision":revision}),
-    );
+    if changed {
+        let _ = handle.emit(
+            "binding-topology-changed",
+            serde_json::json!({"topology_revision":revision}),
+        );
+    }
+    // A listener's independent resolution may have failed since our last
+    // successful snapshot. Retry Unknown even when the inventory is unchanged.
     handle
         .state::<crate::streaming::StreamManager>()
         .binding_topology_changed(scope, revision)
