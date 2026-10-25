@@ -28,24 +28,49 @@ $principal = [Security.Principal.WindowsPrincipal]::new($identity)
 if (!$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Sandbox requires an elevated administrator token.' }
 if ($Hold) {
     if (!$SignalRoot -or !([IO.Path]::GetFullPath($SignalRoot)).StartsWith($resultsRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Invalid fixture signal root.' }
-    $security = [Security.AccessControl.MutexSecurity]::new()
-    $security.SetSecurityDescriptorSddlForm('D:P(A;;0x001f0001;;;SY)(A;;0x001f0001;;;BA)(A;;0x00120001;;;IU)S:(ML;;NW;;;ME)')
-    $created = $false
-    $mutex = [Threading.Mutex]::new($false, ('Global\PocketStream.Desktop.' + $Hold + '.v2'), [ref]$created, $security)
-    $owned = $false
+    # MutexSecurity's SACL path requests an additional privilege. Match the
+    # production CreateMutexExW security attributes and explicit access mask.
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+namespace PocketStream.Qualification {
+ public sealed class NativeMutexLease : IDisposable {
+  [StructLayout(LayoutKind.Sequential)] struct Attributes { public uint Length; public IntPtr Descriptor; public int Inherit; }
+  [DllImport("advapi32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(string text,uint revision,out IntPtr descriptor,IntPtr size);
+  [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern IntPtr CreateMutexExW(ref Attributes attributes,string name,uint flags,uint access);
+  [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle,uint timeout);
+  [DllImport("kernel32.dll",SetLastError=true)] static extern bool ReleaseMutex(IntPtr handle);
+  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+  [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr handle);
+  [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+  IntPtr handle; uint thread;
+  public NativeMutexLease(string name) {
+   IntPtr descriptor;
+   if(!ConvertStringSecurityDescriptorToSecurityDescriptorW("D:P(A;;0x001f0001;;;SY)(A;;0x001f0001;;;BA)(A;;0x00120001;;;IU)S:(ML;;NW;;;ME)",1,out descriptor,IntPtr.Zero))throw new Win32Exception(Marshal.GetLastWin32Error());
+   try { var attributes=new Attributes {Length=(uint)Marshal.SizeOf(typeof(Attributes)),Descriptor=descriptor};handle=CreateMutexExW(ref attributes,name,0,0x120001);var error=Marshal.GetLastWin32Error();if(handle==IntPtr.Zero)throw new Win32Exception(error); }
+   finally {LocalFree(descriptor);}
+   var status=WaitForSingleObject(handle,5000);
+   if(status!=0 && status!=128){CloseHandle(handle);handle=IntPtr.Zero;throw new InvalidOperationException("Fixture mutex acquisition failed: "+status);}
+   thread=GetCurrentThreadId();
+  }
+  public void Dispose(){if(handle==IntPtr.Zero)return;if(thread!=GetCurrentThreadId())throw new InvalidOperationException("Fixture owner thread changed");var released=ReleaseMutex(handle);var error=Marshal.GetLastWin32Error();CloseHandle(handle);handle=IntPtr.Zero;if(!released)throw new Win32Exception(error);}
+ }
+}
+'@
+    $mutex = [PocketStream.Qualification.NativeMutexLease]::new(('Global\PocketStream.Desktop.' + $Hold + '.v2'))
     try {
-        $owned = $mutex.WaitOne(5000)
-        if (!$owned) { throw 'Fixture mutex already busy.' }
         [IO.File]::WriteAllText((Join-Path $SignalRoot 'ready'), [string]$PID)
         $deadline = [DateTime]::UtcNow.AddMinutes(3)
         while (!(Test-Path -LiteralPath (Join-Path $SignalRoot 'release')) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 100 }
-    } finally { if ($owned) { $mutex.ReleaseMutex() }; $mutex.Dispose() }
+    } finally { $mutex.Dispose() }
     exit 0
 }
 $run = Join-Path $resultsRoot ([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ') + '-' + $manifest.id)
 New-Item -ItemType Directory -Path $run | Out-Null
 $report = [ordered]@{version=1;fixture_id=$manifest.id;started_utc=[DateTime]::UtcNow.ToString('o');mode=$Mode;candidate=$manifest.candidate;effective_source_sha256=$manifest.effective_source_sha256;scenarios=@();pending=@();status='preflight';host_configuration_mutated=$false;production_eligibility_relaxed=$false}
-$planned = @('fresh-silent','reinstall-silent','reinstall-passive','reinstall-updater','strict-entry','legacy-migration-and-preservation','migration-failure-and-retry','exact-name-collision','installer-image-in-use','installer-hostowner-busy','standalone-uninstall','install-after-uninstall','final-uninstall')
+$planned = @('fresh-destination-bounds','fresh-silent','reinstall-silent','reinstall-passive','reinstall-updater','strict-entry','legacy-migration-and-preservation','migration-failure-and-retry','exact-name-collision','installer-image-in-use','installer-hostowner-busy','installation-gate-admission','standalone-uninstall','install-after-uninstall','final-uninstall')
+$planned += @('fresh-passive','standalone-uninstall-passive','fresh-updater','updater-standalone-uninstall','interactive-welcome-cancel')
 if ($manifest.legacy_sha256) { $planned += @('legacy-installer-upgrade','upgraded-standalone-uninstall') }
 $nativeStarted = $false
 function Save-Report { $report | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath (Join-Path $run 'results.json') -Encoding UTF8 }
@@ -57,7 +82,9 @@ function Snapshot([string]$Label) {
     $rules | Export-Clixml -LiteralPath (Join-Path $folder 'rules.xml')
     foreach ($name in @('Application','Port','Address','Interface','InterfaceType','Service','Security')) {
         $command = 'Get-NetFirewall' + $name + 'Filter'
-        @($rules | & $command -ErrorAction Stop) | Export-Clixml -LiteralPath (Join-Path $folder ($name + '.xml'))
+        # Query each complete filter class once. Piping every rule causes a
+        # separate CIM association request per row (414 rows in this fixture).
+        @(& $command -All -PolicyStore PersistentStore -ErrorAction Stop) | Export-Clixml -LiteralPath (Join-Path $folder ($name + '.xml'))
     }
     Get-NetAdapter -IncludeHidden | Export-Clixml -LiteralPath (Join-Path $folder 'adapters.xml')
     Get-NetIPAddress | Export-Clixml -LiteralPath (Join-Path $folder 'addresses.xml')
@@ -85,8 +112,23 @@ function Scenario([string]$Name, [scriptblock]$Action) {
     $report.scenarios += $entry
     Save-Report
     try { $null = Snapshot ($Name + '-before'); & $Action; $entry.status='passed' }
-    catch { $entry.status='failed';$entry.error=$_.Exception.Message;throw }
+    catch { $entry.status='failed';$entry.error=$_.Exception.Message;$entry.source_line=$_.InvocationInfo.ScriptLineNumber;$entry.script_stack=$_.ScriptStackTrace;throw }
     finally { $entry.finished_utc=[DateTime]::UtcNow.ToString('o');$null=Snapshot ($Name + '-after');Save-Report }
+}
+function With-FixtureOwner([string]$Role, [string]$Name, [scriptblock]$Action) {
+    $signal=Join-Path $run $Name
+    New-Item -ItemType Directory -Path $signal | Out-Null
+    $holder=Start-Process -FilePath "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -File '+$PSCommandPath+' -Hold '+$Role+' -SignalRoot "'+$signal+'"') -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $signal 'stdout.log') -RedirectStandardError (Join-Path $signal 'stderr.log')
+    $null=$holder.Handle
+    try {
+        $deadline=[DateTime]::UtcNow.AddSeconds(10)
+        while (!(Test-Path -LiteralPath (Join-Path $signal 'ready')) -and !$holder.HasExited -and [DateTime]::UtcNow -lt $deadline) {Start-Sleep -Milliseconds 100}
+        Assert (Test-Path -LiteralPath (Join-Path $signal 'ready')) 'Native ownership fixture did not acquire the mutex.'
+        & $Action
+    } finally {
+        [IO.File]::WriteAllText((Join-Path $signal 'release'),'release')
+        Assert ($holder.WaitForExit(10000)) 'Fixture owner did not release normally.'
+    }
 }
 $installRoot = Join-Path $env:ProgramW6432 'PocketStream Desktop'
 $image = Join-Path $installRoot 'pocketstream-desktop.exe'
@@ -121,6 +163,16 @@ function Preserved([string[]]$Names) {
         [ordered]@{rule=($_ | Select-Object Name,DisplayName,Group,Enabled,Direction,Action,Profile,EdgeTraversalPolicy,LooseSourceMapping,LocalOnlyMapping,Platform,RemoteDynamicKeywordAddresses);app=($_|Get-NetFirewallApplicationFilter|Select-Object Program,Package);port=($_|Get-NetFirewallPortFilter|Select-Object Protocol,LocalPort,RemotePort,DynamicTarget);address=($_|Get-NetFirewallAddressFilter|Select-Object LocalAddress,RemoteAddress);interface=($_|Get-NetFirewallInterfaceFilter|Select-Object InterfaceAlias);type=($_|Get-NetFirewallInterfaceTypeFilter|Select-Object InterfaceType);service=($_|Get-NetFirewallServiceFilter|Select-Object Service);security=($_|Get-NetFirewallSecurityFilter|Select-Object Authentication,Encryption,LocalUser,RemoteUser,RemoteMachine,OverrideBlockRules)}
     }) | ConvertTo-Json -Depth 12 -Compress
 }
+function Wait-Uninstalled {
+    $deadline=[DateTime]::UtcNow.AddSeconds(30)
+    do {
+        # The standalone NSIS launcher can exit before its copied child. File,
+        # registration and rule removal are distinct child completion steps.
+        if (!(Test-Path -LiteralPath $image) -and !(Test-Path -LiteralPath $uninstallKey) -and @(Owned).Count -eq 0) { return }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw 'Uninstall postconditions incomplete after bounded wait.'
+}
 try {
     Start-Transcript -LiteralPath (Join-Path $run 'transcript.log') | Out-Null
     $services = @(foreach ($name in @('BFE','MpsSvc','Winmgmt')) { $service=Get-Service -Name $name -ErrorAction SilentlyContinue; [ordered]@{name=$name;present=($null -ne $service);status=$(if ($service) {$service.Status.ToString()} else {'missing'})} })
@@ -154,6 +206,23 @@ try {
     Assert (!(Test-Path -LiteralPath $uninstallKey) -and !(Test-Path -LiteralPath $image) -and @(Owned).Count -eq 0) 'Use a fresh Sandbox for a new supported run.'
     Assert (!$report.preflight.pocketstream_profile_exists) 'Unexpected pre-existing PocketStream profile; use a fresh Sandbox.'
     $nativeStarted = $true
+    Scenario 'fresh-destination-bounds' {
+        $outside=Join-Path $env:USERPROFILE 'Desktop\PocketStreamForbidden'
+        $traversal=$env:ProgramW6432+'\..\PocketStreamForbidden'
+        foreach($entry in @(@{name='outside-protected-root';path=$outside},@{name='traversal-outside-root';path=$traversal})) {
+            $null=Native $entry.name $setup ('/S /D='+$entry.path) @(71)
+        }
+        Assert (!(Test-Path -LiteralPath $outside) -and !(Test-Path -LiteralPath 'C:\PocketStreamForbidden') -and !(Test-Path -LiteralPath $image) -and !(Test-Path -LiteralPath $uninstallKey) -and @(Owned).Count -eq 0) 'Rejected destination changed installed state.'
+    }
+    Scenario 'interactive-welcome-cancel' {
+        $process=Start-Process -FilePath $setup -WindowStyle Normal -PassThru -RedirectStandardOutput (Join-Path $run 'welcome-cancel.stdout.log') -RedirectStandardError (Join-Path $run 'welcome-cancel.stderr.log')
+        $null=$process.Handle
+        $ack=& "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File (Join-Path $inputRoot 'verify-a1-production-smoke.ps1') -Mode CancelDialog -OwnerPid $process.Id -ExpectedText 'Welcome' -Executable $setup
+        Assert ($LASTEXITCODE -eq 0) 'Interactive welcome cancellation was not observed.'
+        Assert ($process.WaitForExit(10000)) 'Cancelled installer did not exit normally.'
+        Assert (!(Test-Path -LiteralPath $image) -and !(Test-Path -LiteralPath $uninstallKey) -and @(Owned).Count -eq 0 -and !(Test-Path -LiteralPath (Join-Path $env:APPDATA 'PocketStream'))) 'Welcome cancellation changed installed/application state.'
+        [ordered]@{pid=$process.Id;exit=$process.ExitCode;acknowledgement=($ack|Out-String|ConvertFrom-Json);installed=$false;profile_initialized=$false}|ConvertTo-Json -Depth 7|Set-Content -LiteralPath (Join-Path $run 'welcome-cancel.json') -Encoding UTF8
+    }
     Scenario 'fresh-silent' {
         $null=Native 'fresh-silent' $setup ('/S /D=' + $installRoot)
         Assert (Test-Path -LiteralPath $image) 'Installed executable missing.'
@@ -171,7 +240,7 @@ try {
         }
     }
     $seed = 'PocketStream.Qualification.' + $manifest.id
-    $preserveNames = @($seed+'.block',$seed+'.foreign',$seed+'.unrelated')
+    $preserveNames = @(($seed+'.block'),($seed+'.foreign'),($seed+'.unrelated'))
     Scenario 'legacy-migration-and-preservation' {
         New-NetFirewallRule -Name $preserveNames[0] -DisplayName 'PocketStream Query User qualification' -Direction Inbound -Action Block -Program $image -Protocol TCP -LocalPort 18554 -Profile Any | Out-Null
         New-NetFirewallRule -Name $preserveNames[1] -DisplayName 'PocketStream RTSP Server' -Direction Inbound -Action Allow -Program (Join-Path $env:WINDIR 'System32\notepad.exe') -Protocol TCP -LocalPort 18555 -Profile Any | Out-Null
@@ -223,34 +292,59 @@ try {
         $null=Native 'after-image-in-use' $setup '/S'
     }
     Scenario 'installer-hostowner-busy' {
-        $signal=Join-Path $run 'holder';New-Item -ItemType Directory -Path $signal | Out-Null
-        $holder=Start-Process -FilePath "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -File '+$PSCommandPath+' -Hold HostOwner -SignalRoot "'+$signal+'"') -WindowStyle Hidden -PassThru
-        $null=$holder.Handle
-        try {
-            $deadline=[DateTime]::UtcNow.AddSeconds(10)
-            while (!(Test-Path -LiteralPath (Join-Path $signal 'ready')) -and !$holder.HasExited -and [DateTime]::UtcNow -lt $deadline) {Start-Sleep -Milliseconds 100}
-            Assert (Test-Path -LiteralPath (Join-Path $signal 'ready')) 'Native ownership fixture did not acquire the mutex.'
+        With-FixtureOwner 'HostOwner' 'host-owner' {
             $before=(Get-FileHash -LiteralPath $image -Algorithm SHA256).Hash
+            $null=Native 'busy-maintenance' $image '--firewall-maintenance install' @(73)
             $null=Native 'busy-installer' $setup '/S' @(71)
             Assert ((Get-FileHash -LiteralPath $image -Algorithm SHA256).Hash -eq $before) 'Busy installer replaced the image.'
-        } finally { [IO.File]::WriteAllText((Join-Path $signal 'release'),'release');Assert ($holder.WaitForExit(10000)) 'Fixture owner did not release normally.' }
+        }
         $null=Native 'after-busy-reinstall' $setup '/S'
         Verify-Templates
+    }
+    Scenario 'installation-gate-admission' {
+        With-FixtureOwner 'InstallGate' 'installation-gate' {
+            $null=Native 'maintenance-under-installation-gate' $image '--firewall-maintenance install'
+            Verify-Templates
+            Assert (!(Test-Path -LiteralPath (Join-Path $env:APPDATA 'PocketStream'))) 'Maintenance initialized the application profile.'
+            $out=Join-Path $run 'installer-busy-host.stdout.log'
+            $err=Join-Path $run 'installer-busy-host.stderr.log'
+            $hostProcess=Start-Process -FilePath $image -WindowStyle Normal -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+            $null=$hostProcess.Handle
+            # Reuse the existing PID/image/text-bound native dialog fixture.
+            $ack=& "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File (Join-Path $inputRoot 'verify-a1-production-smoke.ps1') -Mode CancelDialog -OwnerPid $hostProcess.Id -ExpectedText 'PocketStream installation is busy' -Executable $image
+            Assert ($LASTEXITCODE -eq 0) 'InstallerBusy native message was not observed/dismissed.'
+            Assert ($hostProcess.WaitForExit(10000)) 'Refused host did not exit after dismissal.'
+            Assert ($hostProcess.ExitCode -eq 0 -and [IO.File]::ReadAllText($err).Contains('PocketStream installation is busy: Busy')) 'Host refusal was not the bounded installation Busy path.'
+            Assert (!(Test-Path -LiteralPath (Join-Path $env:APPDATA 'PocketStream')) -and !(Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'PocketStream\logs'))) 'Refused host initialized profile/log state.'
+            [ordered]@{pid=$hostProcess.Id;exit=$hostProcess.ExitCode;acknowledgement=($ack|Out-String|ConvertFrom-Json);profile_initialized=$false;log_initialized=$false}|ConvertTo-Json -Depth 7|Set-Content -LiteralPath (Join-Path $run 'installer-busy-host.json') -Encoding UTF8
+        }
     }
     Scenario 'standalone-uninstall' {
         $before=Preserved $preserveNames
         $null=Native 'standalone-uninstall' (Join-Path $installRoot 'uninstall.exe') '/S'
-        $deadline=[DateTime]::UtcNow.AddSeconds(30)
-        while ((Test-Path -LiteralPath $image) -and [DateTime]::UtcNow -lt $deadline) {Start-Sleep -Milliseconds 100}
+        Wait-Uninstalled
         Assert (!(Test-Path -LiteralPath $image) -and !(Test-Path -LiteralPath $uninstallKey) -and @(Owned).Count -eq 0) 'Uninstall postconditions incomplete.'
         Assert ((Preserved $preserveNames) -ceq $before) 'Uninstall changed preserved rules/filters.'
     }
     Scenario 'install-after-uninstall' { $null=Native 'install-after-uninstall' $setup '/S';Verify-Templates }
     Scenario 'final-uninstall' {
         $null=Native 'final-uninstall' (Join-Path $installRoot 'uninstall.exe') '/S'
-        $deadline=[DateTime]::UtcNow.AddSeconds(30)
-        while ((Test-Path -LiteralPath $image) -and [DateTime]::UtcNow -lt $deadline) {Start-Sleep -Milliseconds 100}
+        Wait-Uninstalled
         Assert (!(Test-Path -LiteralPath $image) -and !(Test-Path -LiteralPath $uninstallKey) -and @(Owned).Count -eq 0) 'Final uninstall incomplete.'
+    }
+    foreach ($modeEntry in @(@{name='fresh-passive';args='/P';uninstall='standalone-uninstall-passive';uninstallArgs='/P'},@{name='fresh-updater';args='/S /UPDATE';uninstall='updater-standalone-uninstall';uninstallArgs='/S'})) {
+        Scenario $modeEntry.name {
+            $null=Native $modeEntry.name $setup ($modeEntry.args+' /D='+$installRoot)
+            Assert ((Get-FileHash -LiteralPath $image -Algorithm SHA256).Hash.ToLowerInvariant() -eq $manifest.candidate.embedded.sha256) 'Fresh mode installed a different image.'
+            Verify-Templates
+            Assert (!(Test-Path -LiteralPath (Join-Path $env:APPDATA 'PocketStream'))) 'Install without relaunch initialized the application profile.'
+        }
+        Scenario $modeEntry.uninstall {
+            $before=Preserved $preserveNames
+            $null=Native $modeEntry.uninstall (Join-Path $installRoot 'uninstall.exe') $modeEntry.uninstallArgs
+            Wait-Uninstalled
+            Assert ((Preserved $preserveNames) -ceq $before) 'Mode uninstall changed preserved rules/filters.'
+        }
     }
     if ($manifest.legacy_sha256) {
         Scenario 'legacy-installer-upgrade' {
@@ -272,15 +366,14 @@ try {
         }
         Scenario 'upgraded-standalone-uninstall' {
             $null=Native 'upgraded-uninstall' (Join-Path $installRoot 'uninstall.exe') '/S'
-            $deadline=[DateTime]::UtcNow.AddSeconds(30)
-            while ((Test-Path -LiteralPath $image) -and [DateTime]::UtcNow -lt $deadline) {Start-Sleep -Milliseconds 100}
+            Wait-Uninstalled
             Assert (!(Test-Path -LiteralPath $image) -and !(Test-Path -LiteralPath $uninstallKey) -and @(Owned).Count -eq 0) 'Upgraded uninstall incomplete.'
         }
     } else { $report.pending += 'Actual legacy-installer upgrade: no independently hashed predecessor supplied.' }
     $report.status='supported automated subset passed; full qualification incomplete'
-} catch { $report.status=$(if($nativeStarted){'supported scenario failed'}else{'preflight failed; native scenarios pending'});$report.error=$_.Exception.Message }
+} catch { $report.status=$(if($nativeStarted){'supported scenario failed'}else{'preflight failed; native scenarios pending'});$report.error=$_.Exception.Message;$report.source_line=$_.InvocationInfo.ScriptLineNumber;$report.script_stack=$_.ScriptStackTrace }
 finally {
-    $report.pending += @('Interactive fresh/passive/updater/uninstall mode combinations and cancellation, relaunch timing, every failure/exit path and continuous parent/child native mutex observation.','Legacy runtime rule emission (upgrade uses explicitly seeded documented historical shapes), locked payload Ignore/delete, child-uninstaller error propagation and partial-provider fault injection.','Listener lifecycle/Any reset/explicit physical adapter, all native address writes, cross-account/logon/integrity ownership, hardware/G3/signed update/endurance.','A successful conflict case is not partial-provider qualification; virtual adapters do not satisfy production physical-adapter eligibility.')
+    $report.pending += @('Interactive install/uninstall and cancellation, relaunch timing, every failure/exit path and continuous parent/child native mutex observation.','Legacy runtime rule emission (upgrade uses explicitly seeded documented historical shapes), locked payload Ignore/delete, child-uninstaller error propagation and partial-provider fault injection.','Listener lifecycle/Any reset/explicit physical adapter, all native address writes, cross-account/logon/integrity ownership, hardware/G3/signed update/endurance.','A successful conflict case is not partial-provider qualification; virtual adapters do not satisfy production physical-adapter eligibility.')
     $report.finished_utc=[DateTime]::UtcNow.ToString('o')
     $completed=@($report.scenarios | ForEach-Object {$_.name})
     $report.unexecuted_scenarios=@($planned | Where-Object {$_ -notin $completed} | ForEach-Object {[ordered]@{name=$_;status='pending'}})

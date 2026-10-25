@@ -1,5 +1,7 @@
 # Windows Sandbox qualification resume checkpoint
 
+This is the historical pre-restart checkpoint. The [subsequent qualification](privilege-v2-final-qualification.md) records the confirmed restart, demonstrated fixes, rebuilt images, exported Sandbox/hardware results and remaining gates. Use that record and the updated generator for a new run; the original prepared package below is preserved as failed-run evidence.
+
 Windows Sandbox was enabled on 25 October 2026 using the authorized `Containers-DisposableClientVM` feature operation with `-All -NoRestart`. Windows returned **RestartNeeded=true**. No restart has been initiated. An explicit operator confirmation is required before restarting this PC. A feature state of Enabled does not prove the required reboot occurred or that the guest can boot.
 
 The Windows host is build **26200.9711**, Professional / 25H2. The hypervisor is present. The processor reports some virtualization flags as false under that hypervisor; those values alone do not establish a BIOS failure. Preserve the raw prerequisite and DISM result observations under `src-tauri/target/privilege-final`.

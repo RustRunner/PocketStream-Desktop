@@ -4,7 +4,7 @@
 [CmdletBinding()]
 param(
     [string]$RunRoot,
-    [string]$EvidencePath = 'docs/runtime-evidence/privilege-v2-a3-review.json',
+    [string]$EvidencePath = 'docs/runtime-evidence/privilege-v2-final-qualification.json',
     [string]$LegacyInstaller,
     [string]$LegacySha256,
     [ValidateSet('Preflight', 'Supported')][string]$Mode = 'Preflight'
@@ -61,6 +61,8 @@ $copies = [ordered]@{
     'candidate-staged.exe' = (Join-Path $repository $review.artifacts.staged.path)
     'candidate-packaged.exe' = (Join-Path $repository $review.artifacts.embedded.path)
     'Invoke-PrivilegeSandbox.ps1' = (Join-Path $PSScriptRoot 'qualification\Invoke-PrivilegeSandbox.ps1')
+    'Invoke-PrivilegeSandboxFailures.ps1' = (Join-Path $PSScriptRoot 'qualification\Invoke-PrivilegeSandboxFailures.ps1')
+    'verify-a1-production-smoke.ps1' = (Join-Path $PSScriptRoot 'verify-a1-production-smoke.ps1')
     'review.json' = $EvidencePath
 }
 if ($LegacyInstaller) { $copies['legacy-setup.exe'] = (Resolve-Path -LiteralPath $LegacyInstaller).Path }
