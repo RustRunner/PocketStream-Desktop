@@ -149,8 +149,10 @@ try {
         }
         if ($failed) { throw 'Startup ownership reconciliation incomplete' }
     }
-    # Inspect every migration candidate before changing any. No block is owned.
-    $legacy = @(Legacy)
+    # Retiring one listener must not depend on unrelated migration candidates.
+    # Install/ensure still inspect every candidate before preparing any allow.
+    $legacy = @()
+    if ($mode -ne 'disable') { $legacy = @(Legacy) }
     if ($mode -in @('install','uninstall')) {
         $stage = 'legacy_disable'
         foreach ($rule in $legacy) { Disable-Verified $rule }
@@ -214,8 +216,15 @@ try {
     if ($null -ne $touched) {
         try {
             $rules = @(Exact $touched)
-            foreach ($rule in $rules) { if (Owned (Shape $rule)) { Disable-Verified $rule } }
-            $uncertain = $false
+            if ($rules.Count -gt 1) { throw 'Cleanup rule collision' }
+            foreach ($rule in $rules) {
+                if (!(Owned (Shape $rule))) { throw 'Cleanup ownership conflict' }
+                Disable-Verified $rule
+            }
+            # An ensure touches one role. Maintenance can also have unresolved
+            # effects on other roles or legacy removals; this readback cannot
+            # establish those postconditions.
+            if ($mode -eq 'ensure') { $uncertain = $false }
         } catch { $uncertain = $true }
     }
     if ($outcome.state -ne 'unavailable') { $outcome = @{state='failed';stage=$stage;reason='Windows rule policy failed; inspect installer diagnostics or restart with administrator access';uncertain=$uncertain} }

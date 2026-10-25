@@ -15,7 +15,7 @@ $roles=@(
 function Assert($condition,[string]$reason) { if (!$condition) { throw $reason } }
 function Reset {
     $script:rules=[Collections.Generic.List[object]]::new()
-    $script:writeCount=0; $script:failSet=0; $script:failQuery=$false
+    $script:writeCount=0; $script:failSet=0; $script:failQuery=$false; $script:failRemove=$false
     $script:adapter=[pscustomobject]@{InterfaceGuid='{01234567-89ab-cdef-0123-456789abcdef}';MacAddress='00-11-22-33-44-55';ifIndex=15;Status='Up';Name='Renamed Ethernet'}
 }
 function Rule([string]$name,[int]$role=0,[string]$program='Any',[string]$enabled='True') {
@@ -49,7 +49,11 @@ function New-NetFirewallRule {
     $script:rules.Add($row);$script:writeCount++
     return $row
 }
-function Remove-NetFirewallRule { [CmdletBinding()]param([Parameter(ValueFromPipeline=$true)]$InputObject) process {$script:writeCount++;$null=$script:rules.Remove($InputObject)} }
+function Remove-NetFirewallRule { [CmdletBinding()]param([Parameter(ValueFromPipeline=$true)]$InputObject) process {
+    $script:writeCount++
+    if ($script:failRemove) { throw 'fake removal failure with unknown provider outcome' }
+    $null=$script:rules.Remove($InputObject)
+} }
 function Run([string]$mode,[string]$role='rtsp',[int]$port=13554,$identity=$null) {
     $script:testData=@{version=2;program=$program;group='PocketStream.Desktop.Managed.v2';roles=$roles;operation=@{mode=$mode;role=$role;port=$port;interface=$identity}}
     $result=& $policy
@@ -97,4 +101,19 @@ $passed.Add('partial filter failure stays disabled and retry is idempotent')
 Reset;$script:adapter.Name='Wildcard*';$r=Run ensure rtsp 13554 $identity
 Assert (!$r.ok -and $script:writeCount -eq 0) 'Wildcard alias widened to Any'
 $passed.Add('unsupported alias grammar never widens explicit binding')
+Reset;Assert (Run install).ok 'Fixture setup';Assert (Run ensure).ok 'Fixture start'
+$owned=@($script:rules | Where-Object {$_.Name -eq $roles[0].name})[0]
+$bad=Rule 'unrelated-legacy-conflict' 1;$bad.Profile='Private';$script:rules.Add($bad)
+$block=Rule 'Query User preserved' 0 $program;$block.Action='Block';$script:rules.Add($block)
+$foreign=Rule 'foreign-preserved' 0 'C:\Other\app.exe';$script:rules.Add($foreign)
+$r=Run disable
+Assert ($r.ok -and $owned.Enabled -eq 'False') 'Unrelated legacy conflict stranded the stopped listener allow'
+Assert ($bad.Enabled -eq 'True' -and $block.Enabled -eq 'True' -and $foreign.Enabled -eq 'True') 'Stop changed unowned rules'
+Assert (!(Run ensure).ok) 'Ensure must still reject unresolved legacy migration'
+$passed.Add('stop disables only its owned role despite unrelated legacy conflicts')
+Reset;$script:rules.Add((Rule 'legacy-removal-failure'));$script:failRemove=$true;$r=Run install
+Assert (!$r.ok -and $r.outcome.uncertain) 'Cleaning the last template hid an unresolved legacy removal'
+Assert (@($script:rules | Where-Object {$_.Enabled -eq 'True'}).Count -eq 0) 'Failed migration re-enabled a rule'
+$script:failRemove=$false;Assert (Run install).ok 'Migration removal retry failed'
+$passed.Add('partial migration remains uncertain until all native effects are reconciled')
 [Console]::Out.WriteLine((@{passed=$passed.ToArray();native_policy_mutations=0;provider='pure fake'} | ConvertTo-Json -Compress))

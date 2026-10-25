@@ -7,5 +7,5 @@ test('fixed firewall policy against pure provider fakes',{skip:process.platform!
   assert.equal(result.status,0,result.stdout+result.stderr);
   const evidence=JSON.parse(result.stdout.trim());
   assert.equal(evidence.native_policy_mutations,0);
-  assert.equal(evidence.passed.length,8);
+  assert.equal(evidence.passed.length,10);
 });
