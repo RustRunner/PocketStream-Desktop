@@ -1,7 +1,7 @@
 {
   "document": "Rev 2-A.1 A2 integration checkpoint",
   "recorded_at_utc": "2026-10-24T16:39:42.332Z",
-  "status": "A2 integrated; automated/read-only and local development application workflow checks passed; native mutation, elevated hardware and release qualification pending",
+  "status": "A2 integrated; selected elevated hardware/UI workflows and cleanup passed; positive candidate ICMP, native-write, installed/release and other qualification remain pending",
   "baseline": {
     "branch": "main",
     "commit": "3d077ef7104721c21b328438c53305f343906609",
@@ -74,7 +74,7 @@
       "manifest_sha256": "780c5f643a1faa7a7198a3114e470fe789beacf042ba7b0fcdf2e6b3e3e20221",
       "execution_level": "requireAdministrator",
       "common_controls": true,
-      "launched": false,
+      "launched": true,
       "installed": false
     },
     "test": {
@@ -1866,7 +1866,8 @@
     },
     {
       "gate": "A2 elevated production/hardware workflow smoke",
-      "reason": "Selected Ethernet disconnected. Camera discovery/live video and corrected PTU .202 previously passed on distinct A1 artifacts, which do not qualify these new A2 images."
+      "status": "partially qualified",
+      "reason": "Selected elevated settings/Cancel, discovery, visible playback, PTU role/limits/user-guided movement/Home and normal exit/restoration passed on the recorded optimized image. Positive ICMP inside the candidate and cold-start cached-role retry remain unqualified; observed frame-stall recovery and initial readiness refusals are preserved."
     },
     {
       "gate": "A-S4 cross-account/logon/integrity ownership",
@@ -1882,7 +1883,7 @@
     },
     {
       "gate": "A4 installed-package and G3 closure",
-      "reason": "A3 prerequisites and installed/hardware/resource matrices remain incomplete; inspected optimized executable was not launched or installed."
+      "reason": "A3 prerequisites and installed/hardware/resource matrices remain incomplete; the optimized executable passed the selected standalone elevated workflows, while installed-package qualification remains pending."
     },
     {
       "gate": "B implementation",
@@ -1890,7 +1891,7 @@
     }
   ],
   "security_boundary": "A remains an elevated host. This checkpoint does not close A01 or claim privilege separation.",
-  "last_updated_at_utc": "2026-10-24T17:26:32.746Z",
+  "last_updated_at_utc": "2026-10-25T02:06:59.361Z",
   "local_application_continuation": {
     "recorded_at_utc": "2026-10-24T17:26:32.746Z",
     "checkpoint_commit": "2fe798f79f6f6e9d295f856444668b171802370a",
@@ -2717,6 +2718,798 @@
       "Binding/address-change matrices, production crash recovery, installed-package and resource/endurance gates remain as previously recorded.",
       "Only five protected profile/cache/key/log files and the selected physical adapter were checked for restoration; this is not a whole-machine image comparison.",
       "The original broad-suite and prerequisite evidence stays historical. Its 162-input fingerprint is preserved; two fixture changes are qualified separately and their original bytes archived."
+    ]
+  },
+  "elevated_hardware_continuation": {
+    "recorded_at_utc": "2026-10-25T02:06:59.361Z",
+    "baseline_commit": "0160801097c990fc533374e902663e6b6847f41b",
+    "worktree_clean_at_start": true,
+    "status": "selected elevated settings/discovery/playback/PTU/normal-exit workflows passed; positive ICMP in the candidate remains unqualified",
+    "evidence_changes_uncommitted": true,
+    "application_code_changed": false,
+    "artifact_rebuilt": false,
+    "previous_checkpoint": [
+      {
+        "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/prior-privilege-v2-a2.json",
+        "sha256": "43caa150a00ebc43f2058a1bf9df1e617aec46fd820506fe70f85ab4ba6962aa",
+        "bytes": 105140
+      },
+      {
+        "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/prior-privilege-v2-a2.md",
+        "sha256": "7a85f6720f223a9e26958db18f1c6a8464a13038888ee52e7e0b1e69ee91df5d",
+        "bytes": 14428
+      }
+    ],
+    "prior_release_artifact_record": {
+      "path": "src-tauri/target/privilege-a2/release-b77586f746eadcb63fdb7a2883f9ffd494bb5aff140f4ff963baccadd6b8ebed/pocketstream-desktop.exe",
+      "sha256": "b77586f746eadcb63fdb7a2883f9ffd494bb5aff140f4ff963baccadd6b8ebed",
+      "manifest_path": "src-tauri/target/privilege-a2/release-b77586f746eadcb63fdb7a2883f9ffd494bb5aff140f4ff963baccadd6b8ebed/application.manifest",
+      "manifest_sha256": "780c5f643a1faa7a7198a3114e470fe789beacf042ba7b0fcdf2e6b3e3e20221",
+      "execution_level": "requireAdministrator",
+      "common_controls": true,
+      "launched": false,
+      "installed": false
+    },
+    "prior_hardware_gate": {
+      "gate": "A2 elevated production/hardware workflow smoke",
+      "reason": "Selected Ethernet disconnected. Camera discovery/live video and corrected PTU .202 previously passed on distinct A1 artifacts, which do not qualify these new A2 images."
+    },
+    "artifact": {
+      "path": "src-tauri/target/release/pocketstream-desktop.exe",
+      "sha256": "b77586f746eadcb63fdb7a2883f9ffd494bb5aff140f4ff963baccadd6b8ebed",
+      "execution_level": "requireAdministrator",
+      "token_elevated": true,
+      "installed": false,
+      "hash_verified_before_and_after": true,
+      "preserved_image": {
+        "path": "src-tauri/target/privilege-a2/release-b77586f746eadcb63fdb7a2883f9ffd494bb5aff140f4ff963baccadd6b8ebed/pocketstream-desktop.exe",
+        "sha256": "b77586f746eadcb63fdb7a2883f9ffd494bb5aff140f4ff963baccadd6b8ebed",
+        "bytes": 23206912
+      }
+    },
+    "manifests": {
+      "before": {
+        "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/release.manifest",
+        "sha256": "780c5f643a1faa7a7198a3114e470fe789beacf042ba7b0fcdf2e6b3e3e20221",
+        "bytes": 641
+      },
+      "after": {
+        "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/release-after.manifest",
+        "sha256": "780c5f643a1faa7a7198a3114e470fe789beacf042ba7b0fcdf2e6b3e3e20221",
+        "bytes": 641
+      },
+      "require_administrator": true,
+      "common_controls": true
+    },
+    "source_correspondence": {
+      "record": {
+        "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/source-verification.json",
+        "sha256": "dc47d9ba320d6290663536809c469f0d7236b292dc2a457058ca5ecee048657f",
+        "bytes": 41024
+      },
+      "original_inputs": 162,
+      "unchanged_inputs": 160,
+      "previously_qualified_fixture_updates": 2,
+      "application_sources_match_recorded_candidate": true,
+      "historical_fingerprint_rewritten": false
+    },
+    "launch": {
+      "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/launch-result.json",
+      "sha256": "e5f93867fc65c5e0403359681f40dd2ab5ef6217f8a0c454963be29e19c835ae",
+      "bytes": 6482
+    },
+    "completion": {
+      "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/completion-result.json",
+      "sha256": "814d14f6e50df8861f726312ae6038631eff33c6c470736e8bf6a6b3bbb55a34",
+      "bytes": 12126
+    },
+    "started_at_utc": "2026-10-25T01:45:49.4744113Z",
+    "finished_at_utc": "2026-10-25T02:01:35.8144099Z",
+    "preflight": {
+      "record": {
+        "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/preflight.json",
+        "sha256": "2a4d5b58d18a421486ce88e42ffff3c3410e9daf7d2e8bfeeb79fd320c126d10",
+        "bytes": 1656
+      },
+      "selected_adapter": {
+        "alias": "Ethernet",
+        "description": "Intel(R) Ethernet Connection (24) I219-V",
+        "guid": "{812AD22F-3345-4817-B6D7-708D769E69AC}",
+        "mac": "40-C2-BA-CF-D5-75",
+        "index": 15,
+        "status": "Up",
+        "hardware": true,
+        "virtual": false,
+        "media": "802.3"
+      },
+      "mode": "static_auto",
+      "pending_temporary_addresses": 0,
+      "retained_bindings_observed_present": 2,
+      "existing_primary": "192.168.0.100/24",
+      "existing_addresses": [
+        {
+          "InterfaceIndex": 15,
+          "IPAddress": "172.31.169.102",
+          "PrefixLength": 24,
+          "PrefixOrigin": 1
+        },
+        {
+          "InterfaceIndex": 15,
+          "IPAddress": "192.168.0.100",
+          "PrefixLength": 24,
+          "PrefixOrigin": 1
+        },
+        {
+          "InterfaceIndex": 15,
+          "IPAddress": "192.168.1.100",
+          "PrefixLength": 24,
+          "PrefixOrigin": 1
+        }
+      ],
+      "automatic_adoption": "Existing Static-Auto behavior retained; known targets/retained rows already have matching native bindings. No new address or reconciliation mutation is required for planned workflows.",
+      "configuration_changes_required": false
+    },
+    "fresh_device_observations": {
+      "initial_inventory": {
+        "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/native-initial.json",
+        "sha256": "16733536e6eec1b68e35a14edfd4e3c7ae159f7675a770bc40fefa6e3b0a870f",
+        "bytes": 14114
+      },
+      "probes": {
+        "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/fresh-endpoint-probes.json",
+        "sha256": "88fd1d015eccb53ce41970d73057d58ddfefaed595002f2afcdb2d0e3744aa91",
+        "bytes": 3423
+      },
+      "camera": {
+        "ip": "172.31.169.84",
+        "mac": "40:cd:3a:03:28:e2",
+        "interface_index": 15,
+        "source": "172.31.169.102",
+        "fresh_echo_and_neighbor": true
+      },
+      "ptu": {
+        "ip": "192.168.1.202",
+        "mac": "fc:68:3e:22:05:28",
+        "interface_index": 15,
+        "source": "192.168.1.100",
+        "fresh_echo_and_neighbor": true
+      },
+      "old_unknown_74": {
+        "ip": "192.168.1.74",
+        "fresh_probe_answered": false,
+        "treated_as_ptu": false
+      }
+    },
+    "production_ui": {
+      "record": {
+        "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/production-uia-result.json",
+        "sha256": "a3e9586c4fb91f32a1c88c0e9c0fcaef2c25138410e2fe7fcb123509d7837cbd",
+        "bytes": 2787
+      },
+      "method": "same-account elevated UIAutomation patterns on real production controls",
+      "assets_or_handlers_replaced": false,
+      "steps": [
+        {
+          "status": "passed",
+          "action": "acknowledge production Static-Auto listening notice"
+        },
+        {
+          "field": "stream.rtsp_port",
+          "values": [
+            554,
+            13554,
+            554
+          ],
+          "status": "passed",
+          "action": "Save Settings and persisted readback"
+        },
+        {
+          "status": "passed",
+          "native": {
+            "observed": true,
+            "owner_pid": 11528,
+            "text": "PocketStream Desktop\nMainInstructionIcon\nRemove 192.168.0.100 from Ethernet?\nOK\nCancel",
+            "action": "Cancel"
+          },
+          "action": "Configure > Remove primary > native Cancel"
+        },
+        {
+          "mode": "static_auto",
+          "status": "passed",
+          "native": {
+            "observed": true,
+            "owner_pid": 11528,
+            "text": "PocketStream Desktop\nMainInstructionIcon\nSwitching to DHCP removes manually configured addresses from this adapter. Saved managed secondaries will remain pending until a static mode returns. Continue?\nOK\nCancel",
+            "action": "Cancel"
+          },
+          "action": "Configure > DHCP > Close > native Cancel"
+        },
+        {
+          "status": "requested",
+          "camera": "172.31.169.84",
+          "action": "production Start Stream"
+        }
+      ],
+      "visible_nodes": [
+        "172.31.169.84",
+        "192.168.1.202"
+      ],
+      "settings": "passed with persisted port readback 554 -> 13554 -> 554",
+      "address_confirmation": "native Cancel; original primary retained",
+      "dhcp_confirmation": "native Cancel; Static-Auto retained"
+    },
+    "discovery": {
+      "capture": [
+        "2026-10-24 20:45:59 [INFO] pocketstream_desktop::network - event=capture_state adapter_mac=\"40:c2:ba:cf:d5:75\" interface_index=15 scope=selected_interface source_id=Some(115) active=true"
+      ],
+      "camera_identity_samples": [
+        "2026-10-24 20:45:59 [DEBUG] pocketstream_desktop::network - event=identity_probe adapter_mac=\"40:C2:BA:CF:D5:75\" interface_index=15 target=172.31.169.84 source=172.31.169.102 answered=true probes_started=1 probes_answered=1 probes_failed=0 candidates_rejected=0 fence_drops=0",
+        "2026-10-24 20:46:03 [DEBUG] pocketstream_desktop::network - event=identity_probe adapter_mac=\"40:C2:BA:CF:D5:75\" interface_index=15 target=172.31.169.84 source=172.31.169.102 answered=true probes_started=3 probes_answered=2 probes_failed=1 candidates_rejected=5302 fence_drops=0"
+      ],
+      "ptu_identity_samples": [
+        "2026-10-24 20:46:06 [DEBUG] pocketstream_desktop::network - event=identity_probe adapter_mac=\"40:C2:BA:CF:D5:75\" interface_index=15 target=192.168.1.202 source=192.168.1.100 answered=true probes_started=6 probes_answered=4 probes_failed=2 candidates_rejected=10722 fence_drops=0",
+        "2026-10-24 20:46:06 [DEBUG] pocketstream_desktop::network - event=identity_probe adapter_mac=\"40:C2:BA:CF:D5:75\" interface_index=15 target=192.168.1.202 source=192.168.1.100 answered=true probes_started=7 probes_answered=5 probes_failed=2 candidates_rejected=10723 fence_drops=0"
+      ],
+      "new_subnet_adoption_observed": false
+    },
+    "playback": {
+      "user_visible_updating_video": true,
+      "pipeline_events": [
+        "2026-10-24 20:52:43 [INFO] pocketstream_desktop::streaming::rtsp_client - Playback pipeline set to Playing",
+        "2026-10-24 20:53:57 [INFO] pocketstream_desktop::streaming::rtsp_client - Playback pipeline set to Playing"
+      ],
+      "recovery_events": [
+        "2026-10-24 20:52:43 [DEBUG] pocketstream_desktop::streaming - event=playback_attempt generation=1 attempt=0",
+        "2026-10-24 20:52:43 [INFO] pocketstream_desktop::streaming - event=playback_recovery adapter_mac=\"40:c2:ba:cf:d5:75\" interface_index=15 state=\"starting\" cause=null attempt=0 duration_ms=0",
+        "2026-10-24 20:52:44 [INFO] pocketstream_desktop::streaming - event=playback_recovery adapter_mac=\"40:c2:ba:cf:d5:75\" interface_index=15 state=\"playing\" cause=null attempt=0 duration_ms=0",
+        "2026-10-24 20:53:57 [DEBUG] pocketstream_desktop::streaming - event=playback_attempt generation=2 attempt=1",
+        "2026-10-24 20:53:57 [INFO] pocketstream_desktop::streaming - event=playback_recovery adapter_mac=\"40:c2:ba:cf:d5:75\" interface_index=15 state=\"recovering\" cause=\"frame_stall\" attempt=1 duration_ms=0",
+        "2026-10-24 20:53:59 [INFO] pocketstream_desktop::streaming - event=playback_recovery adapter_mac=\"40:c2:ba:cf:d5:75\" interface_index=15 state=\"playing\" cause=null attempt=1 duration_ms=1790",
+        "2026-10-24 20:54:29 [INFO] pocketstream_desktop::streaming - event=playback_recovery adapter_mac=\"40:c2:ba:cf:d5:75\" interface_index=15 state=\"playing\" cause=null attempt=0 duration_ms=0"
+      ],
+      "frame_stalls_observed": 1,
+      "automatic_recovery_duration_ms": 1790,
+      "stall_icmp_diagnostic": [
+        "2026-10-24 20:53:58 [INFO] pocketstream_desktop::streaming - Playback stall diagnostic ip=172.31.169.84 icmp=false"
+      ],
+      "user_confirmed_video_after_recovery": true,
+      "actual_source_connections": {
+        "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/preclose-native-observations.json",
+        "sha256": "a6a1988af71b148824134bdc62fc2f673518833a1e4cb23a977caa2ed8790927",
+        "bytes": 1441
+      },
+      "restream_enabled": false,
+      "loopback_listener": "internal playback bridge; no re-stream listener-start workflow exercised",
+      "limits": "No deliberate cable/reboot/loss matrix or endurance run; one observed stall recovered, cause not established.",
+      "stall_trigger": [
+        "2026-10-24 20:53:57 [WARN] pocketstream_desktop::streaming::relay - Playback generation=1 state=Recovering fault=FrameStall attempt=0 reason=No usable frames for 3 seconds"
+      ],
+      "duration_scope": "1790 ms is the logged recovery attempt, following the three-second no-usable-frame threshold; total interruption was not measured."
+    },
+    "ptu": {
+      "role_reassignment": "user Clear -> PTU at confirmed .202 identity; user reported no red toast",
+      "limits_initialization": [
+        "2026-10-24 20:53:38 [INFO] pocketstream_desktop::commands - [frontend] PTU limits: big=1001 small=100"
+      ],
+      "home_events": [
+        "2026-10-24 20:53:41 [INFO] pocketstream_desktop::commands - [frontend] toast: PTU homing",
+        "2026-10-24 20:53:41 [INFO] pocketstream_desktop::commands - [frontend] PTU: back to speed mode",
+        "2026-10-24 20:56:12 [INFO] pocketstream_desktop::commands - [frontend] toast: PTU homing",
+        "2026-10-24 20:56:13 [INFO] pocketstream_desktop::commands - [frontend] PTU: back to speed mode"
+      ],
+      "production_position_queries": "Home position-polling workflow exercised; per-request response JSON not independently captured",
+      "guided_controls": [
+        "Left",
+        "Right",
+        "Up",
+        "Down",
+        "Home"
+      ],
+      "physical_result": "User gave a global no-issues response to the guided checklist; no individual-axis timing measurements",
+      "earlier_unitemized_input": "User could not recall individual earlier D-pad directions; no per-direction credit claimed for those inputs",
+      "supplemental_http_samples": [
+        {
+          "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/ptu-readonly-sample.json",
+          "sha256": "62bd4b09559aa13d8c854630f4123bb34db9a2c4c43ea03dc0003a88e0ebf2aa",
+          "bytes": 702
+        },
+        {
+          "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/ptu-after-guided-motion.json",
+          "sha256": "0387591b3a0e71732107b4c8e4f0fa1e8a64b3905ed203fa396a6260c8f5fa3d",
+          "bytes": 333
+        }
+      ],
+      "supplemental_scope": "read-only source-bound HTTP outside candidate, distinguished from production workflow",
+      "final_supplemental_position": {
+        "PP": "0",
+        "TP": "0",
+        "status": "*"
+      },
+      "motion_commanded_by_fixture": false,
+      "presets_qualified": false,
+      "stop_deadlines_measured": false
+    },
+    "user_observations": {
+      "record": {
+        "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/user-observations.json",
+        "sha256": "8793bd810cf05005e18c8df556c5923f28132f7c0c7ef25556bf310e848c58db",
+        "bytes": 1523
+      },
+      "answers": [
+        {
+          "prompt": "PTU stationary and all controls released before launch",
+          "answer": "Stationary, controls released"
+        },
+        {
+          "prompt": "Visible updating live video and Clear -> PTU role reassignment at 192.168.1.202, without touching motion",
+          "answer": "Live video; PTU reconnects without a red toast"
+        },
+        {
+          "prompt": "Earlier unplanned motion relative to the staged sequence",
+          "answer": "i messed with d pad too and it worked",
+          "limits": "Not used to claim particular directions."
+        },
+        {
+          "prompt": "Which earlier D-pad directions?",
+          "answer": "i cant remember. do you want me to test all?"
+        },
+        {
+          "prompt": "Home return/stop and live video after logged frame-stall recovery",
+          "answer": "yes, done"
+        },
+        {
+          "prompt": "Guided brief Left, Right, Up, Down and Home repeat; stops after releases and current video",
+          "answer": "no issues that i can see",
+          "interpretation": "Global response to the five-control checklist; not individually itemized direction measurements."
+        },
+        {
+          "prompt": "Release controls and use normal Close",
+          "answer": "Window closed"
+        }
+      ]
+    },
+    "icmp": {
+      "production_status": "negative result logged during the frame stall; positive in-process echo not independently demonstrated",
+      "production_diagnostic": [
+        "2026-10-24 20:53:58 [INFO] pocketstream_desktop::streaming - Playback stall diagnostic ip=172.31.169.84 icmp=false"
+      ],
+      "successful_windows_preflight": "both camera and PTU replied to source-bound Windows echo probes; distinct from candidate",
+      "supplemental_native_fixture": {
+        "command": {
+          "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/controlled-native-icmp-command.json",
+          "sha256": "e03b5779d4e5a92525bcefba6eea6b70e9e7eac467dcf6f6decd0e686eab73da",
+          "bytes": 732
+        },
+        "executable_sha256": "3b70c17ed215a4ba780165f5bd9e3583ce372617f26b7c1dfea981be568e92f0",
+        "record": {
+          "path": "src-tauri/target/privilege-a2-proofs/hardware-icmp-20261025T015655559Z/native-observation-paths.json",
+          "sha256": "383d81a5bb66da27ac925d42456f7557a5ac1cc0fab23ca182a43f569c5364f4",
+          "bytes": 718
+        },
+        "controlled_icmp": {
+          "echo_reply": true,
+          "index": 15,
+          "source": "172.31.169.102",
+          "target": "172.31.169.84"
+        },
+        "exit_code": 0,
+        "capture_started": false,
+        "configuration_mutation": false,
+        "separate_executable": true,
+        "logs": [
+          {
+            "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/controlled-native-icmp.stdout.log",
+            "sha256": "cae4dfde26eaf7122bafd5dd6d21a6be0e0bd8c0e353f1e75d766207bbddfe2d",
+            "bytes": 190
+          },
+          {
+            "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/controlled-native-icmp.stderr.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "bytes": 0
+          }
+        ]
+      },
+      "passive_observers": [
+        {
+          "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/observer-attempt1/passive-icmp-observation.json",
+          "sha256": "6ede5b12484ff2b4ee4412bb372db930551159ca97dd4cd7279a007359c97a4c",
+          "bytes": 320
+        },
+        {
+          "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/passive-icmp-observation.json",
+          "sha256": "16f989bb9828291f1e5b1bed86403287273bab478e8b3462338ebbb117013c7f",
+          "bytes": 320
+        }
+      ],
+      "passive_observer_result": "two empty observations; later window also overlapped a known successful supplemental probe; cannot infer candidate success or failure from absent packets",
+      "positive_candidate_qualification": "pending adequate observation path; no firewall/browser policy or candidate modification made"
+    },
+    "observed_failures_and_fixture_limits": {
+      "initial_cached_role_and_port_scans": [
+        "2026-10-24 20:45:56 [INFO] pocketstream_desktop::commands - [frontend] PTU init failed: Network error: Selected Ethernet adapter unavailable",
+        "2026-10-24 20:45:56 [INFO] pocketstream_desktop::commands - [frontend] Port scan failed for 172.31.169.84: Network error: Selected Ethernet adapter unavailable",
+        "2026-10-24 20:45:56 [INFO] pocketstream_desktop::commands - [frontend] Port scan failed for 192.168.1.202: Network error: Selected Ethernet adapter unavailable",
+        "2026-10-24 20:45:56 [INFO] pocketstream_desktop::commands - [frontend] Port scan failed for 192.168.1.204: Network error: Selected Ethernet adapter unavailable",
+        "2026-10-24 20:45:56 [INFO] pocketstream_desktop::commands - [frontend] Port scan failed for 192.168.1.74: Network error: Selected Ethernet adapter unavailable"
+      ],
+      "startup_limit": "cached-role query preceded adapter readiness; later explicit assignment succeeded; automatic cold-start retry not qualified",
+      "first_elevation_preflight": {
+        "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/operator-preflight-attempt1/completion-result.json",
+        "sha256": "90a4890cbc416901bf82c74059e760e3f76d339859fa781ffc4bd80d441290f9",
+        "bytes": 328
+      },
+      "identity_correction": "sandbox SID differed from desktop SID; corrected after verifying desktop profile matched backups, preserving same-account/elevation checks; no profile/native mutation in failed preflight",
+      "browser_diagnostic": {
+        "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/private-webview-diagnostic.json",
+        "sha256": "a8b785e43615f71047b45d97a4141268384d949519e1dcd9f42e49f90ab8b32a",
+        "bytes": 7752
+      },
+      "webview_version": "155.0.4283.62",
+      "browser_limit": "elevated host ignored environment debugging flags; normal UIAutomation used; no HKLM policy or replacement application code",
+      "supplemental_query_helper": "initial mixed require/top-level-await helper failed with ERR_AMBIGUOUS_MODULE_SYNTAX before sending requests; corrected built-in HTTP helper passed",
+      "product_rebuilt": false,
+      "disposition": "No reproducible application regression established; transient failures and qualification limits retained."
+    },
+    "cleanup": {
+      "record": {
+        "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/independent-cleanup-verification.json",
+        "sha256": "6aaea8bd7892c0ab878bdc3c494c9375404b337a1beb2aeaf84508f6c897b260",
+        "bytes": 1744
+      },
+      "normal_close": "user clicked production Close after releasing controls",
+      "exit_code": 0,
+      "protected_files": [
+        {
+          "file": "config.toml",
+          "original_sha256": "3f05496ba04ad9d682588526a2bcf40ca64deb00bd2fd4595020fe86540d6853",
+          "restored": true
+        },
+        {
+          "file": "device_cache.toml",
+          "original_sha256": "00b602bbd9866b31503e0aa91d862780209e34111c81241a39e19c2ab4fd10e4",
+          "restored": true
+        },
+        {
+          "file": ".key",
+          "original_sha256": "de463f270e487b898a27bb5e7b1586dc9b981855bd2811f038038551baa8b4bc",
+          "restored": true
+        },
+        {
+          "file": "pocketstream.log",
+          "original_sha256": "2f4f58a0c675609e6363885342039f6bf081fcb3836b27f0d63b1f504ccb512e",
+          "restored": true
+        },
+        {
+          "file": "pocketstream.log.1",
+          "original_sha256": "8a3c3091539b68ba8aa815ca3dcbcf90422949afb484401978cfd48265ae1c39",
+          "restored": true
+        }
+      ],
+      "application_processes_remaining": 0,
+      "owned_webview_processes_remaining": 0,
+      "selected_configuration_unchanged": true,
+      "native_before": {
+        "adapter_guid": "{812AD22F-3345-4817-B6D7-708D769E69AC}",
+        "adapter_mac": "40:c2:ba:cf:d5:75",
+        "interface_index": 15,
+        "link": "Up",
+        "addresses": [
+          {
+            "IPAddress": "172.31.169.102",
+            "PrefixLength": 24,
+            "PrefixOrigin": 1
+          },
+          {
+            "IPAddress": "192.168.0.100",
+            "PrefixLength": 24,
+            "PrefixOrigin": 1
+          },
+          {
+            "IPAddress": "192.168.1.100",
+            "PrefixLength": 24,
+            "PrefixOrigin": 1
+          }
+        ],
+        "dhcp": "Disabled",
+        "dns": [],
+        "routes": [
+          {
+            "DestinationPrefix": "172.31.169.0/24",
+            "NextHop": "0.0.0.0",
+            "RouteMetric": 256,
+            "Protocol": 2
+          },
+          {
+            "DestinationPrefix": "172.31.169.102/32",
+            "NextHop": "0.0.0.0",
+            "RouteMetric": 256,
+            "Protocol": 2
+          },
+          {
+            "DestinationPrefix": "172.31.169.255/32",
+            "NextHop": "0.0.0.0",
+            "RouteMetric": 256,
+            "Protocol": 2
+          },
+          {
+            "DestinationPrefix": "192.168.0.0/24",
+            "NextHop": "0.0.0.0",
+            "RouteMetric": 256,
+            "Protocol": 2
+          },
+          {
+            "DestinationPrefix": "192.168.0.100/32",
+            "NextHop": "0.0.0.0",
+            "RouteMetric": 256,
+            "Protocol": 2
+          },
+          {
+            "DestinationPrefix": "192.168.0.255/32",
+            "NextHop": "0.0.0.0",
+            "RouteMetric": 256,
+            "Protocol": 2
+          },
+          {
+            "DestinationPrefix": "192.168.1.0/24",
+            "NextHop": "0.0.0.0",
+            "RouteMetric": 256,
+            "Protocol": 2
+          },
+          {
+            "DestinationPrefix": "192.168.1.100/32",
+            "NextHop": "0.0.0.0",
+            "RouteMetric": 256,
+            "Protocol": 2
+          },
+          {
+            "DestinationPrefix": "192.168.1.255/32",
+            "NextHop": "0.0.0.0",
+            "RouteMetric": 256,
+            "Protocol": 2
+          },
+          {
+            "DestinationPrefix": "224.0.0.0/4",
+            "NextHop": "0.0.0.0",
+            "RouteMetric": 256,
+            "Protocol": 2
+          },
+          {
+            "DestinationPrefix": "255.255.255.255/32",
+            "NextHop": "0.0.0.0",
+            "RouteMetric": 256,
+            "Protocol": 2
+          }
+        ]
+      },
+      "native_after": {
+        "adapter_guid": "{812AD22F-3345-4817-B6D7-708D769E69AC}",
+        "adapter_mac": "40:c2:ba:cf:d5:75",
+        "interface_index": 15,
+        "link": "Up",
+        "addresses": [
+          {
+            "IPAddress": "172.31.169.102",
+            "PrefixLength": 24,
+            "PrefixOrigin": 1
+          },
+          {
+            "IPAddress": "192.168.0.100",
+            "PrefixLength": 24,
+            "PrefixOrigin": 1
+          },
+          {
+            "IPAddress": "192.168.1.100",
+            "PrefixLength": 24,
+            "PrefixOrigin": 1
+          }
+        ],
+        "dhcp": "Disabled",
+        "dns": [],
+        "routes": [
+          {
+            "DestinationPrefix": "172.31.169.0/24",
+            "NextHop": "0.0.0.0",
+            "RouteMetric": 256,
+            "Protocol": 2
+          },
+          {
+            "DestinationPrefix": "172.31.169.102/32",
+            "NextHop": "0.0.0.0",
+            "RouteMetric": 256,
+            "Protocol": 2
+          },
+          {
+            "DestinationPrefix": "172.31.169.255/32",
+            "NextHop": "0.0.0.0",
+            "RouteMetric": 256,
+            "Protocol": 2
+          },
+          {
+            "DestinationPrefix": "192.168.0.0/24",
+            "NextHop": "0.0.0.0",
+            "RouteMetric": 256,
+            "Protocol": 2
+          },
+          {
+            "DestinationPrefix": "192.168.0.100/32",
+            "NextHop": "0.0.0.0",
+            "RouteMetric": 256,
+            "Protocol": 2
+          },
+          {
+            "DestinationPrefix": "192.168.0.255/32",
+            "NextHop": "0.0.0.0",
+            "RouteMetric": 256,
+            "Protocol": 2
+          },
+          {
+            "DestinationPrefix": "192.168.1.0/24",
+            "NextHop": "0.0.0.0",
+            "RouteMetric": 256,
+            "Protocol": 2
+          },
+          {
+            "DestinationPrefix": "192.168.1.100/32",
+            "NextHop": "0.0.0.0",
+            "RouteMetric": 256,
+            "Protocol": 2
+          },
+          {
+            "DestinationPrefix": "192.168.1.255/32",
+            "NextHop": "0.0.0.0",
+            "RouteMetric": 256,
+            "Protocol": 2
+          },
+          {
+            "DestinationPrefix": "224.0.0.0/4",
+            "NextHop": "0.0.0.0",
+            "RouteMetric": 256,
+            "Protocol": 2
+          },
+          {
+            "DestinationPrefix": "255.255.255.255/32",
+            "NextHop": "0.0.0.0",
+            "RouteMetric": 256,
+            "Protocol": 2
+          }
+        ]
+      },
+      "compared": [
+        "identity/index",
+        "link",
+        "IPv4 addresses/prefix/origin",
+        "DHCP",
+        "DNS",
+        "routes/metrics/protocol"
+      ],
+      "scope": "five protected files and selected adapter; not a whole-machine image/ephemeral-neighbor-cache comparison"
+    },
+    "mutation_policy": {
+      "native_configuration_changes_required": false,
+      "native_configuration_repair_attempted": false,
+      "firewall_operations_exercised": false,
+      "installation_operations_exercised": false,
+      "restream_started": false,
+      "new_subnet_or_manual_address_operation_log_matches": []
+    },
+    "targeted_validation": {
+      "record": {
+        "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/targeted-validation.json",
+        "sha256": "e0553294b3cbc3e5e3fdefa2fdd501122c5f198a02264edeb7e825de99c20daa",
+        "bytes": 1470
+      },
+      "checks": [
+        {
+          "name": "ipc-contract",
+          "command": [
+            "C:\\Program Files\\nodejs\\node.exe",
+            "scripts/check-ipc-allowlist.mjs"
+          ],
+          "started_at_utc": "2026-10-25T02:03:33.594Z",
+          "finished_at_utc": "2026-10-25T02:03:34.758Z",
+          "exit_code": 0
+        },
+        {
+          "name": "diff-check",
+          "command": [
+            "git",
+            "-c",
+            "core.safecrlf=false",
+            "diff",
+            "--check"
+          ],
+          "started_at_utc": "2026-10-25T02:03:34.759Z",
+          "finished_at_utc": "2026-10-25T02:03:34.807Z",
+          "exit_code": 0
+        },
+        {
+          "name": "release-manifest-after",
+          "command": [
+            "C:\\Program Files (x86)\\Windows Kits\\10\\bin\\10.0.26100.0\\x64\\mt.exe",
+            "-nologo",
+            "-inputresource:C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\release\\pocketstream-desktop.exe;#1",
+            "-out:C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\privilege-a2\\elevated-hardware-20261025T013937Z\\release-after.manifest"
+          ],
+          "started_at_utc": "2026-10-25T02:03:34.807Z",
+          "finished_at_utc": "2026-10-25T02:03:34.847Z",
+          "exit_code": 0
+        }
+      ],
+      "logs": [
+        {
+          "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/ipc-contract.stdout.log",
+          "sha256": "32a0a344b4c3fb92297e0984b75955703011bb54a2be7ed4b50ac080354c2282",
+          "bytes": 107
+        },
+        {
+          "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/ipc-contract.stderr.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "bytes": 0
+        },
+        {
+          "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/diff-check.stdout.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "bytes": 0
+        },
+        {
+          "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/diff-check.stderr.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "bytes": 0
+        }
+      ],
+      "broad_suites_rerun": false,
+      "reason": "No application/source/binary rebuild; runtime workflows, source/image/manifest checks and one supplemental native observation fixture were exercised."
+    },
+    "fixture_sources": [
+      {
+        "path": "src-tauri/target/privilege-a2/elevated-hardware-launch.ps1",
+        "sha256": "bc5cd43412b7a09ec6bb9d48c4bb0b24d8c6bae6d87031accdae02e28b48e8ab",
+        "bytes": 8328
+      },
+      {
+        "path": "src-tauri/target/privilege-a2/hardware-observe.ps1",
+        "sha256": "9ec5fc07d41c5467c7d644cb03f4ed6c1f7ccb12a72cfb610b6c26619d6567d3",
+        "bytes": 4019
+      },
+      {
+        "path": "src-tauri/target/privilege-a2/hardware-uia-workflows.ps1",
+        "sha256": "5ce369455a4d5fdf3d72e2ce8cf30097bb4c9660a681e4251c723ac511907d5f",
+        "bytes": 5701
+      }
+    ],
+    "raw_logs": [
+      {
+        "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/application.stdout.log",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "bytes": 0
+      },
+      {
+        "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/application.stderr.log",
+        "sha256": "2a1bea9fa4e22a5adc7e59d33c0494080f06510b1fa7ccdb340dfc83cbddffbe",
+        "bytes": 451899
+      },
+      {
+        "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/preclose-app.log",
+        "sha256": "1b36bbfd58a7727167834d42be053b547df139c2dc53900cc0f23b3fd07fd971",
+        "bytes": 402299
+      },
+      {
+        "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/private-session-logs/pocketstream.log",
+        "sha256": "2a1bea9fa4e22a5adc7e59d33c0494080f06510b1fa7ccdb340dfc83cbddffbe",
+        "bytes": 451899
+      },
+      {
+        "path": "src-tauri/target/privilege-a2/elevated-hardware-20261025T013937Z/private-session-logs/pocketstream.log.1",
+        "sha256": "2f4f58a0c675609e6363885342039f6bf081fcb3836b27f0d63b1f504ccb512e",
+        "bytes": 161322
+      }
+    ],
+    "limits": [
+      "Positive candidate ICMP not independently qualified; successful implementation proof used the separate hashed native fixture.",
+      "Cold-start cached-role automatic retry not qualified after initial readiness refusal.",
+      "Guided movement report was global, not independently itemized/timed per axis; presets and boundaries untested.",
+      "No native-write/partial-provider, firewall/install, cross-account/logon/integrity, different-copy/installed-host, bind-change, cable/reboot or resource/endurance qualification.",
+      "Release remains elevated; no privilege separation claim or deferred implementation undertaken."
     ]
   }
 }
