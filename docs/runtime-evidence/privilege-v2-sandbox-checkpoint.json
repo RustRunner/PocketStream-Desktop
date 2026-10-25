@@ -1,0 +1,372 @@
+{
+  "version": 1,
+  "recorded_at_utc": "2026-10-25T05:52:00.211Z",
+  "baseline_commit": "660de41",
+  "fixture_commit": "b61b6c26bf7f9e261f046181d4dcf3bf53e90608",
+  "status": "pending host restart confirmation; no Sandbox or new-candidate hardware qualification executed",
+  "operator_authorization": {
+    "sandbox_feature_enablement": true,
+    "restart_requires_explicit_confirmation": true,
+    "restart_initiated": false,
+    "installation_uninstallation_firewall_mutation_confined_to_sandbox": true
+  },
+  "candidate": {
+    "staged": {
+      "path": "src-tauri/target/privilege-review/final/optimized-7274619250bc8243ebf23f2fa20e3ef96f0b598178b3d01bd49d1bfde235fd6a.exe",
+      "sha256": "7274619250bc8243ebf23f2fa20e3ef96f0b598178b3d01bd49d1bfde235fd6a",
+      "bytes": 23718912
+    },
+    "package": {
+      "path": "src-tauri/target/privilege-review/final/package-833623f1a2db593163ecbd30b4dc546d50e818878ec3aedf75cf91a2df7b5566.exe",
+      "sha256": "833623f1a2db593163ecbd30b4dc546d50e818878ec3aedf75cf91a2df7b5566",
+      "bytes": 29999405
+    },
+    "embedded": {
+      "path": "src-tauri/target/privilege-review/final/package/pocketstream-desktop.exe",
+      "sha256": "227688eabbd07a926e8abe15752b7be5934a9b6c0b06d4259692144c8e108173",
+      "bytes": 23718912
+    },
+    "generated_script": {
+      "path": "src-tauri/target/privilege-review/final/installer.generated.nsi",
+      "sha256": "2f67e516c36c24b74f3637aad1e0fd51bddf5d3f2ea94c509ca0b18f2a093e74",
+      "bytes": 47172
+    },
+    "compiled_trace": {
+      "path": "src-tauri/target/privilege-review/final/installer.compile.log",
+      "sha256": "06ad90aea6b894d5ae8a8cd9dd8501f571e0d7d9fc1a1ad31d16c603a43910e3",
+      "bytes": 218261
+    },
+    "compiler_metadata": {
+      "path": "src-tauri/target/privilege-review/final/compile-inspection.json",
+      "sha256": "2f4d9f798e1a95f88e816a74b0702f915276bb37b0bbd2e6e5648b8c6e463555",
+      "bytes": 453
+    },
+    "staged_manifest": {
+      "path": "src-tauri/target/privilege-review/final/release.manifest",
+      "sha256": "780c5f643a1faa7a7198a3114e470fe789beacf042ba7b0fcdf2e6b3e3e20221",
+      "bytes": 641
+    },
+    "embedded_manifest": {
+      "path": "src-tauri/target/privilege-review/final/embedded.manifest",
+      "sha256": "780c5f643a1faa7a7198a3114e470fe789beacf042ba7b0fcdf2e6b3e3e20221",
+      "bytes": 641
+    }
+  },
+  "source_inputs": {
+    "baseline": {
+      "path": "docs/runtime-evidence/privilege-v2-a3.json",
+      "sha256": "5f19594529ce6d29aa5f4ef0cbc53c656bae34cfa74c3b862571ce78219bbcd4",
+      "bytes": 103451
+    },
+    "review": {
+      "path": "docs/runtime-evidence/privilege-v2-a3-review.json",
+      "sha256": "2fb1a1b69eb0f5826bb3497ae7370927583acf7e87739bc3991bdc7a91995296",
+      "bytes": 18290
+    },
+    "composition": "Original application and validation inventories overridden by review entries by relative path; fixture sources recorded separately.",
+    "count": 230,
+    "effective_source_sha256": "f00fac9915a98394546fd65b45b87c57f8af672272ff7deab8399ebf4301baf6",
+    "convention": "Sort paths with StringComparer.Ordinal; SHA256 + two spaces + relative path + LF; review entries override baseline entries.",
+    "verification": {
+      "path": "src-tauri/target/privilege-final/checkpoint-checks/verification.json",
+      "sha256": "1660a1a74ff74318d0e2b898dc445c66633f233614dff52d3dafe51fa1bd001b",
+      "bytes": 474
+    }
+  },
+  "contracts": {
+    "commands": 46,
+    "wrappers": 46,
+    "plugin_permissions": 9,
+    "rename": "list_vpn_interfaces -> list_bind_interfaces",
+    "shipping_manifest": "requireAdministrator",
+    "common_controls": true,
+    "b": "deferred"
+  },
+  "sandbox": {
+    "enablement": {
+      "path": "src-tauri/target/privilege-final/sandbox-enablement.json",
+      "sha256": "3132c52d0c08e7d1ee1e14208d4fe38d813d62f7136ed8979b5518b02cbab97e",
+      "bytes": 711
+    },
+    "restart_needed": true,
+    "restart_initiated": false,
+    "guest_launched": false,
+    "guest_services_and_prerequisites": "pending",
+    "native_scenarios": "pending",
+    "prepared_record": {
+      "path": "src-tauri/target/privilege-final/sandbox-20261025-ready/prepared.json",
+      "sha256": "1e9abedd27d6afbe4a2b45ef54703972f9f15a4a40b535a70853d099546ce228",
+      "bytes": 710
+    },
+    "launcher": {
+      "path": "src-tauri/target/privilege-final/sandbox-20261025-ready/PocketStream.wsb",
+      "sha256": "13f0da34ad3a20533da41e049fb9853e76c7ead419f93e669d2d2f14f852ad91",
+      "bytes": 1110
+    },
+    "input_manifest": {
+      "path": "src-tauri/target/privilege-final/sandbox-20261025-ready/inputs/fixture.json",
+      "sha256": "f14f4107774336aa371a79def61abdb348470cce4c964515934eb086cb968528",
+      "bytes": 31220
+    },
+    "mapping_verification": {
+      "path": "src-tauri/target/privilege-final/sandbox-20261025-ready/mapping-verification.json",
+      "sha256": "6fcf7fe18f235999f4f21dcc7228812b116640baf523b1aecec71a200c298ca2",
+      "bytes": 255
+    },
+    "read_only_inputs": [
+      {
+        "path": "src-tauri/target/privilege-final/sandbox-20261025-ready/inputs/candidate-packaged.exe",
+        "sha256": "227688eabbd07a926e8abe15752b7be5934a9b6c0b06d4259692144c8e108173",
+        "bytes": 23718912
+      },
+      {
+        "path": "src-tauri/target/privilege-final/sandbox-20261025-ready/inputs/candidate-setup.exe",
+        "sha256": "833623f1a2db593163ecbd30b4dc546d50e818878ec3aedf75cf91a2df7b5566",
+        "bytes": 29999405
+      },
+      {
+        "path": "src-tauri/target/privilege-final/sandbox-20261025-ready/inputs/candidate-staged.exe",
+        "sha256": "7274619250bc8243ebf23f2fa20e3ef96f0b598178b3d01bd49d1bfde235fd6a",
+        "bytes": 23718912
+      },
+      {
+        "path": "src-tauri/target/privilege-final/sandbox-20261025-ready/inputs/Invoke-PrivilegeSandbox.ps1",
+        "sha256": "3aa1abb31ea9a920197a748028520368aa049662f915674a762303ea263ac818",
+        "bytes": 26848
+      },
+      {
+        "path": "src-tauri/target/privilege-final/sandbox-20261025-ready/inputs/legacy-setup.exe",
+        "sha256": "35e2d0a4eff03cd4f5bac95e15315b088873298318ffcf3ae6ab63b2f99e90af",
+        "bytes": 29904423
+      },
+      {
+        "path": "src-tauri/target/privilege-final/sandbox-20261025-ready/inputs/review.json",
+        "sha256": "2fb1a1b69eb0f5826bb3497ae7370927583acf7e87739bc3991bdc7a91995296",
+        "bytes": 18290
+      }
+    ],
+    "writable_host_mapping": "src-tauri/target/privilege-final/sandbox-20261025-ready/results",
+    "input_count": 6,
+    "install_payload_files": 93,
+    "helper_plugin_payloads": "Excluded from installed-file expectations; retained in non-executing package extraction.",
+    "legacy_installer": {
+      "path": "src-tauri/target/privilege-final/sandbox-20261025-ready/inputs/legacy-setup.exe",
+      "sha256": "35e2d0a4eff03cd4f5bac95e15315b088873298318ffcf3ae6ab63b2f99e90af",
+      "provenance": {
+        "path": "src-tauri/target/v0.6.7-release-download/release-metadata.json",
+        "sha256": "e48d213bfccad420045dccd1da3a5eff456d8eb5fa289a6b43cc06e31008ceb8",
+        "bytes": 11524
+      },
+      "qualification": "pending actual guest execution"
+    },
+    "fresh_manifests": [
+      {
+        "path": "src-tauri/target/privilege-final/sandbox-20261025-ready/inspection/candidate-packaged.exe.manifest",
+        "sha256": "780c5f643a1faa7a7198a3114e470fe789beacf042ba7b0fcdf2e6b3e3e20221",
+        "bytes": 641
+      },
+      {
+        "path": "src-tauri/target/privilege-final/sandbox-20261025-ready/inspection/candidate-setup.exe.manifest",
+        "sha256": "af1b818336f0fe606411946503e064b75e22daae2e5cd595d1e88ca8e38ebf03",
+        "bytes": 1480
+      },
+      {
+        "path": "src-tauri/target/privilege-final/sandbox-20261025-ready/inspection/candidate-staged.exe.manifest",
+        "sha256": "780c5f643a1faa7a7198a3114e470fe789beacf042ba7b0fcdf2e6b3e3e20221",
+        "bytes": 641
+      }
+    ],
+    "production_adapter_eligibility_relaxed": false
+  },
+  "fixture_sources": [
+    {
+      "path": "scripts/prepare-privilege-sandbox.ps1",
+      "sha256": "f61eff76d8c5dd849f36d9ee0562b589ef02059fac4bd22f1ac5c212b4c2c015",
+      "bytes": 9284
+    },
+    {
+      "path": "scripts/qualification/Invoke-PrivilegeSandbox.ps1",
+      "sha256": "3aa1abb31ea9a920197a748028520368aa049662f915674a762303ea263ac818",
+      "bytes": 26848
+    },
+    {
+      "path": "tests/sandbox-qualification.test.cjs",
+      "sha256": "981126207bd2b66843bd9f5f2ff8fd56bb6f147f2245fef1ce754afcf5288f5b",
+      "bytes": 2195
+    }
+  ],
+  "validation": {
+    "targeted_fixture_checks": {
+      "passed": 5,
+      "failed": 0,
+      "skipped": 0,
+      "description": "Host refusal in all four entry modes, including spoofed USERNAME; PowerShell 5.1 parsing."
+    },
+    "commands": [
+      {
+        "name": "fixture-guards",
+        "program": "C:\\Program Files\\nodejs\\node.exe",
+        "args": [
+          "--test",
+          "tests/sandbox-qualification.test.cjs"
+        ],
+        "started_utc": "2026-10-25T05:45:07.518Z",
+        "finished_utc": "2026-10-25T05:45:09.041Z",
+        "status": 0,
+        "log": {
+          "path": "src-tauri/target/privilege-final/checkpoint-checks/fixture-guards.log",
+          "sha256": "fcd84bb67274de66ec608386697b0af9af49b985669d4ec81638dea80973d79a"
+        }
+      },
+      {
+        "name": "contracts",
+        "program": "C:/Program Files/nodejs/node.exe",
+        "args": [
+          "C:/Program Files/nodejs/node_modules/npm/bin/npm-cli.js",
+          "run",
+          "check:contracts"
+        ],
+        "started_utc": "2026-10-25T05:45:09.042Z",
+        "finished_utc": "2026-10-25T05:45:11.846Z",
+        "status": 0,
+        "log": {
+          "path": "src-tauri/target/privilege-final/checkpoint-checks/contracts.log",
+          "sha256": "0d70c29f647cdc0e44e772e9f6977e5e24de1f317ecef60dc619fec406e53957"
+        }
+      }
+    ],
+    "generated_mapping_and_hash_checks": "passed",
+    "prior_ordinary_rust": "787 passed / 10 ignored in integration-review evidence; not repeated here",
+    "prior_frontend": "189 passed in integration-review evidence; not repeated here",
+    "diff_check": "passed before checkpoint commit"
+  },
+  "host_observations": {
+    "before": {
+      "path": "src-tauri/target/privilege-final/host-prerequisites.json",
+      "sha256": "5e2d313b75a8bdb2f74b76107f3e24fa03c3006a47787b057cbccdaad979ec81",
+      "bytes": 37629196
+    },
+    "after_enablement": {
+      "path": "src-tauri/target/privilege-final/post-enablement/host-prerequisites.json",
+      "sha256": "102078cd4859ac9753c42620fb022fc3283b7675d5fe7cc8a113c2013b62bd0b",
+      "bytes": 37629195
+    },
+    "comparison": {
+      "path": "src-tauri/target/privilege-final/post-enablement-comparison.json",
+      "sha256": "09ee6395396e07fe4f515d81dd497f81b977eb4d47baa6161f73ebb63cd4e523",
+      "bytes": 224
+    },
+    "selected_adapter": {
+      "alias": "Ethernet",
+      "index": 15,
+      "guid": "{812AD22F-3345-4817-B6D7-708D769E69AC}",
+      "mac": "40:c2:ba:cf:d5:75",
+      "status": "Up",
+      "existing_ipv4_cidrs": [
+        "172.31.169.102/24",
+        "192.168.0.100/24",
+        "192.168.1.100/24"
+      ]
+    },
+    "profile_observation": {
+      "path": "src-tauri/target/privilege-final/profile-preflight.json",
+      "sha256": "84d5cdc41a4c5e1b8849cdbb728265f2a9b47d7b8770c590d012f32a85ee9178",
+      "bytes": 1124
+    },
+    "protected_files": [
+      {
+        "name": "config.toml",
+        "sha256": "3f05496ba04ad9d682588526a2bcf40ca64deb00bd2fd4595020fe86540d6853",
+        "bytes": 1335,
+        "unchanged": true
+      },
+      {
+        "name": "device_cache.toml",
+        "sha256": "00b602bbd9866b31503e0aa91d862780209e34111c81241a39e19c2ab4fd10e4",
+        "bytes": 1075,
+        "unchanged": true
+      },
+      {
+        "name": ".key",
+        "sha256": "de463f270e487b898a27bb5e7b1586dc9b981855bd2811f038038551baa8b4bc",
+        "bytes": 262,
+        "unchanged": true
+      }
+    ],
+    "firewall": {
+      "matching_snapshot_count": 17,
+      "matching_rules_and_all_observed_filter_values_equal": true,
+      "entire_unrelated_policy_store_before_after_not_recorded": true,
+      "exact_v2_rules": 0,
+      "enabled_historical_allow_rules": [
+        {
+          "display": "PocketStream RTSP Server",
+          "protocol": "TCP",
+          "port": 8554,
+          "program": "Any"
+        },
+        {
+          "display": "PocketStream SRT Server",
+          "protocol": "UDP",
+          "port": 8890,
+          "program": "Any"
+        }
+      ],
+      "successful_native_startup": "Requires enabled legacy policy migration; no host migration authorized or performed.",
+      "production_startup_qualified": false
+    },
+    "previous_device_identities": {
+      "camera": "172.31.169.84 / 40:cd:3a:03:28:e2",
+      "ptu": "192.168.1.202 / fc:68:3e:22:05:28",
+      "fresh_live_identity_qualification": "pending after restart; cached/historical identities only at this checkpoint"
+    },
+    "hardware_workflows": "pending; no candidate launch or motion requested"
+  },
+  "unsuccessful_attempts": [
+    {
+      "check": "Feature query from medium-integrity account",
+      "result": "The requested operation requires elevation. Administrator UAC query subsequently succeeded."
+    },
+    {
+      "check": "Initial WSB generation",
+      "result": "XmlNode property assignment rejected a non-string wrapper. Corrected using InnerText and prepared a fresh folder; generated mapping checks passed.",
+      "retained_folder": "src-tauri/target/privilege-final/sandbox-supported"
+    },
+    {
+      "check": "Optional guarded startup-policy prediction",
+      "result": "No exported result; no qualification or safe-launch credit. Prototype preserved and disabled.",
+      "checkpoint": {
+        "path": "src-tauri/target/privilege-final/probe-checkpoint.json",
+        "sha256": "6502ee9141ac725d466e146ca3a89e682bd6dc6366513b73c316331af619f335",
+        "bytes": 332
+      },
+      "retained_folder": "src-tauri/target/privilege-final/incomplete-readonly-prediction"
+    }
+  ],
+  "cleanup": {
+    "candidate_launched": false,
+    "product_installer_executed_on_host": false,
+    "product_uninstaller_executed_on_host": false,
+    "product_maintenance_entry_executed_on_host": false,
+    "profile_files_edited": false,
+    "protected_profile_file_hashes_unchanged": true,
+    "restoration_required": false,
+    "selected_ethernet_state_unchanged": true,
+    "pocketstream_related_firewall_snapshots_unchanged": true,
+    "host_optional_feature_intentionally_enabled": true,
+    "automatic_restart_performed": false,
+    "private_files_or_build_outputs_committed": false,
+    "historical_evidence_preserved": true,
+    "raw_outputs_retained_under_ignored_target": true
+  },
+  "pending": [
+    "Explicit restart confirmation, completed reboot and Sandbox boot",
+    "Guest real services/modules/provider/token/installer preflight and every prepared native scenario",
+    "Full firewall migration/preservation/filter/partial-provider matrix",
+    "Full install/reinstall/actual upgrade/uninstall mode/cancel/failure/queued-launch/ownership matrix",
+    "Fresh safe host startup proof, production settings/both Cancels/discovery/positive in-candidate ICMP/live playback/PTU role/queries/individual operator-confirmed directions/Home/stop/cold-start retry/Close/restoration",
+    "Physical native writes and partial-provider effects; physical binding/watchers; cross-account/session/integrity ownership",
+    "Installed-package/G3/signed updates/endurance/resource closure",
+    "A4 and overall qualification incomplete; B deferred"
+  ]
+}
