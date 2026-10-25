@@ -35,8 +35,8 @@ Choose RTSP or SRT independently under **Output Protocol** for re-streaming. SRT
 ### RTSP / SRT Re-Streaming Server
 - Token-protected RTSP server for sharing the camera feed over the network
 - SRT listener with configurable port, latency, Stream ID and optional passphrase encryption, supporting up to 10 callers
-- With VPN set to **None**, the displayed URL prefers an active physical Wi-Fi address, then Ethernet; camera-adopted addresses are excluded
-- Selecting a VPN explicitly binds the server to that adapter's address
+- With Bind set to **All addresses**, the displayed URL prefers an active physical Wi-Fi address, then Ethernet; camera-adopted addresses are excluded
+- Selecting an eligible Ethernet, Wi-Fi or VPN interface binds to its current address and preserves its stable GUID
 - QR code generation for easy client connection
 - Bandwidth and uptime monitoring
 
@@ -46,8 +46,8 @@ Choose RTSP or SRT independently under **Output Protocol** for re-streaming. SRT
 - Auto-detection of interface status changes (zero network overhead)
 - Host link status refreshes when Windows reports the change; Ethernet hardware negotiation can still take several seconds
 - PC/device IP conflicts identify the owning adapter and explain how to restore browser access
-- VPN interface enumeration for secure remote streaming
-- Automatic Windows Firewall rule management for the RTSP server
+- Physical and VPN binding choices, separate from the full wildcard IPv4 inventory
+- Program-scoped RTSP/SRT Windows rules, preserved block policy, and separate binding/firewall status
 
 All APIPA Nodes are hidden, including historical entries. Saved APIPA host addresses and stored node history are retained. Removing a Node does not remove a host binding. See [reliability release notes](RELEASE-NOTES.md) for binding lifetime, rollback limitations and pending hardware qualification.
 
@@ -104,9 +104,9 @@ npm run typecheck
 
 With the frontend built and the GStreamer SDK's `bin` directory on `PATH`, run `cargo test --lib --locked` from `src-tauri/`. Windows development and test executables embed their Common Controls manifest during linking; no manual executable patch is needed. Leave `POCKETSTREAM_RELEASE` unset for development and tests. Release packaging sets it to `1` to request administrator access.
 
-`npm run check:contracts` also checks the application IPC allowlist. It runs in both modes of `scripts/check.ps1`. The supported wrapper convention is documented with the [v2-A.1 qualification evidence](docs/runtime-evidence/privilege-v2-a1.md). Run the isolated native dialog bridge fixture with `cargo run --example acl_native_smoke --locked` from `src-tauri/`; it cancels only its own dialogs and does not initialize networking. Use a 45-second outer process bound when running this GUI fixture under automation.
+`npm run check:contracts` also checks the application IPC allowlist and pinned installer source contract. `npm run check:installer:generated` inspects and trace-compiles the generated NSIS script after a package build without executing it. It runs in both modes of `scripts/check.ps1`. The supported wrapper convention is documented with the [v2-A.1 qualification evidence](docs/runtime-evidence/privilege-v2-a1.md). Run the isolated native dialog bridge fixture with `cargo run --example acl_native_smoke --locked` from `src-tauri/`; it cancels only its own dialogs and does not initialize networking. Use a 45-second outer process bound when running this GUI fixture under automation.
 
-Privilege-boundary milestone A1 is implemented with 46 commands. [A1 production smoke](docs/runtime-evidence/privilege-v2-a1-continuation.md) exercised settings, both confirmation Cancel paths, discovery, playback and the corrected PTU workflow on the recorded artifacts. The [A2 integration checkpoint](docs/runtime-evidence/privilege-v2-a2.md) connects typed native operations, cancellation ownership, startup recovery and the machine-wide host guard after the [prerequisite proofs](docs/runtime-evidence/privilege-v2-native-prerequisites.md). Native write and remaining production qualification are still pending. A3–A4 and v2-B remain incomplete; firewall/install qualification requires an isolated Windows fixture, which is unavailable. Release builds still request administrator access, so renderer or media compromise still compromises an elevated host.
+The 46-command contract now includes `list_bind_interfaces`. [Earlier application/hardware smoke](docs/runtime-evidence/privilege-v2-a2.md) remains tied to its recorded artifacts. The [firewall/install/binding integration checkpoint](docs/runtime-evidence/privilege-v2-a3.md) implements program-scoped policy, fixed maintenance, guarded in-place installation, stable binding selection and truthful status. Automated/fake-provider checks and installer build/inspection are separate from native qualification. The operator authorized deferring isolated prerequisite tests until release qualification; [the deferred procedure](docs/runtime-evidence/privilege-v2-release-qualification.md) records those pending gates. A4 and overall qualification remain incomplete. v2-B is deferred, and release builds still request administrator access: renderer/media compromise still compromises an elevated host.
 
 ## Architecture
 

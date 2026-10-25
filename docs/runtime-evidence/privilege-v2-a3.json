@@ -1,0 +1,2394 @@
+{
+  "document": "Firewall, installation and binding integration checkpoint",
+  "recorded_at_utc": "2026-10-25T04:12:43.180Z",
+  "baseline": {
+    "commit": "fe21fc09474f41875814cf8753e4ee4db4bc108a",
+    "branch": "main",
+    "worktree_clean_before_continuation": true,
+    "prior_uncommitted_evidence": [],
+    "pushed": false,
+    "co_author_trailers_added": false
+  },
+  "status": {
+    "implementation": "integrated",
+    "automated_checks": "passed",
+    "native_firewall_install_qualification": "pending",
+    "native_binding_matrix": "pending",
+    "a4": "incomplete",
+    "overall_qualification": "incomplete",
+    "b": "deferred"
+  },
+  "sequencing_exception": {
+    "authorized_by": "user",
+    "local_date": "2026-10-24",
+    "instruction": "I authorize deferring the isolated Windows prerequisite tests until release qualification.",
+    "scope": "Permit dependent implementation before isolated firewall/install and native binding prerequisite tests; no passing native result is inferred.",
+    "isolated_fixture_available": false
+  },
+  "specification": {
+    "revision": "2-A.1",
+    "sha256": "4af6b2f7924d8a9c29d9f63159ffd6f112ff4bed7f467111e62197d13465a2a9",
+    "b_implementation": false
+  },
+  "contracts": {
+    "application_commands": 46,
+    "command_rename": {
+      "from": "list_vpn_interfaces",
+      "to": "list_bind_interfaces"
+    },
+    "referenced_command_wrappers": 46,
+    "plugin_permissions": 9,
+    "release_execution_level": "requireAdministrator",
+    "test_execution_level": "asInvoker",
+    "common_controls": true
+  },
+  "source_inputs": {
+    "hash_convention": "SHA-256 of actual worktree bytes; canonical digest is sorted SHA256 + two spaces + relative path + LF. Application/build inputs and validation tools are recorded separately; runtime payload files are hashed under artifacts.",
+    "application": {
+      "files": [
+        {
+          "path": "index.html",
+          "sha256": "b9fa14cd5be40253a8bf1ba3b1c53adf7440cba88ec482bb40da98e962d9785e",
+          "bytes": 32238
+        },
+        {
+          "path": "package-lock.json",
+          "sha256": "93f7275123c002b1c5846f9275d335d9a5bf279fb47a2ab7c220962bf5188696",
+          "bytes": 72978
+        },
+        {
+          "path": "package.json",
+          "sha256": "2cbf16a843bf06efcd5328a67279906d1d692c438a5f005c58050646dcc91564",
+          "bytes": 1221
+        },
+        {
+          "path": "src-tauri/Cargo.lock",
+          "sha256": "21935f69e57d24a299bb96b0ca2c7f20b3ddb5dd985e88a9f33fd69b75e477ac",
+          "bytes": 168969
+        },
+        {
+          "path": "src-tauri/Cargo.toml",
+          "sha256": "6ec0faf1662c899d6a5b4733666cb8383b9c8e8eba94c464b752c390e9fdcbd9",
+          "bytes": 2095
+        },
+        {
+          "path": "src-tauri/build.rs",
+          "sha256": "e90a76336ce3ab1d1d8c6f4646abc3cece68792fc3c88d58f8f834d06bd73068",
+          "bytes": 6786
+        },
+        {
+          "path": "src-tauri/capabilities/default.json",
+          "sha256": "9a0f693f988916a50b7e97e8dd81343675027928a9d1e49a3da72e9f4c1273ef",
+          "bytes": 1884
+        },
+        {
+          "path": "src-tauri/icons/128x128.png",
+          "sha256": "1a21505846cbd29febd620c90793b5a97844b96f3e13d05512a2a5a57e79c2a8",
+          "bytes": 19726
+        },
+        {
+          "path": "src-tauri/icons/128x128@2x.png",
+          "sha256": "57f1431c9171c97474f23f33ebc7f22ddd64ea9ce9a2ecff6fad6065a80b50e0",
+          "bytes": 63967
+        },
+        {
+          "path": "src-tauri/icons/32x32.png",
+          "sha256": "416bd652ca87ff3ce382f70d8553024afbc1367a270300e33961be0956708fb8",
+          "bytes": 2067
+        },
+        {
+          "path": "src-tauri/icons/64x64.png",
+          "sha256": "94fec95f2c66575567ea04f57b6de1f1ccf92d44be802ccd36741c86b4ed0abe",
+          "bytes": 6296
+        },
+        {
+          "path": "src-tauri/icons/Square107x107Logo.png",
+          "sha256": "6d883c1f91a74ec8e23dfceacc518b1238892a157432572a62ee05dbb461a374",
+          "bytes": 14691
+        },
+        {
+          "path": "src-tauri/icons/Square142x142Logo.png",
+          "sha256": "eca7debaf7d541ba6810ed7c12972f84bc6e6164674cc09dd40442528931b6d3",
+          "bytes": 23256
+        },
+        {
+          "path": "src-tauri/icons/Square150x150Logo.png",
+          "sha256": "c94ae61033699b8022df986a4534b7837443df1c46bd89c47d31894a13d5142d",
+          "bytes": 25588
+        },
+        {
+          "path": "src-tauri/icons/Square284x284Logo.png",
+          "sha256": "0dd7f08698c9dfa2480c373f47b0e38bc46de80d8039f5f0d3fbfc5428192f32",
+          "bytes": 77852
+        },
+        {
+          "path": "src-tauri/icons/Square30x30Logo.png",
+          "sha256": "9e9657c9bdb9619d14f423ad883eb4aed1cbccc43db13fe635df1c431281b4bd",
+          "bytes": 1920
+        },
+        {
+          "path": "src-tauri/icons/Square310x310Logo.png",
+          "sha256": "1316ff6b88d959b877d97b9ebdcb4cfb059ae5a420724b3bbd056f04266412f5",
+          "bytes": 92072
+        },
+        {
+          "path": "src-tauri/icons/Square44x44Logo.png",
+          "sha256": "d10b461951ea526d6278f16d05857466be86b04c8e32fedf52a7b6c329795fc6",
+          "bytes": 3438
+        },
+        {
+          "path": "src-tauri/icons/Square71x71Logo.png",
+          "sha256": "720cb30d07baccb8a015563fb8bb42c03f7746c32f9374c08a3731bb51db2bde",
+          "bytes": 7618
+        },
+        {
+          "path": "src-tauri/icons/Square89x89Logo.png",
+          "sha256": "a5af9ebee1e1cce1d3c2b9e3f97a9b89c17f0f32d5de5fcd936f574c48be988b",
+          "bytes": 11007
+        },
+        {
+          "path": "src-tauri/icons/StoreLogo.png",
+          "sha256": "4b0eef3b7f3414f3cf12f26ae1f9dec6a011d40c42dcc2fa7491e91f2071bab6",
+          "bytes": 4305
+        },
+        {
+          "path": "src-tauri/icons/android/mipmap-anydpi-v26/ic_launcher.xml",
+          "sha256": "760d4b8a06bf7163dd010c33ad2cac9e4a75fa0177afaba042f83e311eef0c3e",
+          "bytes": 261
+        },
+        {
+          "path": "src-tauri/icons/android/mipmap-hdpi/ic_launcher.png",
+          "sha256": "228c5dada5eaa1fd8b7c22e0defbcd2175fa424f34f98411a8472c72aadbef20",
+          "bytes": 3403
+        },
+        {
+          "path": "src-tauri/icons/android/mipmap-hdpi/ic_launcher_foreground.png",
+          "sha256": "c38488e087ca9cd4c6702824ef4b87899643acd6bac764c157241832b9ab9727",
+          "bytes": 28831
+        },
+        {
+          "path": "src-tauri/icons/android/mipmap-hdpi/ic_launcher_round.png",
+          "sha256": "a13242dd654e4ce5ef5c66241772ac690913b2db63283f7401579f57fa56462c",
+          "bytes": 3329
+        },
+        {
+          "path": "src-tauri/icons/android/mipmap-mdpi/ic_launcher.png",
+          "sha256": "84b5380237b0c8675af471fabb8a1f834ff3775b3d9710602af22a8b75f98c42",
+          "bytes": 3310
+        },
+        {
+          "path": "src-tauri/icons/android/mipmap-mdpi/ic_launcher_foreground.png",
+          "sha256": "51b0a0230c23ee90ca71a14c2b4d36798f8afad6f7f48635396c5577bf320681",
+          "bytes": 14889
+        },
+        {
+          "path": "src-tauri/icons/android/mipmap-mdpi/ic_launcher_round.png",
+          "sha256": "27a3e7b66174ae4e8e175dd9c046747a6b7c0cd7ec42af4e3c4db5a6037eb8eb",
+          "bytes": 3164
+        },
+        {
+          "path": "src-tauri/icons/android/mipmap-xhdpi/ic_launcher.png",
+          "sha256": "1a15a61078a4b81676de65a4a57bf344562dda78e95b59016b072fa5fca20037",
+          "bytes": 10076
+        },
+        {
+          "path": "src-tauri/icons/android/mipmap-xhdpi/ic_launcher_foreground.png",
+          "sha256": "2cdff4fa26b3e79ab827afe549d454350ed992b87c06b7eaeb361f7e61aa711f",
+          "bytes": 46880
+        },
+        {
+          "path": "src-tauri/icons/android/mipmap-xhdpi/ic_launcher_round.png",
+          "sha256": "47b9d51047a65c4ad3321970707aece70a7a6a6b93db245a84323ce52d44e55b",
+          "bytes": 9927
+        },
+        {
+          "path": "src-tauri/icons/android/mipmap-xxhdpi/ic_launcher.png",
+          "sha256": "cb8247b8221b226222cbc423cc24fcc8f660ad006978d877e115a8cee664e1de",
+          "bytes": 19267
+        },
+        {
+          "path": "src-tauri/icons/android/mipmap-xxhdpi/ic_launcher_foreground.png",
+          "sha256": "99e9568fecccc635304ee8650e9f2831dde94d70191da490bb1f72a92da280b7",
+          "bytes": 99772
+        },
+        {
+          "path": "src-tauri/icons/android/mipmap-xxhdpi/ic_launcher_round.png",
+          "sha256": "d7e3ef287ef7a80467466175dbd8b3a5c35b3eb71910f383c907e82f845ca14f",
+          "bytes": 19379
+        },
+        {
+          "path": "src-tauri/icons/android/mipmap-xxxhdpi/ic_launcher.png",
+          "sha256": "2172b15f5d3b92d1e45716e2986760d94b2e6b0d308f784590290105187f23d6",
+          "bytes": 30651
+        },
+        {
+          "path": "src-tauri/icons/android/mipmap-xxxhdpi/ic_launcher_foreground.png",
+          "sha256": "a7260b26a63138a527459011d2485f63b4258e9aa236c45bcde959dceabd8d85",
+          "bytes": 169700
+        },
+        {
+          "path": "src-tauri/icons/android/mipmap-xxxhdpi/ic_launcher_round.png",
+          "sha256": "401c22d02af7fe06bc7bbcfccbbf436b48b28848423673803019f19b4f580197",
+          "bytes": 30822
+        },
+        {
+          "path": "src-tauri/icons/android/values/ic_launcher_background.xml",
+          "sha256": "0687336f0ccc6f7ee09c7c95110667c63b75931238df779a21af401fb864cd34",
+          "bytes": 115
+        },
+        {
+          "path": "src-tauri/icons/icon.icns",
+          "sha256": "1f7b74f9212380197ee8655e78ec1901abd4ecb574ffd4e119327efa65810f0c",
+          "bytes": 1262556
+        },
+        {
+          "path": "src-tauri/icons/icon.ico",
+          "sha256": "de7cccc3a44a4c486068ee4a6ac6ba98fef82ec91836a13962945a7dd4642c35",
+          "bytes": 80569
+        },
+        {
+          "path": "src-tauri/icons/icon.png",
+          "sha256": "c1419215902fba76aa5f3045ca68aac0bbf432b3df96a4baae27fa6ec2b5a6b2",
+          "bytes": 230108
+        },
+        {
+          "path": "src-tauri/icons/ios/AppIcon-20x20@1x.png",
+          "sha256": "b3ae416ff646f6365c6e2f4d7cee0680c2d62baf6f2e5c0842e362a0dd198d50",
+          "bytes": 1033
+        },
+        {
+          "path": "src-tauri/icons/ios/AppIcon-20x20@2x-1.png",
+          "sha256": "d75a81ce783691372844f7cbb671827efa0a7f6b1b2efa6203151546f44ff819",
+          "bytes": 2870
+        },
+        {
+          "path": "src-tauri/icons/ios/AppIcon-20x20@2x.png",
+          "sha256": "d75a81ce783691372844f7cbb671827efa0a7f6b1b2efa6203151546f44ff819",
+          "bytes": 2870
+        },
+        {
+          "path": "src-tauri/icons/ios/AppIcon-20x20@3x.png",
+          "sha256": "7c6898454ebce7445e627428a670b27e9bbfb2cee9a8d7aeac06e1a9a1e21d64",
+          "bytes": 5482
+        },
+        {
+          "path": "src-tauri/icons/ios/AppIcon-29x29@1x.png",
+          "sha256": "07b204210efea69da7ec90f965e0e560d892996973e584ab9769100b2b0449a0",
+          "bytes": 1808
+        },
+        {
+          "path": "src-tauri/icons/ios/AppIcon-29x29@2x-1.png",
+          "sha256": "47d34c94dbfcf6eb2d7df0b24d7abf3ef4249a6c7935758fa877c852639dc3dd",
+          "bytes": 5190
+        },
+        {
+          "path": "src-tauri/icons/ios/AppIcon-29x29@2x.png",
+          "sha256": "47d34c94dbfcf6eb2d7df0b24d7abf3ef4249a6c7935758fa877c852639dc3dd",
+          "bytes": 5190
+        },
+        {
+          "path": "src-tauri/icons/ios/AppIcon-29x29@3x.png",
+          "sha256": "6efb3740347e74243bd3322c29c4b999077e195c7d0495216b0c1ec51b542cb6",
+          "bytes": 10169
+        },
+        {
+          "path": "src-tauri/icons/ios/AppIcon-40x40@1x.png",
+          "sha256": "d75a81ce783691372844f7cbb671827efa0a7f6b1b2efa6203151546f44ff819",
+          "bytes": 2870
+        },
+        {
+          "path": "src-tauri/icons/ios/AppIcon-40x40@2x-1.png",
+          "sha256": "3d1a77773dd541f0f055cd7eef4b335d632ff924545b5e741042091e489711f2",
+          "bytes": 8876
+        },
+        {
+          "path": "src-tauri/icons/ios/AppIcon-40x40@2x.png",
+          "sha256": "3d1a77773dd541f0f055cd7eef4b335d632ff924545b5e741042091e489711f2",
+          "bytes": 8876
+        },
+        {
+          "path": "src-tauri/icons/ios/AppIcon-40x40@3x.png",
+          "sha256": "bcded73a91828c1608b96341935b3d114b822fe99890ce4d3d5db4ad3c826c6e",
+          "bytes": 17257
+        },
+        {
+          "path": "src-tauri/icons/ios/AppIcon-512@2x.png",
+          "sha256": "d116020857e672f9ebe18aaae2d580a3b362e0b374bc1f7bac701a74722d70f5",
+          "bytes": 635935
+        },
+        {
+          "path": "src-tauri/icons/ios/AppIcon-60x60@2x.png",
+          "sha256": "bcded73a91828c1608b96341935b3d114b822fe99890ce4d3d5db4ad3c826c6e",
+          "bytes": 17257
+        },
+        {
+          "path": "src-tauri/icons/ios/AppIcon-60x60@3x.png",
+          "sha256": "1b995aa6da4006ca3616c15c79e8132db120fb6ede264d129e02fd32795d0f89",
+          "bytes": 33692
+        },
+        {
+          "path": "src-tauri/icons/ios/AppIcon-76x76@1x.png",
+          "sha256": "615071c4542f163b3dd908eb270784cca59886d3fca6c2ab4384ebfe50f2ec3e",
+          "bytes": 8187
+        },
+        {
+          "path": "src-tauri/icons/ios/AppIcon-76x76@2x.png",
+          "sha256": "16511058f5ec82b70b1cbd97399b90ddcf3c46b9b0a90b93d08b60b4d121b149",
+          "bytes": 25408
+        },
+        {
+          "path": "src-tauri/icons/ios/AppIcon-83.5x83.5@2x.png",
+          "sha256": "c156799673ae4cb32285579831341b456fcf4e9032e0fb4da791f9ddaf78d7cc",
+          "bytes": 29720
+        },
+        {
+          "path": "src-tauri/icons/source-icon-cropped.png",
+          "sha256": "6a741c39f6d2ffc7c678760e407460710350da42592bd321fda29d305809bbb7",
+          "bytes": 830067
+        },
+        {
+          "path": "src-tauri/icons/source-icon.png",
+          "sha256": "f0d1833a962c9fa343e1697333622a420050059d1ac78485bcb77afac9c66f85",
+          "bytes": 500834
+        },
+        {
+          "path": "src-tauri/installer/UPSTREAM-LICENSE-MIT",
+          "sha256": "9dd42ea92cff2ede5cd477cbfcce051b2d0115c0ac7f368ee88cb545055dff1d",
+          "bytes": 1090
+        },
+        {
+          "path": "src-tauri/installer/installer.nsi",
+          "sha256": "1852c9bcce8c2d307bb628560cd46492ab5190a417d772352d091af05abce219",
+          "bytes": 25853
+        },
+        {
+          "path": "src-tauri/installer/installer.upstream.nsi",
+          "sha256": "fe22026f68bdb3292fab376756035496ce0a35e3d580e06ebaa6a28295916eb3",
+          "bytes": 31256
+        },
+        {
+          "path": "src-tauri/installer/provenance.json",
+          "sha256": "e302069e91aa088a5a92d1f9a4cf15d708824bdbde0009354a932ec2dd1660f8",
+          "bytes": 962
+        },
+        {
+          "path": "src-tauri/installer/transaction.nsh",
+          "sha256": "df44384bef152970a660249e5ed268321efb254b3168b02b996a1f3b7b468890",
+          "bytes": 7558
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/add_manual_node.toml",
+          "sha256": "59c542d2f11c2dd04b0f9a156e54a855511a2d956eb94cdf0f723c096740ad67",
+          "bytes": 390
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/add_secondary_ip.toml",
+          "sha256": "55227e570fb8ab0853a6e218be1564752081ab0b224bf812dd336deb35d1e15f",
+          "bytes": 396
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/apply_restream_settings.toml",
+          "sha256": "f338dbbabc8ea7d188dd77971d9f20649c8ec9b555c4c5468eaf0765e744d338",
+          "bytes": 438
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/clear_manual_nodes.toml",
+          "sha256": "0e02ceb0f066d9d188baeeb6232484ff969d8e857fca17cfecf90c2fbf35317f",
+          "bytes": 408
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/control_cgi_zoom_direct.toml",
+          "sha256": "47b6c4688f191b2106ae00450015b9208b2fce524e6eefcb2235da48319cbd09",
+          "bytes": 438
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/create_video_window.toml",
+          "sha256": "371acdf00a1d9e9dbb3b48e1a0d4693574805b4b4e681ef381805fb8447e0342",
+          "bytes": 414
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/forget_device.toml",
+          "sha256": "447eaf7564c8e06dc85db48beac8c3dda320cb642e325008a3c06ce6f858ba18",
+          "bytes": 378
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/get_adapter_selection.toml",
+          "sha256": "308c796f8df6d8bdd784ddf712a3648f284e43c5b3eb5589aa1bd52c049828c2",
+          "bytes": 426
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/get_adoption_state.toml",
+          "sha256": "f0a1c1b7070490548179c0b926098e27d074302bd940b2eaa884440f354ed982",
+          "bytes": 408
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/get_capture_state.toml",
+          "sha256": "200966cbed0691348950f6c89650797d9a0078fe4ea0f95715a91ef1c4218d19",
+          "bytes": 402
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/get_config.toml",
+          "sha256": "815bcf8ce240536e89bf35037a68ac3fd27c56b7fb115e81466148c659bbf3b2",
+          "bytes": 360
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/get_device_list.toml",
+          "sha256": "37d400ef3102ba0df33450c45df51be21b831c28834204981622f5f682554afa",
+          "bytes": 390
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/get_dhcp_state.toml",
+          "sha256": "4ffe2cccdf4ec755d3ed70637ae1437cb73e883fdfe63537c50bccb37867bbcf",
+          "bytes": 384
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/get_host_ip_owners.toml",
+          "sha256": "9311ce28bf21443854b3e47b5fc92f9d378d68dac0fd3b49b0d07e03663ff82b",
+          "bytes": 408
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/get_license_document.toml",
+          "sha256": "da94be00b50fc7b8955876d7840f3939dba251e750d65a7c6d6e6db3d88aba8e",
+          "bytes": 420
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/get_network_mode.toml",
+          "sha256": "ff3641d02b2c593643bc92b281a45020a5fb6dd538e5d0346ca86aecc2470b14",
+          "bytes": 396
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/get_startup_notices.toml",
+          "sha256": "45c7dc9003a911dff9c6f597d65a34beec8097805a75fa9b9163d5e5dbb55e4f",
+          "bytes": 414
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/list_bind_interfaces.toml",
+          "sha256": "211907304d46127dca5b6d5f27145eafd0bfa57aadeba3ce635c9c9c9275e28f",
+          "bytes": 420
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/log_frontend.toml",
+          "sha256": "8746769c3dd0cdf1478a4ceb062c317dece01178095dbef3bbfb6bb8486b19ea",
+          "bytes": 372
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/open_device_browser.toml",
+          "sha256": "48018daae010cdb19f9106c5a7c1ea08c61a9ef46317f4c706c3f64fa030a9f6",
+          "bytes": 414
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/open_log_folder.toml",
+          "sha256": "92b7bf8551f080edfda6ab5f5b4c75e355fda588f969cc03fc9cb0b900d0ecf0",
+          "bytes": 390
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/ptu_send.toml",
+          "sha256": "5ae199f17f2cfc077ea248cc6fdffc1a29ada23d1195beee880b159ae6b9ffa8",
+          "bytes": 348
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/refresh_adapter.toml",
+          "sha256": "71fcdbce3fcfe6adf063483577913f57e98f9844a107aab0ded4547f87bb3a64",
+          "bytes": 390
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/remove_adopted_subnet.toml",
+          "sha256": "ee127dc59f5053146b6c677e7008c45067d519bb7a3180c8d5670927c0f75e59",
+          "bytes": 426
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/remove_manual_node.toml",
+          "sha256": "feee3599d3a9ff8a5e2b452990724758546da6a257d6e619e07e596e636c8f01",
+          "bytes": 408
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/remove_secondary_ip.toml",
+          "sha256": "4014e56ed462620bdb51adec61ad0617f4bddb54ed022cbd5d546c0a42e31d2c",
+          "bytes": 414
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/retry_playback.toml",
+          "sha256": "7f94319b2430e6f73d669bc0e730e34bdf10e0b800466512c41c9a6423547892",
+          "bytes": 384
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/scan_network.toml",
+          "sha256": "e1affbbda911c6ff4d0fdac80863a61e92d8c5971e01e9634f8a7419df797bef",
+          "bytes": 372
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/select_adapter.toml",
+          "sha256": "4dda702b57928967d6f48e445c9f2ae3642dd424c58948c49e6c707ee1160b70",
+          "bytes": 384
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/set_audio_muted.toml",
+          "sha256": "04a218a10f10287160683c3ee39a08baf69ff1edc30c95302d3e19ad6b682822",
+          "bytes": 390
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/set_device_alias.toml",
+          "sha256": "2c28507343b9b69b293c264b51c4a45519e945a31cae8cab7f28d02368728061",
+          "bytes": 396
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/set_network_mode.toml",
+          "sha256": "129823afd60fd2d1540b4f28cb0a0d10def3e0a6220380f1d7a137fc55bf850f",
+          "bytes": 396
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/set_video_visible.toml",
+          "sha256": "e439964f996736a75fed5aefc894cd4875e504e86209e45e9ec1015c0ac84367",
+          "bytes": 402
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/set_zoom_position.toml",
+          "sha256": "4bc89d0276388f4aeddcae4dbc4cea348efe3456ef3891d2a00544cd502b16b4",
+          "bytes": 402
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/start_arp_discovery.toml",
+          "sha256": "3e3a7e628f372d5d8b78cafd6403cd416b536b0fea55b8c73e9b92d1a6dcdf2e",
+          "bytes": 414
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/start_recording.toml",
+          "sha256": "4991db9dc57876facec4b12035507bf3a9551ef57ecc77aafd2e7bd68393dc36",
+          "bytes": 390
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/start_restream_server.toml",
+          "sha256": "50eb7e7a5566111937738bb39bf8f8e21c2fac315dfc764215e7bb8871e0114b",
+          "bytes": 426
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/start_stream.toml",
+          "sha256": "aa03b92df3d158dfce6d23e9101748918248f5e7af8fe828d3ecc33b1951b16d",
+          "bytes": 372
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/stop_recording.toml",
+          "sha256": "0008c014102cb1229dec7992bf95c546ee0f10b718652837848886403bbeb185",
+          "bytes": 384
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/stop_restream_server.toml",
+          "sha256": "71e4101ba34026e636e3d5bcabdc4d1933c842658067f255b7af5d4f702285de",
+          "bytes": 420
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/stop_stream.toml",
+          "sha256": "3a0e0c2c6a42be398cd4b874df00493757b96a05b14e36e0aeb79713885fd569",
+          "bytes": 366
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/switch_restream_protocol.toml",
+          "sha256": "32c78555735f3ad881f9c4c3f8b59d47ed2e6834da286395c7c1f46372142d66",
+          "bytes": 444
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/take_screenshot.toml",
+          "sha256": "43e66bcab846c043e11ce9a9b77492a7e4f884edbe019f198161e54125da4b5a",
+          "bytes": 390
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/update_credentials.toml",
+          "sha256": "bd45df0f0d581013a88284635463eef4a42d765ac75257db78c0933f0104451e",
+          "bytes": 408
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/update_stream_settings.toml",
+          "sha256": "3b08c2eba2a79834c6413f59e83b91198dfd830199505118c0a51463b7932b6b",
+          "bytes": 432
+        },
+        {
+          "path": "src-tauri/permissions/autogenerated/update_video_position.toml",
+          "sha256": "bca08c3ec612b838cf050968ec5de7498932e857733acdde1f131e3459da459e",
+          "bytes": 426
+        },
+        {
+          "path": "src-tauri/pocketstream.dev.manifest",
+          "sha256": "80bae5a84c03e1c426f638fc27064cc7ce1aacb403d8ee85b12453a470cf9917",
+          "bytes": 620
+        },
+        {
+          "path": "src-tauri/pocketstream.exe.manifest",
+          "sha256": "c2cde06c274d7ed94b171a357a79976c296693c03926653ad7e304b29e6155ef",
+          "bytes": 631
+        },
+        {
+          "path": "src-tauri/src/camera/flir_ptu.rs",
+          "sha256": "4ca268130f5214f2fa28b2a0d81445aa73daf9c69cc1edc86b939a4e8f9b0533",
+          "bytes": 8665
+        },
+        {
+          "path": "src-tauri/src/camera/mod.rs",
+          "sha256": "496f1cf97048b4deabe526a007a40a0df7d6c4c485983f7897e65d7e57b0b340",
+          "bytes": 19
+        },
+        {
+          "path": "src-tauri/src/commands/camera.rs",
+          "sha256": "3cc2e0eee02785365c1ca725d3f0c4a53f496cf306330348342f9f5139b7c9a6",
+          "bytes": 6309
+        },
+        {
+          "path": "src-tauri/src/commands/config.rs",
+          "sha256": "fcc6d49a4d72aad2ddf866574e9a46efa66150fb77cde330908c8255fc7464f8",
+          "bytes": 1971
+        },
+        {
+          "path": "src-tauri/src/commands/mod.rs",
+          "sha256": "e9bc3d9ba3853bcbb549b675a755fa42dc115556737d5b1682b6f18c9aebd8f4",
+          "bytes": 6853
+        },
+        {
+          "path": "src-tauri/src/commands/network.rs",
+          "sha256": "ce741fe09c0e8c9ca0f8dfa5794b7003444486176507332111907d70abb0945f",
+          "bytes": 14753
+        },
+        {
+          "path": "src-tauri/src/commands/streaming.rs",
+          "sha256": "7d0fe550010cc32cac9a7e27706e557589d6b276237701c8a2d7fbb9be346b4c",
+          "bytes": 8745
+        },
+        {
+          "path": "src-tauri/src/config.rs",
+          "sha256": "e48eef300768b86fe1569933fead534e35186ee775ff33f96e71dd7f2268f789",
+          "bytes": 164605
+        },
+        {
+          "path": "src-tauri/src/entry.rs",
+          "sha256": "96270aa5398fd8504ce4e90272100d34cad25459e681763f29c8d168357bf8b7",
+          "bytes": 5299
+        },
+        {
+          "path": "src-tauri/src/error.rs",
+          "sha256": "db1d00c3eebe6556691996315e8ae2f00a41f2cc9da0cb39adf4c0884c6f3b02",
+          "bytes": 7709
+        },
+        {
+          "path": "src-tauri/src/ipc_acl_tests.rs",
+          "sha256": "e177d8780c22e44ee2262c7d3f61c6d2957fb0e7447caf1c86cfd5fa5644e288",
+          "bytes": 4114
+        },
+        {
+          "path": "src-tauri/src/lib.rs",
+          "sha256": "351b69cf2cc425185c68f972dedab99041524136f8492fb78caa5b03b4fdae80",
+          "bytes": 29720
+        },
+        {
+          "path": "src-tauri/src/logging.rs",
+          "sha256": "e4ded520a1f6f00ba16a14082000b93a030768891df61b88f27530ee307f5bd4",
+          "bytes": 8725
+        },
+        {
+          "path": "src-tauri/src/main.rs",
+          "sha256": "bb38b569d453d7d5c7ba9da05d7600e709d9107529765dc991cd01e9f9626026",
+          "bytes": 119
+        },
+        {
+          "path": "src-tauri/src/maintenance.rs",
+          "sha256": "4d2d7486049c57b91df59dc357e9eb1b2a47b02eea724916f8801c0f5ff7fe13",
+          "bytes": 4937
+        },
+        {
+          "path": "src-tauri/src/network/adapter_refresh.rs",
+          "sha256": "9bc5721856b4f5bb73548fb099beff28022325d0a1c53e8738fdcd0ede4f621e",
+          "bytes": 1420
+        },
+        {
+          "path": "src-tauri/src/network/arp.rs",
+          "sha256": "ebd10ccd15a499b196172b97315d1d33da8ed30349059fe8311c07c9182000ee",
+          "bytes": 100710
+        },
+        {
+          "path": "src-tauri/src/network/auto_adopt.rs",
+          "sha256": "3b0a42e9c7482fbebacc8490aab0848abcd020af83756795f785d1e419465d16",
+          "bytes": 55150
+        },
+        {
+          "path": "src-tauri/src/network/bindings.rs",
+          "sha256": "ccfc1c518658c90f3f7a13aea01c0e6dbb08f5fadbc3541c3f5e5e4918a282f2",
+          "bytes": 10047
+        },
+        {
+          "path": "src-tauri/src/network/bound_tcp.rs",
+          "sha256": "25d8ea77315e5f390714f7d49d27413f04eea9dcb9a27463adea5185f77a237c",
+          "bytes": 13915
+        },
+        {
+          "path": "src-tauri/src/network/cache_probe.rs",
+          "sha256": "0c9d67597e8f4c22407dd8638cbf35848a706f23c10406af2f4554cf9be4bf98",
+          "bytes": 26176
+        },
+        {
+          "path": "src-tauri/src/network/device_registry.rs",
+          "sha256": "3d9c82742d7ad0abb4aa6f2fc961bc6a8c314c9c52a8b9602c1e19b0f18af650",
+          "bytes": 70420
+        },
+        {
+          "path": "src-tauri/src/network/firewall-policy-v2.ps1",
+          "sha256": "b98fc60ecdb9703ff0f7129f5fe8fc40ce45f83bfe43cd1ba5e86337ee78e14b",
+          "bytes": 14237
+        },
+        {
+          "path": "src-tauri/src/network/firewall.rs",
+          "sha256": "4b03b0a85b166c929b0773e0d9a4f537730ea4a3987de7a74bebac95dd791a8b",
+          "bytes": 9500
+        },
+        {
+          "path": "src-tauri/src/network/ghost.rs",
+          "sha256": "30ad3c3b64954ff1b1dbf89a969bc6556d85f9b48ed1cb04033cd1d7b8be96cf",
+          "bytes": 20299
+        },
+        {
+          "path": "src-tauri/src/network/host_owner.rs",
+          "sha256": "f3c885d0d7ca498bc36d5ad97dcc132a45094c74ba69293441be4a0a172d1b3a",
+          "bytes": 8089
+        },
+        {
+          "path": "src-tauri/src/network/interface.rs",
+          "sha256": "8152698287c577bf6d02fee66eac368b1ae18be532dffef5e494dd9b10546d77",
+          "bytes": 99232
+        },
+        {
+          "path": "src-tauri/src/network/ip_config.rs",
+          "sha256": "a71f8cd80ad672cb5f8973c6c706fa54eb5dfd15326977e79ec43e21e3d3ba9e",
+          "bytes": 22451
+        },
+        {
+          "path": "src-tauri/src/network/ip_conflict.rs",
+          "sha256": "0b17b1e12a9c9bc58988926ebffa9362164843260ca361cc1331a09413140209",
+          "bytes": 8705
+        },
+        {
+          "path": "src-tauri/src/network/local_executor.rs",
+          "sha256": "0835cead33614257b997c2cc799a26f338777c35641c21ce5bbf6af491011c36",
+          "bytes": 8724
+        },
+        {
+          "path": "src-tauri/src/network/manual_address.rs",
+          "sha256": "9dd88fbb949cd3428113a7d8e1369cc810d1749d60aa4861d988d39073e0b234",
+          "bytes": 82451
+        },
+        {
+          "path": "src-tauri/src/network/mod.rs",
+          "sha256": "058ffbae226f117cba94efea76f1e662a3386cf5171a8e73b2dc121b9407cb1b",
+          "bytes": 302830
+        },
+        {
+          "path": "src-tauri/src/network/native-operations-v1.ps1",
+          "sha256": "5df29bdc431aa09fb8c3edb86f5af1dd7c823110d5e9115de8b4f8146dac4085",
+          "bytes": 15446
+        },
+        {
+          "path": "src-tauri/src/network/native_operations.rs",
+          "sha256": "0e47c220e842a201b677ebcc8b27e0e8369467684697ca9bd9191978259f8a36",
+          "bytes": 46712
+        },
+        {
+          "path": "src-tauri/src/network/native_runner.rs",
+          "sha256": "baf6484770a3acc01454bd10b03bccc6f6f4e12344b068662ca8e64d3fa4be7e",
+          "bytes": 20790
+        },
+        {
+          "path": "src-tauri/src/network/ping_dot.rs",
+          "sha256": "f73462a815ce1327ccbc366b502defe464a44a7fe53c9c8da839fdf9740b8c24",
+          "bytes": 9602
+        },
+        {
+          "path": "src-tauri/src/network/pktmon.rs",
+          "sha256": "f1219324b4cf298974e7be0a77be611938cfed63c5d8bce0749e477bcf442b23",
+          "bytes": 47973
+        },
+        {
+          "path": "src-tauri/src/network/presence.rs",
+          "sha256": "4fefe1687cc1b9071ea400c242f2aa521e9bb1578e6d5556668f2a2645ff136a",
+          "bytes": 31528
+        },
+        {
+          "path": "src-tauri/src/network/reaper.rs",
+          "sha256": "3b77b22281b504c4a3c775f18b70e4a0ac6a5800310bf8a059cea2c3bca45310",
+          "bytes": 12440
+        },
+        {
+          "path": "src-tauri/src/network/route.rs",
+          "sha256": "60e5a114c261be954b26699f4f411521af8313a3272a922750205d07be3fd48b",
+          "bytes": 9044
+        },
+        {
+          "path": "src-tauri/src/network/scanner.rs",
+          "sha256": "4b7bf89696370b9138cdc49e5a6f5f264cf3bdb9510e5935e01e17137648e724",
+          "bytes": 22965
+        },
+        {
+          "path": "src-tauri/src/network/watcher.rs",
+          "sha256": "9f406e5b66d084883c624a4e92895d234496f7f7984dc334c04f04c4e472a7bb",
+          "bytes": 18665
+        },
+        {
+          "path": "src-tauri/src/settings_validation.rs",
+          "sha256": "e15a779869faf22a42c3ea092778f7aab426cdfce5dd3eb1078d8275cb5011c0",
+          "bytes": 17030
+        },
+        {
+          "path": "src-tauri/src/streaming/audio.rs",
+          "sha256": "6a062be232bbf576a5fba96cb4c57e6c5224da42d193cc58a6d5499e15a7dd9a",
+          "bytes": 20148
+        },
+        {
+          "path": "src-tauri/src/streaming/caller_registry.rs",
+          "sha256": "a79f3d850a2ab2422df17ac537e79b343292c7d728893f1b3cc161b9c60d3c93",
+          "bytes": 20919
+        },
+        {
+          "path": "src-tauri/src/streaming/classify.rs",
+          "sha256": "ea2aeba054b662fdd3ee94ed1b96821680f61df99817d093805747557e193422",
+          "bytes": 6175
+        },
+        {
+          "path": "src-tauri/src/streaming/mod.rs",
+          "sha256": "fb37a1208a1a4a133b320279a224020a3d9142d5336158bc04b60381dea877ba",
+          "bytes": 209581
+        },
+        {
+          "path": "src-tauri/src/streaming/recorder.rs",
+          "sha256": "0be445183f47dfbe7345d2e9bdc74f57c507b74beeed8e60a1a66bbcc5313da3",
+          "bytes": 6051
+        },
+        {
+          "path": "src-tauri/src/streaming/relay.rs",
+          "sha256": "939b40541bd95a86a100b079f9c70a190eb206ac4acbd0208507134d69aa3caf",
+          "bytes": 56224
+        },
+        {
+          "path": "src-tauri/src/streaming/rtsp_client.rs",
+          "sha256": "932293446b299dfb2e42c9486e28a29dfa4ac77419cbfca1146bb4c67b4799de",
+          "bytes": 46887
+        },
+        {
+          "path": "src-tauri/src/streaming/rtsp_server.rs",
+          "sha256": "6c12cd4f5f33e315555a205260becf1d3b688d9f11f2f1365c4261a848698f18",
+          "bytes": 50153
+        },
+        {
+          "path": "src-tauri/src/streaming/rtsp_transport.rs",
+          "sha256": "270a14715835276abdac724d290d437ddab41bfca53bf718c20278b8fe18801c",
+          "bytes": 3331
+        },
+        {
+          "path": "src-tauri/src/streaming/srt_server.rs",
+          "sha256": "a1ca85de9cbbe54764bffd1dd1dcd36798c2bab84092f6db02e647e8c7d98a0d",
+          "bytes": 46608
+        },
+        {
+          "path": "src-tauri/src/streaming/video_embed.rs",
+          "sha256": "a65d167685e73bb1584700452f25a591172234da3f5ccc0256c26b06c9f9b29b",
+          "bytes": 6893
+        },
+        {
+          "path": "src-tauri/src/validation.rs",
+          "sha256": "c85c7506da6f9bd5226a567e552a1bd898cb2856b3525239e4b6c2a245a609d6",
+          "bytes": 7040
+        },
+        {
+          "path": "src-tauri/tauri.conf.json",
+          "sha256": "c8c725168489fd384aac4487905e5b8037f9b7fbf9ab8a2b61097c7bf8d99be2",
+          "bytes": 2086
+        },
+        {
+          "path": "src/assets/ps_icon.png",
+          "sha256": "04c20e260bc571eb9c3b3be45199425129763d15cfed735532e452190eef44b7",
+          "bytes": 9389
+        },
+        {
+          "path": "src/lib/device-cache.ts",
+          "sha256": "cbcfbb106599c3437284ca68c46ac47f8c3ae7ae768657879df1ae319d360fcf",
+          "bytes": 11028
+        },
+        {
+          "path": "src/lib/device-list.ts",
+          "sha256": "f33ecdd483038c64b390009070eebb275a65054f8f6c53899c86ae8184a6664d",
+          "bytes": 7791
+        },
+        {
+          "path": "src/lib/device-state.ts",
+          "sha256": "6efc1251c5521a020ec8bb2969ee61000612c200a6f89706a7a435deee5ad93b",
+          "bytes": 6045
+        },
+        {
+          "path": "src/lib/devices.ts",
+          "sha256": "3258a40b1943a903bb7dd5fca0ec7411698d89707f1eb64a8442c5bc633cbdec",
+          "bytes": 35288
+        },
+        {
+          "path": "src/lib/errors.ts",
+          "sha256": "3a615bece363eb9b686ab87b3101c2d8d29d963138f266f51c23aaf5f4197721",
+          "bytes": 2045
+        },
+        {
+          "path": "src/lib/ip-conflicts.ts",
+          "sha256": "0cba28bb80fde2adbd02e498702343142e0e64266b9bc60779be052c3bf0a2f2",
+          "bytes": 2029
+        },
+        {
+          "path": "src/lib/markdown-lite.ts",
+          "sha256": "81af852d73db8533030d165f1ceb053efeae8ab4b90a30ab81c3f5b756a04392",
+          "bytes": 3288
+        },
+        {
+          "path": "src/lib/network.ts",
+          "sha256": "e14ea8b5d8f8871ebfa4c8e343aa1c5c7522db2e546b640adc87133cd721be48",
+          "bytes": 51246
+        },
+        {
+          "path": "src/lib/ptz.ts",
+          "sha256": "20047412e30ecdad819445c1832b01c2d41949616577687638ed8c678074b5c8",
+          "bytes": 29042
+        },
+        {
+          "path": "src/lib/restream-format.ts",
+          "sha256": "bfeb483c4a5dd0ddbeb5d0602ee735b8512fe32e1e4a19614dc5740839268582",
+          "bytes": 1539
+        },
+        {
+          "path": "src/lib/restream-settings.ts",
+          "sha256": "d3697a694c15055110b7a525b7631fd4d7f6b4a34b5cf4dbe25d312d61d749a0",
+          "bytes": 5320
+        },
+        {
+          "path": "src/lib/state.ts",
+          "sha256": "5dc69b63aaf2728a74bf5d31f4ea2a69070e0f2294112a0726d145e08d6e89f2",
+          "bytes": 7774
+        },
+        {
+          "path": "src/lib/store.ts",
+          "sha256": "fffd3f258567d03608299000c2496cc80dfb1b2250bb1693f254fcb5c84180b6",
+          "bytes": 2504
+        },
+        {
+          "path": "src/lib/streaming.ts",
+          "sha256": "f807948ac5b69e8c55a697cda4c566d1db834bcb612d474a09b7f1384e707851",
+          "bytes": 46743
+        },
+        {
+          "path": "src/lib/tauri-api.ts",
+          "sha256": "1a59fc306c6356e1315dac5a89317b89ab75c8668cff1bec5ed0b1dbaba74a23",
+          "bytes": 12255
+        },
+        {
+          "path": "src/lib/tauri-global.d.ts",
+          "sha256": "024a3d3e0e92ba528d7501347df155a69fa658c516b8efbda039a17fa38abf76",
+          "bytes": 2830
+        },
+        {
+          "path": "src/lib/types.ts",
+          "sha256": "9efe35d813fd10f567958dd08710e5e6c83a0f9c635684668ac19e1767e7d94f",
+          "bytes": 17017
+        },
+        {
+          "path": "src/main.ts",
+          "sha256": "12c546700df683d0da61342eaa9330481412dc268167274437a7b7a0a694c41b",
+          "bytes": 32679
+        },
+        {
+          "path": "src/styles/components.css",
+          "sha256": "8060739240860d73781d49aa9719032ce9298cc85b257b0a0696f15a477be037",
+          "bytes": 35835
+        },
+        {
+          "path": "src/styles/layout.css",
+          "sha256": "c1be3e0eb939897cfeadbd8dc5819c268782f4adfe7bfd3270558b058ca771d4",
+          "bytes": 4248
+        },
+        {
+          "path": "src/styles/theme.css",
+          "sha256": "ad648aa21ecd6ae984c2d42694046cd2ecb71b4e62786701ad0d4cd04cf5510e",
+          "bytes": 2211
+        },
+        {
+          "path": "vite.config.js",
+          "sha256": "39d874d0505c17975ee13fa9c44a07f77d67a2808b8257f9c26140dadccfd252",
+          "bytes": 217
+        }
+      ],
+      "canonical_sha256": "cb10729b393702ddf93bcc78400329da1517091283176444e228a507b1efa1c5"
+    },
+    "validation_tools": {
+      "files": [
+        {
+          "path": ".github/workflows/ci.yml",
+          "sha256": "3903a061fae21adb948e28305b713b1db8a0d96d6e2ccef0204fe06c75f2a1e3",
+          "bytes": 21392
+        },
+        {
+          "path": ".github/workflows/release.yml",
+          "sha256": "dc99235908c55862805c280d645d356045ff4032c13ef2bb95839b5faa5f49ec",
+          "bytes": 13227
+        },
+        {
+          "path": "scripts/build-patched-libsrt.ps1",
+          "sha256": "36ecef6da3c69a169e0eebdbddd4fdb433b35977e0d125247aa6bcc8ce282e17",
+          "bytes": 26720
+        },
+        {
+          "path": "scripts/bump-version.ps1",
+          "sha256": "eab7fad86522c165f3ef6ba2041285bb872e25828b1cd15bf89927df2ca6aa3b",
+          "bytes": 4265
+        },
+        {
+          "path": "scripts/bundle-gstreamer.ps1",
+          "sha256": "30ad54e1d8cce5866640f9cc623f4c4da9c2d5a5e51ae28a17233efd50276268",
+          "bytes": 23671
+        },
+        {
+          "path": "scripts/check-dom-selectors.mjs",
+          "sha256": "cf56d1a220e07888daf696cb57a326b37d28d798807dcb8afb115ebab6415526",
+          "bytes": 2025
+        },
+        {
+          "path": "scripts/check-installer.mjs",
+          "sha256": "90cdecf317e99a145c927b22e29e917dc0ecf06e80c0b22dfa33759b994bb84e",
+          "bytes": 9208
+        },
+        {
+          "path": "scripts/check-ipc-allowlist.mjs",
+          "sha256": "23db5daa033424f8e6fa3b5f34f385c3a67a94aea9632af2de60d2421ec218eb",
+          "bytes": 16127
+        },
+        {
+          "path": "scripts/check-restream-card.mjs",
+          "sha256": "fe8adae0afab99dac046251fc2d4ed1a9091ac0ec61387238361366460a36f02",
+          "bytes": 4761
+        },
+        {
+          "path": "scripts/check-restream-ui.mjs",
+          "sha256": "a8149324657860e93353136491b9abd43b24db64279a17f124cfe829e2d4ff0f",
+          "bytes": 7217
+        },
+        {
+          "path": "scripts/check-third-party.ps1",
+          "sha256": "e7b0e3a684a1d5aad2ac450f2b1e5091bb24d80c8c276535868da25acde87266",
+          "bytes": 12935
+        },
+        {
+          "path": "scripts/check.ps1",
+          "sha256": "7884a0a295a9b2fe256d4493ead837b23b3d79885fb109dbbe23486a8ea534c5",
+          "bytes": 3837
+        },
+        {
+          "path": "scripts/complete-a1-hardware-smoke.ps1",
+          "sha256": "2ab72d1ca019f3f8c37c413a3278e8837967e0f38868d99ed5baf61497439d3d",
+          "bytes": 11226
+        },
+        {
+          "path": "scripts/gstreamer-manifest.psd1",
+          "sha256": "3be8a982ff04a2cbe67119d82c9a01c673b340f5ea3ec86fe7fbca160c47a1ae",
+          "bytes": 35008
+        },
+        {
+          "path": "scripts/mirror-gstreamer-src.ps1",
+          "sha256": "5cd5fcec0fb9311fec2d44080a074337e5a75a1da4be010908bc2e8758a675d7",
+          "bytes": 13288
+        },
+        {
+          "path": "scripts/patches/cerbero-srt-1.5.6.patch",
+          "sha256": "40d311f06bbf5f2911696b65769c51a8aaa744d07809c06291baa8bb30cf6430",
+          "bytes": 500
+        },
+        {
+          "path": "scripts/patches/cerbero-srt-1.5.7.patch",
+          "sha256": "d8d257e19403a8268628a877ef78a78cb94aa46605868bcf573197b5bbac84bf",
+          "bytes": 500
+        },
+        {
+          "path": "scripts/source-release-policy.ps1",
+          "sha256": "d401200377aa8ebeea916f72385b1cbda1176d4d96b06f8c5154c141bb66d549",
+          "bytes": 2684
+        },
+        {
+          "path": "scripts/start-a1-hardware-smoke.ps1",
+          "sha256": "65cc97b255edec90260ed7c9a2a0197d6ea9e0360a4bc9a685476419f36b9548",
+          "bytes": 6169
+        },
+        {
+          "path": "scripts/test-source-release-policy.ps1",
+          "sha256": "6b0b34d8576df7c7ab14c1fb0d6ac5ce9ca5e548bbf4e3341e1dd67cdc8d2ba6",
+          "bytes": 4004
+        },
+        {
+          "path": "scripts/verify-a1-production-smoke.mjs",
+          "sha256": "11abd95d35c8fb619e11965301e05873721660fbbc1c242933aa2c1f0a28c132",
+          "bytes": 8830
+        },
+        {
+          "path": "scripts/verify-a1-production-smoke.ps1",
+          "sha256": "e83a0db9b9b4d1460b150028d238783a99944488f3f056c39069c8f29f664cc0",
+          "bytes": 27393
+        },
+        {
+          "path": "scripts/verify-g1r-srt.ps1",
+          "sha256": "27b7eab0626ec5bbf87503fe82af110527b0b6f9ec4125810926509cc1a0b143",
+          "bytes": 53177
+        },
+        {
+          "path": "scripts/verify-g2-srt.ps1",
+          "sha256": "c5a28b296919a3562340fe2637ac390c0df8caa80ff3861e12b10c41eeb8a793",
+          "bytes": 21853
+        },
+        {
+          "path": "scripts/verify-g3-srt.ps1",
+          "sha256": "c328845c41a5fe18c72cbe3ef0a504370bcdca3ad76feaf32a386e51a0583b81",
+          "bytes": 46381
+        },
+        {
+          "path": "tests/binding-status.test.cjs",
+          "sha256": "fe08ee594a8742e702b283670d7d3829adeac69da6cc4a95d15220225b46376f",
+          "bytes": 2968
+        },
+        {
+          "path": "tests/device-browser.test.cjs",
+          "sha256": "a5b0dd4f28daf158053ac7e8010441dd50d27aa1a8748ce808c069e4569debfd",
+          "bytes": 6833
+        },
+        {
+          "path": "tests/firewall-policy.fixture.ps1",
+          "sha256": "96a92c58138a0457ba2c9e3c196a9ef19cd9bbfd2ed59b7b6fc7d6b55abd072a",
+          "bytes": 8848
+        },
+        {
+          "path": "tests/firewall-policy.test.cjs",
+          "sha256": "f99a028b2c733845eac9056fb8b66b583ec79aa161232beab5cb6f41e9e4c153",
+          "bytes": 664
+        },
+        {
+          "path": "tests/installer-contract.test.cjs",
+          "sha256": "20f04d18cc3d7c46e879de61e833234edc55964362906644f6c11ace5e4162bf",
+          "bytes": 921
+        },
+        {
+          "path": "tests/ip-conflicts.test.cjs",
+          "sha256": "03354927457c972ce70ab6e9164e2ba09da0b0c96c68f6c349f09149292bc79f",
+          "bytes": 3846
+        },
+        {
+          "path": "tests/ipc-allowlist.test.cjs",
+          "sha256": "97ecb0716f24d64dc82fd221a7141f9d80c06b66afccfcdf3c1b9e397d8e9bad",
+          "bytes": 8639
+        },
+        {
+          "path": "tests/launch-notice.test.cjs",
+          "sha256": "38b91aac4f2da32f5a282c8fbab0a42fc5883af62a13b295e24db2f836653dbd",
+          "bytes": 7527
+        },
+        {
+          "path": "tests/network-address-workflow.test.cjs",
+          "sha256": "d593ee0a7b8d2a0d26c6029598e88807c7020431ac202432ec30f5cec50418e6",
+          "bytes": 62207
+        },
+        {
+          "path": "tests/network-discovery.test.cjs",
+          "sha256": "54c3331d67a1dae0f306ba9833e2fa4943ae967ae0863fdf09b7e621d1789c84",
+          "bytes": 4776
+        },
+        {
+          "path": "tests/notification-behavior.test.cjs",
+          "sha256": "ea160c5d804771d60f4dbcec445f6a1840a1acf1fc56fc7f1f2fab03ab95e645",
+          "bytes": 33358
+        },
+        {
+          "path": "tests/ptu-workflow.test.cjs",
+          "sha256": "e70a9d6057caaf88f07157953f03b96646f3515f6a373665afb7573f9bb6b94c",
+          "bytes": 16068
+        }
+      ],
+      "canonical_sha256": "fc8a3f938ff31a8007d5be5ab16f98f6aa73f317237266ad5c1cc901169ba02f"
+    }
+  },
+  "validation": {
+    "ordinary_rust": {
+      "passed": 784,
+      "failed": 0,
+      "ignored": 10
+    },
+    "safe_windows_process_fixtures": {
+      "passed": 7,
+      "failed": 0,
+      "hardware_probe_environment_removed": true,
+      "scope": "Private same-account mutex/job and fake-mutation fixtures plus trusted inventory, DLL and neighbor reads; no address/firewall/install writes."
+    },
+    "frontend": {
+      "passed": 188,
+      "failed": 0
+    },
+    "rust_commands": [
+      {
+        "name": "format-frozen",
+        "program": "cargo",
+        "args": [
+          "fmt"
+        ],
+        "cwd": "src-tauri",
+        "started_utc": "2026-10-25T03:55:59.343Z",
+        "completed_utc": "2026-10-25T03:55:59.939Z",
+        "status": 0,
+        "log": "src-tauri\\target\\privilege-a3\\format-frozen.log",
+        "log_record": {
+          "path": "src-tauri/target/privilege-a3/format-frozen.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "bytes": 0
+        }
+      },
+      {
+        "name": "tests-frozen",
+        "program": "cargo",
+        "args": [
+          "test",
+          "--lib",
+          "--locked",
+          "--offline"
+        ],
+        "cwd": "src-tauri",
+        "started_utc": "2026-10-25T03:55:59.940Z",
+        "completed_utc": "2026-10-25T03:56:17.993Z",
+        "status": 0,
+        "log": "src-tauri\\target\\privilege-a3\\tests-frozen.log",
+        "log_record": {
+          "path": "src-tauri/target/privilege-a3/tests-frozen.log",
+          "sha256": "2d2ab84f70d395d5bc5916ec2e9d8e9e39872d93576ec684929bf392b811a152",
+          "bytes": 67981
+        }
+      },
+      {
+        "name": "native-frozen",
+        "program": "cargo",
+        "args": [
+          "test",
+          "--lib",
+          "--locked",
+          "--offline",
+          "network::native_qualification::qualify_",
+          "--",
+          "--ignored",
+          "--test-threads=1",
+          "--nocapture"
+        ],
+        "cwd": "src-tauri",
+        "started_utc": "2026-10-25T03:56:17.994Z",
+        "completed_utc": "2026-10-25T03:56:31.325Z",
+        "status": 0,
+        "log": "src-tauri\\target\\privilege-a3\\native-frozen.log",
+        "log_record": {
+          "path": "src-tauri/target/privilege-a3/native-frozen.log",
+          "sha256": "52fc613888553a12136e164e3ffc22f5b00457c690c2be2189edea186978e28d",
+          "bytes": 2255
+        }
+      },
+      {
+        "name": "clippy-frozen",
+        "program": "cargo",
+        "args": [
+          "clippy",
+          "--all-targets",
+          "--no-deps",
+          "--locked",
+          "--offline",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "cwd": "src-tauri",
+        "started_utc": "2026-10-25T03:56:31.326Z",
+        "completed_utc": "2026-10-25T03:56:37.075Z",
+        "status": 0,
+        "log": "src-tauri\\target\\privilege-a3\\clippy-frozen.log",
+        "log_record": {
+          "path": "src-tauri/target/privilege-a3/clippy-frozen.log",
+          "sha256": "2eb495f35ba3e4716715c53e6c115190fa58cc452399296d8d9ad993a4feb5d6",
+          "bytes": 161
+        }
+      },
+      {
+        "name": "format-frozen-check",
+        "program": "cargo",
+        "args": [
+          "fmt",
+          "--check"
+        ],
+        "cwd": "src-tauri",
+        "started_utc": "2026-10-25T03:56:37.076Z",
+        "completed_utc": "2026-10-25T03:56:37.601Z",
+        "status": 0,
+        "log": "src-tauri\\target\\privilege-a3\\format-frozen-check.log",
+        "log_record": {
+          "path": "src-tauri/target/privilege-a3/format-frozen-check.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "bytes": 0
+        }
+      }
+    ],
+    "package_commands": [
+      {
+        "name": "frontend-frozen",
+        "program": "C:\\Program Files\\nodejs\\node.exe",
+        "args": [
+          "C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js",
+          "test"
+        ],
+        "started_utc": "2026-10-25T04:05:44.729Z",
+        "completed_utc": "2026-10-25T04:05:56.282Z",
+        "status": 0,
+        "log": "src-tauri\\target\\privilege-a3\\frontend-frozen.log",
+        "log_record": {
+          "path": "src-tauri/target/privilege-a3/frontend-frozen.log",
+          "sha256": "87c647abc697d72064d27d0e4d82e2b26e53a38779970de4108b9c1398130fc0",
+          "bytes": 16920
+        }
+      },
+      {
+        "name": "typecheck-frozen",
+        "program": "C:\\Program Files\\nodejs\\node.exe",
+        "args": [
+          "C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js",
+          "run",
+          "typecheck"
+        ],
+        "started_utc": "2026-10-25T04:05:56.284Z",
+        "completed_utc": "2026-10-25T04:05:57.348Z",
+        "status": 0,
+        "log": "src-tauri\\target\\privilege-a3\\typecheck-frozen.log",
+        "log_record": {
+          "path": "src-tauri/target/privilege-a3/typecheck-frozen.log",
+          "sha256": "f8959cdd7d37f6ecda3ed5496e7c543fe3d79a10dcdda021ff78ded4708f5ad0",
+          "bytes": 56
+        }
+      },
+      {
+        "name": "release-frozen",
+        "program": "C:\\Program Files\\nodejs\\node.exe",
+        "args": [
+          "node_modules/@tauri-apps/cli/tauri.js",
+          "build",
+          "--bundles",
+          "nsis",
+          "--no-sign",
+          "--ci",
+          "--config",
+          "{\"bundle\":{\"createUpdaterArtifacts\":false}}",
+          "--",
+          "--locked",
+          "--offline"
+        ],
+        "started_utc": "2026-10-25T04:05:57.349Z",
+        "completed_utc": "2026-10-25T04:07:35.537Z",
+        "status": 0,
+        "log": "src-tauri\\target\\privilege-a3\\release-frozen.log",
+        "log_record": {
+          "path": "src-tauri/target/privilege-a3/release-frozen.log",
+          "sha256": "c8d4effc321615ab360b3cede241ed133d1d76f6f789d8db5ed1e081a7abc59a",
+          "bytes": 4098
+        }
+      },
+      {
+        "name": "installer-contract-frozen",
+        "program": "C:\\Program Files\\nodejs\\node.exe",
+        "args": [
+          "C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js",
+          "run",
+          "check:installer:generated"
+        ],
+        "started_utc": "2026-10-25T04:07:35.538Z",
+        "completed_utc": "2026-10-25T04:08:09.918Z",
+        "status": 0,
+        "log": "src-tauri\\target\\privilege-a3\\installer-contract-frozen.log",
+        "log_record": {
+          "path": "src-tauri/target/privilege-a3/installer-contract-frozen.log",
+          "sha256": "d664d67a0b450effe4483f46c2aadcbe65587de8de9a4e96c39d15b9fe134223",
+          "bytes": 287
+        }
+      }
+    ],
+    "compiler_inspection": {
+      "executable": "C:\\Users\\joshu\\AppData\\Local\\tauri\\NSIS\\makensis.exe",
+      "compiler_sha256": "f497e92deb9f179f7b8f7553fcb3bd04f511bb2949e5e4a2aee80a10f7b20431",
+      "args": [
+        "-INPUTCHARSET",
+        "UTF8",
+        "-OUTPUTCHARSET",
+        "UTF8",
+        "-DMUI_VERBOSE=4",
+        "-V4",
+        "C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\release\\nsis\\x64\\installer.nsi"
+      ],
+      "status": 0,
+      "stderr": "",
+      "installation_executed": false,
+      "record": {
+        "path": "src-tauri/target/release/nsis/x64/compile-inspection.json",
+        "sha256": "2f4d9f798e1a95f88e816a74b0702f915276bb37b0bbd2e6e5648b8c6e463555",
+        "bytes": 453
+      },
+      "generated_script": {
+        "path": "src-tauri/target/release/nsis/x64/installer.nsi",
+        "sha256": "6fef8e3022d9e7e574eeb93b05881b9be19e5668e218ae090cd96f7efadba896",
+        "bytes": 45549
+      },
+      "compiled_trace": {
+        "path": "src-tauri/target/release/nsis/x64/installer.compile.log",
+        "sha256": "bf95bec48d4d37d6d21eadf83f167ea38908270de66fbc49a191001f4d6d828d",
+        "bytes": 206286
+      },
+      "contract_passed": true,
+      "runtime_mutex_lifetime_proved": false
+    },
+    "native_proof_files": [
+      {
+        "path": "src-tauri/target/privilege-a2-proofs/a3-final-20261025035559/caller-abort-and-barrier.json",
+        "sha256": "fb0df5b998eaf4e975dba098eea9cd0637e94236bf99883e65cc9e8a09774fb6",
+        "bytes": 1513
+      },
+      {
+        "path": "src-tauri/target/privilege-a2-proofs/a3-final-20261025035559/child-tree-and-output.json",
+        "sha256": "3633072fe59abd33a684e3f4859fac140e63380cff3a0d7c44f6fc9ec45b8823",
+        "bytes": 701
+      },
+      {
+        "path": "src-tauri/target/privilege-a2-proofs/a3-final-20261025035559/native-observation-paths.json",
+        "sha256": "1c979481577077e9ea1e1325ca8a921a31e803f2e96ab988ebb583d2f6ed9133",
+        "bytes": 575
+      },
+      {
+        "path": "src-tauri/target/privilege-a2-proofs/a3-final-20261025035559/production-native-required-failure.json",
+        "sha256": "2fb15b749cdde548ce46eae4d6e30225afaf34acebd88d6a72936b21ffbbf6d4",
+        "bytes": 386
+      },
+      {
+        "path": "src-tauri/target/privilege-a2-proofs/a3-final-20261025035559/script-data-and-required-failures.json",
+        "sha256": "9311546f2ed06fa637fa59f6cf2a52a823278a541fa25d3332119de51c2c929b",
+        "bytes": 1622
+      },
+      {
+        "path": "src-tauri/target/privilege-a2-proofs/a3-final-20261025035559/two-owners-and-lone-crash.json",
+        "sha256": "7bd3c3560c36d2610352e84f4e9a4b9b58f10df849c0f3bc2ebf39509db430ef",
+        "bytes": 1721
+      },
+      {
+        "path": "src-tauri/target/privilege-a2-proofs/a3-final-20261025035559/typed-production-inventory.json",
+        "sha256": "994d50bafdb6824bd3704bfb71705eb944ce34327af96d4b790a3b770c56d4bc",
+        "bytes": 7143
+      }
+    ],
+    "diff_check": {
+      "command": "git diff --check",
+      "status": 0
+    }
+  },
+  "artifacts": {
+    "recorded_at_utc": "2026-10-25T04:09:56.648Z",
+    "executable": {
+      "path": "src-tauri/target/release/pocketstream-desktop.exe",
+      "sha256": "0c2daccda7e86918644e09de29786ce0529420106e63b7191a01d1f84dc82a24",
+      "bytes": 23729152
+    },
+    "installer": {
+      "path": "src-tauri/target/release/bundle/nsis/PocketStream Desktop_0.6.7_x64-setup.exe",
+      "sha256": "618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101",
+      "bytes": 29991257
+    },
+    "embedded_executable": {
+      "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/pocketstream-desktop.exe",
+      "sha256": "a3a6f715eaf46aeb7fb1c40645e1329c8e59f01527a732d58987bb1ce6db6589",
+      "bytes": 23729152
+    },
+    "test_executable": {
+      "path": "src-tauri/target/debug/deps/pocketstream_desktop-10048f9d261ead52.exe",
+      "sha256": "43cedfe191cfb1dbfa6ef35690bf66b3c4f38cc5df48559be6722d479badc2e0",
+      "bytes": 32397312
+    },
+    "embedded_matches_staged": false,
+    "bundle_marker_difference": {
+      "staged": "UNK",
+      "packaged": "NSS",
+      "differing_bytes": 3,
+      "offset": 18180962,
+      "all_other_bytes_identical": true,
+      "verified_against": "tauri-utils 2.8.3 src/platform.rs:349-360"
+    },
+    "manifests": {
+      "release": {
+        "path": "src-tauri/target/privilege-a3/release-frozen.manifest",
+        "sha256": "780c5f643a1faa7a7198a3114e470fe789beacf042ba7b0fcdf2e6b3e3e20221",
+        "bytes": 641,
+        "execution_level": "requireAdministrator",
+        "common_controls": true
+      },
+      "embedded": {
+        "path": "src-tauri/target/privilege-a3/embedded-frozen.manifest",
+        "sha256": "780c5f643a1faa7a7198a3114e470fe789beacf042ba7b0fcdf2e6b3e3e20221",
+        "bytes": 641,
+        "execution_level": "requireAdministrator",
+        "common_controls": true
+      },
+      "installer": {
+        "path": "src-tauri/target/privilege-a3/installer-frozen.manifest",
+        "sha256": "af1b818336f0fe606411946503e064b75e22daae2e5cd595d1e88ca8e38ebf03",
+        "bytes": 1480,
+        "execution_level": "requireAdministrator",
+        "common_controls": true
+      },
+      "test": {
+        "path": "src-tauri/target/privilege-a3/test-frozen.manifest",
+        "sha256": "cd613330097d228ae01fce028e50954fe4595249d51edebc4461ec252b514517",
+        "bytes": 604,
+        "execution_level": "asInvoker",
+        "common_controls": true
+      }
+    },
+    "preserved_executable": {
+      "path": "src-tauri/target/privilege-a3/optimized-a3a6f715eaf46aeb7fb1c40645e1329c8e59f01527a732d58987bb1ce6db6589/pocketstream-desktop.exe",
+      "sha256": "a3a6f715eaf46aeb7fb1c40645e1329c8e59f01527a732d58987bb1ce6db6589",
+      "bytes": 23729152
+    },
+    "preserved_staged_executable": {
+      "path": "src-tauri/target/privilege-a3/optimized-a3a6f715eaf46aeb7fb1c40645e1329c8e59f01527a732d58987bb1ce6db6589/pocketstream-desktop-staged.exe",
+      "sha256": "0c2daccda7e86918644e09de29786ce0529420106e63b7191a01d1f84dc82a24",
+      "bytes": 23729152
+    },
+    "preserved_installer": {
+      "path": "src-tauri/target/privilege-a3/optimized-a3a6f715eaf46aeb7fb1c40645e1329c8e59f01527a732d58987bb1ce6db6589/PocketStream Desktop_0.6.7_x64-setup.exe",
+      "sha256": "618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101",
+      "bytes": 29991257
+    },
+    "preserved_test_executable": {
+      "path": "src-tauri/target/privilege-a3/optimized-a3a6f715eaf46aeb7fb1c40645e1329c8e59f01527a732d58987bb1ce6db6589/qualification.exe",
+      "sha256": "43cedfe191cfb1dbfa6ef35690bf66b3c4f38cc5df48559be6722d479badc2e0",
+      "bytes": 32397312
+    },
+    "historical_optimized": {
+      "path": "src-tauri/target/privilege-a2/release-b77586f746eadcb63fdb7a2883f9ffd494bb5aff140f4ff963baccadd6b8ebed/pocketstream-desktop.exe",
+      "sha256": "b77586f746eadcb63fdb7a2883f9ffd494bb5aff140f4ff963baccadd6b8ebed",
+      "bytes": 23206912
+    },
+    "extracted_payload": [
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/$PLUGINSDIR/NSISdl.dll",
+        "sha256": "ddf40229dd9d6b268902d8dea88c8a04aacf1af218dd29f6dcd35babc54ac08d",
+        "bytes": 15360
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/$PLUGINSDIR/StartMenu.dll",
+        "sha256": "fe330320459637d8dd2b5d84d07925c38ec264152ffd3b1760a4d44d76536caa",
+        "bytes": 7680
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/$PLUGINSDIR/System.dll",
+        "sha256": "8b4c47c4cf5e76ec57dd5a050d5acd832a0d532ee875d7b44f6cdaf68f90d37c",
+        "bytes": 12288
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/$PLUGINSDIR/modern-wizard.bmp",
+        "sha256": "3ad2dc318056d0a2024af1804ea741146cfc18cc404649a44610cbf8b2056cf2",
+        "bytes": 26494
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/$PLUGINSDIR/nsDialogs.dll",
+        "sha256": "b1350f487692057c8ffde75dcc55287a52a3272240d4d4912f24464b27551fc0",
+        "bytes": 9728
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/$PLUGINSDIR/nsExec.dll",
+        "sha256": "b121689861b506dbc9c3797b49bc8a90d555cb7db58cb959165cc758391c00bb",
+        "bytes": 7168
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/$PLUGINSDIR/nsis_tauri_utils.dll",
+        "sha256": "5ba143b5db4a87d32d6e7802e033330aae56cbceabe0d1e3ba41948385ad4709",
+        "bytes": 34304
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/pocketstream-desktop.exe",
+        "sha256": "a3a6f715eaf46aeb7fb1c40645e1329c8e59f01527a732d58987bb1ce6db6589",
+        "bytes": 23729152
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/avcodec-61.dll",
+        "sha256": "d871f203550e02de688e5aa17323b2ffb8365f2f6fe4603f330eb450d5cadc19",
+        "bytes": 15265792
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/avfilter-10.dll",
+        "sha256": "ae40b79002b86c1e563f3f0374cc0adabfbcc3b0c90c78ea07dce1ef5db7f42d",
+        "bytes": 223744
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/avformat-61.dll",
+        "sha256": "3dfd6b1a561d005748ceb07df01354668c7765609b1c44836a663be9275e9d0d",
+        "bytes": 2293760
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/avutil-59.dll",
+        "sha256": "d20ee7c1dec0f4211360efb17bc7220863d2ac3b7bb20c7b2c1db0d14d592fc2",
+        "bytes": 952320
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/bz2.dll",
+        "sha256": "3de90277f29a6324abcf28c5e4a075f2d010be32276b9e1740abec23be860c6f",
+        "bytes": 77824
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/ffi-7.dll",
+        "sha256": "7d38c1319a2209a6293703bc605172cc64f24bece7f67e115520079b4b3b2058",
+        "bytes": 31232
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/gio-2.0-0.dll",
+        "sha256": "54a725774a57a19cfeaf98cde26d9ec8783aa396caec1b058718de4190acca32",
+        "bytes": 1840128
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/glib-2.0-0.dll",
+        "sha256": "52ffcad1def38b1dfaa8a4aeb7abedf3f24b0825ff16cc168d25152a010eb4a4",
+        "bytes": 1432064
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/gmodule-2.0-0.dll",
+        "sha256": "a5fc50c81d3c0f6d4409677358a439d3e2810e0af4a0ddb46f5948c3e3faebdd",
+        "bytes": 25088
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/gobject-2.0-0.dll",
+        "sha256": "8306cc2c7ba5d1b64804784335015cb65ccd85296a64e9b55a027288868ef97a",
+        "bytes": 346624
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/graphene-1.0-0.dll",
+        "sha256": "d73f4bb3a299642e0c2cb0f2cf44668f244428467500045e72dcfd939a996711",
+        "bytes": 110080
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/gstallocators-1.0-0.dll",
+        "sha256": "aff56dc96468c4a2362b465a964b99e2cb7ad627d9c781bebe7a2b3ebbbb034f",
+        "bytes": 20480
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/gstapp-1.0-0.dll",
+        "sha256": "957f3b1d5c63d4bbcad9360ee2c187245ae58159e6fcbeba8fc3c7700e3ef954",
+        "bytes": 77824
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/gstaudio-1.0-0.dll",
+        "sha256": "8978f2f4d9b1c6430ba019fa3c6247106b559afb9dcffc66d342a7491307d9d5",
+        "bytes": 547328
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/gstbase-1.0-0.dll",
+        "sha256": "33160d36af07a794b72d89b40238b6ee1c78aa1d3ad9de3cc68f78fb35a3aa93",
+        "bytes": 518656
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/gstcodecparsers-1.0-0.dll",
+        "sha256": "633ea9199b73c9ce9ed1e243a2cfa868715a7a9abed4047054a005312a7ceae9",
+        "bytes": 969728
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/gstcodecs-1.0-0.dll",
+        "sha256": "8396191cea8c897678a6a442b1fc737d53c613d3bb3ce8ddb790aac078649b5d",
+        "bytes": 247296
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/gstcontroller-1.0-0.dll",
+        "sha256": "880e4c5d7e7a64edd9cbf4a5606699085a17f5618c24a472d66060f67d3082aa",
+        "bytes": 67072
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/gstd3d11-1.0-0.dll",
+        "sha256": "15109e41ffd990308e4b46beb13db29f49e200b19da71191067bde4e550e699c",
+        "bytes": 311296
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/gstd3dshader-1.0-0.dll",
+        "sha256": "db6548bdcc334e9010162933004e7bdb566fb5d8889d256573367ccd185c0ecf",
+        "bytes": 2618368
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/gstdxva-1.0-0.dll",
+        "sha256": "f202d1887d5d669d6dd7b298dcdec4e99a58e52094f9437323cb5e942640bc36",
+        "bytes": 91648
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/gstgl-1.0-0.dll",
+        "sha256": "972713b681d24d4fcd31b307700b5a7474639adadeda6b34e7a4ff6df4ad6a36",
+        "bytes": 456192
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/gstmpegts-1.0-0.dll",
+        "sha256": "5a8a00a8c9bb4e02c1cabefd76474f36f12e6344da8f6c39ff2f45da020dd6f0",
+        "bytes": 186880
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/gstnet-1.0-0.dll",
+        "sha256": "744c6955841397176d61b9ab68ee570a942f3c07a2296c8602035ae51f9e531a",
+        "bytes": 112128
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/gstpbutils-1.0-0.dll",
+        "sha256": "60da310de8d70ea4a059998801abfcbb0776e487dfe1685da59974e8f7b68a93",
+        "bytes": 276480
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/gstreamer-1.0-0.dll",
+        "sha256": "2d5a4e511fa2d306811e24ee9fe7e373e01554b07089c9584bcb23342c27e588",
+        "bytes": 1377280
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/gstriff-1.0-0.dll",
+        "sha256": "1d4158345a250b82d615ba558177e9ad2e45613cae17b57b379c728c50dc5f11",
+        "bytes": 58880
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/gstrtp-1.0-0.dll",
+        "sha256": "93e95ae5794db30eb79711e122554059a31e40d5c02b8fdffa5df1ca4cd012bb",
+        "bytes": 160768
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/gstrtsp-1.0-0.dll",
+        "sha256": "0d02ccaf72f18bea159bde0e15c2775a97a8a5e00045229f8c22986af7af6a96",
+        "bytes": 138752
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/gstrtspserver-1.0-0.dll",
+        "sha256": "eb852e5eb6671de7d810265b0694de104a0c3dfc6e47df09f3848174a29081e1",
+        "bytes": 412160
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/gstsdp-1.0-0.dll",
+        "sha256": "e742b36fcaaff9aab42e0dd657cce57d7257139ad00fa1b76aa0ca22ee8e0cc5",
+        "bytes": 116736
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/gsttag-1.0-0.dll",
+        "sha256": "f2a95b392b5fbfa726a81195ea4f2fcb995284ded1c169e28302f02a5d3ba9d9",
+        "bytes": 265216
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/gstvideo-1.0-0.dll",
+        "sha256": "712354d5711ba65e337f95d65bf835c14af261aa0e74f7a0dda42c4b4027b466",
+        "bytes": 883200
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/intl-8.dll",
+        "sha256": "3e754c4e378f6a4e44268233dcf18dd68d2ef05e8edc1670f28ffa64ff0e0bf7",
+        "bytes": 12800
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/jpeg8.dll",
+        "sha256": "930870255cac71ef7dd324a7314f9443fbaf49138257239ef9aad7f1e6a8379a",
+        "bytes": 675328
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/libcrypto-3-x64.dll",
+        "sha256": "8a0e2418a3106c814a2c117c591750f34c0c1b9bef23d2e95dd36c61558e37e0",
+        "bytes": 7094272
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/libgcc_s_seh-1.dll",
+        "sha256": "323372c82a994267b23140681c41c44f3aee0d0032ff9d884d69b1a1ed7f2ac1",
+        "bytes": 992269
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/libsrt.dll",
+        "sha256": "8d58764b2d53df76b7e9b69e55cd3250d3bb0c14631224c0f16962c5317a5600",
+        "bytes": 18487100
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/libstdc++-6.dll",
+        "sha256": "6d8c75b04fa69225ee34cb65cd06b1dd6757640fb646851d8d87c453c8895812",
+        "bytes": 26570154
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/libwinpthread-1.dll",
+        "sha256": "1e165b3f54a3f0387e4e3c1b5ae6143652aee4e4afd6e9474fcfde2cd8a92bbb",
+        "bytes": 296646
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/orc-0.4-0.dll",
+        "sha256": "42dcb7649c460395ed1f083a1dc3005fa7036f057ac89d30e5ce8947af24feef",
+        "bytes": 437248
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/pcre2-8-0.dll",
+        "sha256": "b7a66d42b86fa4203a58477bb458796a23c1f8923dbd44e897f2361703e5faf7",
+        "bytes": 348160
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/png16.dll",
+        "sha256": "7e18a3a24bb1c40879d36bf84672e06a6eebcbcf3c469e6fe2daeade545067f4",
+        "bytes": 195072
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/swresample-5.dll",
+        "sha256": "090e39ac8a9145379b4d6b788b15b8586b075f2c47fb5c0c6e33facfe0be0a6d",
+        "bytes": 132608
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/swscale-8.dll",
+        "sha256": "da9ff19a16a413f891233a2d96d550f46ad15f279cede3c2f4e946ae9428f13d",
+        "bytes": 693760
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/x264-164.dll",
+        "sha256": "4f5b1183cfa786e6d328a3d754b4342204c50cb0e9919cd1209a3f6d0812c506",
+        "bytes": 2234880
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/bin/z-1.dll",
+        "sha256": "fee5151ba5e9bec7835051c54eb5545031edb55e2318b0138e36304fc14144a0",
+        "bytes": 91648
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/lib/gstreamer-1.0/gstalaw.dll",
+        "sha256": "09134165a8cc536d7baed12f76c06f81ed72ba51605108ecf27b4a65a46afdb9",
+        "bytes": 23040
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/lib/gstreamer-1.0/gstapp.dll",
+        "sha256": "c1d53673bccf0653d935283d495d03250db699d084d0c51c3c13435c466d6d01",
+        "bytes": 12800
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/lib/gstreamer-1.0/gstaudioconvert.dll",
+        "sha256": "d7fba1a7427e34b225a93671dfac62bc6deda3ebbc7976d2f7e831d162580ec4",
+        "bytes": 36352
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/lib/gstreamer-1.0/gstaudioresample.dll",
+        "sha256": "3c02bfe7aff0de91efa70797f5f9b735c38ccdcaf29aa31eb4d0f78a205acee9",
+        "bytes": 35328
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/lib/gstreamer-1.0/gstautodetect.dll",
+        "sha256": "2c03159c3072f5137b06485f16761927ae1ceedfa1a49b4e5bd10b97329286de",
+        "bytes": 31232
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/lib/gstreamer-1.0/gstcodecalpha.dll",
+        "sha256": "fdd97c51db89f051d95253f5eacf924c15ea1110868c728e0968c26d05b42e5b",
+        "bytes": 35840
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/lib/gstreamer-1.0/gstcoreelements.dll",
+        "sha256": "140e6cd93db3c6d06240360b69b0bab17f91ef693d1d051b154ad64ff0cb444a",
+        "bytes": 424960
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/lib/gstreamer-1.0/gstd3d11.dll",
+        "sha256": "4c3804eedd08ee1e72f18083f38ec454c0a0cb644e116db20929e3a877676776",
+        "bytes": 1734144
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/lib/gstreamer-1.0/gstdirectsound.dll",
+        "sha256": "a7228380219a08a4e155ad03015fd8f35a6f3199c261e17612a1409da79362d0",
+        "bytes": 34816
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/lib/gstreamer-1.0/gstisomp4.dll",
+        "sha256": "c6f1cd874b3ef54e4056a50ae9019c4678b51c4f98f78e2a0fdf853641c037d8",
+        "bytes": 651264
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/lib/gstreamer-1.0/gstlibav.dll",
+        "sha256": "f84ab8e0568c7341cb3ef79631edc1da22b8f1396ab63d75a8b37ad4887ba67f",
+        "bytes": 251904
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/lib/gstreamer-1.0/gstmpegtsdemux.dll",
+        "sha256": "eb303caaa8a17f949a15f3cccbe59b95c1397987fce2d2a2e86b4805cef2726c",
+        "bytes": 187392
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/lib/gstreamer-1.0/gstmpegtsmux.dll",
+        "sha256": "55ae613b0d278ff834565177fe889744333f6d60603a52363ecc3f7f85ddd6a5",
+        "bytes": 121344
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/lib/gstreamer-1.0/gstmulaw.dll",
+        "sha256": "90bfb95772c27775be14b86fe18e15029352d20035e590f1e74066919bfa5f60",
+        "bytes": 21504
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/lib/gstreamer-1.0/gstopengl.dll",
+        "sha256": "303a55600031b793831233e6c12f7597b4d14a4360d955daef446973ca2b0da2",
+        "bytes": 318464
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/lib/gstreamer-1.0/gstplayback.dll",
+        "sha256": "199534e86bb36fe5228f02f0c2a98c963221ce63792d998b10b0530d38a5d4b9",
+        "bytes": 629248
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/lib/gstreamer-1.0/gstrawparse.dll",
+        "sha256": "993caf3b3cba42e56f1d4ef6fe73b14cac744b05645628dafe25c5713519a3f6",
+        "bytes": 64512
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/lib/gstreamer-1.0/gstrtp.dll",
+        "sha256": "e897da1f5d9ef538d09b6c42932b9210ac8585aa8c04430ac2b0217a895e33b1",
+        "bytes": 693760
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/lib/gstreamer-1.0/gstrtpmanager.dll",
+        "sha256": "e03a81a698eab4b9ff92dd14c6bc39502cbb0198216a6c89a3f3e8e01e6911a7",
+        "bytes": 552448
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/lib/gstreamer-1.0/gstrtsp.dll",
+        "sha256": "03dafcc9f8df8afc02728ff4cc7fc1d43ed50346d370617c81dc4e3472a5a411",
+        "bytes": 204288
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/lib/gstreamer-1.0/gstsrt.dll",
+        "sha256": "bd6f5fdc71d5c1878e143359fef0468a0edda832977f77228d7bf037ab2805a3",
+        "bytes": 67584
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/lib/gstreamer-1.0/gsttcp.dll",
+        "sha256": "6c46bb0fd2dfbb57213a578dca8fee7daa48e2854163e3be696aaa858eb55f5a",
+        "bytes": 103424
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/lib/gstreamer-1.0/gsttypefindfunctions.dll",
+        "sha256": "0c90120ae30b4a51f98010a4136e12b289e952a2c48c4975c0df3c360ef94594",
+        "bytes": 135168
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/lib/gstreamer-1.0/gstudp.dll",
+        "sha256": "41c6d78885920ef2df9a7d695dc3933938df058c311daa3943975a44511ec129",
+        "bytes": 86016
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/lib/gstreamer-1.0/gstvideoconvertscale.dll",
+        "sha256": "debf5b1c494433a30846068e5406ecf4208162c28f21ac73e9a1a08d80043e81",
+        "bytes": 50688
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/lib/gstreamer-1.0/gstvideoparsersbad.dll",
+        "sha256": "a672f214a3defbfbb81a184096d9177c292971891aed269044861cab5503a576",
+        "bytes": 352768
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/lib/gstreamer-1.0/gstvolume.dll",
+        "sha256": "e68c2057d2755109047caa39180d350178f08a542ffc80310ab828cba457cecb",
+        "bytes": 49152
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/lib/gstreamer-1.0/gstwasapi2.dll",
+        "sha256": "a3b3cda7eb8d64b45f8761daf0357007cb47e80ccf3895432d130ac08983eeca",
+        "bytes": 135168
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/gstreamer/lib/gstreamer-1.0/gstx264.dll",
+        "sha256": "e5edcdb3e36dececec46221e10c759632ff7875b4c7f2207a19338068a39b25e",
+        "bytes": 71168
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/licenses/THIRD-PARTY-NOTICES.md",
+        "sha256": "0a594f1f9ac9a4a1c3873e3d6bb3a2d8fcde199a062ab506561ba2155adee2f0",
+        "bytes": 11191
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/licenses/generated/.gitkeep",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "bytes": 0
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/licenses/generated/THIRD-PARTY-RUST.md",
+        "sha256": "19f56901c5d80189a8fc071fa00425e8b5feab523875768f27280d3944482512",
+        "bytes": 350716
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/licenses/texts/Apache-2.0.txt",
+        "sha256": "7d5450cb2d142651b8afa315b5f238efc805dad827d91ba367d8516bc9d49e7a",
+        "bytes": 10175
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/licenses/texts/BSD-3-Clause.txt",
+        "sha256": "dd7b9b02281cd35b83271d126e47316bcf6e1e4e8bb93c868f863f3592eae9fa",
+        "bytes": 1471
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/licenses/texts/GCC-Runtime-Library-Exception-3.1.txt",
+        "sha256": "28e85c5aa4af9b4f1dfe6b4817aa3eefb3eaaee7fd735045016f29ccf50276a1",
+        "bytes": 3323
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/licenses/texts/GPL-2.0.txt",
+        "sha256": "498d32907f132c2cd7d3ae269f304aed87156293f63e724b83d9f62ed787d55a",
+        "bytes": 18322
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/licenses/texts/GPL-3.0.txt",
+        "sha256": "230184f60bae2feaf244f10a8bac053c8ff33a183bcc365b4d8b876d2b7f4809",
+        "bytes": 35823
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/licenses/texts/LGPL-2.0.txt",
+        "sha256": "d486a19b83e7f88d207ef216d32a558a721971bee5d0ed9b654bd4e6b8df0819",
+        "bytes": 25750
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/licenses/texts/LGPL-2.1.txt",
+        "sha256": "b14c366c41cc9f62dc20ec1a0885f278cf9681076d98027012a910fca5e89639",
+        "bytes": 26920
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/licenses/texts/MIT.txt",
+        "sha256": "32303ab887b8c90b6e6fe49e2f031ca01b23b5190e236447d94e1944684dc769",
+        "bytes": 1096
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/licenses/texts/MPL-2.0.txt",
+        "sha256": "1f256ecad192880510e84ad60474eab7589218784b9a50bc7ceee34c2b91f1d5",
+        "bytes": 16725
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/licenses/texts/Zlib.txt",
+        "sha256": "228d112139d15f8b0a51da82de4c002a0252f5cdec9ebef26bd0d05cfe73bcee",
+        "bytes": 849
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/licenses/texts/bzip2.txt",
+        "sha256": "c78c2cbb5dd3ad547999ba0b6f0871079ab617f0e0f60305b345d1038b0fcb2a",
+        "bytes": 1754
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/licenses/texts/libjpeg-turbo-LICENSE.md",
+        "sha256": "be2b2b5ab168bce87bc3e31f2a5c5adba4b7f6e9e51d618e958d1d46972ebd95",
+        "bytes": 5755
+      },
+      {
+        "path": "src-tauri/target/privilege-a3/package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101/resources/licenses/texts/libpng-2.0.txt",
+        "sha256": "4ae719991dbb45a466a532740db39dfad0063c2749a2420b4c375c0c3d15690c",
+        "bytes": 1584
+      }
+    ],
+    "application_launched": false,
+    "installation_executed": false,
+    "uninstallation_executed": false,
+    "firewall_maintenance_executed": false,
+    "calls": [
+      {
+        "program": "C:\\Program Files\\7-Zip\\7z.exe",
+        "args": [
+          "x",
+          "-y",
+          "-oC:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\privilege-a3\\package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101",
+          "C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\release\\bundle\\nsis\\PocketStream Desktop_0.6.7_x64-setup.exe"
+        ],
+        "status": 0,
+        "log": {
+          "path": "src-tauri/target/privilege-a3/package-frozen-extract.log",
+          "sha256": "e297c01db99d8cc2cd793890e0745babb6a58259773215cef55f054ec28feb20",
+          "bytes": 639
+        }
+      },
+      {
+        "program": "C:\\Program Files (x86)\\Windows Kits\\10\\bin\\10.0.26100.0\\x64\\mt.exe",
+        "args": [
+          "-nologo",
+          "-inputresource:C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\release\\pocketstream-desktop.exe;#1",
+          "-out:C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\privilege-a3\\release-frozen.manifest"
+        ],
+        "status": 0,
+        "log": {
+          "path": "src-tauri/target/privilege-a3/release-frozen-manifest.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "bytes": 0
+        }
+      },
+      {
+        "program": "C:\\Program Files (x86)\\Windows Kits\\10\\bin\\10.0.26100.0\\x64\\mt.exe",
+        "args": [
+          "-nologo",
+          "-inputresource:C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\privilege-a3\\package-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101\\pocketstream-desktop.exe;#1",
+          "-out:C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\privilege-a3\\embedded-frozen.manifest"
+        ],
+        "status": 0,
+        "log": {
+          "path": "src-tauri/target/privilege-a3/embedded-frozen-manifest.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "bytes": 0
+        }
+      },
+      {
+        "program": "C:\\Program Files (x86)\\Windows Kits\\10\\bin\\10.0.26100.0\\x64\\mt.exe",
+        "args": [
+          "-nologo",
+          "-inputresource:C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\release\\bundle\\nsis\\PocketStream Desktop_0.6.7_x64-setup.exe;#1",
+          "-out:C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\privilege-a3\\installer-frozen.manifest"
+        ],
+        "status": 0,
+        "log": {
+          "path": "src-tauri/target/privilege-a3/installer-frozen-manifest.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "bytes": 0
+        }
+      },
+      {
+        "program": "C:\\Program Files (x86)\\Windows Kits\\10\\bin\\10.0.26100.0\\x64\\mt.exe",
+        "args": [
+          "-nologo",
+          "-inputresource:C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\debug\\deps\\pocketstream_desktop-10048f9d261ead52.exe;#1",
+          "-out:C:\\Users\\joshu\\PocketStream-Desktop\\src-tauri\\target\\privilege-a3\\test-frozen.manifest"
+        ],
+        "status": 0,
+        "log": {
+          "path": "src-tauri/target/privilege-a3/test-frozen-manifest.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "bytes": 0
+        }
+      }
+    ],
+    "build_options": {
+      "optimized": true,
+      "POCKETSTREAM_RELEASE": "1",
+      "unsigned": true,
+      "updater_artifacts": false,
+      "application_launched": false,
+      "installation_executed": false
+    },
+    "inspection_record": {
+      "path": "src-tauri/target/privilege-a3/artifact-frozen-inspection.json",
+      "sha256": "d9eda7cc164732fa3c1ef01ca313cd6b0c4988cf7ac2a3c719c163c5c9dc8922",
+      "bytes": 35384
+    }
+  },
+  "historical_evidence": {
+    "files": [
+      {
+        "path": "docs/runtime-evidence/privilege-v2-a2.md",
+        "sha256": "8a1a000a25e79caf25c1e62e92d18ee38f8f6da58098bb2e5562c8aaf6015d0f",
+        "bytes": 21611
+      },
+      {
+        "path": "docs/runtime-evidence/privilege-v2-a2.json",
+        "sha256": "962409fdbfcfc1c04f937c4a2d8ce544718abc0863bb5f0028c5e82f1cd160be",
+        "bytes": 140163
+      }
+    ],
+    "optimized_image": {
+      "path": "src-tauri/target/privilege-a2/release-b77586f746eadcb63fdb7a2883f9ffd494bb5aff140f4ff963baccadd6b8ebed/pocketstream-desktop.exe",
+      "sha256": "b77586f746eadcb63fdb7a2883f9ffd494bb5aff140f4ff963baccadd6b8ebed",
+      "bytes": 23206912
+    },
+    "preserved": true,
+    "new_candidate_credit_transferred": false
+  },
+  "unsuccessful_checks": [
+    {
+      "check": "Initial Rust compile and Clippy",
+      "result": "Failed during implementation; format/field initialization, unused legacy helpers and lint issues were corrected before final checks."
+    },
+    {
+      "check": "Sandboxed ordinary Rust tests",
+      "result": "779 passed, three read-only adapter-provider tests failed, ten ignored; required provider access resolved the environment restriction. Final ordinary suite passed 784."
+    },
+    {
+      "check": "Sandboxed frontend build",
+      "result": "Vite/esbuild could not read the parent directory; the elevated build pipeline passed contracts and Vite."
+    },
+    {
+      "check": "First installer build",
+      "result": "Hook functions appeared before plugin registration and template constants; compilation failed. Include ordering was corrected and checked."
+    },
+    {
+      "check": "Second installer build",
+      "result": "Direct abort callbacks conflicted with MUI callbacks; compilation failed. Fixed MUI custom abort hooks are used."
+    },
+    {
+      "check": "Intermediate bundle-only iteration",
+      "result": "Succeeded with an already-patched bundle-marker warning. The final fresh build succeeded without that warning."
+    },
+    {
+      "check": "Preprocessor-only inspection",
+      "result": "Pinned NSIS preprocessing skipped the added plugin registration and could not resolve Tauri plugin calls. Generated source plus real compiler trace with MUI logging are checked instead."
+    },
+    {
+      "check": "First compiler-trace contract",
+      "result": "Compilation succeeded; default MUI logging hid generated abort callback bodies. MUI_VERBOSE=4 exposes the callbacks and final contract passes."
+    },
+    {
+      "check": "Initial package hash comparison",
+      "result": "A byte-equality assumption failed: packaged NSS and staged UNK bundle markers differ by exactly three bytes. The pinned tauri-utils mapping and all remaining bytes were verified, and both hashes are recorded."
+    }
+  ],
+  "historical_attempt_records": [
+    {
+      "path": "src-tauri/target/privilege-a3/compile-first.log",
+      "sha256": "93ace34c4459653d4fc2a8c30acd30f47c04e4bccb1cce84cc614f1a6b52869c",
+      "bytes": 2584
+    },
+    {
+      "path": "src-tauri/target/privilege-a3/compile-second.log",
+      "sha256": "c2c5b3d150a5254bd0ded63860db4d1819115e018da71fbb9bda18cda14987d4",
+      "bytes": 2725
+    },
+    {
+      "path": "src-tauri/target/privilege-a3/tests-first.log",
+      "sha256": "39561c31361f2377ee372cf2a2d42b1b6506923a538b5b3b9f99a8ba997affc2",
+      "bytes": 69391
+    },
+    {
+      "path": "src-tauri/target/privilege-a3/tests-elevated.log",
+      "sha256": "2dd7dd62c59e8f07996b4518ba411c0e3ec508044b8243cd524bb2b1e1ae56b5",
+      "bytes": 67906
+    },
+    {
+      "path": "src-tauri/target/privilege-a3/clippy-first.log",
+      "sha256": "4e8086cf495bb55398765e624732bb8a31a950fd36f147b90e65797c03b48335",
+      "bytes": 2110
+    },
+    {
+      "path": "src-tauri/target/privilege-a3/clippy-second.log",
+      "sha256": "2de302b777d330af870273764fd5a68f1fc347556aecfd75016e7cc6b0c3a5b7",
+      "bytes": 162
+    },
+    {
+      "path": "src-tauri/target/privilege-a3/installer-build-first.json",
+      "sha256": "7b1307edf8034f85b2821ff3d628d56c394115cc2e26605324b5041fd50f57f6",
+      "bytes": 577
+    },
+    {
+      "path": "src-tauri/target/privilege-a3/installer-build-first.log",
+      "sha256": "127b5434c8997d0a5a2d63cf42ebdeb428b58ffc8dce9dde44b73063a3e74696",
+      "bytes": 4598
+    },
+    {
+      "path": "src-tauri/target/privilege-a3/installer-build-second.json",
+      "sha256": "2ff485ad0eb34cb6b1da662edecdaa9df6062fca68dde42d407fd3e0c936b67f",
+      "bytes": 578
+    },
+    {
+      "path": "src-tauri/target/privilege-a3/installer-build-second.log",
+      "sha256": "003e8e017bbc451c1eda7ba11db2fa28d393a52e159ffc26cd85bbd66652dbbf",
+      "bytes": 4326
+    },
+    {
+      "path": "src-tauri/target/privilege-a3/installer-bundle-third.json",
+      "sha256": "0c8ef00aaedf96168089d9c7df26b546205bc6e13bbfd8074a1985d8637d3960",
+      "bytes": 467
+    },
+    {
+      "path": "src-tauri/target/privilege-a3/installer-bundle-third.log",
+      "sha256": "83b984a422f2677ddbc9c2bf1099b6c14684092e3d493963e175be0623765e79",
+      "bytes": 771
+    },
+    {
+      "path": "src-tauri/target/privilege-a3/preprocess-first.json",
+      "sha256": "1f36a27ff5a7837dfea7d3c9f5b7897be6bd968dd114fd55f94bf1cccbe41629",
+      "bytes": 759
+    },
+    {
+      "path": "src-tauri/target/privilege-a3/compile-inspection-first.json",
+      "sha256": "99690ab7402879f70b59e5f31a73cd8b508b3105d5e6ee8238f7e4cecbb8e4b4",
+      "bytes": 430
+    },
+    {
+      "path": "src-tauri/target/privilege-a3/compile-inspection-first.log",
+      "sha256": "f80111f69231446af519b29c87ba97a3348c6f6f64db88208bf190168860d87a",
+      "bytes": 124885
+    },
+    {
+      "path": "src-tauri/target/privilege-a3/frontend-build.log",
+      "sha256": "1e26e781121aadbff44e113949b91841a7515f5c0fb2c84622db089f532c60d7",
+      "bytes": 2256
+    },
+    {
+      "path": "src-tauri/target/privilege-a3/artifact-inspection-first.json",
+      "sha256": "3d8749139f5d93d1f6ecfa450a2527c209211be81205458416d16c19bffbe7ba",
+      "bytes": 5633
+    }
+  ],
+  "cleanup": {
+    "application_launched": false,
+    "installation_executed": false,
+    "uninstallation_executed": false,
+    "firewall_maintenance_executed": false,
+    "native_configuration_writes_dispatched": false,
+    "restoration_required": false,
+    "private_profile_files_committed": false,
+    "build_outputs_committed": false,
+    "historical_evidence_bytes_unchanged": true,
+    "earlier_optimized_image_hash_verified": true,
+    "pocketstream_profile_loaded_or_written": false
+  },
+  "pending_gates": [
+    {
+      "gate": "Native address and partial-provider qualification",
+      "status": "pending",
+      "reason": "Real add/remove/static/DHCP/DNS/route/renew/restart and interrupted-provider effects require a controlled native fixture."
+    },
+    {
+      "gate": "Native firewall policy and legacy migration",
+      "status": "pending",
+      "reason": "Rule/filter readback, enabled state, Any reset, actual deny preservation, legacy/duplicate/custom-port and partial-provider cases have only fake-provider coverage here."
+    },
+    {
+      "gate": "Full installer transaction lifetime",
+      "status": "pending",
+      "reason": "Fresh/repeat/in-place upgrade/standalone uninstall, interactive/passive/silent/updater, cancellation/failure, native mutex owning threads, Busy/file-use and launch ordering require isolated Windows execution."
+    },
+    {
+      "gate": "Native binding and ownership matrices",
+      "status": "pending",
+      "reason": "Unchanged-camera Wi-Fi/VPN/virtual changes, actual all-address inventory/rebind/error recovery, and cross-account/logon/integrity behavior are untested."
+    },
+    {
+      "gate": "Exact rebuilt-candidate production and hardware smoke",
+      "status": "pending",
+      "reason": "No new host launch, settings/confirmations/discovery/playback/PTU/movement/stop/Close smoke. Previous artifact evidence is preserved without transferring credit."
+    },
+    {
+      "gate": "Positive in-process candidate ICMP and cold-start cached-role retry",
+      "status": "pending",
+      "reason": "Previous candidate observation limitations remain; optional probe variables were removed for safe native fixtures."
+    },
+    {
+      "gate": "Installed-package, signed updater, G3 and resource closure",
+      "status": "pending",
+      "reason": "Unsigned inspection and compile traces do not qualify installed packages, signed updates, native runtime/resource/endurance matrices or source-release closure."
+    },
+    {
+      "gate": "A4 and overall qualification",
+      "status": "incomplete",
+      "reason": "Required native/installed/hardware gates remain pending."
+    },
+    {
+      "gate": "Privileged helper and unelevated host",
+      "status": "deferred",
+      "reason": "No helper transport, Grant access/update commands or manifest demotion implemented."
+    }
+  ],
+  "security_boundary": "Shipping host still requests administrator access. Renderer/media compromise remains in an elevated host; this is not privilege separation.",
+  "implementation_commit": "542133fdbe00e8125352a2480691ad5d193e2650",
+  "environment": {
+    "powershell": "5.1.26100.9711",
+    "rustc": "1.97.1 (8bab26f4f 2026-07-14)",
+    "cargo": "1.97.1 (c980f4866 2026-06-30)",
+    "node": "v24.14.0",
+    "tauri_cli": "2.10.1",
+    "nsis": "3.11",
+    "gstreamer_sdk": "existing MSVC x86_64 SDK; payload files hashed separately",
+    "release_variable": "POCKETSTREAM_RELEASE=1 for packaging; unset for ordinary tests",
+    "native_mutation_environment": false,
+    "windows_version_api": "10.0.26200.0",
+    "windows_build": "26200",
+    "windows_ubr": 9711,
+    "windows_display_version": "25H2",
+    "timezone": "Central Standard Time",
+    "observation_record": {
+      "path": "src-tauri/target/privilege-a3/windows-environment.json",
+      "sha256": "c1b352291af6745eef548dd3cc91b4ee4a5e1c7732dc27a6d3604b9f3ee80080",
+      "bytes": 234
+    }
+  }
+}
