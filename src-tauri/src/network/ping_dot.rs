@@ -109,6 +109,13 @@ pub fn start(app_handle: AppHandle, registry: Arc<DeviceRegistry>) -> PingDotHan
                         return;
                     }
                     // Reachability only. No registry or positive-presence write.
+                    log::info!(
+                        "Selected-adapter ICMP result: target={} source={} interface_index={} reachable={}",
+                        target.ip,
+                        path.source,
+                        path.index,
+                        reachable
+                    );
                     let _ = ah.emit(
                         "device-ping-result",
                         serde_json::json!({

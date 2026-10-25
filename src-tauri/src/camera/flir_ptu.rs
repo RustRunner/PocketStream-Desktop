@@ -42,12 +42,30 @@ impl PtuController {
         // Check after the FIFO wait, immediately before this request.
         let path = manager.camera_ready(target, config).await?;
         let client = client(&path)?;
-        send_command(
+        let response = send_command(
             &client,
             &format!("http://{}", path.target.ip),
             &normalize_ptu_cmd(cmd),
         )
-        .await
+        .await?;
+        // Retain numeric readback only, never arbitrary device response text or
+        // command payloads. A successful HTTP request alone is not position proof.
+        if cmd == "PP&TP" {
+            if let (Some(pan), Some(tilt)) = (
+                response.get("PP").and_then(|v| v.parse::<i32>().ok()),
+                response.get("TP").and_then(|v| v.parse::<i32>().ok()),
+            ) {
+                log::info!(
+                    "PTU position reply: target={} source={} interface_index={} pan={} tilt={}",
+                    path.target.ip,
+                    path.source,
+                    path.index,
+                    pan,
+                    tilt
+                );
+            }
+        }
+        Ok(response)
     }
 }
 

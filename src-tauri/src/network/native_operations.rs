@@ -886,6 +886,7 @@ pub(crate) async fn startup_reconcile(app: tauri::AppHandle) -> Result<(), AppEr
         .await
         .map_err(|_| AppError::Network("Startup recovery completion unavailable".into()))?;
     if completion.outcome == Outcome::Completed {
+        log::info!("Native startup reconciliation completed; conflicting writes available");
         Ok(())
     } else {
         Err(admission(AdmissionError::ReconciliationRequired))
