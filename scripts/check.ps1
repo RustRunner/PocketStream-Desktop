@@ -60,7 +60,7 @@ Step "npm run typecheck" {
 }
 
 # ── Frontend build (mirrors `frontend` job) ────────────────────────
-Step "Frontend contracts (including IPC allowlist)" {
+Step "Frontend and installer source contracts (including IPC allowlist)" {
     Push-Location $repoRoot
     try { npm.cmd run check:contracts } finally { Pop-Location }
 }

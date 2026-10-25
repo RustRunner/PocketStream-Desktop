@@ -30,7 +30,9 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": [
+      "nsis"
+    ],
     "createUpdaterArtifacts": true,
     "licenseFile": "../LICENSE",
     "icon": [
@@ -51,7 +53,9 @@
       "nsis": {
         "installMode": "perMachine",
         "installerIcon": "icons/icon.ico",
-        "compression": "lzma"
+        "compression": "lzma",
+        "template": "installer/installer.nsi",
+        "installerHooks": "installer/transaction.nsh"
       }
     }
   },

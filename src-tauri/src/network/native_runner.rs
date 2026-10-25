@@ -381,6 +381,20 @@ impl NativeProcessRunner {
         })
     }
 
+    pub(super) fn run_firewall(
+        operation: super::firewall::Operation,
+        cancel: Cancellation,
+    ) -> Result<ProcessResult, String> {
+        Self::run_inner(
+            super::firewall::SCRIPT,
+            operation.payload()?,
+            cancel,
+            Duration::from_secs(30),
+            None,
+        )
+        .map_err(|_| "Trusted firewall process setup or containment failed".into())
+    }
+
     fn run_inner(
         script: &str,
         payload: Vec<u8>,

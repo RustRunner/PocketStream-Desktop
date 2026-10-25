@@ -406,6 +406,14 @@
   display: contents;
 }
 
+#restream-bind-scope,
+#restream-firewall-state {
+  grid-column: 1 / -1;
+  color: var(--md-on-surface-variant);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
 #card-restream .status-value,
 #card-restream .qr-icon-btn {
   justify-self: end;

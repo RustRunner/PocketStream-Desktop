@@ -1,0 +1,13 @@
+{
+  "cli_version": "2.10.1",
+  "bundler_version": "2.8.1",
+  "source_url": "https://raw.githubusercontent.com/tauri-apps/tauri/tauri-cli-v2.10.1/crates/tauri-bundler/src/bundle/windows/nsis/installer.nsi",
+  "source_sha256_lf": "fe22026f68bdb3292fab376756035496ce0a35e3d580e06ebaa6a28295916eb3",
+  "license": "Apache-2.0 OR MIT",
+  "delta": [
+    "Remove the reinstall page and every chained previous-uninstaller path; accept only in-place supported NSIS predecessors and protected fresh destinations.",
+    "Hold the installation gate from onInit through terminal callbacks and maintenance; bound host/process checks and remove stock process-kill calls.",
+    "Run fixed install/uninstall maintenance, propagate failure with a machine-readable result, and release the transaction before relaunch."
+  ],
+  "qualification": "Static/generated-script checks do not prove native mutex lifetime or installation behavior; isolated Windows qualification is pending."
+}

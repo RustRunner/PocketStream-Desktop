@@ -145,6 +145,8 @@ pub struct ResolvedStartSpec {
     pub source: ResolvedSource,
     pub output: ResolvedOutput,
     pub bind_interface: Option<String>,
+    pub bind_identity: Option<crate::network::interface::NativeIdentity>,
+    pub bind_scope: crate::network::bindings::BindScope,
     pub bind_address: Option<String>,
     pub advertised_ip: String,
     pub username: String,
@@ -1200,6 +1202,9 @@ mod tests {
                 mount_path: "/stream-token".into(),
             },
             bind_interface: None,
+            bind_identity: None,
+
+            bind_scope: crate::network::bindings::BindScope::default(),
             bind_address: None,
             advertised_ip: "192.0.2.10".into(),
             username: "camera".into(),
@@ -1221,6 +1226,9 @@ mod tests {
                 stream_id: "field unit".into(),
             },
             bind_interface: None,
+            bind_identity: None,
+
+            bind_scope: crate::network::bindings::BindScope::default(),
             bind_address: None,
             advertised_ip: "192.0.2.10".into(),
             username: String::new(),
@@ -1253,6 +1261,9 @@ mod tests {
                 stream_id: "#!::r=Pocket Stream/%#&=,snowman-☃".into(),
             },
             bind_interface: Some("ZeroTier".into()),
+            bind_identity: None,
+
+            bind_scope: crate::network::bindings::BindScope::default(),
             bind_address: Some("192.0.2.10".into()),
             advertised_ip: "192.0.2.10".into(),
             username: String::new(),

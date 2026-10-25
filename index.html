@@ -277,6 +277,8 @@
                   <span class="status-label">URL:</span>
                   <span id="restream-url" class="status-value monospace">--</span>
                 </div>
+                <div id="restream-bind-scope">No active listener</div>
+                <div id="restream-firewall-state">Windows rule inactive</div>
                 <div class="status-row">
                   <span class="status-label">Uptime:</span>
                   <span id="restream-uptime" class="status-value">--</span>
@@ -299,9 +301,9 @@
                 </div>
               </div>
               <div class="card-footer">
-                <span class="status-label">VPN:</span>
-                <select id="restream-bind-interface" class="status-select" title="Bind the re-stream server to a VPN interface" disabled>
-                  <option value="">None</option>
+                <span class="status-label">Bind:</span>
+                <select id="restream-bind-interface" class="status-select" title="Bind the re-stream server to local addresses" disabled>
+                  <option value="">All addresses</option>
                 </select>
                 <div class="card-footer-spacer"></div>
                 <button id="btn-toggle-restream" class="text-btn">Start Server</button>

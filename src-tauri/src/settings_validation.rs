@@ -26,6 +26,7 @@ pub(crate) struct ResolvedSrtServerUpdate {
     pub latency_ms: i64,
     pub stream_id: String,
     pub bind_interface: String,
+    pub bind_interface_id: Option<String>,
 }
 
 fn validation_error(message: impl Into<String>) -> AppError {
@@ -110,6 +111,27 @@ pub(crate) fn normalize_restream_servers(
         .ok_or_else(|| validation_error("SRT latency must be between 20 and 8000 ms"))?;
     validate_srt_passphrase(&srt.passphrase)?;
     validate_srt_stream_id(&srt.stream_id)?;
+    for (alias, id) in [
+        (&rtsp.bind_interface, &rtsp.bind_interface_id),
+        (&srt.bind_interface, &srt.bind_interface_id),
+    ] {
+        if let Some(id) = id {
+            if alias.is_empty()
+                || id.len() != 36
+                || !id.bytes().enumerate().all(|(i, b)| {
+                    if [8, 13, 18, 23].contains(&i) {
+                        b == b'-'
+                    } else {
+                        b.is_ascii_hexdigit()
+                    }
+                })
+            {
+                return Err(validation_error(
+                    "Bind identity must be a stable interface GUID with an explicit selection",
+                ));
+            }
+        }
+    }
 
     if stream.protocol == StreamProtocol::Udp && stream.udp_port == srt_port {
         return Err(validation_error(
@@ -123,6 +145,7 @@ pub(crate) fn normalize_restream_servers(
             port: rtsp_port,
             token: rtsp.token,
             bind_interface: rtsp.bind_interface,
+            bind_interface_id: rtsp.bind_interface_id,
         },
         SrtServerConfig {
             port: srt_port,
@@ -130,6 +153,7 @@ pub(crate) fn normalize_restream_servers(
             latency_ms,
             stream_id: srt.stream_id,
             bind_interface: srt.bind_interface,
+            bind_interface_id: srt.bind_interface_id,
         },
     ))
 }
@@ -144,6 +168,7 @@ pub fn validate_prospective_settings(mut settings: AppSettings) -> Result<AppSet
             port: i64::from(settings.rtsp_server.port),
             token: settings.rtsp_server.token.clone(),
             bind_interface: settings.rtsp_server.bind_interface.clone(),
+            bind_interface_id: settings.rtsp_server.bind_interface_id.clone(),
         },
         ResolvedSrtServerUpdate {
             port: i64::from(settings.srt_server.port),
@@ -151,6 +176,7 @@ pub fn validate_prospective_settings(mut settings: AppSettings) -> Result<AppSet
             latency_ms: i64::from(settings.srt_server.latency_ms),
             stream_id: settings.srt_server.stream_id.clone(),
             bind_interface: settings.srt_server.bind_interface.clone(),
+            bind_interface_id: settings.srt_server.bind_interface_id.clone(),
         },
     )?;
     settings.rtsp_server = rtsp_server;
@@ -179,6 +205,7 @@ pub fn prospective_restream_settings(
             latency_ms: update.srt_server.latency_ms,
             stream_id: update.srt_server.stream_id,
             bind_interface: update.srt_server.bind_interface,
+            bind_interface_id: update.srt_server.bind_interface_id,
         },
     )?;
 
@@ -226,6 +253,7 @@ mod tests {
                 port: rtsp_port,
                 token: "0123456789abcdef".into(),
                 bind_interface: String::new(),
+                bind_interface_id: None,
             },
             srt_server: SrtServerUpdate {
                 port: srt_port,
@@ -233,6 +261,7 @@ mod tests {
                 latency_ms,
                 stream_id: stream_id.into(),
                 bind_interface: String::new(),
+                bind_interface_id: None,
             },
         }
     }

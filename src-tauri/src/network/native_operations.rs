@@ -687,6 +687,69 @@ pub(super) async fn inventory() -> Result<String, AppError> {
     .map_err(|_| AppError::Network("Native inventory encoding failed".into()))
 }
 
+/// Firewall policy uses the same retained executor and cancellation barrier as
+/// address writers. A maintenance child starts in reconciliation mode and
+/// never acquires its parent's installation gate.
+pub(super) async fn firewall_request(
+    operation: super::firewall::Operation,
+    recovery: bool,
+) -> super::firewall::FirewallOutcome {
+    use super::firewall::{self, FirewallOutcome};
+    if let Ok((cancel, state)) =
+        NATIVE_SCOPE.try_with(|(cancel, state)| (cancel.clone(), state.clone()))
+    {
+        if let Err(error) = check_writes_available() {
+            return FirewallOutcome::Unavailable {
+                reason: error.to_string(),
+            };
+        }
+        let (completion, result) = firewall::execute(operation, cancel).await;
+        let failed = completion.outcome != Outcome::Completed;
+        state.lock().unwrap().record(completion, failed);
+        return result;
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let work = move |cancel| async move {
+        let (completion, result) = firewall::execute(operation, cancel).await;
+        if recovery {
+            *firewall::MAINTENANCE_OBSERVATION.lock().unwrap() = completion.observation.clone();
+        }
+        let _ = tx.send(result);
+        completion
+    };
+    let pending = if recovery {
+        executor().reconcile(work)
+    } else {
+        executor().submit(work)
+    };
+    let ticket = match pending {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            return FirewallOutcome::Unavailable {
+                reason: admission(error).to_string(),
+            }
+        }
+    };
+    let id = ticket.id;
+    match ticket.wait().await {
+        Ok(completion) => {
+            if !recovery && completion.outcome != Outcome::Uncertain {
+                let _ = executor().acknowledge(id);
+            }
+            rx.await.unwrap_or(FirewallOutcome::Failed {
+                stage: "reply".into(),
+                reason: "Native reply lost; reconciliation required".into(),
+                uncertain: true,
+            })
+        }
+        Err(_) => FirewallOutcome::Failed {
+            stage: "completion".into(),
+            reason: "Native completion lost; reconciliation required".into(),
+            uncertain: true,
+        },
+    }
+}
+
 fn validate_recovery_settings(
     settings: &crate::config::AppSettings,
     all: &[NativeAdapter],
@@ -750,6 +813,18 @@ pub(crate) async fn startup_reconcile(app: tauri::AppHandle) -> Result<(), AppEr
             let tracked = state.clone();
             let result = NATIVE_SCOPE
                 .scope((cancel, state), async move {
+                    let firewall = super::firewall::startup().await;
+                    app.state::<crate::streaming::StreamManager>()
+                        .startup_firewall_status(firewall.clone())
+                        .await;
+                    match firewall {
+                        super::firewall::FirewallOutcome::Inactive => {}
+                        result => {
+                            return Err(AppError::Network(format!(
+                                "Windows rule startup reconciliation: {result:?}"
+                            )))
+                        }
+                    }
                     let manager = app.state::<super::NetworkManager>();
                     let config = app.state::<crate::config::AppConfig>();
                     manager.hydrate_adoption_history(&config);

@@ -23,7 +23,7 @@
     "allow-get-license-document",
     "allow-get-network-mode",
     "allow-get-startup-notices",
-    "allow-list-vpn-interfaces",
+    "allow-list-bind-interfaces",
     "allow-log-frontend",
     "allow-open-device-browser",
     "allow-open-log-folder",

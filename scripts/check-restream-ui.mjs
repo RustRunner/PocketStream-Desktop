@@ -57,6 +57,7 @@ const config = {
     port: 8554,
     token: "0123456789abcdef",
     bind_interface: "ZeroTier RTSP",
+    bind_interface_id: "01234567-89ab-cdef-0123-456789abcdef",
   },
   srt_server: {
     port: 8890,
@@ -64,6 +65,7 @@ const config = {
     latency_ms: 125,
     stream_id: "field unit",
     bind_interface: "ZeroTier SRT",
+    bind_interface_id: "12345678-89ab-cdef-0123-456789abcdef",
   },
   credentials: { username: "", password: "" },
   adopted_subnets: {},
@@ -73,10 +75,10 @@ const config = {
   manual_nodes: [],
 };
 
-if (selectedRestreamBindInterface(config, "rtsp") !== "ZeroTier RTSP") {
+if (selectedRestreamBindInterface(config, "rtsp") !== config.rtsp_server.bind_interface_id) {
   throw new Error("RTSP selection did not retain its independent bind interface");
 }
-if (selectedRestreamBindInterface(config, "srt") !== "ZeroTier SRT") {
+if (selectedRestreamBindInterface(config, "srt") !== config.srt_server.bind_interface_id) {
   throw new Error("SRT selection did not retain its independent bind interface");
 }
 

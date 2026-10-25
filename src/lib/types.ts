@@ -113,12 +113,14 @@ export interface RtspServerConfig {
   token: string;
   /** Empty string means bind to all interfaces */
   bind_interface: string;
+  bind_interface_id: string | null;
 }
 
 export interface RtspServerUpdate {
   port: number;
   token: string;
   bind_interface: string;
+  bind_interface_id: string | null;
 }
 
 export type SrtPassphraseAvailability = "unencrypted" | "available" | "unavailable";
@@ -135,6 +137,7 @@ export interface SrtServerConfig {
   latency_ms: number;
   stream_id: string;
   bind_interface: string;
+  bind_interface_id: string | null;
 }
 
 export type SrtPassphraseUpdate =
@@ -148,6 +151,7 @@ export interface SrtServerUpdate {
   latency_ms: number;
   stream_id: string;
   bind_interface: string;
+  bind_interface_id: string | null;
 }
 
 export interface RestreamSettingsUpdate {
@@ -225,7 +229,21 @@ export type RelayState =
   | "recovering"
   | "failed";
 
+export interface BindInterface { id: string; alias: string; kind: string; address: string; }
+export interface BoundAddress { id: string; alias: string; address: string; }
+export type BindScope =
+  | { kind: "all_addresses"; family: "ipv4"; addresses: BoundAddress[]; topology_revision: number }
+  | { kind: "interface"; id: string; alias: string; address: string; family: "ipv4"; topology_revision: number }
+  | { kind: "unknown"; reason: string };
+export type FirewallOutcome =
+  | { state: "inactive" }
+  | { state: "applied"; rule_name: string; action: "created" | "updated" | "unchanged"; verified_shape: boolean; observed_block_rules: string[] }
+  | { state: "unavailable"; reason: string }
+  | { state: "failed"; stage: string; reason: string; uncertain: boolean };
+
 export interface StreamStatus {
+  bind_scope: BindScope;
+  firewall: FirewallOutcome;
   playing: boolean;
   playback_desired: boolean;
   playback_state: "stopped" | "starting" | "playing" | "recovering" | "failed";
@@ -264,6 +282,8 @@ export interface StreamStatus {
 }
 
 export interface RestreamServerInfo {
+  bind_scope: BindScope;
+  firewall: FirewallOutcome;
   protocol: RestreamProtocol;
   server_url: string;
   display_url: string;

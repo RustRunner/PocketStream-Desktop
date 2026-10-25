@@ -19,7 +19,7 @@ const COMMANDS: &[&str] = &[
     "get_network_mode",
     "get_startup_notices",
     // Renamed with the bind-inventory contract in A3.
-    "list_vpn_interfaces",
+    "list_bind_interfaces",
     "log_frontend",
     "open_device_browser",
     "open_log_folder",

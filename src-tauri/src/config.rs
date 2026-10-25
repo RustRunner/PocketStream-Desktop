@@ -65,6 +65,7 @@ pub struct RtspServerConfig {
     /// Network interface to bind the RTSP server to (empty = all interfaces)
     #[serde(default)]
     pub bind_interface: String,
+    pub bind_interface_id: Option<String>,
 }
 
 /// Runtime-only SRT passphrase state. Deliberately neither `Debug` nor
@@ -85,6 +86,7 @@ pub struct SrtServerConfig {
     pub latency_ms: u32,
     pub stream_id: String,
     pub bind_interface: String,
+    pub bind_interface_id: Option<String>,
 }
 
 impl Default for SrtServerConfig {
@@ -95,6 +97,7 @@ impl Default for SrtServerConfig {
             latency_ms: 125,
             stream_id: String::new(),
             bind_interface: String::new(),
+            bind_interface_id: None,
         }
     }
 }
@@ -107,6 +110,7 @@ pub struct RtspServerUpdate {
     pub port: i64,
     pub token: String,
     pub bind_interface: String,
+    pub bind_interface_id: Option<String>,
 }
 
 /// Explicit passphrase intent. `Keep` is the only untouched-field action;
@@ -127,6 +131,7 @@ pub struct SrtServerUpdate {
     pub latency_ms: i64,
     pub stream_id: String,
     pub bind_interface: String,
+    pub bind_interface_id: Option<String>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -304,6 +309,7 @@ fn remove_adoption_entry(
 
 #[derive(Clone)]
 pub struct AppSettings {
+    pub bind_identity_migration_complete: bool,
     pub selected_adapter_mac: Option<String>,
     /// Explicit primary IPv4 CIDR per adapter MAC. Empty means the user removed
     /// the primary; an absent entry is legacy/unknown, never enumeration order.
@@ -339,6 +345,7 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            bind_identity_migration_complete: true,
             selected_adapter_mac: None,
             primary_addresses: HashMap::new(),
             stream: StreamConfig {
@@ -356,6 +363,7 @@ impl Default for AppSettings {
                 port: 8554,
                 token: generate_token(),
                 bind_interface: String::new(),
+                bind_interface_id: None,
             },
             srt_server: SrtServerConfig::default(),
             credentials: Credentials {
@@ -414,6 +422,7 @@ pub struct SrtServerView {
     pub latency_ms: u32,
     pub stream_id: String,
     pub bind_interface: String,
+    pub bind_interface_id: Option<String>,
 }
 
 impl From<&SrtServerConfig> for SrtServerView {
@@ -424,6 +433,7 @@ impl From<&SrtServerConfig> for SrtServerView {
             latency_ms: settings.latency_ms,
             stream_id: settings.stream_id.clone(),
             bind_interface: settings.bind_interface.clone(),
+            bind_interface_id: settings.bind_interface_id.clone(),
         }
     }
 }
@@ -476,6 +486,7 @@ struct PersistedRtspServerConfig {
     token: String,
     #[serde(default)]
     bind_interface: String,
+    bind_interface_id: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -486,6 +497,7 @@ struct PersistedSrtServerConfig {
     latency_ms: i64,
     stream_id: String,
     bind_interface: String,
+    bind_interface_id: Option<String>,
 }
 
 impl Default for PersistedSrtServerConfig {
@@ -496,12 +508,15 @@ impl Default for PersistedSrtServerConfig {
             latency_ms: 125,
             stream_id: String::new(),
             bind_interface: String::new(),
+            bind_interface_id: None,
         }
     }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 struct PersistedAppSettings {
+    #[serde(default)]
+    bind_identity_migration_complete: bool,
     #[serde(default)]
     selected_adapter_mac: Option<String>,
     #[serde(default)]
@@ -554,6 +569,7 @@ fn runtime_settings_from_persisted(
     key: Option<&[u8]>,
 ) -> Result<AppSettings, crate::AppError> {
     let PersistedAppSettings {
+        bind_identity_migration_complete,
         selected_adapter_mac,
         primary_addresses,
         pending_addresses,
@@ -579,6 +595,7 @@ fn runtime_settings_from_persisted(
             port: rtsp_server.port,
             token: rtsp_server.token,
             bind_interface: rtsp_server.bind_interface,
+            bind_interface_id: rtsp_server.bind_interface_id,
         },
         crate::settings_validation::ResolvedSrtServerUpdate {
             port: srt_server.port,
@@ -586,10 +603,12 @@ fn runtime_settings_from_persisted(
             latency_ms: srt_server.latency_ms,
             stream_id: srt_server.stream_id,
             bind_interface: srt_server.bind_interface,
+            bind_interface_id: srt_server.bind_interface_id,
         },
     )?;
 
     crate::settings_validation::validate_prospective_settings(AppSettings {
+        bind_identity_migration_complete,
         selected_adapter_mac,
         primary_addresses,
         pending_addresses,
@@ -641,6 +660,7 @@ where
     };
 
     Ok(PersistedAppSettings {
+        bind_identity_migration_complete: settings.bind_identity_migration_complete,
         selected_adapter_mac: settings.selected_adapter_mac,
         primary_addresses: settings.primary_addresses,
         pending_addresses: settings.pending_addresses,
@@ -651,6 +671,7 @@ where
             port: i64::from(settings.rtsp_server.port),
             token: settings.rtsp_server.token,
             bind_interface: settings.rtsp_server.bind_interface,
+            bind_interface_id: settings.rtsp_server.bind_interface_id,
         },
         srt_server: PersistedSrtServerConfig {
             port: i64::from(settings.srt_server.port),
@@ -658,6 +679,7 @@ where
             latency_ms: i64::from(settings.srt_server.latency_ms),
             stream_id: settings.srt_server.stream_id,
             bind_interface: settings.srt_server.bind_interface,
+            bind_interface_id: settings.srt_server.bind_interface_id,
         },
         credentials: Credentials {
             username: encrypt_string(&settings.credentials.username, key),
@@ -924,6 +946,49 @@ impl AppConfig {
         srt_server: SrtServerConfig,
     ) -> Result<AppSettings, crate::AppError> {
         self.commit_restream_settings_with(rtsp_server, srt_server, save_to_disk)
+    }
+
+    pub(crate) fn migrate_bind_ids(
+        &self,
+        interfaces: &[crate::network::bindings::BindInterface],
+    ) -> Result<(), crate::AppError> {
+        self.migrate_bind_ids_with(interfaces, save_to_disk)
+    }
+
+    fn migrate_bind_ids_with(
+        &self,
+        interfaces: &[crate::network::bindings::BindInterface],
+        persist: impl FnOnce(&AppSettings) -> Result<(), crate::AppError>,
+    ) -> Result<(), crate::AppError> {
+        self.change_settings_if_with(
+            |settings| {
+                if settings.bind_identity_migration_complete {
+                    return Ok(((), false));
+                }
+                settings.bind_identity_migration_complete = true;
+                let changed = true;
+                for (alias, id) in [
+                    (
+                        &settings.rtsp_server.bind_interface,
+                        &mut settings.rtsp_server.bind_interface_id,
+                    ),
+                    (
+                        &settings.srt_server.bind_interface,
+                        &mut settings.srt_server.bind_interface_id,
+                    ),
+                ] {
+                    if alias.is_empty() || id.is_some() {
+                        continue;
+                    }
+                    let matches: Vec<_> = interfaces.iter().filter(|i| i.alias == *alias).collect();
+                    if matches.len() == 1 {
+                        *id = Some(matches[0].id.clone());
+                    }
+                }
+                Ok(((), changed))
+            },
+            persist,
+        )
     }
 
     pub(crate) fn commit_restream_settings_with<F>(
@@ -2678,6 +2743,7 @@ password = ""
             port: 9_554,
             token: "fedcba9876543210".into(),
             bind_interface: "ZeroTier".into(),
+            bind_interface_id: None,
         };
         let srt = SrtServerConfig {
             port: 9_000,
@@ -2687,6 +2753,7 @@ password = ""
             latency_ms: 250,
             stream_id: "field unit".into(),
             bind_interface: "ZeroTier".into(),
+            bind_interface_id: None,
         };
 
         let error = match config.commit_restream_settings_with(rtsp.clone(), srt.clone(), |_| {
@@ -2758,6 +2825,7 @@ password = ""
     #[test]
     fn settings_toml_with_populated_fields() {
         let settings = AppSettings {
+            bind_identity_migration_complete: true,
             selected_adapter_mac: None,
             primary_addresses: HashMap::new(),
             stream: StreamConfig {
@@ -2775,6 +2843,7 @@ password = ""
                 port: 9554,
                 token: "0123456789abcdef".into(),
                 bind_interface: "Ethernet 2".into(),
+                bind_interface_id: None,
             },
             srt_server: SrtServerConfig::default(),
             credentials: Credentials {
@@ -2796,6 +2865,48 @@ password = ""
         assert!(parsed.rtsp_server.enabled);
         assert_eq!(parsed.credentials.username, "admin");
         assert!(parsed.stream.audio_muted);
+    }
+
+    #[test]
+    fn bind_migration_persists_unique_ids_once_and_never_adopts_a_reused_alias() {
+        use crate::network::bindings::BindInterface;
+        let mut settings = AppSettings {
+            bind_identity_migration_complete: false,
+            ..Default::default()
+        };
+        settings.rtsp_server.bind_interface = "Original Ethernet".into();
+        settings.srt_server.bind_interface = "Missing VPN".into();
+        let config = AppConfig::temporary_test_config(settings);
+        let known = BindInterface {
+            id: "01234567-89ab-cdef-0123-456789abcdef".into(),
+            alias: "Original Ethernet".into(),
+            kind: "ethernet".into(),
+            address: "192.0.2.2".into(),
+        };
+        assert!(config
+            .migrate_bind_ids_with(std::slice::from_ref(&known), |_| Err(
+                crate::AppError::Config("fake disk failure".into())
+            ))
+            .is_err());
+        assert!(!config.get().bind_identity_migration_complete);
+        assert!(config.get().rtsp_server.bind_interface_id.is_none());
+        config
+            .migrate_bind_ids_with(std::slice::from_ref(&known), |_| Ok(()))
+            .unwrap();
+        assert_eq!(
+            config.get().rtsp_server.bind_interface_id.as_deref(),
+            Some(known.id.as_str())
+        );
+        assert!(config.get().srt_server.bind_interface_id.is_none());
+        let reused = BindInterface {
+            alias: "Missing VPN".into(),
+            id: "12345678-89ab-cdef-0123-456789abcdef".into(),
+            ..known
+        };
+        config
+            .migrate_bind_ids_with(&[reused], |_| panic!("migration must not run twice"))
+            .unwrap();
+        assert!(config.get().srt_server.bind_interface_id.is_none());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 pub mod adapter_refresh;
 pub mod arp;
 pub mod auto_adopt;
+pub mod bindings;
 pub(crate) mod bound_tcp;
 mod cache_probe;
 pub mod device_registry;
@@ -75,6 +76,7 @@ pub(crate) fn cmd(program: &str) -> std::process::Command {
 }
 
 /// Create a `tokio::process::Command` that won't flash a console window.
+#[cfg(not(windows))]
 pub(crate) fn async_cmd(program: &str) -> tokio::process::Command {
     let std_cmd = cmd(program);
     tokio::process::Command::from(std_cmd)

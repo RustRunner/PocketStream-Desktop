@@ -1,6 +1,6 @@
 import type {
   AppSettings,
-  InterfaceInfo,
+  BindInterface,
   RestreamProtocol,
   RestreamSettingsUpdate,
   SrtPassphraseUpdate,
@@ -21,9 +21,8 @@ export function selectedRestreamBindInterface(
   config: AppSettings,
   protocol: RestreamProtocol = config.restream_protocol
 ): string {
-  return protocol === "srt"
-    ? config.srt_server.bind_interface
-    : config.rtsp_server.bind_interface;
+  const selected = protocol === "srt" ? config.srt_server : config.rtsp_server;
+  return selected.bind_interface_id || (selected.bind_interface ? `legacy:${selected.bind_interface}` : "");
 }
 
 /** Build the one complete backend transaction used by Settings Save. */
@@ -37,6 +36,7 @@ export function buildRestreamSettingsUpdate(
       port: values.rtspPort,
       token: values.rtspToken,
       bind_interface: config.rtsp_server.bind_interface,
+      bind_interface_id: config.rtsp_server.bind_interface_id ?? null,
     },
     srt_server: {
       port: values.srtPort,
@@ -44,6 +44,7 @@ export function buildRestreamSettingsUpdate(
       latency_ms: values.srtLatencyMs,
       stream_id: values.srtStreamId,
       bind_interface: config.srt_server.bind_interface,
+      bind_interface_id: config.srt_server.bind_interface_id ?? null,
     },
   };
 }
@@ -53,7 +54,8 @@ export function buildRestreamSettingsUpdate(
 export function buildRestreamBindUpdate(
   config: AppSettings,
   protocol: RestreamProtocol,
-  bindInterface: string
+  bindInterface: string,
+  bindInterfaceId: string | null = null
 ): RestreamSettingsUpdate {
   const update = buildRestreamSettingsUpdate(config, {
     enabled: config.rtsp_server.enabled,
@@ -66,8 +68,10 @@ export function buildRestreamBindUpdate(
   });
   if (protocol === "srt") {
     update.srt_server.bind_interface = bindInterface;
+    update.srt_server.bind_interface_id = bindInterfaceId;
   } else {
     update.rtsp_server.bind_interface = bindInterface;
+    update.rtsp_server.bind_interface_id = bindInterfaceId;
   }
   return update;
 }
@@ -123,28 +127,32 @@ export interface RestreamBindOption {
   value: string;
   label: string;
   unavailable: boolean;
+  alias: string;
 }
 
 export function buildRestreamBindOptions(
-  interfaces: readonly InterfaceInfo[],
-  saved: string
+  interfaces: readonly BindInterface[],
+  saved: string,
+  savedAlias = saved.replace(/^legacy:/, "")
 ): RestreamBindOption[] {
   const options: RestreamBindOption[] = [
-    { value: "", label: "None", unavailable: false },
+    { value: "", label: "All addresses", unavailable: false, alias: "" },
   ];
   for (const iface of interfaces) {
-    const address = iface.ips[0]?.address;
+    const address = iface.address;
     options.push({
-      value: iface.name,
-      label: address ? `${iface.name} (${address})` : iface.name,
+      value: iface.id,
+      label: address ? `${iface.alias} (${address})` : iface.alias,
       unavailable: false,
+      alias: iface.alias,
     });
   }
-  if (saved && !interfaces.some((iface) => iface.name === saved)) {
+  if (saved && !interfaces.some((iface) => iface.id === saved)) {
     options.push({
       value: saved,
-      label: `${saved} (unavailable)`,
+      label: `${savedAlias} (unavailable)`,
       unavailable: true,
+      alias: saved.replace(/^legacy:/, ""),
     });
   }
   return options;

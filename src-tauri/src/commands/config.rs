@@ -16,6 +16,7 @@ use crate::streaming::{RestreamOperationResult, StreamManager};
 
 #[tauri::command]
 pub async fn get_config(config: State<'_, AppConfig>) -> Result<AppSettingsView, AppError> {
+    crate::network::bindings::migrate(&config).await?;
     let settings = config.get();
     Ok(AppSettingsView::from(&settings))
 }

@@ -22,6 +22,10 @@ use crate::config::{
 };
 use crate::error::AppError;
 use crate::network::route::{CameraTarget, ReadyPath};
+use crate::network::{
+    bindings::{self, BindScope},
+    firewall::{self, FirewallOutcome, FirewallRule},
+};
 
 /// Apply the required receive policy to an `rtspsrc` that is constrained to
 /// TCP transport.  `set_property` panics for a missing or mismatched property,
@@ -82,6 +86,8 @@ pub(super) fn redact_relay_text(text: &str, mount_path: &str) -> String {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RestreamServerInfo {
+    pub bind_scope: BindScope,
+    pub firewall: FirewallOutcome,
     pub protocol: RestreamProtocol,
     pub server_url: String,
     pub display_url: String,
@@ -191,6 +197,8 @@ impl RestreamServer {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StreamStatus {
+    pub bind_scope: BindScope,
+    pub firewall: FirewallOutcome,
     pub playing: bool,
     pub playback_desired: bool,
     pub playback_state: PlaybackState,
@@ -225,6 +233,8 @@ pub struct StreamStatus {
 impl StreamStatus {
     fn idle(selected_protocol: RestreamProtocol) -> Self {
         Self {
+            bind_scope: BindScope::default(),
+            firewall: FirewallOutcome::Inactive,
             playing: false,
             playback_desired: false,
             playback_state: PlaybackState::Stopped,
@@ -309,6 +319,8 @@ enum SourceMode {
 }
 
 struct StreamState {
+    firewall: FirewallOutcome,
+    firewall_generation: Option<(u64, FirewallRule)>,
     playback_target: Option<CameraTarget>,
     restream_target: Option<CameraTarget>,
     playback_settings: Option<AppSettings>,
@@ -382,6 +394,8 @@ impl StreamManager {
                 recording_finalized_path: None,
                 playback: None,
                 selected_protocol,
+                firewall: FirewallOutcome::Inactive,
+                firewall_generation: None,
                 restream_server: None,
                 restream_desired: false,
                 restream_spec: None,
@@ -650,7 +664,36 @@ impl StreamManager {
                 port: settings.stream.udp_port,
             },
         };
-        let bind_address = resolve_explicit_bind(bind_interface.as_deref(), adopted).await?;
+        let saved_id = match settings.restream_protocol {
+            RestreamProtocol::Rtsp => settings.rtsp_server.bind_interface_id.as_deref(),
+            RestreamProtocol::Srt => settings.srt_server.bind_interface_id.as_deref(),
+        };
+        // An unresolved legacy alias remains unavailable until explicitly chosen.
+        if bind_interface.is_some() && saved_id.is_none() && !cfg!(test) {
+            return Err(AppError::Stream(
+                "Choose the unavailable saved bind interface again to establish its identity"
+                    .into(),
+            ));
+        }
+        let (bind_identity, bind_scope) =
+            match bindings::resolve(bind_interface.as_deref(), saved_id, adopted).await {
+                Ok(resolved) => resolved,
+                Err(error) if bind_interface.is_none() => (
+                    None,
+                    BindScope::Unknown {
+                        reason: error.to_string(),
+                    },
+                ),
+                Err(error) => return Err(error),
+            };
+        let bind_address = match &bind_scope {
+            BindScope::Interface { address, .. } => Some(address.clone()),
+            _ => None,
+        };
+        let bind_interface = bind_identity
+            .as_ref()
+            .map(|i| i.alias.clone())
+            .or(bind_interface);
         let advertised_ip = match &bind_address {
             Some(ip) => ip.clone(),
             None => get_display_ip(adopted)
@@ -667,6 +710,8 @@ impl StreamManager {
             source,
             output,
             bind_interface,
+            bind_identity,
+            bind_scope,
             bind_address,
             advertised_ip,
             username: settings.credentials.username.clone(),
@@ -989,7 +1034,9 @@ impl StreamManager {
             ));
         }
 
-        let info = RestreamServerInfo {
+        let mut info = RestreamServerInfo {
+            bind_scope: spec.bind_scope.clone(),
+            firewall: FirewallOutcome::Inactive,
             protocol: spec.protocol(),
             server_url: spec.client_url(),
             display_url: spec.display_url(),
@@ -1032,6 +1079,7 @@ impl StreamManager {
                 log::info!(
                     "Explicit re-stream Start resolved to the healthy current endpoint; no-op"
                 );
+                info.firewall = state.firewall.clone();
                 return Ok(info);
             }
 
@@ -1066,18 +1114,7 @@ impl StreamManager {
         self.relay_wake.notify_waiters();
         self.refresh_status().await;
 
-        let gst_error = crate::ensure_gstreamer().err();
-        let firewall_rule = match spec.protocol() {
-            RestreamProtocol::Rtsp => crate::network::firewall::FirewallRule::Rtsp,
-            RestreamProtocol::Srt => crate::network::firewall::FirewallRule::Srt,
-        };
-        if let Err(error) =
-            crate::network::firewall::ensure_restream_allowed(firewall_rule, spec.server_port())
-                .await
-        {
-            log::warn!("Firewall setup: {}", error);
-        }
-
+        let gst_error = preflight_restream(&spec).err();
         let _lifecycle = self.relay_lifecycle.lock().await;
         if !relay_is_current(
             &self.state,
@@ -1104,7 +1141,9 @@ impl StreamManager {
             state.restream_server.take()
         };
         if let Some(mut old_server) = old_server {
+            let generation = old_server.server_generation();
             old_server.shutdown().await;
+            retire_firewall(&self.state, generation).await;
         }
 
         if !relay_is_current(
@@ -1141,6 +1180,44 @@ impl StreamManager {
             self.refresh_status().await;
             return Err(error);
         }
+        if bindings::revision() != scope_revision(&spec.bind_scope) {
+            health.mark_resolution_failed(
+                "Bind topology changed during preflight; resolving again".into(),
+            );
+            let _ = self
+                .relay_event_tx
+                .send(RelaySupervisorEvent::RetryRequested { server_generation });
+            return Err(AppError::Stream(
+                "Bind topology changed; listener recovery is pending".into(),
+            ));
+        }
+        info.firewall = apply_firewall(&self.state, &spec, server_generation).await;
+        if !relay_is_current(
+            &self.state,
+            &self.restream_epoch,
+            start_epoch,
+            server_generation,
+        )
+        .await
+            || bindings::revision() != scope_revision(&spec.bind_scope)
+        {
+            retire_firewall(&self.state, server_generation).await;
+            if self
+                .restream_epoch
+                .load(std::sync::atomic::Ordering::Acquire)
+                == start_epoch
+            {
+                health.mark_resolution_failed(
+                    "Bind topology changed during policy reconciliation".into(),
+                );
+                let _ = self
+                    .relay_event_tx
+                    .send(RelaySupervisorEvent::RetryRequested { server_generation });
+            }
+            return Err(AppError::Stream(
+                "Listener start superseded during Windows rule reconciliation".into(),
+            ));
+        }
         let (server_instance, built) = Self::build_restream_server(
             &spec,
             health.clone(),
@@ -1157,6 +1234,7 @@ impl StreamManager {
         let server = match built {
             Ok(server) => server,
             Err(failure) => {
+                retire_firewall(&self.state, server_generation).await;
                 let reason = redact_relay_text(&failure.error.to_string(), spec.mount_path());
                 health.mark_build_failed(
                     server_instance,
@@ -1183,12 +1261,26 @@ impl StreamManager {
                 == start_epoch
                 && state.restream_intent_epoch == Some(start_epoch)
                 && relay_state_is_generation(&state, server_generation)
+                && bindings::revision() == scope_revision(&spec.bind_scope)
             {
                 state.restream_server = candidate.take();
             }
         }
         if let Some(mut stale) = candidate {
             stale.shutdown().await;
+            retire_firewall(&self.state, server_generation).await;
+            if self
+                .restream_epoch
+                .load(std::sync::atomic::Ordering::Acquire)
+                == start_epoch
+            {
+                health.mark_resolution_failed(
+                    "Bind topology changed during listener construction".into(),
+                );
+                let _ = self
+                    .relay_event_tx
+                    .send(RelaySupervisorEvent::RetryRequested { server_generation });
+            }
             return Err(AppError::Stream(
                 "Re-stream server start was superseded by a newer request".into(),
             ));
@@ -1208,6 +1300,100 @@ impl StreamManager {
             Some(intent) => self.finish_restream_stop(intent).await,
             None => Ok(()),
         }
+    }
+
+    pub(crate) async fn startup_firewall_status(&self, outcome: FirewallOutcome) {
+        let mut state = self.state.lock().await;
+        if state.firewall_generation.is_none() {
+            state.firewall = outcome;
+        }
+        drop(state);
+        self.refresh_status().await;
+    }
+
+    pub(crate) async fn binding_topology_changed(&self, scope: BindScope, revision: u64) {
+        let (spec, generation, health) = {
+            let state = self.state.lock().await;
+            let (Some(spec), Some(health)) = (&state.restream_spec, &state.restream_health) else {
+                return;
+            };
+            if !state.restream_desired {
+                return;
+            }
+            (
+                spec.clone(),
+                health.snapshot().server_generation,
+                health.clone(),
+            )
+        };
+        let resolved =
+            if spec.bind_interface.is_none() || matches!(scope, BindScope::Unknown { .. }) {
+                Ok((spec.bind_identity.clone(), scope))
+            } else {
+                let handle = self
+                    .app_handle
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
+                let adopted = match handle {
+                    Some(handle) => adopted_ip_set(&handle).await,
+                    None => Default::default(),
+                };
+                bindings::resolve(
+                    spec.bind_interface.as_deref(),
+                    spec.bind_identity.as_ref().map(|i| i.guid.as_str()),
+                    &adopted,
+                )
+                .await
+            };
+        let _lifecycle = self.relay_lifecycle.lock().await;
+        if bindings::revision() != revision {
+            return;
+        }
+        let (identity, next) = resolved.unwrap_or_else(|error| {
+            (
+                spec.bind_identity.clone(),
+                BindScope::Unknown {
+                    reason: error.to_string(),
+                },
+            )
+        });
+        let rebind = spec.bind_interface.is_some()
+            && match &next {
+                BindScope::Interface { alias, address, .. } => {
+                    Some(alias) != spec.bind_interface.as_ref()
+                        || Some(address) != spec.bind_address.as_ref()
+                        || identity != spec.bind_identity
+                }
+                _ => true,
+            };
+        {
+            let mut state = self.state.lock().await;
+            if !relay_state_is_generation(&state, generation) || !state.restream_desired {
+                return;
+            }
+            if let Some(spec) = state.restream_spec.as_mut() {
+                spec.bind_scope = if rebind {
+                    BindScope::Unknown {
+                        reason: "Resolving changed bind interface".into(),
+                    }
+                } else {
+                    next
+                };
+            }
+        }
+        if rebind {
+            health.mark_resolution_failed(
+                "Bind topology changed; resolving the saved interface identity".into(),
+            );
+            let _ = self
+                .relay_event_tx
+                .send(RelaySupervisorEvent::RetryRequested {
+                    server_generation: generation,
+                });
+        }
+        drop(_lifecycle);
+        self.refresh_status().await;
     }
 
     async fn publish_restream_stop_intent(&self, stop_epoch: u64) -> Option<RestreamStopIntent> {
@@ -1234,7 +1420,8 @@ impl StreamManager {
                 .map(RestreamServer::server_generation);
             let stops_desired = state.restream_desired;
 
-            let target = restream_stop_target(stops_desired, desired_generation, live_generation);
+            let target = restream_stop_target(stops_desired, desired_generation, live_generation)
+                .or_else(|| state.firewall_generation.map(|(generation, _)| generation));
 
             if stops_desired {
                 if let Some(health) = state.restream_health.as_ref() {
@@ -1299,6 +1486,9 @@ impl StreamManager {
             server.shutdown().await;
             log::info!("Re-stream server fully cleaned up");
         }
+        if let Some(generation) = intent.target_generation {
+            retire_firewall(&self.state, generation).await;
+        }
         drop(_lifecycle);
         self.refresh_status().await;
         log::info!("Re-stream server stopped (intent epoch={})", intent.epoch);
@@ -1312,13 +1502,20 @@ impl StreamManager {
             desired: state.restream_desired,
             server_info: state
                 .restream_desired
-                .then(|| state.restream_spec.as_ref().map(Self::info_from_spec))
+                .then(|| {
+                    state
+                        .restream_spec
+                        .as_ref()
+                        .map(|spec| Self::info_from_spec(spec, state.firewall.clone()))
+                })
                 .flatten(),
         }
     }
 
-    fn info_from_spec(spec: &ResolvedStartSpec) -> RestreamServerInfo {
+    fn info_from_spec(spec: &ResolvedStartSpec, firewall: FirewallOutcome) -> RestreamServerInfo {
         RestreamServerInfo {
+            bind_scope: spec.bind_scope.clone(),
+            firewall,
             protocol: spec.protocol(),
             server_url: spec.client_url(),
             display_url: spec.display_url(),
@@ -2612,7 +2809,11 @@ fn resolved_start_is_healthy_noop(
     listener_loop_alive: bool,
 ) -> bool {
     desired
-        && current_spec == Some(candidate_spec)
+        && current_spec.is_some_and(|current| {
+            let mut candidate = candidate_spec.clone();
+            candidate.bind_scope = current.bind_scope.clone();
+            current == &candidate
+        })
         && matches!(
             relay_state,
             Some(RelayState::Listening | RelayState::Streaming)
@@ -2844,6 +3045,7 @@ async fn recover_relay_generation(
         if let Some(mut failed_server) = failed_server {
             failed_server.shutdown().await;
         }
+        retire_firewall(&ctx.state, server_generation).await;
     }
     publish_relay_status(ctx).await;
     if current_relay_context(ctx, server_generation)
@@ -2906,7 +3108,16 @@ async fn recover_relay_generation(
         };
         let mut build_spec = base_spec.clone();
 
-        if health.should_reresolve_explicit_bind() {
+        if base_spec.bind_interface.is_none() {
+            build_spec.bind_scope = bindings::resolve(None, None, &Default::default())
+                .await
+                .map(|(_, scope)| scope)
+                .unwrap_or_else(|error| BindScope::Unknown {
+                    reason: error.to_string(),
+                });
+        }
+
+        if base_spec.bind_identity.is_some() || health.should_reresolve_explicit_bind() {
             if let Some(interface_name) = base_spec.bind_interface.as_deref() {
                 let adopted = adopted_ip_set(&ctx.app_handle).await;
                 if !relay_is_current(
@@ -2919,12 +3130,21 @@ async fn recover_relay_generation(
                 {
                     return;
                 }
-                match resolve_explicit_bind(Some(interface_name), &adopted).await {
-                    Ok(Some(new_address)) => {
-                        build_spec.bind_address = Some(new_address.clone());
-                        build_spec.advertised_ip = new_address;
+                let id = base_spec
+                    .bind_identity
+                    .as_ref()
+                    .map(|identity| identity.guid.as_str());
+                match bindings::resolve(Some(interface_name), id, &adopted).await {
+                    Ok((identity, scope @ BindScope::Interface { .. })) => {
+                        if let BindScope::Interface { address, alias, .. } = &scope {
+                            build_spec.bind_address = Some(address.clone());
+                            build_spec.advertised_ip = address.clone();
+                            build_spec.bind_interface = Some(alias.clone());
+                        }
+                        build_spec.bind_identity = identity;
+                        build_spec.bind_scope = scope;
                     }
-                    Ok(None) => unreachable!("an explicit interface resolves to an address"),
+                    Ok(_) => unreachable!("an explicit interface resolves to an address"),
                     Err(error) => {
                         let reason = redact_relay_text(
                             &format!(
@@ -2983,7 +3203,7 @@ async fn recover_relay_generation(
             return;
         }
 
-        if let Err(error) = crate::ensure_gstreamer() {
+        if let Err(error) = preflight_restream(&build_spec) {
             let server_instance = health.begin_server_instance(true);
             let reason = redact_relay_text(&error.to_string(), build_spec.mount_path());
             health.mark_build_failed(server_instance, reason, false);
@@ -3009,6 +3229,22 @@ async fn recover_relay_generation(
         {
             return;
         }
+        if bindings::revision() != scope_revision(&build_spec.bind_scope) {
+            continue;
+        }
+        apply_firewall(&ctx.state, &build_spec, server_generation).await;
+        if !relay_is_current(
+            &ctx.state,
+            &ctx.restream_epoch,
+            expected_epoch,
+            server_generation,
+        )
+        .await
+            || bindings::revision() != scope_revision(&build_spec.bind_scope)
+        {
+            retire_firewall(&ctx.state, server_generation).await;
+            continue;
+        }
         let (server_instance, result) = StreamManager::build_restream_server(
             &build_spec,
             health.clone(),
@@ -3025,6 +3261,7 @@ async fn recover_relay_generation(
         let server = match result {
             Ok(server) => server,
             Err(failure) => {
+                retire_firewall(&ctx.state, server_generation).await;
                 let reason = redact_relay_text(&failure.error.to_string(), build_spec.mount_path());
                 health.mark_build_failed(
                     server_instance,
@@ -3046,6 +3283,7 @@ async fn recover_relay_generation(
                 == expected_epoch
                 && state.restream_intent_epoch == Some(expected_epoch)
                 && relay_state_is_generation(&state, server_generation)
+                && bindings::revision() == scope_revision(&build_spec.bind_scope)
             {
                 // Publish a re-resolved address only after it bound
                 // successfully. Port, interface, mount, token, and source are
@@ -3057,6 +3295,17 @@ async fn recover_relay_generation(
         if let Some(mut stale) = candidate {
             crate::network::note_fence_drop("relay_listener");
             stale.shutdown().await;
+            retire_firewall(&ctx.state, server_generation).await;
+            if ctx
+                .restream_epoch
+                .load(std::sync::atomic::Ordering::Acquire)
+                == expected_epoch
+            {
+                health.mark_resolution_failed(
+                    "Bind topology changed during listener construction".into(),
+                );
+                continue;
+            }
             return;
         }
         log::info!("event=relay_recovery generation={} cause={} attempt={} phase=listener_ready duration_ms={}",
@@ -3071,6 +3320,107 @@ async fn recover_relay_generation(
 /// Compute a status snapshot from the underlying state. Lifted out of
 /// `StreamManager` so the background ticker can call it without holding
 /// a `StreamManager` reference (it only needs the state Arc).
+fn scope_revision(scope: &BindScope) -> u64 {
+    match scope {
+        BindScope::AllAddresses {
+            topology_revision, ..
+        }
+        | BindScope::Interface {
+            topology_revision, ..
+        } => *topology_revision,
+        BindScope::Unknown { .. } => bindings::revision(),
+    }
+}
+
+fn preflight_restream(spec: &ResolvedStartSpec) -> Result<(), AppError> {
+    crate::ensure_gstreamer()?;
+    let input: &[&str] = match spec.source {
+        ResolvedSource::Rtsp { .. } => &["rtspsrc", "rtph264depay"],
+        ResolvedSource::Udp { .. } => &["udpsrc", "tsdemux"],
+    };
+    let output: &[&str] = match spec.protocol() {
+        RestreamProtocol::Rtsp => &["h264parse", "rtph264pay"],
+        RestreamProtocol::Srt => &["h264parse", "mpegtsmux", "srtsink"],
+    };
+    for name in input.iter().chain(output) {
+        if gst::ElementFactory::find(name).is_none() {
+            return Err(AppError::Stream(format!(
+                "Bundled GStreamer lacks required element '{name}'"
+            )));
+        }
+    }
+    if matches!(spec.source, ResolvedSource::Rtsp { .. }) {
+        let source = gst::ElementFactory::make("rtspsrc")
+            .build()
+            .map_err(|_| AppError::Stream("RTSP source preflight failed".into()))?;
+        configure_tcp_rtspsrc(&source)?;
+    }
+    if spec.protocol() == RestreamProtocol::Srt {
+        srt_server::preflight().map_err(|failure| failure.error)?;
+    }
+    Ok(())
+}
+
+fn firewall_role(protocol: RestreamProtocol) -> FirewallRule {
+    match protocol {
+        RestreamProtocol::Rtsp => FirewallRule::Rtsp,
+        RestreamProtocol::Srt => FirewallRule::Srt,
+    }
+}
+
+// All callers hold relay_lifecycle. The lease is installed before dispatch, so
+// cancellation cannot hide an enabled rule from Stop/startup reconciliation.
+async fn apply_firewall(
+    state: &Arc<Mutex<StreamState>>,
+    spec: &ResolvedStartSpec,
+    generation: u64,
+) -> FirewallOutcome {
+    let prior = state.lock().await.firewall_generation;
+    if let Some((prior_generation, _)) = prior {
+        if !retire_firewall(state, prior_generation).await {
+            return state.lock().await.firewall.clone();
+        }
+    }
+    let role = firewall_role(spec.protocol());
+    {
+        let mut state = state.lock().await;
+        if !relay_state_is_generation(&state, generation) {
+            return FirewallOutcome::Inactive;
+        }
+        state.firewall_generation = Some((generation, role));
+    }
+    let outcome = firewall::ensure(role, spec.server_port(), spec.bind_identity.clone()).await;
+    let mut state = state.lock().await;
+    if state.firewall_generation == Some((generation, role)) {
+        state.firewall = outcome.clone();
+    }
+    outcome
+}
+
+async fn retire_firewall(state: &Arc<Mutex<StreamState>>, generation: u64) -> bool {
+    let lease = {
+        let state = state.lock().await;
+        match state.firewall_generation {
+            Some((current, role)) if current == generation => Some(role),
+            _ => None,
+        }
+    };
+    if let Some(role) = lease {
+        let outcome = firewall::disable(role).await;
+        let disabled = matches!(outcome, FirewallOutcome::Inactive);
+        let mut state = state.lock().await;
+        if state.firewall_generation == Some((generation, role)) {
+            if disabled {
+                state.firewall_generation = None;
+            }
+            state.firewall = outcome;
+        }
+        disabled
+    } else {
+        true
+    }
+}
+
 async fn compute_status(state: &Arc<Mutex<StreamState>>) -> StreamStatus {
     let state = state.lock().await;
     let uptime = state
@@ -3115,6 +3465,16 @@ async fn compute_status(state: &Arc<Mutex<StreamState>>) -> StreamStatus {
         .unwrap_or((false, None));
 
     StreamStatus {
+        bind_scope: if listener_alive {
+            state
+                .restream_spec
+                .as_ref()
+                .map(|s| s.bind_scope.clone())
+                .unwrap_or_default()
+        } else {
+            BindScope::default()
+        },
+        firewall: state.firewall.clone(),
         playing,
         playback_desired: state.playback_settings.is_some(),
         playback_state: playback
@@ -3202,24 +3562,6 @@ fn first_usable_ip(
         .find(|addr| !adopted.contains(addr) && !is_apipa(addr))
 }
 
-async fn resolve_explicit_bind(
-    interface_name: Option<&str>,
-    adopted: &std::collections::HashSet<String>,
-) -> Result<Option<String>, AppError> {
-    let Some(interface_name) = interface_name else {
-        return Ok(None);
-    };
-    let interface = crate::network::interface::get_by_name(interface_name).await?;
-    first_usable_ip(&interface.ips, adopted)
-        .map(Some)
-        .ok_or_else(|| {
-            AppError::Stream(format!(
-                "Interface '{}' has no usable (non-adopted, non-APIPA) IPv4 address to bind",
-                interface_name
-            ))
-        })
-}
-
 /// Best client-facing IPv4 to advertise when no explicit bind interface is
 /// set: prefer physical WiFi (the camera occupies Ethernet), else physical
 /// Ethernet, always skipping adopted secondaries and APIPA. VPN addresses
@@ -3248,6 +3590,53 @@ fn select_display_ip(
 mod tests {
     use super::*;
     use crate::config::*;
+
+    #[tokio::test]
+    async fn stale_firewall_cleanup_cannot_retire_a_newer_listener_lease() {
+        let manager = StreamManager::new();
+        manager.state.lock().await.firewall_generation = Some((9, FirewallRule::Srt));
+        retire_firewall(&manager.state, 8).await;
+        assert_eq!(
+            manager.state.lock().await.firewall_generation,
+            Some((9, FirewallRule::Srt))
+        );
+        // The lib-test seam cannot invoke native firewall policy.
+        retire_firewall(&manager.state, 9).await;
+        assert!(manager.state.lock().await.firewall_generation.is_none());
+    }
+
+    #[tokio::test]
+    async fn stopped_status_retains_startup_policy_failure() {
+        let manager = StreamManager::new();
+        let failed = FirewallOutcome::Failed {
+            stage: "ownership".into(),
+            reason: "Foreign program owns the native rule name".into(),
+            uncertain: false,
+        };
+        manager.startup_firewall_status(failed.clone()).await;
+        let status = compute_status(&manager.state).await;
+        assert!(!status.server_running);
+        assert_eq!(status.firewall, failed);
+        manager.state.lock().await.firewall_generation = Some((2, FirewallRule::Rtsp));
+        manager
+            .startup_firewall_status(FirewallOutcome::Inactive)
+            .await;
+        assert_eq!(manager.state.lock().await.firewall, failed);
+    }
+
+    #[tokio::test]
+    async fn stop_accounts_for_firewall_lease_even_without_a_bound_socket() {
+        let manager = StreamManager::new();
+        {
+            let mut state = manager.state.lock().await;
+            state.restream_desired = true;
+            state.firewall_generation = Some((12, FirewallRule::Rtsp));
+        }
+        let intent = manager.begin_restream_stop_intent().await.unwrap();
+        assert_eq!(intent.target_generation, Some(12));
+        manager.finish_restream_stop(intent).await.unwrap();
+        assert!(manager.state.lock().await.firewall_generation.is_none());
+    }
 
     fn init_gstreamer() {
         static INIT: std::sync::Once = std::sync::Once::new();
@@ -3741,6 +4130,7 @@ mod tests {
         password: &str,
     ) -> AppSettings {
         AppSettings {
+            bind_identity_migration_complete: true,
             selected_adapter_mac: None,
             primary_addresses: std::collections::HashMap::new(),
             stream: StreamConfig {
@@ -3758,6 +4148,7 @@ mod tests {
                 port: 8554,
                 token: "0123456789abcdef".into(),
                 bind_interface: String::new(),
+                bind_interface_id: None,
             },
             srt_server: SrtServerConfig::default(),
             credentials: Credentials {
@@ -3795,6 +4186,7 @@ mod tests {
                 port: i64::from(settings.rtsp_server.port),
                 token: settings.rtsp_server.token.clone(),
                 bind_interface: settings.rtsp_server.bind_interface.clone(),
+                bind_interface_id: settings.rtsp_server.bind_interface_id.clone(),
             },
             srt_server: SrtServerUpdate {
                 port: i64::from(settings.srt_server.port),
@@ -3802,6 +4194,7 @@ mod tests {
                 latency_ms: i64::from(settings.srt_server.latency_ms),
                 stream_id: settings.srt_server.stream_id.clone(),
                 bind_interface: settings.srt_server.bind_interface.clone(),
+                bind_interface_id: settings.srt_server.bind_interface_id.clone(),
             },
         }
     }
@@ -3873,6 +4266,8 @@ mod tests {
             },
             output,
             bind_interface: None,
+            bind_identity: None,
+            bind_scope: crate::network::bindings::BindScope::default(),
             bind_address: None,
             advertised_ip: "127.0.0.1".into(),
             username: String::new(),
@@ -4040,6 +4435,8 @@ mod tests {
                 mount_path: "/stream-token".into(),
             },
             bind_interface: Some("VPN".into()),
+            bind_identity: None,
+            bind_scope: crate::network::bindings::BindScope::default(),
             bind_address: Some("192.0.2.10".into()),
             advertised_ip: "192.0.2.10".into(),
             username: "camera".into(),
@@ -4776,6 +5173,8 @@ mod tests {
                 stream_id: "field unit".into(),
             },
             bind_interface: Some("ZeroTier".into()),
+            bind_identity: None,
+            bind_scope: crate::network::bindings::BindScope::default(),
             bind_address: Some("127.0.0.1".into()),
             advertised_ip: "127.0.0.1".into(),
             username: String::new(),
@@ -4962,6 +5361,8 @@ mod tests {
                 mount_path: "/stream-stable-token".into(),
             },
             bind_interface: Some("VPN".into()),
+            bind_identity: None,
+            bind_scope: crate::network::bindings::BindScope::default(),
             bind_address: Some("192.0.2.10".into()),
             advertised_ip: "192.0.2.10".into(),
             username: "camera".into(),

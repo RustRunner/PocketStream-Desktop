@@ -742,9 +742,7 @@ impl RtspRestreamer {
 
         let server = gst_rtsp_server::RTSPServer::new();
         server.set_service(&port.to_string());
-        if let Some(addr) = bind_address {
-            server.set_address(addr);
-        }
+        server.set_address(bind_address.unwrap_or("0.0.0.0"));
         let session_pool =
             Self::configure_session_pool(&server).map_err(RestreamBuildFailure::configuration)?;
         Self::attach_session_logging(&server, &session_pool);
@@ -897,9 +895,7 @@ impl RtspRestreamer {
         } = runtime;
         let server = gst_rtsp_server::RTSPServer::new();
         server.set_service(&server_port.to_string());
-        if let Some(addr) = bind_address {
-            server.set_address(addr);
-        }
+        server.set_address(bind_address.unwrap_or("0.0.0.0"));
         let session_pool =
             Self::configure_session_pool(&server).map_err(RestreamBuildFailure::configuration)?;
         Self::attach_session_logging(&server, &session_pool);
@@ -1309,6 +1305,8 @@ mod tests {
                     mount_path: "/test".into(),
                 },
                 bind_interface: None,
+                bind_identity: None,
+                bind_scope: crate::network::bindings::BindScope::default(),
                 bind_address: None,
                 advertised_ip: "127.0.0.1".into(),
                 username: String::new(),

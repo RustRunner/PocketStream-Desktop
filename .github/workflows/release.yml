@@ -210,6 +210,9 @@ jobs:
           # Cargo.lock instead of silently re-resolving at release time.
           args: -- --locked
 
+      - name: Verify generated installer transaction contract
+        run: npm run check:installer:generated
+
       # Install the just-built NSIS artifact into a fresh runner directory and
       # rerun the exact hash/import/plugin checks there. Only this invocation
       # can emit draft_ready=true (or g3_complete=true with public sources).
@@ -227,7 +230,7 @@ jobs:
           if (-not (Test-Path -LiteralPath $installerPath -PathType Leaf)) {
             throw "Expected NSIS installer is missing: $installerPath"
           }
-          $installRoot = Join-Path $env:RUNNER_TEMP "pocketstream-g3-install-$version"
+          $installRoot = Join-Path $env:ProgramFiles "PocketStream-G3-$version"
           if (Test-Path -LiteralPath $installRoot) {
             throw "Fresh G3 install root already exists: $installRoot"
           }

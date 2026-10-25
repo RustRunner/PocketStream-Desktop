@@ -313,15 +313,6 @@ pub async fn list_physical() -> Result<Vec<InterfaceInfo>, AppError> {
         .collect())
 }
 
-/// List VPN interfaces only.
-pub async fn list_vpn() -> Result<Vec<InterfaceInfo>, AppError> {
-    Ok(adapter_snapshot()
-        .await?
-        .into_iter()
-        .filter(|i| i.is_vpn && (!cfg!(target_os = "windows") || i.is_virtual))
-        .collect())
-}
-
 /// List all network interfaces with their details (physical + VPN).
 pub async fn list_all() -> Result<Vec<InterfaceInfo>, AppError> {
     Ok(adapter_snapshot()

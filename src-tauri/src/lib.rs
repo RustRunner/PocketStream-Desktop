@@ -1,8 +1,11 @@
 mod camera;
 mod commands;
 mod config;
+mod entry;
 mod error;
 mod logging;
+#[cfg(windows)]
+mod maintenance;
 mod network;
 mod settings_validation;
 mod streaming;
@@ -226,6 +229,7 @@ fn setup_bundled_gstreamer() -> bool {
 /// Fallback watcher follows the same persisted selection as native events.
 async fn watch_interface(handle: tauri::AppHandle) {
     loop {
+        network::bindings::refresh(&handle).await;
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         let manager = handle.state::<network::NetworkManager>();
         let selection = manager.adapter_selection_state().await;
@@ -333,6 +337,9 @@ fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 pub fn run() {
+    if let Some(code) = entry::early_exit(std::env::args().skip(1).collect()) {
+        std::process::exit(code);
+    }
     // This precedes profile loading, log/config writes, capture and all native
     // operations. Fresh mutex creation is never a clean-shutdown signal.
     #[cfg(windows)]
@@ -458,7 +465,7 @@ pub fn run() {
             // Network
             commands::scan_network,
             commands::get_host_ip_owners,
-            commands::list_vpn_interfaces,
+            commands::list_bind_interfaces,
             commands::add_secondary_ip,
             commands::remove_secondary_ip,
             commands::get_dhcp_state,

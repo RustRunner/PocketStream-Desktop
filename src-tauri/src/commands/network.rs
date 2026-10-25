@@ -4,7 +4,7 @@ use tauri::State;
 
 use crate::config::{AppConfig, ManualNode, NetworkMode};
 use crate::error::AppError;
-use crate::network::{DeviceRecord, InterfaceInfo, NetworkManager, ScanResult};
+use crate::network::{DeviceRecord, NetworkManager, ScanResult};
 use crate::validation::parse_cidr;
 
 #[tauri::command]
@@ -71,8 +71,11 @@ pub async fn select_adapter(
 }
 
 #[tauri::command]
-pub async fn list_vpn_interfaces() -> Result<Vec<InterfaceInfo>, AppError> {
-    crate::network::interface::list_vpn().await
+pub async fn list_bind_interfaces(
+    config: State<'_, AppConfig>,
+) -> Result<Vec<crate::network::bindings::BindInterface>, AppError> {
+    let adopted = config.get().adopted_subnets.into_values().collect();
+    crate::network::bindings::list(&adopted).await
 }
 
 #[tauri::command]

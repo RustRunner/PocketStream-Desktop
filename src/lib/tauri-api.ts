@@ -24,7 +24,7 @@ import type {
   CaptureState,
   Credentials,
   DeviceRecord,
-  InterfaceInfo,
+  BindInterface,
   HostIpOwner,
   LicenseDocumentId,
   NetworkMode,
@@ -115,8 +115,8 @@ export async function selectAdapter(mac: string): Promise<AdapterSelection> {
   return await invoke<AdapterSelection>("select_adapter", { mac });
 }
 
-export async function listVpnInterfaces(): Promise<InterfaceInfo[]> {
-  return await invoke<InterfaceInfo[]>("list_vpn_interfaces");
+export async function listBindInterfaces(): Promise<BindInterface[]> {
+  return await invoke<BindInterface[]>("list_bind_interfaces");
 }
 
 export async function addSecondaryIp(

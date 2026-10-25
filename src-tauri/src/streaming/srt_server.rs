@@ -190,6 +190,10 @@ fn require_signal(
 /// Validate the dynamic callback ABI before any listener bind. G2 proves this
 /// exact contract against the pinned runtime; this check prevents a replaced
 /// or older plugin from reaching a panic-prone dynamic signal marshal.
+pub(super) fn preflight() -> Result<(), RestreamBuildFailure> {
+    preflight_srt_capabilities().map(|_| ())
+}
+
 fn preflight_srt_capabilities() -> Result<AdmissionSignalIds, RestreamBuildFailure> {
     let sink = gst::ElementFactory::make("srtsink")
         .build()

@@ -283,6 +283,7 @@ mod imp {
         super::watch_changes(rx, |changed| {
             let handle = handle.clone();
             async move {
+                super::super::bindings::refresh(&handle).await;
                 let result = if changed {
                     let _kinds = DIRTY.swap(0, Ordering::AcqRel);
                     // Both callback kinds can accompany an IP write. Only a

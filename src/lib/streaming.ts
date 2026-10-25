@@ -8,7 +8,7 @@ import { $, $$, state, log, showToast, formatUptime } from "./state.ts";
 import type { DeviceTarget } from "./store.ts";
 import * as deviceList from "./device-list.ts";
 import { formatError } from "./errors.ts";
-import { formatRestreamBitrate } from "./restream-format.ts";
+import { formatRestreamBitrate, formatBindScope, formatFirewallOutcome } from "./restream-format.ts";
 import {
   buildRestreamBindOptions,
   buildRestreamBindUpdate,
@@ -33,6 +33,7 @@ import type {
 
 /** Full client URL (including protocol access data) for QR generation. */
 let restreamFullUrl: string | null = null;
+let lastBindingStatus: Pick<StreamStatus, "bind_scope" | "firewall"> | undefined;
 
 // ── Video area bounds ───────────────────────────────────────────────
 
@@ -641,23 +642,26 @@ export function setupRestreamControls(): void {
     const protocol = currentRestreamProtocol();
     const previous = selectedRestreamBindInterface(state.config, protocol);
     const requested = select.value;
+    const requestedAlias = select.selectedOptions[0]?.dataset["alias"] ?? "";
     restreamBindApplyBusy = true;
     syncRestreamOperationControls();
     try {
       const result = await api.applyRestreamSettings(
-        buildRestreamBindUpdate(state.config, protocol, requested)
+        buildRestreamBindUpdate(state.config, protocol, requestedAlias, requested || null)
       );
       if (protocol === "srt") {
-        state.config.srt_server.bind_interface = requested;
+        state.config.srt_server.bind_interface = requestedAlias;
+        state.config.srt_server.bind_interface_id = requested || null;
       } else {
-        state.config.rtsp_server.bind_interface = requested;
+        state.config.rtsp_server.bind_interface = requestedAlias;
+        state.config.rtsp_server.bind_interface_id = requested || null;
       }
       applyRestreamOperationResult(result);
     } catch (e) {
       if (!(await reloadCanonicalRestreamConfig())) {
         select.value = previous;
       }
-      showToast("Failed to save VPN selection: " + formatError(e), true);
+      showToast("Failed to save bind selection: " + formatError(e), true);
     } finally {
       restreamBindApplyBusy = false;
       syncRestreamOperationControls();
@@ -731,7 +735,7 @@ export function setupRestreamControls(): void {
       try {
         // bind_interface is persisted by the dropdown's change handler,
         // so don't re-copy the <select> value here. During startup the
-        // VPN options are still being populated asynchronously and the
+        // Bind options are still being populated asynchronously and the
         // select can briefly read empty; writing that back would wipe
         // the saved interface.
         const target = getActiveCamTarget();
@@ -742,7 +746,7 @@ export function setupRestreamControls(): void {
         const info = await api.startRestreamServer();
         state.isRestreamDesired = true;
         restreamFullUrl = info.server_url;
-        updateRestreamUI(info.display_url);
+        updateRestreamUI(info.display_url, info);
         showToast("Re-stream server started");
       } catch (e) {
         showToast("Re-stream server failed: " + formatError(e), true);
@@ -784,16 +788,18 @@ export async function reloadCanonicalRestreamConfig(): Promise<boolean> {
 }
 
 function renderRestreamBindOptions(
-  interfaces: Awaited<ReturnType<typeof api.listVpnInterfaces>>,
+  interfaces: Awaited<ReturnType<typeof api.listBindInterfaces>>,
   saved: string
 ): void {
   const select = $<HTMLSelectElement>("#restream-bind-interface");
   select.replaceChildren();
-  for (const model of buildRestreamBindOptions(interfaces, saved)) {
+  const savedAlias = state.config ? (currentRestreamProtocol() === "srt" ? state.config.srt_server.bind_interface : state.config.rtsp_server.bind_interface) : saved;
+  for (const model of buildRestreamBindOptions(interfaces, saved, savedAlias)) {
     const option = document.createElement("option");
     option.value = model.value;
+    option.dataset["alias"] = model.alias;
     option.textContent = model.label;
-    if (model.unavailable) option.dataset["unavailable"] = "true";
+    if (model.unavailable) { option.dataset["unavailable"] = "true"; option.disabled = true; }
     select.appendChild(option);
   }
   select.value = saved;
@@ -802,15 +808,15 @@ function renderRestreamBindOptions(
 async function populateRestreamBindOptions(request: RestreamBindRequest): Promise<void> {
   const select = $<HTMLSelectElement>("#restream-bind-interface");
   try {
-    const vpns = (await api.listVpnInterfaces()).filter((i) => i.ips.length > 0);
+    const interfaces = await api.listBindInterfaces();
     if (!restreamBindRequests.isCurrent(request, currentRestreamProtocol())) return;
     const saved = state.config
       ? selectedRestreamBindInterface(state.config, request.protocol)
       : "";
-    renderRestreamBindOptions(vpns, saved);
+    renderRestreamBindOptions(interfaces, saved);
   } catch (e) {
     if (!restreamBindRequests.isCurrent(request, currentRestreamProtocol())) return;
-    console.warn("Failed to list VPN interfaces:", e);
+    console.warn("Failed to list bind interfaces:", e);
     const saved = state.config
       ? selectedRestreamBindInterface(state.config, request.protocol)
       : "";
@@ -828,7 +834,7 @@ export function applyRestreamOperationResult(result: RestreamOperationResult): v
   acceptRestreamProtocol(result.selected_protocol);
   if (result.server_info) {
     restreamFullUrl = result.server_info.server_url;
-    updateRestreamUI(result.server_info.display_url);
+    updateRestreamUI(result.server_info.display_url, result.server_info);
   } else if (!result.desired) {
     updateRestreamUI(null);
   }
@@ -932,7 +938,7 @@ export function readRestreamSettingsUpdate(): RestreamSettingsUpdate {
   });
 }
 
-export function updateRestreamUI(displayUrl: string | null, status?: StreamStatus): void {
+export function updateRestreamUI(displayUrl: string | null, status?: Partial<StreamStatus>): void {
   const btn = $<HTMLButtonElement>("#btn-toggle-restream");
   btn.textContent = state.isRestreamDesired ? "Stop Server" : "Start Server";
   // A desired listener remains stoppable while rebuilding; transaction busy
@@ -940,6 +946,8 @@ export function updateRestreamUI(displayUrl: string | null, status?: StreamStatu
   syncRestreamStartButton();
 
   const statusEl = $("#restream-status");
+  $("#restream-bind-scope").textContent = formatBindScope(status?.bind_scope);
+  $("#restream-firewall-state").textContent = formatFirewallOutcome(status?.firewall);
   const qrBtn = $<HTMLButtonElement>("#btn-show-qr");
   const errorRow = $("#restream-error-row");
   const errorEl = $("#restream-error");
@@ -1050,6 +1058,7 @@ let lastRecordingReport: string | null = null;
  *  startup. Replaces the old setInterval(pollStatus, 1000). */
 export function startStatusListener(): void {
   api.onEvent<StreamStatus>("stream-status", handleStatus);
+  api.onEvent("binding-topology-changed", () => refreshRestreamBindOptions());
 }
 
 function handleStatus(status: StreamStatus | null): void {
