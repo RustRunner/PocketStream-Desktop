@@ -438,6 +438,7 @@ Section Install
   ${EndIf}
 
   ; Copy resources
+  ClearErrors
   {{#each resources_dirs}}
     CreateDirectory "$INSTDIR\\{{this}}"
   {{/each}}
@@ -449,6 +450,9 @@ Section Install
   {{#each binaries}}
     File /a "/oname={{this}}" "{{no-escape @key}}"
   {{/each}}
+  ${If} ${Errors}
+    !insertmacro PS_FAIL "Resource replacement failed; installation is incomplete"
+  ${EndIf}
 
   ; Create file associations
   {{#each file_associations as |association| ~}}
@@ -466,10 +470,18 @@ Section Install
   {{/each}}
 
   ; Create uninstaller
+  ClearErrors
   WriteUninstaller "$INSTDIR\uninstall.exe"
+  ${If} ${Errors}
+    !insertmacro PS_FAIL "Uninstaller creation failed; installation is incomplete"
+  ${EndIf}
 
   ; Save $INSTDIR in registry for future installations
+  ClearErrors
   WriteRegStr SHCTX "${MANUPRODUCTKEY}" "" $INSTDIR
+  ${If} ${Errors}
+    !insertmacro PS_FAIL "Installation location could not be registered; installation is incomplete"
+  ${EndIf}
 
   !if "${INSTALLMODE}" == "both"
     ; Save install mode to be selected by default for the next installation such as updating
@@ -481,10 +493,15 @@ Section Install
   ReadRegStr $OldMainBinaryName SHCTX "${UNINSTKEY}" "MainBinaryName"
   ${If} $OldMainBinaryName != ""
   ${AndIf} $OldMainBinaryName != "${MAINBINARYNAME}.exe"
+    ClearErrors
     Delete "$INSTDIR\$OldMainBinaryName"
+    ${If} ${Errors}
+      !insertmacro PS_FAIL "Previous executable could not be deleted; installation is incomplete"
+    ${EndIf}
   ${EndIf}
 
   ; Save current MAINBINARYNAME for future updates
+  ClearErrors
   WriteRegStr SHCTX "${UNINSTKEY}" "MainBinaryName" "${MAINBINARYNAME}.exe"
 
   ; Registry information for add/remove programs
@@ -496,7 +513,11 @@ Section Install
   WriteRegStr SHCTX "${UNINSTKEY}" "UninstallString" "$\"$INSTDIR\uninstall.exe$\""
   WriteRegDWORD SHCTX "${UNINSTKEY}" "NoModify" "1"
   WriteRegDWORD SHCTX "${UNINSTKEY}" "NoRepair" "1"
+  ${If} ${Errors}
+    !insertmacro PS_FAIL "Installation registration failed; installation is incomplete"
+  ${EndIf}
 
+  ; GetSize resets the error flag, so registration is checked before it.
   ${GetSize} "$INSTDIR" "/M=uninstall.exe /S=0K /G=0" $0 $1 $2
   IntOp $0 $0 + ${ESTIMATEDSIZE}
   IntFmt $0 "0x%08X" $0
@@ -507,6 +528,9 @@ Section Install
     WriteRegStr SHCTX "${UNINSTKEY}" "URLUpdateInfo" "${HOMEPAGE}"
     WriteRegStr SHCTX "${UNINSTKEY}" "HelpLink" "${HOMEPAGE}"
   !endif
+  ${If} ${Errors}
+    !insertmacro PS_FAIL "Installation registration failed; installation is incomplete"
+  ${EndIf}
 
   ; Create start menu shortcut
   !insertmacro MUI_STARTMENU_WRITE_BEGIN Application
@@ -583,8 +607,8 @@ Section Uninstall
   !insertmacro PS_CHECK_PROCESSES
 
   ; Delete the app directory and its content from disk
-  ; Copy main executable
-  Delete "$INSTDIR\${MAINBINARYNAME}.exe"
+  ; Keep the maintenance image until every runtime resource was removed.
+  ClearErrors
 
   ; Delete resources
   {{#each resources}}
@@ -595,6 +619,13 @@ Section Uninstall
   {{#each binaries}}
     Delete "$INSTDIR\\{{this}}"
   {{/each}}
+  ${If} ${Errors}
+    !insertmacro PS_FAIL "Payload deletion failed; uninstallation is incomplete"
+  ${EndIf}
+  Delete "$INSTDIR\${MAINBINARYNAME}.exe"
+  ${If} ${Errors}
+    !insertmacro PS_FAIL "Executable deletion failed; uninstallation is incomplete"
+  ${EndIf}
 
   ; Delete app associations
   {{#each file_associations as |association| ~}}
@@ -613,7 +644,11 @@ Section Uninstall
 
 
   ; Delete uninstaller
+  ClearErrors
   Delete "$INSTDIR\uninstall.exe"
+  ${If} ${Errors}
+    !insertmacro PS_FAIL "Uninstaller deletion failed; uninstallation is incomplete"
+  ${EndIf}
 
   {{#each resources_ancestors}}
   RMDir /REBOOTOK "$INSTDIR\\{{this}}"
@@ -650,6 +685,7 @@ Section Uninstall
   ${EndIf}
 
   ; Remove registry information for add/remove programs
+  ClearErrors
   !if "${INSTALLMODE}" == "both"
     DeleteRegKey SHCTX "${UNINSTKEY}"
   !else if "${INSTALLMODE}" == "perMachine"
@@ -657,6 +693,12 @@ Section Uninstall
   !else
     DeleteRegKey HKCU "${UNINSTKEY}"
   !endif
+  ; Installation identity is independent of the optional profile deletion.
+  ; Leaving this value makes the next installer reject a missing predecessor.
+  DeleteRegValue SHCTX "${MANUPRODUCTKEY}" ""
+  ${If} ${Errors}
+    !insertmacro PS_FAIL "Installation registration could not be removed; uninstallation is incomplete"
+  ${EndIf}
 
   ; Removes the Autostart entry for ${PRODUCTNAME} from the HKCU Run key if it exists.
   ; This ensures the program does not launch automatically after uninstallation if it exists.

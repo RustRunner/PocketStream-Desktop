@@ -125,6 +125,17 @@ Var PSPhase
 Function PS_PreflightInstall
   ReadRegStr $PSExistingRoot SHCTX '${MANUPRODUCTKEY}' ''
   ReadRegStr $0 SHCTX '${UNINSTKEY}' 'UninstallString'
+  ; Older standalone uninstallers keep the location when retaining app data.
+  ; Treat it as a preference only after registration and both images are gone.
+  ${If} $PSExistingRoot != ''
+  ${AndIf} $0 == ''
+    ReadRegStr $1 SHCTX '${UNINSTKEY}' 'DisplayName'
+    ${If} $1 == ''
+    ${AndIfNot} ${FileExists} '$PSExistingRoot\${MAINBINARYNAME}.exe'
+    ${AndIfNot} ${FileExists} '$PSExistingRoot\uninstall.exe'
+      StrCpy $PSExistingRoot ''
+    ${EndIf}
+  ${EndIf}
   ${If} $PSExistingRoot != ''
     ${If} $0 != '$\"$PSExistingRoot\uninstall.exe$\"'
       !insertmacro PS_FAIL 'Unsupported predecessor; complete standalone uninstall before installing'

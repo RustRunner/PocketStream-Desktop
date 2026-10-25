@@ -27,6 +27,15 @@ export function checkInstaller(source, hooks) {
   require(install.indexOf("PS_ValidateDestination") >= 0 && install.indexOf("PS_ValidateDestination") < install.indexOf('File "${MAINBINARYSRCPATH}"'), "destination not checked before replacement");
   require(install.includes('PS_MAINTENANCE "install"'), "install maintenance missing");
   require(uninstall.indexOf('PS_MAINTENANCE "uninstall"') >= 0 && uninstall.indexOf('PS_MAINTENANCE "uninstall"') < uninstall.indexOf("Delete "), "uninstall deletes before maintenance");
+  const resources = install.slice(install.indexOf("; Copy resources"), install.indexOf("; Create file associations"));
+  require(resources.includes('${If} ${Errors}') && resources.includes('PS_FAIL "Resource replacement failed'), "resource extraction errors must fail installation");
+  const uninstaller = install.slice(install.indexOf("; Create uninstaller"), install.indexOf("; Save $INSTDIR"));
+  require(uninstaller.includes('${If} ${Errors}') && uninstaller.includes('PS_FAIL'), "uninstaller creation errors must fail installation");
+  const deletion = uninstall.slice(uninstall.indexOf('; Delete the app directory'), uninstall.indexOf('; Delete app associations'));
+  require(deletion.includes('ClearErrors') && deletion.includes('${If} ${Errors}') && deletion.includes('PS_FAIL "Payload deletion failed'), "payload deletion errors must fail before unregistering");
+  require(deletion.indexOf('PS_FAIL "Payload deletion failed') < deletion.indexOf('Delete "$INSTDIR\\${MAINBINARYNAME}.exe"') && deletion.includes('PS_FAIL "Executable deletion failed'), "resource deletion must succeed before deleting the maintenance image");
+  const metadataRemoval = uninstall.indexOf('DeleteRegValue SHCTX "${MANUPRODUCTKEY}" ""');
+  require(metadataRemoval >= 0 && metadataRemoval < uninstall.indexOf('${If} $DeleteAppDataCheckboxState = 1'), "uninstall must clear installation location even when retaining app data");
   for (const contract of ["Global\\PocketStream.Desktop.InstallGate.v2", "Global\\PocketStream.Desktop.HostOwner.v2", "GetSecurityInfo", "Descriptor", "WaitForSingleObject", "PSExistingRoot", "GetFileAttributesW", "pocketstream-maintenance.json", "--firewall-maintenance ${mode}", "SetErrorLevel 71"]) {
     require(hooks.toLowerCase().includes(contract.toLowerCase()), `transaction contract missing: ${contract}`);
   }

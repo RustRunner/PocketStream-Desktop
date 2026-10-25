@@ -11,3 +11,19 @@ test('installer source and independently seeded destructive path drift',async()=
     assert.notDeepEqual(checkInstaller(seed,hooks),[]);
   }
 });
+test('installer rejects ignored payload failures and stale install registration',async()=>{
+  const {checkInstaller}=await import('../scripts/check-installer.mjs');
+  const read=p=>fs.readFileSync(path.join(__dirname,'..',p),'utf8');
+  const source=read('src-tauri/installer/installer.nsi'),hooks=read('src-tauri/installer/transaction.nsh');
+  assert.deepEqual(checkInstaller(source,hooks),[]);
+  for(const [from,to] of [
+    ['PS_FAIL "Resource replacement failed','PS_MISSING "Resource replacement failed'],
+    ['PS_FAIL "Uninstaller creation failed','PS_MISSING "Uninstaller creation failed'],
+    ['PS_FAIL "Payload deletion failed','PS_MISSING "Payload deletion failed'],
+    ['PS_FAIL "Executable deletion failed','PS_MISSING "Executable deletion failed'],
+    ['DeleteRegValue SHCTX "${MANUPRODUCTKEY}" ""','; retained stale installation location'],
+  ]) {
+    assert.ok(source.includes(from),`fixture seed missing: ${from}`);
+    assert.notDeepEqual(checkInstaller(source.replace(from,to),hooks),[],from);
+  }
+});

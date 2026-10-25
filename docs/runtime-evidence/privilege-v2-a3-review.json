@@ -1,0 +1,521 @@
+{
+  "version": 1,
+  "recorded_at_utc": "2026-10-25T05:01:32.023Z",
+  "reviewed_commits": [
+    "542133fdbe00e8125352a2480691ad5d193e2650",
+    "af9be8133a673da74449a85a51fdc9512b525637"
+  ],
+  "specification": {
+    "path": "C:/Users/joshu/Documents/Untracked/23OCT26-A01-privilege-boundary-v2-A.md",
+    "sha256": "4af6b2f7924d8a9c29d9f63159ffd6f112ff4bed7f467111e62197d13465a2a9",
+    "bytes": 41315
+  },
+  "historical_tracked_evidence_unchanged": true,
+  "historical_a3": [
+    {
+      "path": "docs/runtime-evidence/privilege-v2-a3.md",
+      "sha256": "a3405cb592d25aa41d40e4c75d69d0ff058a6846a0018bbbb6a883c8ef9f7883",
+      "bytes": 9715
+    },
+    {
+      "path": "docs/runtime-evidence/privilege-v2-a3.json",
+      "sha256": "5f19594529ce6d29aa5f4ef0cbc53c656bae34cfa74c3b862571ce78219bbcd4",
+      "bytes": 103451
+    }
+  ],
+  "review": {
+    "path": "docs/runtime-evidence/privilege-v2-a3-review.md",
+    "sha256": "dcbc31d992b0cbd56991d9ed29a7c50eb4a4974d5a210e666109a46fb437c6e9",
+    "bytes": 10435
+  },
+  "source_inputs": [
+    {
+      "path": "scripts/check-installer.mjs",
+      "sha256": "7cd19555da486256841ee6f8133f57a93f3cfaabfd85cecbcbadd53f5ca6fcdc",
+      "bytes": 10620
+    },
+    {
+      "path": "src-tauri/installer/installer.nsi",
+      "sha256": "b4faa6a51b1f860948f95362f4d91e0ddbeb1eedd2dcb47a445edf792ea8f1c1",
+      "bytes": 27476
+    },
+    {
+      "path": "src-tauri/installer/transaction.nsh",
+      "sha256": "a32f69345465bd10d28137aa91963c11dbbedd36cc0af19f598b8d560e8055bb",
+      "bytes": 8024
+    },
+    {
+      "path": "src-tauri/src/network/bindings.rs",
+      "sha256": "ecf2db0bfb990424d448ebb79c3c019565a6c54a261581a0a40bbee9259259b1",
+      "bytes": 10395
+    },
+    {
+      "path": "src-tauri/src/network/firewall-policy-v2.ps1",
+      "sha256": "5d816c1ef5766fca60a5c2fbde0ada6ecc0d869b6d853a1bd67e8e3d718085ed",
+      "bytes": 14746
+    },
+    {
+      "path": "src-tauri/src/streaming/mod.rs",
+      "sha256": "aa6a42c2ab1f6eeaa8b1d4b05b0c16961915d2a1ac40a346e90e8487e746954c",
+      "bytes": 214780
+    },
+    {
+      "path": "src-tauri/src/streaming/relay.rs",
+      "sha256": "14886026434b0db242566244926722b9c17038d4f0c42e2b97de6cca77fee298",
+      "bytes": 56308
+    },
+    {
+      "path": "tests/firewall-policy.fixture.ps1",
+      "sha256": "0a42950993e8c78b1515c6c2d76ae3c545dc93b83f43d8b157d4dd63b85b6fa2",
+      "bytes": 10302
+    },
+    {
+      "path": "tests/firewall-policy.test.cjs",
+      "sha256": "ee106fd6825be14dad4d72f2ddfe58f7c52016f1bdeb97df418747d3aca20d2b",
+      "bytes": 665
+    },
+    {
+      "path": "tests/installer-contract.test.cjs",
+      "sha256": "3d49cbe4ae764d4e0bf06609ec360806181e3b5547dc5e70a78670a4430618eb",
+      "bytes": 1944
+    },
+    {
+      "path": "src-tauri/build.rs",
+      "sha256": "e90a76336ce3ab1d1d8c6f4646abc3cece68792fc3c88d58f8f834d06bd73068",
+      "bytes": 6786
+    },
+    {
+      "path": "src-tauri/pocketstream.exe.manifest",
+      "sha256": "c2cde06c274d7ed94b171a357a79976c296693c03926653ad7e304b29e6155ef",
+      "bytes": 631
+    },
+    {
+      "path": "src-tauri/capabilities/default.json",
+      "sha256": "9a0f693f988916a50b7e97e8dd81343675027928a9d1e49a3da72e9f4c1273ef",
+      "bytes": 1884
+    },
+    {
+      "path": "src-tauri/tauri.conf.json",
+      "sha256": "c8c725168489fd384aac4487905e5b8037f9b7fbf9ab8a2b61097c7bf8d99be2",
+      "bytes": 2086
+    },
+    {
+      "path": "src-tauri/src/config.rs",
+      "sha256": "e48eef300768b86fe1569933fead534e35186ee775ff33f96e71dd7f2268f789",
+      "bytes": 164605
+    }
+  ],
+  "validation": [
+    {
+      "name": "firewall_baseline",
+      "command": "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <baseline copy>/tests/firewall-policy.fixture.ps1",
+      "status": 1,
+      "result": "Expected regression: unrelated legacy conflict strands owned allow",
+      "log": {
+        "path": "privilege-review-firewall-baseline.log",
+        "sha256": "dc17b3c375ae3a153460507988964f2e33e97fda87c165ad14ae95837e0a57a3",
+        "bytes": 552
+      }
+    },
+    {
+      "name": "firewall_partial_before",
+      "command": "node --test tests/firewall-policy.test.cjs",
+      "status": 1,
+      "result": "Expected regression: last-template cleanup hides legacy-removal uncertainty",
+      "log": {
+        "path": "privilege-review-firewall-before.log",
+        "sha256": "15442194071c3f290988b728ca0ea7477feb9bb4cc2948e8315995affa0d5842",
+        "bytes": 2776
+      }
+    },
+    {
+      "name": "firewall_after",
+      "command": "node --test tests/firewall-policy.test.cjs",
+      "status": 0,
+      "result": "Ten fake-provider scenarios passed; zero native mutations",
+      "log": {
+        "path": "privilege-review-firewall-after.log",
+        "sha256": "afe691ddcce01ac15f698c0e204b0d5d2b20ff95b0473235043ef47ce5bf4cd5",
+        "bytes": 344
+      }
+    },
+    {
+      "name": "topology_before",
+      "command": "cargo test --lib --locked delayed_topology_observation_cannot_overwrite_a_recovered_instance",
+      "status": 101,
+      "result": "Expected regression: delayed Unknown replaces recovered known binding",
+      "log": {
+        "path": "privilege-review-topology-before.log",
+        "sha256": "757696b81ce73ec6009acf796a4efc4cb91be86f9a8e95c0d0f16d0d3267c7c6",
+        "bytes": 5842
+      }
+    },
+    {
+      "name": "lease_before",
+      "command": "cargo test --lib --locked stop_retries_a_retained_policy_lease_from_an_older_listener",
+      "status": 101,
+      "result": "Expected regression: older policy lease survives Stop",
+      "log": {
+        "path": "privilege-review-lease-before.log",
+        "sha256": "2728c7da5b93444b4a21c9e2d65382918e47a48bf3e1faca81cc512f7a21d18a",
+        "bytes": 5604
+      }
+    },
+    {
+      "name": "installer_before",
+      "command": "node --test tests/installer-contract.test.cjs",
+      "status": 1,
+      "result": "Expected missing failure guards and unconditional identity cleanup",
+      "log": {
+        "path": "privilege-review-installer-before.log",
+        "sha256": "2cb2111a91f7c665484c3dca366e657ddf5ca4361f96f8b5098d0641379c77db",
+        "bytes": 5330
+      }
+    },
+    {
+      "name": "frontend",
+      "command": "npm test",
+      "status": 0,
+      "result": "189 passed",
+      "log": {
+        "path": "privilege-review-frontend-tests.log",
+        "sha256": "f2e417effdfff3bd06a40c0344cb882c7cce43879d756d45eb3e8a2549904ca6",
+        "bytes": 33650
+      }
+    },
+    {
+      "name": "typecheck",
+      "command": "npm run typecheck",
+      "status": 0,
+      "result": "Passed",
+      "log": {
+        "path": "privilege-review-typecheck.log",
+        "sha256": "8d1aab0b73c62645422bc51a81484006544e94cfdd38b6e85c04fde0ac7df0ab",
+        "bytes": 122
+      }
+    },
+    {
+      "name": "frontend_build_initial",
+      "command": "npm run build",
+      "status": 1,
+      "result": "Vite parent-directory access denied by sandbox",
+      "log": {
+        "path": "privilege-review-build.log",
+        "sha256": "f9d2b152d3a983bacc94a6cbf96a12b1834549cf82a43a59bfa0e05c9457c70f",
+        "bytes": 5184
+      }
+    },
+    {
+      "name": "frontend_build_retry",
+      "command": "npm run build",
+      "status": 0,
+      "result": "Passed with needed filesystem access; 46-command contract passed",
+      "log": {
+        "path": "privilege-review-build-retry.log",
+        "sha256": "f9d111c2d675468f3c58d2fc05f34d20bdba2c8fb08a7a973ea0dda0f07438b9",
+        "bytes": 2692
+      }
+    },
+    {
+      "name": "rust_initial",
+      "command": "cargo test --lib --locked",
+      "status": 101,
+      "result": "784 passed; 3 read-only adapter-provider tests denied; 10 ignored",
+      "log": {
+        "path": "privilege-review-rust-tests.log",
+        "sha256": "619f8272f7e4ee4fbfebd1f2cc57c2fd62c1d2cf3d0eb02c615b3bd356751325",
+        "bytes": 141996
+      }
+    },
+    {
+      "name": "rust_retry",
+      "command": "cargo test --lib --locked --offline",
+      "status": 0,
+      "result": "787 passed; 10 ignored; read-only provider access granted; native/hardware opt-ins removed",
+      "log": {
+        "path": "privilege-review-rust-tests-retry.log",
+        "sha256": "cc43dd1c0646ce73c88ef0a75fa91d5358ff4459ec70ae64a87deec7886d482b",
+        "bytes": 138646
+      }
+    },
+    {
+      "name": "clippy",
+      "command": "cargo clippy --all-targets --no-deps --locked --offline -- -D warnings",
+      "status": 0,
+      "result": "Passed",
+      "log": {
+        "path": "privilege-review-clippy.log",
+        "sha256": "094b376da7cddd40a84f2e5de58dcd8eab9abecdecb0f9367d0b3ddcd3ec091d",
+        "bytes": 1102
+      }
+    },
+    {
+      "name": "format",
+      "command": "cargo fmt --check",
+      "status": 0,
+      "result": "Passed",
+      "log": {
+        "path": "privilege-review-fmt.log",
+        "sha256": "33c738fb075761b7b2ff133626165383a6cce9459a69687f57040adaa02abddd",
+        "bytes": 684
+      }
+    },
+    {
+      "name": "installer_compiled",
+      "command": "npm run check:installer:generated",
+      "status": 0,
+      "result": "Generated script and compiled callbacks passed; installer not executed",
+      "log": {
+        "path": "privilege-review-installer-generated.log",
+        "sha256": "af6e07acade82d36e56762676ecbcc208fda85039e216daaae9e57d63a54fce0",
+        "bytes": 586
+      }
+    },
+    {
+      "name": "rust_final",
+      "command": "cargo test --lib --locked --offline",
+      "status": 0,
+      "result": "787 passed; 10 ignored; final watcher coalescing change",
+      "log": {
+        "path": "privilege-review-rust-final.log",
+        "sha256": "55c8b3f6255df1695d241f0e48c264744b22cdecea0b93ada6c056166eb6be8f",
+        "bytes": 138822
+      }
+    },
+    {
+      "name": "topology_final",
+      "command": "cargo test --lib --locked --offline delayed_topology_observation_cannot_overwrite_a_recovered_instance",
+      "status": 0,
+      "result": "1 passed; observation is explicitly polled to the lifecycle barrier",
+      "log": {
+        "path": "privilege-review-topology-final.log",
+        "sha256": "ba09ff5b4b433f04042a91c053a793e86ef0ef6d0844df556c4b08a746f813d8",
+        "bytes": 4510
+      }
+    },
+    {
+      "name": "clippy_final",
+      "command": "cargo clippy --all-targets --no-deps --locked --offline -- -D warnings",
+      "status": 0,
+      "result": "Passed",
+      "log": {
+        "path": "privilege-review-clippy-final.log",
+        "sha256": "e09f9a2a9ed264216b123a05055616df9efbee6862958623165ca18cdb462ad3",
+        "bytes": 1102
+      }
+    },
+    {
+      "name": "format_final",
+      "command": "cargo fmt --check",
+      "status": 0,
+      "result": "Passed",
+      "log": {
+        "path": "privilege-review-fmt-final.log",
+        "sha256": "3fccf499c10241c5e4bb8179fb0e691d331a2130101e527bb78c5dc3133da202",
+        "bytes": 708
+      }
+    },
+    {
+      "name": "installer_compiled_final",
+      "command": "npm run check:installer:generated",
+      "status": 0,
+      "result": "Passed on the final package; installer not executed",
+      "log": {
+        "path": "privilege-review-installer-generated-final.log",
+        "sha256": "af6e07acade82d36e56762676ecbcc208fda85039e216daaae9e57d63a54fce0",
+        "bytes": 586
+      }
+    }
+  ],
+  "builds": [
+    {
+      "program": "C:\\Program Files\\nodejs\\node.exe",
+      "args": [
+        "node_modules/@tauri-apps/cli/tauri.js",
+        "build",
+        "--bundles",
+        "nsis",
+        "--no-sign",
+        "--ci",
+        "--config",
+        "{\"bundle\":{\"createUpdaterArtifacts\":false}}",
+        "--",
+        "--locked",
+        "--offline"
+      ],
+      "started_utc": "2026-10-25T04:45:15.798Z",
+      "completed_utc": "2026-10-25T04:45:15.885Z",
+      "status": 1,
+      "installation_executed": false,
+      "application_launched": false,
+      "code_signing": false,
+      "updater_artifacts": false,
+      "log": {
+        "path": "src-tauri/target/privilege-review/package-build.log",
+        "sha256": "c4390247cba48a2a78fef3e1f0dd7c1286df4fc314affaa1c88a22a7c3712a1f",
+        "bytes": 381
+      }
+    },
+    {
+      "program": "C:\\Program Files\\nodejs\\node.exe",
+      "args": [
+        "node_modules/@tauri-apps/cli/tauri.js",
+        "build",
+        "--bundles",
+        "nsis",
+        "--no-sign",
+        "--ci",
+        "--config",
+        "{\"bundle\":{\"createUpdaterArtifacts\":false}}",
+        "--",
+        "--locked",
+        "--offline"
+      ],
+      "started_utc": "2026-10-25T04:45:34.326Z",
+      "completed_utc": "2026-10-25T04:47:23.899Z",
+      "status": 0,
+      "installation_executed": false,
+      "application_launched": false,
+      "code_signing": false,
+      "updater_artifacts": false,
+      "log": {
+        "path": "src-tauri/target/privilege-review/package-build-retry.log",
+        "sha256": "50300c056f623f25db8e854806234e0a68053c302bc5ca2f342f6aff8006669a",
+        "bytes": 4099
+      }
+    },
+    {
+      "program": "C:\\Program Files\\nodejs\\node.exe",
+      "args": [
+        "node_modules/@tauri-apps/cli/tauri.js",
+        "build",
+        "--bundles",
+        "nsis",
+        "--no-sign",
+        "--ci",
+        "--config",
+        "{\"bundle\":{\"createUpdaterArtifacts\":false},\"build\":{\"beforeBuildCommand\":\"\"}}",
+        "--",
+        "--locked",
+        "--offline"
+      ],
+      "started_utc": "2026-10-25T04:57:47.245Z",
+      "completed_utc": "2026-10-25T04:59:33.250Z",
+      "status": 0,
+      "installation_executed": false,
+      "application_launched": false,
+      "code_signing": false,
+      "updater_artifacts": false,
+      "log": {
+        "path": "src-tauri/target/privilege-review/package-build-final.log",
+        "sha256": "c6591bf2b3ded23f15f94de064a819dd9e57eae06065e0984de9e696f0fec3a9",
+        "bytes": 2735
+      }
+    }
+  ],
+  "artifacts": {
+    "staged": {
+      "path": "src-tauri/target/privilege-review/final/optimized-7274619250bc8243ebf23f2fa20e3ef96f0b598178b3d01bd49d1bfde235fd6a.exe",
+      "sha256": "7274619250bc8243ebf23f2fa20e3ef96f0b598178b3d01bd49d1bfde235fd6a",
+      "bytes": 23718912
+    },
+    "package": {
+      "path": "src-tauri/target/privilege-review/final/package-833623f1a2db593163ecbd30b4dc546d50e818878ec3aedf75cf91a2df7b5566.exe",
+      "sha256": "833623f1a2db593163ecbd30b4dc546d50e818878ec3aedf75cf91a2df7b5566",
+      "bytes": 29999405
+    },
+    "embedded": {
+      "path": "src-tauri/target/privilege-review/final/package/pocketstream-desktop.exe",
+      "sha256": "227688eabbd07a926e8abe15752b7be5934a9b6c0b06d4259692144c8e108173",
+      "bytes": 23718912
+    },
+    "generated_script": {
+      "path": "src-tauri/target/privilege-review/final/installer.generated.nsi",
+      "sha256": "2f67e516c36c24b74f3637aad1e0fd51bddf5d3f2ea94c509ca0b18f2a093e74",
+      "bytes": 47172
+    },
+    "compiled_trace": {
+      "path": "src-tauri/target/privilege-review/final/installer.compile.log",
+      "sha256": "06ad90aea6b894d5ae8a8cd9dd8501f571e0d7d9fc1a1ad31d16c603a43910e3",
+      "bytes": 218261
+    },
+    "compiler_metadata": {
+      "path": "src-tauri/target/privilege-review/final/compile-inspection.json",
+      "sha256": "2f4d9f798e1a95f88e816a74b0702f915276bb37b0bbd2e6e5648b8c6e463555",
+      "bytes": 453
+    },
+    "staged_manifest": {
+      "path": "src-tauri/target/privilege-review/final/release.manifest",
+      "sha256": "780c5f643a1faa7a7198a3114e470fe789beacf042ba7b0fcdf2e6b3e3e20221",
+      "bytes": 641
+    },
+    "embedded_manifest": {
+      "path": "src-tauri/target/privilege-review/final/embedded.manifest",
+      "sha256": "780c5f643a1faa7a7198a3114e470fe789beacf042ba7b0fcdf2e6b3e3e20221",
+      "bytes": 641
+    }
+  },
+  "marker_difference": {
+    "differing_bytes": 3,
+    "offsets": [
+      18174786,
+      18174787,
+      18174788
+    ],
+    "staged": "UNK",
+    "embedded": "NSS"
+  },
+  "preserved_prior_artifacts": [
+    {
+      "path": "src-tauri\\target\\privilege-review\\before-0c2daccda7e86918644e09de29786ce0529420106e63b7191a01d1f84dc82a24-pocketstream-desktop.exe",
+      "sha256": "0c2daccda7e86918644e09de29786ce0529420106e63b7191a01d1f84dc82a24",
+      "bytes": 23729152
+    },
+    {
+      "path": "src-tauri\\target\\privilege-review\\before-618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101-PocketStream Desktop_0.6.7_x64-setup.exe",
+      "sha256": "618c36206897ae3b1a80c4bfd0906c358ce6a38e7250f6d496dafd0b7f9da101",
+      "bytes": 29991257
+    },
+    {
+      "path": "src-tauri\\target\\privilege-review\\before-6fef8e3022d9e7e574eeb93b05881b9be19e5668e218ae090cd96f7efadba896-installer.nsi",
+      "sha256": "6fef8e3022d9e7e574eeb93b05881b9be19e5668e218ae090cd96f7efadba896",
+      "bytes": 45549
+    }
+  ],
+  "historical_output_limitation": "Normal release/generated aliases were rebuilt. Prior staged image, package and generated script were archived. Prior generated compiler trace was not separately archived; its original hash remains in the unchanged A3 record.",
+  "safety": {
+    "application_launched": false,
+    "installer_executed": false,
+    "uninstaller_executed": false,
+    "firewall_maintenance_executed": false,
+    "native_configuration_writes_dispatched": false,
+    "hardware_smoke_executed": false,
+    "profile_initialized": false,
+    "code_signing": false,
+    "updater_artifacts": false
+  },
+  "contracts": {
+    "application_commands": 46,
+    "shipping_execution_level": "requireAdministrator",
+    "common_controls": true
+  },
+  "pending": [
+    "native firewall/filter/migration and partial-provider qualification",
+    "installer lifetime, cancellation, failure and entry-mode execution",
+    "cross-account/logon/integrity ownership",
+    "non-camera topology and explicit rebinding execution",
+    "new-candidate hardware/UI qualification",
+    "signed updater, installed-package/G3 and endurance/resource qualification"
+  ],
+  "security_boundary": "The shipping host remains elevated; this is not privilege separation.",
+  "intermediate_review": {
+    "path": "src-tauri/target/privilege-review/intermediate-review.json",
+    "sha256": "48dfadae80d102d9ca9a18559ffc0b41c4a994a552972cb9fea999594bc5c19d",
+    "bytes": 15064
+  },
+  "implementation_commits": [
+    "13c8bfb2d3e85a7444ac8ad61c8ce34b1315058a",
+    "55fcdb1be6229004a67dc462249d45b2c75ea441"
+  ],
+  "installer_and_review_commit": "The commit containing this record"
+}
