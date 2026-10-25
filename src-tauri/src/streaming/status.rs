@@ -1,6 +1,25 @@
 //! One status watch, coherent snapshots and deduplicated publication.
 use super::*;
 
+#[derive(Clone)]
+pub(super) struct StatusPublisher {
+    state: Arc<Mutex<StreamState>>,
+    pub(super) tx: Arc<watch::Sender<StreamStatus>>,
+}
+
+impl StatusPublisher {
+    pub(super) fn new(state: Arc<Mutex<StreamState>>, selected_protocol: RestreamProtocol) -> Self {
+        let (tx, _) = watch::channel(StreamStatus::idle(selected_protocol));
+        Self {
+            state,
+            tx: Arc::new(tx),
+        }
+    }
+    pub(super) async fn refresh(&self) {
+        publish_status_if_changed(self.tx.as_ref(), compute_status(&self.state).await);
+    }
+}
+
 pub(super) fn publish_status_if_changed(tx: &watch::Sender<StreamStatus>, snapshot: StreamStatus) {
     tx.send_if_modified(|current| {
         if *current == snapshot {
@@ -38,7 +57,11 @@ pub(super) async fn compute_status(state: &Arc<Mutex<StreamState>>) -> StreamSta
         None => (0.0, 0, MAX_RTSP_CLIENTS, false),
     };
 
-    let playback = state.playback_health.as_ref().map(|h| h.snapshot());
+    let playback = state
+        .playback_data
+        .playback_health
+        .as_ref()
+        .map(|h| h.snapshot());
     let playing = playback
         .as_ref()
         .is_some_and(|h| h.state == PlaybackState::Playing);
@@ -50,6 +73,7 @@ pub(super) async fn compute_status(state: &Arc<Mutex<StreamState>>) -> StreamSta
     // pipeline instance, so stop and camera-switch resets are
     // structural rather than an explicit clear.
     let (audio_present, audio_codec) = state
+        .playback_data
         .playback
         .as_ref()
         .map(|p| p.audio_status())
@@ -67,15 +91,15 @@ pub(super) async fn compute_status(state: &Arc<Mutex<StreamState>>) -> StreamSta
         },
         firewall: state.firewall.clone(),
         playing,
-        playback_desired: state.playback_settings.is_some(),
+        playback_desired: state.playback_data.playback_settings.is_some(),
         playback_state: playback
             .as_ref()
             .map_or(PlaybackState::Stopped, |h| h.state),
         playback_fault: playback.as_ref().and_then(|h| h.fault.clone()),
         playback_recovery_attempt: playback.as_ref().map_or(0, |h| h.attempt),
         playback_next_retry_secs: playback.as_ref().and_then(|h| h.next_retry_secs),
-        recording_report: state.recording_report.clone(),
-        recording_finalized_path: state.recording_finalized_path.clone(),
+        recording_report: state.playback_data.recording_report.clone(),
+        recording_finalized_path: state.playback_data.recording_finalized_path.clone(),
         selected_protocol: state.selected_protocol,
         active_protocol: state
             .restream_spec
@@ -123,7 +147,7 @@ pub(super) async fn compute_status(state: &Arc<Mutex<StreamState>>) -> StreamSta
                     .map(ResolvedStartSpec::display_url)
             })
             .flatten(),
-        recording: state.recording,
+        recording: state.playback_data.recording,
         uptime_secs: uptime,
         bandwidth_kbps: bandwidth,
         connected_clients,

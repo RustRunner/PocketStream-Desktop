@@ -51,3 +51,24 @@ change was needed. `baseline-rust-inventory.txt` enumerates all 814 scenarios.
 
    Local review commit: commit containing this record, titled
    “A03 slice 7: own video surface and prepare coherent streaming boundaries”.
+
+8. Playback ownership: `PlaybackService` encloses playback/recording fields,
+   lifecycle/epoch/wake controls, diagnostic task and supervisor. Existing Option
+   representations and transitions moved without an enum redesign. The owner
+   receives a `PlaybackSlot`, surface and the single `StatusPublisher`; the slot
+   exposes only playback mutation and checks UDP occupancy under the original
+   shared lock before returning that projection. Readiness/selection/verified
+   wake and source-bound transport validation retain their existing behavior.
+   Shared URL/readiness policy is in `source.rs`; the RTSP client's redaction
+   call now uses that helper rather than the streaming facade.
+
+   Eleven existing playback scenarios moved by name. Three new tests cover
+   construction outside a runtime, failed recording-finalize path retention,
+   and an old lifecycle-gated retirement preserving newer intent while reporting
+   only the old recording. Gates: **812 Rust passed / 10 ignored; 205 frontend
+   passed**, fmt, all-target Clippy, typecheck, contracts and frontend build
+   passed. The focused playback run passed all 14 scenarios. Test-import/parse
+   errors during extraction were corrected before the passing full gates.
+
+   Local review commit: commit containing this record, titled
+   “A03 slice 8: extract playback and recording ownership”. Slice 7 is `7441870`.

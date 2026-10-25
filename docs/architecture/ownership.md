@@ -2,8 +2,8 @@
 
 This describes the implementation following the Revision 3 early-start track
 from `b849dfc`. The user explicitly rescheduled streaming slices 7–10 on
-2026-10-25 before A4; slice 7 preparation is implemented, with playback/relay
-extraction in progress. **A4 remains
+2026-10-25 before A4; slices 7–8 are implemented, with relay extraction
+in progress. **A4 remains
 incomplete/deferred; B remains deferred.** Source checks do not qualify hardware,
 physical timing, recovery, installation, firewall behavior or release artifacts.
 See the [implementation record](../runtime-evidence/a03-revision3-implementation.md).
@@ -29,6 +29,9 @@ frontend mirrors retain their existing contracts.
 | `native_operations` / `LocalExecutor` | Existing private process-wide executor and `NATIVE_SCOPE`, operation identity, cancellation, worker, retained completion/observation, acknowledgment and recovery/shutdown barriers. Address and firewall work share this executor. |
 | `bindings.rs` / `interface.rs` | Existing private topology fingerprint/revision and native/qualified metadata observation state. GUID resolution/migration and all-address exposure remain separate from selected-camera eligibility. |
 | Composition / `MachineGuard` | InstallGate/HostOwner admission and owner-thread release spanning initialization, application work and final retained drain. |
+| `PlaybackService` | Playback and recording Option fields, intent/instance epochs, lifecycle/wake, diagnostic task and supervisor; concrete readiness/selection context, surface and the single status publisher. `PlaybackSlot` exposes only a mutable playback projection of the retained common state mutex. |
+| `VideoSurface` | Native child HWND plus incarnation, serialized main-thread create/replace/reposition/visibility and conditional cleanup via AppBridge. Queued work checks the incarnation before touching a handle. |
+| Status publication | `StatusPublisher` owns the existing watch; all synchronous and supervisor refresh points compose under the common mutex and deduplicate into that watch. The broadcaster uses AppBridge. |
 
 Owner fields are private outside the network module. Network-internal visibility
 supports facade sequencing and the existing callback/fence adapters; it is not

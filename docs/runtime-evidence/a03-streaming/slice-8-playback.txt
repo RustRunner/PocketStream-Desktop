@@ -1,0 +1,46 @@
+cargo : warn: could not canonicalize path C:\Users\joshu
+At line:5 char:49
++ ... Cargo.toml; cargo test --manifest-path src-tauri/Cargo.toml --lib --l ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warn: could not... C:\Users\joshu:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+   Compiling pocketstream-desktop v0.6.7 (C:\Users\joshu\PocketStream-Desktop\src-tauri)
+warning: linker stdout: LINK : warning LNK4199: /DELAYLOAD:Packet.dll ignored; no imports found from Packet.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gmodule-2.0-0.dll ignored; no imports found from gmodule-2.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:intl-8.dll ignored; no imports found from intl-8.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gstaudio-1.0-0.dll ignored; no imports found from gstaudio-1.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gstpbutils-1.0-0.dll ignored; no imports found from gstpbutils-1.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gsttag-1.0-0.dll ignored; no imports found from gsttag-1.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gstrtp-1.0-0.dll ignored; no imports found from gstrtp-1.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gstgl-1.0-0.dll ignored; no imports found from gstgl-1.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gstallocators-1.0-0.dll ignored; no imports found from
+gstallocators-1.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gstcodecparsers-1.0-0.dll ignored; no imports found from
+gstcodecparsers-1.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gstmpegts-1.0-0.dll ignored; no imports found from gstmpegts-1.0-0.dll
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `pocketstream-desktop` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 18.64s
+     Running unittests src\lib.rs (src-tauri\target\debug\deps\pocketstream_desktop-10048f9d261ead52.exe)
+
+running 14 tests
+test streaming::playback::tests::playback_construction_does_not_require_a_runtime ... ok
+test streaming::playback::tests::repeated_fresh_proof_does_not_collapse_transport_backoff ... ok
+test streaming::playback::tests::closed_selection_subscription_does_not_spin_the_supervisor ... ok
+test streaming::playback::tests::stop_cancels_the_owned_stall_diagnostic ... ok
+test streaming::playback::tests::terminal_playback_fault_does_not_retry_on_ticks_or_reconnect ... ok
+test streaming::playback::tests::manual_retry_applies_corrections_without_rebinding_to_another_selection ... ok
+test streaming::playback::tests::stop_and_new_source_fence_backoff_and_late_completions ... ok
+test streaming::playback::tests::playback_owner_recovers_stable_fault_with_relay_off_and_no_status_repeats ... ok
+test streaming::playback::tests::readiness_wake_interrupts_long_backoff_and_rechecks_expected_identity ... ok
+test streaming::playback::tests::stop_beats_an_inflight_start_waiting_for_state_lock ... ok
+test streaming::playback::tests::a_new_start_after_stop_keeps_its_new_intent ... ok
+test streaming::playback::tests::failed_recording_finalize_keeps_path_until_owned_retirement_reports_it ... ok
+test streaming::playback::tests::queued_old_retirement_preserves_new_intent_and_finalizes_only_old_recording ... ok
+test streaming::playback::tests::preview_loss_finalizes_recording_and_keeps_relay_intent_untouched ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 808 filtered out; finished in 0.44s
+

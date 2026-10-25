@@ -195,10 +195,10 @@ impl PlaybackPipeline {
         bus.set_sync_handler(move |_, msg| {
             match msg.view() {
                 gst::MessageView::Error(err) => {
-                    let raw = super::StreamManager::redact_url(&err.error().to_string());
+                    let raw = super::source::redact_url(&err.error().to_string());
                     let debug = err
                         .debug()
-                        .map(|d| super::StreamManager::redact_url(&d))
+                        .map(|d| super::source::redact_url(&d))
                         .unwrap_or_default();
                     let fault = super::classify::bus_fault(
                         &err.error(),

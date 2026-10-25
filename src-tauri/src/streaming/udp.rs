@@ -21,7 +21,7 @@ pub(super) fn guard_playback(state: &StreamState, port: u16) -> Result<(), AppEr
 }
 
 pub(super) fn guard_relay(state: &StreamState, port: u16) -> Result<(), AppError> {
-    if state.playback_source == Some(SourceMode::Udp { port }) {
+    if state.playback_data.playback_source == Some(SourceMode::Udp { port }) {
         return Err(AppError::Stream(format!(
             "UDP port {} is already claimed by the running preview - only one consumer can receive a UDP stream. Stop the stream first, or switch the input to RTSP.", port
         )));
