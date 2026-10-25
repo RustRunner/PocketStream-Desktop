@@ -1,0 +1,247 @@
+cargo : warn: could not canonicalize path C:\Users\joshu
+At line:9 char:49
++ ... Cargo.toml; cargo test --manifest-path src-tauri/Cargo.toml --lib --l ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warn: could not... C:\Users\joshu:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+   Compiling pocketstream-desktop v0.6.7 (C:\Users\joshu\PocketStream-Desktop\src-tauri)
+warning: type `streaming::relay_service::RelayFaultProbe` is more private than the item
+`streaming::relay_service::RestreamServer::fault_probe`
+  --> src\streaming\relay_service.rs:60:5
+   |
+60 |     pub(super) fn fault_probe(&self) -> RelayFaultProbe {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method
+`streaming::relay_service::RestreamServer::fault_probe` is reachable at visibility `pub(in crate::streaming)`
+   |
+note: but type `streaming::relay_service::RelayFaultProbe` is only usable at visibility `pub(self)`
+  --> src\streaming\relay_service.rs:10:1
+   |
+10 | enum RelayFaultProbe {
+   | ^^^^^^^^^^^^^^^^^^^^
+   = note: `#[warn(private_interfaces)]` on by default
+
+warning: linker stdout: LINK : warning LNK4199: /DELAYLOAD:Packet.dll ignored; no imports found from Packet.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gmodule-2.0-0.dll ignored; no imports found from gmodule-2.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:intl-8.dll ignored; no imports found from intl-8.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gstaudio-1.0-0.dll ignored; no imports found from gstaudio-1.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gstpbutils-1.0-0.dll ignored; no imports found from gstpbutils-1.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gsttag-1.0-0.dll ignored; no imports found from gsttag-1.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gstrtp-1.0-0.dll ignored; no imports found from gstrtp-1.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gstgl-1.0-0.dll ignored; no imports found from gstgl-1.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gstallocators-1.0-0.dll ignored; no imports found from
+gstallocators-1.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gstcodecparsers-1.0-0.dll ignored; no imports found from
+gstcodecparsers-1.0-0.dll␍
+         LINK : warning LNK4199: /DELAYLOAD:gstmpegts-1.0-0.dll ignored; no imports found from gstmpegts-1.0-0.dll
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `pocketstream-desktop` (lib test) generated 2 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 24.07s
+     Running unittests src\lib.rs (src-tauri\target\debug\deps\pocketstream_desktop-10048f9d261ead52.exe)
+
+running 196 tests
+test streaming::audio::tests::branch_elements_are_codec_specific ... ok
+test streaming::audio::tests::any_single_missing_element_rejects ... ok
+test streaming::audio::tests::branch_launch_builds_the_full_codec_chain ... ok
+test streaming::audio::tests::other_media_always_declined ... ok
+test streaming::audio::tests::duplicate_audio_pad_routes_to_fakesink ... ok
+test streaming::audio::tests::explicit_unknown_name_rejects_even_with_matching_payload ... ok
+test streaming::audio::tests::first_supported_audio_accepted_later_declined ... ok
+test streaming::audio::tests::duplicate_video_pad_routes_to_fakesink ... ok
+test streaming::audio::tests::media_unknown_or_missing_is_other ... ok
+test streaming::audio::tests::media_matching_is_case_insensitive ... ok
+test streaming::audio::tests::media_video_and_audio_recognized ... ok
+test streaming::audio::tests::first_video_accepted_later_video_declined ... ok
+test streaming::audio::tests::no_outcome_leaves_a_pad_unlinked ... ok
+test streaming::audio::tests::first_video_pad_routes_to_decoder ... ok
+test streaming::audio::tests::codec_names_recognized_case_insensitively ... ok
+test streaming::audio::tests::first_recognized_audio_pad_gets_its_branch ... ok
+test streaming::audio::tests::other_pads_route_to_fakesink ... ok
+test streaming::audio::tests::static_payload_fallback_applies_only_without_name ... ok
+test streaming::audio::tests::supported_when_every_required_element_exists ... ok
+test streaming::audio::tests::unknown_payload_or_nothing_rejects ... ok
+test streaming::audio::tests::unsupported_audio_declined_without_claiming_the_slot ... ok
+test streaming::audio::tests::unrecognized_audio_pad_routes_to_fakesink_without_claiming_slot ... ok
+test streaming::audio::tests::video_and_audio_slots_are_independent ... ok
+test streaming::audio::tests::video_only_accepts_first_video_declines_later ... ok
+test streaming::audio::tests::video_only_declines_audio_and_other ... ok
+test streaming::caller_registry::tests::cap_counts_pending_plus_active_and_allows_same_address_refresh ... ok
+test streaming::caller_registry::tests::added_and_removed_move_one_caller_atomically ... ok
+test streaming::caller_registry::tests::clear_releases_pending_and_active_registrations ... ok
+test streaming::caller_registry::tests::admission_prunes_expired_pending_but_preserves_active_callers ... ok
+test streaming::caller_registry::tests::decodes_null_and_exact_utf8_stream_ids ... ok
+test streaming::caller_registry::tests::duplicate_and_over_capacity_adds_are_capability_faults ... ok
+test streaming::caller_registry::tests::canonicalizes_ipv4_and_ipv6_socket_addresses ... ok
+test streaming::caller_registry::tests::exact_stream_id_mismatch_never_reserves_a_slot ... ok
+test streaming::caller_registry::tests::inconsistent_internal_state_is_detected_before_admission_or_add ... ok
+test streaming::classify::tests::current_rtsp_response_details_handle_access_denied_without_text_matching ... ok
+test streaming::caller_registry::tests::empty_stream_id_policy_accepts_any_caller_value ... ok
+test streaming::caller_registry::tests::impossible_or_out_of_order_transitions_are_faults_without_mutation ... ok
+test streaming::caller_registry::tests::rejects_missing_and_mistyped_callback_values_without_echoing_them ... ok
+test streaming::caller_registry::tests::same_address_refreshes_one_pending_reservation ... ok
+test streaming::playback::tests::playback_construction_does_not_require_a_runtime ... ok
+test streaming::classify::tests::permanent_errors_do_not_retry_even_with_transport_words ... ok
+test streaming::classify::tests::transport_errors_retry_regardless_of_message ... ok
+test streaming::playback::tests::closed_selection_subscription_does_not_spin_the_supervisor ... ok
+test streaming::playback::tests::manual_retry_applies_corrections_without_rebinding_to_another_selection ... ok
+test streaming::playback::tests::playback_owner_recovers_stable_fault_with_relay_off_and_no_status_repeats ... ok
+test streaming::playback::tests::repeated_fresh_proof_does_not_collapse_transport_backoff ... ok
+test streaming::playback::tests::stop_and_new_source_fence_backoff_and_late_completions ... ok
+test streaming::playback::tests::readiness_wake_interrupts_long_backoff_and_rechecks_expected_identity ... ok
+test streaming::playback::tests::stop_cancels_the_owned_stall_diagnostic ... ok
+test streaming::playback::tests::terminal_playback_fault_does_not_retry_on_ticks_or_reconnect ... ok
+test streaming::recorder::tests::free_space_probe_returns_some_for_temp_dir ... ok
+test streaming::recorder::tests::free_space_probe_walks_up_to_existing_ancestor ... ok
+test streaming::caller_registry::tests::concurrent_add_and_remove_keeps_active_count_accurate ... ok
+test streaming::recorder::tests::space_floor_boundaries ... ok
+test streaming::caller_registry::tests::concurrent_admission_never_exceeds_the_combined_limit ... ok
+test streaming::relay::playback_tests::first_buffer_starts_playing_then_three_second_stall_retires_it ... ok
+test streaming::relay::playback_tests::all_backoff_stages_cap_and_readiness_wakes_early ... ok
+test streaming::relay::playback_tests::continuous_frames_reset_attempts_only_after_thirty_seconds ... ok
+test streaming::relay::playback_tests::permanent_failure_waits_for_manual_retry_even_after_readiness ... ok
+test streaming::relay::tests::backoff_sequence_is_bounded ... ok
+test streaming::relay::playback_tests::first_frame_deadline_covers_starting_and_handshake_without_frames ... ok
+test streaming::relay::playback_tests::stop_cancels_every_backoff_and_rejects_late_buffers ... ok
+test streaming::relay::playback_tests::stable_latched_error_retires_before_late_frame_without_repeat_events ... ok
+test streaming::recorder::tests::recording_path_creates_dir ... ok
+test streaming::relay::tests::eager_success_signals_cannot_erase_an_earlier_fault ... ok
+test streaming::relay::tests::explicit_bind_refresh_threshold_and_max_backoff_are_sticky ... ok
+test streaming::relay::tests::eager_arming_faults_without_a_playing_notification ... ok
+test streaming::relay::tests::duplicate_faults_and_stale_data_updates_are_ignored ... ok
+test streaming::relay::tests::first_buffer_timeout_starts_only_when_playing_is_expected ... ok
+test streaming::relay::tests::listener_without_downstream_data_never_stalls ... ok
+test streaming::relay::tests::resolved_identity_includes_credentials ... ok
+test streaming::relay::tests::permanent_media_fault_retires_and_stays_failed_until_explicit_start ... ok
+test streaming::relay::tests::relay_state_transition_table_covers_runtime_states ... ok
+test streaming::relay::tests::srt_urls_encode_stream_id_and_never_include_passphrase ... ok
+test streaming::relay::tests::silence_exempt_output_can_become_healthy_without_a_buffer ... ok
+test streaming::relay::tests::srt_identity_includes_access_controls ... ok
+test streaming::relay::tests::stall_needs_two_windows_and_any_buffer_resets_them ... ok
+test streaming::recorder::tests::save_screenshot_creates_dir_and_file ... ok
+test streaming::relay::tests::udp_is_exempt_from_silence_but_not_runtime_errors ... ok
+test streaming::relay_service::tests::bind_ip_skips_apipa_but_takes_real_ip ... ok
+test streaming::relay_service::tests::bind_ip_prefers_native_over_adopted ... ok
+test streaming::relay_service::tests::bind_ip_none_when_only_adopted ... ok
+test streaming::relay_service::tests::automatic_restream_url_never_selects_vpn_or_virtual_adapters ... ok
+test streaming::relay::tests::thirty_continuous_healthy_seconds_reset_backoff ... ok
+test streaming::relay_service::tests::explicit_start_noop_requires_identical_identity_and_healthy_listener ... ok
+test streaming::relay_service::tests::only_selected_protocol_settings_replace_the_runtime ... ok
+test streaming::relay_service::tests::delayed_topology_observation_cannot_overwrite_a_recovered_instance ... ok
+test streaming::relay_service::tests::failed_initial_start_clears_current_intent ... ok
+test streaming::relay_service::tests::active_settings_apply_invalidates_start_before_waiting_for_the_gate ... ok
+test streaming::relay_service::tests::newer_manual_generation_interrupts_old_backoff ... ok
+test streaming::relay_service::tests::recovery_status_keeps_desired_urls_without_a_listener ... ok
+test streaming::relay_service::tests::srt_output_resolution_is_complete_and_fail_closed ... ok
+test streaming::relay_service::tests::settings_stop_claim_rejects_a_newer_start ... ok
+test streaming::relay_service::tests::stale_firewall_cleanup_cannot_retire_a_newer_listener_lease ... ok
+test streaming::relay_service::tests::stale_start_publication_cannot_reassert_desired ... ok
+test streaming::relay_service::tests::start_intent_is_visible_before_resolution_and_stop_supersedes_it ... ok
+test streaming::relay_service::tests::stop_accounts_for_firewall_lease_even_without_a_bound_socket ... ok
+test streaming::relay_service::tests::stop_tears_down_the_stored_listener_not_an_in_flight_generation ... ok
+test streaming::relay_service::tests::stop_interrupts_every_nonzero_recovery_backoff ... ok
+test streaming::relay_service::tests::stopped_status_retains_startup_policy_failure ... ok
+test streaming::relay_service::tests::successful_reobservation_repairs_unknown_binding_at_the_same_revision ... ok
+test streaming::relay_service::tests::stopped_switch_can_select_unavailable_srt_but_start_remains_blocked ... ok
+test streaming::relay_service::tests::transactional_restart_cannot_override_a_newer_stop ... ok
+test streaming::relay_service::tests::switch_invalidates_a_start_before_waiting_for_the_transaction_gate ... ok
+test streaming::rtsp_client::tests::broken_pipe_recognized ... ok
+test streaming::rtsp_client::tests::cable_unplug_with_cached_401_in_debug_still_says_network ... ok
+test streaming::relay_service::tests::upstream_guard_survives_reasserted_start_but_rejects_stop_and_replacement ... ok
+test streaming::rtsp_client::tests::connection_refused_recognized ... ok
+test streaming::rtsp_client::tests::debug_can_carry_the_signal ... ok
+test streaming::rtsp_client::tests::disk_full_beats_generic_stream_error ... ok
+test streaming::rtsp_client::tests::disk_full_via_windows_phrase ... ok
+test streaming::recorder::tests::recording_path_unique_per_call ... ok
+test streaming::rtsp_client::tests::fallback_exact_120_chars_not_truncated ... ok
+test streaming::rtsp_client::tests::fallback_includes_short_debug_verbatim ... ok
+test streaming::rtsp_client::tests::fallback_truncates_long_debug ... ok
+test streaming::rtsp_client::tests::fallback_truncation_survives_multibyte_utf8_at_boundary ... ok
+test streaming::rtsp_client::tests::matching_is_case_insensitive ... ok
+test streaming::rtsp_client::tests::mid_stream_disconnect_recognized_as_network_loss ... ok
+test streaming::rtsp_client::tests::missing_plugin_includes_original_error ... ok
+test streaming::rtsp_client::tests::no_route_to_host_recognized ... ok
+test streaming::rtsp_client::tests::not_negotiated_recognized ... ok
+test streaming::rtsp_client::tests::rtsp_401_recognized ... ok
+test streaming::rtsp_client::tests::rtsp_403_recognized ... ok
+test streaming::rtsp_client::tests::rtsp_404_recognized ... ok
+test streaming::rtsp_client::tests::rtsp_503_recognized ... ok
+test streaming::rtsp_client::tests::rtsp_503_via_status_phrase ... ok
+test streaming::rtsp_client::tests::timeout_recognized ... ok
+test streaming::rtsp_server::tests::bandwidth_rate_handles_normal_zero_and_rollback_samples ... ok
+test streaming::rtsp_server::tests::client_close_releases_sessions_and_graceful_teardown_is_idempotent ... ok
+test streaming::playback::tests::stop_beats_an_inflight_start_waiting_for_state_lock ... ok
+test streaming::playback::tests::a_new_start_after_stop_keeps_its_new_intent ... ok
+test streaming::rtsp_server::tests::media_error_status_is_generation_checked_and_first_fault_wins ... ok
+test streaming::rtsp_server::tests::constructed_media_remains_unarmed_until_playing_and_prepared ... ok
+test streaming::relay_service::tests::stop_retries_a_retained_policy_lease_from_an_older_listener ... ok
+test streaming::rtsp_server::tests::mount_path_token_is_redacted ... ok
+test streaming::rtsp_server::tests::media_error_status_maps_to_fallback_fault_and_weak_expiry_is_benign ... ok
+test streaming::rtsp_server::tests::non_token_paths_pass_through ... ok
+test streaming::rtsp_transport::tests::camera_video_through_bound_transport ... ignored, requires an explicitly selected H.264 camera and Ethernet source
+test streaming::rtsp_server::tests::probe_byte_count_handles_buffers_lists_and_other_data ... ok
+test streaming::rtsp_server::tests::session_pool_limit_slot_reuse_and_status_count ... ok
+test streaming::rtsp_client::tests::real_bus_fault_is_typed_latched_and_rejects_late_buffers ... ok
+test streaming::playback::tests::failed_recording_finalize_keeps_path_until_owned_retirement_reports_it ... ok
+test streaming::playback::tests::queued_old_retirement_preserves_new_intent_and_finalizes_only_old_recording ... ok
+test streaming::rtsp_server::tests::lazy_rtsp_source_requires_current_readiness_before_setting_location ... ok
+test streaming::srt_server::tests::pipeline_skeletons_are_constant_and_secret_free ... ok
+test streaming::srt_server::tests::probe_byte_count_handles_buffers_lists_and_other_data ... ok
+test streaming::srt_server::tests::rtsp_input_requires_camera_readiness_before_building_srt_output ... ok
+test streaming::srt_server::tests::required_srt_callback_abi_is_available ... ok
+test streaming::srt_server::tests::srt_probe_returns_each_runtime_fault_once ... ok
+test streaming::status::tests::stream_status_default_values ... ok
+test streaming::status::tests::status_publisher_emits_when_only_client_count_changes ... ok
+test streaming::status::tests::stream_status_serializes ... ok
+test streaming::tests::build_url_custom_port_and_path ... ok
+test streaming::tests::build_url_custom_udp_port ... ok
+test streaming::tests::build_url_rejects_apipa_for_preview_and_relay ... ok
+test streaming::tests::build_url_rejects_invalid_camera_ip ... ok
+test streaming::srt_server::tests::sink_configuration_supports_passwordless_and_aes_128_modes ... ok
+test streaming::srt_server::tests::named_pipeline_parts_and_mux_normalization_are_present ... ok
+test streaming::tests::build_url_rejects_pipeline_injection_in_ip ... ok
+test streaming::tests::build_url_rtsp_without_credentials ... ok
+test streaming::tests::build_url_rtsp_omits_credentials ... ok
+test streaming::tests::build_url_udp ... ok
+test streaming::tests::build_url_udp_ignores_camera_ip ... ok
+test streaming::tests::coherent_status_waits_for_whole_cross_owner_transition ... ok
+test streaming::tests::redact_url_embedded_in_bus_debug_text ... ok
+test streaming::tests::redact_url_empty_password ... ok
+test streaming::tests::redact_url_udp ... ok
+test streaming::tests::redact_url_with_credentials ... ok
+test streaming::tests::redact_url_without_credentials ... ok
+test streaming::tests::refresh_status_dedupes_identical_snapshots ... ok
+test streaming::tests::relay_redaction_removes_credentials_and_mount_token ... ok
+test streaming::tests::refresh_status_updates_watch_channel ... ok
+test streaming::tests::tcp_receive_policy_matches_runtime_capability ... ok
+test streaming::tests::stream_manager_initial_status ... ok
+test streaming::tests::tcp_receive_policy_missing_property_returns_stream_error ... ok
+test streaming::tests::udp_bypasses_camera_mac_route_and_service_gate ... ok
+test streaming::tests::video_role_gate_keeps_identity_and_clearing_role_blocks_reconnect ... ok
+test streaming::tests::video_role_gate_requires_an_explicit_unique_cam ... ok
+test streaming::tests::udp_failed_build_keeps_desired_claim_until_stop_and_stale_stop_preserves_replacement ... ok
+test streaming::video_surface::tests::failed_surface_replacement_retires_previous_handle ... ok
+test streaming::video_surface::tests::stale_stop_does_not_clear_replacement_video_hwnd ... ok
+test streaming::video_surface::tests::stale_main_thread_work_cannot_touch_recycled_replacement_hwnd ... ok
+test streaming::video_surface::tests::stream_manager_video_hwnd_roundtrip ... ok
+test streaming::srt_server::tests::diagnostic_bind_allows_a_torn_down_candidate_to_release_its_socket ... ok
+test streaming::rtsp_client::tests::deadline_covers_both_paused_handshake_and_playing_without_buffers ... ok
+test streaming::relay_service::tests::srt_dispatch_populates_protocol_neutral_status ... ok
+test streaming::playback::tests::preview_loss_finalizes_recording_and_keeps_relay_intent_untouched ... ok
+
+(pocketstream_desktop-10048f9d261ead52.exe:20656): GLib-GIO-WARNING **: 16:53:21.514: Failed to open application
+manifest `C:\Windows\SystemApps\Microsoft.WindowsAppRuntime.vNext.CBS_8wekyb3d8bbwe\AppxManifest.xml' for package #40
+(`Microsoft.WindowsAppRuntime.CBS.1.8_8000.800.1936.100_x64__8wekyb3d8bbwe'): error code 0x2
+test streaming::srt_server::tests::diagnostic_bind_classifies_occupied_and_non_socket_failures ... ok
+test streaming::srt_server::tests::passwordless_udp_listener_starts_healthy_and_shuts_down_cleanly ... ok
+test streaming::relay_service::tests::unavailable_live_srt_switch_fails_before_disrupting_rtsp ... ok
+test streaming::tests::concurrent_udp_starts_admit_only_one_owner ... ok
+test streaming::relay_service::tests::settings_apply_restarts_only_active_changes_and_honors_enable ... ok
+test streaming::relay_service::tests::persistence_and_restoration_failures_are_reported_together ... ok
+test streaming::relay_service::tests::desired_recovering_and_failed_outputs_switch_to_the_new_protocol ... ok
+test streaming::relay_service::tests::live_switch_replaces_exactly_one_listener_in_each_direction ... ok
+test streaming::relay_service::tests::persistence_failures_restore_settings_selection_and_runtime ... ok
+
+test result: ok. 195 passed; 0 failed; 1 ignored; 0 measured; 626 filtered out; finished in 21.22s
+

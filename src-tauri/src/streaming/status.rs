@@ -34,16 +34,19 @@ pub(super) fn publish_status_if_changed(tx: &watch::Sender<StreamStatus>, snapsh
 pub(super) async fn compute_status(state: &Arc<Mutex<StreamState>>) -> StreamStatus {
     let state = state.lock().await;
     let uptime = state
+        .relay_data
         .restream_start_time
         .map(|t| t.elapsed().as_secs())
         .unwrap_or(0);
 
     let health = state
+        .relay_data
         .restream_health
         .as_ref()
         .map(|health| health.snapshot());
     let current_generation = health.as_ref().map(|health| health.server_generation);
     let current_server = state
+        .relay_data
         .restream_server
         .as_ref()
         .filter(|server| Some(server.server_generation()) == current_generation);
@@ -82,6 +85,7 @@ pub(super) async fn compute_status(state: &Arc<Mutex<StreamState>>) -> StreamSta
     StreamStatus {
         bind_scope: if listener_alive {
             state
+                .relay_data
                 .restream_spec
                 .as_ref()
                 .map(|s| s.bind_scope.clone())
@@ -89,7 +93,7 @@ pub(super) async fn compute_status(state: &Arc<Mutex<StreamState>>) -> StreamSta
         } else {
             BindScope::default()
         },
-        firewall: state.firewall.clone(),
+        firewall: state.relay_data.firewall.clone(),
         playing,
         playback_desired: state.playback_data.playback_settings.is_some(),
         playback_state: playback
@@ -100,15 +104,22 @@ pub(super) async fn compute_status(state: &Arc<Mutex<StreamState>>) -> StreamSta
         playback_next_retry_secs: playback.as_ref().and_then(|h| h.next_retry_secs),
         recording_report: state.playback_data.recording_report.clone(),
         recording_finalized_path: state.playback_data.recording_finalized_path.clone(),
-        selected_protocol: state.selected_protocol,
+        selected_protocol: state.relay_data.selected_protocol,
         active_protocol: state
+            .relay_data
             .restream_spec
             .as_ref()
             .map(ResolvedStartSpec::protocol)
-            .or_else(|| state.restream_server.as_ref().map(RestreamServer::protocol)),
+            .or_else(|| {
+                state
+                    .relay_data
+                    .restream_server
+                    .as_ref()
+                    .map(RestreamServer::protocol)
+            }),
         server_running: listener_alive,
-        desired: state.restream_desired,
-        relay_state: if state.restream_desired {
+        desired: state.relay_data.restream_desired,
+        relay_state: if state.relay_data.restream_desired {
             health
                 .as_ref()
                 .map(|health| health.state)
@@ -116,12 +127,12 @@ pub(super) async fn compute_status(state: &Arc<Mutex<StreamState>>) -> StreamSta
         } else {
             RelayState::Stopped
         },
-        relay_error: if state.restream_desired {
+        relay_error: if state.relay_data.restream_desired {
             health.as_ref().and_then(|health| health.error.clone())
         } else {
             None
         },
-        recovery_attempt: if state.restream_desired {
+        recovery_attempt: if state.relay_data.restream_desired {
             health
                 .as_ref()
                 .map(|health| health.recovery_attempt)
@@ -130,18 +141,22 @@ pub(super) async fn compute_status(state: &Arc<Mutex<StreamState>>) -> StreamSta
             0
         },
         server_url: state
+            .relay_data
             .restream_desired
             .then(|| {
                 state
+                    .relay_data
                     .restream_spec
                     .as_ref()
                     .map(ResolvedStartSpec::client_url)
             })
             .flatten(),
         display_url: state
+            .relay_data
             .restream_desired
             .then(|| {
                 state
+                    .relay_data
                     .restream_spec
                     .as_ref()
                     .map(ResolvedStartSpec::display_url)

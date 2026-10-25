@@ -72,3 +72,29 @@ change was needed. `baseline-rust-inventory.txt` enumerates all 814 scenarios.
 
    Local review commit: commit containing this record, titled
    “A03 slice 8: extract playback and recording ownership”. Slice 7 is `7441870`.
+
+9. Relay ownership: `RelayService` encloses listener state, complete settings/
+   protocol transactions, lifecycle gates, intent/generation, supervisor, topology
+   handling and both firewall outcome and lease generation. `RelaySlot` exposes
+   only relay mutation; its UDP check reads playback occupancy at the original
+   admission point under the joint mutex. The facade delegates. No relay-native
+   executor, barrier or task was added. Automatic recovery retains its backoff,
+   three-bind-failure re-resolution and generation/instance/topology checks.
+
+   Policy-result closures allow deterministic lease tests while production
+   continues to await `firewall::ensure/disable` inline through the existing shared
+   retained executor. They test lease installation before dispatch, canceled
+   caller retention, failed/uncertain/unavailable retirement, retirement before
+   replacement and stale completion fencing. Only Inactive clears a matching
+   lease. Existing separate listener/outstanding-firewall Stop generations and
+   unavailable-automation listener startup remain unchanged. These fakes prove
+   lease logic, not native cancellation or physical firewall qualification; the
+   unchanged executor/runner scenarios remain the native lifetime regression net.
+
+   Thirty-three existing relay scenarios moved by preserved name; five tests
+   were added. Final gates: **817 Rust passed / 10 ignored; 205 frontend passed**,
+   fmt, all-target Clippy, typecheck, contracts and frontend build passed. Initial
+   extraction/test closure errors and Clippy visibility issues were corrected
+   before the passing rerun. Local review commit: commit containing this record,
+   titled “A03 slice 9: extract relay transactions topology and firewall ownership”.
+   Slice 8 is `60db6fe`.

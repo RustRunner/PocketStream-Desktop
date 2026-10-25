@@ -1294,9 +1294,9 @@ mod tests {
         let manager = super::super::StreamManager::new();
         {
             let mut state = manager.state.lock().await;
-            state.restream_server = Some(super::super::RestreamServer::Rtsp(restreamer));
-            state.restream_desired = true;
-            state.restream_spec = Some(super::super::ResolvedStartSpec {
+            state.relay_data.restream_server = Some(super::super::RestreamServer::Rtsp(restreamer));
+            state.relay_data.restream_desired = true;
+            state.relay_data.restream_spec = Some(super::super::ResolvedStartSpec {
                 source: super::super::ResolvedSource::Rtsp {
                     url: "rtsp://192.0.2.1/live".into(),
                 },
@@ -1312,9 +1312,9 @@ mod tests {
                 username: String::new(),
                 password: String::new(),
             });
-            state.restream_health = Some(health);
-            state.restream_intent_epoch = Some(0);
-            state.restream_start_time = Some(std::time::Instant::now());
+            state.relay_data.restream_health = Some(health);
+            state.relay_data.restream_intent_epoch = Some(0);
+            state.relay_data.restream_start_time = Some(std::time::Instant::now());
         }
         let status = super::super::compute_status(&manager.state).await;
         assert!(status.server_running);

@@ -3,13 +3,15 @@
 use super::*;
 
 pub(super) fn guard_playback(state: &StreamState, port: u16) -> Result<(), AppError> {
-    if (state.restream_desired
+    if (state.relay_data.restream_desired
         && state
+            .relay_data
             .restream_spec
             .as_ref()
             .and_then(ResolvedStartSpec::udp_ingest_port)
             == Some(port))
         || state
+            .relay_data
             .restream_server
             .as_ref()
             .and_then(RestreamServer::udp_ingest_port)

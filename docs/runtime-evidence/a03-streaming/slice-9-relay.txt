@@ -1,0 +1,60 @@
+cargo : warn: could not canonicalize path C:\Users\joshu
+At line:2 char:49
++ ... Cargo.toml; cargo test --manifest-path src-tauri/Cargo.toml --lib --l ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warn: could not... C:\Users\joshu:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+   Compiling pocketstream-desktop v0.6.7 (C:\Users\joshu\PocketStream-Desktop\src-tauri)
+error[E0373]: async block may outlive the current function, but it borrows `role`, which is owned by the current
+function
+    --> src\streaming\relay_service.rs:2467:26
+     |
+2467 |             |role, _, _| async {
+     |                          ^^^^^ may outlive borrowed value `role`
+...
+2472 |                 calls.lock().unwrap().push(role);
+     |                                            ---- `role` is borrowed here
+     |
+note: async block is returned here
+    --> src\streaming\relay_service.rs:2467:26
+     |
+2467 |               |role, _, _| async {
+     |  __________________________^
+2468 | |                 assert_eq!(
+2469 | |                     manager.relay.state.lock().await.firewall_generation,
+2470 | |                     Some((41, FirewallRule::Rtsp))
+...    |
+2473 | |                 expected.clone()
+2474 | |             },
+     | |_____________^
+help: to force the async block to take ownership of `role` (and any other referenced variables), use the `move` keyword
+     |
+2467 |             |role, _, _| async move {
+     |                                ++++
+
+error[E0373]: async block may outlive the current function, but it borrows `role`, which is owned by the current
+function
+    --> src\streaming\relay_service.rs:2475:20
+     |
+2475 |             |role| async {
+     |                    ^^^^^ may outlive borrowed value `role`
+2476 |                 calls.lock().unwrap().push(role);
+     |                                            ---- `role` is borrowed here
+     |
+note: async block is returned here
+    --> src\streaming\relay_service.rs:2475:20
+     |
+2475 |               |role| async {
+     |  ____________________^
+2476 | |                 calls.lock().unwrap().push(role);
+2477 | |                 FirewallOutcome::Inactive
+2478 | |             },
+     | |_____________^
+help: to force the async block to take ownership of `role` (and any other referenced variables), use the `move` keyword
+     |
+2475 |             |role| async move {
+     |                          ++++
+
+For more information about this error, try `rustc --explain E0373`.
+error: could not compile `pocketstream-desktop` (lib test) due to 2 previous errors

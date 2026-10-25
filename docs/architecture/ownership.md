@@ -2,7 +2,7 @@
 
 This describes the implementation following the Revision 3 early-start track
 from `b849dfc`. The user explicitly rescheduled streaming slices 7–10 on
-2026-10-25 before A4; slices 7–8 are implemented, with relay extraction
+2026-10-25 before A4; slices 7–9 are implemented, with streaming closure
 in progress. **A4 remains
 incomplete/deferred; B remains deferred.** Source checks do not qualify hardware,
 physical timing, recovery, installation, firewall behavior or release artifacts.
@@ -30,6 +30,7 @@ frontend mirrors retain their existing contracts.
 | `bindings.rs` / `interface.rs` | Existing private topology fingerprint/revision and native/qualified metadata observation state. GUID resolution/migration and all-address exposure remain separate from selected-camera eligibility. |
 | Composition / `MachineGuard` | InstallGate/HostOwner admission and owner-thread release spanning initialization, application work and final retained drain. |
 | `PlaybackService` | Playback and recording Option fields, intent/instance epochs, lifecycle/wake, diagnostic task and supervisor; concrete readiness/selection context, surface and the single status publisher. `PlaybackSlot` exposes only a mutable playback projection of the retained common state mutex. |
+| `RelayService` | Listener/desired/spec/health, settings/protocol transactions, intent/generation, lifecycle/wake/events/supervisor, topology and both firewall outcome and generation lease. `RelaySlot` exposes only relay mutation; its UDP guard reads playback occupancy while holding the common lock. Firewall dispatch still awaits the shared retained native executor inline. |
 | `VideoSurface` | Native child HWND plus incarnation, serialized main-thread create/replace/reposition/visibility and conditional cleanup via AppBridge. Queued work checks the incarnation before touching a handle. |
 | Status publication | `StatusPublisher` owns the existing watch; all synchronous and supervisor refresh points compose under the common mutex and deduplicate into that watch. The broadcaster uses AppBridge. |
 
