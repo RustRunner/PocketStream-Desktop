@@ -31,8 +31,9 @@ function button(dataset) {
   };
 }
 
-function fixture({ sameIp = false, hold = () => false, failHalt = false } = {}) {
+function fixture({ sameIp = false, hold = () => false, failHalt = false, failInit = 0 } = {}) {
   let current = A, camera = A, timerId = 0;
+  let status = "live";
   let haltFailures = Number(failHalt);
   const calls = [], pending = [], timers = new Map(), subscribers = [], zooms = [], toasts = [], logs = [];
   const home = button({ ptz: "home" }), right = button({ ptz: "right" });
@@ -44,6 +45,9 @@ function fixture({ sameIp = false, hold = () => false, failHalt = false } = {}) 
     async ptuSend(ip, cmd, target) {
       const call = { ip, cmd, target: structuredClone(target) };
       calls.push(call);
+      if (cmd === "PU&TU&PL&TL" && failInit-- > 0) {
+        throw Error("Selected Ethernet adapter unavailable");
+      }
       if (cmd === "PS=0&TS=0" && haltFailures > 0) {
         haltFailures--;
         throw Error("transient refusal");
@@ -65,6 +69,7 @@ function fixture({ sameIp = false, hold = () => false, failHalt = false } = {}) 
     "./store.ts": { selectedDevice: { subscribe() {} } },
     "./device-list.ts": {
       endpointFor: endpoint,
+      resolveTarget: target => target ? { status } : undefined,
       subscribe(fn) { subscribers.push(fn); return () => {}; },
     },
   };
@@ -93,6 +98,10 @@ function fixture({ sameIp = false, hold = () => false, failHalt = false } = {}) 
       if (notify) subscribers.forEach(fn => fn());
     },
     changeCamera(target = B) { camera = target; },
+    snapshot(nextStatus = status) {
+      status = nextStatus;
+      subscribers.forEach(fn => fn());
+    },
     release(cmd, data = { PP: "0", TP: "0" }) {
       const index = pending.findIndex(p => p.call.cmd === cmd);
       assert(index >= 0, `no pending ${cmd}`);
@@ -199,6 +208,41 @@ test("unchanged speed initialization publishes limits and sends C=V on A", async
   assert.deepEqual(f.calls.map(c => c.cmd), ["PU&TU&PL&TL", "C=V"]);
   assert(f.calls.every(c => c.target.key === A.key));
   assert.deepEqual(Array.from(f.hooks.speed()), [200, 20, true]);
+});
+
+test("cached PTU startup failure retries when the same identity becomes live", async () => {
+  const f = fixture({ failInit: 1 });
+  f.snapshot("cached_only");
+  await flush();
+  assert.match(f.logs[0], /PTU init failed.*Selected Ethernet adapter unavailable/);
+  f.snapshot("cached_only");
+  await flush();
+  assert.equal(f.calls.length, 1, "cached snapshots must not retry an unverified target");
+  f.snapshot("live");
+  await flush();
+  assert.deepEqual(f.calls.map(c => c.cmd), ["PU&TU&PL&TL", "PU&TU&PL&TL", "C=V"]);
+  assert.deepEqual(Array.from(f.hooks.speed()), [200, 20, true]);
+  f.snapshot("live");
+  await flush();
+  assert.equal(f.calls.length, 3, "successful initialization must not repeat");
+  assert(f.calls.every(c => c.target.key === A.key));
+});
+
+test("live snapshots and callers share the current in-flight PTU initialization", async () => {
+  const f = fixture({ hold: cmd => cmd === "PU&TU&PL&TL" });
+  f.snapshot();
+  f.snapshot();
+  let completed = false;
+  const query = f.hooks.queryPtuSpeed().then(() => { completed = true; });
+  await flush();
+  assert.equal(f.calls.length, 1);
+  assert.equal(completed, false, "a caller must await the shared query");
+  f.release("PU&TU&PL&TL", { PU: "300", TU: "200", PL: "3", TL: "2" });
+  await flush();
+  assert.equal(f.pending.length, 0, "snapshots must not queue duplicate initialization");
+  await query;
+  assert.deepEqual(f.calls.map(c => c.cmd), ["PU&TU&PL&TL", "C=V"]);
+  assert.equal(completed, true);
 });
 
 test("subscription detects same-IP identity replacement and initializes B separately", async () => {

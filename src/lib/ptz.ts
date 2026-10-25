@@ -298,9 +298,27 @@ async function waitForPtuTarget(
 
 // ── PTZ control setup ───────────────────────────────────────────────
 
-async function queryPtuSpeed(): Promise<void> {
+let ptuSpeedQuery: { generation: number; stamp: string; promise: Promise<void> } | null = null;
+
+function queryPtuSpeed(): Promise<void> {
   const operation = capturePtuOperation();
-  if (!operation) return;
+  if (!operation) return Promise.resolve();
+  const stamp = targetStamp(operation.target, operation.targetIp);
+  if (ptuSpeedQuery?.generation === operation.generation && ptuSpeedQuery.stamp === stamp) {
+    return ptuSpeedQuery.promise;
+  }
+  const query = {
+    generation: operation.generation,
+    stamp,
+    promise: readPtuSpeed(operation).finally(() => {
+      if (ptuSpeedQuery === query) ptuSpeedQuery = null;
+    }),
+  };
+  ptuSpeedQuery = query;
+  return query.promise;
+}
+
+async function readPtuSpeed(operation: PtuOperation): Promise<void> {
   try {
     const data = await ptuCmd("PU&TU&PL&TL", operation);
     if (!ptuOperationCurrent(operation)) return;
@@ -325,15 +343,19 @@ type SpeedAction = "up" | "down" | "left" | "right";
 
 export function setupPtzControls(): void {
   // PTU IP is alias-driven now (no dropdown). Watch the device list
-  // and re-query speed limits whenever the PTU-aliased device changes.
+  // Reuse discovery updates to retry early startup failures after fresh
+  // verification. A pending query is shared with controls and other updates.
   let lastPtu: string | null = null;
   deviceList.subscribe(() => {
     const current = targetStamp(getActivePtuTarget());
-    if (current !== lastPtu) {
+    const changed = current !== lastPtu;
+    if (changed) {
       lastPtu = current;
       ptuOperationGeneration++;
       ptuSpeedQueried = false;
-      queryPtuSpeed();
+    }
+    if (changed || (!ptuSpeedQueried && deviceList.resolveTarget(getActivePtuTarget())?.status === "live")) {
+      void queryPtuSpeed();
     }
   });
 
