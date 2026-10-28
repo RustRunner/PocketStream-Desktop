@@ -8,6 +8,7 @@ pub enum FirewallRule {
     Srt,
 }
 
+#[cfg(any(windows, test))]
 #[derive(Debug, Clone, Serialize)]
 pub struct RoleDefinition {
     pub role: FirewallRule,
@@ -17,6 +18,7 @@ pub struct RoleDefinition {
     pub port: u16,
 }
 // The only role table. Maintenance and runtime send this same data to policy.
+#[cfg(any(windows, test))]
 pub const ROLES: [RoleDefinition; 2] = [
     RoleDefinition {
         role: FirewallRule::Rtsp,
@@ -33,6 +35,7 @@ pub const ROLES: [RoleDefinition; 2] = [
         port: 8890,
     },
 ];
+#[cfg(windows)]
 pub const GROUP: &str = "PocketStream.Desktop.Managed.v2";
 
 #[cfg(windows)]

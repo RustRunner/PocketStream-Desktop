@@ -19,10 +19,12 @@ mod udp;
 pub mod video_embed;
 mod video_surface;
 
+#[cfg(any(windows, test))]
+use crate::network::firewall::FirewallOutcome;
 use crate::{
     config::{AppConfig, AppSettings, RestreamProtocol, RestreamSettingsUpdate},
     error::AppError,
-    network::{bindings::BindScope, firewall::FirewallOutcome},
+    network::bindings::BindScope,
 };
 #[cfg(test)]
 use relay::{ResolvedOutput, ResolvedSource, ResolvedStartSpec};
@@ -144,6 +146,7 @@ impl StreamManager {
     pub async fn stop_restream_server(&self) -> Result<(), AppError> {
         self.relay.stop_restream_server().await
     }
+    #[cfg(any(windows, test))]
     pub(crate) async fn startup_firewall_status(&self, outcome: FirewallOutcome) {
         self.relay.startup_firewall_status(outcome).await
     }

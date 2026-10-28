@@ -12,11 +12,13 @@ pub(crate) struct SurfaceToken {
 
 #[derive(Default)]
 struct SurfaceState {
+    #[cfg(any(windows, test))]
     generation: u64,
     current: Option<SurfaceToken>,
 }
 
 trait SurfaceOps: Send + Sync {
+    #[cfg(any(windows, test))]
     fn create(&self, parent: isize, rect: [i32; 4]) -> Result<isize, AppError>;
     fn reposition(&self, hwnd: isize, rect: [i32; 4]) -> Result<(), AppError>;
     fn visible(&self, hwnd: isize, visible: bool) -> Result<(), AppError>;
@@ -25,6 +27,7 @@ trait SurfaceOps: Send + Sync {
 
 struct NativeSurfaceOps;
 impl SurfaceOps for NativeSurfaceOps {
+    #[cfg(any(windows, test))]
     fn create(&self, parent: isize, [x, y, width, height]: [i32; 4]) -> Result<isize, AppError> {
         video_embed::create_video_child(parent, x, y, width, height)
     }
@@ -62,6 +65,7 @@ impl VideoSurface {
         self.capture().map(|token| token.hwnd)
     }
 
+    #[cfg(any(windows, test))]
     pub(crate) async fn create(&self, parent: isize, rect: [i32; 4]) -> Result<String, AppError> {
         let state = self.state.clone();
         let ops = self.ops.clone();

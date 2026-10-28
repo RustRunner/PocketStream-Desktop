@@ -895,6 +895,7 @@ impl RelayService {
         }
     }
 
+    #[cfg(any(windows, test))]
     pub(crate) async fn startup_firewall_status(&self, outcome: FirewallOutcome) {
         let mut state = self.state.lock().await;
         if state.firewall_generation.is_none() {

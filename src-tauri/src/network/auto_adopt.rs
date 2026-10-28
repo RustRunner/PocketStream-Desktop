@@ -219,8 +219,13 @@ pub type PendingIps = Arc<Mutex<Vec<PendingIp>>>;
 pub enum ProbeSourceState {
     Ready,
     Pending,
+    #[cfg(windows)]
     Tentative,
-    RoutePending { expected: u32, observed: u32 },
+    #[cfg(windows)]
+    RoutePending {
+        expected: u32,
+        observed: u32,
+    },
 }
 
 /// Injectable seam for the OS-touching work `adopt_subnet` performs, so its
