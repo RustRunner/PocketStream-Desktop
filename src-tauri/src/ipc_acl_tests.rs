@@ -50,11 +50,13 @@ fn generated_acl_denies_registered_canary_and_dispatches_allowed_command() {
         .build()
         .unwrap();
 
-    let denied = tauri::test::get_ipc_response(
-        &main,
-        request("acl_denied_canary", "http://tauri.localhost"),
-    )
-    .expect_err("registered unpermitted canary must be denied");
+    // Use the webview's actual origin: Tauri serves bundled content through
+    // http://tauri.localhost on Windows and tauri://localhost on Linux.
+    let local_url = main.url().expect("mock webview must have its app URL");
+
+    let denied =
+        tauri::test::get_ipc_response(&main, request("acl_denied_canary", local_url.as_str()))
+            .expect_err("registered unpermitted canary must be denied");
     let error = denied.as_str().expect("ACL denial is a string");
     assert!(
         error.contains("acl_denied_canary not allowed")
@@ -65,7 +67,7 @@ fn generated_acl_denies_registered_canary_and_dispatches_allowed_command() {
     println!("A-S1: ACL rejection={error}; denied canary executions=0");
 
     let allowed =
-        tauri::test::get_ipc_response(&main, request("get_network_mode", "http://tauri.localhost"))
+        tauri::test::get_ipc_response(&main, request("get_network_mode", local_url.as_str()))
             .expect("allowed command must dispatch");
     assert_eq!(allowed.deserialize::<String>().unwrap(), "static_manual");
     println!("A-S1: allowed get_network_mode dispatched with isolated static_manual state");
@@ -73,11 +75,10 @@ fn generated_acl_denies_registered_canary_and_dispatches_allowed_command() {
     let other = tauri::WebviewWindowBuilder::new(&app, "other", Default::default())
         .build()
         .unwrap();
-    assert!(tauri::test::get_ipc_response(
-        &other,
-        request("get_network_mode", "http://tauri.localhost"),
-    )
-    .is_err());
+    assert!(
+        tauri::test::get_ipc_response(&other, request("get_network_mode", local_url.as_str()))
+            .is_err()
+    );
     assert!(tauri::test::get_ipc_response(
         &main,
         request("get_network_mode", "https://example.invalid"),
@@ -97,11 +98,9 @@ fn denied_canary_is_present_in_the_minimal_handler() {
     let main = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
         .build()
         .unwrap();
-    tauri::test::get_ipc_response(
-        &main,
-        request("acl_denied_canary", "http://tauri.localhost"),
-    )
-    .expect("control must prove the denied canary was registered");
+    let local_url = main.url().expect("mock webview must have its app URL");
+    tauri::test::get_ipc_response(&main, request("acl_denied_canary", local_url.as_str()))
+        .expect("control must prove the denied canary was registered");
     assert_eq!(app.state::<CanaryExecutions>().0.load(Ordering::SeqCst), 1);
     println!("A-S1: registration control executed the canary once without an application ACL");
 }
