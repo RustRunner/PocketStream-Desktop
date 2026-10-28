@@ -3,6 +3,7 @@
  */
 
 #app {
+  --sidebar-width: 270px;
   display: flex;
   flex-direction: column;
   height: 100vh;
@@ -24,6 +25,26 @@
 
 .app-bar .icon-btn {
   -webkit-app-region: no-drag;
+}
+
+.app-bar .sidebar-toggle {
+  position: absolute;
+  left: 16px;
+  transform: translateX(0);
+  transition: transform var(--md-transition);
+}
+
+#app.sidebar-open .sidebar-toggle {
+  /* Keep the whole button 8px inside the edge, accounting for its 16px start. */
+  transform: translateX(calc(var(--sidebar-width) - 100% - 24px));
+}
+
+.sidebar-toggle svg {
+  transition: transform var(--md-transition);
+}
+
+.sidebar-toggle[aria-expanded="true"] svg {
+  transform: rotate(180deg);
 }
 
 .app-bar-center {
@@ -129,7 +150,7 @@
 /* ── Sidebar ────────────────────────────────────────────────────────── */
 
 .sidebar {
-  width: 270px;
+  width: var(--sidebar-width);
   background: var(--md-surface);
   border-right: 1px solid var(--md-surface-variant);
   overflow-y: auto;
@@ -138,7 +159,13 @@
 }
 
 .sidebar.collapsed {
-  margin-left: -270px;
+  margin-left: calc(-1 * var(--sidebar-width));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sidebar, .app-bar .sidebar-toggle, .sidebar-toggle svg {
+    transition: none;
+  }
 }
 
 .sidebar-content {

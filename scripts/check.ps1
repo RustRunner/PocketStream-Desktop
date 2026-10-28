@@ -59,6 +59,11 @@ Step "npm run typecheck" {
     try { npm.cmd run typecheck } finally { Pop-Location }
 }
 
+Step "Frontend regression tests" {
+    Push-Location $repoRoot
+    try { npm.cmd test } finally { Pop-Location }
+}
+
 # ── Frontend build (mirrors `frontend` job) ────────────────────────
 Step "Frontend and installer source contracts (including IPC allowlist)" {
     Push-Location $repoRoot
@@ -66,6 +71,10 @@ Step "Frontend and installer source contracts (including IPC allowlist)" {
 }
 
 if (-not $Quick) {
+    Step "Browser UI regression checks (Node 22+, Edge/Chrome/Chromium)" {
+        Push-Location $repoRoot
+        try { npm.cmd run check:ui } finally { Pop-Location }
+    }
     Step "Frontend build" {
         Push-Location $repoRoot
         try { npm.cmd run build } finally { Pop-Location }

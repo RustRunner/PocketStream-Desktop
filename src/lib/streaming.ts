@@ -8,7 +8,7 @@ import { $, $$, state, log, showToast, formatUptime } from "./state.ts";
 import type { DeviceTarget } from "./store.ts";
 import * as deviceList from "./device-list.ts";
 import { formatError } from "./errors.ts";
-import { formatRestreamBitrate, formatBindScope, formatFirewallOutcome } from "./restream-format.ts";
+import { formatRestreamBitrate } from "./restream-format.ts";
 import {
   buildRestreamBindOptions,
   buildRestreamBindUpdate,
@@ -946,8 +946,6 @@ export function updateRestreamUI(displayUrl: string | null, status?: Partial<Str
   syncRestreamStartButton();
 
   const statusEl = $("#restream-status");
-  $("#restream-bind-scope").textContent = formatBindScope(status?.bind_scope);
-  $("#restream-firewall-state").textContent = formatFirewallOutcome(status?.firewall);
   const qrBtn = $<HTMLButtonElement>("#btn-show-qr");
   const errorRow = $("#restream-error-row");
   const errorEl = $("#restream-error");
@@ -1059,6 +1057,7 @@ let lastRecordingReport: string | null = null;
 export function startStatusListener(): void {
   api.onEvent<StreamStatus>("stream-status", handleStatus);
   api.onEvent("binding-topology-changed", () => refreshRestreamBindOptions());
+  api.onEvent("adapter-selection-changed", () => refreshRestreamBindOptions());
 }
 
 function handleStatus(status: StreamStatus | null): void {

@@ -232,6 +232,8 @@ pub(crate) struct Clock {
     due: HashMap<String, Instant>,
     candidates: HashMap<(u32, Ipv4Addr, [u8; 6]), std::time::Instant>,
     candidate_turn: bool,
+    busy: HashSet<Ipv4Addr>,
+    foreign_busy: bool,
 }
 
 impl Clock {
@@ -259,7 +261,9 @@ impl Clock {
         });
         let source = |ip| super::select_wired_source(ip, &HashMap::new(), &adapter.ips);
         let eligible = |ip| {
-            !crate::validation::prohibited_camera_ip(ip)
+            !self.busy.contains(&ip)
+                && !(self.foreign_busy && source(ip).is_none())
+                && !crate::validation::prohibited_camera_ip(ip)
                 && !adapter.ips.iter().any(|i| i.address == ip.to_string())
                 && (source(ip).is_some() || snapshot.mode == NetworkMode::StaticAuto)
         };
@@ -311,6 +315,20 @@ impl Clock {
         self.due
             .insert(key.into(), Instant::now() + ACTIVE_INTERVAL);
     }
+
+    pub fn started(&mut self, job: &Job) {
+        self.busy.insert(job.ip);
+        if job.source.is_none() {
+            self.foreign_busy = true;
+        }
+    }
+
+    pub fn finished(&mut self, job: &Job) {
+        self.busy.remove(&job.ip);
+        if job.source.is_none() {
+            self.foreign_busy = false;
+        }
+    }
 }
 
 /// One native call at a time. No timeout drops a running native future;
@@ -344,14 +362,17 @@ pub(crate) async fn verify<I: ProbeIo>(
     };
     let at = Instant::now();
     let wall = chrono::Utc::now().to_rfc3339();
-    if foreign {
-        io.release_scratch(&subnet, source).await;
-    }
-    if io.shutdown() || snapshot.fence.is_stale() {
+    let mac = result
+        .as_deref()
+        .and_then(super::device_registry::canonical_mac);
+    if io.shutdown() || snapshot.fence.is_stale() || mac.is_none() {
+        if foreign {
+            io.release_scratch(&subnet, source).await;
+        }
         return None;
     }
-    let mac = super::device_registry::canonical_mac(&result?)?;
-    if foreign && !io.adopt(&subnet, job.ip, &mac).await {
+    let mac = mac?;
+    if foreign && !io.adopt_prepared(&subnet, job.ip, &mac, source).await {
         return None;
     }
     if io.shutdown() || snapshot.fence.is_stale() || at.elapsed() >= FRESHNESS {
@@ -524,6 +545,57 @@ mod tests {
             assert!(!io.events.iter().any(|e| e.starts_with("bind")));
             assert_eq!(r.snapshot().len(), 2);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_foreign_job_does_not_block_on_link_checks_or_start_duplicate_work() {
+        let control = Control::default();
+        control.update(&selection(7, true), NetworkMode::StaticAuto);
+        let mut snapshot = control.snapshot();
+        let base = known().snapshot()[0].clone();
+        let records: Vec<_> = [
+            "172.31.169.84",
+            "192.168.2.20",
+            "192.168.1.202",
+            "192.168.1.74",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(n, ip)| DeviceRecord {
+            ip: ip.into(),
+            mac: format!("aa:bb:cc:dd:ee:{:02x}", n + 2),
+            ..base.clone()
+        })
+        .collect();
+        let mut clock = Clock::default();
+        let foreign = clock.next(&snapshot, &records, &[]).unwrap();
+        assert!(foreign.source.is_none());
+        clock.started(&foreign);
+        let first = clock.next(&snapshot, &records, &[]).unwrap();
+        assert!(first.source.is_some());
+        clock.started(&first);
+        let second = clock.next(&snapshot, &records, &[]).unwrap();
+        assert!(second.source.is_some());
+        clock.started(&second);
+        assert_ne!(first.ip, second.ip);
+        assert!(clock.next(&snapshot, &records, &[]).is_none());
+        // Address metadata changes do not create duplicates of running jobs.
+        snapshot.revision += 1;
+        assert!(clock.next(&snapshot, &records, &[]).is_none());
+        let mut io = io();
+        io.answers.insert(first.ip, first.key.clone().unwrap());
+        assert!(verify(&mut io, &first, &snapshot).await.is_some());
+        clock.finished(&first);
+        clock.verified(first.key.as_ref().unwrap());
+        assert!(
+            clock.next(&snapshot, &records, &[]).is_none(),
+            "the slow foreign probe is still outstanding"
+        );
+        clock.finished(&foreign);
+        clock.verified(foreign.key.as_ref().unwrap());
+        let next_foreign = clock.next(&snapshot, &records, &[]).unwrap();
+        assert_ne!(foreign.ip, next_foreign.ip);
+        assert!(next_foreign.source.is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -866,18 +938,34 @@ pub(super) struct PresenceDeps {
 }
 pub(super) async fn run_presence_job(
     deps: PresenceDeps,
-    job: Job,
-    snapshot: Snapshot,
+    mut job: Job,
+    mut snapshot: Snapshot,
 ) -> Option<String> {
     let adapter = snapshot.adapter.as_ref()?;
     if snapshot.fence.is_stale() {
         return None;
     }
+    if job.source.is_none() && snapshot.mode == NetworkMode::StaticAuto {
+        let records = deps.owners.registry.snapshot();
+        let observed = deps.session.arp_devices.lock().await;
+        if records.iter().any(|record| {
+            record.ip == job.ip.to_string()
+                && super::adopt_loop::live_broadcast(
+                    record,
+                    observed.get(&record.mac),
+                    &adapter.mac,
+                )
+        }) {
+            // The broadcast loop already owns this device's two-observation
+            // adoption. Do not make it wait behind a duplicate scratch probe.
+            return None;
+        }
+    }
     let address_fence = deps.owners.bindings.address_fence();
     if job.source.is_none() && address_fence.is_stale() {
         return None;
     }
-    let _address = if job.source.is_none() {
+    let mut address_guard = if job.source.is_none() {
         Some(deps.owners.bindings.address_work.lock().await)
     } else {
         None
@@ -885,6 +973,25 @@ pub(super) async fn run_presence_job(
     if snapshot.fence.is_stale() || (job.source.is_none() && address_fence.is_stale()) {
         return None;
     }
+    // Another transaction may have adopted this subnet while we waited.
+    // Refresh native addresses, excluding pending scratch, before deciding
+    // whether this job still needs any host-address work.
+    let (current, index, fence) = deps
+        .owners
+        .selector
+        .probe_scope(&deps.owners.bindings.pending_ips)?;
+    if index != snapshot.index || fence.is_stale() || snapshot.fence.is_stale() {
+        return None;
+    }
+    job.source = super::select_wired_source(job.ip, &HashMap::new(), &current.ips);
+    if job.source.is_none() && address_guard.is_none() {
+        return None;
+    }
+    if job.source.is_some() {
+        drop(address_guard.take());
+    }
+    snapshot.adapter = Some(current);
+    let adapter = snapshot.adapter.as_ref()?;
     if presence_target_is_host(&job, adapter, &interface::local_adapter_macs()) {
         return None;
     }
@@ -930,7 +1037,7 @@ pub(super) async fn run_presence_job(
     log::debug!("event=evidence adapter_mac={} interface_index={} identity={} ip={} evidence_age_ms={} origin=presence",
         log_value(&adapter.mac), snapshot.index, log_value(&proof.mac), proof.ip, proof.at.elapsed().as_millis());
     let mutation_fence = ctx.address_fence.clone();
-    drop(_address);
+    drop(address_guard);
     let cache_deps = deps.clone();
     let fence = snapshot.fence.clone();
     let adapter_mac = adapter.mac.clone();

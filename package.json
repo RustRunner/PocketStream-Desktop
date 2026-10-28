@@ -2,7 +2,7 @@
   "name": "pocketstream-desktop",
   "private": true,
   "license": "GPL-3.0-only",
-  "version": "0.6.7",
+  "version": "0.6.16",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -12,6 +12,8 @@
     "typecheck": "tsc --noEmit",
     "test": "cd tests && node --test",
     "check:dom": "node scripts/check-dom-selectors.mjs",
+    "check:ui": "node scripts/check-ui-layout.mjs",
+    "check:performance": "node scripts/check-discovery-performance.mjs",
     "check:restream": "node scripts/check-restream-card.mjs && node scripts/check-restream-ui.mjs",
     "check:ipc": "node scripts/check-ipc-allowlist.mjs",
     "check:contracts": "npm run check:dom && npm run check:restream && npm run check:ipc && npm run check:installer && npm run check:rust-boundaries",

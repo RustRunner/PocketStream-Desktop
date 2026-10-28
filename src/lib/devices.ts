@@ -11,7 +11,7 @@
  *
  * Concerns that live here (not in the backend):
  *   - The discovery phase spinner machine (UX, not data)
- *   - Settle-debounced scan trigger (UX policy)
+ *   - Per-device scan admission as identities and routes become ready
  *   - The DOM rendering itself
  *   - Role dropdown UI (CAM / PTU / Clear per node)
  */
@@ -135,40 +135,24 @@ function renderPresenceDot(record: DeviceRecord): string {
   return `<span class="device-dot ${color}" title="${escapeHtml(presenceLabel(record))}"></span>`;
 }
 
-// ── Debounced scan trigger ─────────────────────────────────────────
-// Collect all ARP discoveries and subnet adoptions, then scan once
-// after activity settles. This prevents partial renders and flicker.
-
-const SETTLE_MS = 6000; // wait 6s after last ARP/adopt event
-let settleTimer: ReturnType<typeof setTimeout> | null = null;
-
-/** Reset the settle timer — called on every new ARP device or adoption. */
-function debounceScan(): void {
-  if (state.config?.network_mode === "static_manual") return;
-  if (settleTimer) clearTimeout(settleTimer);
-  settleTimer = setTimeout(() => {
-    settleTimer = null;
-    scanAllRoutableDevices();
-  }, SETTLE_MS);
-}
+// ── Per-device scan trigger ─────────────────────────────────────────
+// Adoption publishes a usable address. Start each ready device immediately;
+// other discoveries/adoptions and slow peers must not delay its port results.
+// The backend shares one bounded TCP budget across these independent /32 scans.
 
 /** Scan every device the backend currently knows about that's on a
  *  routable subnet and we haven't scanned this session. */
 function scanAllRoutableDevices(): void {
-  if (state.config?.network_mode === "static_manual") return;
+  if (state.config?.network_mode === "static_manual" || !isInterfaceConnected()) return;
   const toScan: DeviceRecord[] = [];
   for (const record of deviceList.getDevices()) {
-    if (!isIpScanned(record.ip) && hasRouteToSubnet(record.subnet)) {
+    if (record.status === "live" && !isIpScanned(record.ip) && hasRouteToSubnet(record.subnet)) {
       toScan.push(record);
     }
   }
   if (toScan.length === 0) {
-    // Nothing to scan yet — stay in whatever phase we're in (typically
-    // "discovering"). The 6s settle timer fires whenever event traffic
-    // goes quiet for a moment, which during initial adoption can happen
-    // *between* subnet-adopted events, before any routable device has
-    // landed. Hiding the spinner here was the original "Nodes card goes
-    // blank mid-work" gap.
+    // Identities and routes arrive independently. Preserve discovery progress
+    // while waiting for both; the next snapshot/adoption retries admission.
     return;
   }
   log(`Scanning ${toScan.length} routable device(s)...`);
@@ -225,7 +209,7 @@ function clearGraceTimer(): void {
 }
 
 /** Arm the hold-release for the initial flow. When it fires quiet —
- *  no scans in flight, no settle timer pending — the startup flow is
+ *  no scans in flight — the startup flow is
  *  genuinely over and the spinner may complete. A scan cycle running
  *  at expiry re-evaluates on its own completion instead (the grace is
  *  spent by then, so it falls through to idle normally). */
@@ -233,7 +217,7 @@ function armGraceTimer(delay: number): void {
   clearGraceTimer();
   graceTimer = setTimeout(() => {
     graceTimer = null;
-    if (pendingScans > 0 || settleTimer !== null) return;
+    if (pendingScans > 0) return;
     if (discoveryPhase === "discovering") {
       initialFlowComplete = true;
       setDiscoveryPhase("idle");
@@ -285,16 +269,12 @@ function isDiscoveryActive(): boolean {
 
 /** Retire pending discovery progress on link-down or entering Manual. */
 export function hideDiscoveryStatus(): void {
-  if (settleTimer) clearTimeout(settleTimer);
-  settleTimer = null;
   clearGraceTimer();
   setDiscoveryPhase("idle");
 }
 
 export function resetDiscoveryStatus(): void {
   clearScannedIps();
-  if (settleTimer) clearTimeout(settleTimer);
-  settleTimer = null;
   clearGraceTimer();
   // Clear the one-shot lock so a reconnect / user-initiated rescan can
   // legitimately show "Discovery..." again at the start of the fresh
@@ -306,7 +286,7 @@ export function resetDiscoveryStatus(): void {
   setDiscoveryPhase("discovering");
   // Reconnect path: backend preserves device records across disconnect for
   // fast UI recovery, so the backend often doesn't re-fire subnet-adopted
-  // or arp-device-discovered events — which means debounceScan never
+  // or arp-device-discovered events — which means event admission never
   // triggers, scanAllRoutableDevices never runs, and the spinner would
   // stay on "Discovery..." indefinitely. Kick a scan of the already-
   // known devices immediately; if the deviceList is empty (cold start),
@@ -324,19 +304,16 @@ export function setupArpListeners(): void {
 
   // Re-render whenever the backend pushes a new snapshot.
   let scanReadyKeys = new Set<string>();
-  let liveSubnets = new Set<string>();
   deviceList.subscribe((snapshot) => {
-    const nextLive = new Set(snapshot.filter((r) => r.status === "live").map((r) => r.subnet));
-    for (const subnet of sessionAdoptedSubnets) {
-      if (liveSubnets.has(subnet) && !nextLive.has(subnet)) sessionAdoptedSubnets.delete(subnet);
-    }
-    liveSubnets = nextLive;
+    // The auto label describes the host binding, not peer reachability.
+    // A missed presence check must not erase a successful adoption.
     renderSubnetList();
     renderArpDeviceList();
     const ready = snapshot.filter((r) => r.status === "live" && hasRouteToSubnet(r.subnet));
-    const newPeer = ready.some((r) => !scanReadyKeys.has(r.mac) && !isIpScanned(r.ip));
-    scanReadyKeys = new Set(ready.map((r) => r.mac));
-    if (newPeer && state.config?.network_mode !== "static_manual") debounceScan();
+    const scanKey = (r: DeviceRecord) => `${r.mac}/${r.ip}`;
+    const newPeer = ready.some((r) => !scanReadyKeys.has(scanKey(r)) && !isIpScanned(r.ip));
+    scanReadyKeys = new Set(ready.map(scanKey));
+    if (newPeer) scanAllRoutableDevices();
   });
 
   // Only show a spinner when the link is actually up. A stale
@@ -348,8 +325,8 @@ export function setupArpListeners(): void {
     setDiscoveryPhase("idle");
   }
 
-  // Live ARP events still arrive per-device — used purely as a UX
-  // signal to debounce the next scan pass. The actual record state
+  // Live ARP events still arrive per-device — used as a scan trigger.
+  // The actual verified record state
   // is sourced from deviceList; we never mutate anything here.
   api.onEvent<ArpDevicePayload>("arp-device-discovered", (device) => {
     if (!isInterfaceConnected()) return;
@@ -368,7 +345,7 @@ export function setupArpListeners(): void {
       if (discoveryPhase === "idle") {
         setDiscoveryPhase("discovering");
       }
-      debounceScan();
+      scanAllRoutableDevices();
     }
   });
 
@@ -386,7 +363,7 @@ export function setupArpListeners(): void {
     // existing behavior.
     if (graceTimer) {
       clearGraceTimer();
-      if (pendingScans <= 0 && settleTimer === null) {
+      if (pendingScans <= 0) {
         initialFlowComplete = true;
         setDiscoveryPhase("idle");
       }
@@ -411,8 +388,9 @@ export function setupArpListeners(): void {
       row.classList.add("subnet-row-just-adopted");
       setTimeout(() => row.classList.remove("subnet-row-just-adopted"), 2500);
     }
-    // Reset the settle timer — netsh needs time to activate the IP
-    debounceScan();
+    // The backend waits for address/route readiness before publishing adoption.
+    // Scan known peers now while other adoptions keep running.
+    scanAllRoutableDevices();
     refreshNetworkEvent();
   });
 
@@ -479,12 +457,16 @@ async function scanDevicePorts(mac: string, ip: string, attempt = 0): Promise<vo
   markIpScanned(ip);
   if (attempt === 0) pendingScans++;
 
+  const started = Date.now();
+  log(`Port scan started: ${ip} (attempt ${attempt + 1})`);
   try {
     const results = await api.scanNetwork(`${ip}/32`);
     if (isManual()) {
       pendingScans--;
       return;
     }
+    const ports = results?.flatMap(r => r.open_ports) ?? [];
+    log(`Port scan finished: ${ip}; ports=${ports.join(",") || "none"}; elapsed=${Date.now() - started}ms`);
     let found = false;
     if (results) {
       for (const r of results) {
@@ -518,18 +500,14 @@ async function scanDevicePorts(mac: string, ip: string, attempt = 0): Promise<vo
 
   pendingScans--;
   if (pendingScans <= 0) {
-    // All port scans done. If the settle timer is still armed from a
-    // late ARP / adoption event, drop back to "discovering" until it
-    // fires. During the initial flow, an otherwise-quiet completion
+    // All port scans done. During the initial flow, an otherwise-quiet completion
     // holds "discovering" for the remaining grace instead of flashing
     // idle — the backend is typically still hunting foreign subnets,
     // and their adoption should read as one continuous flow. Only a
     // quiet grace expiry (or a post-grace completion like this one)
     // ends the startup spinner.
     const grace = initialGraceRemaining();
-    if (settleTimer !== null) {
-      setDiscoveryPhase("discovering");
-    } else if (grace > 0) {
+    if (grace > 0) {
       setDiscoveryPhase("discovering");
       armGraceTimer(grace);
     } else {
@@ -546,6 +524,9 @@ async function scanDevicePorts(mac: string, ip: string, attempt = 0): Promise<vo
 // While one is open, renders queue behind a flag and flush on close.
 let roleMenuOpen = false;
 let renderPending = false;
+// Keep each visible identity's position and number across address, role and
+// presence updates. Removing other nodes must not renumber the remaining ones.
+const nodeNumbers = new Map<string, number>();
 
 function closeRoleMenu(): void {
   if (!roleMenuOpen) return;
@@ -557,6 +538,16 @@ function closeRoleMenu(): void {
 }
 
 export function renderArpDeviceList(): void {
+  const snapshot = deviceList.getDevices();
+  if (snapshot.length === 0) nodeNumbers.clear();
+  const records = visibleDevices(snapshot);
+  // Hydration or a batched event can contain several new identities. Seed
+  // those by discovery time, then keep later arrivals at the end of the list.
+  records.sort((a, b) => (Date.parse(a.first_seen) || 0) - (Date.parse(b.first_seen) || 0));
+  for (const record of records) {
+    if (!nodeNumbers.has(record.mac)) nodeNumbers.set(record.mac, nodeNumbers.size + 1);
+  }
+  records.sort((a, b) => nodeNumbers.get(a.mac)! - nodeNumbers.get(b.mac)!);
   if (roleMenuOpen) {
     renderPending = true;
     return;
@@ -565,17 +556,7 @@ export function renderArpDeviceList(): void {
 
   // Keep the same history as the manager dialog, including disconnected
   // and zero-port records. The backend owns inactive topology reasons.
-  const bySubnet = new Map<string, DeviceRecord[]>();
-  for (const record of visibleDevices(deviceList.getDevices())) {
-    const bucket = bySubnet.get(record.subnet);
-    if (bucket) {
-      bucket.push(record);
-    } else {
-      bySubnet.set(record.subnet, [record]);
-    }
-  }
-
-  if (bySubnet.size === 0) {
+  if (records.length === 0) {
     // An empty backend snapshot retires old rows even with a scan pending.
     // The header's Discovery spinner carries the "still working"
     // signal — leave the list empty while it's visible. Only show
@@ -586,66 +567,48 @@ export function renderArpDeviceList(): void {
     return;
   }
 
-  let html = "";
-  let nodeIndex = 0;
-  for (const [, records] of bySubnet) {
-    if (records.length === 0) continue;
+  // Keep one continuous list. Subnet grouping would insert a newly found
+  // PTU above an existing camera and make discovery appear out of order.
+  let html = `<div class="subnet-group">`;
+  for (const r of records) {
+    const name = r.alias || `Node ${nodeNumbers.get(r.mac)}`;
+    const ports = r.open_ports;
 
-    html += `<div class="subnet-group">`;
+    const classes = ["device-item"];
+    if (selectedDevice.get()?.key === r.mac) classes.push("selected");
 
-    for (const r of records) {
-      nodeIndex++;
-      const name = r.alias || `Node ${nodeIndex}`;
-      const ports = r.open_ports;
+    const dot = renderPresenceDot(r);
 
-      const classes = ["device-item"];
-      if (selectedDevice.get()?.key === r.mac) classes.push("selected");
+    // Escape backend-sourced strings before they hit innerHTML — same
+    // treatment device-cache.ts gives these fields. escapeHtml quotes
+    // are attribute-safe, so the data-* attributes are covered too.
+    const ipEsc = escapeHtml(r.ip);
+    const portsEsc = escapeHtml(ports.join(", "));
+    const conflict = ipConflicts.forIp(r.ip);
 
-      const dot = renderPresenceDot(r);
-
-      // Escape backend-sourced strings before they hit innerHTML — same
-      // treatment device-cache.ts gives these fields. escapeHtml quotes
-      // are attribute-safe, so the data-* attributes are covered too.
-      const ipEsc = escapeHtml(r.ip);
-      const portsEsc = escapeHtml(ports.join(", "));
-      const conflict = ipConflicts.forIp(r.ip);
-
-      // The node's name doubles as the role dropdown face: a synthetic
-      // first option carries the current display name (selected +
-      // disabled + hidden so it shows on the closed face but never
-      // duplicates CAM/PTU inside the popup), followed by the actions.
-      html += `
-        <div class="${classes.join(" ")}" data-key="${escapeHtml(r.mac)}" data-ip="${ipEsc}">
-          <div class="device-name-row">
-            ${dot}
-            <select class="node-role-select" data-role-key="${escapeHtml(r.mac)}" title="Assign role">
-              <option selected disabled hidden>${escapeHtml(name)}</option>
-              <option value="cam">CAM</option>
-              <option value="ptu">PTU</option>
-              <option value="clear">Clear</option>
-            </select>
-          </div>
-          <div class="device-detail-row">
-            <a class="device-ip${conflict ? " conflicting" : ""}" href="#" data-browse="${ipEsc}" title="${escapeHtml(conflict?.message ?? "Open in browser")}">${ipEsc}</a>
-            <span class="device-ports">${portsEsc}</span>
-          </div>
-          ${conflict ? `<div class="device-ip-conflict" title="${escapeHtml(conflict.message)}">${conflict.retainedAdapters?.length ? "IP still reserved by PC" : "IP conflict with PC"}: ${escapeHtml(conflict.adapters.join(", "))}</div>` : ""}
-        </div>`;
-    }
-
-    html += `</div>`;
+    // The node's name doubles as the role dropdown face: a synthetic
+    // first option carries the current display name (selected +
+    // disabled + hidden so it shows on the closed face but never
+    // duplicates CAM/PTU inside the popup), followed by the actions.
+    html += `
+      <div class="${classes.join(" ")}" data-key="${escapeHtml(r.mac)}" data-ip="${ipEsc}">
+        <div class="device-name-row">
+          ${dot}
+          <select class="node-role-select" data-role-key="${escapeHtml(r.mac)}" title="Assign role">
+            <option selected disabled hidden>${escapeHtml(name)}</option>
+            <option value="cam">CAM</option>
+            <option value="ptu">PTU</option>
+            <option value="clear">Clear</option>
+          </select>
+        </div>
+        <div class="device-detail-row">
+          <a class="device-ip${conflict ? " conflicting" : ""}" href="#" data-browse="${ipEsc}" title="${escapeHtml(conflict?.message ?? "Open in browser")}">${ipEsc}</a>
+          <span class="device-ports">${portsEsc}</span>
+        </div>
+        ${conflict ? `<div class="device-ip-conflict" title="${escapeHtml(conflict.message)}">${conflict.retainedAdapters?.length ? "IP still reserved by PC" : "IP conflict with PC"}: ${escapeHtml(conflict.adapters.join(", "))}</div>` : ""}
+      </div>`;
   }
-
-  if (!html) {
-    // Keep the list empty while either ARP discovery is still running
-    // (no devices yet, but they may show up) OR a port scan is still
-    // in flight and no records have arrived yet.
-    // Only show "No devices found." once both have settled.
-    if (pendingScans > 0 || isDiscoveryActive()) return;
-    list.innerHTML = '<p class="placeholder-text">No devices found.</p>';
-    return;
-  }
-
+  html += `</div>`;
   list.innerHTML = html;
 
   // Wire up event handlers

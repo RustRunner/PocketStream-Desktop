@@ -63,7 +63,7 @@ function fixture({initialSelection=true}={}) {
   };
   const exports={};
   vm.runInNewContext(compiled,{exports,require:name=>{assert(name in deps,name);return deps[name];},document:{
-    querySelectorAll(){return [...elements.values()].filter(e=>['#static-iface','#btn-add-sec-ip','#static-ip','#static-mask','#static-gateway','#primary-existing-ip','#btn-remove-primary-ip','#add-sec-ip','#add-sec-mask','#ip-mode-dhcp','#ip-mode-static-auto','#ip-mode-static-manual','#reset-adapter-confirm'].includes(e.id)).concat($('#subnet-list').buttons,$('#secondary-ip-list').buttons);}
+    querySelectorAll(){return [...elements.values()].filter(e=>['#static-iface','#btn-add-sec-ip','#static-ip','#static-mask','#static-gateway','#primary-existing-ip','#add-sec-ip','#add-sec-mask','#ip-mode-dhcp','#ip-mode-static-auto','#ip-mode-static-manual','#reset-adapter-confirm'].includes(e.id)).concat($('#subnet-list').buttons,$('#secondary-ip-list').buttons);}
   },window:ui,performance:{now:()=>++now},
     setTimeout(fn,ms){timers.push({fn,ms});return timers.length;},clearTimeout(id){timers[id-1]=null;}});
   exports.setupIpConfigDialog();exports.setupInterfaceWatcher();if(initialSelection)events.get('adapter-selection-changed')(selection);
@@ -79,6 +79,30 @@ function fixture({initialSelection=true}={}) {
     setSelection(next){events.get('adapter-selection-changed')(next);},
   };
 }
+
+test('An adoption event retires an older host snapshot before it can erase the auto label',async()=>{
+  const f=fixture();await flush();
+  const old=deferred();let count=0;
+  f.api.getAdoptionState=()=>++count===1?old.promise:Promise.resolve({adopted_subnets:{[SUBNET]:IP},meta:{[SUBNET]:f.adoptionMeta.get(SUBNET)}});
+  const refresh=f.exports.refreshInterfaces();
+  f.exports.sessionAdoptedSubnets.add(SUBNET);
+  f.exports.refreshNetworkEvent();await flush();
+  old.resolve({adopted_subnets:{},meta:{}});await refresh;await flush();
+  assert(f.adoptionMeta.has(SUBNET));
+  assert(f.exports.sessionAdoptedSubnets.has(SUBNET));
+  assert(f.$('#subnet-list').innerHTML.includes('badge-auto'));
+  assert.equal(count,2,'one fresh trailing snapshot replaces the stale one');
+});
+
+test('Pending binding observation hides the label without forgetting its adoption',async()=>{
+  const f=fixture();await flush();
+  f.exports.sessionAdoptedSubnets.add(SUBNET);
+  f.adoptionMeta.get(SUBNET).applied=false;await f.exports.refreshInterfaces();
+  assert(!f.$('#subnet-list').innerHTML.includes('badge-auto'));
+  assert(f.exports.sessionAdoptedSubnets.has(SUBNET));
+  f.adoptionMeta.get(SUBNET).applied=true;await f.exports.refreshInterfaces();
+  assert(f.$('#subnet-list').innerHTML.includes('badge-auto'));
+});
 
 test('IP Configuration has one Close action and no Cancel or Apply action',()=>{
   const html=fs.readFileSync(path.join(__dirname,'../index.html'),'utf8');
@@ -96,16 +120,15 @@ test('Host card has no delete control while Configure retains exact-address Remo
 
 async function removalFixture(kind) {
   const f=fixture();
-  if(kind==='primary')f.state.config.primary_addresses={[MAC]:'192.0.2.10/24'};
   if(kind==='unmanaged')f.iface.ips.push({address:'198.51.100.10',prefix:24,subnet:'198.51.100.0/24'});
   await f.$('#btn-ip-config').fire('click');
-  f.button=kind==='primary'?f.$('#btn-remove-primary-ip'):f.$('#secondary-ip-list').buttons.find(b=>
+  f.button=f.$('#secondary-ip-list').buttons.find(b=>
     kind==='saved'?b.dataset.removeBinding===SUBNET:b.dataset.removeIp==='198.51.100.10');
   assert(f.button);
   return f;
 }
 
-for(const kind of ['primary','unmanaged','saved'])for(const outcome of ['accept','cancel','error'])
+for(const kind of ['unmanaged','saved'])for(const outcome of ['accept','cancel','error'])
 test(`${kind} removal waits for the asynchronous confirmation ${outcome}`,async()=>{
   const f=await removalFixture(kind),confirmation=deferred();let prompts=0;
   f.ui.confirm=()=>{prompts++;return confirmation.promise;};
@@ -209,19 +232,15 @@ test('Legacy ambiguous primary can be chosen explicitly without erasing the new 
   assert.equal(f.transitions[0].previous_address,'192.0.2.10/24');
 });
 
-test('Primary Remove uses the same verified reply, clears its role and does not promote a secondary',async()=>{
+test('Primary stays editable without a removal control and is excluded from secondary removal',async()=>{
   const f=fixture();f.state.config.primary_addresses={[MAC]:'192.0.2.10/24'};
-  await f.$('#btn-ip-config').fire('click');const before={...f.calls};
-  const remove=f.$('#btn-remove-primary-ip').fire('click');await flush();assert.equal(f.calls.writes,1);
-  assert.equal(f.$('#btn-remove-primary-ip').disabled,true);assert.equal(f.$('#primary-existing-ip').disabled,true);
-  assert.deepEqual(f.removals,[{name:'Ethernet',ip:'192.0.2.10',primary:true}]);
-  const reply=f.reply();reply.view.address='192.0.2.10';reply.view.subnet=null;reply.view.binding=null;
-  reply.view.primary_address='';reply.view.selection={...f.selection,adapter:{...f.iface,ips:[f.iface.ips[1]]},candidates:[{...f.iface,ips:[f.iface.ips[1]]}]};
-  f.pending[0].resolve(reply);await remove;
-  assert.equal(f.$('#static-ip').value,'');assert.equal(f.$('#btn-remove-primary-ip').style.display,'none');
+  await f.$('#btn-ip-config').fire('click');
+  assert(!fs.readFileSync(path.join(__dirname,'../index.html'),'utf8').includes('btn-remove-primary-ip'));
+  assert.equal(f.$('#static-ip').value,'192.0.2.10');assert.equal(f.$('#static-ip').disabled,false);
+  assert(!f.$('#secondary-ip-list').innerHTML.includes('192.0.2.10'));
   assert(f.$('#secondary-ip-list').innerHTML.includes(IP));
-  for(const key of ['selection','bindings','mode','dhcp'])assert.equal(f.calls[key],before[key]);
   await f.$('#ip-config-close').fire('click');assert.equal(f.transitions.length,0);
+  assert.equal(f.calls.writes,0);assert.equal(f.removals.length,0);
 });
 
 test('Fresh adoption shows the green auto badge; restored, pending and ended attachments stay plain',async()=>{
@@ -236,6 +255,35 @@ test('Fresh adoption shows the green auto badge; restored, pending and ended att
   f.exports.sessionAdoptedSubnets.clear();f.exports.renderSubnetList();
   assert(!f.$('#subnet-list').innerHTML.includes('badge-auto'),'attachment badge expires');
   assert(f.$('#subnet-list').innerHTML.includes(IP),'saved address remains visible');
+});
+
+test('Host keeps the primary first and appends new adoptions despite Windows reordering addresses',()=>{
+  const f=fixture();f.state.config.primary_addresses={[MAC]:'192.0.2.10/24'};
+  const visible=()=>[...f.$('#subnet-list').innerHTML.matchAll(/<span class="status-value">([^<]+)<\/span>/g)].map(m=>m[1]);
+  f.exports.renderSubnetList();
+  const camera={address:'172.31.169.100',prefix:24,subnet:'172.31.169.0/24'};
+  f.state.activeInterface={...f.iface,ips:[camera,...f.iface.ips.slice().reverse()]};
+  f.exports.renderSubnetList();
+  assert.deepEqual(visible(),['192.0.2.10/24','192.0.2.20/24','172.31.169.100/24']);
+  f.adoptionMeta.set(camera.subnet,{adapter_mac:MAC,address:camera.address,prefix:24,desired:'present',applied:true,adopted_at:'2026-10-27T19:02:43Z'});
+  f.exports.sessionAdoptedSubnets.add(camera.subnet);f.exports.renderSubnetList();
+  assert.deepEqual(visible(),['192.0.2.10/24','192.0.2.20/24','172.31.169.100/24'],'late metadata does not reshuffle the rows');
+  assert(f.$('#subnet-list').innerHTML.includes('badge-auto'));
+  assert.equal(f.calls.writes,0);
+});
+
+test('A removed and later re-adopted Host address appends after addresses that remained visible',()=>{
+  const f=fixture();f.state.config.primary_addresses={[MAC]:'192.0.2.10/24'};
+  const camera={address:'172.31.169.100',prefix:24,subnet:'172.31.169.0/24'};
+  f.exports.renderSubnetList();
+  f.state.activeInterface={...f.iface,ips:[...f.iface.ips,camera]};f.exports.renderSubnetList();
+  f.state.activeInterface.ips=f.state.activeInterface.ips.filter(ip=>ip.address!==IP);
+  Object.assign(f.adoptionMeta.get(SUBNET),{desired:'removed',applied:false,last_error:null});f.exports.renderSubnetList();
+  f.state.activeInterface.ips.push(f.iface.ips[1]);
+  Object.assign(f.adoptionMeta.get(SUBNET),{desired:'present',applied:true});f.exports.renderSubnetList();
+  const html=f.$('#subnet-list').innerHTML;
+  assert(html.indexOf('192.0.2.10/24')<html.indexOf('172.31.169.100/24'));
+  assert(html.indexOf('172.31.169.100/24')<html.indexOf('192.0.2.20/24'));
 });
 
 test('Completed removed history stays hidden before and after Ethernet link-up without hiding real 172 addresses',async()=>{

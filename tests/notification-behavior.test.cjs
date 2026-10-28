@@ -27,6 +27,7 @@ function fixture() {
     get textContent() { return (this._text || '') + (this.children || []).map(c => c.textContent).join(''); }
     set textContent(value) { this._text=String(value);this.children=[]; }
     setAttribute(name,value) { this.attributes ??= {};this.attributes[name]=value; }
+    getBoundingClientRect() { return this.bounds ?? { top: 0, height: 0 }; }
     append(...children) { children.forEach(c => this.appendChild(c)); }
     remove() { if (this.parent) this.parent.children = this.parent.children.filter(c => c !== this); }
     addEventListener(name, callback) { this.listeners[name] = callback; }
@@ -56,10 +57,11 @@ function fixture() {
     onEvent: async (name, callback) => { events.set(name, callback); return () => {}; },
     setVideoVisible: async value => { visibility.push(value); },
     retryPlayback: async () => {}, getCaptureState: async () => null,
+    listBindInterfaces: async () => [],
     takeScreenshot: async () => "C:\\Pictures\\PocketStream\\capture.jpg",
     startRecording: async () => {}, stopRecording: async () => "C:\\Videos\\PocketStream\\recording.mp4",
   };
-  const globals = { document, console: { log() {}, warn() {} }, Date: class extends Date { static now() { return now; } },
+  const globals = { document, window: { innerHeight: 1000 }, console: { log() {}, warn() {} }, Date: class extends Date { static now() { return now; } },
     setTimeout: fn => { timers.push(fn); return timers.length; }, clearTimeout() {} };
   function load(text, deps = {}, extra = {}) {
     const exports = {};
@@ -110,6 +112,54 @@ test("Screenshot and recording buttons show the saved file paths", async () => {
   assert.equal(f.toast().textContent, "Recording started");
   f.advance(1000); await f.$("#btn-record").fire("click");
   assert.equal(f.toast().textContent, "Recording saved: C:\\Videos\\PocketStream\\recording.mp4");
+});
+
+test("Screenshot and recording can be pressed again while their previous toast is visible", async () => {
+  const f = fixture(); let shots = 0, starts = 0, stops = 0;
+  f.api.takeScreenshot = async () => `shot-${++shots}.jpg`;
+  f.api.startRecording = async () => { starts++; };
+  f.api.stopRecording = async () => { stops++; return 'recording.mp4'; };
+  f.streaming.setupStreamControls();
+  await f.$('#btn-screenshot').fire('click');
+  const first = f.toast();
+  assert.match(first.style.cssText, /pointer-events:\s*none/);
+  await f.$('#btn-screenshot').fire('click');
+  assert.equal(shots, 2); assert.notEqual(f.toast(), first);
+  await f.$('#btn-record').fire('click');
+  f.advance(1000); await f.$('#btn-record').fire('click');
+  f.advance(1000); await f.$('#btn-record').fire('click');
+  assert.equal(starts, 2); assert.equal(stops, 1);
+  assert.equal(f.toast().textContent, 'Recording started');
+});
+
+test("Transient notices clear both controls and the native video without stealing clicks", () => {
+  const f = fixture();
+  f.shared.showToast('Settings saved');
+  assert.match(f.toast().style.cssText, /bottom:\s*80px/);
+  f.shared.state.isStreaming = true;
+  f.$('#video-area').bounds = { top: 400, height: 500 };
+  f.shared.showToast('Recording started');
+  assert.match(f.toast().style.cssText, /bottom:\s*612px/);
+  assert.match(f.toast().style.cssText, /pointer-events:\s*none/);
+});
+
+test("Changing the camera adapter retires an older re-stream interface enumeration", async () => {
+  const f = fixture(), requests = [];
+  f.shared.state.config = { restream_protocol: 'rtsp',
+    rtsp_server: { bind_interface: 'Wi-Fi', bind_interface_id: 'wifi' },
+    srt_server: { bind_interface: '', bind_interface_id: null } };
+  f.api.listBindInterfaces = () => new Promise(resolve => requests.push(resolve));
+  f.streaming.startStatusListener();
+  f.events.get('binding-topology-changed')();
+  f.events.get('adapter-selection-changed')();
+  assert.equal(requests.length, 2);
+  requests[1]([{ id: 'wifi', alias: 'Wi-Fi', kind: 'wifi', address: '192.0.2.2' }]);
+  await flush();
+  requests[0]([{ id: 'camera', alias: 'Ethernet', kind: 'ethernet', address: '192.168.0.100' }]);
+  await flush();
+  const select = f.$('#restream-bind-interface');
+  assert.deepEqual(select.children.map(option => option.value), ['', 'wifi']);
+  assert.equal(select.value, 'wifi'); assert.equal(select.disabled, false);
 });
 
 test("Update toast keeps Install and survives routine and error notifications", async () => {
@@ -288,6 +338,16 @@ async function nodeRemovalFixture(kind) {
   };
 }
 
+test("Nodes title leaves the modal closed while Configure still opens it", async () => {
+  const t = await nodeRemovalFixture('cached');
+  const dialog = t.f.$('#cache-dialog'); dialog.open = false;
+  await t.f.$('#nodes-title').fire('click');
+  assert.equal(dialog.open, false);
+  await t.f.$('#btn-nodes-config').fire('click');
+  assert.equal(dialog.open, true);
+  t.finish(); await t.scan;
+});
+
 for (const kind of ["cached", "manual", "all"]) {
   test(`Nodes ${kind} removal clears the card immediately while the last port scan is pending`, async () => {
     const t = await nodeRemovalFixture(kind); await t.remove();
@@ -331,9 +391,9 @@ for (const result of ["ports", "empty", "error"]) {
     const history = JSON.stringify(mirror.getDevices());
     const scan = devices.scanForTest(record.mac, record.ip);
     f.events.get("arp-device-discovered")({ ip: "192.168.1.205", mac: "40:cd:3a:03:8f:40" });
-    assert.equal(scans.length, 1); assert(timers.size > 0, "settle work is pending before mode change");
+    assert.equal(scans.length, 1, "new ARP activity cannot duplicate the running scan");
     f.shared.state.config.network_mode = "static_manual"; devices.hideDiscoveryStatus();
-    assert.equal(timers.size, 0, "Manual discards the old settle/grace work");
+    assert.equal(timers.size, 0, "Manual discards the old progress work");
     f.events.get("arp-device-discovered")({ ip: "192.168.1.205", mac: "40:cd:3a:03:8f:40" });
     if (result === "ports") devices.resetDiscoveryStatus(); // Queued NIC reconnect in Manual.
     if (result === "error") scans[0].reject(Error("prior scan cancelled by transition"));
@@ -352,6 +412,129 @@ for (const result of ["ports", "empty", "error"]) {
     assert.equal(JSON.stringify(mirror.getDevices()), history);
   });
 }
+
+async function progressiveScanFixture() {
+  const f = fixture(), scans = [], timers = new Map();
+  let timerId = 0;
+  f.shared.state.config = { network_mode: "static_auto" };
+  f.shared.state.activeInterface = { name: "Ethernet", mac: "00:22:20:3a:e3:b3", is_up: true,
+    ips: [{ address: "192.168.0.100", prefix: 24, subnet: "192.168.0.0/24" }] };
+  f.api.getDeviceList = async () => [];
+  f.api.scanNetwork = cidr => new Promise(resolve => scans.push({ cidr, resolve }));
+  f.deps["./store.ts"] = f.load(source("src/lib/store.ts"));
+  f.deps["./device-state.ts"] = f.load(source("src/lib/device-state.ts"), f.deps);
+  const mirror = f.load(source("src/lib/device-list.ts"), f.deps);
+  f.deps["./device-list.ts"] = mirror;
+  f.deps["./network.ts"] = { ...f.network, refreshNetworkEvent() {} };
+  f.$("#device-list").querySelectorAll = () => [];
+  const devices = f.load(source("src/lib/devices.ts"), f.deps, {
+    setTimeout(fn, ms) { timers.set(++timerId, { fn, ms }); return timerId; },
+    clearTimeout(id) { timers.delete(id); },
+  });
+  devices.setupArpListeners(); await mirror.start();
+  return { f, scans, timers, devices,
+    publish: records => f.events.get("device-list-changed")(records),
+    adopt: (subnet, adopted_ip) => f.events.get("subnet-adopted")({ subnet, adopted_ip,
+      restored: false, adapter_mac: f.shared.state.activeInterface.mac }),
+    finish: async () => { scans.forEach(s => s.resolve([{ reachable: true, open_ports: [80, 554] }])); await flush(); },
+  };
+}
+
+const scanPeer = (ip, mac, status = "live") => ({ mac, ip,
+  subnet: ip.split(".").slice(0, 3).join(".") + ".0/24", status,
+  alias: "", open_ports: [], first_seen: "before", last_seen: "now",
+});
+
+test("Discovery rows and node numbers survive subnet sorting, late peers and IP changes", async () => {
+  const t = await progressiveScanFixture();
+  const first = { ...scanPeer('192.168.1.74', '08:df:ec:22:01:77'), first_seen: '2026-10-27T19:01:59Z' };
+  const camera = { ...scanPeer('172.31.169.84', '40:cd:3a:03:28:e2'), first_seen: '2026-10-27T19:02:13Z' };
+  const ptu = { ...scanPeer('192.168.1.202', 'fc:68:3e:22:05:28'), first_seen: '2026-10-27T19:02:31Z' };
+  const rows = () => [...t.f.$('#device-list').innerHTML.matchAll(/data-key="([^"]+)" data-ip="([^"]+)"[\s\S]*?<option selected disabled hidden>([^<]+)<\/option>/g)].map(m => [m[1], m[2], m[3]]);
+  t.publish([first]);
+  t.publish([camera, first]);
+  t.publish([camera, first, ptu]);
+  assert.deepEqual(rows(), [[first.mac, first.ip, 'Node 1'], [camera.mac, camera.ip, 'Node 2'], [ptu.mac, ptu.ip, 'Node 3']]);
+  t.publish([{ ...ptu, status: 'offline' }, { ...camera, ip: '172.31.169.85', open_ports: [554] }]);
+  assert.deepEqual(rows(), [[camera.mac, '172.31.169.85', 'Node 2'], [ptu.mac, ptu.ip, 'Node 3']]);
+  t.publish([ptu, camera, first]);
+  assert.equal(rows()[0][0], first.mac);
+  t.publish([]); t.publish([ptu]);
+  assert.equal(rows()[0][2], 'Node 1', 'clearing all history starts fresh numbering');
+  await t.finish();
+});
+
+test("An initial device batch uses discovery timestamps rather than backend IP order", async () => {
+  const t = await progressiveScanFixture();
+  const first = { ...scanPeer('192.168.1.74', '08:df:ec:22:01:77'), first_seen: '2026-10-27T19:01:59Z' };
+  const camera = { ...scanPeer('172.31.169.84', '40:cd:3a:03:28:e2'), first_seen: '2026-10-27T19:02:13Z' };
+  t.publish([camera, first]);
+  const html = t.f.$('#device-list').innerHTML;
+  assert(html.indexOf(first.ip) < html.indexOf(camera.ip));
+  await t.finish();
+});
+
+test("Auto adoption label survives a peer expiring and returning, until the binding is removed", async () => {
+  const t = await progressiveScanFixture();
+  const ptu = scanPeer("192.168.1.202", "fc:68:3e:22:05:28");
+  t.publish([ptu]); t.adopt(ptu.subnet, "192.168.1.100");
+  const labels = t.f.network.sessionAdoptedSubnets;
+  assert(labels.has(ptu.subnet));
+  t.publish([{ ...ptu, status: "offline" }]);
+  assert(labels.has(ptu.subnet), "peer presence does not own the host binding label");
+  t.publish([ptu]); assert(labels.has(ptu.subnet));
+  t.f.events.get("subnet-removed")({ subnet: ptu.subnet, adopted_ip: "192.168.1.100", reason: "manual" });
+  assert(!labels.has(ptu.subnet));
+  await t.finish();
+});
+
+test("Each adopted subnet scans immediately while another adoption or device scan is unfinished", async () => {
+  const t = await progressiveScanFixture();
+  const camera = scanPeer("172.31.169.84", "40:cd:3a:03:28:e2");
+  const ptu = scanPeer("192.168.1.202", "fc:68:3e:22:05:28");
+  t.publish([camera, ptu]); assert.equal(t.scans.length, 0, "foreign IPs wait for a route");
+  t.adopt(camera.subnet, "172.31.169.100");
+  assert.deepEqual(t.scans.map(s => s.cidr), ["172.31.169.84/32"], "no settle timer must expire");
+  t.f.events.get("arp-device-discovered")({ ip: "10.9.1.20", mac: "aa:bb:cc:dd:ee:04" });
+  t.publish([camera, ptu]);
+  assert.equal(t.scans.length, 1, "unrelated activity cannot restart or delay this scan");
+  t.adopt(ptu.subnet, "192.168.1.100");
+  assert.deepEqual(t.scans.map(s => s.cidr), ["172.31.169.84/32", "192.168.1.202/32"], "second scan starts before the first replies");
+  await t.finish();
+});
+
+test("A route arriving before identity verification starts the scan on the first live snapshot", async () => {
+  const t = await progressiveScanFixture();
+  const camera = scanPeer("172.31.169.84", "40:cd:3a:03:28:e2", "cached_only");
+  t.publish([camera]); t.adopt(camera.subnet, "172.31.169.100");
+  assert.equal(t.scans.length, 0, "cached history is not a verified scan target");
+  t.publish([{ ...camera, status: "live" }]);
+  assert.equal(t.scans.length, 1);
+  t.publish([{ ...camera, status: "live", open_ports: [554] }]);
+  assert.equal(t.scans.length, 1, "capability and repeated presence snapshots are deduplicated");
+  await t.finish();
+});
+
+test("A new IP for the same live identity scans immediately on its existing subnet", async () => {
+  const t = await progressiveScanFixture();
+  const camera = scanPeer("192.168.0.50", "40:cd:3a:03:28:e2");
+  t.publish([camera]);
+  t.publish([{ ...camera, ip: "192.168.0.51" }]);
+  assert.deepEqual(t.scans.map(s => s.cidr), ["192.168.0.50/32", "192.168.0.51/32"]);
+  await t.finish();
+});
+
+test("A device joining a ready subnet scans without waiting for unrelated ARP traffic", async () => {
+  const t = await progressiveScanFixture();
+  const first = scanPeer("192.168.0.50", "40:cd:3a:03:28:e2");
+  const second = scanPeer("192.168.0.51", "fc:68:3e:22:05:28");
+  t.publish([first]);
+  t.f.events.get("arp-device-discovered")({ ip: second.ip, mac: second.mac });
+  t.publish([first, second]);
+  assert.deepEqual(t.scans.map(s => s.cidr), ["192.168.0.50/32", "192.168.0.51/32"]);
+  assert(![...t.timers.values()].some(timer => timer.ms === 6000), "no global discovery settle delay remains");
+  await t.finish();
+});
 
 async function cameraRoleFixture({ alias = "", persisted = false, protocol = "rtsp" } = {}) {
   const f = fixture(), calls = [], key = "40:cd:3a:03:8f:3f";

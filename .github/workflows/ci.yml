@@ -31,6 +31,27 @@ jobs:
         run: npm test
       - run: npm run build
 
+  ui:
+    name: Browser UI Regressions
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check:ui
+      - name: Preserve layout evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-layout
+          path: |
+            src-tauri/target/ui-layout/result.json
+            src-tauri/target/ui-layout/*.png
+            src-tauri/target/ui-layout/browser.log
+
   rust:
     name: Rust Checks (Linux)
     runs-on: ubuntu-latest

@@ -131,11 +131,22 @@ export function showToast(message: string, isError = false): void {
   const toast = document.createElement("div");
   toast.className = `toast ${isError ? "toast-error" : ""}`;
   toast.textContent = message;
+  // Clear the playback controls. A native video child paints above the
+  // WebView, so live-playback notices must also sit above its top edge.
+  let bottom = 80;
+  const video = document.querySelector<HTMLElement>("#video-area");
+  if (state.isStreaming && video) {
+    const bounds = video.getBoundingClientRect();
+    if (bounds.height > 0) bottom = Math.max(bottom, window.innerHeight - bounds.top + 12);
+  }
   toast.style.cssText = `
     position: fixed;
-    bottom: 24px;
+    bottom: ${bottom}px;
     left: 50%;
     transform: translateX(-50%);
+    pointer-events: none;
+    max-width: calc(100vw - 48px);
+    overflow-wrap: anywhere;
     background: ${isError ? "var(--md-error)" : "var(--md-surface-variant)"};
     color: ${isError ? "var(--md-on-error)" : "var(--md-on-surface)"};
     padding: 12px 24px;

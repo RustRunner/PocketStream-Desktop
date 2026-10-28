@@ -79,8 +79,9 @@ pub async fn select_adapter(
 pub async fn list_bind_interfaces(
     config: State<'_, std::sync::Arc<AppConfig>>,
 ) -> Result<Vec<crate::network::bindings::BindInterface>, AppError> {
-    let adopted = config.get().adopted_subnets.into_values().collect();
-    crate::network::bindings::list(&adopted).await
+    let settings = config.get();
+    let adopted = settings.adopted_subnets.into_values().collect();
+    crate::network::bindings::list(&adopted, settings.selected_adapter_mac.as_deref()).await
 }
 
 #[tauri::command]

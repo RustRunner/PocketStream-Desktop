@@ -114,6 +114,22 @@ pub(crate) trait ProbeIo {
     /// scratch is already released when this is called. `false` = stop
     /// the whole pass (a shutdown raced the adoption).
     async fn adopt(&mut self, subnet: &str, ip: Ipv4Addr, mac: &str) -> bool;
+    /// Hand over an owned scratch with verified identity. Implementations may
+    /// reuse it for conflict checks; all paths must release or retain durable
+    /// cleanup ownership. The default preserves release-before-adopt behavior.
+    async fn adopt_prepared(
+        &mut self,
+        subnet: &str,
+        ip: Ipv4Addr,
+        mac: &str,
+        scratch: Ipv4Addr,
+    ) -> bool {
+        self.release_scratch(subnet, scratch).await;
+        if self.shutdown() {
+            return false;
+        }
+        self.adopt(subnet, ip, mac).await
+    }
     /// Whether a discovery stop has been signalled.
     fn shutdown(&self) -> bool;
 }
@@ -146,9 +162,9 @@ pub(crate) const FAST_ADOPT_PROBE_BUDGET: Duration = Duration::from_secs(20);
 
 /// Run one probe pass over the candidate set. Per subnet: one scratch
 /// bind, each cached pair resolved in order, first fresh MAC match wins
-/// (remaining pairs skipped), and the scratch is always released before
-/// the adoption hand-off — the adoption's own scratch/conflict cycle
-/// must never see the identity scratch as a native address.
+/// (remaining pairs skipped). A match hands the owned scratch to adoption
+/// for reuse; misses release it. Only that exact owned address can be
+/// exempted from adoption's existing-native-address check.
 ///
 /// The budget and the shutdown signal are checked before every subnet
 /// and between every pair; expiry releases any bound scratch and records
@@ -206,13 +222,19 @@ pub(crate) async fn run_pass<I: ProbeIo>(
                 Ok(Some(_)) | Ok(None) | Err(()) => {}
             }
         }
-        io.release_scratch(&candidate.subnet, scratch).await;
-        if io.shutdown() {
-            break;
-        }
         if let Some((ip, mac)) = matched {
-            report.handed_off.push(candidate.subnet.clone());
-            if !io.adopt(&candidate.subnet, ip, &mac).await {
+            let keep_running = io
+                .adopt_prepared(&candidate.subnet, ip, &mac, scratch)
+                .await;
+            if !io.shutdown() {
+                report.handed_off.push(candidate.subnet.clone());
+            }
+            if !keep_running || io.shutdown() {
+                break;
+            }
+        } else {
+            io.release_scratch(&candidate.subnet, scratch).await;
+            if io.shutdown() {
                 break;
             }
         }

@@ -20,6 +20,22 @@ const ADOPTION_SETTLE: std::time::Duration = std::time::Duration::from_millis(30
 /// tail and the reap pass's failure backoff.
 const COOLDOWN_INITIAL: std::time::Duration = std::time::Duration::from_secs(60);
 const COOLDOWN_MAX: std::time::Duration = std::time::Duration::from_secs(600);
+const READINESS_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn adoption_retry_delay(
+    error: &AppError,
+    cleanup_complete: bool,
+    previous: Option<std::time::Duration>,
+) -> std::time::Duration {
+    let initial = if cleanup_complete && matches!(error, AppError::AddressNotReady(_)) {
+        READINESS_RETRY_INITIAL
+    } else {
+        COOLDOWN_INITIAL
+    };
+    previous
+        .map(|delay| (delay * 2).max(initial).min(COOLDOWN_MAX))
+        .unwrap_or(initial)
+}
 
 /// RAII gate around a single adoption. On creation it emits
 /// `adoption-started`; on drop — normal completion OR a dropped/aborted
@@ -147,6 +163,71 @@ enum AdoptionAttemptOutcome {
     ShutdownRace,
 }
 
+/// Only a current, selected-interface broadcast can defer an identity probe.
+/// Cached history or a presence reply without a matching broadcast cannot.
+pub(super) fn live_broadcast(
+    record: &DeviceRecord,
+    observed: Option<&ArpDevice>,
+    adapter_mac: &str,
+) -> bool {
+    record.status == DeviceStatus::Live
+        && record
+            .verified_by_mac
+            .as_ref()
+            .is_some_and(|mac| mac.eq_ignore_ascii_case(adapter_mac))
+        && observed.is_some_and(|frame| {
+            frame.mac.eq_ignore_ascii_case(&record.mac)
+                && frame.ip == record.ip
+                && frame.last_seen == record.last_seen
+        })
+}
+
+async fn broadcast_work_pending(
+    ctx: &AdoptionCtx,
+    known: &HashSet<String>,
+    cooldowns: &HashMap<String, (std::time::Instant, std::time::Duration)>,
+) -> bool {
+    let Some((adapter, _, _)) = ctx.sweep.selector.probe_scope(&ctx.pending_ips) else {
+        return false;
+    };
+    let records = ctx.registry.snapshot();
+    let observed = ctx.devices.lock().await;
+    // A saved binding still awaiting restore/removal cannot enter adoption.
+    // It must not indefinitely keep unrelated quiet cache work deferred.
+    let mut unavailable = known.clone();
+    unavailable.extend(
+        ctx.config
+            .get()
+            .adopted_meta
+            .into_iter()
+            .filter(|(_, row)| !row.removal_complete())
+            .map(|(subnet, _)| subnet),
+    );
+    broadcast_work_pending_in(&records, &observed, &adapter, &unavailable, cooldowns)
+}
+
+fn broadcast_work_pending_in(
+    records: &[DeviceRecord],
+    observed: &HashMap<String, ArpDevice>,
+    adapter: &InterfaceInfo,
+    known: &HashSet<String>,
+    cooldowns: &HashMap<String, (std::time::Instant, std::time::Duration)>,
+) -> bool {
+    records.iter().any(|record| {
+        let Ok(ip) = record.ip.parse::<Ipv4Addr>() else {
+            return false;
+        };
+        let subnet = subnet_key_for(ip);
+        !crate::validation::prohibited_camera_ip(ip)
+            && !known.contains(&subnet)
+            && !cooldowns
+                .get(&subnet)
+                .is_some_and(|(retry_at, _)| std::time::Instant::now() < *retry_at)
+            && select_wired_source(ip, &HashMap::new(), &adapter.ips).is_none()
+            && live_broadcast(record, observed.get(&record.mac), &adapter.mac)
+    })
+}
+
 /// The shared adoption tail: gate, bounded `adopt_subnet`, and every
 /// success/failure consequence (liveness seed, metadata, events, pending
 /// handover, post-adoption sweeps, config persist, cooldown handling).
@@ -163,6 +244,7 @@ async fn attempt_adoption(
     cooldowns: &mut HashMap<String, (std::time::Instant, std::time::Duration)>,
     known_subnets: &mut HashSet<String>,
     shutdown_rx: &tokio::sync::watch::Receiver<bool>,
+    prepared: Option<auto_adopt::PreparedScratch>,
 ) -> AdoptionAttemptOutcome {
     let config = ctx.config.clone();
     let ops = auto_adopt::PendingAdoptOps::new(&config, &ctx.adapter_mac, auto_adopt::RealAdoptOps);
@@ -193,7 +275,9 @@ async fn attempt_adoption(
 
     log::info!("Foreign subnet {} — adopting ({})", device_subnet, evidence);
 
-    let adoption_id = ctx.bindings.next_adoption_id();
+    let adoption_id = prepared
+        .map(|p| p.adoption_id)
+        .unwrap_or_else(|| ctx.bindings.next_adoption_id());
     // Bracket the adoption with started/finished so the frontend
     // suppresses restarts from its own IP churn. The guard emits
     // `adoption-finished` on drop, so every terminal path below
@@ -208,7 +292,7 @@ async fn attempt_adoption(
     let started = std::time::Instant::now();
     let outcome = tokio::time::timeout(
         ADOPT_MAX_TOTAL,
-        auto_adopt::adopt_subnet(
+        auto_adopt::adopt_subnet_with_scratch(
             &ops,
             &ctx.iface_name,
             device_ip,
@@ -217,6 +301,7 @@ async fn attempt_adoption(
             &ctx.pending_ips,
             adoption_id,
             shutdown_rx,
+            prepared,
         ),
     )
     .await;
@@ -323,8 +408,15 @@ async fn attempt_adoption(
 
             log::info!("event=binding_change adapter_mac={} interface_index={} subnet={} address={} desired=Present applied=true reason=adopted",
                 log_value(&ctx.adapter_mac), ctx.interface_index, log_value(device_subnet), adopted_ip);
+            log::info!(
+                "event=adoption_ready subnet={} device={} elapsed_ms={} reused_probe_address={}",
+                log_value(device_subnet),
+                device_ip,
+                started.elapsed().as_millis(),
+                prepared.is_some()
+            );
 
-            // One bounded pass after the new binding settles. Presence handles
+            // One bounded pass once the new binding is usable. Presence handles
             // later verification; a quiet adopted subnet is not swept repeatedly.
             let sweep_ip = adopted_ip.to_string();
             let sweep_devices = ctx.devices.clone();
@@ -337,7 +429,6 @@ async fn attempt_adoption(
             let sweep_candidates = ctx.candidates.clone();
             let sweep_local = ctx.local_macs.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
                 if sweep_fence.is_stale() {
                     return;
                 }
@@ -379,10 +470,17 @@ async fn attempt_adoption(
             // Cooldown instead of a permanent blacklist so a transient
             // failure is retried.
             auto_adopt::reconcile_pending(&ops, &ctx.pending_ips, Some(adoption_id)).await;
-            let next_backoff = cooldowns
-                .get(device_subnet)
-                .map(|(_, b)| (*b * 2).min(COOLDOWN_MAX))
-                .unwrap_or(COOLDOWN_INITIAL);
+            let cleanup_complete = !ctx
+                .pending_ips
+                .lock()
+                .await
+                .iter()
+                .any(|p| p.adoption_id == adoption_id);
+            let next_backoff = adoption_retry_delay(
+                &e,
+                cleanup_complete,
+                cooldowns.get(device_subnet).map(|(_, delay)| *delay),
+            );
             cooldowns.insert(
                 device_subnet.to_string(),
                 (std::time::Instant::now() + next_backoff, next_backoff),
@@ -404,11 +502,6 @@ async fn attempt_adoption(
         }
     }
 }
-
-/// Settle wait after binding an identity scratch, covering Windows
-/// duplicate-address detection (~1 s per DAD transmit, three transmits
-/// by default) so `SendARP` sourced from the scratch actually transmits.
-const SCRATCH_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Which adoption path is driving a probe pass. Picks the evidence
 /// variant a hand-off carries and the prefix its log lines wear, so
@@ -527,15 +620,29 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
                     subnet
                 );
                 self.scratch_id = Some(id);
-                // A freshly bound address sits in duplicate-address
-                // detection (tentative) for ~1–3 s and is not usable as
-                // an ARP source until that clears — the same window the
-                // post-adoption sweep documents for its first pass. The
-                // conflict-probe path absorbs it across its multi-
-                // candidate loop; the identity probe gets one explicit
-                // settle, counted against the pass budget.
-                tokio::time::sleep(SCRATCH_SETTLE).await;
-                true
+                let octets = scratch.octets();
+                let target = Ipv4Addr::new(octets[0], octets[1], octets[2], 1);
+                match auto_adopt::wait_for_probe_source(
+                    &ops,
+                    &self.ctx.iface_name,
+                    scratch,
+                    target,
+                    self.shutdown_rx,
+                )
+                .await
+                {
+                    Ok(true) if !self.shutdown() => true,
+                    result => {
+                        log::info!(
+                            "{}: scratch readiness failed for {}: {:?}",
+                            self.origin.label(),
+                            subnet,
+                            result
+                        );
+                        self.release_scratch(subnet, scratch).await;
+                        false
+                    }
+                }
             }
             Err(e) => {
                 log::info!(
@@ -664,6 +771,7 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
             self.cooldowns,
             self.known_subnets,
             self.shutdown_rx,
+            None,
         )
         .await;
         if outcome == AdoptionAttemptOutcome::ShutdownRace {
@@ -673,16 +781,157 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
         true
     }
 
+    async fn adopt_prepared(
+        &mut self,
+        subnet: &str,
+        ip: Ipv4Addr,
+        mac: &str,
+        scratch: Ipv4Addr,
+    ) -> bool {
+        let Some(id) = self.scratch_id.take() else {
+            return false;
+        };
+        let current_ips = get_interface_ips(&self.ctx.iface_name).await;
+        let outcome = attempt_adoption(
+            self.ctx,
+            ip,
+            subnet,
+            probe_evidence(self.origin, ip, mac),
+            &current_ips,
+            self.cooldowns,
+            self.known_subnets,
+            self.shutdown_rx,
+            Some(auto_adopt::PreparedScratch {
+                address: scratch,
+                adoption_id: id,
+            }),
+        )
+        .await;
+        // This also covers an admission/no-op failure before the shared tail
+        // consumed the scratch. Successful handover has no pending final IP.
+        let ops = auto_adopt::PendingAdoptOps::new(
+            &self.ctx.config,
+            &self.ctx.adapter_mac,
+            auto_adopt::RealAdoptOps,
+        );
+        auto_adopt::reconcile_pending(&ops, &self.ctx.pending_ips, Some(id)).await;
+        if outcome == AdoptionAttemptOutcome::ShutdownRace {
+            self.stop = true;
+        }
+        !self.stop && !self.shutdown()
+    }
+
     fn shutdown(&self) -> bool {
         *self.shutdown_rx.borrow() || self.ctx.fence.is_stale() || self.ctx.address_fence.is_stale()
     }
 }
 
+#[derive(Default)]
+struct BroadcastDwell {
+    generation: u64,
+    tracker: auto_adopt::DwellTracker,
+    ready: HashSet<(String, String)>,
+}
+
+impl BroadcastDwell {
+    fn generation(&mut self, generation: u64) {
+        if self.generation != generation {
+            self.generation = generation;
+            self.tracker = auto_adopt::DwellTracker::new();
+            self.ready.clear();
+        }
+    }
+
+    fn observe(
+        &mut self,
+        generation: u64,
+        records: &[DeviceRecord],
+        observed: &HashMap<String, ArpDevice>,
+        adapter: &InterfaceInfo,
+        now: std::time::Instant,
+    ) -> bool {
+        self.generation(generation);
+        let mut wake = false;
+        for record in records {
+            let Ok(ip) = record.ip.parse::<Ipv4Addr>() else {
+                continue;
+            };
+            if crate::validation::prohibited_camera_ip(ip)
+                || select_wired_source(ip, &HashMap::new(), &adapter.ips).is_some()
+                || !live_broadcast(record, observed.get(&record.mac), &adapter.mac)
+            {
+                continue;
+            }
+            let subnet = subnet_key_for(ip);
+            let verdict = self
+                .tracker
+                .check(&subnet, &record.mac, &record.last_seen, now);
+            let key = (subnet.clone(), record.mac.clone());
+            if verdict == auto_adopt::DwellVerdict::Started {
+                self.ready.remove(&key);
+                log::info!(
+                    "Foreign subnet queued: {} ({} at {})",
+                    subnet,
+                    record.mac,
+                    ip
+                );
+                wake = true;
+            } else if verdict == auto_adopt::DwellVerdict::Mature && self.ready.insert(key) {
+                wake = true;
+            }
+        }
+        wake
+    }
+}
+
+/// Keep collecting evidence while the single address writer waits on Windows.
+/// Both futures live in this scope, so stop/drop cannot leave a collector behind.
 pub(super) async fn run(
+    ctx: AdoptionCtx,
+    known_ips: Vec<String>,
+    bindings: Arc<binding_store::BindingStore>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let dwell = Arc::new(StdMutex::new(BroadcastDwell::default()));
+    let wake = Arc::new(tokio::sync::Notify::new());
+    let devices = ctx.devices.clone();
+    let registry = ctx.registry.clone();
+    let selector = ctx.sweep.selector.clone();
+    let pending = ctx.pending_ips.clone();
+    let config = ctx.config.clone();
+    let work = run_worker(
+        ctx,
+        known_ips,
+        bindings.clone(),
+        shutdown_rx,
+        dwell.clone(),
+        wake.clone(),
+    );
+    tokio::pin!(work);
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    loop {
+        tokio::select! {
+            _ = &mut work => break,
+            _ = tick.tick() => {
+                let fence = bindings.address_fence();
+                if fence.is_stale() || config.get_network_mode() != crate::config::NetworkMode::StaticAuto { continue; }
+                let Some((adapter, _, _)) = selector.probe_scope(&pending) else { continue; };
+                let records = registry.snapshot();
+                let observed = devices.lock().await;
+                if dwell.lock().unwrap_or_else(|p| p.into_inner()).observe(fence.generation,
+                    &records, &observed, &adapter, std::time::Instant::now()) { wake.notify_one(); }
+            }
+        }
+    }
+}
+
+async fn run_worker(
     mut ctx: AdoptionCtx,
     known_ips: Vec<String>,
     bindings: Arc<binding_store::BindingStore>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    dwell: Arc<StdMutex<BroadcastDwell>>,
+    wake: Arc<tokio::sync::Notify>,
 ) {
     ctx.address_fence = bindings.address_fence();
     let iface_name = ctx.iface_name.clone();
@@ -693,8 +942,8 @@ pub(super) async fn run(
     let address_active = bindings.address_active.clone();
     // Read-only metadata view for existing cache-probe admission; BindingStore publishes it.
     let meta_for_adopt = bindings.adopted_meta.clone();
-    // Cached-device probe: at most one pass per discovery
-    // session, deferred (not consumed) while the DHCP gate is
+    // Cached-device probe: at most one attempt per subnet per discovery
+    // session, yielding between subnets and deferred while the DHCP gate is
     // closed. Identity misses land in the attempted set, never
     // in the shared cooldowns.
     let mut cache_probe_done = false;
@@ -704,7 +953,6 @@ pub(super) async fn run(
     // triggering device produces a second accepted ARP frame, so
     // a single spurious frame (which sits in the persistent
     // device map forever) can no longer bind a secondary IP.
-    let mut dwell = auto_adopt::DwellTracker::new();
     // Mark subnets we already have IPs on as known
     for ip_str in &known_ips {
         if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
@@ -740,17 +988,22 @@ pub(super) async fn run(
     const GHOST_SUBNET_RECHECK: std::time::Duration = std::time::Duration::from_secs(300);
     const GHOST_NETS_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
+    let mut worked = false;
     loop {
         // Shutdown-aware idle: wake on the 2 s tick or the moment a
         // stop is signalled, and exit promptly either way.
-        tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
-            res = shutdown_rx.changed() => {
-                if res.is_err() {
-                    break;
+        if !worked {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                _ = wake.notified() => {}
+                res = shutdown_rx.changed() => {
+                    if res.is_err() {
+                        break;
+                    }
                 }
             }
         }
+        worked = false;
         if *shutdown_rx.borrow() {
             break;
         }
@@ -774,7 +1027,10 @@ pub(super) async fn run(
             // A manual add/remove can invalidate permanent session
             // knowledge without restarting capture or discovery.
             known_subnets.clear();
-            dwell = auto_adopt::DwellTracker::new();
+            dwell
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .generation(next_address_fence.generation);
             cache_probe_done = false;
             cache_probe_attempted.clear();
             cached_dhcp_state = None;
@@ -854,8 +1110,10 @@ pub(super) async fn run(
         // gets its pass). Rediscovers quiet known devices in
         // seconds instead of waiting for their spontaneous
         // broadcast ARP, which can be minutes apart on a quiet camera.
-        if !cache_probe_done {
-            cache_probe_done = true;
+        // Service current Ethernet sightings before spending time on quiet
+        // cached peers. The deferred cache pass still runs once live work is
+        // adopted, stops producing fresh evidence, or enters failure backoff.
+        if !cache_probe_done && !broadcast_work_pending(&ctx, &known_subnets, &cooldowns).await {
             let cached_records = {
                 let config = &ctx.config;
                 config.get_cache()
@@ -889,7 +1147,8 @@ pub(super) async fn run(
                     &ghost_nets,
                     &cache_probe_attempted,
                 );
-                if !candidates.is_empty() {
+                cache_probe_done = candidates.is_empty();
+                if !cache_probe_done {
                     log::info!(
                         "Cache probe: verifying {} candidate subnet(s) from the device cache",
                         candidates.len()
@@ -905,10 +1164,11 @@ pub(super) async fn run(
                     };
                     let report = cache_probe::run_pass(
                         &mut io,
-                        candidates,
+                        candidates.into_iter().take(1).collect(),
                         cache_probe::CACHE_PROBE_PASS_BUDGET,
                     )
                     .await;
+                    worked = true;
                     let stop = io.stop;
                     log::info!(
                         "Cache probe pass finished: attempted={:?}, adopted={:?}",
@@ -927,13 +1187,29 @@ pub(super) async fn run(
                         break;
                     }
                 }
+            } else {
+                cache_probe_done = true;
             }
         }
 
-        let device_list: Vec<ArpDevice> = {
+        let mut device_list: Vec<ArpDevice> = {
             let map = devices.lock().await;
             map.values().cloned().collect()
         };
+        {
+            let dwell = dwell.lock().unwrap_or_else(|p| p.into_inner());
+            let now = std::time::Instant::now();
+            device_list.sort_by_key(|d| {
+                let subnet =
+                    d.ip.parse::<Ipv4Addr>()
+                        .map(subnet_key_for)
+                        .unwrap_or_else(|_| d.subnet.clone());
+                (
+                    dwell.tracker.priority(&subnet, &d.mac, &d.last_seen, now),
+                    d.mac.clone(),
+                )
+            });
+        }
 
         for device in &device_list {
             if *shutdown_rx.borrow() {
@@ -945,6 +1221,15 @@ pub(super) async fn run(
             };
 
             if crate::validation::prohibited_camera_ip(device_ip) {
+                continue;
+            }
+            // Recheck current selected-link evidence after any queued work.
+            if !ctx
+                .registry
+                .snapshot()
+                .iter()
+                .any(|r| r.mac == device.mac && live_broadcast(r, Some(device), &ctx.adapter_mac))
+            {
                 continue;
             }
 
@@ -1025,18 +1310,37 @@ pub(super) async fn run(
             // accepted frame from this device before binding.
             // `last_seen` is rewritten on every accepted frame,
             // so it serves as the observation token.
-            match dwell.check(
-                &device_subnet,
-                &device.mac,
-                &device.last_seen,
-                std::time::Instant::now(),
-            ) {
+            let verdict = dwell
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .tracker
+                .check(
+                    &device_subnet,
+                    &device.mac,
+                    &device.last_seen,
+                    std::time::Instant::now(),
+                );
+            match verdict {
                 auto_adopt::DwellVerdict::Started => {
                     log::info!(
                         "Foreign subnet detected: {} — holding adoption until {} is observed again",
                         device_subnet,
                         device.mac
                     );
+                    // Seed every newly seen device this pass. Repeated traffic
+                    // can satisfy dwell on the next tick without an extra
+                    // scratch bind/resolve/release cycle for each device.
+                    continue;
+                }
+                auto_adopt::DwellVerdict::Waiting => {
+                    if !dwell
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .tracker
+                        .take_probe_due(&device_subnet, &device.mac, std::time::Instant::now())
+                    {
+                        continue;
+                    }
                     // Solicit the second observation instead of
                     // waiting out the device's beacon cadence: a
                     // directed probe answered with the sighted MAC
@@ -1072,6 +1376,7 @@ pub(super) async fn run(
                         cache_probe::FAST_ADOPT_PROBE_BUDGET,
                     )
                     .await;
+                    worked = true;
                     if report.handed_off.is_empty() {
                         log::info!(
                             "Fast adopt: {} did not confirm — leaving the two-observation gate armed",
@@ -1079,7 +1384,11 @@ pub(super) async fn run(
                         );
                     } else {
                         log::info!("Fast adopt: {} confirmed by directed probe", device_subnet);
-                        dwell.prune_subnet(&device_subnet);
+                        dwell
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .tracker
+                            .prune_subnet(&device_subnet);
                     }
                     // One probe per pass: the probe consumed this
                     // iteration's slot whatever the outcome, and the
@@ -1089,7 +1398,6 @@ pub(super) async fn run(
                     // same way the ShutdownRace break below does.
                     break;
                 }
-                auto_adopt::DwellVerdict::Waiting => continue,
                 auto_adopt::DwellVerdict::Mature => {}
             }
 
@@ -1104,18 +1412,27 @@ pub(super) async fn run(
                 &mut cooldowns,
                 &mut known_subnets,
                 &shutdown_rx,
+                None,
             )
             .await;
+            worked = outcome != AdoptionAttemptOutcome::NoOp;
 
             // Whatever the attempt's outcome, this subnet's dwell
             // candidacy is spent — a later approach (post-cooldown
             // retry, removal then re-appearance) restarts the
             // two-observation gate. Dwell stays at this call site:
             // the probe path must never touch the tracker.
-            dwell.prune_subnet(&device_subnet);
+            dwell
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .tracker
+                .prune_subnet(&device_subnet);
             if outcome == AdoptionAttemptOutcome::ShutdownRace {
                 break;
             }
+            // Re-read and rank the queue after each transaction. A newly
+            // confirmed camera must not sit behind a stale snapshot's probe.
+            break;
         }
     }
     log::info!("Auto-adopt loop exited");
@@ -1124,6 +1441,215 @@ pub(super) async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_retries_are_prompt_only_after_clean_rollback_and_remain_bounded() {
+        let pending = AppError::AddressNotReady("still tentative".into());
+        assert_eq!(adoption_retry_delay(&pending, true, None).as_secs(), 5);
+        let mut delay = None;
+        for expected in [5, 10, 20, 40, 80, 160, 320, 600, 600] {
+            let next = adoption_retry_delay(&pending, true, delay);
+            assert_eq!(next.as_secs(), expected);
+            delay = Some(next);
+        }
+        assert_eq!(adoption_retry_delay(&pending, false, None).as_secs(), 60);
+        let unknown = AppError::Network("source ownership changed".into());
+        assert_eq!(adoption_retry_delay(&unknown, true, None).as_secs(), 60);
+        assert_eq!(
+            adoption_retry_delay(&unknown, true, Some(READINESS_RETRY_INITIAL)).as_secs(),
+            60
+        );
+    }
+
+    fn broadcast_fixture() -> (DeviceRecord, ArpDevice, InterfaceInfo) {
+        let adapter = InterfaceInfo {
+            name: "Ethernet".into(),
+            display_name: "Ethernet".into(),
+            description: "test".into(),
+            mac: "40:c2:ba:cf:d5:75".into(),
+            ips: vec![],
+            is_up: true,
+            is_ethernet: true,
+            is_wifi: false,
+            is_vpn: false,
+            is_virtual: false,
+        };
+        let record = DeviceRecord {
+            mac: "40:cd:3a:03:28:e2".into(),
+            ip: "172.31.169.84".into(),
+            subnet: "172.31.169.0/24".into(),
+            open_ports: vec![],
+            alias: String::new(),
+            status: DeviceStatus::Live,
+            first_seen: "first".into(),
+            last_seen: "fresh".into(),
+            verified_by_mac: Some(adapter.mac.clone()),
+            last_verified_at: Some("fresh".into()),
+        };
+        let observed = ArpDevice {
+            mac: record.mac.clone(),
+            ip: record.ip.clone(),
+            subnet: record.subnet.clone(),
+            first_seen: record.first_seen.clone(),
+            last_seen: record.last_seen.clone(),
+        };
+        (record, observed, adapter)
+    }
+
+    #[test]
+    fn broadcast_collection_continues_during_a_slow_probe_and_prefers_confirmed_peers() {
+        let (mut camera, mut frame, adapter) = broadcast_fixture();
+        let mut slow = camera.clone();
+        slow.mac = "08:df:ec:22:01:77".into();
+        slow.ip = "192.168.1.74".into();
+        slow.subnet = "192.168.1.0/24".into();
+        let slow_frame = ArpDevice {
+            mac: slow.mac.clone(),
+            ip: slow.ip.clone(),
+            subnet: slow.subnet.clone(),
+            ..frame.clone()
+        };
+        let mut observed = HashMap::from([(slow.mac.clone(), slow_frame)]);
+        let mut queue = BroadcastDwell::default();
+        let now = std::time::Instant::now();
+        assert!(queue.observe(1, &[slow.clone()], &observed, &adapter, now));
+        // The worker is still probing the first IP when the camera arrives.
+        observed.insert(camera.mac.clone(), frame.clone());
+        assert!(queue.observe(
+            1,
+            &[slow.clone(), camera.clone()],
+            &observed,
+            &adapter,
+            now + std::time::Duration::from_secs(3)
+        ));
+        camera.last_seen = "repeat".into();
+        frame.last_seen = camera.last_seen.clone();
+        observed.insert(camera.mac.clone(), frame);
+        let finished = now + std::time::Duration::from_secs(12);
+        assert!(queue.observe(
+            1,
+            &[slow.clone(), camera.clone()],
+            &observed,
+            &adapter,
+            finished,
+        ));
+        assert!(!queue.observe(
+            1,
+            &[slow.clone(), camera.clone()],
+            &observed,
+            &adapter,
+            finished
+        ));
+        assert!(
+            !queue
+                .tracker
+                .priority(&camera.subnet, &camera.mac, &camera.last_seen, finished)
+                .0
+        );
+        assert!(
+            queue
+                .tracker
+                .priority(&slow.subnet, &slow.mac, &slow.last_seen, finished)
+                .0
+        );
+        // Manual address changes retire the old pair of observations.
+        queue.observe(2, &[camera.clone()], &observed, &adapter, finished);
+        assert!(
+            queue
+                .tracker
+                .priority(&camera.subnet, &camera.mac, &camera.last_seen, finished)
+                .0
+        );
+    }
+
+    #[test]
+    fn broadcast_queue_cannot_seed_from_history_another_adapter_or_a_native_subnet() {
+        let (record, frame, mut adapter) = broadcast_fixture();
+        let observed = HashMap::from([(record.mac.clone(), frame)]);
+        let now = std::time::Instant::now();
+        for status in [DeviceStatus::Offline, DeviceStatus::CachedOnly] {
+            let mut stale = record.clone();
+            stale.status = status;
+            assert!(!BroadcastDwell::default().observe(1, &[stale], &observed, &adapter, now));
+        }
+        let mut other = record.clone();
+        other.verified_by_mac = Some("aa:bb:cc:dd:ee:00".into());
+        assert!(!BroadcastDwell::default().observe(1, &[other], &observed, &adapter, now));
+        adapter.ips.push(interface::IpInfo {
+            address: "172.31.169.100".into(),
+            prefix: 24,
+            subnet: record.subnet.clone(),
+        });
+        assert!(!BroadcastDwell::default().observe(1, &[record], &observed, &adapter, now));
+    }
+
+    #[test]
+    fn only_current_selected_ethernet_broadcasts_defer_duplicate_identity_probes() {
+        let (mut record, mut observed, adapter) = broadcast_fixture();
+        assert!(live_broadcast(&record, Some(&observed), &adapter.mac));
+        assert!(!live_broadcast(&record, None, &adapter.mac));
+        assert!(!live_broadcast(
+            &record,
+            Some(&observed),
+            "aa:bb:cc:dd:ee:ff"
+        ));
+        observed.last_seen = "old".into();
+        assert!(!live_broadcast(&record, Some(&observed), &adapter.mac));
+        observed.last_seen = record.last_seen.clone();
+        observed.ip = "172.31.169.85".into();
+        assert!(!live_broadcast(&record, Some(&observed), &adapter.mac));
+        observed.ip = record.ip.clone();
+        for status in [
+            DeviceStatus::CachedOnly,
+            DeviceStatus::Verifying,
+            DeviceStatus::Offline,
+        ] {
+            record.status = status;
+            assert!(!live_broadcast(&record, Some(&observed), &adapter.mac));
+        }
+    }
+
+    #[test]
+    fn quiet_cache_work_resumes_after_live_adoption_or_failure_backoff() {
+        let (record, frame, mut adapter) = broadcast_fixture();
+        let observed = HashMap::from([(record.mac.clone(), frame)]);
+        let records = vec![record.clone()];
+        let mut known = HashSet::new();
+        let mut cooldowns = HashMap::new();
+        assert!(broadcast_work_pending_in(
+            &records, &observed, &adapter, &known, &cooldowns
+        ));
+        known.insert(record.subnet.clone());
+        assert!(!broadcast_work_pending_in(
+            &records, &observed, &adapter, &known, &cooldowns
+        ));
+        known.clear();
+        cooldowns.insert(
+            record.subnet.clone(),
+            (
+                std::time::Instant::now() + COOLDOWN_INITIAL,
+                COOLDOWN_INITIAL,
+            ),
+        );
+        assert!(!broadcast_work_pending_in(
+            &records, &observed, &adapter, &known, &cooldowns
+        ));
+        cooldowns.clear();
+        adapter.ips.push(interface::IpInfo {
+            address: "172.31.169.100".into(),
+            prefix: 24,
+            subnet: record.subnet.clone(),
+        });
+        assert!(!broadcast_work_pending_in(
+            &records, &observed, &adapter, &known, &cooldowns
+        ));
+        adapter.ips.clear();
+        let mut expired = records;
+        expired[0].status = DeviceStatus::Offline;
+        assert!(!broadcast_work_pending_in(
+            &expired, &observed, &adapter, &known, &cooldowns
+        ));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn aborting_adoption_caller_keeps_paired_finish_after_settle() {

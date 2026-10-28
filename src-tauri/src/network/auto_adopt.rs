@@ -40,6 +40,7 @@ struct DwellCandidate {
     token: String,
     first_qualifying: Instant,
     last_checked: Instant,
+    probe_started: bool,
 }
 
 /// Gate that requires a device to produce two distinct accepted ARP
@@ -80,6 +81,7 @@ impl DwellTracker {
                         token: token.to_string(),
                         first_qualifying: now,
                         last_checked: now,
+                        probe_started: false,
                     },
                 );
                 DwellVerdict::Started
@@ -95,6 +97,44 @@ impl DwellTracker {
                 }
             }
         }
+    }
+
+    /// Give ordinary repeat broadcasts one short dwell before soliciting a
+    /// quiet device. Each candidate gets only one directed identity probe.
+    pub fn take_probe_due(&mut self, subnet: &str, mac: &str, now: Instant) -> bool {
+        let Some(candidate) = self
+            .candidates
+            .get_mut(&(subnet.to_string(), mac.to_string()))
+        else {
+            return false;
+        };
+        if candidate.probe_started
+            || now.saturating_duration_since(candidate.first_qualifying) < DWELL_MIN
+        {
+            return false;
+        }
+        candidate.probe_started = true;
+        true
+    }
+
+    /// Confirmed sightings precede speculative probes, then oldest first.
+    pub(super) fn priority(
+        &self,
+        subnet: &str,
+        mac: &str,
+        token: &str,
+        now: Instant,
+    ) -> (bool, Instant) {
+        self.candidates
+            .get(&(subnet.into(), mac.into()))
+            .map(|c| {
+                (
+                    !(c.token != token
+                        && now.saturating_duration_since(c.first_qualifying) >= DWELL_MIN),
+                    c.first_qualifying,
+                )
+            })
+            .unwrap_or((true, now))
     }
 
     /// Drop every candidate on `subnet`. Called once an adoption attempt
@@ -175,6 +215,14 @@ pub struct PendingIp {
 /// handed to the auto-adopt loop and reconciled on stop.
 pub type PendingIps = Arc<Mutex<Vec<PendingIp>>>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeSourceState {
+    Ready,
+    Pending,
+    Tentative,
+    RoutePending { expected: u32, observed: u32 },
+}
+
 /// Injectable seam for the OS-touching work `adopt_subnet` performs, so its
 /// scratch/final bookkeeping and rollback can be unit-tested without binding
 /// real addresses or probing the wire.
@@ -190,6 +238,32 @@ pub trait AdoptOps {
     async fn add(&self, iface: &str, ip: Ipv4Addr, mask: &str) -> Result<(), AppError>;
     /// Remove a secondary IP (production: `netsh delete address`).
     async fn remove(&self, iface: &str, ip: Ipv4Addr) -> Result<(), AppError>;
+    /// A newly added address can still be tentative while Windows runs DAD.
+    /// Only a preferred source with an on-link route can run conflict probes.
+    async fn probe_ready(
+        &self,
+        _iface: &str,
+        _source: Ipv4Addr,
+        _target: Ipv4Addr,
+    ) -> Result<bool, AppError> {
+        Err(AppError::Network(
+            "Probe source readiness unavailable".into(),
+        ))
+    }
+    async fn probe_state(
+        &self,
+        iface: &str,
+        source: Ipv4Addr,
+        target: Ipv4Addr,
+    ) -> Result<ProbeSourceState, AppError> {
+        self.probe_ready(iface, source, target).await.map(|ready| {
+            if ready {
+                ProbeSourceState::Ready
+            } else {
+                ProbeSourceState::Pending
+            }
+        })
+    }
     /// Probe whether `target` is already in use on-link. Returns `true` for
     /// in-use OR indeterminate — the caller must not claim a maybe-used IP.
     async fn probe(&self, target: Ipv4Addr, source: Option<Ipv4Addr>) -> bool;
@@ -238,11 +312,43 @@ impl AdoptOps for RealAdoptOps {
     async fn remove(&self, iface: &str, ip: Ipv4Addr) -> Result<(), AppError> {
         ip_config::remove_secondary_ip(iface, &ip.to_string()).await
     }
+    async fn probe_ready(
+        &self,
+        iface: &str,
+        source: Ipv4Addr,
+        target: Ipv4Addr,
+    ) -> Result<bool, AppError> {
+        self.probe_state(iface, source, target)
+            .await
+            .map(|state| state == ProbeSourceState::Ready)
+    }
+    async fn probe_state(
+        &self,
+        iface: &str,
+        source: Ipv4Addr,
+        target: Ipv4Addr,
+    ) -> Result<ProbeSourceState, AppError> {
+        #[cfg(windows)]
+        {
+            super::interface::conflict_probe_source_state(iface, source, target).await
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (iface, source, target);
+            Err(AppError::Network(
+                "Native source readiness requires Windows".into(),
+            ))
+        }
+    }
     async fn probe(&self, target: Ipv4Addr, source: Option<Ipv4Addr>) -> bool {
         // A probe error (couldn't determine conflict) is treated as in-use.
-        super::arp::send_arp_probe(target, source, std::time::Duration::from_secs(1))
-            .await
-            .unwrap_or(true)
+        match super::arp::send_arp_probe(target, source, std::time::Duration::from_secs(1)).await {
+            Ok(occupied) => occupied,
+            Err(error) => {
+                log::warn!("Conflict probe for {target} from {source:?} is inconclusive: {error}");
+                true
+            }
+        }
     }
 }
 
@@ -366,6 +472,22 @@ impl<O: AdoptOps> AdoptOps for PendingAdoptOps<'_, O> {
         self.config.forget_temporary_with(&row, self.persist)
     }
 
+    async fn probe_ready(
+        &self,
+        iface: &str,
+        source: Ipv4Addr,
+        target: Ipv4Addr,
+    ) -> Result<bool, AppError> {
+        self.ops.probe_ready(iface, source, target).await
+    }
+    async fn probe_state(
+        &self,
+        iface: &str,
+        source: Ipv4Addr,
+        target: Ipv4Addr,
+    ) -> Result<ProbeSourceState, AppError> {
+        self.ops.probe_state(iface, source, target).await
+    }
     async fn probe(&self, target: Ipv4Addr, source: Option<Ipv4Addr>) -> bool {
         self.ops.probe(target, source).await
     }
@@ -475,6 +597,58 @@ pub async fn reconcile_pending<O: AdoptOps>(ops: &O, pending: &PendingIps, filte
     }
 }
 
+// The five-second limit proved too short during rapid remove/re-add on Windows.
+// Polling still returns immediately on readiness; the longer ceiling is only
+// for a source/route that remains pending, never permission to probe blindly.
+const PROBE_SOURCE_READY_TIMEOUT: Duration = Duration::from_secs(12);
+const PROBE_SOURCE_POLL: Duration = Duration::from_millis(100);
+
+/// Address creation acknowledges presence before Windows finishes DAD and
+/// installs its usable route. Wait on native state; never interpret a source
+/// that is still tentative as evidence that all candidate addresses are busy.
+pub(super) async fn wait_for_probe_source<O: AdoptOps>(
+    ops: &O,
+    iface: &str,
+    source: Ipv4Addr,
+    target: Ipv4Addr,
+    shutdown: &watch::Receiver<bool>,
+) -> Result<bool, AppError> {
+    let mut shutdown = shutdown.clone();
+    let started = tokio::time::Instant::now();
+    let mut last_state = None;
+    tokio::time::timeout(PROBE_SOURCE_READY_TIMEOUT, async {
+        loop {
+            if *shutdown.borrow() {
+                return Ok(false);
+            }
+            let state = ops.probe_state(iface, source, target).await?;
+            if last_state != Some(state) {
+                log::info!("event=adoption_source_state source={} target={} state={:?} elapsed_ms={}",
+                    source, target, state, started.elapsed().as_millis());
+                last_state = Some(state);
+            }
+            if state == ProbeSourceState::Ready {
+                return Ok(true);
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(PROBE_SOURCE_POLL) => {},
+                result = shutdown.changed() => {
+                    if result.is_err() || *shutdown.borrow() {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| {
+        AppError::AddressNotReady(format!(
+            "Adoption address {source} did not become usable on {iface} within {}s (last state: {last_state:?})",
+            PROBE_SOURCE_READY_TIMEOUT.as_secs()
+        ))
+    })?
+}
+
 /// Adopt a foreign subnet by adding a secondary IP to the interface.
 /// Returns the adopted IP if successful, or `None` if already on that subnet
 /// (or if a shutdown was signalled before the final bind).
@@ -485,6 +659,7 @@ pub async fn reconcile_pending<O: AdoptOps>(ops: &O, pending: &PendingIps, filte
 /// `reconcile_pending` can clean up. The caller removes the final entry via
 /// `pending_handover` only after recording the adoption in `adopted_ips`.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub async fn adopt_subnet<O: AdoptOps>(
     ops: &O,
     interface_name: &str,
@@ -495,7 +670,60 @@ pub async fn adopt_subnet<O: AdoptOps>(
     adoption_id: u64,
     shutdown: &watch::Receiver<bool>,
 ) -> Result<Option<Ipv4Addr>, AppError> {
-    if already_on_subnet(device_ip, current_ips) {
+    adopt_subnet_with_scratch(
+        ops,
+        interface_name,
+        device_ip,
+        current_ips,
+        local_ips,
+        pending,
+        adoption_id,
+        shutdown,
+        None,
+    )
+    .await
+}
+
+/// A probe's owned temporary address can serve the conflict checks too.
+/// The caller retains cleanup responsibility on every early return/drop.
+#[derive(Clone, Copy)]
+pub(super) struct PreparedScratch {
+    pub address: Ipv4Addr,
+    pub adoption_id: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn adopt_subnet_with_scratch<O: AdoptOps>(
+    ops: &O,
+    interface_name: &str,
+    device_ip: Ipv4Addr,
+    current_ips: &[Ipv4Addr],
+    local_ips: &[Ipv4Addr],
+    pending: &PendingIps,
+    adoption_id: u64,
+    shutdown: &watch::Receiver<bool>,
+    prepared: Option<PreparedScratch>,
+) -> Result<Option<Ipv4Addr>, AppError> {
+    if let Some(scratch) = prepared {
+        if scratch.adoption_id != adoption_id
+            || scratch.address == device_ip
+            || !already_on_subnet(device_ip, &[scratch.address])
+            || !pending.lock().await.iter().any(|p| {
+                p.iface == interface_name && p.ip == scratch.address && p.adoption_id == adoption_id
+            })
+        {
+            return Err(AppError::Network(
+                "Prepared probe address ownership is unconfirmed".into(),
+            ));
+        }
+    }
+    // Only the exact owned scratch is exempt from the existing-address gate.
+    let current_ips: Vec<_> = current_ips
+        .iter()
+        .copied()
+        .filter(|ip| prepared.is_none_or(|scratch| scratch.address != *ip))
+        .collect();
+    if already_on_subnet(device_ip, &current_ips) {
         log::info!("Already on subnet for {} — skipping auto-adopt", device_ip);
         return Ok(None);
     }
@@ -506,7 +734,7 @@ pub async fn adopt_subnet<O: AdoptOps>(
     // with the passed-in target IPs in case enumeration hasn't yet reflected
     // a freshly-added one.
     let mut used_ips = local_ips.to_vec();
-    used_ips.extend_from_slice(current_ips);
+    used_ips.extend_from_slice(&current_ips);
     let candidates = pick_candidate_ip(device_ip, &used_ips);
     if candidates.is_empty() {
         return Err(AppError::Network(format!(
@@ -519,24 +747,43 @@ pub async fn adopt_subnet<O: AdoptOps>(
     // conflict probes below route on-link. Without an address on this
     // subnet the probe is structurally blind and risks a duplicate-IP
     // assignment. A failed scratch bind aborts; never probe unbound.
-    let scratch = pick_scratch(device_ip, &candidates);
+    let scratch = prepared
+        .map(|p| p.address)
+        .unwrap_or_else(|| pick_scratch(device_ip, &candidates));
     log::info!(
-        "Auto-adopt {}: binding scratch {} on {} for on-link probe",
+        "Auto-adopt {}: {} scratch {} on {} for on-link probe",
         adoption_id,
+        if prepared.is_some() {
+            "reusing"
+        } else {
+            "binding"
+        },
         scratch,
         interface_name
     );
-    bind_scratch(ops, pending, interface_name, scratch, adoption_id).await?;
+    if prepared.is_none() {
+        bind_scratch(ops, pending, interface_name, scratch, adoption_id).await?;
+    }
     let source = Some(scratch);
 
-    // Probe candidates on-link, then always release the scratch.
+    // Even readiness failure/shutdown follows the scratch cleanup below.
+    log::info!("Auto-adopt {adoption_id}: waiting for probe source {scratch} to become usable");
+    let readiness = wait_for_probe_source(ops, interface_name, scratch, device_ip, shutdown).await;
     let mut chosen = None;
-    for candidate in &candidates {
-        if !ops.probe(*candidate, source).await {
-            chosen = Some(*candidate);
-            break;
+    if matches!(readiness, Ok(true)) {
+        for candidate in &candidates {
+            if *shutdown.borrow() {
+                break;
+            }
+            if !ops.probe(*candidate, source).await {
+                chosen = Some(*candidate);
+                break;
+            }
+            log::info!(
+                "Candidate {} is occupied or its conflict probe is inconclusive, trying next",
+                candidate
+            );
         }
-        log::info!("Candidate {} is in use, trying next", candidate);
     }
 
     {
@@ -554,6 +801,9 @@ pub async fn adopt_subnet<O: AdoptOps>(
         }
     }
 
+    if !readiness? || *shutdown.borrow() {
+        return Ok(None);
+    }
     let candidate = match chosen {
         Some(c) => c,
         None => {
@@ -584,11 +834,18 @@ pub async fn adopt_subnet<O: AdoptOps>(
     // Register the final IP BEFORE binding: a drop between the bind and the
     // caller's record leaves this breadcrumb for reconciliation.
     pending_insert(pending, interface_name, candidate, adoption_id).await;
-    match ops.add(interface_name, candidate, "255.255.255.0").await {
-        Ok(()) => Ok(Some(candidate)),
-        Err(e) => {
+    if let Err(e) = ops.add(interface_name, candidate, "255.255.255.0").await {
+        release_scratch(ops, pending, interface_name, candidate, adoption_id).await;
+        return Err(e);
+    }
+    // The final address also starts tentative. Do not publish adoption or
+    // launch the subnet sweep until this source and its route are usable.
+    log::info!("Auto-adopt {adoption_id}: waiting for adopted source {candidate} to become usable");
+    match wait_for_probe_source(ops, interface_name, candidate, device_ip, shutdown).await {
+        Ok(true) if !*shutdown.borrow() => Ok(Some(candidate)),
+        result => {
             release_scratch(ops, pending, interface_name, candidate, adoption_id).await;
-            Err(e)
+            result.map(|_| None)
         }
     }
 }
@@ -667,6 +924,19 @@ mod tests {
                 .unwrap()
                 .retain(|a| a.address != ip.to_string());
             Ok(())
+        }
+        async fn probe_ready(
+            &self,
+            iface: &str,
+            source: Ipv4Addr,
+            _: Ipv4Addr,
+        ) -> Result<bool, AppError> {
+            Ok(self
+                .observe(iface)
+                .await?
+                .ips
+                .iter()
+                .any(|ip| ip.address == source.to_string()))
         }
         async fn probe(&self, _: Ipv4Addr, _: Option<Ipv4Addr>) -> bool {
             false
@@ -878,6 +1148,49 @@ mod tests {
         let mut d = DwellTracker::new();
         let t0 = Instant::now();
         assert_eq!(d.check(SUBNET_A, MAC_1, "t0", t0), DwellVerdict::Started);
+    }
+
+    #[test]
+    fn dwell_allows_one_directed_probe_only_after_the_broadcast_window() {
+        let mut dwell = DwellTracker::new();
+        let now = Instant::now();
+        assert!(!dwell.take_probe_due(SUBNET_A, MAC_1, now));
+        dwell.check(SUBNET_A, MAC_1, "first", now);
+        assert!(!dwell.take_probe_due(SUBNET_A, MAC_1, now));
+        assert!(!dwell.take_probe_due(SUBNET_A, MAC_1, now + Duration::from_secs(1)));
+        let due = now + DWELL_MIN;
+        assert_eq!(
+            dwell.check(SUBNET_A, MAC_1, "first", due),
+            DwellVerdict::Waiting
+        );
+        assert!(dwell.take_probe_due(SUBNET_A, MAC_1, due));
+        assert!(!dwell.take_probe_due(SUBNET_A, MAC_1, due + Duration::from_secs(60)));
+        assert_eq!(
+            dwell.check(SUBNET_A, MAC_1, "repeat", due),
+            DwellVerdict::Mature
+        );
+        dwell.prune_subnet(SUBNET_A);
+        dwell.check(SUBNET_A, MAC_1, "later", due);
+        assert!(dwell.take_probe_due(SUBNET_A, MAC_1, due + DWELL_MIN));
+    }
+
+    #[test]
+    fn dwell_tracks_both_subnets_before_either_needs_a_slow_identity_probe() {
+        let mut dwell = DwellTracker::new();
+        let now = Instant::now();
+        for (subnet, mac) in [(SUBNET_A, MAC_1), (SUBNET_B, MAC_2)] {
+            assert_eq!(
+                dwell.check(subnet, mac, "first", now),
+                DwellVerdict::Started
+            );
+            assert!(!dwell.take_probe_due(subnet, mac, now));
+        }
+        for (subnet, mac) in [(SUBNET_A, MAC_1), (SUBNET_B, MAC_2)] {
+            assert_eq!(
+                dwell.check(subnet, mac, "repeat", now + DWELL_MIN),
+                DwellVerdict::Mature
+            );
+        }
     }
 
     #[test]
@@ -1198,6 +1511,11 @@ mod tests {
         in_use: Vec<Ipv4Addr>,
         fail_add: Vec<Ipv4Addr>,
         fail_remove: Vec<Ipv4Addr>,
+        ready_after: Duration,
+        added_at: std::sync::Mutex<Option<tokio::time::Instant>>,
+        probes: std::sync::Mutex<Vec<Ipv4Addr>>,
+        never_ready: Vec<Ipv4Addr>,
+        readiness_error: bool,
     }
 
     impl FakeOps {
@@ -1207,6 +1525,11 @@ mod tests {
                 in_use: Vec::new(),
                 fail_add: Vec::new(),
                 fail_remove: Vec::new(),
+                ready_after: Duration::ZERO,
+                added_at: std::sync::Mutex::new(None),
+                probes: std::sync::Mutex::new(Vec::new()),
+                never_ready: Vec::new(),
+                readiness_error: false,
             }
         }
         fn bound_ips(&self) -> Vec<Ipv4Addr> {
@@ -1220,6 +1543,7 @@ mod tests {
                 return Err(AppError::Network(format!("fake add fail {}", ip)));
             }
             self.bound.lock().unwrap().push(ip);
+            *self.added_at.lock().unwrap() = Some(tokio::time::Instant::now());
             Ok(())
         }
         async fn remove(&self, _iface: &str, ip: Ipv4Addr) -> Result<(), AppError> {
@@ -1229,9 +1553,161 @@ mod tests {
             self.bound.lock().unwrap().retain(|b| *b != ip);
             Ok(())
         }
-        async fn probe(&self, target: Ipv4Addr, _source: Option<Ipv4Addr>) -> bool {
-            self.in_use.contains(&target)
+        async fn probe_ready(
+            &self,
+            _: &str,
+            source: Ipv4Addr,
+            _: Ipv4Addr,
+        ) -> Result<bool, AppError> {
+            if self.readiness_error || !self.bound_ips().contains(&source) {
+                return Err(AppError::Network("Probe source observation failed".into()));
+            }
+            Ok(!self.never_ready.contains(&source)
+                && self.added_at.lock().unwrap().unwrap().elapsed() >= self.ready_after)
         }
+        async fn probe(&self, target: Ipv4Addr, source: Option<Ipv4Addr>) -> bool {
+            self.probes.lock().unwrap().push(target);
+            // A tentative source cannot send: production conservatively
+            // treats that probe error as occupied, which caused the loop.
+            !self
+                .probe_ready("eth", source.unwrap(), target)
+                .await
+                .unwrap_or(false)
+                || self.in_use.contains(&target)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn verified_scratch_is_reused_without_a_second_bind_or_dad_wait() {
+        let mut ops = FakeOps::new();
+        ops.ready_after = Duration::from_secs(3);
+        let pending = new_pending();
+        let (_tx, rx) = watch::channel(false);
+        bind_scratch(&ops, &pending, "eth", SCRATCH, 7)
+            .await
+            .unwrap();
+        tokio::time::advance(ops.ready_after).await;
+        ops.fail_add.push(SCRATCH); // any redundant bind would fail
+        let start = tokio::time::Instant::now();
+        let adopted = adopt_subnet_with_scratch(
+            &ops,
+            "eth",
+            DEVICE,
+            &[SCRATCH],
+            &[SCRATCH],
+            &pending,
+            7,
+            &rx,
+            Some(PreparedScratch {
+                address: SCRATCH,
+                adoption_id: 7,
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            start.elapsed(),
+            ops.ready_after,
+            "only the final address needs DAD"
+        );
+        assert_eq!(ops.bound_ips(), [adopted]);
+        assert_eq!(ops.probes.lock().unwrap().as_slice(), [adopted]);
+        assert_eq!(
+            pending.lock().await.as_slice(),
+            [PendingIp {
+                iface: "eth".into(),
+                ip: adopted,
+                adoption_id: 7
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn scratch_reuse_requires_exact_owner_and_does_not_hide_an_existing_host_address() {
+        let ops = FakeOps::new();
+        let pending = new_pending();
+        let (_tx, rx) = watch::channel(false);
+        bind_scratch(&ops, &pending, "eth", SCRATCH, 7)
+            .await
+            .unwrap();
+        for (iface, id) in [("eth", 8), ("other", 7)] {
+            assert!(adopt_subnet_with_scratch(
+                &ops,
+                iface,
+                DEVICE,
+                &[SCRATCH],
+                &[SCRATCH],
+                &pending,
+                id,
+                &rx,
+                Some(PreparedScratch {
+                    address: SCRATCH,
+                    adoption_id: id
+                })
+            )
+            .await
+            .is_err());
+        }
+        assert_eq!(ops.bound_ips(), [SCRATCH]);
+        let existing = Ipv4Addr::new(
+            DEVICE.octets()[0],
+            DEVICE.octets()[1],
+            DEVICE.octets()[2],
+            101,
+        );
+        assert_eq!(
+            adopt_subnet_with_scratch(
+                &ops,
+                "eth",
+                DEVICE,
+                &[SCRATCH, existing],
+                &[SCRATCH, existing],
+                &pending,
+                7,
+                &rx,
+                Some(PreparedScratch {
+                    address: SCRATCH,
+                    adoption_id: 7
+                })
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        reconcile_pending(&ops, &pending, Some(7)).await;
+        assert!(ops.bound_ips().is_empty());
+        assert!(ops.probes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reused_scratch_still_checks_readiness_and_cleans_up_on_failure() {
+        let mut ops = FakeOps::new();
+        ops.never_ready.push(SCRATCH);
+        let pending = new_pending();
+        let (_tx, rx) = watch::channel(false);
+        bind_scratch(&ops, &pending, "eth", SCRATCH, 7)
+            .await
+            .unwrap();
+        assert!(adopt_subnet_with_scratch(
+            &ops,
+            "eth",
+            DEVICE,
+            &[SCRATCH],
+            &[SCRATCH],
+            &pending,
+            7,
+            &rx,
+            Some(PreparedScratch {
+                address: SCRATCH,
+                adoption_id: 7
+            })
+        )
+        .await
+        .is_err());
+        assert!(ops.bound_ips().is_empty());
+        assert!(pending.lock().await.is_empty());
+        assert!(ops.probes.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1294,6 +1770,200 @@ mod tests {
     const CANDIDATE: Ipv4Addr = Ipv4Addr::new(10, 99, 99, 100);
     const SCRATCH: Ipv4Addr = Ipv4Addr::new(10, 99, 99, 254);
     const DEVICE: Ipv4Addr = Ipv4Addr::new(10, 99, 99, 50);
+
+    #[tokio::test(start_paused = true)]
+    async fn performance_ready_sources_add_no_fixed_settle_delay() {
+        let ops = FakeOps::new();
+        let pending = new_pending();
+        let (_tx, rx) = watch::channel(false);
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            adopt_subnet(&ops, "eth", DEVICE, &[], &[], &pending, 1, &rx)
+                .await
+                .unwrap(),
+            Some(CANDIDATE)
+        );
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert_eq!(ops.bound_ips(), [CANDIDATE]);
+        assert_eq!(*ops.probes.lock().unwrap(), [CANDIDATE]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn performance_ready_sources_are_not_delayed_by_more_than_one_poll() {
+        let mut ops = FakeOps::new();
+        // Neither source becomes ready exactly on a poll boundary.
+        ops.ready_after = Duration::from_millis(3050);
+        let pending = new_pending();
+        let (_tx, rx) = watch::channel(false);
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            adopt_subnet(&ops, "eth", DEVICE, &[], &[], &pending, 1, &rx)
+                .await
+                .unwrap(),
+            Some(CANDIDATE)
+        );
+        assert!(started.elapsed() >= Duration::from_millis(6100));
+        // Fixed budget, independent of the production polling constant: an
+        // accidentally slower poll must fail instead of moving this goalpost.
+        assert!(started.elapsed() <= Duration::from_millis(6300));
+        assert_eq!(ops.bound_ips(), [CANDIDATE]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn adoption_waits_for_tentative_sources_before_probing_and_publishing() {
+        let mut ops = FakeOps::new();
+        ops.ready_after = Duration::from_secs(3);
+        let pending = new_pending();
+        let (_tx, rx) = watch::channel(false);
+        let started = tokio::time::Instant::now();
+        let result = adopt_subnet(&ops, "eth", DEVICE, &[], &[], &pending, 1, &rx).await;
+        assert_eq!(result.unwrap(), Some(CANDIDATE));
+        assert!(started.elapsed() >= Duration::from_secs(6));
+        assert!(ops.probe_ready("eth", CANDIDATE, DEVICE).await.unwrap());
+        assert_eq!(*ops.probes.lock().unwrap(), vec![CANDIDATE]);
+        assert_eq!(ops.bound_ips(), vec![CANDIDATE]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn adoption_still_rejects_occupied_candidate_after_source_becomes_ready() {
+        let mut ops = FakeOps::new();
+        ops.ready_after = Duration::from_secs(3);
+        ops.in_use.push(CANDIDATE);
+        let pending = new_pending();
+        let (_tx, rx) = watch::channel(false);
+        let next = Ipv4Addr::new(10, 99, 99, 101);
+        assert_eq!(
+            adopt_subnet(&ops, "eth", DEVICE, &[], &[], &pending, 1, &rx)
+                .await
+                .unwrap(),
+            Some(next)
+        );
+        assert_eq!(*ops.probes.lock().unwrap(), vec![CANDIDATE, next]);
+        assert_eq!(ops.bound_ips(), vec![next]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn adoption_waits_through_slow_windows_readiness_instead_of_abandoning_the_subnet() {
+        let mut ops = FakeOps::new();
+        ops.ready_after = Duration::from_secs(7);
+        let pending = new_pending();
+        let (_tx, rx) = watch::channel(false);
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            adopt_subnet(&ops, "eth", DEVICE, &[], &[], &pending, 1, &rx)
+                .await
+                .unwrap(),
+            Some(CANDIDATE)
+        );
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(14),
+            "both scratch and final readiness must pass"
+        );
+        assert_eq!(ops.probes.lock().unwrap().as_slice(), [CANDIDATE]);
+        assert_eq!(ops.bound_ips(), [CANDIDATE]);
+        assert_eq!(
+            pending.lock().await.len(),
+            1,
+            "final remains owned until durable handover"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn adoption_unusable_source_times_out_without_probing_and_cleans_scratch() {
+        let mut ops = FakeOps::new();
+        ops.never_ready.push(SCRATCH);
+        let pending = new_pending();
+        let (_tx, rx) = watch::channel(false);
+        let started = tokio::time::Instant::now();
+        let error = adopt_subnet(&ops, "eth", DEVICE, &[], &[], &pending, 1, &rx)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("usable"), "{error}");
+        assert!(matches!(error, AppError::AddressNotReady(_)));
+        assert_eq!(started.elapsed(), PROBE_SOURCE_READY_TIMEOUT);
+        assert!(ops.probes.lock().unwrap().is_empty());
+        assert!(ops.bound_ips().is_empty());
+        assert!(pending.lock().await.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn adoption_source_observation_error_is_not_reported_as_ip_conflict() {
+        let mut ops = FakeOps::new();
+        ops.readiness_error = true;
+        let pending = new_pending();
+        let (_tx, rx) = watch::channel(false);
+        let error = adopt_subnet(&ops, "eth", DEVICE, &[], &[], &pending, 1, &rx)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("observation failed"), "{error}");
+        assert!(
+            matches!(error, AppError::Network(_)),
+            "unknown ownership is not a transient settling timeout"
+        );
+        assert!(ops.probes.lock().unwrap().is_empty());
+        assert!(ops.bound_ips().is_empty());
+        assert!(pending.lock().await.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn adoption_shutdown_during_source_wait_releases_scratch() {
+        let mut ops = FakeOps::new();
+        ops.ready_after = Duration::from_secs(3);
+        let pending = new_pending();
+        let (tx, rx) = watch::channel(false);
+        let stop = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tx.send(true).unwrap();
+        };
+        let (result, ()) = tokio::join!(
+            adopt_subnet(&ops, "eth", DEVICE, &[], &[], &pending, 1, &rx),
+            stop
+        );
+        assert_eq!(result.unwrap(), None);
+        assert!(ops.probes.lock().unwrap().is_empty());
+        assert!(ops.bound_ips().is_empty());
+        assert!(pending.lock().await.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn adoption_unusable_final_address_is_released_without_publishing() {
+        let mut ops = FakeOps::new();
+        ops.never_ready.push(CANDIDATE);
+        let pending = new_pending();
+        let (_tx, rx) = watch::channel(false);
+        let error = adopt_subnet(&ops, "eth", DEVICE, &[], &[], &pending, 1, &rx)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(&CANDIDATE.to_string()),
+            "{error}"
+        );
+        assert!(error.to_string().contains("usable"), "{error}");
+        assert_eq!(*ops.probes.lock().unwrap(), vec![CANDIDATE]);
+        assert!(ops.bound_ips().is_empty());
+        assert!(pending.lock().await.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn adoption_shutdown_during_final_source_wait_releases_both_addresses() {
+        let mut ops = FakeOps::new();
+        ops.ready_after = Duration::from_secs(3);
+        let pending = new_pending();
+        let (tx, rx) = watch::channel(false);
+        let stop = async {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            tx.send(true).unwrap();
+        };
+        let (result, ()) = tokio::join!(
+            adopt_subnet(&ops, "eth", DEVICE, &[], &[], &pending, 1, &rx),
+            stop
+        );
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(*ops.probes.lock().unwrap(), vec![CANDIDATE]);
+        assert!(ops.bound_ips().is_empty());
+        assert!(pending.lock().await.is_empty());
+    }
 
     #[tokio::test]
     async fn adopt_binds_deterministic_candidate_and_registers_pending() {

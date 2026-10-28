@@ -40,9 +40,11 @@ impl AdapterSelector {
         let candidates = deps.owners.capture.candidates.clone();
         *handle = Some(tokio::spawn(async move {
             let mut clock = presence::Clock::default();
+            let mut jobs = tokio::task::JoinSet::new();
+            let mut running = HashMap::new();
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
             loop {
-                if control.stopped() {
+                if control.stopped() && jobs.is_empty() {
                     break;
                 }
                 if let Some(selection) = control.observe_link(interface::quick_link_by_mac) {
@@ -55,26 +57,50 @@ impl AdapterSelector {
                 if control.tick(&registry) {
                     emitter.poke();
                 }
-                let snapshot = control.snapshot();
+                let mut snapshot = control.snapshot();
+                if let Some((adapter, _, _)) = deps
+                    .owners
+                    .selector
+                    .probe_scope(&deps.owners.bindings.pending_ips)
+                {
+                    snapshot.adapter = Some(adapter);
+                } else {
+                    snapshot.adapter = None;
+                }
                 let observations = candidates.snapshot(std::time::Instant::now());
-                if let Some(job) = clock.next(&snapshot, &registry.snapshot(), &observations) {
-                    let work = presence::run_presence_job(deps.clone(), job, snapshot);
-                    tokio::pin!(work);
-                    loop {
-                        tokio::select! {
-                            biased;
-                            _ = tick.tick() => {
-                                if let Some(selection) = control.observe_link(interface::quick_link_by_mac) {
-                                    watcher::emit_link_change(deps.owners.bridge.as_ref(), &deps.owners.selector, &selection);
-                                }
-                                if control.tick(&registry) { emitter.poke(); }
+                // At most three jobs, with at most one foreign transaction.
+                // Native ARP calls also share their existing two-call limit.
+                // A slow/quiet IP cannot monopolize presence verification.
+                while !control.stopped() && jobs.len() < 3 {
+                    let Some(job) = clock.next(&snapshot, &registry.snapshot(), &observations)
+                    else {
+                        break;
+                    };
+                    clock.started(&job);
+                    let deps = deps.clone();
+                    let snapshot = snapshot.clone();
+                    let work_job = job.clone();
+                    let task = jobs.spawn(async move {
+                        presence::run_presence_job(deps, work_job, snapshot).await
+                    });
+                    running.insert(task.id(), job);
+                }
+                tokio::select! {
+                    _ = tick.tick() => {},
+                    _ = control.wake.notified() => {},
+                    result = jobs.join_next_with_id(), if !jobs.is_empty() => {
+                        match result {
+                            Some(Ok((id, key))) => {
+                                if let Some(job) = running.remove(&id) { clock.finished(&job); }
+                                if let Some(key) = key { clock.verified(&key); }
                             }
-                            result = &mut work => { if let Some(key) = result { clock.verified(&key); } break; }
-                            _ = control.wake.notified() => { if control.tick(&registry) { emitter.poke(); } }
+                            Some(Err(error)) => {
+                                log::error!("Presence worker failed: {error}");
+                                if let Some(job) = running.remove(&error.id()) { clock.finished(&job); }
+                            }
+                            None => {}
                         }
                     }
-                } else {
-                    tokio::select! { _ = tick.tick() => {}, _ = control.wake.notified() => {} }
                 }
             }
         }));

@@ -1178,6 +1178,70 @@ pub(crate) fn source_matches_interface(index: u32, source: std::net::Ipv4Addr) -
     )
 }
 
+#[cfg(windows)]
+fn preferred_probe_address(state: i32) -> Result<bool, AppError> {
+    use windows_sys::Win32::Networking::WinSock::{
+        IpDadStatePreferred as PREFERRED, IpDadStateTentative as TENTATIVE,
+    };
+    match state {
+        TENTATIVE => Ok(false),
+        PREFERRED => Ok(true),
+        _ => Err(AppError::Network(format!(
+            "Adoption source is unusable (Windows DAD state {state})"
+        ))),
+    }
+}
+
+/// Read-only readiness for an adoption address after the add was acknowledged.
+/// DAD must complete and the route must select the same unique source owner.
+#[cfg(windows)]
+pub(crate) async fn conflict_probe_source_state(
+    iface: &str,
+    source: std::net::Ipv4Addr,
+    target: std::net::Ipv4Addr,
+) -> Result<super::auto_adopt::ProbeSourceState, AppError> {
+    use super::auto_adopt::ProbeSourceState;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetUnicastIpAddressEntry, MIB_UNICASTIPADDRESS_ROW,
+    };
+    use windows_sys::Win32::Networking::WinSock::AF_INET;
+    let adapters = read_native().await?;
+    let adapter = native_by_alias(&adapters, iface)?;
+    let addresses = adapters.iter().flat_map(|a| {
+        a.ips
+            .iter()
+            .filter_map(move |ip| ip.address.parse().ok().map(|ip| (a.index, ip)))
+    });
+    if !adapter.is_up || !source_matches_index(adapter.index, source, addresses) {
+        return Err(AppError::Network(
+            "Adoption source ownership changed".into(),
+        ));
+    }
+    let mut row: MIB_UNICASTIPADDRESS_ROW = unsafe { std::mem::zeroed() };
+    row.InterfaceIndex = adapter.index;
+    row.Address.Ipv4.sin_family = AF_INET;
+    row.Address.Ipv4.sin_addr.S_un.S_addr = u32::from_ne_bytes(source.octets());
+    // Address and interface identify the exact row; this API never changes it.
+    let status = unsafe { GetUnicastIpAddressEntry(&mut row) };
+    if status != 0 {
+        return Err(AppError::Network(format!(
+            "Adoption source observation failed: {status}"
+        )));
+    }
+    if !preferred_probe_address(row.DadState)? {
+        return Ok(ProbeSourceState::Tentative);
+    }
+    let observed = super::route::egress_index(target)?;
+    Ok(if observed == adapter.index {
+        ProbeSourceState::Ready
+    } else {
+        ProbeSourceState::RoutePending {
+            expected: adapter.index,
+            observed,
+        }
+    })
+}
+
 /// Lightweight interface status check by MAC (no process spawning, no
 /// network traffic). Matches by MAC address and returns (is_up,
 /// current_ipv4_ips). Cheap enough to poll every few seconds.
@@ -1952,6 +2016,25 @@ mod tests {
             wired,
             [(7, wired), (8, wired)].into_iter()
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn conflict_probe_waits_for_dad_and_rejects_invalid_sources() {
+        use windows_sys::Win32::Networking::WinSock::{
+            IpDadStateDeprecated, IpDadStateDuplicate, IpDadStateInvalid, IpDadStatePreferred,
+            IpDadStateTentative,
+        };
+        assert!(!preferred_probe_address(IpDadStateTentative).unwrap());
+        assert!(preferred_probe_address(IpDadStatePreferred).unwrap());
+        for state in [
+            IpDadStateInvalid,
+            IpDadStateDuplicate,
+            IpDadStateDeprecated,
+            99,
+        ] {
+            assert!(preferred_probe_address(state).is_err());
+        }
     }
 
     // ── Camera-port predicates ──────────────────────────────────────

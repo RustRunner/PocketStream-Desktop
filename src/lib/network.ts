@@ -58,6 +58,9 @@ export function refreshHostBindings(): Promise<void> { return refreshInterfaces(
 
 /** Collapse a callback burst before entering the shared fetch path. */
 export function refreshNetworkEvent(): void {
+  // Events describe a newer state than an already outstanding snapshot.
+  // Retire that reply before it can overwrite an adoption or removal event.
+  ++bindingRefresh;
   if (addressBusy) { refreshTrailing = true; return; }
   if (eventRefreshQueued) return;
   eventRefreshQueued = true;
@@ -157,7 +160,7 @@ export function refreshInterfaces(): Promise<void> {
         for (const [subnet, meta] of Object.entries(snapshot.meta)) adoptionMeta.set(subnet, meta);
         for (const subnet of sessionAdoptedSubnets) {
           const meta = adoptionMeta.get(subnet);
-          if (!meta?.applied || meta.desired !== "present") sessionAdoptedSubnets.delete(subnet);
+          if (!meta || meta.desired !== "present") sessionAdoptedSubnets.delete(subnet);
         }
       }
       hostMode = mode;
@@ -287,7 +290,6 @@ export function setupInterfaceWatcher(onReconnect: () => void = () => {}): void 
     // A queued callback describes an earlier observation. After a reply, use
     // a fresh shared read rather than repainting its payload over verified IPs.
     if (verifiedAddressView) { refreshNetworkEvent(); return; }
-    if (isDownEvent(iface)) sessionAdoptedSubnets.clear();
     refreshNetworkEvent();
     // Capture the prior connection state BEFORE any state mutation so
     // applyUpEvent can decide whether this is a true reconnect.
@@ -485,6 +487,23 @@ export function renderModeBadge(): void {
   });
 }
 
+// Preserve visible address order while interface events and adoption metadata
+// arrive independently. Only the primary address is pinned above other rows.
+const hostAddressOrder = new Map<string, number>();
+let hostAddressAdapter: string | undefined;
+let nextHostAddressOrder = 0;
+
+/** Use the same primary identity in the Host card and IP Configuration. */
+function primaryAddressChoice(iface: InterfaceInfo): string | null {
+  const saved = state.config?.primary_addresses?.[iface.mac.replaceAll("-", ":").toLowerCase()];
+  if (saved !== undefined) return saved;
+  const usable = iface.ips.filter((ip) => !isApipa(ip.address));
+  const savedIps = new Set([...adoptionMeta.values()].map((m) => m.address));
+  const native = usable.filter((ip) => !savedIps.has(ip.address));
+  const legacy = native.length === 1 ? native[0] : usable.length === 1 ? usable[0] : undefined;
+  return legacy ? `${legacy.address}/${legacy.prefix}` : null;
+}
+
 export function renderSubnetList(): void {
   const subnetList = $("#subnet-list");
   renderModeBadge();
@@ -503,8 +522,27 @@ export function renderSubnetList(): void {
     rows.set(key, { address, prefix, subnet, observed: rows.get(key)?.observed ?? false, meta });
   }
   const normalizeMac = (mac: string | null | undefined) => mac?.replaceAll("-", ":").toLowerCase();
+  const primary = state.activeInterface ? primaryAddressChoice(state.activeInterface) : null;
+  const adapter = normalizeMac(state.activeInterface?.mac);
+  if (adapter && adapter !== hostAddressAdapter) {
+    hostAddressOrder.clear();
+    nextHostAddressOrder = 0;
+    hostAddressAdapter = adapter;
+  }
+  for (const key of hostAddressOrder.keys()) {
+    if (!rows.has(key)) hostAddressOrder.delete(key);
+  }
+  if (rows.size === 0) nextHostAddressOrder = 0;
+  // Restored batches use adoption timestamps; later rows append even when
+  // their address sorts before another address already visible in the card.
+  for (const [key] of [...rows].sort(([, a], [, b]) =>
+    (Date.parse(a.meta?.adopted_at ?? "") || 0) - (Date.parse(b.meta?.adopted_at ?? "") || 0)
+  )) {
+    if (!hostAddressOrder.has(key)) hostAddressOrder.set(key, nextHostAddressOrder++);
+  }
   subnetList.innerHTML = [...rows.values()].sort((a, b) =>
-    a.address.localeCompare(b.address) || (a.prefix ?? -1) - (b.prefix ?? -1)
+    Number(`${b.address}/${b.prefix}` === primary) - Number(`${a.address}/${a.prefix}` === primary) ||
+    hostAddressOrder.get(`${a.address}/${a.prefix}`)! - hostAddressOrder.get(`${b.address}/${b.prefix}`)!
   ).map(({ address, prefix, subnet, observed, meta }) => {
     const ownerKnown = /^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/i.test(normalizeMac(meta?.adapter_mac) ?? "") && prefix !== null && prefix >= 0 && prefix <= 32;
     const mismatch = observed && normalizeMac(meta?.adapter_mac) !== normalizeMac(state.activeInterface?.mac);
@@ -598,7 +636,7 @@ function renderAdapterChoices(): void {
   if (field) field.style.display = dialogInterfaces.length > 1 ? "" : "none";
 }
 
-const addressControlSelector = "#static-iface, #btn-add-sec-ip, #static-ip, #static-mask, #static-gateway, #primary-existing-ip, #btn-remove-primary-ip, #add-sec-ip, #add-sec-mask, #ip-mode-dhcp, #ip-mode-static-auto, #ip-mode-static-manual, #reset-adapter-confirm, [data-remove-binding], [data-remove-ip]";
+const addressControlSelector = "#static-iface, #btn-add-sec-ip, #static-ip, #static-mask, #static-gateway, #primary-existing-ip, #add-sec-ip, #add-sec-mask, #ip-mode-dhcp, #ip-mode-static-auto, #ip-mode-static-manual, #reset-adapter-confirm, [data-remove-binding], [data-remove-ip]";
 function lockAddressControls(): void {
   if (!addressBusy && !dialogSaving) return;
   document.querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLSelectElement>(addressControlSelector).forEach((el) => {
@@ -773,20 +811,6 @@ export function setupIpConfigDialog(
     dialogSession.primaryChosen = true;
     populateDialogFields();
   });
-  $<HTMLButtonElement>("#btn-remove-primary-ip").addEventListener("click", async () => {
-    if (addressBusy || dialogSaving || selectingAdapter) return;
-    const iface = dialogInterfaces.find((i) => i.name === $<HTMLSelectElement>("#static-iface").value);
-    const previous = dialogSession?.previousAddress;
-    const ip = previous?.split("/")[0];
-    if (!iface || !ip) return;
-    if (await mutateAddress("Removing address…", () => api.removeSecondaryIp(iface.name, ip, true), $<HTMLButtonElement>("#btn-remove-primary-ip"), {
-      message: `Remove ${ip} from ${iface.display_name || iface.name}?`,
-      isCurrent: () => dialogSession?.previousAddress === previous,
-    })) {
-      if (dialogSession) { dialogSession.previousAddress = null; dialogSession.primaryChosen = true; }
-      renderNetwork();
-    }
-  });
 
   // ── Add secondary IP ─────────────────────────────────────────────
   async function addDialogAddress(): Promise<boolean> {
@@ -945,7 +969,6 @@ function populateDialogFields(): void {
   const iface = dialogInterfaces.find((i) => i.name === name);
   if (!iface) {
     $("#primary-existing-field").style.display = "none";
-    $("#btn-remove-primary-ip").style.display = "none";
     renderSecondaryIps(undefined, undefined); return;
   }
 
@@ -954,18 +977,14 @@ function populateDialogFields(): void {
   // merely because Windows changed enumeration order.
   const cidr = (ip: { address: string; prefix: number }) => `${ip.address}/${ip.prefix}`;
   const usable = iface.ips.filter((ip) => !isApipa(ip.address));
-  const savedIps = new Set([...adoptionMeta.values()].map((m) => m.address));
-  const native = usable.filter((ip) => !savedIps.has(ip.address));
   const saved = state.config?.primary_addresses?.[iface.mac.replaceAll("-", ":").toLowerCase()];
-  const legacy = native.length === 1 ? native[0] : usable.length === 1 ? usable[0] : undefined;
   const choice = dialogSession && (dialogSession.primaryEdited || dialogSession.primaryChosen)
-    ? dialogSession.previousAddress : saved ?? (legacy ? cidr(legacy) : null);
+    ? dialogSession.previousAddress : primaryAddressChoice(iface);
   const primary = usable.find((ip) => cidr(ip) === choice);
   const existing = $<HTMLSelectElement>("#primary-existing-ip");
   existing.innerHTML = '<option value="">Select an address</option>' + usable.map((ip) => `<option value="${escapeHtml(cidr(ip))}">${escapeHtml(cidr(ip))}</option>`).join("");
   existing.value = choice ?? "";
   $("#primary-existing-field").style.display = !primary && saved !== "" && usable.length > 1 ? "" : "none";
-  $("#btn-remove-primary-ip").style.display = primary ? "" : "none";
   // Left blank intentionally. The snapshot carries no gateway to seed it
   // with, but a blank gateway on save no longer wipes the configured
   // one — the backend preserves the existing default gateway when this

@@ -33,16 +33,15 @@ import {
   type ListeningNoticeTrigger,
 } from "./lib/devices.ts";
 import { setupCacheDialog } from "./lib/device-cache.ts";
+import { setupSidebarToggle } from "./lib/sidebar.ts";
 import * as deviceList from "./lib/device-list.ts";
 import { renderMarkdownLite } from "./lib/markdown-lite.ts";
 import {
   setupStreamControls,
   setupRestreamControls,
   setupVideoResize,
-  getVideoAreaBounds,
   startStatusListener,
   handleHardDisconnect,
-  syncVideoVisibility,
   showModalWithVideo,
   updateMuteButton,
   applyRestreamOperationResult,
@@ -625,26 +624,7 @@ function setupMenuAndAbout(): void {
     licenseDialog.close();
   });
 
-  // Hamburger toggles settings sidebar
-  $<HTMLButtonElement>("#menu-toggle").addEventListener("click", () => {
-    const sidebar = $("#sidebar");
-    sidebar.classList.toggle("collapsed");
-
-    // Reposition video after sidebar animation completes
-    if (state.isStreaming) {
-      api.setVideoVisible(false).catch(() => {});
-      setTimeout(async () => {
-        try {
-          const bounds = getVideoAreaBounds();
-          await api.updateVideoPosition(bounds.x, bounds.y, bounds.width, bounds.height);
-          // Route through syncVideoVisibility rather than an
-          // unconditional show — during a lost stream or with a modal
-          // open the video must stay hidden.
-          await syncVideoVisibility();
-        } catch (_) {}
-      }, 250);
-    }
-  });
+  setupSidebarToggle();
 
   // About icon toggles about panel
   const aboutPanel = $("#about-panel");

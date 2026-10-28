@@ -68,7 +68,7 @@ function fixture(mode = "static_auto") {
     "./lib/tauri-api.ts": api, "./lib/state.ts": shared, "./lib/devices.ts": devices,
     "./lib/errors.ts": { formatError: String }, "./lib/streaming.ts": streaming,
   };
-  for (const name of ["network", "device-cache", "device-list", "markdown-lite", "ptz"])
+  for (const name of ["network", "device-cache", "device-list", "markdown-lite", "ptz", "sidebar"])
     deps[`./lib/${name}.ts`] = new Proxy({}, { get: () => noop });
   const exports = load(source("src/main.ts") + `
     setupMenuAndAbout = setupWindowControls = setupProtocolToggle = setupSettingsSave =

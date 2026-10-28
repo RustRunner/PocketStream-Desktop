@@ -17,8 +17,6 @@ const requiredIds = [
   "restream-error-row",
   "restream-error",
   "restream-url",
-  "restream-bind-scope",
-  "restream-firewall-state",
   "restream-uptime",
   "restream-clients",
   "restream-bandwidth",

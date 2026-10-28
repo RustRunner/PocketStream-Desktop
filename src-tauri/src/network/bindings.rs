@@ -176,12 +176,31 @@ pub(crate) async fn resolve(
     ))
 }
 
-pub(crate) async fn list(adopted: &HashSet<String>) -> Result<Vec<BindInterface>, AppError> {
+pub(crate) async fn list(
+    adopted: &HashSet<String>,
+    camera_mac: Option<&str>,
+) -> Result<Vec<BindInterface>, AppError> {
     let rows = native().await?;
     let metadata = interface::list_all_adapters().await?;
+    Ok(bind_options(&rows, &metadata, adopted, camera_mac))
+}
+
+fn bind_options(
+    rows: &[NativeAdapter],
+    metadata: &[interface::InterfaceInfo],
+    adopted: &HashSet<String>,
+    camera_mac: Option<&str>,
+) -> Vec<BindInterface> {
+    let camera_mac = camera_mac.and_then(super::device_registry::canonical_mac);
     let mut result = Vec::new();
-    for row in &rows {
-        if !row.is_up {
+    for row in rows {
+        // Exclude the camera link itself, including its primary address.
+        // Other wired uplinks remain valid re-stream output choices.
+        if !row.is_up
+            || camera_mac.as_ref().is_some_and(|camera| {
+                super::device_registry::canonical_mac(&row.mac).as_ref() == Some(camera)
+            })
+        {
             continue;
         }
         let candidates: Vec<_> = metadata
@@ -211,7 +230,7 @@ pub(crate) async fn list(adopted: &HashSet<String>) -> Result<Vec<BindInterface>
             });
         }
     }
-    Ok(result)
+    result
 }
 
 pub(crate) async fn migrate(config: &crate::config::AppConfig) -> Result<(), AppError> {
@@ -221,7 +240,7 @@ pub(crate) async fn migrate(config: &crate::config::AppConfig) -> Result<(), App
     }
     let adopted = settings.adopted_subnets.into_values().collect();
     // Failed/ambiguous observations retain the original unavailable selection.
-    if let Ok(interfaces) = list(&adopted).await {
+    if let Ok(interfaces) = list(&adopted, None).await {
         config.migrate_bind_ids(&interfaces)?;
     }
     Ok(())
@@ -350,6 +369,51 @@ mod tests {
         );
         assert!(select(&rows, Some("missing"), "Old alias").is_err());
         assert!(select(&[rows[0].clone(), rows[0].clone()], None, "Renamed").is_err());
+    }
+
+    #[test]
+    fn camera_adapter_is_not_an_output_even_with_a_usable_primary_address() {
+        let mut camera = row(
+            "camera",
+            "Renamed Camera Port",
+            &["192.168.0.100", "172.31.169.100"],
+        );
+        camera.mac = "40:c2:ba:cf:d5:75".into();
+        let mut uplink = row("uplink", "Ethernet 2", &["198.51.100.2"]);
+        uplink.mac = "40:c2:ba:cf:d5:76".into();
+        let mut wifi = row("wifi", "Wi-Fi", &["203.0.113.2"]);
+        wifi.mac = "40:c2:ba:cf:d5:77".into();
+        let rows = vec![camera, uplink, wifi];
+        let metadata: Vec<_> = rows
+            .iter()
+            .map(|r| interface::InterfaceInfo {
+                name: r.alias.clone(),
+                display_name: r.alias.clone(),
+                description: String::new(),
+                ips: r.ips.clone(),
+                mac: r.mac.clone(),
+                is_up: true,
+                is_ethernet: r.guid != "wifi",
+                is_wifi: r.guid == "wifi",
+                is_vpn: false,
+                is_virtual: false,
+            })
+            .collect();
+        let adopted = HashSet::from(["172.31.169.100".into()]);
+        let options = bind_options(&rows, &metadata, &adopted, Some("40-C2-BA-CF-D5-75"));
+        assert_eq!(
+            options.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(),
+            ["uplink", "wifi"]
+        );
+        // Changing the selected camera port changes only that exclusion.
+        let options = bind_options(&rows, &metadata, &adopted, Some(&rows[1].mac));
+        assert_eq!(
+            options.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(),
+            ["camera", "wifi"]
+        );
+        // Migration can still identify an older saved binding without offering
+        // it as a new choice or silently changing it to a wildcard listener.
+        assert_eq!(bind_options(&rows, &metadata, &adopted, None).len(), 3);
     }
     #[test]
     fn unrelated_changes_and_failures_retire_inventory() {

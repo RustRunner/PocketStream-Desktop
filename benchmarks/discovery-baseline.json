@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "id": "discovery-0.6.16",
+  "accepted_version": "0.6.16",
+  "local_installer_sha256": "077c8a6a7d5201e4d9add8c6b6ce161db439314ed51f8a0ca2d5450881e1e8b4",
+  "reference": {
+    "version": "0.6.14",
+    "link_up_local": "2026-10-27 19:29:53",
+    "fixture": "tests/fixtures/discovery-reference-0.6.14.json",
+    "note": "Last observed successful connection run. Discovery implementation is unchanged in 0.6.16; later changes concern UI and re-stream choices. This is one reference run, not a percentile estimate."
+  },
+  "environment": {
+    "os": "Windows",
+    "link_speed_mbps": 100,
+    "adapter_mac": "40:c2:ba:cf:d5:75",
+    "primary_cidr": "192.168.0.100/24",
+    "mode": "static_auto",
+    "preparation": "Use the same host and camera/PTU unit; app listening before cable insertion; adopted secondary addresses removed; retain cached identities; no added network probes. Connect one cable and leave it connected for at least 180 seconds."
+  },
+  "clock": "Local log timestamps, one-second precision; compare a single connection attempt without wall-clock changes.",
+  "timing_allowance_seconds": 5,
+  "scan_dispatch_budget_seconds": 2,
+  "observation_window_seconds": 180,
+  "required_adoptions": 2,
+  "max_link_drops": 0,
+  "max_offline_transitions": 0,
+  "max_warnings_or_errors": 0,
+  "devices": [
+    {
+      "key": "camera",
+      "ip": "172.31.169.84",
+      "mac": "40:cd:3a:03:28:e2",
+      "subnet": "172.31.169.0/24",
+      "required_ports": [
+        22,
+        80,
+        554,
+        8080
+      ],
+      "observed_seconds": {
+        "discovered": 3,
+        "frontend_discovered": 3,
+        "adopted": 18,
+        "scan_started": 18,
+        "scan_finished": 21
+      }
+    },
+    {
+      "key": "unidentified",
+      "ip": "192.168.1.74",
+      "mac": "08:df:ec:22:01:77",
+      "subnet": "192.168.1.0/24",
+      "required_ports": [],
+      "observed_seconds": {
+        "discovered": 7,
+        "frontend_discovered": 7,
+        "adopted": 46,
+        "scan_started": 46,
+        "scan_finished": 48
+      }
+    },
+    {
+      "key": "ptu",
+      "ip": "192.168.1.202",
+      "mac": "fc:68:3e:22:05:28",
+      "subnet": "192.168.1.0/24",
+      "required_ports": [
+        80
+      ],
+      "observed_seconds": {
+        "discovered": 49,
+        "frontend_discovered": 49,
+        "adopted": 46,
+        "scan_started": 49,
+        "scan_finished": 51
+      }
+    }
+  ],
+  "invariants": [
+    "Scan each verified IP as soon as its route is usable; one slow peer must not block another scan.",
+    "Adoption must not require open ports; the unidentified peer exposes the PTU subnet.",
+    "No fixed sleep after source readiness; retain readiness, identity, conflict and rollback checks.",
+    "Primary Host IP first; secondary rows and node identities keep their presentation order; auto tags survive peer presence changes."
+  ],
+  "update_policy": "Keep this baseline fixed when testing later versions. Relaxing limits requires an explained review and fresh comparable evidence; never regenerate limits automatically from a failing run."
+}

@@ -11,7 +11,7 @@ const context = JSON.parse(fs.readFileSync(contextPath, "utf8").replace(/^\uFEFF
 const readyOnly = process.argv[3] === "--ready-only";
 const closeOnly = process.argv[3] === "--close-only";
 const directory = path.dirname(contextPath);
-const result = { production_ui: true, replaced_assets_or_handlers: false, settings: "pending", address_removal_confirmation: "pending", dhcp_confirmation: "pending", errors: [] };
+const result = { production_ui: true, replaced_assets_or_handlers: false, settings: "pending", primary_address_controls: "pending", dhcp_confirmation: "pending", errors: [] };
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 let socket;
 let next = 0;
@@ -83,13 +83,12 @@ try {
   await until(`window.__TAURI__.core.invoke('get_config').then(c => c.stream.rtsp_port === 554 && !c.rtsp_server.enabled)`, "restored settings readback");
   result.settings = { status: "passed", action: "Save Settings", field: "stream.rtsp_port", values: [554, 13554, 554], readback: "real get_config IPC" };
 
-  console.log("Production address removal: actual Configure/Remove handler, native Cancel");
+  console.log("Production address controls: Configure retains the editable primary without a removal control");
   await evaluate(`document.querySelector('#btn-ip-config').click();`);
   await until(`document.querySelector('#ip-config-dialog').open && document.querySelector('#static-iface').value === ${JSON.stringify(context.alias)} && document.querySelector('#static-ip').value === ${JSON.stringify(context.expected_address)}`, "live selected adapter fields");
-  await evaluate(`document.querySelector('#btn-remove-primary-ip').click();`);
-  const address = await cancelNative(`Remove ${context.expected_address} from`);
-  await until(`document.querySelector('#ip-config-dialog').open && !document.querySelector('#btn-remove-primary-ip').disabled && document.querySelector('#static-ip').value === ${JSON.stringify(context.expected_address)}`, "address Cancel leaves dialog/address unchanged");
-  result.address_removal_confirmation = { status: "passed", path: "Configure > Remove primary", native: address, observed: "dialog remained open; original address field preserved" };
+  const primaryControls = await evaluate(`({ removal: !!document.querySelector('#btn-remove-primary-ip'), editable: !document.querySelector('#static-ip').disabled, listed_as_secondary: document.querySelector('#secondary-ip-list').textContent.includes(${JSON.stringify(context.expected_address)}) })`);
+  if (primaryControls.removal || !primaryControls.editable || primaryControls.listed_as_secondary) throw Error("Primary address controls did not match the protected-primary layout");
+  result.primary_address_controls = { status: "passed", path: "Configure > Primary IP", observed: "primary remains editable and has no removal action" };
 
   console.log("Production DHCP: actual radio/Close handler, backend warning, native Cancel");
   await evaluate(`document.querySelector('#ip-mode-dhcp').click(); document.querySelector('#ip-config-close').click();`);
@@ -102,7 +101,7 @@ try {
   await until(`!document.querySelector('#ip-config-dialog').open`, "unchanged dialog closes without a write");
   const shot = await send("Page.captureScreenshot", { format: "png" });
   fs.writeFileSync(path.join(directory, "production-ui.png"), Buffer.from(shot.data, "base64"));
-  console.log("Production settings and both native Cancel workflows passed; discovery/playback/PTU remain separate gates");
+  console.log("Production settings, primary address controls and native DHCP Cancel passed; discovery/playback/PTU remain separate gates");
   }
 } catch (error) {
   result.errors.push(String(error)); process.exitCode = 1;

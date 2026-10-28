@@ -6,6 +6,11 @@ pub enum AppError {
     #[error("Network error: {0}")]
     Network(String),
 
+    /// The owned address is still settling; retry only after verified cleanup.
+    /// Keep the existing Network wire kind for frontend compatibility.
+    #[error("Network error: {0}")]
+    AddressNotReady(String),
+
     /// The OS-native packet-capture backend (PacketMonitor) is not
     /// usable on this machine — either the API is absent (Windows below
     /// the PacketMonitor floor) or a live capture-start failure. Carries
@@ -42,7 +47,7 @@ impl AppError {
     /// these strings are part of the IPC contract.
     pub fn kind(&self) -> &'static str {
         match self {
-            AppError::Network(_) => "Network",
+            AppError::Network(_) | AppError::AddressNotReady(_) => "Network",
             AppError::DiscoveryUnavailable(_) => "DiscoveryUnavailable",
             AppError::Stream(_) => "Stream",
             AppError::Config(_) => "Config",
@@ -78,6 +83,18 @@ mod tests {
     use super::*;
 
     // ── Display ─────────────────────────────────────────────────────
+
+    #[test]
+    fn pending_address_keeps_network_wire_kind_and_useful_diagnostic() {
+        let err =
+            AppError::AddressNotReady("source still tentative after readiness deadline".into());
+        let value = serde_json::to_value(&err).unwrap();
+        assert_eq!(value["kind"], "Network");
+        assert_eq!(
+            value["message"],
+            "Network error: source still tentative after readiness deadline"
+        );
+    }
 
     #[test]
     fn display_network_error() {

@@ -5,7 +5,7 @@
  * the registry in Static-Manual mode and persist across mode toggles)
  * and removes any node from the registry — manual or discovered.
  *
- * Triggered by clicking the "Nodes" card title.
+ * Triggered by the Nodes card's Configure button.
  */
 
 import * as api from "./tauri-api.ts";
@@ -233,12 +233,6 @@ export function setupCacheDialog(): void {
   // Card-footer Configure button — mirrors the Hosts card's IP Config
   // button (same placement, same `text-btn` style).
   $<HTMLButtonElement>("#btn-nodes-config").addEventListener("click", openCacheDialog);
-  // Title click is a secondary entry point. Kept so users with the
-  // pre-button muscle memory still land in the right place.
-  const titleEl = $("#nodes-title");
-  if (titleEl) {
-    titleEl.addEventListener("click", openCacheDialog);
-  }
 
   const dialog = $<HTMLDialogElement>("#cache-dialog");
   if (!dialog) return;
