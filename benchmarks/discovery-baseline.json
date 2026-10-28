@@ -82,5 +82,6 @@
     "No fixed sleep after source readiness; retain readiness, identity, conflict and rollback checks.",
     "Primary Host IP first; secondary rows and node identities keep their presentation order; auto tags survive peer presence changes."
   ],
-  "update_policy": "Keep this baseline fixed when testing later versions. Relaxing limits requires an explained review and fresh comparable evidence; never regenerate limits automatically from a failing run."
+  "update_policy": "Keep this baseline fixed when testing later versions. Relaxing limits requires an explained review and fresh comparable evidence; never regenerate limits automatically from a failing run.",
+  "release_version": "0.6.8"
 }

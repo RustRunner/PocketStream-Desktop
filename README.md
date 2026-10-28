@@ -112,7 +112,7 @@ The 46-command contract now includes `list_bind_interfaces`. [Earlier applicatio
 
 #### Discovery performance baseline
 
-[The fixed 0.6.16 baseline](benchmarks/discovery-baseline.json) is the comparison point for future discovery changes. Its hardware timings come from the successful 0.6.14 watch on October 27, 2026; the discovery implementation is unchanged in 0.6.16. [The retained diagnostic extract](tests/fixtures/discovery-reference-0.6.14.json) records the measurement provenance. These are log event timings from one run, not rendered-frame timings or a statistical percentile.
+[The fixed local-build 0.6.16 baseline](benchmarks/discovery-baseline.json) is the comparison point for future discovery changes, including public release v0.6.8. The local test-build numbers are retained as measurement provenance. Its hardware timings come from the successful 0.6.14 watch on October 27, 2026; the discovery implementation is unchanged in 0.6.16. [The retained diagnostic extract](tests/fixtures/discovery-reference-0.6.14.json) records the measurement provenance. These are log event timings from one run, not rendered-frame timings or a statistical percentile.
 
 | Device | First observed | Subnet ready | Ports ready | Maximum ports-ready time |
 |---|---:|---:|---:|---:|
