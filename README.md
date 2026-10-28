@@ -61,7 +61,7 @@ If a camera shares the PC's Wi-Fi IP, turning off the Wi-Fi radio may leave Wind
 
 ## System Requirements
 
-- Windows 10/11
+- Windows 11
 - Ethernet (for direct camera connection)
 - IP camera configured for static IP (program can detect a previous DHCP lease if it persists on the camera)
 - GStreamer runtime (bundled with the application)
