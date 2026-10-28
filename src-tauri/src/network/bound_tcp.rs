@@ -148,9 +148,17 @@ async fn serve(
     // Dropping JoinSet aborts every forwarding task, including pending connects.
 }
 
-fn bind_socket(path: &ReadyPath) -> std::io::Result<TcpSocket> {
+/// Bind both the applied source and the outgoing interface. A default-route
+/// lookup cannot select a path for this explicitly bound socket.
+pub(super) fn bind_socket(source: std::net::Ipv4Addr, index: u32) -> std::io::Result<TcpSocket> {
+    if index == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Missing Ethernet interface index",
+        ));
+    }
     let socket = TcpSocket::new_v4()?;
-    socket.bind(SocketAddr::V4(SocketAddrV4::new(path.source, 0)))?;
+    socket.bind(SocketAddr::V4(SocketAddrV4::new(source, 0)))?;
     #[cfg(windows)]
     {
         use std::os::windows::io::AsRawSocket;
@@ -158,7 +166,7 @@ fn bind_socket(path: &ReadyPath) -> std::io::Result<TcpSocket> {
             setsockopt, WSAGetLastError, IPPROTO_IP, IP_UNICAST_IF, SOCKET_ERROR,
         };
         // IP_UNICAST_IF expects a DWORD interface index in network byte order.
-        let index = path.index.to_be();
+        let index = index.to_be();
         // The socket and option bytes remain valid throughout this call.
         let result = unsafe {
             setsockopt(
@@ -184,7 +192,7 @@ async fn forward(
     gate: Arc<Gate>,
 ) -> Result<(), AppError> {
     gate.check()?;
-    let socket = bind_socket(&gate.path).map_err(transport_error)?;
+    let socket = bind_socket(gate.path.source, gate.path.index).map_err(transport_error)?;
     let mut camera = tokio::time::timeout(CONNECT_TIMEOUT, socket.connect(destination.into()))
         .await
         .map_err(|_| AppError::Network("Camera TCP connection timed out on Ethernet".into()))?
@@ -222,6 +230,34 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shared_tcp_binding_sets_source_and_explicit_interface() {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{getsockopt, IPPROTO_IP, IP_UNICAST_IF};
+        let source = std::net::Ipv4Addr::LOCALHOST;
+        let index = crate::network::route::egress_index(source).unwrap();
+        let socket = bind_socket(source, index).unwrap();
+        assert_eq!(socket.local_addr().unwrap().ip(), source);
+        let mut observed = 0u32;
+        let mut size = std::mem::size_of_val(&observed) as i32;
+        assert_eq!(
+            unsafe {
+                getsockopt(
+                    socket.as_raw_socket() as _,
+                    IPPROTO_IP,
+                    IP_UNICAST_IF,
+                    (&mut observed as *mut u32).cast(),
+                    &mut size,
+                )
+            },
+            0
+        );
+        // Winsock returns this option in host order, unlike its setter.
+        assert_eq!(observed, index);
+        assert!(bind_socket(source, 0).is_err());
+    }
 
     async fn closed(socket: &mut TcpStream) {
         let mut byte = [0];

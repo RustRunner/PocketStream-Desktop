@@ -98,7 +98,9 @@ impl ScanWorkflow {
                 expected_mac: Some(key.clone()),
                 ip: result.ip.clone(),
             };
-            let Ok(path) = readiness.camera_path_now(&target, config, false) else {
+            // Scanner sockets bind source AND IP_UNICAST_IF. Validate that
+            // bound path; the external-browser default route is unrelated.
+            let Ok(path) = readiness.camera_path_now(&target, config, cfg!(windows)) else {
                 continue;
             };
             if fence.is_stale()

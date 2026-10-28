@@ -13,7 +13,16 @@ $script:recordBytes = 0
 function Is-Any($value) { return @($value).Count -eq 1 -and [string]$value -in @('Any','*') }
 function Same-Program($value) { return [string]::Equals([string]$value, $data.program, [StringComparison]::OrdinalIgnoreCase) }
 function All-Rules { return @(Get-NetFirewallRule -PolicyStore PersistentStore -ErrorAction Stop) }
-function Exact($role) { return @(All-Rules | Where-Object { $_.Name -eq $role.name }) }
+function Exact($role) {
+    try { return @(Get-NetFirewallRule -PolicyStore PersistentStore -Name ([WildcardPattern]::Escape([string]$role.name)) -ErrorAction Stop | Where-Object { $_.Name -eq $role.name }) }
+    catch {
+        # A missing InstanceID is the provider's exact-name zero-match result.
+        # Access, transport and other query failures must not become empty policy.
+        if ($_.CategoryInfo.Category -eq [Management.Automation.ErrorCategory]::ObjectNotFound -and
+            $_.FullyQualifiedErrorId -ceq 'CmdletizationQuery_NotFound_InstanceID,Get-NetFirewallRule') { return @() }
+        throw
+    }
+}
 function Shape($rule) {
     $app = @($rule | Get-NetFirewallApplicationFilter -ErrorAction Stop)
     $port = @($rule | Get-NetFirewallPortFilter -ErrorAction Stop)
@@ -49,9 +58,13 @@ function Verified($s, $role, [int]$port, [string]$alias, [bool]$enabled) {
         @($s.interface).Count -eq 1 -and [string]$s.interface -ceq $alias -and ($s.enabled -eq $(if ($enabled) {'True'} else {'False'}))
 }
 function Disable-Verified($rule) {
-    $script:mutated = $true
-    $rule | Set-NetFirewallRule -Enabled False -ErrorAction Stop
-    $again = @(All-Rules | Where-Object { $_.Name -eq $rule.Name })
+    if ([string]$rule.Enabled -ne 'False') {
+        $script:mutated = $true
+        $rule | Set-NetFirewallRule -Enabled False -ErrorAction Stop
+    }
+    # Even the no-write path needs a fresh read: a cached disabled row is not
+    # evidence that another writer has left the rule disabled.
+    $again = @(Exact @{name=$rule.Name})
     if ($again.Count -ne 1 -or [string]$again[0].Enabled -ne 'False') { throw 'Disable readback failed' }
 }
 function Selected-Alias {
@@ -162,6 +175,9 @@ try {
         $roles = @($data.roles | Where-Object { $_.role -ceq $data.operation.role })
         if ($roles.Count -ne 1) { throw 'Unknown rule role' }
     }
+    # Startup has already reconciled both roles, including independent failure
+    # handling, before inspecting legacy candidates. Do not repeat that work.
+    if ($mode -eq 'startup') { $roles = @() }
     foreach ($role in $roles) {
         $stage = 'ownership'
         $rules = @(Exact $role)

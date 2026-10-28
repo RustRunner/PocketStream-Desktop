@@ -130,36 +130,112 @@ pub(super) async fn execute(
     operation: Operation,
     cancel: super::native_runner::Cancellation,
 ) -> (super::local_executor::Completion, FirewallOutcome) {
-    use super::local_executor::{Completion, Outcome};
-    use super::native_runner::{NativeProcessRunner, Termination};
+    use super::native_runner::NativeProcessRunner;
     let process =
         tokio::task::spawn_blocking(move || NativeProcessRunner::run_firewall(operation, cancel))
             .await;
-    let parsed = process.ok().and_then(Result::ok).and_then(|p| {
-        if p.termination != Termination::Exited
-            || !p.observed_tree_exited
-            || p.stdout.truncated
-            || p.stderr.truncated
-            || p.stdout.read_failed
-            || p.stderr.read_failed
-        {
-            return None;
+    match process {
+        Ok(Ok(process)) => evaluate_process(process),
+        Ok(Err(error)) => {
+            log::error!("event=firewall_native_setup error={error}");
+            unavailable(
+                "native_setup",
+                "Firewall process setup failed; native recovery is required",
+                None,
+            )
         }
-        let report: Report = serde_json::from_slice(&p.stdout.bytes).ok()?;
-        (report.version == 2
-            && report.ok == (p.exit_code == 0)
-            && report.stage.len() <= 64
-            && report.records.len() <= 64
-            && report.ok
-                == matches!(
-                    report.outcome,
-                    FirewallOutcome::Applied {
-                        verified_shape: true,
-                        ..
-                    } | FirewallOutcome::Inactive
-                ))
-        .then_some(report)
-    });
+        Err(error) => {
+            log::error!("event=firewall_native_task error={error}");
+            unavailable(
+                "native_task",
+                "Firewall worker failed; native recovery is required",
+                None,
+            )
+        }
+    }
+}
+
+#[cfg(windows)]
+fn unavailable(
+    stage: &str,
+    reason: &str,
+    observation: Option<serde_json::Value>,
+) -> (super::local_executor::Completion, FirewallOutcome) {
+    use super::local_executor::{Completion, Outcome};
+    let mut completion = Completion::new(Outcome::Uncertain, "firewall_result_unavailable");
+    completion.observation = observation;
+    (
+        completion,
+        FirewallOutcome::Failed {
+            stage: stage.into(),
+            reason: reason.into(),
+            uncertain: true,
+        },
+    )
+}
+
+#[cfg(windows)]
+fn evaluate_process(
+    p: super::native_runner::ProcessResult,
+) -> (super::local_executor::Completion, FirewallOutcome) {
+    use super::local_executor::{Completion, Outcome};
+    use super::native_runner::Termination;
+    log::info!(
+        "event=firewall_native_result exit={} termination={:?} elapsed_ms={} contained={} tree_exited={} stdout_truncated={} stderr_truncated={} stdout_read_failed={} stderr_read_failed={}",
+        p.exit_code, p.termination, p.elapsed.as_millis(), p.containment_verified_before_resume,
+        p.observed_tree_exited, p.stdout.truncated, p.stderr.truncated, p.stdout.read_failed, p.stderr.read_failed
+    );
+    let native = serde_json::json!({"exit_code":p.exit_code,"termination":format!("{:?}",p.termination),
+        "elapsed_ms":p.elapsed.as_millis(),"contained":p.containment_verified_before_resume,"tree_exited":p.observed_tree_exited,
+        "stdout_truncated":p.stdout.truncated,"stderr_truncated":p.stderr.truncated,
+        "stdout_read_failed":p.stdout.read_failed,"stderr_read_failed":p.stderr.read_failed});
+    let failure = match p.termination {
+        Termination::TimedOut => Some((
+            "native_timeout",
+            "Firewall policy timed out; native recovery is required",
+        )),
+        Termination::Canceled => Some((
+            "native_canceled",
+            "Firewall policy was canceled; native recovery is required",
+        )),
+        Termination::Exited if !p.observed_tree_exited || !p.containment_verified_before_resume => {
+            Some((
+                "native_containment",
+                "Firewall process containment is unverified; native recovery is required",
+            ))
+        }
+        Termination::Exited
+            if p.stdout.truncated
+                || p.stderr.truncated
+                || p.stdout.read_failed
+                || p.stderr.read_failed =>
+        {
+            Some((
+                "native_output",
+                "Firewall output was incomplete; native recovery is required",
+            ))
+        }
+        Termination::Exited => None,
+    };
+    if let Some((stage, reason)) = failure {
+        return unavailable(stage, reason, Some(native));
+    }
+    let parsed = serde_json::from_slice::<Report>(&p.stdout.bytes)
+        .ok()
+        .filter(|report| {
+            report.version == 2
+                && report.ok == (p.exit_code == 0)
+                && report.stage.len() <= 64
+                && report.records.len() <= 64
+                && report.ok
+                    == matches!(
+                        report.outcome,
+                        FirewallOutcome::Applied {
+                            verified_shape: true,
+                            ..
+                        } | FirewallOutcome::Inactive
+                    )
+        });
     match parsed {
         Some(report) => {
             let uncertain = matches!(
@@ -180,19 +256,14 @@ pub(super) async fn execute(
                 "firewall_policy",
             );
             completion.observation = Some(
-                serde_json::json!({"report":{"stage":report.stage,"mutated":report.mutated},"records":report.records,"firewall":report.outcome}),
+                serde_json::json!({"native":native,"report":{"stage":report.stage,"mutated":report.mutated},"records":report.records,"firewall":report.outcome}),
             );
             (completion, report.outcome)
         }
-        None => (
-            Completion::new(Outcome::Uncertain, "firewall_result_unavailable"),
-            FirewallOutcome::Failed {
-                stage: "native_result".into(),
-                reason:
-                    "Firewall result unavailable; restart with administrator access to reconcile"
-                        .into(),
-                uncertain: true,
-            },
+        None => unavailable(
+            "native_report",
+            "Firewall report was invalid; native recovery is required",
+            Some(native),
         ),
     }
 }
@@ -250,6 +321,128 @@ pub(crate) async fn disable(rule: FirewallRule) -> FirewallOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    fn process() -> super::super::native_runner::ProcessResult {
+        use super::super::native_runner::{Captured, ProcessResult, Termination};
+        ProcessResult {
+            exit_code: 0, termination: Termination::Exited,
+            stdout: Captured { bytes: br#"{"version":2,"ok":true,"stage":"verified","mutated":false,"outcome":{"state":"inactive"},"records":[]}"#.to_vec(), ..Default::default() },
+            stderr: Captured::default(), observed_tree_pids: vec![123], observed_tree_exited: true,
+            containment_verified_before_resume: true, elapsed: std::time::Duration::from_secs(30),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn killed_firewall_result_retains_uncertainty_and_actual_termination() {
+        use super::super::{local_executor::Outcome, native_runner::Termination};
+        for (termination, stage) in [
+            (Termination::TimedOut, "native_timeout"),
+            (Termination::Canceled, "native_canceled"),
+        ] {
+            let mut p = process();
+            p.termination = termination;
+            // Even a buffered successful report cannot account for killed work.
+            let (completion, result) = evaluate_process(p);
+            assert_eq!(completion.outcome, Outcome::Uncertain);
+            assert!(
+                matches!(result, FirewallOutcome::Failed { stage:s, uncertain:true,.. } if s == stage)
+            );
+            assert_eq!(
+                completion.observation.unwrap()["termination"],
+                format!("{termination:?}")
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn invalid_or_incomplete_firewall_evidence_never_becomes_reconciled() {
+        use super::super::local_executor::Outcome;
+        for case in 0..8 {
+            let mut p = process();
+            match case {
+                0 => p.stdout.bytes = b"not JSON".to_vec(),
+                1 => p.exit_code = 71,
+                2 => p.observed_tree_exited = false,
+                3 => p.containment_verified_before_resume = false,
+                4 => p.stdout.truncated = true,
+                5 => p.stderr.truncated = true,
+                6 => p.stdout.read_failed = true,
+                _ => p.stderr.read_failed = true,
+            }
+            let (completion, result) = evaluate_process(p);
+            assert_eq!(completion.outcome, Outcome::Uncertain, "case {case}");
+            assert!(matches!(
+                result,
+                FirewallOutcome::Failed {
+                    uncertain: true,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verified_firewall_report_preserves_completion_and_policy_failure() {
+        use super::super::local_executor::Outcome;
+        let (completion, result) = evaluate_process(process());
+        assert_eq!(completion.outcome, Outcome::Completed);
+        assert_eq!(result, FirewallOutcome::Inactive);
+        for uncertain in [false, true] {
+            let mut p = process();
+            p.exit_code = 71;
+            p.stdout.bytes=serde_json::to_vec(&serde_json::json!({"version":2,"ok":false,"stage":"disable","mutated":true,
+                "outcome":{"state":"failed","stage":"disable","reason":"provider failed","uncertain":uncertain},"records":[]})).unwrap();
+            let (completion, result) = evaluate_process(p);
+            assert_eq!(
+                completion.outcome,
+                if uncertain {
+                    Outcome::Uncertain
+                } else {
+                    Outcome::Failed
+                }
+            );
+            assert!(matches!(result,FirewallOutcome::Failed{stage,..} if stage=="disable"));
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn firewall_timeout_blocks_address_admission_until_verified_reconciliation() {
+        use super::super::{
+            local_executor::{AdmissionError, LocalExecutor, Outcome},
+            native_runner::Termination,
+        };
+        let executor = LocalExecutor::for_serialized_writers();
+        let pending = executor
+            .reconcile(|_| async {
+                let mut p = process();
+                p.termination = Termination::TimedOut;
+                evaluate_process(p).0
+            })
+            .unwrap();
+        let id = pending.id;
+        assert_eq!(pending.wait().await.unwrap().outcome, Outcome::Uncertain);
+        assert_eq!(
+            executor.available(),
+            Err(AdmissionError::ReconciliationRequired)
+        );
+        assert_eq!(
+            executor.acknowledge(id),
+            Err(AdmissionError::ReconciliationRequired)
+        );
+        let (verified, _) = evaluate_process(process());
+        executor
+            .reconcile(|_| async move { verified })
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        assert_eq!(executor.available(), Ok(()));
+    }
     #[test]
     fn roles_and_wire_tags_are_stable() {
         assert_eq!(ROLES[0].name, "PocketStream.RTSP.Inbound.v2");

@@ -16,6 +16,8 @@ function Assert($condition,[string]$reason) { if (!$condition) { throw $reason }
 function Reset {
     $script:rules=[Collections.Generic.List[object]]::new()
     $script:writeCount=0; $script:failSet=0; $script:failQuery=$false; $script:failRemove=$false
+    $script:fullQueries=0; $script:namedQueries=0; $script:filterReads=0
+    $script:failNamedQuery=$false; $script:foreignNotFound=$false; $script:changeReadback=$false
     $script:adapter=[pscustomobject]@{InterfaceGuid='{01234567-89ab-cdef-0123-456789abcdef}';MacAddress='00-11-22-33-44-55';ifIndex=15;Status='Up';Name='Renamed Ethernet'}
 }
 function Rule([string]$name,[int]$role=0,[string]$program='Any',[string]$enabled='True') {
@@ -25,11 +27,28 @@ function Rule([string]$name,[int]$role=0,[string]$program='Any',[string]$enabled
         OverrideBlockRules=$false;LooseSourceMapping=$false;LocalOnlyMapping=$false;DynamicTarget='Any';Platform=@('Any');RemoteDynamicKeywordAddresses=@();
         EdgeTraversalPolicy='Block';Authentication='NotRequired';Encryption='NotRequired';LocalUser='Any';RemoteUser='Any';RemoteMachine='Any'}
 }
-function Get-NetFirewallRule { [CmdletBinding()]param($PolicyStore) if($script:failQuery){throw 'fake query failure'}; return $script:rules.ToArray() }
+function Get-NetFirewallRule {
+    [CmdletBinding()]param($PolicyStore,[string]$Name)
+    if($script:failQuery){throw 'fake query failure'}
+    if($Name) {
+        $script:namedQueries++
+        if($script:failNamedQuery){throw 'genuine named provider failure'}
+        if($script:foreignNotFound){$PSCmdlet.ThrowTerminatingError([Management.Automation.ErrorRecord]::new([Management.Automation.ItemNotFoundException]::new('provider object unavailable'),'ProviderQueryFailure',[Management.Automation.ErrorCategory]::ObjectNotFound,$Name))}
+        $matches=@($script:rules | Where-Object { $_.Name -like $Name })
+        if(!$matches.Count) {
+            $err=[Management.Automation.ErrorRecord]::new([Management.Automation.ItemNotFoundException]::new('missing name'),'CmdletizationQuery_NotFound_InstanceID',[Management.Automation.ErrorCategory]::ObjectNotFound,$Name)
+            $PSCmdlet.ThrowTerminatingError($err)
+        }
+        if($script:changeReadback -and $script:namedQueries -eq 2){$matches[0].Enabled='True'}
+        return $matches
+    }
+    $script:fullQueries++
+    return $script:rules.ToArray()
+}
 function Get-NetAdapter { [CmdletBinding()]param([switch]$IncludeHidden) return $script:adapter }
 foreach($name in @('Application','Port','Address','Interface','InterfaceType','Service','Security')) {
     Set-Item -LiteralPath ('Function:Get-NetFirewall'+$name+'Filter') -Value {
-        [CmdletBinding()]param([Parameter(ValueFromPipeline=$true)]$InputObject) process {return $InputObject}
+        [CmdletBinding()]param([Parameter(ValueFromPipeline=$true)]$InputObject) process {$script:filterReads++;return $InputObject}
     }
 }
 function Set-NetFirewallRule {
@@ -61,7 +80,7 @@ function Run([string]$mode,[string]$role='rtsp',[int]$port=13554,$identity=$null
 }
 $passed=[Collections.Generic.List[string]]::new()
 Reset
-$script:rules.Add((Rule 'legacy-tcp-1'));$script:rules.Add((Rule 'legacy-tcp-2'));$script:rules.Add((Rule 'legacy-srt' 1 'Any' 'False'));$script:rules.Add((Rule 'legacy-program-scoped' 1 $program))
+$script:rules.Add((Rule 'legacy-tcp-1'));$script:rules.Add((Rule 'legacy-tcp[2]*?`'));$script:rules.Add((Rule 'legacy-srt' 1 'Any' 'False'));$script:rules.Add((Rule 'legacy-program-scoped' 1 $program))
 $block=Rule 'Query User deny';$block.Action='Block';$block.Program=$program;$script:rules.Add($block)
 $foreign=Rule 'foreign' 0 'C:\Other\app.exe';$script:rules.Add($foreign)
 $r=Run install
@@ -116,4 +135,33 @@ Assert (!$r.ok -and $r.outcome.uncertain) 'Cleaning the last template hid an unr
 Assert (@($script:rules | Where-Object {$_.Enabled -eq 'True'}).Count -eq 0) 'Failed migration re-enabled a rule'
 $script:failRemove=$false;Assert (Run install).ok 'Migration removal retry failed'
 $passed.Add('partial migration remains uncertain until all native effects are reconciled')
+Reset;Assert (Run install).ok 'Load fixture setup'
+foreach($i in 1..602){$other=Rule ('unrelated-'+$i) 0 'C:\Other\app.exe';$other.DisplayName='Other product';$script:rules.Add($other)}
+$block=Rule 'preserved-block' 0 $program;$block.Action='Block';$script:rules.Add($block)
+foreach($sample in @('cold policy pass','warm policy pass')) {
+    $script:writeCount=0;$script:fullQueries=0;$script:namedQueries=0;$script:filterReads=0
+    $r=Run startup
+    Assert $r.ok ($sample+' failed')
+    Assert ($script:rules.Count -eq 605 -and $block.Enabled -eq 'True') 'Substantial existing policy was changed'
+    Assert ($script:fullQueries -eq 1 -and $script:filterReads -eq 14) 'Startup repeated full inventories or owned-rule Shape reads'
+    Assert ($script:writeCount -eq 0 -and !$r.mutated) 'Startup rewrote already-disabled rules'
+    Assert ($script:namedQueries -eq 4) 'Startup omitted fresh exact-name readback'
+}
+$passed.Add('cold/warm startup with 605 rules uses one legacy inventory, two Shapes, fresh readback and no redundant disabled writes')
+Reset;$r=Run startup
+Assert ($r.ok -and $script:namedQueries -eq 2 -and $script:writeCount -eq 0) 'Exact missing name did not remain distinct from provider failure'
+$script:failNamedQuery=$true;$r=Run startup
+Assert (!$r.ok -and $script:writeCount -eq 0) 'Genuine named-query failure became empty success'
+$script:failNamedQuery=$false;$script:foreignNotFound=$true;$r=Run startup
+Assert (!$r.ok -and $script:writeCount -eq 0) 'Unrelated ObjectNotFound became an empty rule set'
+$passed.Add('exact ObjectNotFound is empty; genuine targeted provider failure fails closed')
+Reset;Assert (Run install).ok 'Readback fixture setup';$script:namedQueries=0;$script:writeCount=0;$script:changeReadback=$true
+$r=Run startup
+Assert (!$r.ok -and $script:writeCount -eq 0) 'Concurrent enable passed a cached disabled observation'
+$passed.Add('already-disabled startup still requires fresh disabled readback')
+Reset;Assert (Run install).ok 'Conflict fixture setup'
+$script:rules[0].Action='Block';$script:rules[0].Enabled='True';$script:rules[1].Enabled='True';$script:writeCount=0
+$r=Run startup
+Assert (!$r.ok -and $script:rules[0].Enabled -eq 'True' -and $script:rules[1].Enabled -eq 'False' -and $script:writeCount -eq 1) 'Conflict changed a Block or stranded another owned allow'
+$passed.Add('startup preserves exact-name Block conflict while disabling the other stale owned allow')
 [Console]::Out.WriteLine((@{passed=$passed.ToArray();native_policy_mutations=0;provider='pure fake'} | ConvertTo-Json -Compress))

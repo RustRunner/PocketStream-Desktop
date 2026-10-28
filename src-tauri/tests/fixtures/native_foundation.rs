@@ -1,7 +1,9 @@
-//! Explicit, read-only Windows process fixtures for prerequisite A-S2/A-S4.
+//! Explicit Windows process fixtures for prerequisite A-S2/A-S4 and v0.6.8 reads.
 //! Loaded in the network test module to reuse its private fake seams.
 //! Kept out of ordinary unit runs. Native addresses are existing AddressIo /
-//! AdoptOps fakes; only private nonce-named mutexes and child jobs touch Windows.
+//! AdoptOps fakes. The separately opted-in v0.6.8 diagnostic sends bounded TCP
+//! probes on two already applied /24s and verifies fresh selected-interface MACs;
+//! it never configures an adapter, sends PTU commands or qualifies B-S1.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,6 +25,80 @@ use super::native_runner::{
 };
 use super::AddressOps;
 use crate::config::{AppConfig, AppSettings, NetworkMode};
+
+#[tokio::test]
+#[ignore = "Explicit v0.6.8 target read-only bound /24 probes; no adapter changes or PTU commands"]
+async fn diagnose_v068_bound_discovery_read_only() {
+    assert_eq!(
+        std::env::var("POCKETSTREAM_V068_BOUND_READ").as_deref(),
+        Ok("1")
+    );
+    let started = Instant::now();
+    let before = interface::read_native().await.unwrap();
+    let native = before.iter().find(|a| a.index == 13).unwrap();
+    assert_eq!(
+        native.identity().guid,
+        "86193159-40f0-4a29-a389-c4c0b1945e82"
+    );
+    assert_eq!(native.identity().mac, "00:22:20:3a:e3:b3");
+    assert!(native.is_up);
+    let adapters = interface::list_all_adapters().await.unwrap();
+    let selected = adapters
+        .iter()
+        .find(|a| a.mac.eq_ignore_ascii_case(&native.mac))
+        .unwrap();
+    assert!(
+        selected.is_up
+            && selected.is_ethernet
+            && !selected.is_wifi
+            && !selected.is_virtual
+            && !selected.is_vpn
+    );
+    let mut records = Vec::new();
+    for (subnet, source) in [
+        ("192.168.1.0/24", "192.168.1.100"),
+        ("10.131.50.0/24", "10.131.50.100"),
+    ] {
+        assert!(native
+            .ips
+            .iter()
+            .any(|a| a.address == source && a.prefix == 24));
+        println!("BOUND_READ_BEGIN={subnet}");
+        let results = super::scanner::scan(
+            subnet,
+            super::scanner::ScanScope {
+                index: 13,
+                ips: selected.ips.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        for result in results.into_iter().filter(|r| r.reachable) {
+            let target = result.ip.parse().unwrap();
+            let source = result.source.as_ref().unwrap().parse().unwrap();
+            let mac = super::arp::fresh_resolve_mac(target, source, 13).await;
+            records.push(json!({"ip":result.ip,"source":result.source,"interface_index":13,
+                "ports":result.open_ports,"fresh_mac_after_probe":mac.as_ref().ok().and_then(|m|m.clone()),
+                "fresh_resolution_error":mac.err().map(|e|e.to_string())}));
+        }
+    }
+    let after = interface::read_native().await.unwrap();
+    let current = after.iter().find(|a| a.index == 13).unwrap();
+    assert_eq!(current.guid, native.guid);
+    assert_eq!(current.mac, native.mac);
+    assert!(current.is_up);
+    assert_eq!(
+        serde_json::to_value(&current.ips).unwrap(),
+        serde_json::to_value(&native.ips).unwrap()
+    );
+    println!(
+        "BOUND_READ_RESULT={}",
+        json!({"elapsed_ms":started.elapsed().as_millis(),"records":records,
+        "adapter_configuration_unchanged":true,"ptu_commands":0,"B_S1_credit":false,
+        "scope":"diagnostic TCP probes plus fresh selected-interface neighbor verification; not unassisted discovery qualification"})
+    );
+}
 
 fn evidence_root() -> &'static Path {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();

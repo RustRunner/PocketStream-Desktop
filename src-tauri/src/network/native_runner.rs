@@ -330,6 +330,44 @@ fn observe_tree(job: &Handle, processes: &mut BTreeMap<u32, Handle>) -> std::io:
 
 pub(super) struct NativeProcessRunner;
 impl NativeProcessRunner {
+    // Diagnostic only: reuse the real runner/budget. The read-only variant
+    // intercepts every writer; the separate provider test needs explicit opt-in.
+    #[cfg(test)]
+    fn firewall_startup_probe(read_only: bool) -> Result<ProcessResult, String> {
+        let script = super::firewall::SCRIPT.replace(
+            "# @TRUSTED_IMPORTS_END@",
+            include_str!("../../tests/fixtures/firewall-read-only-v1.ps1"),
+        );
+        let script = script.replace(
+            "function All-Rules { return @(Get-NetFirewallRule -PolicyStore PersistentStore -ErrorAction Stop) }",
+            "function All-Rules { $w=[Diagnostics.Stopwatch]::StartNew(); try { return @(Get-NetFirewallRule -PolicyStore PersistentStore -ErrorAction Stop) } finally { [Console]::Error.WriteLine(('read_all_ms='+$w.ElapsedMilliseconds)) } }",
+        );
+        let script = script.replace(
+            "function Shape($rule) {",
+            "function Shape($rule) { [Console]::Error.WriteLine(('shape_begin='+$rule.Name)); $w=[Diagnostics.Stopwatch]::StartNew()",
+        ).replace(
+            "    if ($app.Count -ne 1",
+            "    [Console]::Error.WriteLine(('shape_ms='+$w.ElapsedMilliseconds))\n    if ($app.Count -ne 1",
+        );
+        let mut payload: serde_json::Value =
+            serde_json::from_slice(&super::firewall::Operation::Startup.payload()?)
+                .map_err(|e| e.to_string())?;
+        payload["program"] =
+            serde_json::json!(r"C:\Program Files\PocketStream Desktop\pocketstream-desktop.exe");
+        Self::run_inner(
+            if read_only {
+                &script
+            } else {
+                super::firewall::SCRIPT
+            },
+            serde_json::to_vec(&payload).map_err(|e| e.to_string())?,
+            Cancellation::default(),
+            Duration::from_secs(30),
+            None,
+        )
+        .map_err(|e| e.to_string())
+    }
+
     // There is no program/script/argument/environment-map entry point. The
     // qualification operation picks one fixed source and bounded JSON input.
     #[cfg(test)]
@@ -392,7 +430,13 @@ impl NativeProcessRunner {
             Duration::from_secs(30),
             None,
         )
-        .map_err(|_| "Trusted firewall process setup or containment failed".into())
+        .map_err(|error| {
+            format!(
+                "Trusted firewall process setup or containment failed ({:?}, Windows code {:?})",
+                error.kind(),
+                error.raw_os_error()
+            )
+        })
     }
 
     fn run_inner(
@@ -564,4 +608,47 @@ impl NativeProcessRunner {
             elapsed: start.elapsed(),
         })
     }
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "Explicit target read-only startup timing; all firewall writes intercepted"]
+fn qualify_firewall_startup_read_only() {
+    assert_eq!(
+        std::env::var("POCKETSTREAM_READ_ONLY_FIREWALL_PROBE").as_deref(),
+        Ok("1")
+    );
+    let p = NativeProcessRunner::firewall_startup_probe(true).unwrap();
+    print_firewall_probe(&p, true);
+    assert!(p.containment_verified_before_resume && p.observed_tree_exited);
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "Requires explicit approval: real startup disables of the two installed owned rules"]
+fn qualify_firewall_startup_provider() {
+    assert_eq!(
+        std::env::var("POCKETSTREAM_FIREWALL_PROVIDER_PROBE").as_deref(),
+        Ok("approved-disabled-installed-rules")
+    );
+    let p = NativeProcessRunner::firewall_startup_probe(false).unwrap();
+    print_firewall_probe(&p, false);
+    assert!(p.containment_verified_before_resume && p.observed_tree_exited);
+}
+
+#[cfg(test)]
+fn print_firewall_probe(p: &ProcessResult, read_only: bool) {
+    println!(
+        "FIREWALL_READ_PROBE={}",
+        serde_json::json!({
+            "termination":format!("{:?}",p.termination),"exit_code":p.exit_code,
+            "elapsed_ms":p.elapsed.as_millis(),"contained":p.containment_verified_before_resume,
+            "tree_exited":p.observed_tree_exited,"tree_pids":p.observed_tree_pids,
+            "stdout":String::from_utf8_lossy(&p.stdout.bytes),
+            "stderr":String::from_utf8_lossy(&p.stderr.bytes),
+            "stdout_truncated":p.stdout.truncated,"stderr_truncated":p.stderr.truncated,
+            "stdout_read_failed":p.stdout.read_failed,"stderr_read_failed":p.stderr.read_failed,
+            "firewall_writes_intercepted":read_only
+        })
+    );
 }

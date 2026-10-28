@@ -674,7 +674,7 @@ pub(super) async fn provoke_sweep(
     if params.fence.is_stale() {
         return;
     }
-    log::info!("Ping sweeping selected subnets to populate ARP");
+    log::info!("Soliciting selected subnets to populate ARP");
     ping_sweep_subnets(sweep_ips, &params.fence, deps).await;
 
     // One brief-lock snapshot for the whole merge pass (never lock per
@@ -711,14 +711,10 @@ pub(super) async fn provoke_sweep(
     }
 }
 
-/// Fast parallel ping sweep of all /24 subnets to provoke ARP responses.
-///
-/// Each ping is issued with `-S <ip_str>` so Windows uses that address as
-/// the source and therefore routes the packet out the adapter that owns
-/// it. Without this, a /24 that overlaps another interface (very common:
-/// 192.168.1.0/24 on both Ethernet-camera-network and home WiFi) can
-/// silently route out the wrong NIC — the Ethernet capture listener
-/// never sees the replies and passive devices on that subnet stay invisible.
+/// Solicit ARP on the selected adapter's /24s. On Windows, short TCP probes
+/// bind both source and interface, including when Wi-Fi wins the unbound route.
+/// Their connect result never establishes presence: the existing ARP capture
+/// and fresh-MAC verification pipeline remains the only admission path.
 pub(super) async fn ping_sweep_subnets(
     interface_ips: &[String],
     fence: &SweepFence,
@@ -727,14 +723,15 @@ pub(super) async fn ping_sweep_subnets(
     use tokio::sync::Semaphore;
     use tokio::task::JoinSet;
 
-    // ICMP has a separate process bound; it never takes TCP scan permits.
-    const MAX_CONCURRENT_PINGS: usize = 32;
-    let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_PINGS));
+    // Solicitation has its own bound and never takes device-scan permits.
+    const MAX_CONCURRENT_SOLICITATIONS: usize = 32;
+    let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_SOLICITATIONS));
     let mut join_set = JoinSet::new();
     let Some((_, index, adapter_fence)) = deps.selector.probe_scope(&deps.pending) else {
         return;
     };
     let mut solicited = false;
+    let local_ips = interface::all_local_ipv4();
     for ip_str in interface_ips {
         let Ok(ip) = ip_str.parse::<Ipv4Addr>() else {
             continue;
@@ -755,11 +752,15 @@ pub(super) async fn ping_sweep_subnets(
                 break;
             }
             let target = Ipv4Addr::new(o[0], o[1], o[2], last);
-            if interface_ips
-                .iter()
-                .any(|local| local == &target.to_string())
-                || route::egress_index(target).ok() != Some(index)
+            if local_ips.contains(&target)
+                || interface_ips
+                    .iter()
+                    .any(|local| local == &target.to_string())
             {
+                continue;
+            }
+            #[cfg(not(windows))]
+            if route::egress_index(target).ok() != Some(index) {
                 continue;
             }
             if !solicited {
@@ -771,13 +772,32 @@ pub(super) async fn ping_sweep_subnets(
             }
             #[cfg(not(windows))]
             let source = ip_str.clone();
+            #[cfg(windows)]
+            let probe_fence = fence.clone();
+            #[cfg(windows)]
+            let probe_adapter = adapter_fence.clone();
             join_set.spawn(async move {
                 let _permit = permit;
                 #[cfg(windows)]
                 {
-                    let _ =
-                        arp::bound_ping(target, ip, index, std::time::Duration::from_millis(200))
-                            .await;
+                    if probe_fence.is_stale()
+                        || probe_adapter.is_stale()
+                        || !interface::source_matches_interface(index, ip)
+                    {
+                        return;
+                    }
+                    let Ok(socket) = super::bound_tcp::bind_socket(ip, index) else {
+                        return;
+                    };
+                    // Any TCP port provokes neighbor resolution; no HTTP or
+                    // PTU payload is sent, and closed/filtered ports are fine.
+                    tokio::select! {
+                        biased;
+                        _ = probe_fence.cancelled() => {},
+                        _ = probe_adapter.cancelled() => {},
+                        _ = tokio::time::timeout(std::time::Duration::from_millis(200),
+                            socket.connect(std::net::SocketAddrV4::new(target, 80).into())) => {},
+                    }
                 }
                 #[cfg(not(windows))]
                 {
@@ -800,7 +820,7 @@ pub(super) async fn ping_sweep_subnets(
         _ = adapter_fence.cancelled() => {},
         _ = async { while join_set.join_next().await.is_some() {} } => {},
     }
-    log::info!("Ping sweep complete");
+    log::info!("ARP solicitation sweep complete");
 }
 
 pub(super) async fn get_interface_ips(name: &str) -> Vec<Ipv4Addr> {

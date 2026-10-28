@@ -2,7 +2,6 @@ use serde::Serialize;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpSocket;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -143,6 +142,7 @@ async fn scan_hosts(network: ipnetwork::Ipv4Network, scope: ScanScope) -> Vec<Sc
                 return None;
             }
             let source = super::select_wired_source(ip, &Default::default(), &scope.ips)?;
+            #[cfg(not(windows))]
             if super::route::egress_index(ip).ok() != Some(scope.index) {
                 return None;
             }
@@ -224,18 +224,10 @@ async fn probe_host_at(
             }
             let source = source?; // never send an unbound probe
             #[cfg(windows)]
-            if !super::interface::source_matches_interface(index, source)
-                || super::route::egress_index(match ip {
-                    IpAddr::V4(ip) => ip,
-                    _ => return None,
-                })
-                .ok()
-                    != Some(index)
-            {
+            if !super::interface::source_matches_interface(index, source) {
                 return None;
             }
-            let socket = TcpSocket::new_v4().ok()?;
-            socket.bind(SocketAddr::new(IpAddr::V4(source), 0)).ok()?;
+            let socket = super::bound_tcp::bind_socket(source, index).ok()?;
             // Queue time is not part of the connect timeout.
             tokio::select! {
                 biased;
@@ -336,6 +328,27 @@ mod tests {
     /// Generous semaphore for tests that don't care about throttling.
     fn unbounded_semaphore() -> Arc<Semaphore> {
         Arc::new(Semaphore::new(64))
+    }
+
+    #[tokio::test]
+    async fn missing_interface_never_falls_back_to_the_default_route() {
+        let (listener, port) = bind_loopback().await;
+        let result = probe_host_at(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            Some(Ipv4Addr::LOCALHOST),
+            0,
+            Some("missing-interface".into()),
+            &[port],
+            unbounded_semaphore(),
+            None,
+        )
+        .await;
+        assert!(!result.reachable && result.open_ports.is_empty());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
