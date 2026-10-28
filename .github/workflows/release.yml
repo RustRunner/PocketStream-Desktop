@@ -262,4 +262,6 @@ jobs:
           path: |
             ${{ runner.temp }}\g3-srt-release-staged-1.5.7.json
             ${{ runner.temp }}\g3-srt-installed-1.5.7.json
+            src-tauri/target/release/nsis/x64/compile-inspection.json
+            src-tauri/target/release/nsis/x64/installer.compile.log
           if-no-files-found: warn

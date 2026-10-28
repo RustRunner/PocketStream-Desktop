@@ -8,6 +8,13 @@ export const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "
 const read = p => fs.readFileSync(path.join(root, p), "utf8");
 const body = (source, name) => source.match(new RegExp(`Function ${name.replaceAll(".", "\\.")}\\s*\\n([\\s\\S]*?)FunctionEnd`))?.[1] ?? "";
 
+export function nsisCompilerEnvironment(environment = process.env) {
+  // Use the pinned compiler's configuration and let its Windows PowerShell
+  // child build compatible module paths instead of inheriting PowerShell 7's.
+  return Object.fromEntries(Object.entries(environment).filter(([key]) =>
+    !["NSISDIR", "NSISCONFDIR", "PSMODULEPATH"].includes(key.toUpperCase())));
+}
+
 export function checkInstaller(source, hooks) {
   const failures = [];
   const require = (condition, message) => { if (!condition) failures.push(message); };
@@ -117,13 +124,12 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     const executable=[path.join(cache,"makensis.exe"),path.join(cache,"Bin/makensis.exe")].find(p=>fs.existsSync(p));
     if (!executable) throw new Error("Pinned NSIS compiler is unavailable; build the installer first");
     const args=["-INPUTCHARSET","UTF8","-OUTPUTCHARSET","UTF8","-DMUI_VERBOSE=4","-V4",path.resolve(generated)];
-    const env={...process.env};
-    delete env.NSISDIR; delete env.NSISCONFDIR;
-    const result=spawnSync(executable,args,{cwd:directory,env,encoding:"utf8",maxBuffer:32*1024*1024,timeout:120000});
+    const env=nsisCompilerEnvironment();
+    const result=spawnSync(executable,args,{cwd:directory,env,encoding:"utf8",windowsHide:true,maxBuffer:32*1024*1024,timeout:120000});
     fs.writeFileSync(path.join(directory,"compile-inspection.json"),JSON.stringify({executable,compiler_sha256:crypto.createHash("sha256").update(fs.readFileSync(executable)).digest("hex"),args,status:result.status,stderr:result.stderr,error:result.error?.message,installation_executed:false},null,2)+"\n");
-    if (result.status!==0) throw new Error(`NSIS trace compilation failed: ${result.stderr || result.error}`);
-    trace=result.stdout;
+    trace=result.stdout ?? "";
     fs.writeFileSync(path.join(directory,"installer.compile.log"),trace);
+    if (result.status!==0) throw new Error(`NSIS trace compilation failed: ${result.stderr || result.error}\n${trace.slice(-12000)}`);
   }
   const failures = checkRepository(generated,trace);
   if (failures.length) { console.error(failures.join("\n")); process.exitCode = 1; }

@@ -2,6 +2,30 @@ const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const fs=require('node:fs');
 const path=require('node:path');
+test('NSIS child can hash prerequisites despite incompatible inherited PowerShell module paths', {skip:process.platform!=='win32'}, async(t)=>{
+  const {spawnSync}=require('node:child_process');
+  const crypto=require('node:crypto');
+  const os=require('node:os');
+  const {nsisCompilerEnvironment}=await import('../scripts/check-installer.mjs');
+  const moduleRoot=fs.mkdtempSync(path.join(os.tmpdir(),'pocketstream-nsis-modules-'));
+  const utility=path.join(moduleRoot,'Microsoft.PowerShell.Utility');
+  fs.mkdirSync(utility);
+  const manifest=path.join(utility,'Microsoft.PowerShell.Utility.psd1');
+  fs.writeFileSync(manifest,"@{ ModuleVersion='7.0.0.0'; PowerShellVersion='3.0'; CompatiblePSEditions=@('Core'); CmdletsToExport=@('Get-FileHash'); NestedModules='incompatible-utility.dll' }");
+  t.after(()=>{fs.unlinkSync(manifest);fs.rmdirSync(utility);fs.rmdirSync(moduleRoot);});
+  const inherited={...process.env,POCKETSTREAM_HASH_PROBE:__filename};
+  const key=Object.keys(inherited).find(name=>name.toUpperCase()==='PSMODULEPATH') ?? 'PSModulePath';
+  inherited[key]=`${moduleRoot};${inherited[key] ?? ''}`;
+  const args=['-NoProfile','-NonInteractive','-Command',"$ErrorActionPreference='Stop'; (Get-FileHash -LiteralPath $env:POCKETSTREAM_HASH_PROBE -Algorithm SHA256).Hash"];
+  const options={encoding:'utf8',windowsHide:true,timeout:30000};
+  const broken=spawnSync('powershell.exe',args,{...options,env:inherited});
+  assert.notEqual(broken.status,0,'negative control must reject the incompatible module search path');
+  assert.match(broken.stderr,/Get-FileHash/);
+  const isolated=spawnSync('powershell.exe',args,{...options,env:nsisCompilerEnvironment(inherited)});
+  assert.equal(isolated.status,0,isolated.stderr || isolated.error?.message);
+  assert.equal(isolated.stdout.trim().toLowerCase(),crypto.createHash('sha256').update(fs.readFileSync(__filename)).digest('hex'));
+});
+
 test('installer source and independently seeded destructive path drift',async()=>{
   const {checkInstaller,checkRepository}=await import('../scripts/check-installer.mjs');
   const read=p=>fs.readFileSync(path.join(__dirname,'..',p),'utf8');
