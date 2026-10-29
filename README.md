@@ -43,6 +43,14 @@ The app checks GitHub releases for updates and offers **Install** or **Later** w
 
 Discovery starts automatically. If a camera does not appear, reconnect its network cable while discovery is running.
 
+Once scanning finishes, use the open ports listed beside each IP to identify likely roles:
+
+| Ports listed | What they suggest |
+| --- | --- |
+| **554** (possibly alongside other ports) | The standard RTSP video port; usually the camera to assign as **CAM**. |
+| **80 only** | A web interface; a likely **PTU** candidate in a FLIR camera/PTU setup. Open its web page to confirm, since other devices can also use port 80. |
+| **No ports listed** | No services responded on the scanned ports. Ignore this entry when choosing **CAM** or **PTU**. |
+
 <details>
 <summary>Before connecting a camera</summary>
 
