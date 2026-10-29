@@ -96,12 +96,9 @@ For UDP input, stop the local preview before starting the server. Only one can r
 
 *Choose the input and output protocols in settings, then start the server.*
 
-<details>
-<summary>Sharing the connection by QR code</summary>
+![Stream QR Code dialog showing the demo QR code and connection URL](docs/images/06-stream-qr.png)
 
-![Stream QR Code dialog with the QR code and connection URL hidden](docs/images/06-stream-qr-redacted.png)
-
-</details>
+*Share the stream by scanning the QR code or copying the connection URL.*
 
 ## Network notes
 
