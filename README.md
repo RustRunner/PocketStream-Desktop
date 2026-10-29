@@ -104,6 +104,7 @@ For UDP input, stop the local preview before starting the server. Only one can r
 
 ## Network notes
 
+- **Manage host IPs in the app.** Use **Host → Configure** to set the primary IP address, add or remove secondary addresses, and choose static or DHCP mode. Routine host network setup requires no manual changes in Windows network settings.
 - **Added IP addresses persist.** Host addresses added for camera access remain after closing the app or restarting Windows. Remove them explicitly through **Host → Configure**; removing a Node does not remove its host address.
 - **IP conflicts can block browser access.** If the app reports **IP still reserved by PC**, open Network Connections (`Win+R` → `ncpa.cpl`), fully disable the named conflicting adapter, give the camera an unused IP through its web page, then re-enable the adapter. Turning off Wi-Fi alone may leave the address reserved.
 
