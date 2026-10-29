@@ -90,6 +90,8 @@ With a **PTU** assigned, hold the directional controls to move it. Tap a preset 
 2. In the **Re-stream Server** card, choose the **Bind** interface and click **Start Server**.
 3. Connect viewers using the displayed URL or QR code.
 
+**Bind** defaults to **All addresses**, so the server listens on all local IPv4 addresses. The displayed URL and QR code use an active LAN address, preferring Wi-Fi and then Ethernet. If a VPN is configured and connected, select its interface in **Bind** to listen specifically on its VPN IP address and use that address in the URL and QR code.
+
 For UDP input, stop the local preview before starting the server. Only one can receive the UDP stream at a time.
 
 ![RTSP input and output settings alongside live video and an online re-stream server, with the token hidden](docs/images/05-restream-settings-redacted.png)
