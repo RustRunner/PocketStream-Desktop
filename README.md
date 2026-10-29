@@ -37,11 +37,11 @@ The app checks GitHub releases for updates and offers **Install** or **Later** w
 
 ### 1. Connect and discover
 
-1. Connect the camera over Ethernet and open PocketStream.
-2. Open **Host → Configure**, select the Ethernet adapter, choose **Static — Auto-adopt**, and set a unique primary IP address for the PC.
-3. Find the camera in **Nodes** and assign it the **CAM** role. If you have a FLIR pan-tilt unit, assign it **PTU**. One device can hold each role at a time.
+1. Open PocketStream **before connecting the camera's Ethernet cable**.
+2. Under **Host → Configure**, select the Ethernet adapter and use **Static — Auto-adopt** for automated discovery, or **Static — Manual** for manually configured IPs with discovery disabled.
+3. In **Auto-adopt** mode, let discovery start listening, then connect the camera. Find it in **Nodes** and assign it the **CAM** role. If you have a FLIR pan-tilt unit, assign it **PTU**. One device can hold each role at a time.
 
-Discovery starts automatically. If a camera does not appear, reconnect its network cable while discovery is running.
+Launching first helps discovery capture the camera's initial **gratuitous ARP** announcements. If a camera does not appear, reconnect its network cable while discovery is running.
 
 Once scanning finishes, use the open ports listed beside each IP to identify likely roles:
 
@@ -73,7 +73,7 @@ Once scanning finishes, use the open ports listed beside each IP to identify lik
 
 Open settings and choose **Input Protocol**:
 
-- **RTSP:** Set the camera's port, stream path, and credentials.
+- **RTSP:** Set **Port** (typically 554) and choose a matching stream path from **Path**. Common camera paths are already listed; for another path, select **Custom…** and enter it in **Custom Path**. Enter the camera's **Username** and **Password** if required; otherwise leave them blank.
 - **UDP:** Set the listening port and configure the camera to send video to the PC on that port.
 
 Click **Save Settings**, then **Start Stream**. Use the video controls to mute audio, record an MP4, or save a snapshot to Pictures.
@@ -88,11 +88,11 @@ With a **PTU** assigned, hold the directional controls to move it. Tap a preset 
 
 1. In settings, turn on **Enable Re-stream Server**, choose **Output Protocol**, configure the server settings, and click **Save Settings**.
 2. In the **Re-stream Server** card, choose the **Bind** interface and click **Start Server**.
-3. Connect viewers using the displayed URL or QR code.
+3. Connect viewers using the copied connection URL or QR code.
 
 **Bind** defaults to **All addresses**, so the server listens on all local IPv4 addresses. The displayed URL and QR code use an active LAN address, preferring Wi-Fi and then Ethernet. If a VPN is configured and connected, select its interface in **Bind** to listen specifically on its VPN IP address and use that address in the URL and QR code.
 
-For UDP input, stop the local preview before starting the server. Only one can receive the UDP stream at a time.
+**UDP input:** Current builds prevent PocketStream's video display and re-stream server from receiving on the same UDP port. Click **Stop Stream**, then **Start Server**. The camera keeps sending video, and the re-stream server still supports multiple viewers.
 
 ![RTSP input and output settings alongside live video and an online re-stream server, with the token hidden](docs/images/05-restream-settings-redacted.png)
 
@@ -101,6 +101,21 @@ For UDP input, stop the local preview before starting the server. Only one can r
 ![Stream QR Code dialog showing the demo QR code and connection URL](docs/images/06-stream-qr.png)
 
 *Share the stream by scanning the QR code or copying the connection URL.*
+
+#### RTSP access
+
+The **RTSP Token** is part of the full re-stream URL and QR code. Viewers use that complete link; no separate re-stream username or password is needed. The token is separate from the camera's RTSP login and does not encrypt the video.
+
+To replace the token, use its regenerate button, click **Save Settings**, and share the new URL or QR code.
+
+#### SRT encryption and Stream ID
+
+PocketStream runs as an SRT **listener** for up to 10 **callers**. Configure each viewer as a caller.
+
+- **SRT Passphrase (optional):** Enables encryption. Use 10–79 visible ASCII characters with no spaces, and enter the same passphrase in the viewer. SRT does not use a username. Without a passphrase, the stream is unencrypted.
+- **Required Stream ID (optional):** When set, the viewer must send the same identifier. This is an SRT stream identifier, separate from the RTSP token and not a password.
+
+The connection URL and QR code exclude the SRT passphrase. Use the passphrase field's copy button and share it separately.
 
 ## Network notes
 
