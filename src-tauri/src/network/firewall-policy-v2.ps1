@@ -42,9 +42,17 @@ function Shape($rule) {
         platform=@($rule.Platform);loose_source=[string]$rule.LooseSourceMapping;local_only=[string]$rule.LocalOnlyMapping;
         dynamic_target=[string]$port[0].DynamicTarget;dynamic_addresses=@($rule.RemoteDynamicKeywordAddresses)}
 }
+function Owner-Shape($rule) {
+    $app = @($rule | Get-NetFirewallApplicationFilter -ErrorAction Stop)
+    if ($app.Count -ne 1) { throw 'Ambiguous application filter' }
+    return @{group=[string]$rule.Group;enabled=[string]$rule.Enabled;direction=[string]$rule.Direction;
+        action=[string]$rule.Action;program=[string]$app[0].Program;package=[string]$app[0].Package}
+}
+function Template-Package($s) { return [string]$s.package -ceq '' }
+function Legacy-Package($s) { return [string]$s.package -in @('Any','*','') }
 function Unscoped($s) {
     return (Is-Any $s.remote_port) -and (Is-Any $s.local_address) -and (Is-Any $s.remote_address) -and
-        (Is-Any $s.service) -and ($s.package -in @('Any','*','')) -and $s.interface_type -eq 'Any' -and
+        (Is-Any $s.service) -and $s.interface_type -eq 'Any' -and
         $s.edge -eq 'Block' -and $s.authentication -eq 'NotRequired' -and $s.encryption -eq 'NotRequired' -and
         (Is-Any $s.local_user) -and (Is-Any $s.remote_user) -and (Is-Any $s.remote_machine) -and $s.override_block -eq 'False' -and
         $s.loose_source -eq 'False' -and $s.local_only -eq 'False' -and $s.dynamic_target -eq 'Any' -and
@@ -54,7 +62,7 @@ function Owned($s) { return $s.group -ceq $data.group -and (Same-Program $s.prog
 function Verified($s, $role, [int]$port, [string]$alias, [bool]$enabled) {
     return (Owned $s) -and $s.name -eq $role.name -and $s.display -ceq $role.display_name -and $s.profile -eq 'Any' -and
         $s.protocol -in @($role.protocol, $(if ($role.protocol -eq 'TCP') {'6'} else {'17'})) -and
-        @($s.local_port).Count -eq 1 -and [string]$s.local_port -eq [string]$port -and (Unscoped $s) -and
+        @($s.local_port).Count -eq 1 -and [string]$s.local_port -eq [string]$port -and (Unscoped $s) -and (Template-Package $s) -and
         @($s.interface).Count -eq 1 -and [string]$s.interface -ceq $alias -and ($s.enabled -eq $(if ($enabled) {'True'} else {'False'}))
 }
 function Disable-Verified($rule) {
@@ -89,12 +97,19 @@ function Prepare($role, [int]$port, [string]$alias) {
         $action = 'updated'
         if (Verified $shape $role $port $alias $false) { $action = 'unchanged' }
         Disable-Verified $rules[0]
+        if (!(Template-Package $shape)) {
+            $script:touched = $role; $script:mutated = $true
+            $rules[0] | Remove-NetFirewallRule -ErrorAction Stop
+            if (@(Exact $role).Count -ne 0) { throw 'Template repair removal readback failed' }
+            Add-Record @{repaired_template=[string]$role.name;prior_package=[string]$shape.package}
+            $rules = @()
+        }
     }
     $script:touched = $role
     $script:mutated = $true
     $params = @{DisplayName=$role.display_name;Group=$data.group;Direction='Inbound';Action='Allow';Enabled='False';Profile='Any';
         Program=$data.program;Protocol=$role.protocol;LocalPort=$port;RemotePort='Any';LocalAddress='Any';RemoteAddress='Any';
-        InterfaceAlias=$alias;InterfaceType='Any';Service='Any';Package='Any';EdgeTraversalPolicy='Block';
+        InterfaceAlias=$alias;InterfaceType='Any';Service='Any';EdgeTraversalPolicy='Block';
         Authentication='NotRequired';Encryption='NotRequired';LocalUser='Any';RemoteUser='Any';RemoteMachine='Any';
         OverrideBlockRules=$false;LooseSourceMapping=$false;LocalOnlyMapping=$false;DynamicTarget='Any';ErrorAction='Stop'}
     if ($rules.Count -eq 0) { New-NetFirewallRule -PolicyStore PersistentStore -Name $role.name @params | Out-Null }
@@ -108,6 +123,13 @@ function Prepare($role, [int]$port, [string]$alias) {
     if ($read.Count -ne 1 -or !(Verified (Shape $read[0]) $role $port $alias $false)) { throw 'Shape readback failed' }
     return $action
 }
+function Add-Record($record) {
+    if ($records.Count -ge 60) { throw 'Too many migration records' }
+    $bytes=[Text.Encoding]::UTF8.GetByteCount(($record | ConvertTo-Json -Depth 8 -Compress))
+    if ($bytes -gt 4096 -or ($script:recordBytes+$bytes) -gt 16000) { throw 'Migration diagnostics exceed the bounded result' }
+    $script:recordBytes+=$bytes
+    $records.Add($record)
+}
 function Legacy {
     $found = [Collections.Generic.List[object]]::new()
     foreach ($rule in @(All-Rules)) {
@@ -117,13 +139,8 @@ function Legacy {
             if (!(Is-Any $s.program) -and !(Same-Program $s.program)) { continue }
             $validPort = @($s.local_port).Count -eq 1 -and [string]$s.local_port -match '^\d{1,5}$' -and [int][string]$s.local_port -ge 1 -and [int][string]$s.local_port -le 65535
             if ($s.action -ne 'Allow' -or $s.direction -ne 'Inbound' -or $s.profile -ne 'Any' -or !$validPort -or
-                $s.protocol -notin @($role.protocol, $(if ($role.protocol -eq 'TCP') {'6'} else {'17'})) -or !(Unscoped $s) -or !(Is-Any $s.interface)) { throw 'Legacy migration conflict' }
-            if ($records.Count -ge 60) { throw 'Too many migration records' }
-            $encoded=$s | ConvertTo-Json -Depth 8 -Compress
-            $bytes=[Text.Encoding]::UTF8.GetByteCount($encoded)
-            if ($bytes -gt 4096 -or ($script:recordBytes+$bytes) -gt 16000) { throw 'Migration diagnostics exceed the bounded result' }
-            $script:recordBytes+=$bytes
-            $records.Add($s)
+                $s.protocol -notin @($role.protocol, $(if ($role.protocol -eq 'TCP') {'6'} else {'17'})) -or !(Unscoped $s) -or !(Legacy-Package $s) -or !(Is-Any $s.interface)) { throw 'Legacy migration conflict' }
+            Add-Record $s
             $found.Add($rule)
         }
     }
@@ -155,7 +172,9 @@ try {
                 $rules=@(Exact $role)
                 if ($rules.Count -gt 1) { throw 'Rule collision' }
                 foreach ($rule in $rules) {
-                    if (!(Owned (Shape $rule))) { throw 'Rule ownership conflict' }
+                    $s = Owner-Shape $rule
+                    if (!(Owned $s)) { throw 'Rule ownership conflict' }
+                    if (!(Template-Package $s)) { Add-Record @{defective_template=[string]$role.name;prior_package=[string]$s.package} }
                     Disable-Verified $rule
                 }
             } catch { $failed=$true }
@@ -182,7 +201,10 @@ try {
         $stage = 'ownership'
         $rules = @(Exact $role)
         if ($rules.Count -gt 1) { throw 'Rule collision' }
-        foreach ($rule in $rules) { if (!(Owned (Shape $rule))) { throw 'Rule ownership conflict' } }
+        foreach ($rule in $rules) {
+            $s = if ($mode -eq 'disable') { Owner-Shape $rule } else { Shape $rule }
+            if (!(Owned $s)) { throw 'Rule ownership conflict' }
+        }
         if ($mode -in @('startup','disable','uninstall')) {
             foreach ($rule in $rules) {
                 $stage = 'disable'
@@ -203,6 +225,7 @@ try {
                 $stage = 'enable'
                 if ((Selected-Alias) -cne $alias) { throw 'Bind changed before enable' }
                 $rule = @(Exact $role)[0]
+                $script:touched = $role; $script:mutated = $true
                 $rule | Set-NetFirewallRule -Enabled True -ErrorAction Stop
                 $stage = 'enabled_readback'
                 $read = @(Exact $role)
@@ -234,7 +257,7 @@ try {
             $rules = @(Exact $touched)
             if ($rules.Count -gt 1) { throw 'Cleanup rule collision' }
             foreach ($rule in $rules) {
-                if (!(Owned (Shape $rule))) { throw 'Cleanup ownership conflict' }
+                if (!(Owned (Owner-Shape $rule))) { throw 'Cleanup ownership conflict' }
                 Disable-Verified $rule
             }
             # An ensure touches one role. Maintenance can also have unresolved

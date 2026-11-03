@@ -329,6 +329,17 @@ fn observe_tree(job: &Handle, processes: &mut BTreeMap<u32, Handle>) -> std::io:
 }
 
 pub(super) struct NativeProcessRunner;
+fn firewall_budget(operation: &super::firewall::Operation) -> Duration {
+    use super::firewall::Operation;
+    Duration::from_secs(match operation {
+        Operation::Ensure { .. } | Operation::Disable { .. } => 30,
+        Operation::Startup => 45,
+        Operation::Install | Operation::Uninstall => 55,
+    })
+}
+fn clamp_budget(budget: Duration) -> Duration {
+    budget.clamp(Duration::from_millis(250), Duration::from_secs(60))
+}
 impl NativeProcessRunner {
     // Diagnostic only: reuse the real runner/budget. The read-only variant
     // intercepts every writer; the separate provider test needs explicit opt-in.
@@ -362,7 +373,7 @@ impl NativeProcessRunner {
             },
             serde_json::to_vec(&payload).map_err(|e| e.to_string())?,
             Cancellation::default(),
-            Duration::from_secs(30),
+            firewall_budget(&super::firewall::Operation::Startup),
             None,
         )
         .map_err(|e| e.to_string())
@@ -427,7 +438,7 @@ impl NativeProcessRunner {
             super::firewall::SCRIPT,
             operation.payload()?,
             cancel,
-            Duration::from_secs(30),
+            firewall_budget(&operation),
             None,
         )
         .map_err(|error| {
@@ -561,7 +572,7 @@ impl NativeProcessRunner {
             let _ = dispatched.send(info.dwProcessId);
         }
         let mut processes = BTreeMap::new();
-        let budget = budget.clamp(Duration::from_millis(250), Duration::from_secs(30));
+        let budget = clamp_budget(budget);
         let termination = loop {
             if observe_tree(&job, &mut processes).is_err() {
                 unsafe { TerminateJobObject(job.0, CANCELED_EXIT) };
@@ -608,6 +619,42 @@ impl NativeProcessRunner {
             elapsed: start.elapsed(),
         })
     }
+}
+
+#[cfg(test)]
+#[test]
+fn firewall_mode_budgets_and_runner_clamp() {
+    use super::firewall::{FirewallRule, Operation};
+    for (operation, seconds) in [
+        (Operation::Startup, 45),
+        (Operation::Install, 55),
+        (Operation::Uninstall, 55),
+        (
+            Operation::Ensure {
+                role: FirewallRule::Rtsp,
+                port: 8554,
+                interface: None,
+            },
+            30,
+        ),
+        (
+            Operation::Disable {
+                role: FirewallRule::Srt,
+            },
+            30,
+        ),
+    ] {
+        assert_eq!(firewall_budget(&operation), Duration::from_secs(seconds));
+    }
+    assert_eq!(
+        clamp_budget(Duration::from_secs(55)),
+        Duration::from_secs(55)
+    );
+    assert_eq!(
+        clamp_budget(Duration::from_secs(90)),
+        Duration::from_secs(60)
+    );
+    assert_eq!(clamp_budget(Duration::ZERO), Duration::from_millis(250));
 }
 
 #[cfg(test)]

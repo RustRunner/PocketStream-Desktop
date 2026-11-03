@@ -12,21 +12,23 @@ $program='C:\Program Files\PocketStream Desktop\pocketstream-desktop.exe'
 $roles=@(
     @{role='rtsp';name='PocketStream.RTSP.Inbound.v2';display_name='PocketStream RTSP Server';protocol='TCP';port=8554},
     @{role='srt';name='PocketStream.SRT.Inbound.v2';display_name='PocketStream SRT Server';protocol='UDP';port=8890})
+$script:packageBindings=0
 function Assert($condition,[string]$reason) { if (!$condition) { throw $reason } }
 function Reset {
     $script:rules=[Collections.Generic.List[object]]::new()
     $script:writeCount=0; $script:failSet=0; $script:failQuery=$false; $script:failRemove=$false
     $script:fullQueries=0; $script:namedQueries=0; $script:filterReads=0
-    $script:failNamedQuery=$false; $script:foreignNotFound=$false; $script:changeReadback=$false
+    $script:failNamedQuery=$false; $script:foreignNotFound=$false; $script:changeReadback=$false; $script:restorePackage=$false
     $script:adapter=[pscustomobject]@{InterfaceGuid='{01234567-89ab-cdef-0123-456789abcdef}';MacAddress='00-11-22-33-44-55';ifIndex=15;Status='Up';Name='Renamed Ethernet'}
 }
 function Rule([string]$name,[int]$role=0,[string]$program='Any',[string]$enabled='True') {
     return [pscustomobject]@{Name=$name;DisplayName=$roles[$role].display_name;Group='';Program=$program;Enabled=$enabled;
         Direction='Inbound';Action='Allow';Profile='Any';Protocol=$roles[$role].protocol;LocalPort=@('9123');RemotePort=@('Any');
-        LocalAddress=@('Any');RemoteAddress=@('Any');InterfaceAlias=@('Any');InterfaceType='Any';Service='Any';Package='Any';
+        LocalAddress=@('Any');RemoteAddress=@('Any');InterfaceAlias=@('Any');InterfaceType='Any';Service='Any';Package='';
         OverrideBlockRules=$false;LooseSourceMapping=$false;LocalOnlyMapping=$false;DynamicTarget='Any';Platform=@('Any');RemoteDynamicKeywordAddresses=@();
         EdgeTraversalPolicy='Block';Authentication='NotRequired';Encryption='NotRequired';LocalUser='Any';RemoteUser='Any';RemoteMachine='Any'}
 }
+function Enforced($row) { return $row.Enabled -eq 'True' -and [string]$row.Package -ceq '' }
 function Get-NetFirewallRule {
     [CmdletBinding()]param($PolicyStore,[string]$Name)
     if($script:failQuery){throw 'fake query failure'}
@@ -54,13 +56,16 @@ foreach($name in @('Application','Port','Address','Interface','InterfaceType','S
 function Set-NetFirewallRule {
     [CmdletBinding()]param([Parameter(ValueFromPipeline=$true)]$InputObject,$NewDisplayName,$Direction,$Action,$Enabled,$Profile,$Program,$Protocol,$LocalPort,$RemotePort,$LocalAddress,$RemoteAddress,$InterfaceAlias,$InterfaceType,$Service,$Package,$EdgeTraversalPolicy,$Authentication,$Encryption,$LocalUser,$RemoteUser,$RemoteMachine,$OverrideBlockRules,$LooseSourceMapping,$LocalOnlyMapping,$DynamicTarget)
     process {
+        if($PSBoundParameters.ContainsKey('Package')){$script:packageBindings++}
         $script:writeCount++
         if($script:failSet -eq $script:writeCount){throw 'fake partial filter failure'}
         foreach($key in $PSBoundParameters.Keys){if($key -eq 'NewDisplayName'){$InputObject.DisplayName=$NewDisplayName} elseif($key -notin @('InputObject','ErrorAction')){$InputObject.$key=$PSBoundParameters[$key]}}
+        if($script:restorePackage){$InputObject.Package='Any'}
     }
 }
 function New-NetFirewallRule {
     [CmdletBinding()]param($PolicyStore,$Name,$DisplayName,$Group,$Direction,$Action,$Enabled,$Profile,$Program,$Protocol,$LocalPort,$RemotePort,$LocalAddress,$RemoteAddress,$InterfaceAlias,$InterfaceType,$Service,$Package,$EdgeTraversalPolicy,$Authentication,$Encryption,$LocalUser,$RemoteUser,$RemoteMachine,$OverrideBlockRules,$LooseSourceMapping,$LocalOnlyMapping,$DynamicTarget)
+    if($PSBoundParameters.ContainsKey('Package')){$script:packageBindings++}
     # Creation before disabling *all* legacy allows is a policy regression.
     Assert (@($script:rules | Where-Object {$_.Program -eq 'Any' -and $_.Action -eq 'Allow' -and $_.Enabled -eq 'True' -and $_.DisplayName -in $roles.display_name}).Count -eq 0) 'Enabled broad allow survived template creation'
     $row=Rule $Name
@@ -80,14 +85,16 @@ function Run([string]$mode,[string]$role='rtsp',[int]$port=13554,$identity=$null
 }
 $passed=[Collections.Generic.List[string]]::new()
 Reset
-$script:rules.Add((Rule 'legacy-tcp-1'));$script:rules.Add((Rule 'legacy-tcp[2]*?`'));$script:rules.Add((Rule 'legacy-srt' 1 'Any' 'False'));$script:rules.Add((Rule 'legacy-program-scoped' 1 $program))
+$legacy=Rule 'legacy-tcp-1';$legacy.Package='Any';$script:rules.Add($legacy)
+$legacy=Rule 'legacy-tcp[2]*?`';$legacy.Package='*';$script:rules.Add($legacy)
+$script:rules.Add((Rule 'legacy-srt' 1 'Any' 'False'));$script:rules.Add((Rule 'legacy-program-scoped' 1 $program))
 $block=Rule 'Query User deny';$block.Action='Block';$block.Program=$program;$script:rules.Add($block)
 $foreign=Rule 'foreign' 0 'C:\Other\app.exe';$script:rules.Add($foreign)
 $r=Run install
 Assert $r.ok ('Migration failed: '+($r | ConvertTo-Json -Depth 10))
 Assert ($script:rules.Count -eq 4) 'Duplicate/custom-port legacy rules were not removed'
 Assert ($script:rules.Contains($block) -and $block.Enabled -eq 'True' -and $script:rules.Contains($foreign)) 'Foreign/block rules changed'
-Assert (@($script:rules | Where-Object {$_.Group -eq $script:testData.group -and $_.Enabled -eq 'False' -and $_.Program -eq $program}).Count -eq 2) 'Install templates not disabled/program scoped'
+Assert (@($script:rules | Where-Object {$_.Group -eq $script:testData.group -and $_.Enabled -eq 'False' -and $_.Program -eq $program -and $_.Package -ceq ''}).Count -eq 2) 'Install templates not disabled/program scoped/package free'
 Assert ($r.records.Count -eq 4) 'Prior migration shapes not retained'
 Assert (Run install).ok 'Repeated install failed'
 $passed.Add('custom ports, duplicate/disabled legacy rules, both protocols, disabled templates, repeat install, preserved block/foreign rules')
@@ -143,11 +150,11 @@ foreach($sample in @('cold policy pass','warm policy pass')) {
     $r=Run startup
     Assert $r.ok ($sample+' failed')
     Assert ($script:rules.Count -eq 605 -and $block.Enabled -eq 'True') 'Substantial existing policy was changed'
-    Assert ($script:fullQueries -eq 1 -and $script:filterReads -eq 14) 'Startup repeated full inventories or owned-rule Shape reads'
+    Assert ($script:fullQueries -eq 1 -and $script:filterReads -eq 2) 'Startup repeated full inventories or light ownership reads'
     Assert ($script:writeCount -eq 0 -and !$r.mutated) 'Startup rewrote already-disabled rules'
     Assert ($script:namedQueries -eq 4) 'Startup omitted fresh exact-name readback'
 }
-$passed.Add('cold/warm startup with 605 rules uses one legacy inventory, two Shapes, fresh readback and no redundant disabled writes')
+$passed.Add('cold/warm startup with 605 rules uses one legacy inventory, two application filters, fresh readback and no redundant disabled writes')
 Reset;$r=Run startup
 Assert ($r.ok -and $script:namedQueries -eq 2 -and $script:writeCount -eq 0) 'Exact missing name did not remain distinct from provider failure'
 $script:failNamedQuery=$true;$r=Run startup
@@ -164,4 +171,43 @@ $script:rules[0].Action='Block';$script:rules[0].Enabled='True';$script:rules[1]
 $r=Run startup
 Assert (!$r.ok -and $script:rules[0].Enabled -eq 'True' -and $script:rules[1].Enabled -eq 'False' -and $script:writeCount -eq 1) 'Conflict changed a Block or stranded another owned allow'
 $passed.Add('startup preserves exact-name Block conflict while disabling the other stale owned allow')
+Reset;Assert (Run install).ok 'Upgrade fixture setup'
+$prior=@($script:rules.ToArray());foreach($row in $prior){$row.Package='Any'}
+$block=Rule 'upgrade-block' 0 $program;$block.Action='Block';$script:rules.Add($block)
+$foreign=Rule 'upgrade-foreign' 1 'C:\Other\app.exe';$script:rules.Add($foreign)
+$r=Run install
+Assert ($r.ok -and @($r.records | Where-Object {$_.repaired_template}).Count -eq 2) 'Upgrade did not record both repairs'
+Assert (@($prior | Where-Object {$script:rules.Contains($_)}).Count -eq 0) 'Upgrade reused defective templates'
+Assert (@($script:rules | Where-Object {$_.Group -eq $script:testData.group -and $_.Enabled -eq 'False' -and $_.Package -ceq ''}).Count -eq 2) 'Upgrade templates not repaired/disabled'
+Assert ($script:rules.Contains($block) -and $block.Enabled -eq 'True' -and $script:rules.Contains($foreign)) 'Upgrade changed block/foreign rules'
+$passed.Add('upgrade removes/recreates both defective templates and preserves other rules')
+foreach($role in @('rtsp','srt')) {
+    Reset;Assert (Run install).ok 'Runtime repair setup';$index=if($role -eq 'rtsp'){0}else{1}
+    $prior=$script:rules[$index];$prior.Package='Any'
+    $r=Run ensure $role $roles[$index].port
+    $row=@($script:rules | Where-Object {$_.Name -eq $roles[$index].name})[0]
+    Assert ($r.ok -and $r.outcome.verified_shape -and $r.outcome.action -eq 'updated' -and (Enforced $row)) 'Defective template passed as unchanged or unenforced'
+    Assert (!$script:rules.Contains($prior) -and $r.records[0].repaired_template -eq $row.Name) 'Runtime repair skipped remove/create'
+}
+$passed.Add('both runtime roles repair a default template before enabling')
+foreach($package in @('*','S-1-15-2-1')) {
+    Reset;Assert (Run install).ok 'Other package setup';$script:rules[0].Package=$package
+    $r=Run install
+    Assert ($r.ok -and $r.records[0].prior_package -ceq $package -and @($script:rules | Where-Object {$_.Package -cne ''}).Count -eq 0) 'Non-empty package was trusted'
+}
+$passed.Add('wildcard and SID packages also require repair')
+Reset;Assert (Run install).ok 'Concurrent package setup';$script:rules[0].Package='Any';$script:restorePackage=$true
+$r=Run ensure
+Assert (!$r.ok -and @($script:rules | Where-Object {$_.Enabled -eq 'True'}).Count -eq 0) 'Concurrent package write passed enabled readback'
+$passed.Add('enabled readback rejects a concurrent package change')
+Reset;Assert (Run install).ok 'Repair failure setup';$script:rules[0].Package='Any';$script:rules[0].Enabled='True';$script:failRemove=$true
+$r=Run ensure
+Assert (!$r.ok -and !$r.outcome.uncertain -and @($script:rules | Where-Object {$_.Enabled -eq 'True'}).Count -eq 0) 'Repair failure left an enabled rule or wrong uncertainty'
+$passed.Add('repair removal failure verifies the role disabled')
+Reset;Assert (Run install).ok 'Startup defect setup';$prior=$script:rules[0];$prior.Package='Any';$prior.Enabled='True';$script:writeCount=0;$script:filterReads=0
+$r=Run startup
+Assert ($r.ok -and $prior.Enabled -eq 'False' -and $prior.Package -eq 'Any' -and $script:rules.Contains($prior)) 'Startup repaired instead of disabling'
+Assert ($script:writeCount -eq 1 -and $script:filterReads -eq 2 -and $r.records[0].defective_template -eq $prior.Name) 'Startup defect diagnostic added reads/writes'
+$passed.Add('startup detects defective templates with the light ownership read and only disables')
+Assert ($script:packageBindings -eq 0) 'A New/Set call bound the Package parameter'
 [Console]::Out.WriteLine((@{passed=$passed.ToArray();native_policy_mutations=0;provider='pure fake'} | ConvertTo-Json -Compress))

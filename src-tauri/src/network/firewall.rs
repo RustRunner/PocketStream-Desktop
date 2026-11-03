@@ -238,6 +238,18 @@ fn evaluate_process(
         });
     match parsed {
         Some(report) => {
+            for record in &report.records {
+                if let Some(name) = record
+                    .get("repaired_template")
+                    .or_else(|| record.get("defective_template"))
+                {
+                    log::info!(
+                        "event=firewall_template_repair role={} prior_package={}",
+                        name.as_str().unwrap_or_default(),
+                        record["prior_package"].as_str().unwrap_or_default()
+                    );
+                }
+            }
             let uncertain = matches!(
                 report.outcome,
                 FirewallOutcome::Failed {
