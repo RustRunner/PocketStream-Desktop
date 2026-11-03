@@ -291,9 +291,85 @@ impl RestreamServer {
     }
 }
 
+// One schedule and a lifetime failure budget per desired listener generation.
+// This does not own a rule: firewall_generation remains the conservative lease.
+struct PolicyRetry {
+    generation: u64,
+    admission_attempt: u32,
+    transient_failures: u8,
+    due: Option<tokio::time::Instant>,
+}
+
+impl PolicyRetry {
+    fn new(generation: u64) -> Self {
+        Self {
+            generation,
+            admission_attempt: 0,
+            transient_failures: 0,
+            due: None,
+        }
+    }
+
+    fn observe(&mut self, result: &PolicyResult, retiring: bool, supervisor: bool) {
+        // A cancellation sentinel says nothing about policy or the pending request.
+        if !result.admitted && result.outcome == FirewallOutcome::Inactive {
+            return;
+        }
+        if result.admitted {
+            self.admission_attempt = 0;
+        }
+        let delay = match &result.outcome {
+            FirewallOutcome::Failed {
+                uncertain: true, ..
+            } => None,
+            FirewallOutcome::Unavailable { .. } if !result.admitted => {
+                self.admission_attempt = self.admission_attempt.saturating_add(1);
+                Some(super::relay::recovery_delay(
+                    self.admission_attempt.saturating_add(1),
+                ))
+            }
+            FirewallOutcome::Inactive if result.admitted && retiring => return,
+            FirewallOutcome::Failed {
+                stage,
+                uncertain: false,
+                ..
+            } if result.admitted && retryable_policy_stage(stage, retiring) => {
+                if supervisor {
+                    self.transient_failures = self.transient_failures.saturating_add(1).min(5);
+                }
+                (self.transient_failures < 5).then_some(std::time::Duration::from_secs(60))
+            }
+            _ => None,
+        };
+        self.due = delay.map(|delay| tokio::time::Instant::now() + delay);
+    }
+}
+
+fn retryable_policy_stage(stage: &str, retiring: bool) -> bool {
+    matches!(
+        stage,
+        "shape"
+            | "prepare"
+            | "blocks"
+            | "enable"
+            | "readback"
+            | "native_timeout"
+            | "native_canceled"
+            | "native_containment"
+            | "native_output"
+            | "native_report"
+    ) || (retiring && stage == "disable")
+}
+
+fn clean_firewall(outcome: &FirewallOutcome) -> bool {
+    matches!(outcome, FirewallOutcome::Applied { verified_shape: true, observed_block_rules, .. }
+        if observed_block_rules.is_empty())
+}
+
 pub(super) struct RelayData {
     pub(super) firewall: FirewallOutcome,
     pub(super) firewall_generation: Option<(u64, FirewallRule)>,
+    policy_retry: Option<PolicyRetry>,
     pub(super) restream_target: Option<CameraTarget>,
     pub(super) selected_protocol: RestreamProtocol,
     pub(super) restream_server: Option<RestreamServer>,
@@ -310,6 +386,7 @@ impl RelayData {
             selected_protocol,
             firewall: FirewallOutcome::Inactive,
             firewall_generation: None,
+            policy_retry: None,
             restream_target: None,
             restream_server: None,
             restream_desired: false,
@@ -318,6 +395,40 @@ impl RelayData {
             restream_intent_epoch: None,
             restream_start_time: None,
         }
+    }
+
+    fn eligible_policy_retry(&self) -> Option<(&PolicyRetry, &ResolvedStartSpec)> {
+        if !self.restream_desired {
+            return None;
+        }
+        let retry = self.policy_retry.as_ref()?;
+        let health = self.restream_health.as_ref()?.snapshot();
+        let server = self.restream_server.as_ref()?;
+        let spec = self.restream_spec.as_ref()?;
+        if retry.generation != health.server_generation
+            || server.server_generation() != retry.generation
+            || !server.loop_alive()
+            || !health.loop_alive
+            || health.error.is_some()
+            || !matches!(health.state, RelayState::Listening | RelayState::Streaming)
+            || (spec.bind_interface.is_some()
+                && (spec.bind_identity.is_none() || spec.bind_address.is_none()))
+        {
+            return None;
+        }
+        Some((retry, spec))
+    }
+
+    pub(super) fn firewall_next_retry_secs(&self) -> Option<u64> {
+        let (retry, _) = self.eligible_policy_retry()?;
+        let remaining = retry
+            .due?
+            .saturating_duration_since(tokio::time::Instant::now());
+        Some(
+            remaining
+                .as_secs()
+                .saturating_add(u64::from(remaining.subsec_nanos() != 0)),
+        )
     }
 }
 
@@ -717,6 +828,7 @@ impl RelayService {
                     health.stop();
                 }
                 state.restream_desired = false;
+                state.policy_retry = None;
                 state.restream_spec = None;
                 state.restream_health = None;
                 state.restream_intent_epoch = None;
@@ -873,6 +985,23 @@ impl RelayService {
                     "Explicit re-stream Start resolved to the healthy current endpoint; no-op"
                 );
                 info.firewall = state.firewall.clone();
+                if !clean_firewall(&state.firewall)
+                    && !matches!(
+                        state.firewall,
+                        FirewallOutcome::Failed {
+                            uncertain: true,
+                            ..
+                        }
+                    )
+                {
+                    if let Some(retry) = state.policy_retry.as_mut() {
+                        let now = tokio::time::Instant::now();
+                        // A due/in-flight request stays due; manual requests coalesce.
+                        retry.due = Some(retry.due.map_or(now, |due| due.min(now)));
+                    }
+                }
+                drop(state);
+                self.refresh_status().await;
                 return Ok(info);
             }
 
@@ -896,6 +1025,7 @@ impl RelayService {
             state.restream_target = target.clone();
             state.restream_spec = Some(spec.clone());
             state.restream_health = Some(health.clone());
+            state.policy_retry = Some(PolicyRetry::new(server_generation));
             state.restream_start_time = Some(std::time::Instant::now());
             (server_generation, health)
         };
@@ -1033,6 +1163,7 @@ impl RelayService {
             &self.restream_epoch,
             start_epoch,
             &self.relay_wake,
+            "start",
         )
         .await;
         if !relay_is_current(
@@ -1355,6 +1486,7 @@ impl RelayService {
                     health.stop();
                 }
                 state.restream_desired = false;
+                state.policy_retry = None;
                 state.restream_spec = None;
                 state.restream_health = None;
                 state.restream_intent_epoch = None;
@@ -2043,9 +2175,12 @@ async fn record_bind_failure(
     reason: String,
     events: Option<&RelayEventSender>,
 ) -> bool {
-    let state = state.lock().await;
+    let mut state = state.lock().await;
     if !relay_state_is_current(&state, epoch, expected_epoch, generation) {
         return false;
+    }
+    if let Some(retry) = state.policy_retry.as_mut() {
+        retry.due = None;
     }
     state
         .restream_health
@@ -2132,6 +2267,66 @@ async fn poll_relay_fault(ctx: &RelaySupervisorContext) -> Option<RelayFaultEven
     health.evaluate_watchdog(tokio::time::Instant::now())
 }
 
+async fn poll_policy_retry(ctx: &RelaySupervisorContext) -> Option<(u64, u64)> {
+    let state = ctx.state.lock().await;
+    let (retry, _) = state.eligible_policy_retry()?;
+    let epoch = state.restream_intent_epoch?;
+    (retry.due? <= tokio::time::Instant::now()
+        && relay_state_is_current(&state, &ctx.restream_epoch, epoch, retry.generation))
+    .then_some((retry.generation, epoch))
+}
+
+async fn retry_relay_policy(ctx: &RelaySupervisorContext, generation: u64, epoch: u64) {
+    if !relay_is_current(&ctx.state, &ctx.restream_epoch, epoch, generation).await {
+        return;
+    }
+    let _lifecycle = ctx.relay_lifecycle.lock().await;
+    let spec = {
+        let state = ctx.state.lock().await;
+        if !relay_state_is_current(&state, &ctx.restream_epoch, epoch, generation) {
+            return;
+        }
+        let Some((retry, spec)) = state.eligible_policy_retry() else {
+            return;
+        };
+        if !retry
+            .due
+            .is_some_and(|due| due <= tokio::time::Instant::now())
+        {
+            return;
+        }
+        spec.clone()
+    };
+    // A fault may have arrived while waiting for serialization. It owns recovery.
+    if let Some(fault) = poll_relay_fault(ctx).await {
+        let _ = ctx.relay_event_tx.send(RelaySupervisorEvent::Fault(fault));
+        return;
+    }
+    publish_relay_status(ctx).await;
+    apply_firewall(
+        &ctx.state,
+        ctx.policy.as_ref(),
+        &spec,
+        generation,
+        &ctx.restream_epoch,
+        epoch,
+        &ctx.relay_wake,
+        "retry",
+    )
+    .await;
+    // Epoch-only supersession still owns this lease. Only Stop/replacement
+    // warrants cleanup; an admitted result may satisfy the coalesced Start.
+    let still_owned = {
+        let state = ctx.state.lock().await;
+        relay_state_is_generation(&state, generation)
+    };
+    if !still_owned {
+        retire_firewall(&ctx.state, ctx.policy.as_ref(), generation).await;
+    }
+    drop(_lifecycle);
+    publish_relay_status(ctx).await;
+}
+
 pub(super) async fn run_relay_supervisor(
     mut events: RelayEventReceiver,
     ctx: RelaySupervisorContext,
@@ -2142,6 +2337,7 @@ pub(super) async fn run_relay_supervisor(
 
     loop {
         let event = tokio::select! {
+            biased;
             received = events.recv(), if channel_open => {
                 match received {
                     Some(event) => Some(event),
@@ -2152,7 +2348,14 @@ pub(super) async fn run_relay_supervisor(
                 }
             }
             _ = interval.tick() => {
-                poll_relay_fault(&ctx).await.map(RelaySupervisorEvent::Fault)
+                if let Some(fault) = poll_relay_fault(&ctx).await {
+                    Some(RelaySupervisorEvent::Fault(fault))
+                } else {
+                    if let Some((generation, epoch)) = poll_policy_retry(&ctx).await {
+                        retry_relay_policy(&ctx, generation, epoch).await;
+                    }
+                    None
+                }
             }
         };
 
@@ -2210,6 +2413,19 @@ async fn recover_relay_generation(
     cause: &'static str,
 ) {
     let recovery_started = tokio::time::Instant::now();
+    {
+        let mut state = ctx.state.lock().await;
+        if relay_state_is_current(
+            &state,
+            &ctx.restream_epoch,
+            expected_epoch,
+            server_generation,
+        ) {
+            if let Some(retry) = state.policy_retry.as_mut() {
+                retry.due = None;
+            }
+        }
+    }
     // Retire and fully release the failed listener before applying backoff.
     // The lifecycle gate is also the Stop completion barrier.
     {
@@ -2501,6 +2717,7 @@ async fn recover_relay_generation(
             &ctx.restream_epoch,
             expected_epoch,
             &ctx.relay_wake,
+            "rebuild",
         )
         .await;
         if !relay_is_current(
@@ -2714,8 +2931,109 @@ fn firewall_role(protocol: RestreamProtocol) -> FirewallRule {
     }
 }
 
+fn observe_policy_result(
+    state: &mut RelayData,
+    generation: u64,
+    phase: &str,
+    result: &PolicyResult,
+    retiring: bool,
+) {
+    if relay_state_is_generation(state, generation) {
+        if let Some(retry) = state
+            .policy_retry
+            .as_mut()
+            .filter(|r| r.generation == generation)
+        {
+            retry.observe(result, retiring, phase == "retry");
+        }
+    }
+}
+
+fn log_relay_firewall(
+    phase: &str,
+    generation: u64,
+    role: FirewallRule,
+    result: &PolicyResult,
+    retry: Option<&PolicyRetry>,
+    spec: Option<&ResolvedStartSpec>,
+) {
+    let (outcome, action, verified, blocks, stage, uncertain, reason) = match &result.outcome {
+        FirewallOutcome::Applied {
+            action,
+            verified_shape,
+            observed_block_rules,
+            ..
+        } => (
+            "applied",
+            match action {
+                firewall::RuleAction::Created => "created",
+                firewall::RuleAction::Updated => "updated",
+                firewall::RuleAction::Unchanged => "unchanged",
+            },
+            if *verified_shape { "true" } else { "false" },
+            observed_block_rules.len(),
+            "-",
+            "-",
+            "-",
+        ),
+        FirewallOutcome::Inactive => (
+            "inactive",
+            "-",
+            "-",
+            0,
+            "-",
+            "-",
+            if result.admitted { "-" } else { "superseded" },
+        ),
+        FirewallOutcome::Unavailable { reason } => {
+            ("unavailable", "-", "-", 0, "-", "-", reason.as_str())
+        }
+        FirewallOutcome::Failed {
+            stage,
+            reason,
+            uncertain,
+        } => (
+            "failed",
+            "-",
+            "-",
+            0,
+            stage.as_str(),
+            if *uncertain { "true" } else { "false" },
+            reason.as_str(),
+        ),
+    };
+    let mut reason = redact_relay_text(reason, spec.map_or("", ResolvedStartSpec::mount_path));
+    if let Some(spec) = spec {
+        for secret in [&spec.username, &spec.password]
+            .into_iter()
+            .chain(match &spec.output {
+                ResolvedOutput::Srt { passphrase, .. } => Some(passphrase),
+                _ => None,
+            })
+        {
+            if !secret.is_empty() {
+                reason = reason.replace(secret, "***");
+            }
+        }
+    }
+    let line = format!("event=relay_firewall phase={} generation={} role={} admitted={} outcome={} action={} verified={} blocks={} stage={} uncertain={} retry_for_generation={} next_retry_ms={} reason={}",
+        phase, generation, match role { FirewallRule::Rtsp => "rtsp", FirewallRule::Srt => "srt" }, result.admitted,
+        outcome, action, verified, blocks, crate::network::log_value(&stage.chars().take(64).collect::<String>()), uncertain,
+        retry.map_or_else(|| "-".into(), |r| r.generation.to_string()),
+        retry.and_then(|r| r.due).map_or_else(|| "-".into(), |due| due.saturating_duration_since(tokio::time::Instant::now()).as_millis().to_string()),
+        crate::network::log_value(&reason.chars().take(256).collect::<String>()));
+    if result.admitted
+        && (clean_firewall(&result.outcome) || result.outcome == FirewallOutcome::Inactive)
+    {
+        log::info!("{line}");
+    } else {
+        log::warn!("{line}");
+    }
+}
+
 // All callers hold relay_lifecycle. The lease is installed before dispatch, so
 // cancellation cannot hide an enabled rule from Stop/startup reconciliation.
+#[allow(clippy::too_many_arguments)] // Existing lifecycle/admission inputs plus the result's phase.
 async fn apply_firewall(
     state: &state::RelaySlot,
     policy: &dyn RelayPolicy,
@@ -2724,11 +3042,16 @@ async fn apply_firewall(
     epoch: &Arc<std::sync::atomic::AtomicU64>,
     expected_epoch: u64,
     wake: &Notify,
+    phase: &'static str,
 ) -> FirewallOutcome {
+    if !relay_is_current(state, epoch, expected_epoch, generation).await {
+        return FirewallOutcome::Inactive;
+    }
     apply_firewall_with(
         state,
         spec,
         generation,
+        phase,
         |r, p, i| {
             policy.ensure(
                 r,
@@ -2773,6 +3096,7 @@ async fn apply_firewall_with<E, D>(
     state: &state::RelaySlot,
     spec: &ResolvedStartSpec,
     generation: u64,
+    phase: &'static str,
     ensure: impl FnOnce(FirewallRule, u16, Option<crate::network::interface::NativeIdentity>) -> E,
     disable: impl FnOnce(FirewallRule) -> D,
     current: impl Future<Output = bool>,
@@ -2784,7 +3108,11 @@ where
     let role = firewall_role(spec.protocol());
     let prior = state.lock().await.firewall_generation;
     if let Some((prior_generation, _)) = prior.filter(|lease| *lease != (generation, role)) {
-        if !retire_firewall_with(state, prior_generation, disable).await {
+        if retire_firewall_with(state, prior_generation, Some((generation, phase)), disable)
+            .await
+            .is_err()
+        {
+            // In particular, never expose a cancellation sentinel as retirement.
             return state.lock().await.firewall.clone();
         }
     }
@@ -2799,16 +3127,27 @@ where
     };
     let result = ensure(role, spec.server_port(), spec.bind_identity.clone()).await;
     let obsolete = !result.admitted && !current.await;
-    let outcome = result.outcome;
     let mut state = state.lock().await;
     if state.firewall_generation == Some((generation, role)) {
-        if installed && obsolete && outcome == FirewallOutcome::Inactive {
+        if installed && obsolete && result.outcome == FirewallOutcome::Inactive {
             state.firewall_generation = None;
-        } else if result.admitted || outcome != FirewallOutcome::Inactive {
-            state.firewall = outcome.clone();
+        } else if result.admitted || result.outcome != FirewallOutcome::Inactive {
+            state.firewall = result.outcome.clone();
         }
     }
-    outcome
+    observe_policy_result(&mut state, generation, phase, &result, false);
+    log_relay_firewall(
+        phase,
+        generation,
+        role,
+        &result,
+        state
+            .policy_retry
+            .as_ref()
+            .filter(|r| r.generation == generation),
+        Some(spec),
+    );
+    result.outcome
 }
 
 async fn retire_firewall(
@@ -2816,14 +3155,17 @@ async fn retire_firewall(
     policy: &dyn RelayPolicy,
     generation: u64,
 ) -> bool {
-    retire_firewall_with(state, generation, |r| policy.disable(r)).await
+    retire_firewall_with(state, generation, None, |r| policy.disable(r))
+        .await
+        .is_ok()
 }
 
 async fn retire_firewall_with<D>(
     state: &state::RelaySlot,
     generation: u64,
+    retry_for: Option<(u64, &'static str)>,
     disable: impl FnOnce(FirewallRule) -> D,
-) -> bool
+) -> Result<(), PolicyResult>
 where
     D: std::future::Future<Output = PolicyResult>,
 {
@@ -2843,12 +3185,27 @@ where
                 state.firewall_generation = None;
             }
             if result.admitted || result.outcome != FirewallOutcome::Inactive {
-                state.firewall = result.outcome;
+                state.firewall = result.outcome.clone();
             }
         }
-        disabled
+        if let Some((generation, phase)) = retry_for {
+            observe_policy_result(&mut state, generation, phase, &result, true);
+        }
+        log_relay_firewall(
+            "retire",
+            generation,
+            role,
+            &result,
+            retry_for.and_then(|(g, _)| state.policy_retry.as_ref().filter(|r| r.generation == g)),
+            state.restream_spec.as_ref(),
+        );
+        if disabled {
+            Ok(())
+        } else {
+            Err(result)
+        }
     } else {
-        true
+        Ok(())
     }
 }
 
@@ -3009,6 +3366,9 @@ mod tests {
         struct Policy {
             ensures: SyncMutex<Vec<(FirewallRule, u16, Option<NativeIdentity>)>>,
             disables: SyncMutex<Vec<FirewallRule>>,
+            calls: SyncMutex<Vec<(&'static str, FirewallRule)>>,
+            ensure_results: SyncMutex<VecDeque<PolicyResult>>,
+            disable_results: SyncMutex<VecDeque<PolicyResult>>,
             ensure_barrier: SyncMutex<Option<Arc<Barrier>>>,
             admission_barrier: SyncMutex<Option<Arc<Barrier>>>,
             disable_barrier: SyncMutex<Option<Arc<Barrier>>>,
@@ -3023,6 +3383,7 @@ mod tests {
             ) -> RelayFuture<'a, PolicyResult> {
                 let admission = self.admission_barrier.lock().unwrap().take();
                 let barrier = self.ensure_barrier.lock().unwrap().take();
+                let result = self.ensure_results.lock().unwrap().pop_front();
                 Box::pin(async move {
                     let availability = async {
                         if let Some(admission) = admission {
@@ -3035,25 +3396,30 @@ mod tests {
                         () = availability => (),
                     }
                     self.ensures.lock().unwrap().push((rule, port, identity));
+                    self.calls.lock().unwrap().push(("ensure", rule));
                     if let Some(barrier) = barrier {
                         barrier.wait().await;
                     }
-                    PolicyResult::accepted(FirewallOutcome::Applied {
-                        rule_name: "owned-test-rule".into(),
-                        action: firewall::RuleAction::Unchanged,
-                        verified_shape: true,
-                        observed_block_rules: vec![],
+                    result.unwrap_or_else(|| {
+                        PolicyResult::accepted(FirewallOutcome::Applied {
+                            rule_name: "owned-test-rule".into(),
+                            action: firewall::RuleAction::Unchanged,
+                            verified_shape: true,
+                            observed_block_rules: vec![],
+                        })
                     })
                 })
             }
             fn disable(&self, rule: FirewallRule) -> RelayFuture<'_, PolicyResult> {
                 self.disables.lock().unwrap().push(rule);
+                self.calls.lock().unwrap().push(("disable", rule));
                 let barrier = self.disable_barrier.lock().unwrap().take();
+                let result = self.disable_results.lock().unwrap().pop_front();
                 Box::pin(async move {
                     if let Some(barrier) = barrier {
                         barrier.wait().await;
                     }
-                    PolicyResult::accepted(FirewallOutcome::Inactive)
+                    result.unwrap_or_else(|| PolicyResult::accepted(FirewallOutcome::Inactive))
                 })
             }
         }
@@ -3241,6 +3607,8 @@ mod tests {
             }
         }
 
+        include!("relay_policy_tests.rs");
+
         #[tokio::test]
         async fn obsolete_idle_ensure_and_intent_change_after_prior_retirement_never_dispatch() {
             for retire_prior in [false, true] {
@@ -3268,6 +3636,7 @@ mod tests {
                         &service.restream_epoch,
                         0,
                         &service.relay_wake,
+                        "start",
                     )
                     .await
                 });
@@ -4474,13 +4843,14 @@ mod tests {
             state.firewall = enabled.clone();
         }
         assert!(
-            !retire_firewall_with(&manager.relay.state, 41, |_| async {
+            retire_firewall_with(&manager.relay.state, 41, None, |_| async {
                 PolicyResult {
                     admitted: false,
                     outcome: FirewallOutcome::Inactive,
                 }
             })
             .await
+            .is_err()
         );
         assert_eq!(
             manager.relay.state.lock().await.firewall_generation,
@@ -4488,10 +4858,11 @@ mod tests {
         );
         assert_eq!(manager.relay.state.lock().await.firewall, enabled);
         assert!(
-            retire_firewall_with(&manager.relay.state, 41, |_| async {
+            retire_firewall_with(&manager.relay.state, 41, None, |_| async {
                 PolicyResult::accepted(FirewallOutcome::Inactive)
             })
             .await
+            .is_ok()
         );
         assert!(manager
             .relay
@@ -4518,6 +4889,7 @@ mod tests {
                         &manager.relay.state,
                         &resolved_spec_for_test(&settings),
                         41,
+                        "start",
                         |_, _, _| async {
                             PolicyResult {
                                 admitted,
@@ -4555,6 +4927,7 @@ mod tests {
             &manager.relay.state,
             &resolved_spec_for_test(&settings),
             41,
+            "start",
             |_, _, _| async {
                 PolicyResult {
                     admitted: false,
@@ -4594,6 +4967,7 @@ mod tests {
                 &m.relay.state,
                 &spec,
                 41,
+                "start",
                 |role, _, _| async move {
                     entered_tx.send(role).unwrap();
                     std::future::pending::<PolicyResult>().await
@@ -4611,10 +4985,11 @@ mod tests {
         caller.abort();
         assert!(caller.await.unwrap_err().is_cancelled());
         assert!(
-            !retire_firewall_with(&manager.relay.state, 41, |_| async {
+            retire_firewall_with(&manager.relay.state, 41, None, |_| async {
                 PolicyResult::accepted(uncertain_policy())
             })
             .await
+            .is_err()
         );
         assert_eq!(
             manager.relay.state.lock().await.firewall,
@@ -4659,6 +5034,7 @@ mod tests {
                 &manager.relay.state,
                 &resolved_spec_for_test(&settings),
                 41,
+                "start",
                 |_, _, _| async {
                     dispatched.store(true, std::sync::atomic::Ordering::Release);
                     PolicyResult::accepted(FirewallOutcome::Inactive)
@@ -4691,6 +5067,7 @@ mod tests {
             &manager.relay.state,
             &spec,
             41,
+            "start",
             |_, _, _| async { result.await.unwrap() },
             |_| async { PolicyResult::accepted(FirewallOutcome::Inactive) },
             std::future::ready(true),
@@ -4728,7 +5105,7 @@ mod tests {
         let manager = StreamManager::new();
         manager.relay.state.lock().await.firewall_generation = Some((40, FirewallRule::Rtsp));
         let (done, result) = tokio::sync::oneshot::channel();
-        let retire = retire_firewall_with(&manager.relay.state, 40, |_| async {
+        let retire = retire_firewall_with(&manager.relay.state, 40, None, |_| async {
             result.await.unwrap()
         });
         tokio::pin!(retire);
@@ -4743,7 +5120,7 @@ mod tests {
         }
         done.send(PolicyResult::accepted(FirewallOutcome::Inactive))
             .unwrap();
-        assert!(retire.await);
+        assert!(retire.await.is_ok());
         let state = manager.relay.state.lock().await;
         assert_eq!(state.firewall_generation, Some((41, FirewallRule::Rtsp)));
         assert_eq!(state.firewall, newer);
@@ -4763,6 +5140,7 @@ mod tests {
             &manager.relay.state,
             &resolved_spec_for_test(&settings),
             41,
+            "start",
             |role, _, _| {
                 calls.lock().unwrap().push(role);
                 let state = manager.relay.state.clone();

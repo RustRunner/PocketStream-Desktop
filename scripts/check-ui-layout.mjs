@@ -32,7 +32,13 @@ const sidebar = load(${JSON.stringify(compile('src/lib/sidebar.ts'))}, {
   './streaming.ts': { getVideoAreaBounds: () => ({ x: 0, y: 0, width: 1, height: 1 }), syncVideoVisibility: async () => {} },
 });
 sidebar.setupSidebarToggle();
-window.layout = { shared, clicks: { screenshot: 0, record: 0 } };
+const policyFormat = load(${JSON.stringify(compile('src/lib/restream-format.ts'))}, {});
+const streaming = load(${JSON.stringify(compile('src/lib/streaming.ts'))}, {
+  'qrcode': {}, './tauri-api.ts': native, './state.ts': shared, './errors.ts': { formatError: String },
+  './device-list.ts': {}, './network.ts': {}, './restream-format.ts': policyFormat,
+  './restream-settings.ts': load(${JSON.stringify(compile('src/lib/restream-settings.ts'))}, {}),
+});
+window.layout = { shared, streaming, clicks: { screenshot: 0, record: 0 } };
 for (const name of ['screenshot', 'record']) {
   const button = document.querySelector('#btn-' + name); button.disabled = false;
   button.addEventListener('click', () => { window.layout.clicks[name]++; });
@@ -134,7 +140,51 @@ try {
     const after = await evaluate('({...layout.clicks})');
     assert.equal(after.screenshot - before.screenshot, 2); assert.equal(after.record - before.record, 2);
     assert(await evaluate(`!!document.querySelector('.toast')`), 'repeat clicks happen while the notice remains visible');
-    assert(await evaluate(`!document.querySelector('#btn-remove-primary-ip, #restream-bind-scope, #restream-firewall-state')`));
+    assert(await evaluate(`!document.querySelector('#btn-remove-primary-ip')`));
+    assert(await evaluate(`['restream-bind-scope', 'restream-firewall-state', 'restream-scope-row', 'restream-firewall-row'].every(id => document.querySelector('#card-restream #' + id))`));
+    const policyLayout = await evaluate(`(() => {
+      const scope = { kind: 'interface', id: 'uplink', alias: 'Long uplink adapter name '.repeat(5), address: '192.0.2.2', family: 'ipv4', topology_revision: 1 };
+      const blocks = ['Disabled other-protocol Block ' + 'native-name'.repeat(40), 'unrelated-interface-rule'];
+      const applied = { state: 'applied', rule_name: 'owned', action: 'updated', verified_shape: true, observed_block_rules: blocks };
+      const failure = { state: 'failed', stage: 'native_timeout', uncertain: false, reason: 'Long reported reason '.repeat(40) };
+      const render = (desired, firewall) => {
+        layout.shared.state.isRestreamDesired = desired;
+        layout.streaming.updateRestreamUI('rtsp://192.0.2.2:8554/***', { bind_scope: scope, firewall, relay_state: 'listening', firewall_next_retry_secs: 0 });
+      };
+      const visible = id => getComputedStyle(document.querySelector('#' + id)).display !== 'none';
+      render(true, applied);
+      const conflict = { scope: visible('restream-scope-row'), policy: visible('restream-firewall-row'), detail: document.querySelector('#restream-firewall-state').title };
+      const overflow = () => {
+        const card = document.querySelector('#card-restream').getBoundingClientRect();
+        return ['restream-bind-scope', 'restream-firewall-state'].map(id => {
+          const value = document.querySelector('#' + id), rect = value.getBoundingClientRect();
+          return { id, left: rect.left, right: rect.right, cardLeft: card.left, cardRight: card.right, scroll: value.scrollWidth, width: value.clientWidth };
+        });
+      };
+      const conflictGeometry = overflow();
+      render(true, failure); const failedGeometry = overflow();
+      render(false, failure); const stopped = { scope: visible('restream-scope-row'), policy: visible('restream-firewall-row') };
+      render(false, { state: 'inactive' }); const inactive = { scope: visible('restream-scope-row'), policy: visible('restream-firewall-row') };
+      render(true, applied);
+      const readable = ['restream-bind-scope', 'restream-firewall-state'].map(id => {
+        const value = document.querySelector('#' + id);
+        value.scrollIntoView({ block: 'start' });
+        const rect = value.getBoundingClientRect(), body = value.closest('.card-body').getBoundingClientRect();
+        return { id, inView: rect.top < body.bottom && rect.bottom > body.top, detail: value.title.length >= value.textContent.length };
+      });
+      return { conflict, conflictGeometry, failedGeometry, stopped, inactive, readable, pageOverflow: document.documentElement.scrollWidth > innerWidth };
+    })()`);
+    assert(policyLayout.conflict.scope && policyLayout.conflict.policy);
+    assert.match(policyLayout.conflict.detail, /Disabled other-protocol Block.*unrelated-interface-rule/);
+    assert.match(policyLayout.conflict.detail, /whether they are enabled and apply/);
+    for (const item of [...policyLayout.conflictGeometry, ...policyLayout.failedGeometry]) {
+      assert(item.left >= item.cardLeft && item.right <= item.cardRight + 1, `policy value stays in card: ${JSON.stringify(item)}`);
+      assert(item.scroll <= item.width + 1, `long policy/scope text wraps: ${JSON.stringify(item)}`);
+    }
+    assert.deepEqual(policyLayout.stopped, { scope: false, policy: true });
+    assert.deepEqual(policyLayout.inactive, { scope: false, policy: false });
+    assert(!policyLayout.pageOverflow, 'policy rows cannot widen the viewport');
+    assert(policyLayout.readable.every(row => row.inView && row.detail), 'each policy row scrolls into view with its full detail available');
     assert(await evaluate(`!!document.querySelector('#card-restream .card-header #btn-show-qr')`));
     assert(await evaluate(`!document.querySelector('#nodes-title').matches('.clickable-title, [role="button"]')`));
     const shot = await send('Page.captureScreenshot', { format: 'png' });
@@ -143,7 +193,7 @@ try {
     assert.equal((await evaluate(geometry)).expanded, 'false');
     const closedShot = await send('Page.captureScreenshot', { format: 'png' });
     fs.writeFileSync(path.join(output, `collapsed-${width}.png`), Buffer.from(closedShot.data, 'base64'));
-    observations.push({ width, height, closed, moving, open, notice, clicks: after });
+    observations.push({ width, height, closed, moving, open, notice, policyLayout, clicks: after });
   }
   await send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'reduce' }] });
   assert.equal(await evaluate(`getComputedStyle(document.querySelector('#menu-toggle')).transitionDuration`), '0s');

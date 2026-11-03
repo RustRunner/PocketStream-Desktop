@@ -13,10 +13,10 @@ test('binding and firewall text keep local scope separate from policy and reacha
   assert.equal(formatBindScope({kind:'all_addresses',family:'ipv4',topology_revision:7,addresses:[{id:'a',alias:'Hidden virtual',address:'169.254.1.2'},{id:'b',alias:'Loopback',address:'127.0.0.1'}]}),'Bound on all IPv4 addresses: 169.254.1.2 (Hidden virtual), 127.0.0.1 (Loopback)');
   assert.match(formatBindScope({kind:'unknown',reason:'Observation failed'}),/unknown: Observation failed/);
   assert.match(formatBindScope({kind:'interface',id:'a',alias:'Wi-Fi',address:'192.0.2.2',family:'ipv4',topology_revision:8}),/^Bound on Wi-Fi:/);
-  assert.match(formatFirewallOutcome({state:'applied',rule_name:'owned',action:'updated',verified_shape:true,observed_block_rules:['Query User deny']}),/preserved Windows block rules: Query User deny/);
-  assert.match(formatFirewallOutcome({state:'failed',stage:'readback',reason:'Unavailable',uncertain:true}),/reconciliation required/);
+  assert.match(formatFirewallOutcome({state:'applied',rule_name:'owned',action:'updated',verified_shape:true,observed_block_rules:['Query User deny']}),/Observed Block rules: Query User deny/);
+  assert.match(formatFirewallOutcome({state:'failed',stage:'readback',reason:'Unavailable',uncertain:true}),/state is uncertain.*Stop the server to attempt rule retirement/);
   assert.match(formatFirewallOutcome({state:'unavailable',reason:'Administrator access required'}),/unavailable/);
-  assert.equal(formatFirewallOutcome({state:'inactive'}),'Windows rule inactive');
+  assert.match(formatFirewallOutcome({state:'inactive'}),/^Windows rule inactive\./);
 });
 test('bind selections retain GUIDs, missing choices and independent protocol state',async()=>{
   const {buildRestreamBindOptions,selectedRestreamBindInterface,buildRestreamBindUpdate}=await load('src/lib/restream-settings.ts');

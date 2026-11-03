@@ -244,6 +244,7 @@ export type FirewallOutcome =
 export interface StreamStatus {
   bind_scope: BindScope;
   firewall: FirewallOutcome;
+  firewall_next_retry_secs: number | null;
   playing: boolean;
   playback_desired: boolean;
   playback_state: "stopped" | "starting" | "playing" | "recovering" | "failed";

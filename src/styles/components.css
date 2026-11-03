@@ -392,7 +392,8 @@
 
 #card-restream .card-body {
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: auto minmax(0, 1fr);
+  column-gap: 12px;
   row-gap: 6px;
   align-items: center;
   font-size: 13px;
@@ -464,6 +465,18 @@
   max-width: 240px;
   overflow-wrap: anywhere;
   text-align: right;
+}
+
+#card-restream .restream-policy-detail {
+  min-width: 0;
+  max-width: 240px;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
+#restream-scope-row > .status-label,
+#restream-firewall-row > .status-label {
+  align-self: start;
 }
 
 /* ── Progress Bar ───────────────────────────────────────────────────── */
