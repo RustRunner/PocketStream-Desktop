@@ -153,10 +153,20 @@ pub(crate) async fn resolve(
 ) -> Result<(Option<NativeIdentity>, BindScope), AppError> {
     let revision = revision();
     let rows = native().await?;
+    resolve_rows(&rows, revision, alias, id, adopted)
+}
+
+pub(crate) fn resolve_rows(
+    rows: &[NativeAdapter],
+    revision: u64,
+    alias: Option<&str>,
+    id: Option<&str>,
+    adopted: &HashSet<String>,
+) -> Result<(Option<NativeIdentity>, BindScope), AppError> {
     let Some(alias) = alias else {
-        return Ok((None, exposure(&rows, revision)));
+        return Ok((None, exposure(rows, revision)));
     };
-    let row = select(&rows, id, alias)?;
+    let row = select(rows, id, alias)?;
     let address = usable(&row.ips, adopted).ok_or_else(|| {
         AppError::Stream(format!(
             "Interface '{}' has no usable non-adopted, non-APIPA IPv4 address",
@@ -285,6 +295,78 @@ fn topology_observation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_resolution_preserves_selection_exposure_and_observation_stamp() {
+        let mut rows = vec![
+            row("b", "Other", &["198.51.100.2"]),
+            row("a", "Renamed", &["192.0.2.2", "192.0.2.2"]),
+        ];
+        let adopted = HashSet::new();
+        let (identity, scope) = resolve_rows(&rows, 17, None, None, &adopted).unwrap();
+        assert!(identity.is_none());
+        let BindScope::AllAddresses {
+            addresses,
+            topology_revision,
+            ..
+        } = scope
+        else {
+            panic!()
+        };
+        assert_eq!(topology_revision, 17);
+        assert_eq!(
+            addresses.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        for (alias, id) in [("Renamed", None), ("Old alias", Some("{A}"))] {
+            let (identity, scope) = resolve_rows(&rows, 18, Some(alias), id, &adopted).unwrap();
+            assert_eq!(identity.unwrap().guid, "a");
+            assert!(
+                matches!(scope, BindScope::Interface { alias, address, topology_revision: 18, .. }
+                if alias == "Renamed" && address == "192.0.2.2")
+            );
+        }
+        assert!(resolve_rows(&rows, 19, Some("Missing"), None, &adopted).is_err());
+        assert!(resolve_rows(&rows, 19, Some("Renamed"), Some("missing"), &adopted).is_err());
+        rows.push(rows[1].clone());
+        assert!(resolve_rows(&rows, 19, Some("Renamed"), None, &adopted).is_err());
+        rows.pop();
+        rows[1].is_up = false;
+        assert!(resolve_rows(&rows, 19, Some("Renamed"), Some("a"), &adopted).is_err());
+        rows[1].is_up = true;
+        rows[1].guid.clear();
+        assert!(resolve_rows(&rows, 19, Some("Renamed"), None, &adopted).is_err());
+    }
+
+    #[test]
+    fn row_resolution_filters_unusable_addresses_only_for_explicit_binds() {
+        let rows = vec![row(
+            "a",
+            "Uplink",
+            &[
+                "0.0.0.0",
+                "127.0.0.1",
+                "169.254.1.2",
+                "192.0.2.2",
+                "198.51.100.2",
+            ],
+        )];
+        let mut adopted = HashSet::from(["192.0.2.2".into()]);
+        let (_, scope) = resolve_rows(&rows, 20, Some("Uplink"), Some("a"), &adopted).unwrap();
+        assert!(matches!(scope, BindScope::Interface { address, .. } if address == "198.51.100.2"));
+        adopted.insert("198.51.100.2".into());
+        assert!(resolve_rows(&rows, 20, Some("Uplink"), Some("a"), &adopted).is_err());
+        let (_, scope) = resolve_rows(&rows, 21, None, None, &adopted).unwrap();
+        assert!(matches!(scope, BindScope::AllAddresses { addresses, .. } if addresses.len() == 5));
+        assert!(resolve_rows(
+            &[row("a", "Uplink", &[])],
+            22,
+            Some("Uplink"),
+            None,
+            &adopted
+        )
+        .is_err());
+    }
 
     #[test]
     fn observation_retries_unchanged_success_but_suppresses_repeated_failure() {

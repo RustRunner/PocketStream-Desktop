@@ -24,13 +24,170 @@ use crate::{
     network::{
         bindings::{self, BindScope},
         firewall::{self, FirewallOutcome, FirewallRule},
+        interface::NativeIdentity,
         route::CameraTarget,
     },
 };
 use gstreamer as gst;
 use serde::Serialize;
 use std::sync::Arc;
+use std::{collections::HashSet, future::Future, pin::Pin};
 use tokio::sync::{Mutex, Notify};
+
+type RelayFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+type BindingResolution = Result<(Option<NativeIdentity>, BindScope), AppError>;
+
+// These two boundaries are shared with the supervisor; they do not alter
+// native executor admission, settlement, or lease ownership.
+trait RelayBindings: Send + Sync {
+    fn revision(&self) -> u64;
+    fn resolve<'a>(
+        &'a self,
+        alias: Option<&'a str>,
+        id: Option<&'a str>,
+        adopted: &'a HashSet<String>,
+    ) -> RelayFuture<'a, BindingResolution>;
+}
+
+struct NativeBindings;
+impl RelayBindings for NativeBindings {
+    fn revision(&self) -> u64 {
+        bindings::revision()
+    }
+    fn resolve<'a>(
+        &'a self,
+        alias: Option<&'a str>,
+        id: Option<&'a str>,
+        adopted: &'a HashSet<String>,
+    ) -> RelayFuture<'a, BindingResolution> {
+        Box::pin(bindings::resolve(alias, id, adopted))
+    }
+}
+
+trait RelayPolicy: Send + Sync {
+    fn ensure(
+        &self,
+        rule: FirewallRule,
+        port: u16,
+        interface: Option<NativeIdentity>,
+    ) -> RelayFuture<'_, FirewallOutcome>;
+    fn disable(&self, rule: FirewallRule) -> RelayFuture<'_, FirewallOutcome>;
+}
+
+struct NativePolicy;
+impl RelayPolicy for NativePolicy {
+    fn ensure(
+        &self,
+        rule: FirewallRule,
+        port: u16,
+        interface: Option<NativeIdentity>,
+    ) -> RelayFuture<'_, FirewallOutcome> {
+        Box::pin(firewall::ensure(rule, port, interface))
+    }
+    fn disable(&self, rule: FirewallRule) -> RelayFuture<'_, FirewallOutcome> {
+        Box::pin(firewall::disable(rule))
+    }
+}
+
+fn explicit_bind_changed(
+    spec: &ResolvedStartSpec,
+    identity: Option<&NativeIdentity>,
+    next: &BindScope,
+) -> bool {
+    match next {
+        BindScope::Interface { alias, address, .. } => {
+            Some(alias) != spec.bind_interface.as_ref()
+                || Some(address) != spec.bind_address.as_ref()
+                || identity != spec.bind_identity.as_ref()
+        }
+        _ => true,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BindValidity {
+    Unchanged,
+    Refreshed(BindScope),
+    Invalidated(String),
+}
+
+fn classify_bind_validity(
+    spec: &ResolvedStartSpec,
+    observation: BindingResolution,
+) -> BindValidity {
+    match &spec.bind_scope {
+        BindScope::Unknown { .. } => BindValidity::Unchanged,
+        BindScope::AllAddresses { .. } => BindValidity::Refreshed(match observation {
+            Ok((_, scope @ BindScope::AllAddresses { .. })) => scope,
+            Ok(_) => BindScope::Unknown {
+                reason: "Wildcard binding observation unavailable".into(),
+            },
+            Err(error) => BindScope::Unknown {
+                reason: redact_relay_text(&error.to_string(), spec.mount_path()),
+            },
+        }),
+        BindScope::Interface { .. } => match observation {
+            Ok((identity, scope)) if !explicit_bind_changed(spec, identity.as_ref(), &scope) => {
+                BindValidity::Refreshed(scope)
+            }
+            Ok(_) => {
+                BindValidity::Invalidated("Selected bind identity, alias or address changed".into())
+            }
+            Err(error) => BindValidity::Invalidated(redact_relay_text(
+                &format!("Selected bind resolution failed: {error}"),
+                spec.mount_path(),
+            )),
+        },
+    }
+}
+
+async fn bind_validity(
+    provider: &dyn RelayBindings,
+    spec: &ResolvedStartSpec,
+    adopted: &HashSet<String>,
+    generation: u64,
+    phase: &str,
+) -> BindValidity {
+    let Some(captured) = scope_revision(&spec.bind_scope) else {
+        return BindValidity::Unchanged;
+    };
+    let checked = provider.revision();
+    if captured == checked {
+        return BindValidity::Unchanged;
+    }
+    let explicit = matches!(spec.bind_scope, BindScope::Interface { .. });
+    let observation = provider
+        .resolve(
+            if explicit {
+                spec.bind_interface.as_deref()
+            } else {
+                None
+            },
+            if explicit {
+                spec.bind_identity.as_ref().map(|i| i.guid.as_str())
+            } else {
+                None
+            },
+            adopted,
+        )
+        .await;
+    let observed = observation
+        .as_ref()
+        .ok()
+        .and_then(|(_, scope)| scope_revision(scope));
+    let result = classify_bind_validity(spec, observation);
+    let (label, reason) = match &result {
+        BindValidity::Unchanged => return result,
+        BindValidity::Refreshed(BindScope::Unknown { reason }) => ("refreshed", reason.as_str()),
+        BindValidity::Refreshed(_) => ("refreshed", "none"),
+        BindValidity::Invalidated(reason) => ("invalidated", reason.as_str()),
+    };
+    log::info!("event=relay_bind_validity generation={} phase={} scope={} result={} captured_revision={} checked_revision={} observed_revision={} reason={}",
+        generation, phase, if explicit { "interface" } else { "all" }, label, captured, checked,
+        observed.map_or_else(|| "unknown".into(), |r| r.to_string()),
+        crate::network::log_value(&reason.chars().take(256).collect::<String>()));
+    result
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RestreamServerInfo {
@@ -164,6 +321,8 @@ impl RelayData {
 }
 
 pub(super) struct RelayService {
+    bindings: Arc<dyn RelayBindings>,
+    policy: Arc<dyn RelayPolicy>,
     state: state::RelaySlot,
     status: status::StatusPublisher,
     readiness: Option<Arc<crate::network::readiness::CameraReadiness>>,
@@ -186,6 +345,8 @@ pub(super) struct RestreamStopIntent {
 
 #[derive(Clone)]
 pub(super) struct RelaySupervisorContext {
+    bindings: Arc<dyn RelayBindings>,
+    policy: Arc<dyn RelayPolicy>,
     state: state::RelaySlot,
     status: status::StatusPublisher,
     restream_epoch: Arc<std::sync::atomic::AtomicU64>,
@@ -207,8 +368,26 @@ impl RelayService {
         status: status::StatusPublisher,
         readiness: Option<Arc<crate::network::readiness::CameraReadiness>>,
     ) -> Self {
+        Self::with_providers(
+            state,
+            status,
+            readiness,
+            Arc::new(NativeBindings),
+            Arc::new(NativePolicy),
+        )
+    }
+
+    fn with_providers(
+        state: state::RelaySlot,
+        status: status::StatusPublisher,
+        readiness: Option<Arc<crate::network::readiness::CameraReadiness>>,
+        bindings: Arc<dyn RelayBindings>,
+        policy: Arc<dyn RelayPolicy>,
+    ) -> Self {
         let (relay_event_tx, relay_event_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
+            bindings,
+            policy,
             state,
             status,
             readiness,
@@ -231,6 +410,8 @@ impl RelayService {
         Some((
             events,
             RelaySupervisorContext {
+                bindings: self.bindings.clone(),
+                policy: self.policy.clone(),
                 state: self.state.clone(),
                 status: self.status.clone(),
                 restream_epoch: self.restream_epoch.clone(),
@@ -245,9 +426,18 @@ impl RelayService {
     async fn refresh_status(&self) {
         self.status.refresh().await;
     }
+    #[cfg(test)]
     pub(super) async fn resolve_restream_start_spec(
         settings: &AppSettings,
         adopted: &std::collections::HashSet<String>,
+    ) -> Result<ResolvedStartSpec, AppError> {
+        Self::resolve_restream_start_spec_with(&NativeBindings, settings, adopted).await
+    }
+
+    async fn resolve_restream_start_spec_with(
+        provider: &dyn RelayBindings,
+        settings: &AppSettings,
+        adopted: &HashSet<String>,
     ) -> Result<ResolvedStartSpec, AppError> {
         let (bind_interface, output) = resolve_selected_restream_output(settings)?;
         let source = match settings.stream.protocol {
@@ -269,17 +459,19 @@ impl RelayService {
                     .into(),
             ));
         }
-        let (bind_identity, bind_scope) =
-            match bindings::resolve(bind_interface.as_deref(), saved_id, adopted).await {
-                Ok(resolved) => resolved,
-                Err(error) if bind_interface.is_none() => (
-                    None,
-                    BindScope::Unknown {
-                        reason: error.to_string(),
-                    },
-                ),
-                Err(error) => return Err(error),
-            };
+        let (bind_identity, bind_scope) = match provider
+            .resolve(bind_interface.as_deref(), saved_id, adopted)
+            .await
+        {
+            Ok(resolved) => resolved,
+            Err(error) if bind_interface.is_none() => (
+                None,
+                BindScope::Unknown {
+                    reason: error.to_string(),
+                },
+            ),
+            Err(error) => return Err(error),
+        };
         let bind_address = match &bind_scope {
             BindScope::Interface { address, .. } => Some(address.clone()),
             _ => None,
@@ -613,14 +805,17 @@ impl RelayService {
                 return Err(error);
             }
         }
-        let spec = match Self::resolve_restream_start_spec(settings, adopted).await {
-            Ok(spec) => spec,
-            Err(error) => {
-                self.cancel_restream_start_intent(start_epoch, preserve_prior_desired)
-                    .await;
-                return Err(error);
-            }
-        };
+        let mut spec =
+            match Self::resolve_restream_start_spec_with(self.bindings.as_ref(), settings, adopted)
+                .await
+            {
+                Ok(spec) => spec,
+                Err(error) => {
+                    self.cancel_restream_start_intent(start_epoch, preserve_prior_desired)
+                        .await;
+                    return Err(error);
+                }
+            };
         if self
             .restream_epoch
             .load(std::sync::atomic::Ordering::Acquire)
@@ -724,8 +919,7 @@ impl RelayService {
 
         let old_server = {
             let mut state = self.state.lock().await;
-            if !relay_state_is_generation(&state, server_generation)
-                || state.restream_intent_epoch != Some(start_epoch)
+            if !relay_state_is_current(&state, &self.restream_epoch, start_epoch, server_generation)
             {
                 return Err(AppError::Stream(
                     "Re-stream server start was superseded by a newer request".into(),
@@ -736,7 +930,7 @@ impl RelayService {
         if let Some(mut old_server) = old_server {
             let generation = old_server.server_generation();
             old_server.shutdown().await;
-            retire_firewall(&self.state, generation).await;
+            retire_firewall(&self.state, self.policy.as_ref(), generation).await;
         }
 
         if !relay_is_current(
@@ -773,18 +967,6 @@ impl RelayService {
             self.refresh_status().await;
             return Err(error);
         }
-        if bindings::revision() != scope_revision(&spec.bind_scope) {
-            health.mark_resolution_failed(
-                "Bind topology changed during preflight; resolving again".into(),
-            );
-            let _ = self
-                .relay_event_tx
-                .send(RelaySupervisorEvent::RetryRequested { server_generation });
-            return Err(AppError::Stream(
-                "Bind topology changed; listener recovery is pending".into(),
-            ));
-        }
-        info.firewall = apply_firewall(&self.state, &spec, server_generation).await;
         if !relay_is_current(
             &self.state,
             &self.restream_epoch,
@@ -792,24 +974,117 @@ impl RelayService {
             server_generation,
         )
         .await
-            || bindings::revision() != scope_revision(&spec.bind_scope)
         {
-            retire_firewall(&self.state, server_generation).await;
-            if self
-                .restream_epoch
-                .load(std::sync::atomic::Ordering::Acquire)
-                == start_epoch
-            {
-                health.mark_resolution_failed(
-                    "Bind topology changed during policy reconciliation".into(),
-                );
-                let _ = self
-                    .relay_event_tx
-                    .send(RelaySupervisorEvent::RetryRequested { server_generation });
+            return Err(AppError::Stream(
+                "Re-stream server start was superseded by a newer request".into(),
+            ));
+        }
+        let validity = bind_validity(
+            self.bindings.as_ref(),
+            &spec,
+            adopted,
+            server_generation,
+            "preflight",
+        )
+        .await;
+        if !relay_is_current(
+            &self.state,
+            &self.restream_epoch,
+            start_epoch,
+            server_generation,
+        )
+        .await
+        {
+            return Err(AppError::Stream(
+                "Re-stream server start was superseded by a newer request".into(),
+            ));
+        }
+        match validity {
+            BindValidity::Refreshed(scope) => spec.bind_scope = scope,
+            BindValidity::Invalidated(reason) => {
+                let current = record_bind_failure(
+                    &self.state,
+                    &self.restream_epoch,
+                    start_epoch,
+                    server_generation,
+                    reason,
+                    Some(&self.relay_event_tx),
+                )
+                .await;
+                drop(_lifecycle);
+                self.refresh_status().await;
+                return Err(AppError::Stream(
+                    if current {
+                        "Bind topology changed; listener recovery is pending"
+                    } else {
+                        "Re-stream server start was superseded by a newer request"
+                    }
+                    .into(),
+                ));
             }
+            BindValidity::Unchanged => {}
+        }
+        info.firewall =
+            apply_firewall(&self.state, self.policy.as_ref(), &spec, server_generation).await;
+        if !relay_is_current(
+            &self.state,
+            &self.restream_epoch,
+            start_epoch,
+            server_generation,
+        )
+        .await
+        {
+            retire_firewall(&self.state, self.policy.as_ref(), server_generation).await;
             return Err(AppError::Stream(
                 "Listener start superseded during Windows rule reconciliation".into(),
             ));
+        }
+        let validity = bind_validity(
+            self.bindings.as_ref(),
+            &spec,
+            adopted,
+            server_generation,
+            "policy",
+        )
+        .await;
+        if !relay_is_current(
+            &self.state,
+            &self.restream_epoch,
+            start_epoch,
+            server_generation,
+        )
+        .await
+        {
+            retire_firewall(&self.state, self.policy.as_ref(), server_generation).await;
+            return Err(AppError::Stream(
+                "Listener start superseded during Windows rule reconciliation".into(),
+            ));
+        }
+        match validity {
+            BindValidity::Refreshed(scope) => spec.bind_scope = scope,
+            BindValidity::Invalidated(reason) => {
+                retire_firewall(&self.state, self.policy.as_ref(), server_generation).await;
+                let current = record_bind_failure(
+                    &self.state,
+                    &self.restream_epoch,
+                    start_epoch,
+                    server_generation,
+                    reason,
+                    Some(&self.relay_event_tx),
+                )
+                .await;
+                drop(_lifecycle);
+                self.refresh_status().await;
+                return Err(AppError::Stream(
+                    if current {
+                        "Bind topology changed; listener recovery is pending"
+                    } else {
+                        "Listener start superseded during Windows rule reconciliation"
+                    }
+                    .into(),
+                ));
+            }
+            BindValidity::Unchanged => {}
         }
         let (server_instance, built) = Self::build_restream_server(
             &spec,
@@ -827,18 +1102,23 @@ impl RelayService {
         let server = match built {
             Ok(server) => server,
             Err(failure) => {
-                retire_firewall(&self.state, server_generation).await;
+                retire_firewall(&self.state, self.policy.as_ref(), server_generation).await;
                 let reason = redact_relay_text(&failure.error.to_string(), spec.mount_path());
-                health.mark_build_failed(
-                    server_instance,
-                    reason,
-                    // The interface refresh rule counts failed automatic
-                    // rebuilds; this explicit Start is the baseline attempt.
-                    false,
-                );
-                let _ = self
-                    .relay_event_tx
-                    .send(RelaySupervisorEvent::RetryRequested { server_generation });
+                {
+                    let state = self.state.lock().await;
+                    if relay_state_is_current(
+                        &state,
+                        &self.restream_epoch,
+                        start_epoch,
+                        server_generation,
+                    ) {
+                        // Explicit Start remains the baseline build attempt.
+                        health.mark_build_failed(server_instance, reason, false);
+                        let _ = self
+                            .relay_event_tx
+                            .send(RelaySupervisorEvent::RetryRequested { server_generation });
+                    }
+                }
                 drop(_lifecycle);
                 self.refresh_status().await;
                 return Err(failure.error);
@@ -846,36 +1126,63 @@ impl RelayService {
         };
 
         let mut candidate = Some(server);
+        let validity = if relay_is_current(
+            &self.state,
+            &self.restream_epoch,
+            start_epoch,
+            server_generation,
+        )
+        .await
+        {
+            bind_validity(
+                self.bindings.as_ref(),
+                &spec,
+                adopted,
+                server_generation,
+                "install",
+            )
+            .await
+        } else {
+            BindValidity::Unchanged
+        };
         {
             let mut state = self.state.lock().await;
-            if self
-                .restream_epoch
-                .load(std::sync::atomic::Ordering::Acquire)
-                == start_epoch
-                && state.restream_intent_epoch == Some(start_epoch)
-                && relay_state_is_generation(&state, server_generation)
-                && bindings::revision() == scope_revision(&spec.bind_scope)
+            if relay_state_is_current(&state, &self.restream_epoch, start_epoch, server_generation)
+                && !matches!(validity, BindValidity::Invalidated(_))
             {
+                if let BindValidity::Refreshed(scope) = &validity {
+                    spec.bind_scope = scope.clone();
+                }
+                info.bind_scope = spec.bind_scope.clone();
+                state.restream_spec = Some(spec);
                 state.restream_server = candidate.take();
             }
         }
         if let Some(mut stale) = candidate {
             stale.shutdown().await;
-            retire_firewall(&self.state, server_generation).await;
-            if self
-                .restream_epoch
-                .load(std::sync::atomic::Ordering::Acquire)
-                == start_epoch
-            {
-                health.mark_resolution_failed(
-                    "Bind topology changed during listener construction".into(),
-                );
-                let _ = self
-                    .relay_event_tx
-                    .send(RelaySupervisorEvent::RetryRequested { server_generation });
-            }
+            retire_firewall(&self.state, self.policy.as_ref(), server_generation).await;
+            let topology_failure = if let BindValidity::Invalidated(reason) = validity {
+                record_bind_failure(
+                    &self.state,
+                    &self.restream_epoch,
+                    start_epoch,
+                    server_generation,
+                    reason,
+                    Some(&self.relay_event_tx),
+                )
+                .await
+            } else {
+                false
+            };
+            drop(_lifecycle);
+            self.refresh_status().await;
             return Err(AppError::Stream(
-                "Re-stream server start was superseded by a newer request".into(),
+                if topology_failure {
+                    "Bind topology changed; listener recovery is pending"
+                } else {
+                    "Re-stream server start was superseded by a newer request"
+                }
+                .into(),
             ));
         }
 
@@ -906,17 +1213,25 @@ impl RelayService {
     }
 
     pub(crate) async fn binding_topology_changed(&self, scope: BindScope, revision: u64) {
-        let (spec, generation, instance, health) = {
+        let (spec, generation, instance, health, intent) = {
             let state = self.state.lock().await;
             let (Some(spec), Some(health)) = (&state.restream_spec, &state.restream_health) else {
                 return;
             };
-            if !state.restream_desired {
+            let Some(intent) = state.restream_intent_epoch else {
+                return;
+            };
+            if !state.restream_desired
+                || self
+                    .restream_epoch
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    != intent
+            {
                 return;
             }
             if !matches!(scope, BindScope::Unknown { .. })
                 && !matches!(spec.bind_scope, BindScope::Unknown { .. })
-                && scope_revision(&spec.bind_scope) == revision
+                && scope_revision(&spec.bind_scope) == Some(revision)
             {
                 return;
             }
@@ -926,6 +1241,7 @@ impl RelayService {
                 snapshot.server_generation,
                 snapshot.server_instance,
                 health.clone(),
+                intent,
             )
         };
         let resolved =
@@ -937,15 +1253,19 @@ impl RelayService {
                     Some(handle) => adopted_ip_set(&handle).await,
                     None => Default::default(),
                 };
-                bindings::resolve(
-                    spec.bind_interface.as_deref(),
-                    spec.bind_identity.as_ref().map(|i| i.guid.as_str()),
-                    &adopted,
-                )
-                .await
+                if !relay_is_current(&self.state, &self.restream_epoch, intent, generation).await {
+                    return;
+                }
+                self.bindings
+                    .resolve(
+                        spec.bind_interface.as_deref(),
+                        spec.bind_identity.as_ref().map(|i| i.guid.as_str()),
+                        &adopted,
+                    )
+                    .await
             };
         let _lifecycle = self.relay_lifecycle.lock().await;
-        if bindings::revision() != revision {
+        if self.bindings.revision() != revision {
             return;
         }
         let (identity, next) = resolved.unwrap_or_else(|error| {
@@ -956,23 +1276,18 @@ impl RelayService {
                 },
             )
         });
-        let rebind = spec.bind_interface.is_some()
-            && match &next {
-                BindScope::Interface { alias, address, .. } => {
-                    Some(alias) != spec.bind_interface.as_ref()
-                        || Some(address) != spec.bind_address.as_ref()
-                        || identity != spec.bind_identity
-                }
-                _ => true,
-            };
         {
             let mut state = self.state.lock().await;
-            if !relay_state_is_generation(&state, generation)
+            if !relay_state_is_current(&state, &self.restream_epoch, intent, generation)
                 || health.snapshot().server_instance != instance
             {
                 return;
             }
             if let Some(spec) = state.restream_spec.as_mut() {
+                // Recovery can install a refreshed specification for this same
+                // reserved instance while this observation waits for lifecycle.
+                let rebind = spec.bind_interface.is_some()
+                    && explicit_bind_changed(spec, identity.as_ref(), &next);
                 spec.bind_scope = if rebind {
                     BindScope::Unknown {
                         reason: "Resolving changed bind interface".into(),
@@ -980,17 +1295,17 @@ impl RelayService {
                 } else {
                     next
                 };
+                if rebind {
+                    health.mark_resolution_failed(
+                        "Bind topology changed; resolving the saved interface identity".into(),
+                    );
+                    let _ = self
+                        .relay_event_tx
+                        .send(RelaySupervisorEvent::RetryRequested {
+                            server_generation: generation,
+                        });
+                }
             }
-        }
-        if rebind {
-            health.mark_resolution_failed(
-                "Bind topology changed; resolving the saved interface identity".into(),
-            );
-            let _ = self
-                .relay_event_tx
-                .send(RelaySupervisorEvent::RetryRequested {
-                    server_generation: generation,
-                });
         }
         drop(_lifecycle);
         self.refresh_status().await;
@@ -1098,14 +1413,14 @@ impl RelayService {
             log::info!("Re-stream server fully cleaned up");
         }
         if let Some(generation) = intent.target_generation {
-            retire_firewall(&self.state, generation).await;
+            retire_firewall(&self.state, self.policy.as_ref(), generation).await;
         }
         // A failed prior retirement can survive a replacement listener whose
         // automation is unavailable. Stop must retry that captured lease too;
         // retire_firewall still rejects a newer generation's lease.
         if intent.firewall_generation != intent.target_generation {
             if let Some(generation) = intent.firewall_generation {
-                retire_firewall(&self.state, generation).await;
+                retire_firewall(&self.state, self.policy.as_ref(), generation).await;
             }
         }
         drop(_lifecycle);
@@ -1695,9 +2010,45 @@ async fn relay_is_current(
         return false;
     }
     let state = state.lock().await;
+    relay_state_is_current(&state, epoch, expected_epoch, server_generation)
+}
+
+fn relay_state_is_current(
+    state: &RelayData,
+    epoch: &std::sync::atomic::AtomicU64,
+    expected_epoch: u64,
+    server_generation: u64,
+) -> bool {
     epoch.load(std::sync::atomic::Ordering::Acquire) == expected_epoch
         && state.restream_intent_epoch == Some(expected_epoch)
-        && relay_state_is_generation(&state, server_generation)
+        && relay_state_is_generation(state, server_generation)
+}
+
+// Attribute failure and retry together, only to the request that still owns
+// desired state. Cleanup can await policy and lose that ownership.
+async fn record_bind_failure(
+    state: &state::RelaySlot,
+    epoch: &std::sync::atomic::AtomicU64,
+    expected_epoch: u64,
+    generation: u64,
+    reason: String,
+    events: Option<&RelayEventSender>,
+) -> bool {
+    let state = state.lock().await;
+    if !relay_state_is_current(&state, epoch, expected_epoch, generation) {
+        return false;
+    }
+    state
+        .restream_health
+        .as_ref()
+        .unwrap()
+        .mark_resolution_failed(reason);
+    if let Some(events) = events {
+        let _ = events.send(RelaySupervisorEvent::RetryRequested {
+            server_generation: generation,
+        });
+    }
+    true
 }
 
 async fn wait_relay_backoff(
@@ -1879,7 +2230,7 @@ async fn recover_relay_generation(
         if let Some(mut failed_server) = failed_server {
             failed_server.shutdown().await;
         }
-        retire_firewall(&ctx.state, server_generation).await;
+        retire_firewall(&ctx.state, ctx.policy.as_ref(), server_generation).await;
     }
     publish_relay_status(ctx).await;
     if current_relay_context(ctx, server_generation)
@@ -1938,56 +2289,91 @@ async fn recover_relay_generation(
         };
         let mut build_spec = base_spec.clone();
 
-        if base_spec.bind_interface.is_none() {
-            build_spec.bind_scope = bindings::resolve(None, None, &Default::default())
-                .await
-                .map(|(_, scope)| scope)
-                .unwrap_or_else(|error| BindScope::Unknown {
-                    reason: error.to_string(),
-                });
+        // Keep one adopted-address set for initial resolution and every
+        // validation in this attempt, all obtained before lifecycle.
+        let adopted = if base_spec.bind_interface.is_some() {
+            adopted_ip_set(&ctx.readiness).await
+        } else {
+            HashSet::new()
+        };
+        if !relay_is_current(
+            &ctx.state,
+            &ctx.restream_epoch,
+            expected_epoch,
+            server_generation,
+        )
+        .await
+        {
+            return;
         }
-
-        if base_spec.bind_identity.is_some() || health.should_reresolve_explicit_bind() {
-            if let Some(interface_name) = base_spec.bind_interface.as_deref() {
-                let adopted = adopted_ip_set(&ctx.readiness).await;
-                if !relay_is_current(
-                    &ctx.state,
-                    &ctx.restream_epoch,
-                    expected_epoch,
-                    server_generation,
+        if base_spec.bind_interface.is_none()
+            || base_spec.bind_identity.is_some()
+            || health.should_reresolve_explicit_bind()
+        {
+            let resolved = ctx
+                .bindings
+                .resolve(
+                    base_spec.bind_interface.as_deref(),
+                    base_spec.bind_identity.as_ref().map(|i| i.guid.as_str()),
+                    &adopted,
                 )
-                .await
+                .await;
+            if !relay_is_current(
+                &ctx.state,
+                &ctx.restream_epoch,
+                expected_epoch,
+                server_generation,
+            )
+            .await
+            {
+                return;
+            }
+            match resolved {
+                Ok((identity, scope @ BindScope::Interface { .. }))
+                    if base_spec.bind_interface.is_some() =>
                 {
-                    return;
+                    if let BindScope::Interface { address, alias, .. } = &scope {
+                        build_spec.bind_address = Some(address.clone());
+                        build_spec.advertised_ip = address.clone();
+                        build_spec.bind_interface = Some(alias.clone());
+                    }
+                    build_spec.bind_identity = identity;
+                    build_spec.bind_scope = scope;
                 }
-                let id = base_spec
-                    .bind_identity
-                    .as_ref()
-                    .map(|identity| identity.guid.as_str());
-                match bindings::resolve(Some(interface_name), id, &adopted).await {
-                    Ok((identity, scope @ BindScope::Interface { .. })) => {
-                        if let BindScope::Interface { address, alias, .. } = &scope {
-                            build_spec.bind_address = Some(address.clone());
-                            build_spec.advertised_ip = address.clone();
-                            build_spec.bind_interface = Some(alias.clone());
-                        }
-                        build_spec.bind_identity = identity;
-                        build_spec.bind_scope = scope;
+                result if base_spec.bind_interface.is_none() => {
+                    build_spec.bind_scope =
+                        result
+                            .map(|(_, scope)| scope)
+                            .unwrap_or_else(|error| BindScope::Unknown {
+                                reason: redact_relay_text(
+                                    &error.to_string(),
+                                    base_spec.mount_path(),
+                                ),
+                            });
+                }
+                result => {
+                    let detail = match result {
+                        Err(error) => error.to_string(),
+                        Ok(_) => "Explicit binding did not resolve to an interface".into(),
+                    };
+                    let reason = redact_relay_text(
+                        &format!("Re-stream bind interface is unavailable: {detail}"),
+                        base_spec.mount_path(),
+                    );
+                    let state = ctx.state.lock().await;
+                    if !relay_state_is_current(
+                        &state,
+                        &ctx.restream_epoch,
+                        expected_epoch,
+                        server_generation,
+                    ) {
+                        return;
                     }
-                    Ok(_) => unreachable!("an explicit interface resolves to an address"),
-                    Err(error) => {
-                        let reason = redact_relay_text(
-                            &format!(
-                                "Re-stream bind interface '{}' is unavailable: {}",
-                                interface_name, error
-                            ),
-                            base_spec.mount_path(),
-                        );
-                        health.mark_resolution_failed(reason);
-                        health.force_max_backoff();
-                        publish_relay_status(ctx).await;
-                        continue;
-                    }
+                    health.mark_resolution_failed(reason);
+                    health.force_max_backoff();
+                    drop(state);
+                    publish_relay_status(ctx).await;
+                    continue;
                 }
             }
         }
@@ -2059,10 +2445,14 @@ async fn recover_relay_generation(
         {
             return;
         }
-        if bindings::revision() != scope_revision(&build_spec.bind_scope) {
-            continue;
-        }
-        apply_firewall(&ctx.state, &build_spec, server_generation).await;
+        let validity = bind_validity(
+            ctx.bindings.as_ref(),
+            &build_spec,
+            &adopted,
+            server_generation,
+            "rebuild_preflight",
+        )
+        .await;
         if !relay_is_current(
             &ctx.state,
             &ctx.restream_epoch,
@@ -2070,10 +2460,88 @@ async fn recover_relay_generation(
             server_generation,
         )
         .await
-            || bindings::revision() != scope_revision(&build_spec.bind_scope)
         {
-            retire_firewall(&ctx.state, server_generation).await;
-            continue;
+            return;
+        }
+        match validity {
+            BindValidity::Refreshed(scope) => build_spec.bind_scope = scope,
+            BindValidity::Invalidated(reason) => {
+                if !record_bind_failure(
+                    &ctx.state,
+                    &ctx.restream_epoch,
+                    expected_epoch,
+                    server_generation,
+                    reason,
+                    None,
+                )
+                .await
+                {
+                    return;
+                }
+                drop(_lifecycle);
+                publish_relay_status(ctx).await;
+                continue;
+            }
+            BindValidity::Unchanged => {}
+        }
+        apply_firewall(
+            &ctx.state,
+            ctx.policy.as_ref(),
+            &build_spec,
+            server_generation,
+        )
+        .await;
+        if !relay_is_current(
+            &ctx.state,
+            &ctx.restream_epoch,
+            expected_epoch,
+            server_generation,
+        )
+        .await
+        {
+            retire_firewall(&ctx.state, ctx.policy.as_ref(), server_generation).await;
+            return;
+        }
+        let validity = bind_validity(
+            ctx.bindings.as_ref(),
+            &build_spec,
+            &adopted,
+            server_generation,
+            "rebuild_policy",
+        )
+        .await;
+        if !relay_is_current(
+            &ctx.state,
+            &ctx.restream_epoch,
+            expected_epoch,
+            server_generation,
+        )
+        .await
+        {
+            retire_firewall(&ctx.state, ctx.policy.as_ref(), server_generation).await;
+            return;
+        }
+        match validity {
+            BindValidity::Refreshed(scope) => build_spec.bind_scope = scope,
+            BindValidity::Invalidated(reason) => {
+                retire_firewall(&ctx.state, ctx.policy.as_ref(), server_generation).await;
+                if !record_bind_failure(
+                    &ctx.state,
+                    &ctx.restream_epoch,
+                    expected_epoch,
+                    server_generation,
+                    reason,
+                    None,
+                )
+                .await
+                {
+                    return;
+                }
+                drop(_lifecycle);
+                publish_relay_status(ctx).await;
+                continue;
+            }
+            BindValidity::Unchanged => {}
         }
         let (server_instance, result) = RelayService::build_restream_server(
             &build_spec,
@@ -2091,13 +2559,24 @@ async fn recover_relay_generation(
         let server = match result {
             Ok(server) => server,
             Err(failure) => {
-                retire_firewall(&ctx.state, server_generation).await;
+                retire_firewall(&ctx.state, ctx.policy.as_ref(), server_generation).await;
                 let reason = redact_relay_text(&failure.error.to_string(), build_spec.mount_path());
-                health.mark_build_failed(
-                    server_instance,
-                    reason,
-                    failure.kind == RestreamBuildFailureKind::Bind,
-                );
+                {
+                    let state = ctx.state.lock().await;
+                    if !relay_state_is_current(
+                        &state,
+                        &ctx.restream_epoch,
+                        expected_epoch,
+                        server_generation,
+                    ) {
+                        return;
+                    }
+                    health.mark_build_failed(
+                        server_instance,
+                        reason,
+                        failure.kind == RestreamBuildFailureKind::Bind,
+                    );
+                }
                 drop(_lifecycle);
                 publish_relay_status(ctx).await;
                 continue;
@@ -2105,16 +2584,37 @@ async fn recover_relay_generation(
         };
 
         let mut candidate = Some(server);
+        let validity = if relay_is_current(
+            &ctx.state,
+            &ctx.restream_epoch,
+            expected_epoch,
+            server_generation,
+        )
+        .await
+        {
+            bind_validity(
+                ctx.bindings.as_ref(),
+                &build_spec,
+                &adopted,
+                server_generation,
+                "rebuild_install",
+            )
+            .await
+        } else {
+            BindValidity::Unchanged
+        };
         {
             let mut state = ctx.state.lock().await;
-            if ctx
-                .restream_epoch
-                .load(std::sync::atomic::Ordering::Acquire)
-                == expected_epoch
-                && state.restream_intent_epoch == Some(expected_epoch)
-                && relay_state_is_generation(&state, server_generation)
-                && bindings::revision() == scope_revision(&build_spec.bind_scope)
+            if relay_state_is_current(
+                &state,
+                &ctx.restream_epoch,
+                expected_epoch,
+                server_generation,
+            ) && !matches!(validity, BindValidity::Invalidated(_))
             {
+                if let BindValidity::Refreshed(scope) = &validity {
+                    build_spec.bind_scope = scope.clone();
+                }
                 // Publish a re-resolved address only after it bound
                 // successfully. Port, interface, mount, token, and source are
                 // byte-for-byte inherited from the desired specification.
@@ -2125,15 +2625,22 @@ async fn recover_relay_generation(
         if let Some(mut stale) = candidate {
             crate::network::note_fence_drop("relay_listener");
             stale.shutdown().await;
-            retire_firewall(&ctx.state, server_generation).await;
-            if ctx
-                .restream_epoch
-                .load(std::sync::atomic::Ordering::Acquire)
-                == expected_epoch
-            {
-                health.mark_resolution_failed(
-                    "Bind topology changed during listener construction".into(),
-                );
+            retire_firewall(&ctx.state, ctx.policy.as_ref(), server_generation).await;
+            if let BindValidity::Invalidated(reason) = validity {
+                if !record_bind_failure(
+                    &ctx.state,
+                    &ctx.restream_epoch,
+                    expected_epoch,
+                    server_generation,
+                    reason,
+                    None,
+                )
+                .await
+                {
+                    return;
+                }
+                drop(_lifecycle);
+                publish_relay_status(ctx).await;
                 continue;
             }
             return;
@@ -2147,15 +2654,15 @@ async fn recover_relay_generation(
     }
 }
 
-fn scope_revision(scope: &BindScope) -> u64 {
+fn scope_revision(scope: &BindScope) -> Option<u64> {
     match scope {
         BindScope::AllAddresses {
             topology_revision, ..
         }
         | BindScope::Interface {
             topology_revision, ..
-        } => *topology_revision,
-        BindScope::Unknown { .. } => bindings::revision(),
+        } => Some(*topology_revision),
+        BindScope::Unknown { .. } => None,
     }
 }
 
@@ -2199,10 +2706,18 @@ fn firewall_role(protocol: RestreamProtocol) -> FirewallRule {
 // cancellation cannot hide an enabled rule from Stop/startup reconciliation.
 async fn apply_firewall(
     state: &state::RelaySlot,
+    policy: &dyn RelayPolicy,
     spec: &ResolvedStartSpec,
     generation: u64,
 ) -> FirewallOutcome {
-    apply_firewall_with(state, spec, generation, firewall::ensure, firewall::disable).await
+    apply_firewall_with(
+        state,
+        spec,
+        generation,
+        |r, p, i| policy.ensure(r, p, i),
+        |r| policy.disable(r),
+    )
+    .await
 }
 
 // Focused policy-result seam. Production still awaits the existing shared
@@ -2240,8 +2755,12 @@ where
     outcome
 }
 
-async fn retire_firewall(state: &state::RelaySlot, generation: u64) -> bool {
-    retire_firewall_with(state, generation, firewall::disable).await
+async fn retire_firewall(
+    state: &state::RelaySlot,
+    policy: &dyn RelayPolicy,
+    generation: u64,
+) -> bool {
+    retire_firewall_with(state, generation, |r| policy.disable(r)).await
 }
 
 async fn retire_firewall_with<D>(
@@ -2321,6 +2840,1401 @@ fn select_display_ip(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod topology {
+        use super::*;
+        use std::collections::VecDeque;
+        use std::sync::{
+            atomic::{AtomicU64, Ordering},
+            Mutex as SyncMutex,
+        };
+
+        #[derive(Default)]
+        struct Barrier {
+            entered: Notify,
+            release: Notify,
+        }
+        impl Barrier {
+            async fn wait(&self) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+        }
+
+        struct Read {
+            result: BindingResolution,
+            barrier: Option<Arc<Barrier>>,
+            revision_after: Option<u64>,
+        }
+        impl Read {
+            fn ready(result: BindingResolution) -> Self {
+                Self {
+                    result,
+                    barrier: None,
+                    revision_after: None,
+                }
+            }
+            fn blocked(result: BindingResolution, barrier: &Arc<Barrier>) -> Self {
+                Self {
+                    result,
+                    barrier: Some(barrier.clone()),
+                    revision_after: None,
+                }
+            }
+        }
+
+        #[derive(Debug, PartialEq, Eq)]
+        struct Selection {
+            alias: Option<String>,
+            id: Option<String>,
+            adopted: HashSet<String>,
+        }
+        struct Bindings {
+            revision: AtomicU64,
+            revision_reads: AtomicU64,
+            samples: SyncMutex<VecDeque<u64>>,
+            reads: SyncMutex<VecDeque<Read>>,
+            selections: SyncMutex<Vec<Selection>>,
+        }
+        impl Bindings {
+            fn new(samples: &[u64], reads: Vec<Read>) -> Arc<Self> {
+                Arc::new(Self {
+                    revision: AtomicU64::new(1),
+                    revision_reads: AtomicU64::new(0),
+                    samples: SyncMutex::new(samples.iter().copied().collect()),
+                    reads: SyncMutex::new(reads.into()),
+                    selections: SyncMutex::new(vec![]),
+                })
+            }
+            fn read_count(&self) -> usize {
+                self.selections.lock().unwrap().len()
+            }
+        }
+        impl RelayBindings for Bindings {
+            fn revision(&self) -> u64 {
+                self.revision_reads.fetch_add(1, Ordering::AcqRel);
+                if let Some(sample) = self.samples.lock().unwrap().pop_front() {
+                    self.revision.store(sample, Ordering::Release);
+                }
+                self.revision.load(Ordering::Acquire)
+            }
+            fn resolve<'a>(
+                &'a self,
+                alias: Option<&'a str>,
+                id: Option<&'a str>,
+                adopted: &'a HashSet<String>,
+            ) -> RelayFuture<'a, BindingResolution> {
+                self.selections.lock().unwrap().push(Selection {
+                    alias: alias.map(str::to_owned),
+                    id: id.map(str::to_owned),
+                    adopted: adopted.clone(),
+                });
+                let read = self
+                    .reads
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("unexpected binding read");
+                Box::pin(async move {
+                    if let Some(barrier) = read.barrier {
+                        barrier.wait().await;
+                    }
+                    if let Some(revision) = read.revision_after {
+                        self.revision.store(revision, Ordering::Release);
+                    }
+                    read.result
+                })
+            }
+        }
+
+        #[derive(Default)]
+        struct Policy {
+            ensures: SyncMutex<Vec<(FirewallRule, u16, Option<NativeIdentity>)>>,
+            disables: SyncMutex<Vec<FirewallRule>>,
+            ensure_barrier: SyncMutex<Option<Arc<Barrier>>>,
+            disable_barrier: SyncMutex<Option<Arc<Barrier>>>,
+        }
+        impl RelayPolicy for Policy {
+            fn ensure(
+                &self,
+                rule: FirewallRule,
+                port: u16,
+                identity: Option<NativeIdentity>,
+            ) -> RelayFuture<'_, FirewallOutcome> {
+                self.ensures.lock().unwrap().push((rule, port, identity));
+                let barrier = self.ensure_barrier.lock().unwrap().take();
+                Box::pin(async move {
+                    if let Some(barrier) = barrier {
+                        barrier.wait().await;
+                    }
+                    FirewallOutcome::Applied {
+                        rule_name: "owned-test-rule".into(),
+                        action: firewall::RuleAction::Unchanged,
+                        verified_shape: true,
+                        observed_block_rules: vec![],
+                    }
+                })
+            }
+            fn disable(&self, rule: FirewallRule) -> RelayFuture<'_, FirewallOutcome> {
+                self.disables.lock().unwrap().push(rule);
+                let barrier = self.disable_barrier.lock().unwrap().take();
+                Box::pin(async move {
+                    if let Some(barrier) = barrier {
+                        barrier.wait().await;
+                    }
+                    FirewallOutcome::Inactive
+                })
+            }
+        }
+
+        fn wildcard(revision: u64) -> BindingResolution {
+            Ok((
+                None,
+                BindScope::AllAddresses {
+                    family: bindings::SocketFamily::Ipv4,
+                    addresses: vec![bindings::BoundAddress {
+                        id: "unrelated".into(),
+                        alias: "Other adapter".into(),
+                        address: format!("192.0.2.{revision}"),
+                    }],
+                    topology_revision: revision,
+                },
+            ))
+        }
+        fn explicit(address: &str, revision: u64) -> BindingResolution {
+            Ok((
+                Some(NativeIdentity {
+                    guid: "uplink".into(),
+                    index: 7,
+                    mac: "00:11:22:33:44:55".into(),
+                    alias: "Uplink".into(),
+                }),
+                BindScope::Interface {
+                    id: "uplink".into(),
+                    alias: "Uplink".into(),
+                    address: address.into(),
+                    family: bindings::SocketFamily::Ipv4,
+                    topology_revision: revision,
+                },
+            ))
+        }
+        fn observation(explicit_bind: bool, revision: u64) -> BindingResolution {
+            if explicit_bind {
+                explicit("127.0.0.1", revision)
+            } else {
+                wildcard(revision)
+            }
+        }
+        fn failed() -> BindingResolution {
+            Err(AppError::Network("inventory unavailable".into()))
+        }
+        fn spec(settings: &AppSettings, explicit_bind: bool, revision: u64) -> ResolvedStartSpec {
+            let mut spec = resolved_spec_for_test(settings);
+            let (identity, scope) = observation(explicit_bind, revision).unwrap();
+            spec.bind_identity = identity;
+            spec.bind_scope = scope;
+            if explicit_bind {
+                spec.bind_interface = Some("Uplink".into());
+                spec.bind_address = Some("127.0.0.1".into());
+            }
+            spec
+        }
+        fn fixture(
+            protocol: RestreamProtocol,
+            explicit_bind: bool,
+            bindings: Arc<Bindings>,
+            policy: Arc<Policy>,
+        ) -> (StreamManager, AppSettings) {
+            init_gstreamer();
+            let mut manager = StreamManager::with_selected_protocol(protocol);
+            let readiness = crate::network::NetworkManager::new().readiness();
+            manager.relay = Arc::new(RelayService::with_providers(
+                manager.relay.state.clone(),
+                manager.status.clone(),
+                Some(readiness),
+                bindings,
+                policy,
+            ));
+            let mut settings = restream_test_settings(protocol);
+            if explicit_bind {
+                match protocol {
+                    RestreamProtocol::Rtsp => {
+                        settings.rtsp_server.bind_interface = "Uplink".into();
+                        settings.rtsp_server.bind_interface_id = Some("uplink".into());
+                    }
+                    RestreamProtocol::Srt => {
+                        settings.srt_server.bind_interface = "Uplink".into();
+                        settings.srt_server.bind_interface_id = Some("uplink".into());
+                    }
+                }
+            }
+            (manager, settings)
+        }
+        async fn start(
+            service: &RelayService,
+            settings: &AppSettings,
+        ) -> Result<RestreamServerInfo, AppError> {
+            let (epoch, preserve) = service.begin_restream_start_intent().await.unwrap();
+            service
+                .start_restream_server_inner(
+                    settings,
+                    &HashSet::from(["192.0.2.254".into()]),
+                    epoch,
+                    preserve,
+                )
+                .await
+        }
+        fn spawn_start(
+            manager: &StreamManager,
+            settings: &AppSettings,
+        ) -> tokio::task::JoinHandle<Result<RestreamServerInfo, AppError>> {
+            let service = manager.relay.clone();
+            let settings = settings.clone();
+            tokio::spawn(async move { start(&service, &settings).await })
+        }
+        async fn seed(manager: &StreamManager, settings: &AppSettings, explicit_bind: bool) {
+            seed_desired_relay_state(manager, settings, RelayState::Recovering).await;
+            manager.relay.state.lock().await.restream_spec = Some(spec(settings, explicit_bind, 0));
+            manager
+                .relay
+                .restream_generation
+                .store(41, Ordering::Release);
+        }
+        fn assert_no_retry(events: &mut RelayEventReceiver) {
+            assert!(matches!(
+                events.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+        }
+        async fn poll_pending<F: Future>(future: Pin<&mut F>) {
+            let mut future = future;
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(future.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
+        }
+
+        #[test]
+        fn explicit_predicate_checks_each_binding_component() {
+            let settings = restream_test_settings(RestreamProtocol::Rtsp);
+            let spec = spec(&settings, true, 1);
+            let (identity, scope) = explicit("127.0.0.1", 99).unwrap();
+            assert!(!explicit_bind_changed(&spec, identity.as_ref(), &scope));
+            for part in 0..5 {
+                let mut identity = identity.clone().unwrap();
+                let mut scope = scope.clone();
+                match part {
+                    0 => identity.guid = "replacement".into(),
+                    1 => identity.index += 1,
+                    2 => identity.mac = "66:77:88:99:aa:bb".into(),
+                    3 => {
+                        if let BindScope::Interface { alias, .. } = &mut scope {
+                            *alias = "Renamed".into();
+                        }
+                    }
+                    _ => {
+                        if let BindScope::Interface { address, .. } = &mut scope {
+                            *address = "127.0.0.2".into();
+                        }
+                    }
+                }
+                assert!(
+                    explicit_bind_changed(&spec, Some(&identity), &scope),
+                    "component {part}"
+                );
+            }
+            assert!(explicit_bind_changed(&spec, None, &scope));
+            assert!(explicit_bind_changed(
+                &spec,
+                identity.as_ref(),
+                &wildcard(2).unwrap().1
+            ));
+            assert!(explicit_bind_changed(
+                &spec,
+                identity.as_ref(),
+                &BindScope::default()
+            ));
+        }
+
+        #[tokio::test]
+        async fn classification_fast_paths_and_bounded_observation_preserve_stamps() {
+            let settings = restream_test_settings(RestreamProtocol::Rtsp);
+            let mut spec = spec(&settings, false, 1);
+            assert!(matches!(
+                classify_bind_validity(&spec, wildcard(2)),
+                BindValidity::Refreshed(BindScope::AllAddresses { .. })
+            ));
+            assert!(matches!(
+                classify_bind_validity(&spec, failed()),
+                BindValidity::Refreshed(BindScope::Unknown { .. })
+            ));
+            let provider = Bindings::new(&[1], vec![]);
+            assert_eq!(
+                bind_validity(provider.as_ref(), &spec, &HashSet::new(), 1, "preflight").await,
+                BindValidity::Unchanged
+            );
+            spec.bind_scope = BindScope::default();
+            assert_eq!(
+                bind_validity(provider.as_ref(), &spec, &HashSet::new(), 1, "policy").await,
+                BindValidity::Unchanged
+            );
+            assert_eq!(
+                classify_bind_validity(&spec, failed()),
+                BindValidity::Unchanged
+            );
+            assert_eq!(provider.read_count(), 0);
+            assert_eq!(provider.revision_reads.load(Ordering::Acquire), 1);
+            let explicit_spec = self::spec(&settings, true, 1);
+            assert!(matches!(
+                classify_bind_validity(&explicit_spec, explicit("127.0.0.1", 2)),
+                BindValidity::Refreshed(_)
+            ));
+            for result in [explicit("127.0.0.2", 2), failed(), wildcard(2)] {
+                assert!(matches!(
+                    classify_bind_validity(&explicit_spec, result),
+                    BindValidity::Invalidated(_)
+                ));
+            }
+            let mut read = Read::ready(explicit("127.0.0.1", 2));
+            read.revision_after = Some(3);
+            let provider = Bindings::new(&[2], vec![read]);
+            let result = bind_validity(
+                provider.as_ref(),
+                &explicit_spec,
+                &HashSet::new(),
+                1,
+                "install",
+            )
+            .await;
+            assert!(
+                matches!(result, BindValidity::Refreshed(scope) if scope_revision(&scope) == Some(2))
+            );
+            assert_eq!(provider.revision.load(Ordering::Acquire), 3);
+            assert_eq!(provider.read_count(), 1);
+        }
+
+        #[tokio::test]
+        async fn start_refreshes_each_checkpoint_and_retains_lease_for_both_protocols() {
+            for protocol in [RestreamProtocol::Rtsp, RestreamProtocol::Srt] {
+                for explicit_bind in [false, true] {
+                    let bindings = Bindings::new(
+                        &[2, 3, 4],
+                        (1..=4)
+                            .map(|r| Read::ready(observation(explicit_bind, r)))
+                            .collect(),
+                    );
+                    let policy = Arc::new(Policy::default());
+                    let (manager, settings) =
+                        fixture(protocol, explicit_bind, bindings.clone(), policy.clone());
+                    let (mut events, _) = manager.relay.supervisor().unwrap();
+                    let info = start(&manager.relay, &settings).await.unwrap();
+                    {
+                        let state = manager.relay.state.lock().await;
+                        assert_eq!(
+                            state.restream_spec.as_ref().unwrap().bind_scope,
+                            info.bind_scope
+                        );
+                        assert_eq!(scope_revision(&info.bind_scope), Some(4));
+                        assert_eq!(state.restream_server.as_ref().unwrap().protocol(), protocol);
+                        assert_eq!(
+                            state.firewall_generation,
+                            Some((1, firewall_role(protocol)))
+                        );
+                        assert!(matches!(
+                            state.restream_health.as_ref().unwrap().snapshot().state,
+                            RelayState::Listening | RelayState::Streaming
+                        ));
+                    }
+                    assert_eq!(bindings.read_count(), 4);
+                    {
+                        let selections = bindings.selections.lock().unwrap();
+                        for selection in selections.iter() {
+                            assert_eq!(
+                                selection.alias.as_deref(),
+                                explicit_bind.then_some("Uplink")
+                            );
+                            assert_eq!(selection.id.as_deref(), explicit_bind.then_some("uplink"));
+                            assert_eq!(selection.adopted, HashSet::from(["192.0.2.254".into()]));
+                        }
+                    }
+                    assert_eq!(policy.ensures.lock().unwrap().len(), 1);
+                    assert!(policy.disables.lock().unwrap().is_empty());
+                    assert_no_retry(&mut events);
+                    manager.stop_restream_server().await.unwrap();
+                    assert_eq!(*policy.disables.lock().unwrap(), [firewall_role(protocol)]);
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn wildcard_policy_read_failure_installs_unknown_and_watcher_repairs_same_revision() {
+            for protocol in [RestreamProtocol::Rtsp, RestreamProtocol::Srt] {
+                let bindings = Bindings::new(
+                    &[1, 2],
+                    vec![Read::ready(wildcard(1)), Read::ready(failed())],
+                );
+                let policy = Arc::new(Policy::default());
+                let (manager, settings) =
+                    fixture(protocol, false, bindings.clone(), policy.clone());
+                let info = start(&manager.relay, &settings).await.unwrap();
+                assert!(matches!(info.bind_scope, BindScope::Unknown { .. }));
+                assert_eq!(
+                    manager
+                        .relay
+                        .state
+                        .lock()
+                        .await
+                        .restream_spec
+                        .as_ref()
+                        .unwrap()
+                        .bind_scope,
+                    info.bind_scope
+                );
+                assert_eq!(bindings.read_count(), 2);
+                let scope = wildcard(2).unwrap().1;
+                manager.binding_topology_changed(scope.clone(), 2).await;
+                assert_eq!(
+                    manager
+                        .relay
+                        .state
+                        .lock()
+                        .await
+                        .restream_spec
+                        .as_ref()
+                        .unwrap()
+                        .bind_scope,
+                    scope
+                );
+                assert!(policy.disables.lock().unwrap().is_empty());
+                manager.stop_restream_server().await.unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn churn_overlapping_ensure_refreshes_without_retiring_the_acquired_lease() {
+            for protocol in [RestreamProtocol::Rtsp, RestreamProtocol::Srt] {
+                for explicit_bind in [false, true] {
+                    let barrier = Arc::new(Barrier::default());
+                    let bindings = Bindings::new(
+                        &[],
+                        vec![
+                            Read::ready(observation(explicit_bind, 1)),
+                            Read::ready(observation(explicit_bind, 2)),
+                        ],
+                    );
+                    let policy = Arc::new(Policy::default());
+                    *policy.ensure_barrier.lock().unwrap() = Some(barrier.clone());
+                    let (manager, settings) =
+                        fixture(protocol, explicit_bind, bindings.clone(), policy.clone());
+                    let (mut events, _) = manager.relay.supervisor().unwrap();
+                    let task = spawn_start(&manager, &settings);
+                    barrier.entered.notified().await;
+                    bindings.revision.store(2, Ordering::Release);
+                    barrier.release.notify_one();
+                    let info = task.await.unwrap().unwrap();
+                    let state = manager.relay.state.lock().await;
+                    assert_eq!(scope_revision(&info.bind_scope), Some(2));
+                    assert_eq!(
+                        state.restream_spec.as_ref().unwrap().bind_scope,
+                        info.bind_scope
+                    );
+                    assert!(state.restream_server.is_some());
+                    assert_eq!(
+                        state.firewall_generation,
+                        Some((1, firewall_role(protocol)))
+                    );
+                    drop(state);
+                    assert_eq!(policy.ensures.lock().unwrap().len(), 1);
+                    assert!(policy.disables.lock().unwrap().is_empty());
+                    assert_no_retry(&mut events);
+                    manager.stop_restream_server().await.unwrap();
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn recovery_ensure_honors_stop_and_newer_start_without_another_attempt() {
+            for protocol in [RestreamProtocol::Rtsp, RestreamProtocol::Srt] {
+                for newer_start in [false, true] {
+                    let barrier = Arc::new(Barrier::default());
+                    let bindings = Bindings::new(&[], vec![Read::ready(explicit("127.0.0.1", 1))]);
+                    let policy = Arc::new(Policy::default());
+                    *policy.ensure_barrier.lock().unwrap() = Some(barrier.clone());
+                    let (manager, settings) = fixture(protocol, true, bindings, policy.clone());
+                    seed(&manager, &settings, true).await;
+                    let (mut events, ctx) = manager.relay.supervisor().unwrap();
+                    let health = manager
+                        .relay
+                        .state
+                        .lock()
+                        .await
+                        .restream_health
+                        .clone()
+                        .unwrap();
+                    let task = tokio::spawn(async move {
+                        recover_relay_generation(&ctx, 0, 41, "test_policy_supersession").await
+                    });
+                    barrier.entered.notified().await;
+                    let stop = if newer_start {
+                        manager.relay.begin_restream_start_intent().await.unwrap();
+                        None
+                    } else {
+                        manager.relay.begin_restream_stop_intent().await
+                    };
+                    barrier.release.notify_one();
+                    task.await.unwrap();
+                    if let Some(stop) = stop {
+                        manager.relay.finish_restream_stop(stop).await.unwrap();
+                    }
+                    assert!(manager.relay.state.lock().await.restream_server.is_none());
+                    assert!(manager
+                        .relay
+                        .state
+                        .lock()
+                        .await
+                        .firewall_generation
+                        .is_none());
+                    assert_eq!(policy.disables.lock().unwrap().len(), 1);
+                    assert_eq!(health.snapshot().recovery_attempt, 1);
+                    assert!(health.snapshot().error.is_none());
+                    assert_no_retry(&mut events);
+                    manager.stop_restream_server().await.unwrap();
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn start_invalidates_real_change_or_read_failure_at_each_checkpoint_then_recovers() {
+            for protocol in [RestreamProtocol::Rtsp, RestreamProtocol::Srt] {
+                for checkpoint in 0..3 {
+                    for read_failure in [false, true] {
+                        let mut samples = vec![1; checkpoint];
+                        samples.push(2);
+                        let bindings = Bindings::new(
+                            &samples,
+                            vec![
+                                Read::ready(explicit("127.0.0.1", 1)),
+                                Read::ready(if read_failure {
+                                    failed()
+                                } else {
+                                    explicit("127.0.0.2", 2)
+                                }),
+                                // Recovery observes a settled replacement identity on a usable loopback socket.
+                                Read::ready({
+                                    let (mut identity, scope) = explicit("127.0.0.1", 2).unwrap();
+                                    identity.as_mut().unwrap().index = 8;
+                                    Ok((identity, scope))
+                                }),
+                            ],
+                        );
+                        let policy = Arc::new(Policy::default());
+                        let (manager, settings) = fixture(protocol, true, bindings, policy.clone());
+                        let (mut events, ctx) = manager.relay.supervisor().unwrap();
+                        let error = start(&manager.relay, &settings).await.unwrap_err();
+                        assert_eq!(
+                            error.to_string(),
+                            "Stream error: Bind topology changed; listener recovery is pending"
+                        );
+                        {
+                            let state = manager.relay.state.lock().await;
+                            assert!(state.restream_server.is_none());
+                            assert!(state.firewall_generation.is_none());
+                            assert_eq!(
+                                state.restream_health.as_ref().unwrap().snapshot().state,
+                                RelayState::Failed
+                            );
+                            assert_eq!(
+                                scope_revision(&state.restream_spec.as_ref().unwrap().bind_scope),
+                                Some(1)
+                            );
+                        }
+                        assert_eq!(
+                            policy.ensures.lock().unwrap().len(),
+                            usize::from(checkpoint > 0)
+                        );
+                        assert_eq!(
+                            policy.disables.lock().unwrap().len(),
+                            usize::from(checkpoint > 0)
+                        );
+                        assert!(matches!(
+                            events.try_recv(),
+                            Ok(RelaySupervisorEvent::RetryRequested {
+                                server_generation: 1
+                            })
+                        ));
+                        recover_relay_generation(
+                            &ctx,
+                            manager.relay.test_epoch(),
+                            1,
+                            "test_change",
+                        )
+                        .await;
+                        {
+                            let state = manager.relay.state.lock().await;
+                            assert!(state.restream_server.is_some());
+                            assert_eq!(
+                                state
+                                    .restream_spec
+                                    .as_ref()
+                                    .unwrap()
+                                    .bind_identity
+                                    .as_ref()
+                                    .unwrap()
+                                    .index,
+                                8
+                            );
+                            assert_eq!(
+                                state
+                                    .restream_health
+                                    .as_ref()
+                                    .unwrap()
+                                    .snapshot()
+                                    .recovery_attempt,
+                                1
+                            );
+                        }
+                        manager.stop_restream_server().await.unwrap();
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn recovery_refreshes_all_checkpoints_without_extra_attempt_or_retirement() {
+            for protocol in [RestreamProtocol::Rtsp, RestreamProtocol::Srt] {
+                for explicit_bind in [false, true] {
+                    let bindings = Bindings::new(
+                        &[2, 3, 4],
+                        (1..=4)
+                            .map(|r| Read::ready(observation(explicit_bind, r)))
+                            .collect(),
+                    );
+                    let policy = Arc::new(Policy::default());
+                    let (manager, settings) =
+                        fixture(protocol, explicit_bind, bindings.clone(), policy.clone());
+                    seed(&manager, &settings, explicit_bind).await;
+                    let (mut events, ctx) = manager.relay.supervisor().unwrap();
+                    recover_relay_generation(&ctx, 0, 41, "test_churn").await;
+                    {
+                        let state = manager.relay.state.lock().await;
+                        let health = state.restream_health.as_ref().unwrap().snapshot();
+                        assert_eq!(health.recovery_attempt, 1);
+                        assert!(matches!(
+                            health.state,
+                            RelayState::Listening | RelayState::Streaming
+                        ));
+                        assert_eq!(
+                            scope_revision(&state.restream_spec.as_ref().unwrap().bind_scope),
+                            Some(4)
+                        );
+                        assert_eq!(
+                            state.firewall_generation,
+                            Some((41, firewall_role(protocol)))
+                        );
+                        assert!(state.restream_server.is_some());
+                    }
+                    assert_eq!(bindings.read_count(), 4);
+                    assert!(policy.disables.lock().unwrap().is_empty());
+                    assert_no_retry(&mut events);
+                    manager.stop_restream_server().await.unwrap();
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn start_binding_reads_honor_stop_and_newer_intent_before_interpreting_invalidation()
+        {
+            for protocol in [RestreamProtocol::Rtsp, RestreamProtocol::Srt] {
+                for checkpoint in 0..3 {
+                    for newer_start in [false, true] {
+                        let barrier = Arc::new(Barrier::default());
+                        let mut samples = vec![1; checkpoint];
+                        samples.push(2);
+                        let bindings = Bindings::new(
+                            &samples,
+                            vec![
+                                Read::ready(explicit("127.0.0.1", 1)),
+                                Read::blocked(failed(), &barrier),
+                                Read::ready(explicit("127.0.0.1", 2)),
+                            ],
+                        );
+                        let policy = Arc::new(Policy::default());
+                        let (manager, settings) = fixture(protocol, true, bindings, policy.clone());
+                        let (mut events, _) = manager.relay.supervisor().unwrap();
+                        let task = spawn_start(&manager, &settings);
+                        barrier.entered.notified().await;
+                        let health = manager
+                            .relay
+                            .state
+                            .lock()
+                            .await
+                            .restream_health
+                            .clone()
+                            .unwrap();
+                        let prior = health.snapshot();
+                        let next = if newer_start {
+                            Some(manager.relay.begin_restream_start_intent().await.unwrap())
+                        } else {
+                            None
+                        };
+                        let stop = if newer_start {
+                            None
+                        } else {
+                            manager.relay.begin_restream_stop_intent().await
+                        };
+                        // A newer intent deliberately retains the old generation here.
+                        if newer_start {
+                            assert_eq!(
+                                manager
+                                    .relay
+                                    .state
+                                    .lock()
+                                    .await
+                                    .restream_health
+                                    .as_ref()
+                                    .unwrap()
+                                    .server_generation(),
+                                1
+                            );
+                        }
+                        barrier.release.notify_one();
+                        let error = task.await.unwrap().unwrap_err().to_string();
+                        let expected = if checkpoint == 1 {
+                            "Stream error: Listener start superseded during Windows rule reconciliation"
+                        } else {
+                            "Stream error: Re-stream server start was superseded by a newer request"
+                        };
+                        assert_eq!(error, expected);
+                        assert!(manager.relay.state.lock().await.restream_server.is_none());
+                        assert!(manager
+                            .relay
+                            .state
+                            .lock()
+                            .await
+                            .firewall_generation
+                            .is_none());
+                        assert_no_retry(&mut events);
+                        assert_eq!(
+                            policy.disables.lock().unwrap().len(),
+                            usize::from(checkpoint > 0)
+                        );
+                        if let Some((epoch, preserve)) = next {
+                            assert_eq!(health.snapshot().state, prior.state);
+                            assert_eq!(health.snapshot().error, prior.error);
+                            assert_eq!(
+                                scope_revision(
+                                    &manager
+                                        .relay
+                                        .state
+                                        .lock()
+                                        .await
+                                        .restream_spec
+                                        .as_ref()
+                                        .unwrap()
+                                        .bind_scope
+                                ),
+                                Some(1)
+                            );
+                            let mut replacement = settings.clone();
+                            replacement.stream.udp_port = unused_udp_port();
+                            replacement.rtsp_server.port = unused_tcp_port();
+                            replacement.srt_server.port = unused_udp_port();
+                            manager
+                                .relay
+                                .start_restream_server_inner(
+                                    &replacement,
+                                    &HashSet::new(),
+                                    epoch,
+                                    preserve,
+                                )
+                                .await
+                                .unwrap();
+                            assert_eq!(
+                                manager.relay.state.lock().await.firewall_generation,
+                                Some((2, firewall_role(protocol)))
+                            );
+                            assert_eq!(
+                                policy.disables.lock().unwrap().len(),
+                                usize::from(checkpoint > 0)
+                            );
+                        } else {
+                            manager
+                                .relay
+                                .finish_restream_stop(stop.unwrap())
+                                .await
+                                .unwrap();
+                            assert!(manager.relay.state.lock().await.restream_spec.is_none());
+                            assert_eq!(health.snapshot().state, RelayState::Stopped);
+                        }
+                        manager.stop_restream_server().await.unwrap();
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn stop_and_newer_start_during_ensure_keep_synchronous_cleanup_and_replacement_lease()
+        {
+            for protocol in [RestreamProtocol::Rtsp, RestreamProtocol::Srt] {
+                for newer_start in [false, true] {
+                    let barrier = Arc::new(Barrier::default());
+                    let bindings = Bindings::new(
+                        &[1],
+                        vec![Read::ready(wildcard(1)), Read::ready(wildcard(2))],
+                    );
+                    let policy = Arc::new(Policy::default());
+                    *policy.ensure_barrier.lock().unwrap() = Some(barrier.clone());
+                    let (manager, settings) =
+                        fixture(protocol, false, bindings.clone(), policy.clone());
+                    let (mut events, _) = manager.relay.supervisor().unwrap();
+                    let task = spawn_start(&manager, &settings);
+                    barrier.entered.notified().await;
+                    let next = if newer_start {
+                        Some(manager.relay.begin_restream_start_intent().await.unwrap())
+                    } else {
+                        None
+                    };
+                    let stop = if newer_start {
+                        None
+                    } else {
+                        manager.relay.begin_restream_stop_intent().await
+                    };
+                    let finish = async {
+                        if let Some(stop) = stop {
+                            manager.relay.finish_restream_stop(stop).await.unwrap();
+                        }
+                    };
+                    tokio::pin!(finish);
+                    if !newer_start {
+                        poll_pending(finish.as_mut()).await;
+                    }
+                    barrier.release.notify_one();
+                    assert_eq!(task.await.unwrap().unwrap_err().to_string(),
+                        "Stream error: Listener start superseded during Windows rule reconciliation");
+                    assert_no_retry(&mut events);
+                    assert_eq!(policy.disables.lock().unwrap().len(), 1);
+                    assert!(manager.relay.state.lock().await.restream_server.is_none());
+                    assert!(manager
+                        .relay
+                        .state
+                        .lock()
+                        .await
+                        .firewall_generation
+                        .is_none());
+                    finish.await;
+                    bindings.revision.store(2, Ordering::Release);
+                    if let Some((epoch, preserve)) = next {
+                        manager
+                            .relay
+                            .start_restream_server_inner(
+                                &settings,
+                                &HashSet::new(),
+                                epoch,
+                                preserve,
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            manager.relay.state.lock().await.firewall_generation,
+                            Some((2, firewall_role(protocol)))
+                        );
+                        assert_eq!(policy.disables.lock().unwrap().len(), 1);
+                    }
+                    manager.stop_restream_server().await.unwrap();
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn supersession_during_invalidated_candidate_retirement_does_not_publish_failure() {
+            for protocol in [RestreamProtocol::Rtsp, RestreamProtocol::Srt] {
+                for checkpoint in [1, 2] {
+                    let barrier = Arc::new(Barrier::default());
+                    let mut samples = vec![1; checkpoint];
+                    samples.push(2);
+                    let bindings = Bindings::new(
+                        &samples,
+                        vec![Read::ready(explicit("127.0.0.1", 1)), Read::ready(failed())],
+                    );
+                    let policy = Arc::new(Policy::default());
+                    *policy.disable_barrier.lock().unwrap() = Some(barrier.clone());
+                    let (manager, settings) = fixture(protocol, true, bindings, policy.clone());
+                    let (mut events, _) = manager.relay.supervisor().unwrap();
+                    let task = spawn_start(&manager, &settings);
+                    barrier.entered.notified().await;
+                    let health = manager
+                        .relay
+                        .state
+                        .lock()
+                        .await
+                        .restream_health
+                        .clone()
+                        .unwrap();
+                    let before = health.snapshot();
+                    manager.relay.begin_restream_start_intent().await.unwrap();
+                    barrier.release.notify_one();
+                    let error = task.await.unwrap().unwrap_err().to_string();
+                    assert!(error.contains("superseded"));
+                    assert_eq!(health.snapshot().state, before.state);
+                    assert_eq!(health.snapshot().error, before.error);
+                    assert_eq!(
+                        scope_revision(
+                            &manager
+                                .relay
+                                .state
+                                .lock()
+                                .await
+                                .restream_spec
+                                .as_ref()
+                                .unwrap()
+                                .bind_scope
+                        ),
+                        Some(1)
+                    );
+                    assert_no_retry(&mut events);
+                    assert_eq!(policy.disables.lock().unwrap().len(), 1);
+                    manager.stop_restream_server().await.unwrap();
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn recovery_binding_reads_and_cleanup_honor_supersession_at_each_checkpoint() {
+            for protocol in [RestreamProtocol::Rtsp, RestreamProtocol::Srt] {
+                for checkpoint in 0..3 {
+                    for during_cleanup in [false, true] {
+                        if checkpoint == 0 && during_cleanup {
+                            continue;
+                        }
+                        let barrier = Arc::new(Barrier::default());
+                        let mut samples = vec![1; checkpoint];
+                        samples.push(2);
+                        let invalid = if during_cleanup {
+                            Read::ready(failed())
+                        } else {
+                            Read::blocked(failed(), &barrier)
+                        };
+                        let bindings = Bindings::new(
+                            &samples,
+                            vec![Read::ready(explicit("127.0.0.1", 1)), invalid],
+                        );
+                        let policy = Arc::new(Policy::default());
+                        if during_cleanup {
+                            *policy.disable_barrier.lock().unwrap() = Some(barrier.clone());
+                        }
+                        let (manager, settings) = fixture(protocol, true, bindings, policy.clone());
+                        seed(&manager, &settings, true).await;
+                        let (mut events, ctx) = manager.relay.supervisor().unwrap();
+                        let task = tokio::spawn(async move {
+                            recover_relay_generation(&ctx, 0, 41, "test_supersession").await
+                        });
+                        barrier.entered.notified().await;
+                        let health = manager
+                            .relay
+                            .state
+                            .lock()
+                            .await
+                            .restream_health
+                            .clone()
+                            .unwrap();
+                        let before = health.snapshot();
+                        manager.relay.begin_restream_start_intent().await.unwrap();
+                        barrier.release.notify_one();
+                        task.await.unwrap();
+                        assert_eq!(health.snapshot().state, before.state);
+                        assert_eq!(health.snapshot().error, before.error);
+                        assert_eq!(health.snapshot().recovery_attempt, 1);
+                        assert!(manager.relay.state.lock().await.restream_server.is_none());
+                        assert!(manager
+                            .relay
+                            .state
+                            .lock()
+                            .await
+                            .firewall_generation
+                            .is_none());
+                        assert_eq!(
+                            scope_revision(
+                                &manager
+                                    .relay
+                                    .state
+                                    .lock()
+                                    .await
+                                    .restream_spec
+                                    .as_ref()
+                                    .unwrap()
+                                    .bind_scope
+                            ),
+                            Some(0)
+                        );
+                        assert_eq!(
+                            policy.disables.lock().unwrap().len(),
+                            usize::from(checkpoint > 0)
+                        );
+                        assert_no_retry(&mut events);
+                        manager.stop_restream_server().await.unwrap();
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn recovery_invalidates_each_checkpoint_cleans_up_and_resolves_next_attempt() {
+            for protocol in [RestreamProtocol::Rtsp, RestreamProtocol::Srt] {
+                for checkpoint in 0..3 {
+                    for read_failure in [false, true] {
+                        let mut samples = vec![1; checkpoint];
+                        samples.extend([2, 3, 3, 3]);
+                        let mut replacement = explicit("127.0.0.1", 3).unwrap();
+                        replacement.0.as_mut().unwrap().index = 8;
+                        let bindings = Bindings::new(
+                            &samples,
+                            vec![
+                                Read::ready(explicit("127.0.0.1", 1)),
+                                Read::ready(if read_failure {
+                                    failed()
+                                } else {
+                                    explicit("127.0.0.2", 2)
+                                }),
+                                Read::ready(Ok(replacement)),
+                            ],
+                        );
+                        let policy = Arc::new(Policy::default());
+                        let (manager, settings) = fixture(protocol, true, bindings, policy.clone());
+                        seed(&manager, &settings, true).await;
+                        let (mut events, ctx) = manager.relay.supervisor().unwrap();
+                        recover_relay_generation(&ctx, 0, 41, "test_invalidation").await;
+                        {
+                            let state = manager.relay.state.lock().await;
+                            let health = state.restream_health.as_ref().unwrap().snapshot();
+                            assert_eq!(health.recovery_attempt, 2);
+                            assert!(matches!(
+                                health.state,
+                                RelayState::Listening | RelayState::Streaming
+                            ));
+                            assert!(state.restream_server.is_some());
+                            let spec = state.restream_spec.as_ref().unwrap();
+                            assert_eq!(scope_revision(&spec.bind_scope), Some(3));
+                            assert_eq!(spec.bind_identity.as_ref().unwrap().index, 8);
+                            assert_eq!(
+                                state.firewall_generation,
+                                Some((41, firewall_role(protocol)))
+                            );
+                        }
+                        assert_eq!(
+                            policy.ensures.lock().unwrap().len(),
+                            1 + usize::from(checkpoint > 0)
+                        );
+                        assert_eq!(
+                            policy.disables.lock().unwrap().len(),
+                            usize::from(checkpoint > 0)
+                        );
+                        assert_no_retry(&mut events);
+                        manager.stop_restream_server().await.unwrap();
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn recovery_keeps_final_observation_stamp_and_unknown_remains_repairable() {
+            for protocol in [RestreamProtocol::Rtsp, RestreamProtocol::Srt] {
+                for explicit_bind in [false, true] {
+                    let mut final_read = Read::ready(observation(explicit_bind, 2));
+                    final_read.revision_after = Some(3);
+                    let mut reads = vec![Read::ready(observation(explicit_bind, 1)), final_read];
+                    if explicit_bind {
+                        reads.push(Read::ready(observation(true, 3)));
+                    }
+                    let bindings = Bindings::new(&[1, 1, 2], reads);
+                    let policy = Arc::new(Policy::default());
+                    let (manager, settings) =
+                        fixture(protocol, explicit_bind, bindings.clone(), policy.clone());
+                    seed(&manager, &settings, explicit_bind).await;
+                    let (mut events, ctx) = manager.relay.supervisor().unwrap();
+                    recover_relay_generation(&ctx, 0, 41, "test_freshness").await;
+                    assert_eq!(bindings.read_count(), 2);
+                    assert_eq!(
+                        scope_revision(
+                            &manager
+                                .relay
+                                .state
+                                .lock()
+                                .await
+                                .restream_spec
+                                .as_ref()
+                                .unwrap()
+                                .bind_scope
+                        ),
+                        Some(2)
+                    );
+                    manager
+                        .binding_topology_changed(wildcard(3).unwrap().1, 3)
+                        .await;
+                    assert_eq!(
+                        scope_revision(
+                            &manager
+                                .relay
+                                .state
+                                .lock()
+                                .await
+                                .restream_spec
+                                .as_ref()
+                                .unwrap()
+                                .bind_scope
+                        ),
+                        Some(3)
+                    );
+                    assert!(policy.disables.lock().unwrap().is_empty());
+                    assert_no_retry(&mut events);
+                    manager.stop_restream_server().await.unwrap();
+                }
+                let bindings = Bindings::new(&[], vec![Read::ready(failed())]);
+                let policy = Arc::new(Policy::default());
+                let (manager, settings) =
+                    fixture(protocol, false, bindings.clone(), policy.clone());
+                seed(&manager, &settings, false).await;
+                let (mut events, ctx) = manager.relay.supervisor().unwrap();
+                recover_relay_generation(&ctx, 0, 41, "test_unknown").await;
+                assert!(matches!(
+                    manager
+                        .relay
+                        .state
+                        .lock()
+                        .await
+                        .restream_spec
+                        .as_ref()
+                        .unwrap()
+                        .bind_scope,
+                    BindScope::Unknown { .. }
+                ));
+                manager
+                    .binding_topology_changed(wildcard(1).unwrap().1, 1)
+                    .await;
+                assert_eq!(
+                    scope_revision(
+                        &manager
+                            .relay
+                            .state
+                            .lock()
+                            .await
+                            .restream_spec
+                            .as_ref()
+                            .unwrap()
+                            .bind_scope
+                    ),
+                    Some(1)
+                );
+                assert_eq!(bindings.read_count(), 1);
+                assert!(policy.disables.lock().unwrap().is_empty());
+                assert_no_retry(&mut events);
+                manager.stop_restream_server().await.unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn explicit_unknown_scope_repairs_at_same_revision_without_broadening_socket() {
+            let bindings = Bindings::new(&[], vec![Read::ready(explicit("127.0.0.1", 1))]);
+            let policy = Arc::new(Policy::default());
+            let (manager, settings) = fixture(RestreamProtocol::Rtsp, true, bindings, policy);
+            seed(&manager, &settings, true).await;
+            let (mut events, _) = manager.relay.supervisor().unwrap();
+            manager
+                .relay
+                .state
+                .lock()
+                .await
+                .restream_spec
+                .as_mut()
+                .unwrap()
+                .bind_scope = BindScope::default();
+            manager
+                .binding_topology_changed(wildcard(1).unwrap().1, 1)
+                .await;
+            let state = manager.relay.state.lock().await;
+            let spec = state.restream_spec.as_ref().unwrap();
+            assert_eq!(scope_revision(&spec.bind_scope), Some(1));
+            assert_eq!(spec.bind_address.as_deref(), Some("127.0.0.1"));
+            assert!(spec.bind_identity.is_some());
+            assert_no_retry(&mut events);
+        }
+
+        #[tokio::test]
+        async fn same_instance_watcher_handoff_compares_installed_specification() {
+            for protocol in [RestreamProtocol::Rtsp, RestreamProtocol::Srt] {
+                let barrier = Arc::new(Barrier::default());
+                let bindings = Bindings::new(
+                    &[1, 1, 2],
+                    vec![
+                        Read::ready(explicit("127.0.0.1", 1)),
+                        Read::blocked(explicit("127.0.0.1", 2), &barrier),
+                        Read::ready(explicit("127.0.0.1", 2)),
+                    ],
+                );
+                let policy = Arc::new(Policy::default());
+                let (manager, settings) = fixture(protocol, true, bindings.clone(), policy.clone());
+                seed(&manager, &settings, true).await;
+                // Published A remains while recovery constructs B and reserves N.
+                {
+                    let mut state = manager.relay.state.lock().await;
+                    let spec = state.restream_spec.as_mut().unwrap();
+                    spec.bind_address = Some("127.0.0.2".into());
+                    if let BindScope::Interface { address, .. } = &mut spec.bind_scope {
+                        *address = "127.0.0.2".into();
+                    }
+                }
+                let (mut events, ctx) = manager.relay.supervisor().unwrap();
+                let recovery = tokio::spawn(async move {
+                    recover_relay_generation(&ctx, 0, 41, "test_handoff").await
+                });
+                barrier.entered.notified().await;
+                let health = manager
+                    .relay
+                    .state
+                    .lock()
+                    .await
+                    .restream_health
+                    .clone()
+                    .unwrap();
+                let instance = health.snapshot().server_instance;
+                let watcher = manager.binding_topology_changed(wildcard(2).unwrap().1, 2);
+                tokio::pin!(watcher);
+                poll_pending(watcher.as_mut()).await;
+                assert_eq!(bindings.read_count(), 3);
+                barrier.release.notify_one();
+                recovery.await.unwrap();
+                assert_eq!(health.snapshot().server_instance, instance);
+                watcher.await;
+                {
+                    let state = manager.relay.state.lock().await;
+                    assert!(state.restream_server.is_some());
+                    assert_eq!(
+                        state
+                            .restream_spec
+                            .as_ref()
+                            .unwrap()
+                            .bind_address
+                            .as_deref(),
+                        Some("127.0.0.1")
+                    );
+                    assert_eq!(
+                        scope_revision(&state.restream_spec.as_ref().unwrap().bind_scope),
+                        Some(2)
+                    );
+                }
+                assert_eq!(health.snapshot().server_instance, instance);
+                assert!(matches!(
+                    health.snapshot().state,
+                    RelayState::Listening | RelayState::Streaming
+                ));
+                assert!(health.snapshot().error.is_none());
+                assert!(policy.disables.lock().unwrap().is_empty());
+                assert_no_retry(&mut events);
+                manager.stop_restream_server().await.unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn final_observation_stamp_is_published_then_watcher_converges() {
+            for protocol in [RestreamProtocol::Rtsp, RestreamProtocol::Srt] {
+                for explicit_bind in [false, true] {
+                    let mut final_read = Read::ready(observation(explicit_bind, 2));
+                    final_read.revision_after = Some(3);
+                    let mut reads = vec![Read::ready(observation(explicit_bind, 1)), final_read];
+                    if explicit_bind {
+                        reads.push(Read::ready(observation(true, 3)));
+                    }
+                    let bindings = Bindings::new(&[1, 1, 2], reads);
+                    let policy = Arc::new(Policy::default());
+                    let (manager, settings) =
+                        fixture(protocol, explicit_bind, bindings.clone(), policy.clone());
+                    let (mut events, _) = manager.relay.supervisor().unwrap();
+                    let info = start(&manager.relay, &settings).await.unwrap();
+                    assert_eq!(scope_revision(&info.bind_scope), Some(2));
+                    assert_eq!(bindings.read_count(), 2);
+                    assert_eq!(bindings.revision.load(Ordering::Acquire), 3);
+                    assert_eq!(
+                        manager
+                            .relay
+                            .state
+                            .lock()
+                            .await
+                            .restream_spec
+                            .as_ref()
+                            .unwrap()
+                            .bind_scope,
+                        info.bind_scope
+                    );
+                    manager
+                        .binding_topology_changed(wildcard(3).unwrap().1, 3)
+                        .await;
+                    assert_eq!(
+                        scope_revision(
+                            &manager
+                                .relay
+                                .state
+                                .lock()
+                                .await
+                                .restream_spec
+                                .as_ref()
+                                .unwrap()
+                                .bind_scope
+                        ),
+                        Some(3)
+                    );
+                    assert!(policy.disables.lock().unwrap().is_empty());
+                    assert_no_retry(&mut events);
+                    manager.stop_restream_server().await.unwrap();
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn delayed_watcher_rejects_newer_intent_with_the_same_generation_and_instance() {
+            let bindings = Bindings::new(&[], vec![Read::ready(explicit("127.0.0.2", 1))]);
+            let policy = Arc::new(Policy::default());
+            let (manager, settings) =
+                fixture(RestreamProtocol::Rtsp, true, bindings, policy.clone());
+            seed(&manager, &settings, true).await;
+            let (mut events, _) = manager.relay.supervisor().unwrap();
+            let health = manager
+                .relay
+                .state
+                .lock()
+                .await
+                .restream_health
+                .clone()
+                .unwrap();
+            let before = health.snapshot();
+            let lifecycle = manager.relay.relay_lifecycle.lock().await;
+            let watcher = manager.binding_topology_changed(wildcard(1).unwrap().1, 1);
+            tokio::pin!(watcher);
+            poll_pending(watcher.as_mut()).await;
+            manager.relay.begin_restream_start_intent().await.unwrap();
+            drop(lifecycle);
+            watcher.await;
+            assert_eq!(
+                scope_revision(
+                    &manager
+                        .relay
+                        .state
+                        .lock()
+                        .await
+                        .restream_spec
+                        .as_ref()
+                        .unwrap()
+                        .bind_scope
+                ),
+                Some(0)
+            );
+            assert_eq!(health.snapshot().state, before.state);
+            assert_eq!(health.snapshot().server_instance, before.server_instance);
+            assert_eq!(health.snapshot().error, before.error);
+            assert!(policy.disables.lock().unwrap().is_empty());
+            assert_no_retry(&mut events);
+            manager.stop_restream_server().await.unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn old_stop_preserves_replacement_listener_udp_and_firewall_lease() {
@@ -2569,13 +4483,13 @@ mod tests {
     async fn stale_firewall_cleanup_cannot_retire_a_newer_listener_lease() {
         let manager = StreamManager::new();
         manager.state.lock().await.relay_data.firewall_generation = Some((9, FirewallRule::Srt));
-        retire_firewall(&manager.relay.state, 8).await;
+        retire_firewall(&manager.relay.state, manager.relay.policy.as_ref(), 8).await;
         assert_eq!(
             manager.state.lock().await.relay_data.firewall_generation,
             Some((9, FirewallRule::Srt))
         );
         // The lib-test seam cannot invoke native firewall policy.
-        retire_firewall(&manager.relay.state, 9).await;
+        retire_firewall(&manager.relay.state, manager.relay.policy.as_ref(), 9).await;
         assert!(manager
             .state
             .lock()
