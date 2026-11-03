@@ -44,6 +44,8 @@ pub(crate) mod native_operations;
 mod native_qualification;
 #[cfg(windows)]
 mod native_runner;
+#[cfg(windows)]
+mod temporary_cleanup;
 
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
@@ -1023,6 +1025,17 @@ impl NetworkManager {
         let mut store = binding_store::BindingStore::new(config.clone(), selector.clone());
         store.address_io = io;
         let bindings = Arc::new(store);
+        let discovery_op = Arc::new(Mutex::new(()));
+        #[cfg(windows)]
+        {
+            let cleanup = temporary_cleanup::TemporaryCleanup::new(
+                &bindings,
+                discovery_op.clone(),
+                config.clone(),
+                native_operations::writer_executor().clone(),
+            );
+            assert!(bindings.cleanup.set(cleanup).is_ok());
+        }
         let discovery = Arc::new(discovery_session::DiscoverySession::new());
         let pinger = ping_dot::Pinger::new();
         let readiness = Arc::new(readiness::CameraReadiness {
@@ -1048,7 +1061,7 @@ impl NetworkManager {
             device_registry: registry,
             device_emitter: emitter,
 
-            discovery_op: Arc::new(Mutex::new(())),
+            discovery_op,
         }
     }
 
@@ -1227,7 +1240,7 @@ impl NetworkManager {
         }
         .await;
         // Even partial OS/config failure is followed by a fresh observation.
-        self.bindings.reconcile_temporary_locked(config).await;
+        let _ = self.bindings.reconcile_temporary_locked(config).await;
         self.bindings.reconcile_bindings_locked(config).await;
         let mode = config.get_network_mode();
         self.update_presence_adapter(&self.adapter_selection_state().await, mode);
@@ -1296,7 +1309,7 @@ impl NetworkManager {
         let _op = self.discovery_op.lock().await;
         let pause = self.bindings.pause_addresses();
         let _address = self.bindings.address_work.lock().await;
-        self.bindings.reconcile_temporary_locked(config).await;
+        let _ = self.bindings.reconcile_temporary_locked(config).await;
         self.bindings.reconcile_bindings_locked(config).await;
         drop(_address);
         drop(pause);
@@ -1423,7 +1436,7 @@ impl NetworkManager {
         if binding_link_changed(&previous, &selection) {
             let _pause = self.bindings.pause_addresses();
             let _address = self.bindings.address_work.lock().await;
-            self.bindings.reconcile_temporary_locked(config).await;
+            let _ = self.bindings.reconcile_temporary_locked(config).await;
             self.bindings.reconcile_bindings_locked(config).await;
             self.selector.presence.bootstrap();
         }
@@ -1836,7 +1849,7 @@ impl NetworkManager {
         if let Ok(_address) = self.bindings.address_work.try_lock() {
             let initialized = self.capture.capture_signal.lock().await.app.is_some();
             if initialized {
-                self.bindings.reconcile_temporary_locked(&self.config).await;
+                let _ = self.bindings.reconcile_temporary_locked(&self.config).await;
             }
         }
     }
@@ -1897,7 +1910,28 @@ impl NetworkManager {
         native_operations::drain().await;
         let _pause = self.bindings.pause_addresses();
         let _address = self.bindings.address_work.lock().await;
-        self.bindings.reconcile_temporary_locked(config).await;
+        let _ = self.bindings.reconcile_temporary_locked(config).await;
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn schedule_temporary_cleanup(&self) {
+        if let Some(cleanup) = self.bindings.cleanup.get() {
+            cleanup.schedule();
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn close_temporary_cleanup(&self) {
+        if let Some(cleanup) = self.bindings.cleanup.get() {
+            cleanup.close();
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) async fn join_temporary_cleanup(&self) {
+        if let Some(cleanup) = self.bindings.cleanup.get() {
+            cleanup.join().await;
+        }
     }
 }
 

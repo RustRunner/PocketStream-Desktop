@@ -414,6 +414,7 @@ async fn reconcile_existing(config: Arc<AppConfig>, io: Arc<FakeAddressIo>) -> C
             return Completion::new(Outcome::Uncertain, "pending_adapter_unqualified");
         }
         let ops = PendingAdoptOps {
+            cleanup: None,
             config: config.as_ref(),
             adapter_mac: &row.adapter_mac,
             ops: AddressOps(io.as_ref(), None),
@@ -486,12 +487,12 @@ async fn qualify_caller_abort_retains_completion_and_barrier() {
         let native_result = Arc::new(std::sync::Mutex::new(None));
         let runner_record = native_result.clone();
         let caller = tokio::spawn(async move {
-            let ticket = running_executor.submit_managed(move |cancel| async move {
+            let mut ticket = running_executor.submit_managed(move |cancel| async move {
                 let native = effects.table.lock().unwrap()[0].clone();
                 // Simulate a provider applying an address before reporting an
                 // error. PendingAdoptOps retains the existing durable intent.
                 *effects.effect.lock().unwrap()=Effect::ErrorAfter;
-                let ops = PendingAdoptOps {config:owned_config.as_ref(),adapter_mac:&native.mac,ops:AddressOps(effects.as_ref(),Some(&native)),persist: |_| Ok(())};
+                let ops = PendingAdoptOps { cleanup: None,config:owned_config.as_ref(),adapter_mac:&native.mac,ops:AddressOps(effects.as_ref(),Some(&native)),persist: |_| Ok(())};
                 assert!(ops.add(&native.alias,"192.0.2.254".parse().unwrap(),"255.255.255.0").await.is_err());
                 let process = tokio::task::spawn_blocking(move || NativeProcessRunner::run(QualificationOperation::ChildTree,cancel,Duration::from_secs(15),Some(dispatched))).await.unwrap().unwrap();
                 *runner_record.lock().unwrap()=Some(json!({"termination":format!("{:?}",process.termination),"elapsed_ms":process.elapsed.as_millis(),"runner_deadline_ms":15000,"all_observed_children_exited":process.observed_tree_exited}));
@@ -559,13 +560,13 @@ async fn qualify_caller_abort_retains_completion_and_barrier() {
         assert_eq!(recovered.outcome, Outcome::Completed);
         assert!(config.get().pending_addresses.is_empty());
         assert!(io.table.lock().unwrap()[0].ips.is_empty());
-        let later = executor
+        let mut later = executor
             .submit(|_| async { Completion::new(Outcome::Canceled, "no_effects_accounted") })
             .unwrap();
         let later_id = later.id;
         assert_eq!(later.wait().await.unwrap().outcome, Outcome::Canceled);
         executor.acknowledge(later_id).unwrap();
-        let failure = executor
+        let mut failure = executor
             .submit(|_| async {
                 Completion::new(Outcome::Failed, "required_step_failed_without_effect")
             })
@@ -792,7 +793,7 @@ fn owner_child() {
             let config=config_for(&io);
             let native=io.table.lock().unwrap()[0].clone();
             config.set_temporary_test_binding("192.0.2.0/24",crate::config::AdoptedMeta {adapter_mac:Some(native.mac.clone()),prefix:Some(24),address:Some("192.0.2.100".into()),applied:true,..Default::default()}).unwrap();
-            let ops=PendingAdoptOps {config:config.as_ref(),adapter_mac:&native.mac,ops:AddressOps(io.as_ref(),Some(&native)),persist: |_| Ok(())};
+            let ops=PendingAdoptOps { cleanup: None,config:config.as_ref(),adapter_mac:&native.mac,ops:AddressOps(io.as_ref(),Some(&native)),persist: |_| Ok(())};
             ops.add(&native.alias,"192.0.2.254".parse().unwrap(),"255.255.255.0").await.unwrap();
             fs::write(dir.join("config.toml"),crate::config::test_support::serialize_for_test(&config.get())).unwrap();
             write_json(&dir.join("fake-native-addresses.json"),json!(["192.0.2.100","192.0.2.254"]));
@@ -824,7 +825,7 @@ fn owner_child() {
         assert!(config.get().pending_addresses.is_empty());
         assert_eq!(io.table.lock().unwrap()[0].ips.len(),1);
         assert_eq!(io.table.lock().unwrap()[0].ips[0].address,"192.0.2.100");
-        let admitted=executor.submit(|_| async {Completion::new(Outcome::Completed,"conflicting_write_admitted_after_reconciliation")}).unwrap();
+        let mut admitted=executor.submit(|_| async {Completion::new(Outcome::Completed,"conflicting_write_admitted_after_reconciliation")}).unwrap();
         let id=admitted.id;
         admitted.wait().await.unwrap();executor.acknowledge(id).unwrap();
         executor.shutdown().await;

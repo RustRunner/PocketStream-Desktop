@@ -23,7 +23,7 @@ use crate::{
     error::AppError,
     network::{
         bindings::{self, BindScope},
-        firewall::{self, FirewallOutcome, FirewallRule},
+        firewall::{self, FirewallOutcome, FirewallRule, PolicyResult},
         interface::NativeIdentity,
         route::CameraTarget,
     },
@@ -37,8 +37,7 @@ use tokio::sync::{Mutex, Notify};
 type RelayFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 type BindingResolution = Result<(Option<NativeIdentity>, BindScope), AppError>;
 
-// These two boundaries are shared with the supervisor; they do not alter
-// native executor admission, settlement, or lease ownership.
+// These instance boundaries are shared with the supervisor.
 trait RelayBindings: Send + Sync {
     fn revision(&self) -> u64;
     fn resolve<'a>(
@@ -65,27 +64,29 @@ impl RelayBindings for NativeBindings {
 }
 
 trait RelayPolicy: Send + Sync {
-    fn ensure(
-        &self,
+    fn ensure<'a>(
+        &'a self,
         rule: FirewallRule,
         port: u16,
         interface: Option<NativeIdentity>,
-    ) -> RelayFuture<'_, FirewallOutcome>;
-    fn disable(&self, rule: FirewallRule) -> RelayFuture<'_, FirewallOutcome>;
+        abort: RelayFuture<'a, ()>,
+    ) -> RelayFuture<'a, PolicyResult>;
+    fn disable(&self, rule: FirewallRule) -> RelayFuture<'_, PolicyResult>;
 }
 
 struct NativePolicy;
 impl RelayPolicy for NativePolicy {
-    fn ensure(
-        &self,
+    fn ensure<'a>(
+        &'a self,
         rule: FirewallRule,
         port: u16,
         interface: Option<NativeIdentity>,
-    ) -> RelayFuture<'_, FirewallOutcome> {
-        Box::pin(firewall::ensure(rule, port, interface))
+        abort: RelayFuture<'a, ()>,
+    ) -> RelayFuture<'a, PolicyResult> {
+        Box::pin(firewall::ensure(rule, port, interface, abort))
     }
-    fn disable(&self, rule: FirewallRule) -> RelayFuture<'_, FirewallOutcome> {
-        Box::pin(firewall::disable(rule))
+    fn disable(&self, rule: FirewallRule) -> RelayFuture<'_, PolicyResult> {
+        Box::pin(firewall::disable(rule, std::future::pending()))
     }
 }
 
@@ -1024,8 +1025,16 @@ impl RelayService {
             }
             BindValidity::Unchanged => {}
         }
-        info.firewall =
-            apply_firewall(&self.state, self.policy.as_ref(), &spec, server_generation).await;
+        info.firewall = apply_firewall(
+            &self.state,
+            self.policy.as_ref(),
+            &spec,
+            server_generation,
+            &self.restream_epoch,
+            start_epoch,
+            &self.relay_wake,
+        )
+        .await;
         if !relay_is_current(
             &self.state,
             &self.restream_epoch,
@@ -2489,6 +2498,9 @@ async fn recover_relay_generation(
             ctx.policy.as_ref(),
             &build_spec,
             server_generation,
+            &ctx.restream_epoch,
+            expected_epoch,
+            &ctx.relay_wake,
         )
         .await;
         if !relay_is_current(
@@ -2709,15 +2721,50 @@ async fn apply_firewall(
     policy: &dyn RelayPolicy,
     spec: &ResolvedStartSpec,
     generation: u64,
+    epoch: &Arc<std::sync::atomic::AtomicU64>,
+    expected_epoch: u64,
+    wake: &Notify,
 ) -> FirewallOutcome {
     apply_firewall_with(
         state,
         spec,
         generation,
-        |r, p, i| policy.ensure(r, p, i),
+        |r, p, i| {
+            policy.ensure(
+                r,
+                p,
+                i,
+                Box::pin(obsolete_ensure(
+                    state,
+                    epoch,
+                    expected_epoch,
+                    generation,
+                    wake,
+                )),
+            )
+        },
         |r| policy.disable(r),
+        relay_is_current(state, epoch, expected_epoch, generation),
     )
     .await
+}
+
+async fn obsolete_ensure(
+    state: &state::RelaySlot,
+    epoch: &Arc<std::sync::atomic::AtomicU64>,
+    expected_epoch: u64,
+    generation: u64,
+    wake: &Notify,
+) {
+    loop {
+        let notified = wake.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !relay_is_current(state, epoch, expected_epoch, generation).await {
+            return;
+        }
+        notified.await;
+    }
 }
 
 // Focused policy-result seam. Production still awaits the existing shared
@@ -2728,29 +2775,38 @@ async fn apply_firewall_with<E, D>(
     generation: u64,
     ensure: impl FnOnce(FirewallRule, u16, Option<crate::network::interface::NativeIdentity>) -> E,
     disable: impl FnOnce(FirewallRule) -> D,
+    current: impl Future<Output = bool>,
 ) -> FirewallOutcome
 where
-    E: std::future::Future<Output = FirewallOutcome>,
-    D: std::future::Future<Output = FirewallOutcome>,
+    E: std::future::Future<Output = PolicyResult>,
+    D: std::future::Future<Output = PolicyResult>,
 {
+    let role = firewall_role(spec.protocol());
     let prior = state.lock().await.firewall_generation;
-    if let Some((prior_generation, _)) = prior {
+    if let Some((prior_generation, _)) = prior.filter(|lease| *lease != (generation, role)) {
         if !retire_firewall_with(state, prior_generation, disable).await {
             return state.lock().await.firewall.clone();
         }
     }
-    let role = firewall_role(spec.protocol());
-    {
+    let installed = {
         let mut state = state.lock().await;
         if !relay_state_is_generation(&state, generation) {
             return FirewallOutcome::Inactive;
         }
+        let installed = state.firewall_generation != Some((generation, role));
         state.firewall_generation = Some((generation, role));
-    }
-    let outcome = ensure(role, spec.server_port(), spec.bind_identity.clone()).await;
+        installed
+    };
+    let result = ensure(role, spec.server_port(), spec.bind_identity.clone()).await;
+    let obsolete = !result.admitted && !current.await;
+    let outcome = result.outcome;
     let mut state = state.lock().await;
     if state.firewall_generation == Some((generation, role)) {
-        state.firewall = outcome.clone();
+        if installed && obsolete && outcome == FirewallOutcome::Inactive {
+            state.firewall_generation = None;
+        } else if result.admitted || outcome != FirewallOutcome::Inactive {
+            state.firewall = outcome.clone();
+        }
     }
     outcome
 }
@@ -2769,7 +2825,7 @@ async fn retire_firewall_with<D>(
     disable: impl FnOnce(FirewallRule) -> D,
 ) -> bool
 where
-    D: std::future::Future<Output = FirewallOutcome>,
+    D: std::future::Future<Output = PolicyResult>,
 {
     let lease = {
         let state = state.lock().await;
@@ -2779,14 +2835,16 @@ where
         }
     };
     if let Some(role) = lease {
-        let outcome = disable(role).await;
-        let disabled = matches!(outcome, FirewallOutcome::Inactive);
+        let result = disable(role).await;
+        let disabled = result.admitted && result.outcome == FirewallOutcome::Inactive;
         let mut state = state.lock().await;
         if state.firewall_generation == Some((generation, role)) {
             if disabled {
                 state.firewall_generation = None;
             }
-            state.firewall = outcome;
+            if result.admitted || result.outcome != FirewallOutcome::Inactive {
+                state.firewall = result.outcome;
+            }
         }
         disabled
     } else {
@@ -2952,37 +3010,50 @@ mod tests {
             ensures: SyncMutex<Vec<(FirewallRule, u16, Option<NativeIdentity>)>>,
             disables: SyncMutex<Vec<FirewallRule>>,
             ensure_barrier: SyncMutex<Option<Arc<Barrier>>>,
+            admission_barrier: SyncMutex<Option<Arc<Barrier>>>,
             disable_barrier: SyncMutex<Option<Arc<Barrier>>>,
         }
         impl RelayPolicy for Policy {
-            fn ensure(
-                &self,
+            fn ensure<'a>(
+                &'a self,
                 rule: FirewallRule,
                 port: u16,
                 identity: Option<NativeIdentity>,
-            ) -> RelayFuture<'_, FirewallOutcome> {
-                self.ensures.lock().unwrap().push((rule, port, identity));
+                abort: RelayFuture<'a, ()>,
+            ) -> RelayFuture<'a, PolicyResult> {
+                let admission = self.admission_barrier.lock().unwrap().take();
                 let barrier = self.ensure_barrier.lock().unwrap().take();
                 Box::pin(async move {
+                    let availability = async {
+                        if let Some(admission) = admission {
+                            admission.wait().await;
+                        }
+                    };
+                    tokio::select! {
+                        biased;
+                        () = abort => return PolicyResult { admitted: false, outcome: FirewallOutcome::Inactive },
+                        () = availability => (),
+                    }
+                    self.ensures.lock().unwrap().push((rule, port, identity));
                     if let Some(barrier) = barrier {
                         barrier.wait().await;
                     }
-                    FirewallOutcome::Applied {
+                    PolicyResult::accepted(FirewallOutcome::Applied {
                         rule_name: "owned-test-rule".into(),
                         action: firewall::RuleAction::Unchanged,
                         verified_shape: true,
                         observed_block_rules: vec![],
-                    }
+                    })
                 })
             }
-            fn disable(&self, rule: FirewallRule) -> RelayFuture<'_, FirewallOutcome> {
+            fn disable(&self, rule: FirewallRule) -> RelayFuture<'_, PolicyResult> {
                 self.disables.lock().unwrap().push(rule);
                 let barrier = self.disable_barrier.lock().unwrap().take();
                 Box::pin(async move {
                     if let Some(barrier) = barrier {
                         barrier.wait().await;
                     }
-                    FirewallOutcome::Inactive
+                    PolicyResult::accepted(FirewallOutcome::Inactive)
                 })
             }
         }
@@ -3113,6 +3184,115 @@ mod tests {
                     .await
                     .is_pending()
             );
+        }
+
+        #[tokio::test]
+        async fn start_policy_waits_then_applies_or_cancels_on_stop_and_newer_start() {
+            for protocol in [RestreamProtocol::Rtsp, RestreamProtocol::Srt] {
+                for supersession in 0..3 {
+                    let barrier = Arc::new(Barrier::default());
+                    let bindings = Bindings::new(&[], vec![Read::ready(wildcard(1))]);
+                    let policy = Arc::new(Policy::default());
+                    *policy.admission_barrier.lock().unwrap() = Some(barrier.clone());
+                    let (manager, settings) = fixture(protocol, false, bindings, policy.clone());
+                    let start_task = spawn_start(&manager, &settings);
+                    barrier.entered.notified().await;
+                    assert!(policy.ensures.lock().unwrap().is_empty());
+                    assert!(manager
+                        .relay
+                        .state
+                        .lock()
+                        .await
+                        .firewall_generation
+                        .is_some());
+                    let stop = match supersession {
+                        1 => manager.relay.begin_restream_stop_intent().await,
+                        2 => {
+                            manager.relay.begin_restream_start_intent().await.unwrap();
+                            None
+                        }
+                        _ => {
+                            barrier.release.notify_one();
+                            None
+                        }
+                    };
+                    let result = start_task.await.unwrap();
+                    assert_eq!(result.is_ok(), supersession == 0);
+                    assert_eq!(
+                        policy.ensures.lock().unwrap().len(),
+                        usize::from(supersession == 0)
+                    );
+                    assert!(policy.disables.lock().unwrap().is_empty());
+                    if supersession != 0 {
+                        assert!(manager
+                            .relay
+                            .state
+                            .lock()
+                            .await
+                            .firewall_generation
+                            .is_none());
+                        assert!(manager.relay.state.lock().await.restream_server.is_none());
+                    }
+                    if let Some(stop) = stop {
+                        manager.relay.finish_restream_stop(stop).await.unwrap();
+                    }
+                    manager.stop_restream_server().await.unwrap();
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn obsolete_idle_ensure_and_intent_change_after_prior_retirement_never_dispatch() {
+            for retire_prior in [false, true] {
+                let barrier = Arc::new(Barrier::default());
+                let bindings = Bindings::new(&[], vec![]);
+                let policy = Arc::new(Policy::default());
+                let (manager, settings) =
+                    fixture(RestreamProtocol::Rtsp, false, bindings, policy.clone());
+                seed_desired_relay_state(&manager, &settings, RelayState::Starting).await;
+                if retire_prior {
+                    manager.relay.state.lock().await.firewall_generation =
+                        Some((40, FirewallRule::Srt));
+                    *policy.disable_barrier.lock().unwrap() = Some(barrier.clone());
+                } else {
+                    manager.relay.begin_restream_start_intent().await.unwrap();
+                }
+                let service = manager.relay.clone();
+                let spec = resolved_spec_for_test(&settings);
+                let apply = tokio::spawn(async move {
+                    apply_firewall(
+                        &service.state,
+                        service.policy.as_ref(),
+                        &spec,
+                        41,
+                        &service.restream_epoch,
+                        0,
+                        &service.relay_wake,
+                    )
+                    .await
+                });
+                if retire_prior {
+                    barrier.entered.notified().await;
+                    manager.relay.begin_restream_start_intent().await.unwrap();
+                    // Retirement remains awaited through supersession.
+                    assert!(!apply.is_finished());
+                    barrier.release.notify_one();
+                }
+                assert_eq!(apply.await.unwrap(), FirewallOutcome::Inactive);
+                assert!(policy.ensures.lock().unwrap().is_empty());
+                assert_eq!(
+                    policy.disables.lock().unwrap().len(),
+                    usize::from(retire_prior)
+                );
+                assert!(manager
+                    .relay
+                    .state
+                    .lock()
+                    .await
+                    .firewall_generation
+                    .is_none());
+                manager.stop_restream_server().await.unwrap();
+            }
         }
 
         #[test]
@@ -4280,6 +4460,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unadmitted_inactive_never_retires_an_existing_lease() {
+        let manager = StreamManager::new();
+        let enabled = FirewallOutcome::Applied {
+            rule_name: "owned".into(),
+            action: firewall::RuleAction::Unchanged,
+            verified_shape: true,
+            observed_block_rules: vec![],
+        };
+        {
+            let mut state = manager.relay.state.lock().await;
+            state.firewall_generation = Some((41, FirewallRule::Rtsp));
+            state.firewall = enabled.clone();
+        }
+        assert!(
+            !retire_firewall_with(&manager.relay.state, 41, |_| async {
+                PolicyResult {
+                    admitted: false,
+                    outcome: FirewallOutcome::Inactive,
+                }
+            })
+            .await
+        );
+        assert_eq!(
+            manager.relay.state.lock().await.firewall_generation,
+            Some((41, FirewallRule::Rtsp))
+        );
+        assert_eq!(manager.relay.state.lock().await.firewall, enabled);
+        assert!(
+            retire_firewall_with(&manager.relay.state, 41, |_| async {
+                PolicyResult::accepted(FirewallOutcome::Inactive)
+            })
+            .await
+        );
+        assert!(manager
+            .relay
+            .state
+            .lock()
+            .await
+            .firewall_generation
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn only_matching_obsolete_unadmitted_provisional_lease_can_be_discarded() {
+        for existing in [false, true] {
+            for current in [false, true] {
+                for admitted in [false, true] {
+                    let manager = StreamManager::new();
+                    let settings = restream_test_settings(RestreamProtocol::Rtsp);
+                    seed_desired_relay_state(&manager, &settings, RelayState::Starting).await;
+                    if existing {
+                        manager.relay.state.lock().await.firewall_generation =
+                            Some((41, FirewallRule::Rtsp));
+                    }
+                    apply_firewall_with(
+                        &manager.relay.state,
+                        &resolved_spec_for_test(&settings),
+                        41,
+                        |_, _, _| async {
+                            PolicyResult {
+                                admitted,
+                                outcome: FirewallOutcome::Inactive,
+                            }
+                        },
+                        |_| async { panic!("same lease re-ensure must not retire it") },
+                        std::future::ready(current),
+                    )
+                    .await;
+                    assert_eq!(
+                        manager
+                            .relay
+                            .state
+                            .lock()
+                            .await
+                            .firewall_generation
+                            .is_none(),
+                        !existing && !current && !admitted
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn current_ensure_refusal_retains_lease_for_later_stop() {
+        let manager = StreamManager::new();
+        let settings = restream_test_settings(RestreamProtocol::Rtsp);
+        seed_desired_relay_state(&manager, &settings, RelayState::Starting).await;
+        let unavailable = FirewallOutcome::Unavailable {
+            reason: "admission timeout".into(),
+        };
+        let result = apply_firewall_with(
+            &manager.relay.state,
+            &resolved_spec_for_test(&settings),
+            41,
+            |_, _, _| async {
+                PolicyResult {
+                    admitted: false,
+                    outcome: unavailable.clone(),
+                }
+            },
+            |_| async { unreachable!() },
+            std::future::ready(true),
+        )
+        .await;
+        assert_eq!(result, unavailable);
+        assert_eq!(
+            manager.relay.state.lock().await.firewall_generation,
+            Some((41, FirewallRule::Rtsp))
+        );
+        manager.stop_restream_server().await.unwrap();
+        assert!(manager
+            .relay
+            .state
+            .lock()
+            .await
+            .firewall_generation
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn cancelled_policy_caller_leaves_installed_lease_for_uncertain_retirement_and_stop() {
         let manager = Arc::new(StreamManager::new());
         let settings = restream_test_settings(RestreamProtocol::Rtsp);
@@ -4295,9 +4596,10 @@ mod tests {
                 41,
                 |role, _, _| async move {
                     entered_tx.send(role).unwrap();
-                    std::future::pending::<FirewallOutcome>().await
+                    std::future::pending::<PolicyResult>().await
                 },
-                |_| async { FirewallOutcome::Inactive },
+                |_| async { PolicyResult::accepted(FirewallOutcome::Inactive) },
+                std::future::ready(true),
             )
             .await
         });
@@ -4309,7 +4611,10 @@ mod tests {
         caller.abort();
         assert!(caller.await.unwrap_err().is_cancelled());
         assert!(
-            !retire_firewall_with(&manager.relay.state, 41, |_| async { uncertain_policy() }).await
+            !retire_firewall_with(&manager.relay.state, 41, |_| async {
+                PolicyResult::accepted(uncertain_policy())
+            })
+            .await
         );
         assert_eq!(
             manager.relay.state.lock().await.firewall,
@@ -4356,9 +4661,10 @@ mod tests {
                 41,
                 |_, _, _| async {
                     dispatched.store(true, std::sync::atomic::Ordering::Release);
-                    FirewallOutcome::Inactive
+                    PolicyResult::accepted(FirewallOutcome::Inactive)
                 },
-                |_| async move { outcome },
+                |_| async move { PolicyResult::accepted(outcome) },
+                std::future::ready(true),
             )
             .await;
             assert_eq!(actual, expected);
@@ -4386,7 +4692,8 @@ mod tests {
             &spec,
             41,
             |_, _, _| async { result.await.unwrap() },
-            |_| async { FirewallOutcome::Inactive },
+            |_| async { PolicyResult::accepted(FirewallOutcome::Inactive) },
+            std::future::ready(true),
         );
         tokio::pin!(apply);
         assert!(poll_fn(|cx| Poll::Ready(apply.as_mut().poll(cx)))
@@ -4404,7 +4711,8 @@ mod tests {
             state.firewall_generation = Some((42, FirewallRule::Srt));
             state.firewall = newer.clone();
         }
-        done.send(uncertain_policy()).unwrap();
+        done.send(PolicyResult::accepted(uncertain_policy()))
+            .unwrap();
         apply.await;
         let state = manager.relay.state.lock().await;
         assert_eq!(state.firewall_generation, Some((42, FirewallRule::Srt)));
@@ -4433,7 +4741,8 @@ mod tests {
             state.firewall_generation = Some((41, FirewallRule::Rtsp));
             state.firewall = newer.clone();
         }
-        done.send(FirewallOutcome::Inactive).unwrap();
+        done.send(PolicyResult::accepted(FirewallOutcome::Inactive))
+            .unwrap();
         assert!(retire.await);
         let state = manager.relay.state.lock().await;
         assert_eq!(state.firewall_generation, Some((41, FirewallRule::Rtsp)));
@@ -4463,13 +4772,14 @@ mod tests {
                         state.lock().await.firewall_generation,
                         Some((41, FirewallRule::Rtsp))
                     );
-                    outcome
+                    PolicyResult::accepted(outcome)
                 }
             },
             |role| {
                 calls.lock().unwrap().push(role);
-                std::future::ready(FirewallOutcome::Inactive)
+                std::future::ready(PolicyResult::accepted(FirewallOutcome::Inactive))
             },
+            std::future::ready(true),
         )
         .await;
         assert_eq!(

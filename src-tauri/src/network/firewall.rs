@@ -62,6 +62,22 @@ pub enum FirewallOutcome {
         uncertain: bool,
     },
 }
+
+/// Executor acceptance is independent of the native policy outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PolicyResult {
+    pub outcome: FirewallOutcome,
+    pub admitted: bool,
+}
+
+impl PolicyResult {
+    pub(crate) fn accepted(outcome: FirewallOutcome) -> Self {
+        Self {
+            outcome,
+            admitted: true,
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuleAction {
@@ -98,7 +114,7 @@ pub(super) enum Operation {
 }
 #[cfg(windows)]
 impl Operation {
-    fn mode(&self) -> &'static str {
+    pub(super) fn mode(&self) -> &'static str {
         match self {
             Self::Startup => "startup",
             Self::Install => "install",
@@ -107,7 +123,7 @@ impl Operation {
             Self::Disable { .. } => "disable",
         }
     }
-    fn runtime_role(&self) -> Option<FirewallRule> {
+    pub(super) fn runtime_role(&self) -> Option<FirewallRule> {
         match self {
             Self::Ensure { role, .. } | Self::Disable { role } => Some(*role),
             _ => None,
@@ -523,7 +539,9 @@ pub(super) fn evaluate_process(
 }
 #[cfg(windows)]
 pub(crate) async fn startup() -> FirewallOutcome {
-    super::native_operations::firewall_request(Operation::Startup, false).await
+    super::native_operations::firewall_request(Operation::Startup, false, std::future::pending())
+        .await
+        .outcome
 }
 #[cfg(windows)]
 pub(crate) async fn maintenance(mode: Maintenance) -> FirewallOutcome {
@@ -533,14 +551,17 @@ pub(crate) async fn maintenance(mode: Maintenance) -> FirewallOutcome {
             Maintenance::Uninstall => Operation::Uninstall,
         },
         true,
+        std::future::pending(),
     )
     .await
+    .outcome
 }
 pub(crate) async fn ensure(
     rule: FirewallRule,
     port: u16,
     interface: Option<super::interface::NativeIdentity>,
-) -> FirewallOutcome {
+    abort: impl std::future::Future<Output = ()>,
+) -> PolicyResult {
     #[cfg(all(windows, not(test)))]
     {
         super::native_operations::firewall_request(
@@ -550,26 +571,31 @@ pub(crate) async fn ensure(
                 interface,
             },
             false,
+            abort,
         )
         .await
     }
     #[cfg(any(not(windows), test))]
     {
-        let _ = (rule, port, interface);
-        FirewallOutcome::Unavailable {
+        let _ = (rule, port, interface, abort);
+        PolicyResult::accepted(FirewallOutcome::Unavailable {
             reason: "Windows firewall automation is unavailable on this platform".into(),
-        }
+        })
     }
 }
-pub(crate) async fn disable(rule: FirewallRule) -> FirewallOutcome {
+pub(crate) async fn disable(
+    rule: FirewallRule,
+    abort: impl std::future::Future<Output = ()>,
+) -> PolicyResult {
     #[cfg(all(windows, not(test)))]
     {
-        super::native_operations::firewall_request(Operation::Disable { role: rule }, false).await
+        super::native_operations::firewall_request(Operation::Disable { role: rule }, false, abort)
+            .await
     }
     #[cfg(any(not(windows), test))]
     {
-        let _ = rule;
-        FirewallOutcome::Inactive
+        let _ = (rule, abort);
+        PolicyResult::accepted(FirewallOutcome::Inactive)
     }
 }
 #[cfg(test)]
@@ -1033,7 +1059,7 @@ pub(super) mod tests {
             native_runner::Termination,
         };
         let executor = LocalExecutor::for_serialized_writers();
-        let pending = executor
+        let mut pending = executor
             .reconcile(|_| async {
                 let mut p = process();
                 p.termination = Termination::TimedOut;

@@ -651,13 +651,15 @@ pub fn run() {
             // its own 5 s wait. block_on is safe here — the event loop is
             // already exiting and there's no UI to keep responsive.
             if let tauri::RunEvent::ExitRequested { .. } = event {
+                let manager: tauri::State<'_, std::sync::Arc<network::NetworkManager>> = app_handle.state();
+                #[cfg(windows)]
+                manager.close_temporary_cleanup();
                 let stream: tauri::State<'_, std::sync::Arc<streaming::StreamManager>> = app_handle.state();
                 let _ = tauri::async_runtime::block_on(async {
                     tokio::time::timeout(std::time::Duration::from_secs(5), async {
                         let _ = tokio::join!(stream.stop_playback(), stream.stop_restream_server());
                     }).await
                 });
-                let manager: tauri::State<'_, std::sync::Arc<network::NetworkManager>> = app_handle.state();
                 let _ = tauri::async_runtime::block_on(async {
                     manager.stop_presence().await;
                     manager.stop_ping_dot().await;
@@ -670,6 +672,7 @@ pub fn run() {
                 #[cfg(windows)]
                 tauri::async_runtime::block_on(async {
                     network::native_operations::shutdown().await;
+                    manager.join_temporary_cleanup().await;
                     // A retained transaction can outlive the bounded cleanup
                     // above. Stop any producer it resumed before cancellation.
                     manager.stop_ping_dot().await;
