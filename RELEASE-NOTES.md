@@ -1,3 +1,13 @@
+# v0.6.10 hotfix candidate (unreleased)
+
+The managed RTSP and SRT firewall templates now require an empty package field. Installer maintenance repairs the ineffective v0.6.8/v0.6.9 templates by disabling, removing and recreating them; the first runtime ensure also repairs them if needed. Startup detects defective templates and disables them. Policy execution uses fewer provider reads, skips unchanged template rewrites, reports stage timings and applies mode-specific budgets.
+
+An uncertain runtime firewall operation gets one safety disable when every writer is proven contained and exited. Stop can retry eligible uncertainty for the same role; unsuccessful recovery preserves the original barrier. Startup can retry one eligible process failure within its original admission. Ordinary abandoned completions still require acknowledgement.
+
+All three implementation slices are required together. WFP enforcement, remote RTSP/SRT media, installer upgrades, induced native timeouts and hardware timing qualification remain pending; this candidate is not release-ready. See the [local verification and remaining gates](docs/runtime-evidence/firewall-revision3-local-verification.md).
+
+After a qualified upgrade, manually added workaround allow rules can be removed once remote playback has been verified. Downgrading to v0.6.8 or v0.6.9 restores the defective package field.
+
 # v0.6.7 camera test build
 
 This local reliability checkpoint has software verification, partial elevated camera/PTU smoke and isolated installer qualification. Physical native-write, full adapter/installer matrices and resource/release closure remain pending; it is not a fully qualified release.

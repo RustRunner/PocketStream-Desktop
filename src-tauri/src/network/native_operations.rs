@@ -681,6 +681,25 @@ pub(super) async fn firewall_request(
     operation: super::firewall::Operation,
     recovery: bool,
 ) -> super::firewall::FirewallOutcome {
+    firewall_request_with(
+        executor(),
+        operation,
+        recovery,
+        super::firewall::execute_settling,
+    )
+    .await
+}
+
+async fn firewall_request_with<F, Fut>(
+    executor: &LocalExecutor,
+    operation: super::firewall::Operation,
+    maintenance: bool,
+    execute: F,
+) -> super::firewall::FirewallOutcome
+where
+    F: FnOnce(super::firewall::Operation, Cancellation) -> Fut + Send + 'static,
+    Fut: Future<Output = (Completion, super::firewall::FirewallOutcome)> + Send + 'static,
+{
     use super::firewall::{self, FirewallOutcome};
     if let Ok((cancel, state)) =
         NATIVE_SCOPE.try_with(|(cancel, state)| (cancel.clone(), state.clone()))
@@ -690,24 +709,42 @@ pub(super) async fn firewall_request(
                 reason: error.to_string(),
             };
         }
-        let (completion, result) = firewall::execute(operation, cancel).await;
+        let (completion, result) = execute(operation, cancel).await;
         let failed = completion.outcome != Outcome::Completed;
         state.lock().unwrap().record(completion, failed);
         return result;
     }
+    let retained = if !maintenance {
+        match &operation {
+            firewall::Operation::Disable { role } => executor
+                .retained()
+                .filter(|(_, c)| firewall::recovery_eligible(c, *role)),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let retained_id = retained.as_ref().map(|(id, _)| *id);
     let (tx, rx) = tokio::sync::oneshot::channel();
     let work = move |cancel| async move {
-        let (completion, result) = firewall::execute(operation, cancel).await;
-        if recovery {
+        let result = execute(operation, cancel).await;
+        let (completion, result) = if let Some((_, original)) = retained {
+            firewall::finish_recovery(original, result)
+        } else {
+            result
+        };
+        if maintenance {
             *firewall::MAINTENANCE_OBSERVATION.lock().unwrap() = completion.observation.clone();
         }
         let _ = tx.send(result);
         completion
     };
-    let pending = if recovery {
-        executor().reconcile(work)
+    let pending = if maintenance {
+        executor.reconcile(work)
+    } else if let Some(id) = retained_id {
+        executor.reconcile_retained(id, work)
     } else {
-        executor().submit(work)
+        executor.submit(work)
     };
     let ticket = match pending {
         Ok(ticket) => ticket,
@@ -720,8 +757,8 @@ pub(super) async fn firewall_request(
     let id = ticket.id;
     match ticket.wait().await {
         Ok(completion) => {
-            if !recovery && completion.outcome != Outcome::Uncertain {
-                let _ = executor().acknowledge(id);
+            if !maintenance && retained_id.is_none() && completion.outcome != Outcome::Uncertain {
+                let _ = executor.acknowledge(id);
             }
             rx.await.unwrap_or(FirewallOutcome::Failed {
                 stage: "reply".into(),
@@ -892,7 +929,417 @@ pub(crate) async fn shutdown() {
 
 #[cfg(test)]
 mod tests {
+    use super::super::firewall::{self, FirewallOutcome, FirewallRule};
     use super::*;
+
+    fn firewall_attempt(termination: Termination, failure: bool, retired: bool) -> ProcessResult {
+        let mut p = firewall::tests::process();
+        p.termination = termination;
+        p.observed_tree_exited = retired;
+        if failure {
+            p.exit_code = 71;
+            p.stdout.bytes=serde_json::to_vec(&serde_json::json!({"version":2,"ok":false,"stage":"access","mutated":false,
+                "outcome":{"state":"failed","stage":"access","reason":"pre-write failure","uncertain":false},"records":[]})).unwrap();
+        }
+        p
+    }
+
+    async fn firewall_scripted(
+        executor: &LocalExecutor,
+        operation: firewall::Operation,
+        processes: Vec<ProcessResult>,
+    ) -> FirewallOutcome {
+        firewall_request_with(executor, operation, false, move |op, cancel| async move {
+            let mut processes = processes.into_iter();
+            firewall::execute_settling_with(op, cancel, |_, _| {
+                std::future::ready(firewall::evaluate_process(processes.next().unwrap()))
+            })
+            .await
+        })
+        .await
+    }
+
+    async fn retained_firewall(executor: &LocalExecutor) {
+        executor
+            .reconcile(|_| async { Completion::new(Outcome::Completed, "ready") })
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        let outcome = firewall_scripted(
+            executor,
+            firewall::Operation::Ensure {
+                role: FirewallRule::Rtsp,
+                port: 8554,
+                interface: None,
+            },
+            vec![
+                firewall_attempt(Termination::TimedOut, false, true),
+                firewall_attempt(Termination::TimedOut, false, true),
+            ],
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            FirewallOutcome::Failed {
+                uncertain: true,
+                ..
+            }
+        ));
+    }
+
+    async fn qualification_firewall_request(
+        executor: &LocalExecutor,
+        faults: Arc<super::super::native_runner::FirewallQualification>,
+        operation: firewall::Operation,
+    ) -> FirewallOutcome {
+        firewall_request_with(executor, operation, false, move |op, cancel| async move {
+            firewall::execute_settling_with(op, cancel, move |op, cancel| {
+                let faults = faults.clone();
+                async move {
+                    firewall::evaluate_process(
+                        tokio::task::spawn_blocking(move || faults.run(op, cancel))
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                    )
+                }
+            })
+            .await
+        })
+        .await
+    }
+
+    #[tokio::test]
+    #[ignore = "Isolated elevated qualification host only: enables/disables the installed RTSP rule and induces real 30s timeouts"]
+    async fn qualify_firewall_post_enable_timeout_and_explicit_recovery() {
+        use super::super::native_runner::FirewallQualification;
+        use std::sync::atomic::Ordering;
+        assert_eq!(
+            std::env::var("POCKETSTREAM_FIREWALL_TIMEOUT_PROBE").as_deref(),
+            Ok("approved-isolated-installed-rules")
+        );
+        let _owner = super::super::host_owner::MachineGuard::acquire(
+            super::super::host_owner::Role::Host,
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        let executor = LocalExecutor::for_serialized_writers();
+        executor
+            .reconcile(|_| async { Completion::new(Outcome::Completed, "qualification_ready") })
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        let faults = Arc::new(FirewallQualification::default());
+        let ensure = firewall::Operation::Ensure {
+            role: FirewallRule::Rtsp,
+            port: 8554,
+            interface: None,
+        };
+        let disable = firewall::Operation::Disable {
+            role: FirewallRule::Rtsp,
+        };
+        for double_failure in [false, true] {
+            faults.ensure_timeout.store(true, Ordering::Release);
+            faults
+                .disable_timeout
+                .store(double_failure, Ordering::Release);
+            let result =
+                qualification_firewall_request(&executor, faults.clone(), ensure.clone()).await;
+            assert!(
+                matches!(result, FirewallOutcome::Failed { uncertain, .. } if uncertain == double_failure)
+            );
+            if double_failure {
+                assert_eq!(
+                    executor.available(),
+                    Err(AdmissionError::ReconciliationRequired)
+                );
+                faults
+                    .recovery_prewrite_failure
+                    .store(true, Ordering::Release);
+                assert!(matches!(
+                    qualification_firewall_request(&executor, faults.clone(), disable.clone())
+                        .await,
+                    FirewallOutcome::Failed {
+                        uncertain: true,
+                        ..
+                    }
+                ));
+                assert_eq!(
+                    executor.available(),
+                    Err(AdmissionError::ReconciliationRequired)
+                );
+            } else {
+                assert_eq!(executor.available(), Ok(()));
+            }
+            assert_eq!(
+                qualification_firewall_request(&executor, faults.clone(), disable.clone()).await,
+                FirewallOutcome::Inactive
+            );
+            assert_eq!(executor.available(), Ok(()));
+            // Same-session ensure is normal: the host already consumed its fault.
+            assert!(matches!(
+                qualification_firewall_request(&executor, faults.clone(), ensure.clone()).await,
+                FirewallOutcome::Applied { .. }
+            ));
+            assert_eq!(
+                qualification_firewall_request(&executor, faults.clone(), disable.clone()).await,
+                FirewallOutcome::Inactive
+            );
+        }
+        // Startup's first 1s budget is consumed in the host, within one admission.
+        faults.startup_timeout.store(true, Ordering::Release);
+        let owned_executor = executor.clone();
+        executor
+            .reconcile(move |cancel| async move {
+                let state = Arc::new(Mutex::new(ScopeState::default()));
+                let tracked = state.clone();
+                NATIVE_SCOPE
+                    .scope((cancel, state), async move {
+                        assert_eq!(
+                            qualification_firewall_request(
+                                &owned_executor,
+                                faults,
+                                firewall::Operation::Startup
+                            )
+                            .await,
+                            FirewallOutcome::Inactive
+                        );
+                        assert!(check_writes_available().is_ok());
+                        let mut state = tracked.lock().unwrap();
+                        assert!(state
+                            .last
+                            .as_ref()
+                            .unwrap()
+                            .observation
+                            .as_ref()
+                            .unwrap()
+                            .get("first_attempt")
+                            .is_some());
+                        std::mem::take(&mut *state)
+                            .finish(Outcome::Completed, "qualified_startup_retry")
+                    })
+                    .await
+            })
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        assert_eq!(executor.available(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn firewall_recovery_preserves_original_uncertainty_on_prewrite_and_writer_failures() {
+        let executor = LocalExecutor::for_serialized_writers();
+        retained_firewall(&executor).await;
+        let disable = firewall::Operation::Disable {
+            role: FirewallRule::Rtsp,
+        };
+        let original = executor.retained().unwrap().1;
+        let journal = serde_json::json!({"maintenance":"unchanged"});
+        *firewall::MAINTENANCE_OBSERVATION.lock().unwrap() = Some(journal.clone());
+        for attempt in 0..5 {
+            let processes = if attempt % 2 == 0 {
+                let mut p = firewall_attempt(Termination::Exited, true, true);
+                let mut report: serde_json::Value =
+                    serde_json::from_slice(&p.stdout.bytes).unwrap();
+                let stage = ["access", "query", "ownership"][attempt / 2];
+                report["stage"] = serde_json::json!(stage);
+                report["outcome"]["stage"] = serde_json::json!(stage);
+                p.stdout.bytes = serde_json::to_vec(&report).unwrap();
+                vec![p]
+            } else {
+                vec![
+                    firewall_attempt(Termination::TimedOut, false, true),
+                    firewall_attempt(Termination::TimedOut, false, true),
+                ]
+            };
+            let result = firewall_scripted(&executor, disable.clone(), processes).await;
+            assert!(matches!(
+                result,
+                FirewallOutcome::Failed {
+                    uncertain: true,
+                    ..
+                }
+            ));
+            assert_eq!(
+                executor.available(),
+                Err(AdmissionError::ReconciliationRequired)
+            );
+            let (_, c) = executor.retained().unwrap();
+            assert_eq!(c.outcome, Outcome::Uncertain);
+            assert_eq!(c.step, original.step);
+            assert!(firewall::recovery_eligible(&c, FirewallRule::Rtsp));
+            let facts = c.observation.unwrap();
+            assert_eq!(facts["unresolved"], original.observation.clone().unwrap());
+            assert!(facts["latest_recovery"].get("unresolved").is_none());
+            assert!(serde_json::to_vec(&facts).unwrap().len() < 10000);
+        }
+        assert_eq!(
+            *firewall::MAINTENANCE_OBSERVATION.lock().unwrap(),
+            Some(journal)
+        );
+        assert_eq!(
+            firewall_scripted(
+                &executor,
+                disable,
+                vec![firewall_attempt(Termination::Exited, false, true)]
+            )
+            .await,
+            FirewallOutcome::Inactive
+        );
+        assert_eq!(executor.available(), Ok(()));
+        firewall::MAINTENANCE_OBSERVATION.lock().unwrap().take();
+    }
+
+    #[tokio::test]
+    async fn unretired_recovery_prevents_another_writer_despite_a_disabled_snapshot() {
+        let executor = LocalExecutor::for_serialized_writers();
+        retained_firewall(&executor).await;
+        let disable = firewall::Operation::Disable {
+            role: FirewallRule::Rtsp,
+        };
+        assert!(matches!(
+            firewall_scripted(
+                &executor,
+                disable.clone(),
+                vec![firewall_attempt(Termination::TimedOut, false, false)]
+            )
+            .await,
+            FirewallOutcome::Failed {
+                uncertain: true,
+                ..
+            }
+        ));
+        assert!(!firewall::recovery_eligible(
+            &executor.retained().unwrap().1,
+            FirewallRule::Rtsp
+        ));
+        let result = firewall_request_with(&executor, disable, false, |_, _| async {
+            panic!("unretired writer was bypassed")
+        })
+        .await;
+        assert!(matches!(result, FirewallOutcome::Unavailable { .. }));
+        assert_eq!(
+            executor.available(),
+            Err(AdmissionError::ReconciliationRequired)
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_firewall_recovery_refuses_other_roles_origins_and_orphans() {
+        for case in 0..7 {
+            let executor = LocalExecutor::for_serialized_writers();
+            retained_firewall(&executor).await;
+            let mut retained = executor.retained().unwrap().1;
+            match case {
+                0 => {} // A different requested role.
+                1 => retained.step = "address_policy",
+                2 => {
+                    retained.observation.as_mut().unwrap()["firewall_execution"]["mode"] =
+                        serde_json::json!("startup")
+                }
+                3 => {
+                    retained.observation.as_mut().unwrap()["firewall_execution"]["mode"] =
+                        serde_json::json!("install")
+                }
+                4 => {
+                    retained
+                        .observation
+                        .as_mut()
+                        .unwrap()
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("firewall_execution");
+                }
+                5 => retained.outcome = Outcome::Failed,
+                _ => retained.outcome = Outcome::Completed,
+            }
+            // Ordinary submit retains even a Completed orphan without ack.
+            executor
+                .reconcile(|_| async { Completion::new(Outcome::Completed, "ready") })
+                .unwrap()
+                .wait()
+                .await
+                .unwrap();
+            executor
+                .submit(|_| async move { retained })
+                .unwrap()
+                .wait()
+                .await
+                .unwrap();
+            let role = if case == 0 {
+                FirewallRule::Srt
+            } else {
+                FirewallRule::Rtsp
+            };
+            let result = firewall_request_with(
+                &executor,
+                firewall::Operation::Disable { role },
+                false,
+                |_, _| async { panic!("ineligible recovery dispatched") },
+            )
+            .await;
+            assert!(
+                matches!(result, FirewallOutcome::Unavailable { .. }),
+                "case {case}"
+            );
+            assert_eq!(
+                executor.available(),
+                Err(AdmissionError::ReconciliationRequired)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_firewall_startup_retry_records_once_before_remaining_scope_work() {
+        let executor = LocalExecutor::for_serialized_writers();
+        let worker_executor = executor.clone();
+        executor
+            .reconcile(|cancel| async move {
+                let state = Arc::new(Mutex::new(ScopeState::default()));
+                let tracked = state.clone();
+                NATIVE_SCOPE
+                    .scope((cancel, state), async move {
+                        let result = firewall_scripted(
+                            &worker_executor,
+                            firewall::Operation::Startup,
+                            vec![
+                                firewall_attempt(Termination::TimedOut, false, true),
+                                firewall_attempt(Termination::Exited, false, true),
+                            ],
+                        )
+                        .await;
+                        assert_eq!(result, FirewallOutcome::Inactive);
+                        assert!(check_writes_available().is_ok());
+                        let mut scope = tracked.lock().unwrap();
+                        assert!(!scope.failed);
+                        assert_eq!(scope.last.as_ref().unwrap().step, "firewall_policy");
+                        assert!(scope
+                            .last
+                            .as_ref()
+                            .unwrap()
+                            .observation
+                            .as_ref()
+                            .unwrap()
+                            .get("first_attempt")
+                            .is_some());
+                        scope.record(
+                            Completion::new(Outcome::Completed, "remaining_address_reconciliation"),
+                            false,
+                        );
+                        std::mem::take(&mut *scope).finish(Outcome::Completed, "startup_reconciled")
+                    })
+                    .await
+            })
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        assert_eq!(executor.available(), Ok(()));
+    }
+
     #[tokio::test]
     async fn caller_abort_after_native_success_retains_persistence_and_barrier() {
         use super::super::auto_adopt::{AdoptOps, PendingAdoptOps};

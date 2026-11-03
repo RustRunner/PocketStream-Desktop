@@ -329,6 +329,134 @@ fn observe_tree(job: &Handle, processes: &mut BTreeMap<u32, Handle>) -> std::io:
 }
 
 pub(super) struct NativeProcessRunner;
+
+// Qualification executable only. Faults are consumed in the host, never in the
+// fresh PowerShell process. No production flag, setting or IPC entry exists.
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct FirewallQualification {
+    pub ensure_timeout: AtomicBool,
+    pub disable_timeout: AtomicBool,
+    pub recovery_prewrite_failure: AtomicBool,
+    pub startup_timeout: AtomicBool,
+}
+#[cfg(test)]
+impl FirewallQualification {
+    fn attempt(&self, operation: &super::firewall::Operation) -> (String, Duration) {
+        use super::firewall::Operation;
+        let mut script = super::firewall::SCRIPT.to_string();
+        let mut budget = firewall_budget(operation);
+        let injection = match operation {
+            Operation::Ensure { .. } if self.ensure_timeout.swap(false, Ordering::AcqRel) => Some((
+                "                Stage 'readback'",
+                "                [Console]::Error.WriteLine('qualification_after_enable'); [Threading.Thread]::Sleep(45000)\n                Stage 'readback'")),
+            Operation::Disable { .. } if self.disable_timeout.swap(false, Ordering::AcqRel) => Some((
+                "    # Even the no-write path needs a fresh read:",
+                "    [Console]::Error.WriteLine('qualification_disable_before_readback'); [Threading.Thread]::Sleep(45000)\n    # Even the no-write path needs a fresh read:")),
+            Operation::Disable { .. } if self.recovery_prewrite_failure.swap(false, Ordering::AcqRel) => Some((
+                "    Stage 'inventory'", "    throw 'Qualification recovery failure before writes'\n    Stage 'inventory'")),
+            Operation::Startup if self.startup_timeout.swap(false, Ordering::AcqRel) => {
+                budget = Duration::from_secs(1); None
+            }
+            _ => None,
+        };
+        if let Some((anchor, replacement)) = injection {
+            assert_eq!(script.matches(anchor).count(), 1, "qualification anchor");
+            script = script.replace(anchor, replacement);
+        }
+        (script, budget)
+    }
+
+    pub fn run(
+        &self,
+        operation: super::firewall::Operation,
+        cancel: Cancellation,
+    ) -> Result<ProcessResult, String> {
+        let (script, budget) = self.attempt(&operation);
+        let mut payload: serde_json::Value =
+            serde_json::from_slice(&operation.payload()?).map_err(|e| e.to_string())?;
+        // The same fixed installed-image identity as the existing startup probe.
+        payload["program"] =
+            serde_json::json!(r"C:\Program Files\PocketStream Desktop\pocketstream-desktop.exe");
+        let result = NativeProcessRunner::run_inner(
+            &script,
+            serde_json::to_vec(&payload).map_err(|e| e.to_string())?,
+            cancel,
+            budget,
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+        print_firewall_probe(&result, false);
+        for marker in [
+            "qualification_after_enable",
+            "qualification_disable_before_readback",
+        ] {
+            if script.contains(marker) {
+                assert_eq!(
+                    result.termination,
+                    Termination::TimedOut,
+                    "injected attempt must exhaust its normal budget"
+                );
+                assert!(
+                    String::from_utf8_lossy(&result.stderr.bytes).contains(marker),
+                    "attempt never reached the injected stage"
+                );
+                assert!(result.containment_verified_before_resume && result.observed_tree_exited);
+            }
+        }
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn firewall_qualification_faults_are_consumed_once_in_the_host() {
+    use super::firewall::{FirewallRule, Operation};
+    let faults = FirewallQualification::default();
+    faults.ensure_timeout.store(true, Ordering::Release);
+    let ensure = Operation::Ensure {
+        role: FirewallRule::Rtsp,
+        port: 8554,
+        interface: None,
+    };
+    let disable = Operation::Disable {
+        role: FirewallRule::Rtsp,
+    };
+    let (script, budget) = faults.attempt(&ensure);
+    assert_eq!(budget, Duration::from_secs(30));
+    assert!(
+        script.find("Set-NetFirewallRule -Enabled True").unwrap()
+            < script.find("qualification_after_enable").unwrap()
+    );
+    assert_eq!(faults.attempt(&disable).0, super::firewall::SCRIPT);
+    assert_eq!(faults.attempt(&ensure).0, super::firewall::SCRIPT);
+    faults.disable_timeout.store(true, Ordering::Release);
+    assert!(faults
+        .attempt(&disable)
+        .0
+        .contains("qualification_disable_before_readback"));
+    assert_eq!(faults.attempt(&disable).0, super::firewall::SCRIPT);
+    faults
+        .recovery_prewrite_failure
+        .store(true, Ordering::Release);
+    assert!(faults
+        .attempt(&disable)
+        .0
+        .contains("Qualification recovery failure before writes"));
+    assert_eq!(faults.attempt(&disable).0, super::firewall::SCRIPT);
+    faults.startup_timeout.store(true, Ordering::Release);
+    assert_eq!(
+        faults.attempt(&Operation::Startup).1,
+        Duration::from_secs(1)
+    );
+    assert_eq!(
+        faults.attempt(&Operation::Startup).1,
+        Duration::from_secs(45)
+    );
+    // Fault variants must also fit the real runner's base64 command line.
+    assert!(script.len().div_ceil(3) * 4 + 512 < 32767);
+}
+
 #[cfg(test)]
 fn firewall_probe_script() -> String {
     let mut script = super::firewall::SCRIPT.to_string();

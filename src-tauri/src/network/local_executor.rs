@@ -109,7 +109,7 @@ impl LocalExecutor {
         F: FnOnce(Cancellation) -> Fut + Send + 'static,
         Fut: Future<Output = Completion> + Send + 'static,
     {
-        self.start(false, false, work)
+        self.start(false, false, None, work)
     }
 
     pub fn submit_managed<F, Fut>(&self, work: F) -> Result<Pending, AdmissionError>
@@ -117,7 +117,7 @@ impl LocalExecutor {
         F: FnOnce(Cancellation) -> Fut + Send + 'static,
         Fut: Future<Output = Completion> + Send + 'static,
     {
-        self.start(false, true, work)
+        self.start(false, true, None, work)
     }
 
     pub fn reconcile<F, Fut>(&self, observe: F) -> Result<Pending, AdmissionError>
@@ -125,13 +125,22 @@ impl LocalExecutor {
         F: FnOnce(Cancellation) -> Fut + Send + 'static,
         Fut: Future<Output = Completion> + Send + 'static,
     {
-        self.start(true, true, observe)
+        self.start(true, true, None, observe)
+    }
+
+    pub fn reconcile_retained<F, Fut>(&self, id: u64, observe: F) -> Result<Pending, AdmissionError>
+    where
+        F: FnOnce(Cancellation) -> Fut + Send + 'static,
+        Fut: Future<Output = Completion> + Send + 'static,
+    {
+        self.start(true, true, Some(id), observe)
     }
 
     fn start<F, Fut>(
         &self,
         recovery: bool,
         managed: bool,
+        retained_id: Option<u64>,
         work: F,
     ) -> Result<Pending, AdmissionError>
     where
@@ -146,6 +155,12 @@ impl LocalExecutor {
             (Phase::Running { .. }, _) => return Err(AdmissionError::Busy),
             (Phase::Idle, _) | (_, true) => (),
             _ => return Err(AdmissionError::ReconciliationRequired),
+        }
+        if let Some(expected) = retained_id {
+            if !matches!(&state.phase, Phase::Retained { id, result } if *id == expected && result.outcome == Outcome::Uncertain)
+            {
+                return Err(AdmissionError::ReconciliationRequired);
+            }
         }
         state.next_id = state.next_id.checked_add(1).expect("operation counter");
         let id = state.next_id;
@@ -263,6 +278,73 @@ impl LocalExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn conditional_reconcile_checks_retained_id_uncertainty_running_and_shutdown() {
+        let executor = LocalExecutor::for_serialized_writers();
+        let ticket = executor
+            .reconcile(|_| async { Completion::new(Outcome::Uncertain, "firewall_policy") })
+            .unwrap();
+        let original = ticket.id;
+        ticket.wait().await.unwrap();
+        assert!(matches!(
+            executor.reconcile_retained(original + 1, |_| async { unreachable!() }),
+            Err(AdmissionError::ReconciliationRequired)
+        ));
+        let (release, wait) = oneshot::channel();
+        let ticket = executor
+            .reconcile_retained(original, |_| async move {
+                wait.await.unwrap();
+                Completion::new(Outcome::Uncertain, "firewall_policy")
+            })
+            .unwrap();
+        assert!(matches!(
+            executor.reconcile_retained(original, |_| async { unreachable!() }),
+            Err(AdmissionError::Busy)
+        ));
+        drop(ticket);
+        release.send(()).unwrap();
+        executor.wait_terminal().await;
+        let (new_id, retained) = executor.retained().unwrap();
+        assert_ne!(new_id, original);
+        assert_eq!(retained.outcome, Outcome::Uncertain);
+        assert!(matches!(
+            executor.reconcile_retained(original, |_| async { unreachable!() }),
+            Err(AdmissionError::ReconciliationRequired)
+        ));
+        assert_eq!(
+            executor.acknowledge(new_id),
+            Err(AdmissionError::ReconciliationRequired)
+        );
+        executor
+            .reconcile_retained(new_id, |_| async {
+                Completion::new(Outcome::Completed, "verified")
+            })
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        assert_eq!(executor.available(), Ok(()));
+        assert!(matches!(
+            executor.reconcile_retained(new_id, |_| async { unreachable!() }),
+            Err(AdmissionError::ReconciliationRequired)
+        ));
+        let ticket = executor
+            .submit(|_| async { Completion::new(Outcome::Failed, "ordinary") })
+            .unwrap();
+        let ordinary_id = ticket.id;
+        ticket.wait().await.unwrap();
+        assert!(matches!(
+            executor.reconcile_retained(ordinary_id, |_| async { unreachable!() }),
+            Err(AdmissionError::ReconciliationRequired)
+        ));
+        assert_eq!(executor.acknowledge(ordinary_id), Ok(()));
+        executor.shutdown().await;
+        assert!(matches!(
+            executor.reconcile_retained(ordinary_id, |_| async { unreachable!() }),
+            Err(AdmissionError::ShuttingDown)
+        ));
+    }
+
     #[tokio::test]
     async fn recovery_drain_does_not_wait_for_a_manager_lock_held_by_its_caller() {
         let executor = LocalExecutor::for_serialized_writers();

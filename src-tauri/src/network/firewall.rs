@@ -98,6 +98,21 @@ pub(super) enum Operation {
 }
 #[cfg(windows)]
 impl Operation {
+    fn mode(&self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Install => "install",
+            Self::Uninstall => "uninstall",
+            Self::Ensure { .. } => "ensure",
+            Self::Disable { .. } => "disable",
+        }
+    }
+    fn runtime_role(&self) -> Option<FirewallRule> {
+        match self {
+            Self::Ensure { role, .. } | Self::Disable { role } => Some(*role),
+            _ => None,
+        }
+    }
     pub(super) fn payload(&self) -> Result<Vec<u8>, String> {
         let program = std::env::current_exe()
             .and_then(std::fs::canonicalize)
@@ -133,13 +148,7 @@ pub(super) async fn execute(
     cancel: super::native_runner::Cancellation,
 ) -> (super::local_executor::Completion, FirewallOutcome) {
     use super::native_runner::NativeProcessRunner;
-    let mode = match operation {
-        Operation::Startup => "startup",
-        Operation::Install => "install",
-        Operation::Uninstall => "uninstall",
-        Operation::Ensure { .. } => "ensure",
-        Operation::Disable { .. } => "disable",
-    };
+    let mode = operation.mode();
     let process =
         tokio::task::spawn_blocking(move || NativeProcessRunner::run_firewall(operation, cancel))
             .await;
@@ -152,10 +161,9 @@ pub(super) async fn execute(
                 .as_ref()
                 .and_then(|o| o.get("timings_ms"))
             {
-                log::debug!(
-                    "event=firewall_policy_timing mode={mode} total_ms={} timings_ms={timings}",
-                    timings["total"]
-                );
+                if let Some(total) = timings.get("total").and_then(serde_json::Value::as_u64) {
+                    log::debug!("event=firewall_policy_timing mode={mode} total_ms={total} timings_ms={timings}");
+                }
             }
             result
         }
@@ -179,6 +187,215 @@ pub(super) async fn execute(
 }
 
 #[cfg(windows)]
+pub(super) async fn execute_settling(
+    operation: Operation,
+    cancel: super::native_runner::Cancellation,
+) -> (super::local_executor::Completion, FirewallOutcome) {
+    execute_settling_with(operation, cancel, execute).await
+}
+
+// Focused execution seam: each attempt is the existing fixed policy/runner.
+// Both follow-ups retain the parent's admission, with no recursive settlement.
+#[cfg(windows)]
+pub(super) async fn execute_settling_with<F, Fut>(
+    operation: Operation,
+    cancel: super::native_runner::Cancellation,
+    mut run: F,
+) -> (super::local_executor::Completion, FirewallOutcome)
+where
+    F: FnMut(Operation, super::native_runner::Cancellation) -> Fut,
+    Fut: std::future::Future<Output = (super::local_executor::Completion, FirewallOutcome)>,
+{
+    use super::{local_executor::Outcome, native_runner::Cancellation};
+    let (mut first, first_outcome) = run(operation.clone(), cancel.clone()).await;
+    execution_evidence(&mut first, &operation, &first_outcome);
+    if matches!(operation, Operation::Startup) {
+        let eligible = first.step == "firewall_result_unavailable"
+            && matches!(&first_outcome, FirewallOutcome::Failed { stage, .. }
+            if matches!(stage.as_str(), "native_timeout" | "native_canceled" | "native_output" | "native_report"));
+        if !eligible || !writers_retired(&first) || cancel.requested() {
+            return (first, first_outcome);
+        }
+        let (mut last, outcome) = run(operation.clone(), cancel).await;
+        execution_evidence(&mut last, &operation, &outcome);
+        // Keep the final attempt's normal fields; the failed first attempt is
+        // diagnostic only and is never recorded as a separate scope step.
+        last.observation.as_mut().unwrap()["first_attempt"] = serde_json::json!(first.observation);
+        log::info!(
+            "event=firewall_startup_retry first_stage={} result={}",
+            failure_stage(&first_outcome),
+            result_label(&outcome)
+        );
+        return (last, outcome);
+    }
+    let Some(role) = operation.runtime_role() else {
+        return (first, first_outcome);
+    };
+    if first.outcome != Outcome::Uncertain || !writers_retired(&first) {
+        return (first, first_outcome);
+    }
+    let start = std::time::Instant::now();
+    let disable = Operation::Disable { role };
+    let (mut settle, settle_outcome) = run(disable.clone(), Cancellation::default()).await;
+    execution_evidence(&mut settle, &disable, &settle_outcome);
+    let retired = writers_retired(&settle);
+    let verified = settle.outcome == Outcome::Completed
+        && settle_outcome == FirewallOutcome::Inactive
+        && retired;
+    log::info!(
+        "event=firewall_settle mode={} role={} first_stage={} settle={} elapsed_ms={}",
+        operation.mode(),
+        role_name(role),
+        failure_stage(&first_outcome),
+        result_label(&settle_outcome),
+        start.elapsed().as_millis()
+    );
+    let outcome = if verified {
+        first.step = "firewall_settled";
+        if matches!(operation, Operation::Ensure { .. }) {
+            first.outcome = Outcome::Failed;
+            FirewallOutcome::Failed {
+                stage: failure_stage(&first_outcome).into(),
+                reason: format!("{}; rule verified disabled", failure_reason(&first_outcome)),
+                uncertain: false,
+            }
+        } else {
+            first.outcome = Outcome::Completed;
+            FirewallOutcome::Inactive
+        }
+    } else {
+        first_outcome
+    };
+    let evidence = first.observation.as_ref().unwrap()["firewall_execution"].clone();
+    first.observation = Some(
+        serde_json::json!({"first_attempt":first.observation,"settle":settle.observation,
+        "firewall_execution":evidence,"firewall":outcome}),
+    );
+    first.observation.as_mut().unwrap()["firewall_execution"]["writers_retired"] =
+        serde_json::json!(retired);
+    (first, outcome)
+}
+
+#[cfg(windows)]
+fn role_name(role: FirewallRule) -> &'static str {
+    match role {
+        FirewallRule::Rtsp => "rtsp",
+        FirewallRule::Srt => "srt",
+    }
+}
+#[cfg(windows)]
+fn failure_stage(outcome: &FirewallOutcome) -> &str {
+    match outcome {
+        FirewallOutcome::Failed { stage, .. } => stage,
+        _ => "firewall_recovery",
+    }
+}
+#[cfg(windows)]
+fn failure_reason(outcome: &FirewallOutcome) -> &str {
+    match outcome {
+        FirewallOutcome::Failed { reason, .. } | FirewallOutcome::Unavailable { reason } => reason,
+        _ => "Firewall retirement was not verified",
+    }
+}
+#[cfg(windows)]
+fn result_label(outcome: &FirewallOutcome) -> &'static str {
+    match outcome {
+        FirewallOutcome::Inactive => "inactive",
+        FirewallOutcome::Failed {
+            uncertain: true, ..
+        } => "uncertain",
+        _ => "failed",
+    }
+}
+
+#[cfg(windows)]
+fn execution_evidence(
+    completion: &mut super::local_executor::Completion,
+    operation: &Operation,
+    outcome: &FirewallOutcome,
+) {
+    let mut observation = completion
+        .observation
+        .take()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let native = observation.get("native").unwrap_or(&observation);
+    let retired = native["contained"] == true && native["tree_exited"] == true;
+    observation["firewall_execution"] = serde_json::json!({"mode":operation.mode(),
+        "role":operation.runtime_role().map(role_name),"writers_retired":retired});
+    observation["firewall"] = serde_json::json!(outcome);
+    completion.observation = Some(observation);
+}
+#[cfg(windows)]
+fn writers_retired(completion: &super::local_executor::Completion) -> bool {
+    completion
+        .observation
+        .as_ref()
+        .is_some_and(|o| o["firewall_execution"]["writers_retired"] == true)
+}
+
+#[cfg(windows)]
+pub(super) fn recovery_eligible(
+    completion: &super::local_executor::Completion,
+    role: FirewallRule,
+) -> bool {
+    use super::local_executor::Outcome;
+    completion.outcome == Outcome::Uncertain
+        && matches!(
+            completion.step,
+            "firewall_result_unavailable" | "firewall_policy"
+        )
+        && writers_retired(completion)
+        && completion.observation.as_ref().is_some_and(|o| {
+            o["firewall_execution"]["role"] == role_name(role)
+                && matches!(
+                    o["firewall_execution"]["mode"].as_str(),
+                    Some("ensure" | "disable")
+                )
+        })
+}
+
+#[cfg(windows)]
+pub(super) fn finish_recovery(
+    mut original: super::local_executor::Completion,
+    (mut latest, outcome): (super::local_executor::Completion, FirewallOutcome),
+) -> (super::local_executor::Completion, FirewallOutcome) {
+    use super::local_executor::Outcome;
+    let retired = writers_retired(&original) && writers_retired(&latest);
+    if latest.outcome == Outcome::Completed && outcome == FirewallOutcome::Inactive && retired {
+        latest.observation.as_mut().unwrap()["recovered"] = serde_json::json!(original.observation);
+        return (latest, outcome);
+    }
+    let prior = original.observation.take().unwrap();
+    // Replace the latest failure rather than recursively retaining recoveries.
+    let unresolved = prior.get("unresolved").unwrap_or(&prior);
+    let result = FirewallOutcome::Failed {
+        stage: "firewall_recovery".into(),
+        reason: format!(
+            "{}; recovery did not verify retirement: {}",
+            unresolved["firewall"]["reason"]
+                .as_str()
+                .unwrap_or("Unresolved firewall operation")
+                .chars()
+                .take(384)
+                .collect::<String>(),
+            failure_reason(&outcome)
+                .chars()
+                .take(384)
+                .collect::<String>()
+        ),
+        uncertain: true,
+    };
+    let mut evidence = prior["firewall_execution"].clone();
+    evidence["writers_retired"] = serde_json::json!(retired);
+    original.outcome = Outcome::Uncertain;
+    original.observation = Some(
+        serde_json::json!({"unresolved":unresolved,"latest_recovery":latest.observation,
+        "firewall_execution":evidence,"firewall":result}),
+    );
+    (original, result)
+}
+
+#[cfg(windows)]
 fn unavailable(
     stage: &str,
     reason: &str,
@@ -198,7 +415,7 @@ fn unavailable(
 }
 
 #[cfg(windows)]
-fn evaluate_process(
+pub(super) fn evaluate_process(
     p: super::native_runner::ProcessResult,
 ) -> (super::local_executor::Completion, FirewallOutcome) {
     use super::local_executor::{Completion, Outcome};
@@ -356,7 +573,7 @@ pub(crate) async fn disable(rule: FirewallRule) -> FirewallOutcome {
     }
 }
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     #[cfg(windows)]
@@ -402,7 +619,7 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn process() -> super::super::native_runner::ProcessResult {
+    pub(in crate::network) fn process() -> super::super::native_runner::ProcessResult {
         use super::super::native_runner::{Captured, ProcessResult, Termination};
         ProcessResult {
             exit_code: 0, termination: Termination::Exited,
@@ -410,6 +627,326 @@ mod tests {
             stderr: Captured::default(), observed_tree_pids: vec![123], observed_tree_exited: true,
             containment_verified_before_resume: true, elapsed: std::time::Duration::from_secs(30),
         }
+    }
+
+    #[cfg(windows)]
+    fn failed_process(uncertain: bool) -> super::super::native_runner::ProcessResult {
+        let mut p = process();
+        p.exit_code = 71;
+        p.stdout.bytes = serde_json::to_vec(&serde_json::json!({"version":2,"ok":false,"stage":"access","mutated":false,
+            "outcome":{"state":"failed","stage":"access","reason":"provider failure","uncertain":uncertain},"records":[]})).unwrap();
+        p
+    }
+
+    #[cfg(windows)]
+    async fn scripted(
+        operation: Operation,
+        cancel: super::super::native_runner::Cancellation,
+        mut processes: Vec<Result<super::super::native_runner::ProcessResult, ()>>,
+    ) -> (
+        (super::super::local_executor::Completion, FirewallOutcome),
+        Vec<(String, bool)>,
+    ) {
+        let mut calls = Vec::new();
+        let result = execute_settling_with(operation, cancel, |op, cancel| {
+            calls.push((op.mode().to_string(), cancel.requested()));
+            std::future::ready(match processes.remove(0) {
+                Ok(p) => evaluate_process(p),
+                Err(()) => unavailable("native_setup", "Unknown writer lifetime", None),
+            })
+        })
+        .await;
+        (result, calls)
+    }
+
+    #[cfg(windows)]
+    fn ensure_operation() -> Operation {
+        Operation::Ensure {
+            role: FirewallRule::Rtsp,
+            port: 8554,
+            interface: None,
+        }
+    }
+
+    #[cfg(windows)]
+    fn timed_out() -> super::super::native_runner::ProcessResult {
+        let mut p = process();
+        p.termination = super::super::native_runner::Termination::TimedOut;
+        p
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn runtime_timeouts_settle_once_for_the_same_role_with_a_fresh_token() {
+        use super::super::{local_executor::Outcome, native_runner::Cancellation};
+        for operation in [
+            ensure_operation(),
+            Operation::Disable {
+                role: FirewallRule::Rtsp,
+            },
+        ] {
+            let ensure = matches!(operation, Operation::Ensure { .. });
+            let cancel = Cancellation::default();
+            cancel.request();
+            let ((completion, outcome), calls) =
+                scripted(operation, cancel, vec![Ok(timed_out()), Ok(process())]).await;
+            assert_eq!(
+                calls,
+                vec![
+                    (if ensure { "ensure" } else { "disable" }.into(), true),
+                    ("disable".into(), false)
+                ]
+            );
+            assert_eq!(completion.step, "firewall_settled");
+            assert_eq!(
+                completion.outcome,
+                if ensure {
+                    Outcome::Failed
+                } else {
+                    Outcome::Completed
+                }
+            );
+            assert!(writers_retired(&completion));
+            if ensure {
+                assert!(matches!(
+                    outcome,
+                    FirewallOutcome::Failed {
+                        uncertain: false,
+                        ..
+                    }
+                ));
+            } else {
+                assert_eq!(outcome, FirewallOutcome::Inactive);
+            }
+            let evidence = completion.observation.unwrap();
+            assert_eq!(evidence["first_attempt"]["termination"], "TimedOut");
+            assert_eq!(evidence["settle"]["native"]["termination"], "Exited");
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn failed_settle_retains_the_original_cause_and_all_writer_evidence() {
+        use super::super::native_runner::Cancellation;
+        for retired in [true, false] {
+            let mut settle = timed_out();
+            settle.observed_tree_exited = retired;
+            let ((completion, outcome), calls) = scripted(
+                ensure_operation(),
+                Cancellation::default(),
+                vec![Ok(timed_out()), Ok(settle)],
+            )
+            .await;
+            assert_eq!(calls.len(), 2);
+            assert!(
+                matches!(outcome, FirewallOutcome::Failed { stage, uncertain:true, .. } if stage == "native_timeout")
+            );
+            assert_eq!(recovery_eligible(&completion, FirewallRule::Rtsp), retired);
+            assert!(!recovery_eligible(&completion, FirewallRule::Srt));
+            let evidence = completion.observation.unwrap();
+            assert_eq!(evidence["settle"]["tree_exited"], retired);
+            assert_eq!(evidence["first_attempt"]["termination"], "TimedOut");
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn unknown_writer_lifetime_never_dispatches_a_followup() {
+        use super::super::native_runner::{Cancellation, Termination};
+        for termination in [
+            Termination::TimedOut,
+            Termination::Canceled,
+            Termination::Exited,
+        ] {
+            for missing in [0, 1, 2] {
+                for operation in [ensure_operation(), Operation::Startup] {
+                    let mut p = process();
+                    p.termination = termination;
+                    if missing == 0 {
+                        p.containment_verified_before_resume = false;
+                    }
+                    if missing == 1 {
+                        p.observed_tree_exited = false;
+                    }
+                    let first = if missing == 2 { Err(()) } else { Ok(p) };
+                    let ((completion, _), calls) =
+                        scripted(operation, Cancellation::default(), vec![first]).await;
+                    assert_eq!(calls.len(), 1);
+                    assert!(!writers_retired(&completion));
+                    assert!(!recovery_eligible(&completion, FirewallRule::Rtsp));
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn only_uncertain_runtime_policy_failures_get_one_settle() {
+        use super::super::{local_executor::Outcome, native_runner::Cancellation};
+        for uncertain in [true, false] {
+            let ((completion, _), calls) = scripted(
+                ensure_operation(),
+                Cancellation::default(),
+                vec![Ok(failed_process(uncertain)), Ok(failed_process(true))],
+            )
+            .await;
+            assert_eq!(calls.len(), if uncertain { 2 } else { 1 });
+            assert_eq!(
+                completion.outcome,
+                if uncertain {
+                    Outcome::Uncertain
+                } else {
+                    Outcome::Failed
+                }
+            );
+        }
+        for operation in [Operation::Install, Operation::Uninstall] {
+            let (_, calls) =
+                scripted(operation, Cancellation::default(), vec![Ok(timed_out())]).await;
+            assert_eq!(calls.len(), 1);
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn startup_retries_only_eligible_process_failures_and_keeps_final_fields() {
+        use super::super::native_runner::{Cancellation, Termination};
+        for case in 0..4 {
+            let mut p = process();
+            match case {
+                0 => p.termination = Termination::TimedOut,
+                1 => p.termination = Termination::Canceled,
+                2 => p.stdout.truncated = true,
+                _ => p.stdout.bytes = b"invalid JSON".to_vec(),
+            }
+            let ((completion, outcome), calls) = scripted(
+                Operation::Startup,
+                Cancellation::default(),
+                vec![Ok(p), Ok(process())],
+            )
+            .await;
+            assert_eq!(calls.len(), 2);
+            assert_eq!(outcome, FirewallOutcome::Inactive);
+            let evidence = completion.observation.unwrap();
+            assert_eq!(evidence["report"]["stage"], "verified");
+            assert!(evidence.get("first_attempt").is_some());
+            assert!(!recovery_eligible(
+                &super::super::local_executor::Completion {
+                    observation: Some(evidence),
+                    ..completion
+                },
+                FirewallRule::Rtsp
+            ));
+        }
+        let (_, calls) = scripted(
+            Operation::Startup,
+            Cancellation::default(),
+            vec![Ok(failed_process(false))],
+        )
+        .await;
+        assert_eq!(calls.len(), 1);
+        let mut policy = failed_process(true);
+        let mut report: serde_json::Value = serde_json::from_slice(&policy.stdout.bytes).unwrap();
+        report["outcome"]["stage"] = serde_json::json!("native_timeout");
+        policy.stdout.bytes = serde_json::to_vec(&report).unwrap();
+        let (_, calls) = scripted(
+            Operation::Startup,
+            Cancellation::default(),
+            vec![Ok(policy)],
+        )
+        .await;
+        assert_eq!(calls.len(), 1, "policy failures are never process retries");
+        let cancel = Cancellation::default();
+        cancel.request();
+        let (_, calls) = scripted(Operation::Startup, cancel, vec![Ok(timed_out())]).await;
+        assert_eq!(calls.len(), 1);
+        let ((completion, _), calls) = scripted(
+            Operation::Startup,
+            Cancellation::default(),
+            vec![Ok(timed_out()), Ok(timed_out())],
+        )
+        .await;
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            completion.outcome,
+            super::super::local_executor::Outcome::Uncertain
+        );
+        assert!(completion
+            .observation
+            .unwrap()
+            .get("first_attempt")
+            .is_some());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn startup_second_attempt_honors_original_cancellation() {
+        use super::super::native_runner::{Cancellation, Termination};
+        let original = Cancellation::default();
+        let mut calls = 0;
+        let (_, outcome) =
+            execute_settling_with(Operation::Startup, original.clone(), |_, token| {
+                calls += 1;
+                let p = if calls == 1 {
+                    timed_out()
+                } else {
+                    original.request();
+                    assert!(token.requested());
+                    let mut p = process();
+                    p.termination = Termination::Canceled;
+                    p
+                };
+                std::future::ready(evaluate_process(p))
+            })
+            .await;
+        assert_eq!(calls, 2);
+        assert!(
+            matches!(outcome, FirewallOutcome::Failed {stage, uncertain:true,..} if stage=="native_canceled")
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn abandoned_requester_still_settles_but_retains_acknowledgement_barrier() {
+        use super::super::local_executor::{AdmissionError, Completion, LocalExecutor, Outcome};
+        let executor = LocalExecutor::for_serialized_writers();
+        executor
+            .reconcile(|_| async { Completion::new(Outcome::Completed, "ready") })
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let ticket = executor
+            .submit(|cancel| async move {
+                entered.send(()).unwrap();
+                wait.await.unwrap();
+                let ((completion, _), calls) = scripted(
+                    ensure_operation(),
+                    cancel,
+                    vec![Ok(timed_out()), Ok(process())],
+                )
+                .await;
+                assert_eq!(
+                    calls,
+                    vec![("ensure".into(), true), ("disable".into(), false)]
+                );
+                completion
+            })
+            .unwrap();
+        waiting.await.unwrap();
+        drop(ticket);
+        release.send(()).unwrap();
+        executor.wait_terminal().await;
+        let (_, retained) = executor.retained().unwrap();
+        assert_eq!(retained.outcome, Outcome::Failed);
+        assert!(writers_retired(&retained));
+        assert!(!recovery_eligible(&retained, FirewallRule::Rtsp));
+        assert_eq!(
+            executor.available(),
+            Err(AdmissionError::ReconciliationRequired)
+        );
     }
 
     #[cfg(windows)]
