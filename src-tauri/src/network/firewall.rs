@@ -123,6 +123,8 @@ struct Report {
     mutated: bool,
     outcome: FirewallOutcome,
     records: Vec<serde_json::Value>,
+    #[serde(default)]
+    timings_ms: std::collections::BTreeMap<String, u64>,
 }
 
 #[cfg(windows)]
@@ -131,11 +133,32 @@ pub(super) async fn execute(
     cancel: super::native_runner::Cancellation,
 ) -> (super::local_executor::Completion, FirewallOutcome) {
     use super::native_runner::NativeProcessRunner;
+    let mode = match operation {
+        Operation::Startup => "startup",
+        Operation::Install => "install",
+        Operation::Uninstall => "uninstall",
+        Operation::Ensure { .. } => "ensure",
+        Operation::Disable { .. } => "disable",
+    };
     let process =
         tokio::task::spawn_blocking(move || NativeProcessRunner::run_firewall(operation, cancel))
             .await;
     match process {
-        Ok(Ok(process)) => evaluate_process(process),
+        Ok(Ok(process)) => {
+            let result = evaluate_process(process);
+            if let Some(timings) = result
+                .0
+                .observation
+                .as_ref()
+                .and_then(|o| o.get("timings_ms"))
+            {
+                log::debug!(
+                    "event=firewall_policy_timing mode={mode} total_ms={} timings_ms={timings}",
+                    timings["total"]
+                );
+            }
+            result
+        }
         Ok(Err(error)) => {
             log::error!("event=firewall_native_setup error={error}");
             unavailable(
@@ -227,6 +250,8 @@ fn evaluate_process(
                 && report.ok == (p.exit_code == 0)
                 && report.stage.len() <= 64
                 && report.records.len() <= 64
+                && report.timings_ms.len() <= 16
+                && report.timings_ms.keys().all(|key| key.len() <= 64)
                 && report.ok
                     == matches!(
                         report.outcome,
@@ -268,7 +293,7 @@ fn evaluate_process(
                 "firewall_policy",
             );
             completion.observation = Some(
-                serde_json::json!({"native":native,"report":{"stage":report.stage,"mutated":report.mutated},"records":report.records,"firewall":report.outcome}),
+                serde_json::json!({"native":native,"report":{"stage":report.stage,"mutated":report.mutated},"records":report.records,"firewall":report.outcome,"timings_ms":report.timings_ms}),
             );
             (completion, report.outcome)
         }
@@ -333,6 +358,48 @@ pub(crate) async fn disable(rule: FirewallRule) -> FirewallOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn report_timings_are_optional_bounded_and_strict() {
+        let mut p = process();
+        let mut report: serde_json::Value = serde_json::from_slice(&p.stdout.bytes).unwrap();
+        report["timings_ms"] = serde_json::json!({"input":0,"prepare":12,"total":30});
+        p.stdout.bytes = serde_json::to_vec(&report).unwrap();
+        assert_eq!(evaluate_process(p).1, FirewallOutcome::Inactive);
+        for timings in [
+            serde_json::json!({"input":-1}),
+            serde_json::json!({"input":1.5}),
+            serde_json::to_value(
+                (0..17)
+                    .map(|i| (i.to_string(), 0))
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            )
+            .unwrap(),
+        ] {
+            let mut p = process();
+            report["timings_ms"] = timings;
+            p.stdout.bytes = serde_json::to_vec(&report).unwrap();
+            assert!(matches!(
+                evaluate_process(p).1,
+                FirewallOutcome::Failed {
+                    uncertain: true,
+                    ..
+                }
+            ));
+        }
+        let mut p = process();
+        report.as_object_mut().unwrap().remove("timings_ms");
+        report["unknown"] = serde_json::json!(true);
+        p.stdout.bytes = serde_json::to_vec(&report).unwrap();
+        assert!(matches!(
+            evaluate_process(p).1,
+            FirewallOutcome::Failed {
+                uncertain: true,
+                ..
+            }
+        ));
+    }
 
     #[cfg(windows)]
     fn process() -> super::super::native_runner::ProcessResult {

@@ -329,6 +329,30 @@ fn observe_tree(job: &Handle, processes: &mut BTreeMap<u32, Handle>) -> std::io:
 }
 
 pub(super) struct NativeProcessRunner;
+#[cfg(test)]
+fn firewall_probe_script() -> String {
+    let mut script = super::firewall::SCRIPT.to_string();
+    for (original, instrumented) in [
+        ("# @TRUSTED_IMPORTS_END@", include_str!("../../tests/fixtures/firewall-read-only-v1.ps1")),
+        ("function All-Rules { return @(Get-NetFirewallRule -PolicyStore PersistentStore -ErrorAction Stop) }",
+         "function All-Rules { $w=[Diagnostics.Stopwatch]::StartNew(); try { return @(Get-NetFirewallRule -PolicyStore PersistentStore -ErrorAction Stop) } finally { [Console]::Error.WriteLine(('read_all_ms='+$w.ElapsedMilliseconds)) } }"),
+        ("function Owner-Shape($rule) {", "function Owner-Shape($rule) { [Console]::Error.WriteLine(('owner_begin='+$rule.Name)); $w=[Diagnostics.Stopwatch]::StartNew()"),
+        ("    if ($app.Count -ne 1) {", "    [Console]::Error.WriteLine(('owner_ms='+$w.ElapsedMilliseconds))\n    if ($app.Count -ne 1) {"),
+    ] {
+        assert_eq!(script.matches(original).count(), 1, "firewall probe anchor: {original}");
+        script = script.replace(original, instrumented);
+    }
+    script
+}
+
+#[cfg(test)]
+#[test]
+fn startup_probe_instruments_every_current_anchor() {
+    let script = firewall_probe_script();
+    assert!(script.contains("owner_begin=") && script.contains("owner_ms="));
+    assert!(script.contains("read_all_ms=") && script.contains("Read-only probe refuses creation"));
+}
+
 fn firewall_budget(operation: &super::firewall::Operation) -> Duration {
     use super::firewall::Operation;
     Duration::from_secs(match operation {
@@ -345,21 +369,7 @@ impl NativeProcessRunner {
     // intercepts every writer; the separate provider test needs explicit opt-in.
     #[cfg(test)]
     fn firewall_startup_probe(read_only: bool) -> Result<ProcessResult, String> {
-        let script = super::firewall::SCRIPT.replace(
-            "# @TRUSTED_IMPORTS_END@",
-            include_str!("../../tests/fixtures/firewall-read-only-v1.ps1"),
-        );
-        let script = script.replace(
-            "function All-Rules { return @(Get-NetFirewallRule -PolicyStore PersistentStore -ErrorAction Stop) }",
-            "function All-Rules { $w=[Diagnostics.Stopwatch]::StartNew(); try { return @(Get-NetFirewallRule -PolicyStore PersistentStore -ErrorAction Stop) } finally { [Console]::Error.WriteLine(('read_all_ms='+$w.ElapsedMilliseconds)) } }",
-        );
-        let script = script.replace(
-            "function Shape($rule) {",
-            "function Shape($rule) { [Console]::Error.WriteLine(('shape_begin='+$rule.Name)); $w=[Diagnostics.Stopwatch]::StartNew()",
-        ).replace(
-            "    if ($app.Count -ne 1",
-            "    [Console]::Error.WriteLine(('shape_ms='+$w.ElapsedMilliseconds))\n    if ($app.Count -ne 1",
-        );
+        let script = firewall_probe_script();
         let mut payload: serde_json::Value =
             serde_json::from_slice(&super::firewall::Operation::Startup.payload()?)
                 .map_err(|e| e.to_string())?;

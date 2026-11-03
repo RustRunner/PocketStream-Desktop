@@ -5,7 +5,7 @@ Import-Module Microsoft.PowerShell.Utility
 Import-Module Microsoft.PowerShell.Management
 $root=Split-Path -Parent $PSScriptRoot
 $source=[IO.File]::ReadAllText((Join-Path $root 'src-tauri/src/network/firewall-policy-v2.ps1'))
-$source=[regex]::Replace($source,'(?s)# @TRUSTED_IMPORTS_BEGIN@.*?# @TRUSTED_IMPORTS_END@','try { $data=$script:testData')
+$source=[regex]::Replace($source,'(?s)# @TRUSTED_IMPORTS_BEGIN@.*?# @TRUSTED_IMPORTS_END@','try { function Import-Trusted($module) { $script:imports.Add($module) }; $data=$script:testData')
 $source=$source.Replace('[Console]::Out.WriteLine(','Write-Output (').Replace('exit 0','return').Replace('exit 71','return')
 $policy=[scriptblock]::Create($source)
 $program='C:\Program Files\PocketStream Desktop\pocketstream-desktop.exe'
@@ -18,6 +18,8 @@ function Reset {
     $script:rules=[Collections.Generic.List[object]]::new()
     $script:writeCount=0; $script:failSet=0; $script:failQuery=$false; $script:failRemove=$false
     $script:fullQueries=0; $script:namedQueries=0; $script:filterReads=0
+    $script:filteredQueries=0; $script:rewrites=0; $script:events=[Collections.Generic.List[string]]::new(); $script:imports=[Collections.Generic.List[string]]::new()
+    $script:failAfterEnable=$false; $script:failCleanup=$false; $script:enableThenThrow=$false; $script:enabledWrite=$false; $script:emptyBlocks=$false; $script:foreignBlockFailure=$false
     $script:failNamedQuery=$false; $script:foreignNotFound=$false; $script:changeReadback=$false; $script:restorePackage=$false
     $script:adapter=[pscustomobject]@{InterfaceGuid='{01234567-89ab-cdef-0123-456789abcdef}';MacAddress='00-11-22-33-44-55';ifIndex=15;Status='Up';Name='Renamed Ethernet'}
 }
@@ -30,10 +32,11 @@ function Rule([string]$name,[int]$role=0,[string]$program='Any',[string]$enabled
 }
 function Enforced($row) { return $row.Enabled -eq 'True' -and [string]$row.Package -ceq '' }
 function Get-NetFirewallRule {
-    [CmdletBinding()]param($PolicyStore,[string]$Name)
+    [CmdletBinding()]param($PolicyStore,[string]$Name,$Action,$Direction,$DisplayName)
     if($script:failQuery){throw 'fake query failure'}
     if($Name) {
         $script:namedQueries++
+        if($script:enabledWrite -and $script:failAfterEnable){$script:failAfterEnable=$false;throw 'fake enabled readback failure'}
         if($script:failNamedQuery){throw 'genuine named provider failure'}
         if($script:foreignNotFound){$PSCmdlet.ThrowTerminatingError([Management.Automation.ErrorRecord]::new([Management.Automation.ItemNotFoundException]::new('provider object unavailable'),'ProviderQueryFailure',[Management.Automation.ErrorCategory]::ObjectNotFound,$Name))}
         $matches=@($script:rules | Where-Object { $_.Name -like $Name })
@@ -44,7 +47,13 @@ function Get-NetFirewallRule {
         if($script:changeReadback -and $script:namedQueries -eq 2){$matches[0].Enabled='True'}
         return $matches
     }
-    $script:fullQueries++
+    if($Action -or $Direction -or $DisplayName) {
+        $script:filteredQueries++;$script:events.Add('blocks')
+        if($script:foreignBlockFailure){$PSCmdlet.ThrowTerminatingError([Management.Automation.ErrorRecord]::new([Management.Automation.ItemNotFoundException]::new('foreign block query failure'),'ProviderQueryFailure',[Management.Automation.ErrorCategory]::ObjectNotFound,$Action))}
+        if($script:emptyBlocks){$PSCmdlet.ThrowTerminatingError([Management.Automation.ErrorRecord]::new([Management.Automation.ItemNotFoundException]::new('no matching block'),'CmdletizationQuery_NotFound',[Management.Automation.ErrorCategory]::ObjectNotFound,$Action))}
+        return @($script:rules | Where-Object { (!$Action -or $_.Action -eq $Action) -and (!$Direction -or $_.Direction -eq $Direction) -and (!$DisplayName -or $_.DisplayName -eq $DisplayName) })
+    }
+    $script:fullQueries++;$script:events.Add('full')
     return $script:rules.ToArray()
 }
 function Get-NetAdapter { [CmdletBinding()]param([switch]$IncludeHidden) return $script:adapter }
@@ -57,17 +66,23 @@ function Set-NetFirewallRule {
     [CmdletBinding()]param([Parameter(ValueFromPipeline=$true)]$InputObject,$NewDisplayName,$Direction,$Action,$Enabled,$Profile,$Program,$Protocol,$LocalPort,$RemotePort,$LocalAddress,$RemoteAddress,$InterfaceAlias,$InterfaceType,$Service,$Package,$EdgeTraversalPolicy,$Authentication,$Encryption,$LocalUser,$RemoteUser,$RemoteMachine,$OverrideBlockRules,$LooseSourceMapping,$LocalOnlyMapping,$DynamicTarget)
     process {
         if($PSBoundParameters.ContainsKey('Package')){$script:packageBindings++}
+        if($NewDisplayName){$script:rewrites++}
         $script:writeCount++
+        if($Enabled -eq 'False' -and $script:enabledWrite -and $script:failCleanup){throw 'fake cleanup failure'}
         if($script:failSet -eq $script:writeCount){throw 'fake partial filter failure'}
         foreach($key in $PSBoundParameters.Keys){if($key -eq 'NewDisplayName'){$InputObject.DisplayName=$NewDisplayName} elseif($key -notin @('InputObject','ErrorAction')){$InputObject.$key=$PSBoundParameters[$key]}}
         if($script:restorePackage){$InputObject.Package='Any'}
+        if($Enabled -eq 'True'){$script:enabledWrite=$true;$script:events.Add('enable');if($script:enableThenThrow){throw 'fake enable mutated before failure'}}
     }
 }
 function New-NetFirewallRule {
     [CmdletBinding()]param($PolicyStore,$Name,$DisplayName,$Group,$Direction,$Action,$Enabled,$Profile,$Program,$Protocol,$LocalPort,$RemotePort,$LocalAddress,$RemoteAddress,$InterfaceAlias,$InterfaceType,$Service,$Package,$EdgeTraversalPolicy,$Authentication,$Encryption,$LocalUser,$RemoteUser,$RemoteMachine,$OverrideBlockRules,$LooseSourceMapping,$LocalOnlyMapping,$DynamicTarget)
     if($PSBoundParameters.ContainsKey('Package')){$script:packageBindings++}
-    # Creation before disabling *all* legacy allows is a policy regression.
-    Assert (@($script:rules | Where-Object {$_.Program -eq 'Any' -and $_.Action -eq 'Allow' -and $_.Enabled -eq 'True' -and $_.DisplayName -in $roles.display_name}).Count -eq 0) 'Enabled broad allow survived template creation'
+    # Installer creation must follow disabling every legacy allow. Runtime
+    # ensure intentionally preserves legacy rules introduced after startup.
+    if($script:testData.operation.mode -eq 'install') {
+        Assert (@($script:rules | Where-Object {$_.Program -eq 'Any' -and $_.Action -eq 'Allow' -and $_.Enabled -eq 'True' -and $_.DisplayName -in $roles.display_name}).Count -eq 0) 'Enabled broad allow survived template creation'
+    }
     $row=Rule $Name
     foreach($key in $PSBoundParameters.Keys){if($key -notin @('PolicyStore','ErrorAction')){$row.$key=$PSBoundParameters[$key]}}
     $script:rules.Add($row);$script:writeCount++
@@ -135,7 +150,9 @@ $foreign=Rule 'foreign-preserved' 0 'C:\Other\app.exe';$script:rules.Add($foreig
 $r=Run disable
 Assert ($r.ok -and $owned.Enabled -eq 'False') 'Unrelated legacy conflict stranded the stopped listener allow'
 Assert ($bad.Enabled -eq 'True' -and $block.Enabled -eq 'True' -and $foreign.Enabled -eq 'True') 'Stop changed unowned rules'
-Assert (!(Run ensure).ok) 'Ensure must still reject unresolved legacy migration'
+Assert (Run ensure).ok 'Mid-session legacy conflict blocked ensure'
+Assert ($bad.Enabled -eq 'True') 'Ensure changed the mid-session legacy conflict'
+Assert (!(Run startup).ok -and !(Run install).ok) 'Startup/install accepted a legacy conflict'
 $passed.Add('stop disables only its owned role despite unrelated legacy conflicts')
 Reset;$script:rules.Add((Rule 'legacy-removal-failure'));$script:failRemove=$true;$r=Run install
 Assert (!$r.ok -and $r.outcome.uncertain) 'Cleaning the last template hid an unresolved legacy removal'
@@ -209,5 +226,47 @@ $r=Run startup
 Assert ($r.ok -and $prior.Enabled -eq 'False' -and $prior.Package -eq 'Any' -and $script:rules.Contains($prior)) 'Startup repaired instead of disabling'
 Assert ($script:writeCount -eq 1 -and $script:filterReads -eq 2 -and $r.records[0].defective_template -eq $prior.Name) 'Startup defect diagnostic added reads/writes'
 $passed.Add('startup detects defective templates with the light ownership read and only disables')
+foreach($explicit in @($false,$true)) {
+    Reset;Assert (Run install).ok 'Lean ensure setup'
+    $bind=if($explicit){$identity}else{$null};$alias=if($explicit){$script:adapter.Name}else{'Any'}
+    if($explicit){$script:rules[0].InterfaceAlias=$alias}
+    $script:fullQueries=0;$script:filterReads=0;$script:writeCount=0;$script:rewrites=0
+    $r=Run ensure rtsp 8554 $bind
+    Assert ($r.ok -and $r.outcome.action -eq 'unchanged' -and $script:fullQueries -eq 0 -and $script:filteredQueries -eq 1) 'Lean ensure enumerated a full store'
+    Assert ($script:filterReads -eq (9+[int]$explicit) -and $script:writeCount -eq 1 -and $script:rewrites -eq 0) 'Unchanged ensure repeated shape or rewrite'
+    Assert (($script:imports -contains 'NetAdapter') -eq $explicit) 'NetAdapter import did not follow explicit identity'
+    Assert ($script:events.IndexOf('blocks') -lt $script:events.IndexOf('enable')) 'Block observation followed enable'
+}
+$passed.Add('unchanged ensure has one shape, minimal enabled readback, filtered blocks and conditional imports')
+Reset;Assert (Run install).ok 'Changed port setup';$script:filterReads=0;$script:rewrites=0;$script:writeCount=0
+$r=Run ensure rtsp 13554
+Assert ($r.ok -and $r.outcome.action -eq 'updated' -and $script:rewrites -eq 1 -and $script:filterReads -eq 16) 'Changed port did not use one rewrite and readback'
+$passed.Add('changed port rewrites once and reads the full template back once')
+Reset;Assert (Run install).ok 'Light disable setup';$script:rules[0].Enabled='True';$script:filterReads=0;$script:fullQueries=0;$script:namedQueries=0
+$r=Run disable
+Assert ($r.ok -and $script:filterReads -eq 1 -and $script:fullQueries -eq 0 -and $script:namedQueries -eq 2) 'Disable did not use light ownership and fresh disabled readback'
+$passed.Add('disable uses one application filter and fresh exact readback')
+foreach($cleanupFails in @($false,$true)) {
+    foreach($enableThrows in @($false,$true)) {
+        Reset;Assert (Run install).ok 'Unchanged failure setup';$script:failAfterEnable=!$enableThrows;$script:enableThenThrow=$enableThrows;$script:failCleanup=$cleanupFails
+        $r=Run ensure rtsp 8554
+        Assert (!$r.ok -and $r.mutated -and $r.outcome.uncertain -eq $cleanupFails) 'Unchanged enable lost mutation/uncertainty bookkeeping'
+        Assert (($script:rules[0].Enabled -eq 'True') -eq $cleanupFails) 'Unchanged enable cleanup state mismatch'
+    }
+}
+$passed.Add('unchanged enable/readback failures always run cleanup with truthful uncertainty')
+Reset;Assert (Run install).ok 'Block query setup';$script:emptyBlocks=$true
+Assert (Run ensure rtsp 8554).ok 'Exact provider block not-found did not mean empty'
+$script:emptyBlocks=$false;$script:foreignBlockFailure=$true;$r=Run ensure
+Assert (!$r.ok -and $script:rules[0].Enabled -eq 'False') 'Foreign ObjectNotFound did not fail closed before enable'
+$passed.Add('filtered blocks distinguish exact provider not-found from query failure')
+foreach($mode in @('install','startup','ensure','disable','uninstall')) {
+    Reset;$r=Run $mode
+    Assert ($null -ne $r.timings_ms -and @($r.timings_ms.psobject.Properties).Count -le 16) 'Missing or unbounded timings'
+    foreach($value in $r.timings_ms.psobject.Properties.Value){Assert ($value -is [ValueType] -and $value -ge 0) 'Timing is not a nonnegative integer'}
+}
+Reset;$script:failQuery=$true;$r=Run install
+Assert (!$r.ok -and $null -ne $r.timings_ms) 'Handled failure omitted timings'
+$passed.Add('bounded numeric timings accompany success and handled failures')
 Assert ($script:packageBindings -eq 0) 'A New/Set call bound the Package parameter'
 [Console]::Out.WriteLine((@{passed=$passed.ToArray();native_policy_mutations=0;provider='pure fake'} | ConvertTo-Json -Compress))

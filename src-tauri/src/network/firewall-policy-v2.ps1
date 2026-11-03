@@ -4,12 +4,20 @@ $ProgressPreference = 'SilentlyContinue'
 $PSModuleAutoLoadingPreference = 'None'
 [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
-$stage = 'trusted_modules'
+$script:stage = 'trusted_modules'
+$script:clock = [Diagnostics.Stopwatch]::StartNew()
+$script:stageStarted = 0L
+$script:timings = @{}
 $script:mutated = $false
 $records = [Collections.Generic.List[object]]::new()
 $outcome = @{state='inactive'}
 $script:touched = $null
 $script:recordBytes = 0
+function Stage([string]$next) {
+    $now = $clock.ElapsedMilliseconds
+    $timings[$stage] = [long]$timings[$stage] + ($now - $script:stageStarted)
+    $script:stageStarted = $now; $script:stage = $next
+}
 function Is-Any($value) { return @($value).Count -eq 1 -and [string]$value -in @('Any','*') }
 function Same-Program($value) { return [string]::Equals([string]$value, $data.program, [StringComparison]::OrdinalIgnoreCase) }
 function All-Rules { return @(Get-NetFirewallRule -PolicyStore PersistentStore -ErrorAction Stop) }
@@ -74,6 +82,7 @@ function Disable-Verified($rule) {
     # evidence that another writer has left the rule disabled.
     $again = @(Exact @{name=$rule.Name})
     if ($again.Count -ne 1 -or [string]$again[0].Enabled -ne 'False') { throw 'Disable readback failed' }
+    $script:preparedRule = $again[0]
 }
 function Selected-Alias {
     if ($null -eq $data.operation.interface) { return 'Any' }
@@ -87,22 +96,27 @@ function Selected-Alias {
     if ($alias.IndexOfAny([char[]]'*?[]') -ge 0 -or @($all | Where-Object { $_.Name -ceq $alias }).Count -ne 1) { throw 'Ambiguous interface alias' }
     return $alias
 }
-function Prepare($role, [int]$port, [string]$alias) {
+function Prepare($role, [int]$port, [string]$alias, $existingShape) {
     $rules = @(Exact $role)
     if ($rules.Count -gt 1) { throw 'Rule name collision' }
     $action = 'created'
     if ($rules.Count -eq 1) {
-        $shape = Shape $rules[0]
+        $shape = $existingShape
         if (!(Owned $shape)) { throw 'Rule ownership conflict' }
         $action = 'updated'
-        if (Verified $shape $role $port $alias $false) { $action = 'unchanged' }
-        Disable-Verified $rules[0]
         if (!(Template-Package $shape)) {
             $script:touched = $role; $script:mutated = $true
+            Disable-Verified $rules[0]
             $rules[0] | Remove-NetFirewallRule -ErrorAction Stop
             if (@(Exact $role).Count -ne 0) { throw 'Template repair removal readback failed' }
             Add-Record @{repaired_template=[string]$role.name;prior_package=[string]$shape.package}
             $rules = @()
+        } elseif (Verified $shape $role $port $alias $false) {
+            Disable-Verified $rules[0]
+            return 'unchanged'
+        } else {
+            $script:touched = $role
+            Disable-Verified $rules[0]
         }
     }
     $script:touched = $role
@@ -121,6 +135,7 @@ function Prepare($role, [int]$port, [string]$alias) {
     }
     $read = @(Exact $role)
     if ($read.Count -ne 1 -or !(Verified (Shape $read[0]) $role $port $alias $false)) { throw 'Shape readback failed' }
+    $script:preparedRule = $read[0]
     return $action
 }
 function Add-Record($record) {
@@ -149,20 +164,23 @@ function Legacy {
 # @TRUSTED_IMPORTS_BEGIN@
 try {
     $moduleRoot = [IO.Path]::Combine($env:SystemRoot,'System32','WindowsPowerShell','v1.0','Modules')
-    foreach ($module in @('Microsoft.PowerShell.Utility','Microsoft.PowerShell.Management','CimCmdlets','NetAdapter','NetSecurity')) {
+    function Import-Trusted([string]$module) {
         Import-Module -Name ([IO.Path]::Combine($moduleRoot,$module,($module+'.psd1'))) -ErrorAction Stop
     }
-    $stage = 'input'
+    # Retain Management/CimCmdlets until runner measurements qualify their removal on 5.1.
+    foreach ($module in @('Microsoft.PowerShell.Utility','Microsoft.PowerShell.Management','CimCmdlets','NetSecurity')) { Import-Trusted $module }
+    Stage 'input'
     $data = [Console]::In.ReadToEnd() | ConvertFrom-Json -ErrorAction Stop
     if ($data.version -ne 2 -or @($data.roles).Count -ne 2 -or $data.operation.mode -notin @('startup','install','uninstall','ensure','disable') -or
         ![IO.Path]::IsPathRooted($data.program) -or $data.program.Length -gt 32700) { throw 'Invalid policy input' }
-    $stage = 'access'
+    Stage 'access'
     if (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
         $outcome = @{state='unavailable';reason='Administrator access is required for Windows rule automation'}
         throw 'Native access unavailable'
     }
     # @TRUSTED_IMPORTS_END@
-    $stage = 'inventory'
+    if ($null -ne $data.operation.interface) { Import-Trusted 'NetAdapter' }
+    Stage 'inventory'
     $mode = $data.operation.mode
     if ($mode -eq 'startup') {
         # A migration conflict must not strand unrelated stale owned enables.
@@ -182,11 +200,11 @@ try {
         if ($failed) { throw 'Startup ownership reconciliation incomplete' }
     }
     # Retiring one listener must not depend on unrelated migration candidates.
-    # Install/ensure still inspect every candidate before preparing any allow.
+    # Startup and installer migration inspect legacy candidates.
     $legacy = @()
-    if ($mode -ne 'disable') { $legacy = @(Legacy) }
+    if ($mode -notin @('disable','ensure')) { $legacy = @(Legacy) }
     if ($mode -in @('install','uninstall')) {
-        $stage = 'legacy_disable'
+        Stage 'legacy_disable'
         foreach ($rule in $legacy) { Disable-Verified $rule }
     } elseif (@($legacy | Where-Object { [string]$_.Enabled -eq 'True' }).Count -gt 0) { throw 'Enabled legacy allow requires elevated installer migration' }
     $roles = @($data.roles)
@@ -198,21 +216,23 @@ try {
     # handling, before inspecting legacy candidates. Do not repeat that work.
     if ($mode -eq 'startup') { $roles = @() }
     foreach ($role in $roles) {
-        $stage = 'ownership'
+        Stage 'ownership'
         $rules = @(Exact $role)
         if ($rules.Count -gt 1) { throw 'Rule collision' }
+        $s = $null
         foreach ($rule in $rules) {
+            Stage 'shape'
             $s = if ($mode -eq 'disable') { Owner-Shape $rule } else { Shape $rule }
             if (!(Owned $s)) { throw 'Rule ownership conflict' }
         }
         if ($mode -in @('startup','disable','uninstall')) {
             foreach ($rule in $rules) {
-                $stage = 'disable'
+                Stage 'disable'
                 Disable-Verified $rule
-                if ($mode -eq 'uninstall') { $stage='remove'; $rule | Remove-NetFirewallRule -ErrorAction Stop; if (@(Exact $role).Count -ne 0) { throw 'Remove readback failed' } }
+                if ($mode -eq 'uninstall') { Stage 'remove'; $rule | Remove-NetFirewallRule -ErrorAction Stop; if (@(Exact $role).Count -ne 0) { throw 'Remove readback failed' } }
             }
         } else {
-            $stage = 'shape'
+            Stage 'prepare'
             $port = [int]$role.port
             $alias = 'Any'
             if ($mode -eq 'ensure') {
@@ -220,37 +240,54 @@ try {
                 if ($port -lt 1 -or $port -gt 65535) { throw 'Invalid port' }
                 $alias = Selected-Alias
             }
-            $action = Prepare $role $port $alias
+            $action = Prepare $role $port $alias $s
             if ($mode -eq 'ensure') {
-                $stage = 'enable'
-                if ((Selected-Alias) -cne $alias) { throw 'Bind changed before enable' }
-                $rule = @(Exact $role)[0]
-                $script:touched = $role; $script:mutated = $true
-                $rule | Set-NetFirewallRule -Enabled True -ErrorAction Stop
-                $stage = 'enabled_readback'
-                $read = @(Exact $role)
-                if ($read.Count -ne 1 -or !(Verified (Shape $read[0]) $role $port $alias $true)) { throw 'Enabled readback failed' }
-                $blocks = @(Get-NetFirewallRule -PolicyStore ActiveStore -ErrorAction Stop | Where-Object { [string]$_.Action -eq 'Block' -and [string]$_.Direction -eq 'Inbound' } | ForEach-Object {
+                Stage 'blocks'
+                try { $blockRules = @(Get-NetFirewallRule -PolicyStore ActiveStore -Action Block -Direction Inbound -ErrorAction Stop) }
+                catch {
+                    if ($_.CategoryInfo.Category -ne [Management.Automation.ErrorCategory]::ObjectNotFound -or
+                        $_.FullyQualifiedErrorId -cne 'CmdletizationQuery_NotFound,Get-NetFirewallRule') { throw }
+                    $blockRules = @()
+                }
+                $blocks = @($blockRules | ForEach-Object {
                     $block = $_; $apps = @($block | Get-NetFirewallApplicationFilter -ErrorAction Stop)
                     if (@($apps | Where-Object { Same-Program $_.Program }).Count -gt 0) { [string]$block.Name }
                 })
                 if ($blocks.Count -gt 32) { throw 'Too many observed block rules' }
+                Stage 'enable'
+                if ((Selected-Alias) -cne $alias) { throw 'Bind changed before enable' }
+                $script:touched = $role; $script:mutated = $true
+                $script:preparedRule | Set-NetFirewallRule -Enabled True -ErrorAction Stop
+                Stage 'readback'
+                $read = @(Exact $role)
+                if ($read.Count -ne 1 -or [string]$read[0].Enabled -ne 'True') { throw 'Enabled readback failed' }
+                $app = @($read[0] | Get-NetFirewallApplicationFilter -ErrorAction Stop)
+                $pf = @($read[0] | Get-NetFirewallPortFilter -ErrorAction Stop)
+                if ($app.Count -ne 1 -or !(Same-Program $app[0].Program) -or !(Template-Package $app[0]) -or
+                    $pf.Count -ne 1 -or [string]$pf[0].Protocol -notin @($role.protocol, $(if ($role.protocol -eq 'TCP') {'6'} else {'17'})) -or
+                    @($pf[0].LocalPort).Count -ne 1 -or [string]$pf[0].LocalPort -ne [string]$port) { throw 'Enabled scope readback failed' }
+                if ($alias -cne 'Any') {
+                    $iface = @($read[0] | Get-NetFirewallInterfaceFilter -ErrorAction Stop)
+                    if ($iface.Count -ne 1 -or @($iface[0].InterfaceAlias).Count -ne 1 -or [string]$iface[0].InterfaceAlias -cne $alias) { throw 'Enabled interface readback failed' }
+                }
                 $outcome = @{state='applied';rule_name=$role.name;action=$action;verified_shape=$true;observed_block_rules=$blocks}
             }
         }
     }
     if ($mode -in @('install','uninstall')) {
-        $stage='legacy_remove'
+        Stage 'legacy_remove'
         foreach ($rule in $legacy) {
             $rule | Remove-NetFirewallRule -ErrorAction Stop
-            if (@(All-Rules | Where-Object { $_.Name -eq $rule.Name }).Count -ne 0) { throw 'Legacy removal readback failed' }
+            if (@(Exact @{name=$rule.Name}).Count -ne 0) { throw 'Legacy removal readback failed' }
         }
     }
-    $report=@{version=2;ok=$true;stage='verified';mutated=$mutated;outcome=$outcome;records=$records.ToArray()} | ConvertTo-Json -Depth 12 -Compress
+    Stage 'verified'; $timings.total = $clock.ElapsedMilliseconds
+    $report=@{version=2;ok=$true;stage='verified';mutated=$mutated;outcome=$outcome;records=$records.ToArray();timings_ms=$timings} | ConvertTo-Json -Depth 12 -Compress
     if ([Text.Encoding]::UTF8.GetByteCount($report) -gt 30000) { throw 'Policy result exceeds the bounded result' }
     [Console]::Out.WriteLine($report)
     exit 0
 } catch {
+    Stage $stage
     $uncertain = $mutated
     if ($null -ne $touched) {
         try {
@@ -267,6 +304,7 @@ try {
         } catch { $uncertain = $true }
     }
     if ($outcome.state -ne 'unavailable') { $outcome = @{state='failed';stage=$stage;reason='Windows rule policy failed; inspect installer diagnostics or restart with administrator access';uncertain=$uncertain} }
-    [Console]::Out.WriteLine((@{version=2;ok=$false;stage=$stage;mutated=$mutated;outcome=$outcome;records=$records.ToArray()} | ConvertTo-Json -Depth 12 -Compress))
+    Stage $stage; $timings.total = $clock.ElapsedMilliseconds
+    [Console]::Out.WriteLine((@{version=2;ok=$false;stage=$stage;mutated=$mutated;outcome=$outcome;records=$records.ToArray();timings_ms=$timings} | ConvertTo-Json -Depth 12 -Compress))
     exit 71
 }
