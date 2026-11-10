@@ -6046,10 +6046,13 @@ mod tests {
     #[tokio::test]
     async fn persistence_and_restoration_failures_are_reported_together() {
         init_gstreamer();
-        let settings = restream_test_settings(RestreamProtocol::Srt);
-        let srt_port = settings.srt_server.port;
+        // This tests transaction errors, not SRT's deferred UDP socket cleanup.
+        // RTSP lets us occupy the stopped listener's TCP port synchronously.
+        let settings = restream_test_settings(RestreamProtocol::Rtsp);
+        let rtsp_port = settings.rtsp_server.port;
+        let original_token = settings.rtsp_server.token.clone();
         let config = AppConfig::for_test(settings);
-        let manager = StreamManager::with_selected_protocol(RestreamProtocol::Srt);
+        let manager = StreamManager::with_selected_protocol(RestreamProtocol::Rtsp);
         let adopted = adopted_set(&[]);
         manager
             .start_restream_server(&config, &adopted)
@@ -6058,11 +6061,12 @@ mod tests {
         let occupied = std::sync::Mutex::new(None);
 
         let mut update = restream_update_from(&config.get(), true);
-        update.srt_server.stream_id = "replacement".into();
+        update.rtsp_server.token = "fedcba9876543210".into();
         let error = manager
             .relay
             .apply_restream_settings_with(&config, update, &adopted, |_, _| {
-                let listener = bind_udp_after_release(srt_port);
+                let listener = std::net::TcpListener::bind(("0.0.0.0", rtsp_port))
+                    .expect("the stopped RTSP listener must release its port");
                 *occupied.lock().unwrap() = Some(listener);
                 Err(AppError::Config("injected settings write failure".into()))
             })
@@ -6078,7 +6082,8 @@ mod tests {
                 .contains("restoring the prior re-stream output also failed"),
             "unexpected error: {error}"
         );
-        assert!(config.get().srt_server.stream_id.is_empty());
+        assert!(error.to_string().contains("RTSP server socket failed"));
+        assert_eq!(config.get().rtsp_server.token, original_token);
         let status = compute_status(&manager.state).await;
         assert!(status.desired);
         assert_eq!(status.relay_state, RelayState::Failed);

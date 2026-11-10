@@ -213,21 +213,6 @@ pub(super) async fn wait_for_udp_rebind(port: u16) -> bool {
     false
 }
 
-pub(super) fn bind_udp_after_release(port: u16) -> std::net::UdpSocket {
-    let mut last_error = None;
-    for _ in 0..80 {
-        match std::net::UdpSocket::bind(("0.0.0.0", port)) {
-            Ok(socket) => return socket,
-            Err(error) => last_error = Some(error),
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    panic!(
-        "the old listener did not release UDP port {port}: {}",
-        last_error.expect("at least one bind attempt must run")
-    );
-}
-
 pub(super) async fn seed_desired_relay(manager: &StreamManager, generation: u64, epoch: u64) {
     let mut state = manager.state.lock().await;
     state.relay_data.restream_desired = true;

@@ -3,6 +3,11 @@
 Date: 10 November 2026. Local source integration checkpoint; hardware,
 installed-upgrade and release qualification remain pending.
 
+Follow-up: [Rust failure investigation and fixes](v0610-rust-failure-investigation.md)
+records the SRT fixture correction, RTSP readiness race reproduction and fix,
+and two passing default-parallel full runs (932 passed, 14 ignored). The
+original merge-checkpoint results below are retained as historical evidence.
+
 ## Integrated source
 
 Fetched `origin/main` from GitHub and verified it at

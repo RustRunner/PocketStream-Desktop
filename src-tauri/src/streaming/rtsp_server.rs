@@ -623,11 +623,31 @@ impl RtspRestreamer {
         let handle = std::thread::Builder::new()
             .name("rtsp-server-glib".into())
             .spawn(move || {
-                health_for_loop.loop_started(server_instance);
-                let _ = ready_tx.send(());
                 let _ = ctx.with_thread_default(|| {
+                    let ready_loop = loop_clone.clone();
+                    let ready_health = health_for_loop.clone();
+                    let shutdown = shutdown_for_loop.clone();
+                    // Signal readiness from inside run(): quit() before run()
+                    // is lost, so an immediate Stop could otherwise leak the
+                    // listener and prevent recovery from binding its port.
+                    let ready_source = glib::source::idle_source_new(
+                        Some("pocketstream-rtsp-ready"),
+                        glib::Priority::HIGH,
+                        move || {
+                            if shutdown.load(Ordering::Acquire) {
+                                // Startup may have timed out before dispatch.
+                                ready_loop.quit();
+                            } else {
+                                ready_health.loop_started(server_instance);
+                                let _ = ready_tx.send(());
+                            }
+                            glib::ControlFlow::Break
+                        },
+                    );
+                    ready_source.attach(Some(&ctx));
                     log::info!("RTSP server GLib main loop running (dedicated context)");
                     loop_clone.run();
+                    ready_source.destroy();
                     log::info!("RTSP server GLib main loop exited");
                 });
                 if let Some(event) = health_for_loop.loop_exited(
@@ -1023,6 +1043,47 @@ mod tests {
     fn init_gstreamer() {
         static INIT: std::sync::Once = std::sync::Once::new();
         INIT.call_once(|| gst::init().expect("GStreamer test initialization failed"));
+    }
+
+    #[tokio::test]
+    async fn listener_is_running_before_start_returns_and_immediate_stop_releases_port() {
+        init_gstreamer();
+        for _ in 0..16 {
+            let health = Arc::new(RelayRuntimeHealth::new(
+                1,
+                super::super::relay::RelayIngestKind::Udp,
+            ));
+            let server_instance = health.begin_server_instance(false);
+            let (event_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+            let runtime = RestreamRuntimeContext {
+                health: health.clone(),
+                event_tx,
+                server_instance,
+                upstream_ready: None,
+            };
+            // Let the real listener reserve its port, with no probe/rebind gap.
+            let mut server =
+                RtspRestreamer::start_from_udp(0, 0, "/test", Some("127.0.0.1"), runtime)
+                    .unwrap_or_else(|failure| panic!("listener start failed: {}", failure.error));
+            let port = u16::try_from(server.server.bound_port()).unwrap();
+            assert_ne!(port, 0);
+            assert!(
+                server.main_loop.is_running(),
+                "ready must mean the loop is running"
+            );
+            assert!(server.loop_alive());
+
+            server.shutdown().await;
+            assert!(!server.main_loop.is_running());
+            assert!(!server.loop_alive());
+            drop(server);
+            let _reclaimed = std::net::TcpListener::bind(("127.0.0.1", port))
+                .expect("immediate stop must release the listener socket");
+            assert!(matches!(
+                events.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+            ));
+        }
     }
 
     fn probe_fixture() -> (Arc<RelayRuntimeHealth>, RtspRuntimeProbe, u64) {
