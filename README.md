@@ -86,13 +86,15 @@ With a **PTU** assigned, hold the directional controls to move it. Tap a preset 
 
 ### 3. Share the feed
 
-1. In settings, turn on **Enable Re-stream Server**, choose **Output Protocol**, configure the server settings, and click **Save Settings**.
+1. In settings, choose **Output Protocol**, configure the server settings, and click **Save Settings**. **Enable Re-stream Server** saves immediately; after enabling an already configured server, you can start it without another Save.
 2. In the **Re-stream Server** card, choose the **Bind** interface and click **Start Server**.
 3. Connect viewers using the copied connection URL or QR code.
 
 **Bind** defaults to **All addresses**, so the server listens on all local IPv4 addresses. The displayed URL and QR code use an active LAN address, preferring Wi-Fi and then Ethernet. If a VPN is configured and connected, select its interface in **Bind** to listen specifically on its VPN IP address and use that address in the URL and QR code.
 
 **UDP input:** Current builds prevent PocketStream's video display and re-stream server from receiving on the same UDP port. Click **Stop Stream**, then **Start Server**. The camera keeps sending video, and the re-stream server still supports multiple viewers.
+
+Turning off **Enable Re-stream Server** waits for the server stop transaction. Other unsaved settings and secret edits stay in the draft. The card reports listener, binding and Windows rule observations separately; another firewall Block can still prevent remote playback. Start or Stop can take longer while discovery or native policy cleanup is busy. An Offline listener with unresolved policy status still needs attention.
 
 ![RTSP input and output settings alongside live video and an online re-stream server, with the token hidden](docs/images/05-restream-settings-redacted.png)
 
@@ -121,6 +123,7 @@ The connection URL and QR code exclude the SRT passphrase. Use the passphrase fi
 
 - **Manage host IPs in the app.** Use **Host → Configure** to set the primary IP address, add or remove secondary addresses, and choose static or DHCP mode. Routine host network setup requires no manual changes in Windows network settings.
 - **Added IP addresses persist.** Host addresses added for camera access remain after closing the app or restarting Windows. Remove them explicitly through **Host → Configure**; removing a Node does not remove its host address.
+- **Discovery and Clear improvements are pending.** This re-stream release retains current discovery behavior and does not add an atomic Clear All or shared-subnet route protection. Launch before connecting the camera and reconnect its cable if its initial announcement was missed.
 - **IP conflicts can block browser access.** If the app reports **IP still reserved by PC**, open Network Connections (`Win+R` → `ncpa.cpl`), fully disable the named conflicting adapter, give the camera an unused IP through its web page, then re-enable the adapter. Turning off Wi-Fi alone may leave the address reserved.
 
 See the [release notes](RELEASE-NOTES.md) for detailed network behavior, downgrade limitations, and pending hardware qualification.

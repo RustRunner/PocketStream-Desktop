@@ -1,10 +1,22 @@
-# v0.6.10 hotfix candidate (unreleased)
+# v0.6.10 re-stream release candidate (unreleased)
 
 The managed RTSP and SRT firewall templates now require an empty package field. Installer maintenance repairs the ineffective v0.6.8/v0.6.9 templates by disabling, removing and recreating them; the first runtime ensure also repairs them if needed. Startup detects defective templates and disables them. Policy execution uses fewer provider reads, skips unchanged template rewrites, reports stage timings and applies mode-specific budgets.
 
 An uncertain runtime firewall operation gets one safety disable when every writer is proven contained and exited. Stop can retry eligible uncertainty for the same role; unsuccessful recovery preserves the original barrier. Startup can retry one eligible process failure within its original admission. Ordinary abandoned completions still require acknowledgement.
 
-All three implementation slices are required together. WFP enforcement, remote RTSP/SRT media, installer upgrades, induced native timeouts and hardware timing qualification remain pending; this candidate is not release-ready. See the [local verification and remaining gates](docs/runtime-evidence/firewall-revision3-local-verification.md).
+Re-stream Start and recovery now refresh usable binding observations instead of aborting on unrelated network changes. Explicit interface selections still require a verified current address. RTSP reports readiness only after its event loop is running, so an immediate Stop can retire the listener reliably.
+
+Native operations wait within their existing admission budgets when discovery is busy. Obsolete queued policy work is cancelled before dispatch; admitted work retains ownership until completion and acknowledgement. Temporary-address cleanup retains durable ownership across refused admission and uncertain results. Stop continues to wait for listener teardown and firewall retirement; the individual stage budgets are not an end-to-end Stop deadline.
+
+The re-stream card separates listener state, verified local binding and observed Windows rule status. Eligible policy failures retry within the existing bounded workflow, and unresolved retirement remains visible after the listener is offline. Rule observations alone do not prove remote reachability or override another Windows Block rule.
+
+Enable is saved immediately, allowing Enable followed by Start without a separate Save. Disabling uses the same synchronous settings transaction to stop the server. Other unsaved settings and secret edits remain in the draft; Enable does not start a listener by itself. Save other edited server settings before starting.
+
+The release lockfile updates only OpenSSL to 0.10.80 and its required openssl-sys dependency to address the blocking security audit findings. The pinned GStreamer 1.26.11 and patched SRT 1.5.7 runtime are unchanged.
+
+Discovery, Clear All and Refresh redesigns are deferred. Current discovery can still contend with re-stream operations and retain history-driven discovery behavior. Removing a Node does not remove its host address, and there is no new atomic Clear All workflow. Shared-subnet route/metric protection and privilege helper integration are separate work. The release still requires administrator access.
+
+Installed/native qualification and public-release readiness are recorded separately in the [candidate run sheet](docs/runtime-evidence/v0610-release-candidate.md). Historical source and Sandbox results qualify only their recorded artifacts. Pending WFP enforcement, remote RTSP/SRT media, installer upgrades, induced native timeouts and hardware timing gates must pass on the new candidate before public release.
 
 After a qualified upgrade, manually added workaround allow rules can be removed once remote playback has been verified. Downgrading to v0.6.8 or v0.6.9 restores the defective package field.
 

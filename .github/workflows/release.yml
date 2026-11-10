@@ -208,6 +208,12 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "PocketStream Desktop ${{ github.ref_name }}"
+          releaseBody: |
+            Re-stream-only release candidate. Repairs the v0.6.8/v0.6.9 Windows firewall templates, refreshes usable topology during Start/recovery, waits for native admission, reports bounded policy retries, and persists Enable without a separate Save. Stop retains synchronous listener and policy retirement.
+
+            Discovery/Clear/Refresh improvements, shared-subnet route protection and privilege helper integration are deferred. Installed/native qualification and signing/update gates must be completed before public release.
+
+            [Release notes](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/RELEASE-NOTES.md) · [Candidate qualification run sheet](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/runtime-evidence/v0610-release-candidate.md)
           releaseDraft: true
           prerelease: false
           # Trailing args after -- reach cargo: fail on a drifted
