@@ -80,6 +80,48 @@ updater signatures by SHA-256. A local build cannot replace the CI artifact.
 
 ## Installed/native run sheet
 
+Preparation on 10 November: the existing IP-pinned SSH connection reached Test
+read-only at `192.168.1.73`, Windows 11 Pro build 26200, PowerShell
+`5.1.26100.9711`, account `DESKTOP-PI5BMJR\TSD-0311`, SID ending 1001, elevated
+SSH session 0. BFE/MpsSvc/Winmgmt/sshd are running. The authentic v0.6.9 packaged
+image is still running as PID 3296 in desktop session 1; its SHA-256
+`6f8e2a0d1e7c2b6db7eba6d2dc7739983b6a2b4194243a3c7f9f86ce10325a1c`
+matches the independently extracted public v0.6.9 installer. Both installed
+templates were observed disabled with `Package=Any` and registry `AppPkgId=Any`.
+These are predecessor observations, not new-candidate passes. No process was
+closed, installer run or native state changed on Test. Current-use/normal-close,
+Second, fresh VM and Peer availability were requested from the operator.
+
+Actual predecessor installers are downloaded in
+`src-tauri/target/release-candidate/legacy/`:
+
+| Installer | SHA-256 |
+| --- | --- |
+| Public v0.6.8 | `a6b83207d217d7e9e5aadb26a09843554bf680fc54201c5e2fa76934394b5410` |
+| Public v0.6.9 | `beba0a03b8e881cd7d532d2f5ada6d8488f638949f3c14ad87c927249ef5edef` |
+
+Their hashes match GitHub's asset digests. The v0.6.9 updater signature verifies
+against the current application public key; a modified-file negative control is
+rejected. The current public `latest.json` is v0.6.9, SHA-256
+`e2002dce38f57c36cb4f607a9192f4d318c75d4c1d082d54085c34a91c8ab66a`.
+
+The fixed existing post-enable timeout harness was compiled and listed, not run.
+Prepared local debug lib-test executable SHA-256:
+`07b0685b7d8042464488a74f40bbfda180608367d382c9be1d303f75a570c5a7`.
+Its manifest is asInvoker/Common Controls v6; elevated isolated execution and
+independent installed-image baseline remain mandatory. Source hashes and ignored
+inventory are under `src-tauri/target/release-candidate/fault-fixture/`. This
+qualification-only executable cannot replace CI production-artifact evidence.
+
+The existing Sandbox `Verify-Templates` still accepted `Any`/`*` package fields.
+A new pure-provider regression reproduced that false pass. The qualification
+fixture now requires exactly empty Package, a successfully observed stored rule,
+and absence of registry AppPkgId. The regression covers both roles, six package
+restrictions, stored restrictions, missing records and registry failure; no
+NetSecurity provider is imported or mutated. All 12 Sandbox tooling tests and
+the full 288-test frontend suite pass. This validation-only follow-up is separate
+from the immutable `v0.6.10` application tag; production sources are unchanged.
+
 Host assignments follow the consolidated spec: Test = authorized
 `DESKTOP-PI5BMJR`; Second = separately identified disposable Windows host; VM =
 fresh isolated disposable Windows fixture; Peer = remote media client. Concrete

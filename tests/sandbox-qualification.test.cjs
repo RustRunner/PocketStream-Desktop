@@ -8,6 +8,72 @@ const repository = path.resolve(__dirname, '..');
 const guest = path.join(repository, 'scripts/qualification/Invoke-PrivilegeSandbox.ps1');
 const windows = process.platform === 'win32';
 
+test('installed template qualification rejects package restrictions and failed registry observations', { skip: !windows }, () => {
+  const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `
+    $ErrorActionPreference='Stop'
+    $PSModuleAutoLoadingPreference='None'
+    Import-Module Microsoft.PowerShell.Utility
+    Import-Module Microsoft.PowerShell.Management
+    $tokens=$null; $errors=$null
+    $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path (Get-Location) 'scripts/qualification/Invoke-PrivilegeSandbox.ps1'),[ref]$tokens,[ref]$errors)
+    if($errors.Count){throw 'Fixture parse failed'}
+    $fn=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Verify-Templates'},$true)
+    if(!$fn){throw 'Missing template verification'}
+    . ([scriptblock]::Create($fn.Extent.Text))
+    function Assert($condition,[string]$reason){if(!$condition){throw $reason}}
+    $image='fixture-image.exe'
+    $roles=@(@{name='rtsp';display='RTSP';protocol='TCP';port='8554'},@{name='srt';display='SRT';protocol='UDP';port='8890'})
+    $script:packages=@{}; $script:stored=@{}; $script:readFails=$false
+    foreach($role in $roles){$script:packages[$role.name]='';$script:stored[$role.name]='v2.33|Action=Allow|'}
+    function Owned {
+      foreach($role in $roles){[pscustomobject]@{
+        Name=$role.name;DisplayName=$role.display;Group='PocketStream.Desktop.Managed.v2';Enabled='False';Direction='Inbound';Action='Allow';Profile='Any'
+        Program=$image;Package=$script:packages[$role.name];Protocol=$role.protocol;LocalPort=$role.port;RemotePort='Any';DynamicTarget='Any'
+        LocalAddress='Any';RemoteAddress='Any';InterfaceAlias='Any';InterfaceType='Any';Service='Any'
+        Authentication='NotRequired';Encryption='NotRequired';OverrideBlockRules='False';EdgeTraversalPolicy='Block'
+        LooseSourceMapping='False';LocalOnlyMapping='False';Platform=@();RemoteDynamicKeywordAddresses=@();LocalUser='Any';RemoteUser='Any';RemoteMachine='Any'
+      }}
+    }
+    function Get-NetFirewallApplicationFilter {process{$_}}
+    function Get-NetFirewallPortFilter {process{$_}}
+    function Get-NetFirewallAddressFilter {process{$_}}
+    function Get-NetFirewallInterfaceFilter {process{$_}}
+    function Get-NetFirewallInterfaceTypeFilter {process{$_}}
+    function Get-NetFirewallServiceFilter {process{$_}}
+    function Get-NetFirewallSecurityFilter {process{$_}}
+    function Get-ItemProperty {
+      param($LiteralPath,$Name,$ErrorAction)
+      Assert ($LiteralPath -eq 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\FirewallRules') 'Unexpected registry read'
+      if($script:readFails){throw 'registry observation failed'}
+      [pscustomobject]@{$Name=$script:stored[$Name]}
+    }
+    function Expect-Refusal([string]$reason){
+      $refused=$false
+      try{Verify-Templates}catch{if(!$_.Exception.Message.Contains($reason)){throw};$refused=$true}
+      Assert $refused ('Template defect was accepted: '+$reason)
+    }
+    Verify-Templates
+    foreach($role in $roles){
+      foreach($package in @('Any','*','S-1-15-2-123')){
+        $script:packages[$role.name]=$package
+        Expect-Refusal 'Unexpected package'
+      }
+      $script:packages[$role.name]=''
+      $script:stored[$role.name]='v2.33|AppPkgId=Any|'
+      Expect-Refusal 'Stored template package restriction'
+      $script:stored[$role.name]=''
+      Expect-Refusal 'Stored template package restriction'
+      $script:stored[$role.name]='v2.33|Action=Allow|'
+    }
+    $script:readFails=$true
+    Expect-Refusal 'registry observation failed'
+    Write-Output 'verified-empty; rejected-six-packages-two-stored-restrictions-two-missing-records-and-read-failure'
+  `], { cwd: repository, encoding: 'utf8', timeout: 15000, windowsHide: true });
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /verified-empty; rejected-six-packages-two-stored-restrictions-two-missing-records-and-read-failure/);
+});
+
 for (const args of [
   ['-Mode', 'Preflight'],
   ['-Mode', 'Supported'],
