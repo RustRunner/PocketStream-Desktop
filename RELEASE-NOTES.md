@@ -16,7 +16,7 @@ The release lockfile updates only OpenSSL to 0.10.80 and its required openssl-sy
 
 Discovery, Clear All and Refresh redesigns are deferred. Current discovery can still contend with re-stream operations and retain history-driven discovery behavior. Removing a Node does not remove its host address, and there is no new atomic Clear All workflow. Shared-subnet route/metric protection and privilege helper integration are separate work. The release still requires administrator access.
 
-Installed/native qualification and public-release readiness are recorded separately in the [candidate run sheet](docs/runtime-evidence/v0610-release-candidate.md). Historical source and Sandbox results qualify only their recorded artifacts. Pending WFP enforcement, remote RTSP/SRT media, installer upgrades, induced native timeouts and hardware timing gates must pass on the new candidate before public release.
+The CI draft installer passed fresh installation, upgrades from v0.6.8 and v0.6.9, and default and custom-port remote RTSP/SRT with Windows firewall enforcement on the tested configuration. The [candidate run sheet](docs/runtime-evidence/v0610-release-candidate.md) records the exact artifact, SRT recovery, and remaining gates, including timeout and contention qualification, Second-host repeats and the rest of the installer/update and hardware matrix. The draft is still awaiting public-release qualification.
 
 After a qualified upgrade, manually added workaround allow rules can be removed once remote playback has been verified. Downgrading to v0.6.8 or v0.6.9 restores the defective package field.
 
