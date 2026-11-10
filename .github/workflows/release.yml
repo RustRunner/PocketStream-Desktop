@@ -9,6 +9,15 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing unpublished candidate tag to rebuild
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 # Needed to create the draft GitHub release.
 permissions:
@@ -20,14 +29,28 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       # First gate: the tag must match the version in all three files.
       # This — not the build — is what prevents a release built from the
       # wrong commit / a forgotten version bump.
       - name: Version consistency gate
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $tag = "${{ github.ref_name }}" -replace '^v', ''
+          if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$') { throw 'Expected an exact application version tag' }
+          $sourceCommit = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot identify checked-out source' }
+          $tagCommit = git rev-parse "${env:RELEASE_TAG}^{commit}"
+          if ($LASTEXITCODE -ne 0 -or $tagCommit -ne $sourceCommit) { throw 'Checked-out source differs from the release tag' }
+          $releaseList = gh api 'repos/${{ github.repository }}/releases?per_page=100'
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot verify existing release state' }
+          $existing = @($releaseList | ConvertFrom-Json | Where-Object tag_name -eq $env:RELEASE_TAG)
+          if (@($existing | Where-Object { -not $_.draft }).Count) { throw 'Refusing to rebuild a published release' }
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch' -and $existing.Count -ne 1) { throw 'Manual rebuild requires one existing unpublished draft' }
+          $tag = $env:RELEASE_TAG -replace '^v', ''
           $pkg = (Get-Content package.json -Raw | ConvertFrom-Json).version
           $conf = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
           $cargoLine = Select-String -Path src-tauri/Cargo.toml `
@@ -37,6 +60,12 @@ jobs:
           if ($pkg -ne $tag -or $conf -ne $tag -or $cargo -ne $tag) {
             throw "Version mismatch: tag '$tag' but package.json=$pkg, tauri.conf.json=$conf, Cargo.toml=$cargo. Run bump-version.ps1 so all three match the tag."
           }
+          $npmLock = Get-Content package-lock.json -Raw | ConvertFrom-Json -AsHashtable
+          $cargoLock = Get-Content src-tauri/Cargo.lock -Raw
+          $lockedVersion = [regex]::Match($cargoLock, 'name = "pocketstream-desktop"\r?\nversion = "([^"]+)"').Groups[1].Value
+          if ($npmLock.version -ne $tag -or $npmLock.packages[''].version -ne $tag -or $lockedVersion -ne $tag) { throw 'Lockfile root versions differ from the release tag' }
+          @{ application_commit=$sourceCommit; tag=$env:RELEASE_TAG; tag_commit=$tagCommit; version=$tag; workflow_commit=$env:GITHUB_SHA; workflow_ref=$env:GITHUB_WORKFLOW_REF; run_id=$env:GITHUB_RUN_ID; run_attempt=$env:GITHUB_RUN_ATTEMPT } |
+            ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'release-source-identity.json') -Encoding utf8
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -206,14 +235,14 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "PocketStream Desktop ${{ github.ref_name }}"
+          tagName: ${{ env.RELEASE_TAG }}
+          releaseName: "PocketStream Desktop ${{ env.RELEASE_TAG }}"
           releaseBody: |
             Re-stream-only release candidate. Repairs the v0.6.8/v0.6.9 Windows firewall templates, refreshes usable topology during Start/recovery, waits for native admission, reports bounded policy retries, and persists Enable without a separate Save. Stop retains synchronous listener and policy retirement.
 
             Discovery/Clear/Refresh improvements, shared-subnet route protection and privilege helper integration are deferred. Installed/native qualification and signing/update gates must be completed before public release.
 
-            [Release notes](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/RELEASE-NOTES.md) · [Candidate qualification run sheet](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/runtime-evidence/v0610-release-candidate.md)
+            [Release notes](https://github.com/${{ github.repository }}/blob/${{ env.RELEASE_TAG }}/RELEASE-NOTES.md) · [Candidate qualification run sheet](https://github.com/${{ github.repository }}/blob/${{ env.RELEASE_TAG }}/docs/runtime-evidence/v0610-release-candidate.md)
           releaseDraft: true
           prerelease: false
           # Trailing args after -- reach cargo: fail on a drifted
@@ -266,8 +295,11 @@ jobs:
         with:
           name: g3-srt-release-evidence
           path: |
+            ${{ runner.temp }}\release-source-identity.json
             ${{ runner.temp }}\g3-srt-release-staged-1.5.7.json
             ${{ runner.temp }}\g3-srt-installed-1.5.7.json
+            src-tauri/target/release/pocketstream-desktop.exe
+            src-tauri/target/release/nsis/x64/installer.nsi
             src-tauri/target/release/nsis/x64/compile-inspection.json
             src-tauri/target/release/nsis/x64/installer.compile.log
           if-no-files-found: warn
