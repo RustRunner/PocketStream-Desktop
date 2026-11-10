@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
+import assert from "node:assert/strict";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -19,9 +20,9 @@ const {
   RestreamBindRequestGate,
   buildRestreamBindOptions,
   buildRestreamBindUpdate,
+  buildRestreamEnableUpdate,
   buildRestreamSettingsUpdate,
   resolveSrtPassphraseUpdate,
-  restreamSwitchStatusIsFinal,
   srtPassphraseClearNeedsConfirmation,
   selectedRestreamBindInterface,
 } = await importTypeScript("src/lib/restream-settings.ts");
@@ -43,6 +44,7 @@ if (formatRestreamBitrate(500, 1).includes("aggregate")) {
 }
 
 const config = {
+  selected_adapter_mac: null,
   stream: {
     protocol: "rtsp",
     rtsp_port: 554,
@@ -108,6 +110,17 @@ if (
   throw new Error("SRT bind selection changed inactive settings or protected-secret intent");
 }
 
+const canonicalSnapshot = structuredClone(config);
+const { enabled: canonicalEnabled, ...rtspSection } = config.rtsp_server;
+for (const enabled of [!canonicalEnabled, canonicalEnabled]) {
+  assert.deepEqual(buildRestreamEnableUpdate(config, enabled), {
+    enabled,
+    rtsp_server: rtspSection,
+    srt_server: { ...config.srt_server, passphrase: { action: "keep" } },
+  }, "Enable must preserve both canonical protocol sections and keep the secret");
+  assert.deepEqual(config, canonicalSnapshot, "Enable builder must not mutate config");
+}
+
 const available = { state: "available", value: "strongPass1" };
 const unavailable = { state: "unavailable", value: null };
 if (resolveSrtPassphraseUpdate(available, "strongPass1", false, false).action !== "keep") {
@@ -153,16 +166,6 @@ if (
   )
 ) {
   throw new Error("an already-passwordless field must not request redundant confirmation");
-}
-
-if (restreamSwitchStatusIsFinal("srt", true, "srt", false)) {
-  throw new Error("a live switch released its latch on the intermediate stopped status");
-}
-if (!restreamSwitchStatusIsFinal("srt", true, "srt", true)) {
-  throw new Error("a live switch did not release after its desired SRT status arrived");
-}
-if (!restreamSwitchStatusIsFinal("srt", false, "srt", false)) {
-  throw new Error("a stopped switch did not release after its selected SRT status arrived");
 }
 
 const unavailableOptions = buildRestreamBindOptions([], "Missing VPN");

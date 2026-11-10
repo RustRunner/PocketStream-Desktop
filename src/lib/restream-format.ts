@@ -9,11 +9,58 @@ export function formatBindScope(scope: BindScope | undefined): string {
   }
 }
 
+export interface PolicyPresentation {
+  classification: "applied" | "warning" | "inactive";
+  text: string;
+  detail: string;
+  shortReason: string;
+}
+
+/** Last policy observation only; this does not measure remote connectivity. */
+export function presentFirewallPolicy(outcome: FirewallOutcome | undefined): PolicyPresentation {
+  const compact = (text: string) => text.length > 150 ? `${text.slice(0, 147)}…` : text;
+  const refresh = "Stop, resolve the reported problem as needed, then start the server to refresh this observation.";
+  const administrator = "Restart PocketStream from the installed administrator shortcut to manage the Windows rule.";
+  if (!outcome) {
+    const text = "Windows rule outcome unavailable";
+    return { classification: "warning", text, detail: `${text}. ${refresh}`, shortReason: text };
+  }
+  if (outcome.state === "inactive") {
+    return { classification: "inactive", text: "Windows rule inactive", detail: `Windows rule inactive. ${refresh}`, shortReason: "Windows rule inactive" };
+  }
+  if (outcome.state === "applied") {
+    if (outcome.observed_block_rules.length) {
+      return {
+        classification: "warning", text: "Applied; possible Block-rule conflict",
+        shortReason: "Windows rule observation reports a possible Block-rule conflict.",
+        detail: `Applied${outcome.verified_shape ? " (last verified)" : "; shape verification missing"}. Observed Block rules: ${outcome.observed_block_rules.join(", ")}. Review Block rules for pocketstream-desktop.exe in Windows Defender Firewall with Advanced Security → Inbound Rules. Check whether they are enabled and apply to this output before changing them. Stop and start the server to refresh this observation.`,
+      };
+    }
+    const text = outcome.verified_shape ? "Applied (last verified)" : "Applied; shape verification missing";
+    return { classification: outcome.verified_shape ? "applied" : "warning", text,
+      detail: `${text}. This is the last Windows rule observation. ${refresh}`, shortReason: text };
+  }
+  const description = outcome.state === "failed"
+    ? `Windows rule failed (${outcome.stage}): ${outcome.reason}`
+    : `Windows rule unavailable: ${outcome.reason}`;
+  let guidance = refresh;
+  if (outcome.state === "failed" && outcome.uncertain) {
+    guidance = "Windows rule state is uncertain. Stop the server to attempt rule retirement, then start again. If uncertainty remains, restart PocketStream and resolve any startup reconciliation error.";
+  } else if ((outcome.state === "failed" && outcome.stage === "access") || /administrator|elevat|access denied/i.test(outcome.reason)) {
+    guidance = administrator;
+  } else if (outcome.state === "failed" && ["input", "inventory", "ownership", "trusted_modules"].includes(outcome.stage)) {
+    guidance = `Review the reported conflict or installation. ${refresh}`;
+  }
+  return { classification: "warning", text: compact(description), detail: `${description}. ${guidance}`, shortReason: compact(description) };
+}
+
 export function formatFirewallOutcome(outcome: FirewallOutcome | undefined): string {
-  if (!outcome || outcome.state === "inactive") return "Windows rule inactive";
-  if (outcome.state === "unavailable") return `Windows rule unavailable: ${outcome.reason}`;
-  if (outcome.state === "failed") return `Windows rule failed (${outcome.stage}): ${outcome.reason}${outcome.uncertain ? "; reconciliation required" : ""}`;
-  return `Windows rule applied${outcome.observed_block_rules.length ? `; preserved Windows block rules: ${outcome.observed_block_rules.join(", ")}` : ""}`;
+  return presentFirewallPolicy(outcome).detail;
+}
+
+export function formatFirewallRetry(seconds: number | null | undefined): string {
+  if (seconds == null) return "";
+  return seconds > 0 ? `Retrying in ${Math.ceil(seconds)} s` : "Retry requested / in progress";
 }
 
 /** Render one measured output copy and, for fan-out of two or more clients,

@@ -329,26 +329,175 @@ fn observe_tree(job: &Handle, processes: &mut BTreeMap<u32, Handle>) -> std::io:
 }
 
 pub(super) struct NativeProcessRunner;
+
+// Qualification executable only. Faults are consumed in the host, never in the
+// fresh PowerShell process. No production flag, setting or IPC entry exists.
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct FirewallQualification {
+    pub ensure_timeout: AtomicBool,
+    pub disable_timeout: AtomicBool,
+    pub recovery_prewrite_failure: AtomicBool,
+    pub startup_timeout: AtomicBool,
+}
+#[cfg(test)]
+impl FirewallQualification {
+    fn attempt(&self, operation: &super::firewall::Operation) -> (String, Duration) {
+        use super::firewall::Operation;
+        let mut script = super::firewall::SCRIPT.to_string();
+        let mut budget = firewall_budget(operation);
+        let injection = match operation {
+            Operation::Ensure { .. } if self.ensure_timeout.swap(false, Ordering::AcqRel) => Some((
+                "                Stage 'readback'",
+                "                [Console]::Error.WriteLine('qualification_after_enable'); [Threading.Thread]::Sleep(45000)\n                Stage 'readback'")),
+            Operation::Disable { .. } if self.disable_timeout.swap(false, Ordering::AcqRel) => Some((
+                "    # Even the no-write path needs a fresh read:",
+                "    [Console]::Error.WriteLine('qualification_disable_before_readback'); [Threading.Thread]::Sleep(45000)\n    # Even the no-write path needs a fresh read:")),
+            Operation::Disable { .. } if self.recovery_prewrite_failure.swap(false, Ordering::AcqRel) => Some((
+                "    Stage 'inventory'", "    throw 'Qualification recovery failure before writes'\n    Stage 'inventory'")),
+            Operation::Startup if self.startup_timeout.swap(false, Ordering::AcqRel) => {
+                budget = Duration::from_secs(1); None
+            }
+            _ => None,
+        };
+        if let Some((anchor, replacement)) = injection {
+            assert_eq!(script.matches(anchor).count(), 1, "qualification anchor");
+            script = script.replace(anchor, replacement);
+        }
+        (script, budget)
+    }
+
+    pub fn run(
+        &self,
+        operation: super::firewall::Operation,
+        cancel: Cancellation,
+    ) -> Result<ProcessResult, String> {
+        let (script, budget) = self.attempt(&operation);
+        let mut payload: serde_json::Value =
+            serde_json::from_slice(&operation.payload()?).map_err(|e| e.to_string())?;
+        // The same fixed installed-image identity as the existing startup probe.
+        payload["program"] =
+            serde_json::json!(r"C:\Program Files\PocketStream Desktop\pocketstream-desktop.exe");
+        let result = NativeProcessRunner::run_inner(
+            &script,
+            serde_json::to_vec(&payload).map_err(|e| e.to_string())?,
+            cancel,
+            budget,
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+        print_firewall_probe(&result, false);
+        for marker in [
+            "qualification_after_enable",
+            "qualification_disable_before_readback",
+        ] {
+            if script.contains(marker) {
+                assert_eq!(
+                    result.termination,
+                    Termination::TimedOut,
+                    "injected attempt must exhaust its normal budget"
+                );
+                assert!(
+                    String::from_utf8_lossy(&result.stderr.bytes).contains(marker),
+                    "attempt never reached the injected stage"
+                );
+                assert!(result.containment_verified_before_resume && result.observed_tree_exited);
+            }
+        }
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn firewall_qualification_faults_are_consumed_once_in_the_host() {
+    use super::firewall::{FirewallRule, Operation};
+    let faults = FirewallQualification::default();
+    faults.ensure_timeout.store(true, Ordering::Release);
+    let ensure = Operation::Ensure {
+        role: FirewallRule::Rtsp,
+        port: 8554,
+        interface: None,
+    };
+    let disable = Operation::Disable {
+        role: FirewallRule::Rtsp,
+    };
+    let (script, budget) = faults.attempt(&ensure);
+    assert_eq!(budget, Duration::from_secs(30));
+    assert!(
+        script.find("Set-NetFirewallRule -Enabled True").unwrap()
+            < script.find("qualification_after_enable").unwrap()
+    );
+    assert_eq!(faults.attempt(&disable).0, super::firewall::SCRIPT);
+    assert_eq!(faults.attempt(&ensure).0, super::firewall::SCRIPT);
+    faults.disable_timeout.store(true, Ordering::Release);
+    assert!(faults
+        .attempt(&disable)
+        .0
+        .contains("qualification_disable_before_readback"));
+    assert_eq!(faults.attempt(&disable).0, super::firewall::SCRIPT);
+    faults
+        .recovery_prewrite_failure
+        .store(true, Ordering::Release);
+    assert!(faults
+        .attempt(&disable)
+        .0
+        .contains("Qualification recovery failure before writes"));
+    assert_eq!(faults.attempt(&disable).0, super::firewall::SCRIPT);
+    faults.startup_timeout.store(true, Ordering::Release);
+    assert_eq!(
+        faults.attempt(&Operation::Startup).1,
+        Duration::from_secs(1)
+    );
+    assert_eq!(
+        faults.attempt(&Operation::Startup).1,
+        Duration::from_secs(45)
+    );
+    // Fault variants must also fit the real runner's base64 command line.
+    assert!(script.len().div_ceil(3) * 4 + 512 < 32767);
+}
+
+#[cfg(test)]
+fn firewall_probe_script() -> String {
+    let mut script = super::firewall::SCRIPT.to_string();
+    for (original, instrumented) in [
+        ("# @TRUSTED_IMPORTS_END@", include_str!("../../tests/fixtures/firewall-read-only-v1.ps1")),
+        ("function All-Rules { return @(Get-NetFirewallRule -PolicyStore PersistentStore -ErrorAction Stop) }",
+         "function All-Rules { $w=[Diagnostics.Stopwatch]::StartNew(); try { return @(Get-NetFirewallRule -PolicyStore PersistentStore -ErrorAction Stop) } finally { [Console]::Error.WriteLine(('read_all_ms='+$w.ElapsedMilliseconds)) } }"),
+        ("function Owner-Shape($rule) {", "function Owner-Shape($rule) { [Console]::Error.WriteLine(('owner_begin='+$rule.Name)); $w=[Diagnostics.Stopwatch]::StartNew()"),
+        ("    if ($app.Count -ne 1) {", "    [Console]::Error.WriteLine(('owner_ms='+$w.ElapsedMilliseconds))\n    if ($app.Count -ne 1) {"),
+    ] {
+        assert_eq!(script.matches(original).count(), 1, "firewall probe anchor: {original}");
+        script = script.replace(original, instrumented);
+    }
+    script
+}
+
+#[cfg(test)]
+#[test]
+fn startup_probe_instruments_every_current_anchor() {
+    let script = firewall_probe_script();
+    assert!(script.contains("owner_begin=") && script.contains("owner_ms="));
+    assert!(script.contains("read_all_ms=") && script.contains("Read-only probe refuses creation"));
+}
+
+fn firewall_budget(operation: &super::firewall::Operation) -> Duration {
+    use super::firewall::Operation;
+    Duration::from_secs(match operation {
+        Operation::Ensure { .. } | Operation::Disable { .. } => 30,
+        Operation::Startup => 45,
+        Operation::Install | Operation::Uninstall => 55,
+    })
+}
+fn clamp_budget(budget: Duration) -> Duration {
+    budget.clamp(Duration::from_millis(250), Duration::from_secs(60))
+}
 impl NativeProcessRunner {
     // Diagnostic only: reuse the real runner/budget. The read-only variant
     // intercepts every writer; the separate provider test needs explicit opt-in.
     #[cfg(test)]
     fn firewall_startup_probe(read_only: bool) -> Result<ProcessResult, String> {
-        let script = super::firewall::SCRIPT.replace(
-            "# @TRUSTED_IMPORTS_END@",
-            include_str!("../../tests/fixtures/firewall-read-only-v1.ps1"),
-        );
-        let script = script.replace(
-            "function All-Rules { return @(Get-NetFirewallRule -PolicyStore PersistentStore -ErrorAction Stop) }",
-            "function All-Rules { $w=[Diagnostics.Stopwatch]::StartNew(); try { return @(Get-NetFirewallRule -PolicyStore PersistentStore -ErrorAction Stop) } finally { [Console]::Error.WriteLine(('read_all_ms='+$w.ElapsedMilliseconds)) } }",
-        );
-        let script = script.replace(
-            "function Shape($rule) {",
-            "function Shape($rule) { [Console]::Error.WriteLine(('shape_begin='+$rule.Name)); $w=[Diagnostics.Stopwatch]::StartNew()",
-        ).replace(
-            "    if ($app.Count -ne 1",
-            "    [Console]::Error.WriteLine(('shape_ms='+$w.ElapsedMilliseconds))\n    if ($app.Count -ne 1",
-        );
+        let script = firewall_probe_script();
         let mut payload: serde_json::Value =
             serde_json::from_slice(&super::firewall::Operation::Startup.payload()?)
                 .map_err(|e| e.to_string())?;
@@ -362,7 +511,7 @@ impl NativeProcessRunner {
             },
             serde_json::to_vec(&payload).map_err(|e| e.to_string())?,
             Cancellation::default(),
-            Duration::from_secs(30),
+            firewall_budget(&super::firewall::Operation::Startup),
             None,
         )
         .map_err(|e| e.to_string())
@@ -427,7 +576,7 @@ impl NativeProcessRunner {
             super::firewall::SCRIPT,
             operation.payload()?,
             cancel,
-            Duration::from_secs(30),
+            firewall_budget(&operation),
             None,
         )
         .map_err(|error| {
@@ -561,7 +710,7 @@ impl NativeProcessRunner {
             let _ = dispatched.send(info.dwProcessId);
         }
         let mut processes = BTreeMap::new();
-        let budget = budget.clamp(Duration::from_millis(250), Duration::from_secs(30));
+        let budget = clamp_budget(budget);
         let termination = loop {
             if observe_tree(&job, &mut processes).is_err() {
                 unsafe { TerminateJobObject(job.0, CANCELED_EXIT) };
@@ -608,6 +757,42 @@ impl NativeProcessRunner {
             elapsed: start.elapsed(),
         })
     }
+}
+
+#[cfg(test)]
+#[test]
+fn firewall_mode_budgets_and_runner_clamp() {
+    use super::firewall::{FirewallRule, Operation};
+    for (operation, seconds) in [
+        (Operation::Startup, 45),
+        (Operation::Install, 55),
+        (Operation::Uninstall, 55),
+        (
+            Operation::Ensure {
+                role: FirewallRule::Rtsp,
+                port: 8554,
+                interface: None,
+            },
+            30,
+        ),
+        (
+            Operation::Disable {
+                role: FirewallRule::Srt,
+            },
+            30,
+        ),
+    ] {
+        assert_eq!(firewall_budget(&operation), Duration::from_secs(seconds));
+    }
+    assert_eq!(
+        clamp_budget(Duration::from_secs(55)),
+        Duration::from_secs(55)
+    );
+    assert_eq!(
+        clamp_budget(Duration::from_secs(90)),
+        Duration::from_secs(60)
+    );
+    assert_eq!(clamp_budget(Duration::ZERO), Duration::from_millis(250));
 }
 
 #[cfg(test)]

@@ -3,9 +3,12 @@
 use super::*;
 
 pub(super) struct BindingStore {
+    #[cfg(windows)]
+    pub(super) cleanup: std::sync::OnceLock<Arc<super::temporary_cleanup::TemporaryCleanup>>,
     config: Arc<crate::config::AppConfig>,
     pub(super) selector: Arc<adapter_selector::AdapterSelector>,
     pub(super) address_io: Arc<dyn interface::AddressIo>,
+    pub(super) temporary_persist: fn(&crate::config::AppSettings) -> Result<(), AppError>,
     pub(super) adopted_ips: Arc<Mutex<HashMap<String, Ipv4Addr>>>,
     /// In-memory working copy of the persisted adoption metadata
     /// (config's `adopted_meta`), stamped through the same choke point
@@ -58,9 +61,12 @@ impl BindingStore {
         selector: Arc<adapter_selector::AdapterSelector>,
     ) -> Self {
         Self {
+            #[cfg(windows)]
+            cleanup: std::sync::OnceLock::new(),
             config,
             selector,
             address_io: Arc::new(interface::RealAddressIo),
+            temporary_persist: crate::config::save_to_disk,
             adopted_ips: Arc::new(Mutex::new(HashMap::new())),
             adopted_meta: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pending_ips: Arc::new(Mutex::new(Vec::new())),
@@ -507,14 +513,20 @@ impl BindingStore {
         Ok(snapshot.iface)
     }
 
-    pub(super) async fn reconcile_temporary_locked(&self, config: &crate::config::AppConfig) {
-        if self.address_io.check_writes_available().is_err() {
-            return;
-        }
+    pub(super) async fn reconcile_temporary_locked(
+        &self,
+        config: &crate::config::AppConfig,
+    ) -> Result<(), AppError> {
+        #[cfg(windows)]
+        let _retry = super::temporary_cleanup::ScheduleRemaining {
+            config,
+            cleanup: self.cleanup.get(),
+        };
+        self.address_io.check_writes_available()?;
         use auto_adopt::AdoptOps;
         let saved = config.get().pending_addresses;
         if saved.is_empty() {
-            return;
+            return Ok(());
         }
         let adapters = match interface::read_native_with(self.address_io.as_ref()).await {
             Ok(list) => list
@@ -523,9 +535,10 @@ impl BindingStore {
                 .collect::<Vec<_>>(),
             Err(e) => {
                 log::warn!("Temporary cleanup waiting for native state: {e}");
-                return;
+                return Err(e);
             }
         };
+        let mut result = Ok(());
         for row in saved {
             let Some(ip) = row
                 .address
@@ -561,11 +574,14 @@ impl BindingStore {
                     });
                 }
             }
-            let ops = auto_adopt::PendingAdoptOps::new(
+            let mut ops = auto_adopt::PendingAdoptOps::new(
                 config,
                 &row.adapter_mac,
                 AddressOps(self.address_io.as_ref(), None),
             );
+            ops.persist = self.temporary_persist;
+            #[cfg(windows)]
+            let ops = ops.with_cleanup(self.cleanup.get());
             if let Err(e) = ops.remove(&iface.name, ip).await {
                 log::warn!(
                     "Temporary address {}/{} on {} cleanup pending: {}",
@@ -574,6 +590,7 @@ impl BindingStore {
                     row.adapter_mac,
                     e
                 );
+                result = Err(e);
             }
         }
         let remaining = config.get().pending_addresses;
@@ -581,6 +598,7 @@ impl BindingStore {
             .lock()
             .await
             .retain(|p| remaining.iter().any(|r| r.address == p.ip.to_string()));
+        result
     }
 
     #[cfg(test)]

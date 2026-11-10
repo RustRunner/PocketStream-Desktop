@@ -248,6 +248,8 @@ async fn attempt_adoption(
 ) -> AdoptionAttemptOutcome {
     let config = ctx.config.clone();
     let ops = auto_adopt::PendingAdoptOps::new(&config, &ctx.adapter_mac, auto_adopt::RealAdoptOps);
+    #[cfg(windows)]
+    let ops = ops.with_cleanup(ctx.bindings.cleanup.get());
     if ctx.fence.is_stale()
         || ctx.address_fence.is_stale()
         || config.get_network_mode() != crate::config::NetworkMode::StaticAuto
@@ -567,6 +569,8 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
             &self.ctx.adapter_mac,
             auto_adopt::RealAdoptOps,
         );
+        #[cfg(windows)]
+        let ops = ops.with_cleanup(self.ctx.bindings.cleanup.get());
         if self.shutdown()
             || self.ctx.address_fence.is_stale()
             || config.get_network_mode() != crate::config::NetworkMode::StaticAuto
@@ -663,6 +667,8 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
             &self.ctx.adapter_mac,
             auto_adopt::RealAdoptOps,
         );
+        #[cfg(windows)]
+        let ops = ops.with_cleanup(self.ctx.bindings.cleanup.get());
         if let Some(id) = self.scratch_id.take() {
             auto_adopt::release_scratch(
                 &ops,
@@ -814,6 +820,8 @@ impl cache_probe::ProbeIo for RealProbeIo<'_> {
             &self.ctx.adapter_mac,
             auto_adopt::RealAdoptOps,
         );
+        #[cfg(windows)]
+        let ops = ops.with_cleanup(self.ctx.bindings.cleanup.get());
         auto_adopt::reconcile_pending(&ops, &self.ctx.pending_ips, Some(id)).await;
         if outcome == AdoptionAttemptOutcome::ShutdownRace {
             self.stop = true;

@@ -360,6 +360,8 @@ impl AdoptOps for RealAdoptOps {
 /// Temporary writes use the existing config transaction before the OS call.
 /// Ordinary committed restore/removal continues to use RealAdoptOps directly.
 pub(crate) struct PendingAdoptOps<'a, O> {
+    #[cfg(windows)]
+    pub(super) cleanup: Option<&'a Arc<super::temporary_cleanup::TemporaryCleanup>>,
     pub config: &'a crate::config::AppConfig,
     pub adapter_mac: &'a str,
     pub ops: O,
@@ -369,11 +371,22 @@ pub(crate) struct PendingAdoptOps<'a, O> {
 impl<'a, O: AdoptOps> PendingAdoptOps<'a, O> {
     pub fn new(config: &'a crate::config::AppConfig, adapter_mac: &'a str, ops: O) -> Self {
         Self {
+            #[cfg(windows)]
+            cleanup: None,
             config,
             adapter_mac,
             ops,
             persist: crate::config::save_to_disk,
         }
+    }
+
+    #[cfg(windows)]
+    pub(super) fn with_cleanup(
+        mut self,
+        cleanup: Option<&'a Arc<super::temporary_cleanup::TemporaryCleanup>>,
+    ) -> Self {
+        self.cleanup = cleanup;
+        self
     }
 
     async fn observe_owned(&self, iface: &str) -> Result<super::InterfaceInfo, AppError> {
@@ -437,6 +450,11 @@ impl<O: AdoptOps> AdoptOps for PendingAdoptOps<'_, O> {
     }
 
     async fn remove(&self, iface: &str, ip: Ipv4Addr) -> Result<(), AppError> {
+        #[cfg(windows)]
+        let _retry = super::temporary_cleanup::ScheduleRemaining {
+            config: self.config,
+            cleanup: self.cleanup,
+        };
         self.check_writes_available()?;
         let settings = self.config.get();
         let row = settings.pending_addresses.into_iter().find(|p| {
@@ -952,6 +970,8 @@ mod tests {
         ops: &CrashOps,
     ) -> PendingAdoptOps<'a, CrashOps> {
         PendingAdoptOps {
+            #[cfg(windows)]
+            cleanup: None,
             config,
             adapter_mac: OWNER,
             ops: ops.clone(),

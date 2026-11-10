@@ -8,13 +8,13 @@ import { $, $$, state, log, showToast, formatUptime } from "./state.ts";
 import type { DeviceTarget } from "./store.ts";
 import * as deviceList from "./device-list.ts";
 import { formatError } from "./errors.ts";
-import { formatRestreamBitrate } from "./restream-format.ts";
+import { formatBindScope, formatFirewallRetry, formatRestreamBitrate, presentFirewallPolicy } from "./restream-format.ts";
 import {
   buildRestreamBindOptions,
   buildRestreamBindUpdate,
+  buildRestreamEnableUpdate,
   buildRestreamSettingsUpdate,
   resolveSrtPassphraseUpdate,
-  restreamSwitchStatusIsFinal,
   srtPassphraseClearNeedsConfirmation,
   RestreamBindRequestGate,
   selectedRestreamBindInterface,
@@ -33,7 +33,10 @@ import type {
 
 /** Full client URL (including protocol access data) for QR generation. */
 let restreamFullUrl: string | null = null;
-let lastBindingStatus: Pick<StreamStatus, "bind_scope" | "firewall"> | undefined;
+let latestRestreamStatus: StreamStatus | undefined;
+let policyWarningBaseline: boolean | undefined;
+// undefined = no Start; null = awaiting Start without a live observation yet.
+let startPolicyObservation: StreamStatus | null | undefined;
 
 // ── Video area bounds ───────────────────────────────────────────────
 
@@ -405,8 +408,6 @@ export function updateMuteButton(): void {
 /** Busy latch for the re-stream toggle (see streamToggleBusy). */
 let restreamToggleBusy = false;
 let restreamProtocolBusy = false;
-let restreamProtocolPending: RestreamProtocol | null = null;
-let restreamProtocolExpectedDesired: boolean | null = null;
 let restreamProtocolRequestGeneration = 0;
 let renderedRestreamProtocol: RestreamProtocol = "rtsp";
 const restreamBindRequests = new RestreamBindRequestGate();
@@ -463,6 +464,12 @@ function syncRestreamOperationControls(): void {
   syncRestreamProtocolButtons();
   syncRestreamSpinner();
   syncRestreamBindAvailability();
+  $<HTMLInputElement>("#restream-server-enable").disabled =
+    !state.config ||
+    restreamToggleBusy ||
+    restreamProtocolBusy ||
+    restreamBindApplyBusy ||
+    restreamSettingsBusy;
   $<HTMLButtonElement>("#save-settings").disabled =
     !state.config ||
     restreamToggleBusy ||
@@ -471,10 +478,7 @@ function syncRestreamOperationControls(): void {
     restreamSettingsBusy;
 }
 
-function finishRestreamProtocolSwitch(expected?: RestreamProtocol): void {
-  if (expected && restreamProtocolPending !== expected) return;
-  restreamProtocolPending = null;
-  restreamProtocolExpectedDesired = null;
+function finishRestreamProtocolSwitch(): void {
   restreamProtocolBusy = false;
   syncRestreamOperationControls();
 }
@@ -497,11 +501,8 @@ function acceptRestreamProtocol(
 }
 
 /**
- * Re-derive the re-stream Start button's enabled state from the Enable
- * checkbox. `loadConfig` sets `.checked` programmatically, which fires
- * no `change` event — without this call, a user whose config has the
- * server enabled got a dead Start button until they toggled the
- * checkbox off and on.
+ * Derive Start availability from accepted Enable settings and operation latches.
+ * A desired output remains a Stop action even when Enable is false.
  */
 export function syncRestreamStartButton(): void {
   const startBtn = $<HTMLButtonElement>("#btn-toggle-restream");
@@ -511,7 +512,7 @@ export function syncRestreamStartButton(): void {
     restreamBindApplyBusy ||
     restreamSettingsBusy ||
     (!state.isRestreamDesired &&
-      !$<HTMLInputElement>("#restream-server-enable").checked);
+      !(state.config?.rtsp_server.enabled ?? false));
 }
 
 /** Serialize the shared Settings Save button with live re-stream controls so
@@ -576,10 +577,31 @@ export async function confirmSrtPassphraseClearIfNeeded(): Promise<boolean> {
 
 export function setupRestreamControls(): void {
   const enableToggle = $<HTMLInputElement>("#restream-server-enable");
-  enableToggle.addEventListener("change", () => {
-    // Enable is persisted and enforced by the atomic Settings Save command.
-    // A desired output always remains stoppable before that save.
-    syncRestreamStartButton();
+  enableToggle.addEventListener("change", async () => {
+    const requested = enableToggle.checked;
+    if (!state.config || !beginRestreamSettingsSave()) {
+      enableToggle.checked = state.config?.rtsp_server.enabled ?? false;
+      return;
+    }
+    const wasDesired = state.isRestreamDesired;
+    try {
+      const result = await api.applyRestreamSettings(
+        buildRestreamEnableUpdate(state.config, requested)
+      );
+      state.config.rtsp_server.enabled = requested;
+      enableToggle.checked = requested;
+      applyRestreamOperationResult(result);
+      showToast(requested ? "Re-stream server enabled"
+        : wasDesired && !result.desired ? "Re-stream server disabled and stopped"
+        : "Re-stream server disabled");
+    } catch (error) {
+      const reloaded = await reloadCanonicalRestreamEnable();
+      const fallback = reloaded ? ""
+        : " Settings could not be reloaded; showing the last confirmed Enable value.";
+      showToast(`Failed to turn the re-stream server ${requested ? "on" : "off"}: ${formatError(error)}${fallback}`, true);
+    } finally {
+      finishRestreamSettingsSave();
+    }
   });
 
   $$<HTMLButtonElement>("[data-restream-protocol]").forEach((button) => {
@@ -599,8 +621,6 @@ export function setupRestreamControls(): void {
 
       const protocol: RestreamProtocol = value;
       const requestGeneration = ++restreamProtocolRequestGeneration;
-      restreamProtocolPending = protocol;
-      restreamProtocolExpectedDesired = state.isRestreamDesired;
       restreamProtocolBusy = true;
       restreamBindReady = false;
       $<HTMLSelectElement>("#restream-bind-interface").disabled = true;
@@ -615,9 +635,8 @@ export function setupRestreamControls(): void {
         await reloadCanonicalRestreamConfig();
         showToast("Failed to switch re-stream output: " + formatError(error), true);
       } finally {
-        // A matching status event may have released the latch before the
-        // command returned. Never let this older completion release a newer
-        // selector request.
+        // Only the owning handler releases the latch, after its response or
+        // canonical error reconciliation. Stale completions cannot unlock it.
         if (requestGeneration === restreamProtocolRequestGeneration) {
           finishRestreamProtocolSwitch();
         }
@@ -723,15 +742,22 @@ export function setupRestreamControls(): void {
     syncRestreamOperationControls();
 
     if (state.isRestreamDesired) {
+      const statusBeforeStop = latestRestreamStatus;
       try {
         await api.stopRestreamServer();
-        state.isRestreamDesired = false;
-        updateRestreamUI(null);
+        if (latestRestreamStatus !== statusBeforeStop && latestRestreamStatus?.desired) {
+          updateRestreamUI(latestRestreamStatus.display_url ?? null, latestRestreamStatus);
+        } else {
+          state.isRestreamDesired = false;
+          updateRestreamUI(null);
+        }
         showToast("Re-stream server stopped");
       } catch (e) {
         showToast("Failed to stop: " + formatError(e), true);
       }
     } else {
+      startPolicyObservation = null;
+      const statusBeforeStart = latestRestreamStatus;
       try {
         // bind_interface is persisted by the dropdown's change handler,
         // so don't re-copy the <select> value here. During startup the
@@ -744,12 +770,27 @@ export function setupRestreamControls(): void {
           await persistPlaybackTarget(target);
         }
         const info = await api.startRestreamServer();
-        state.isRestreamDesired = true;
-        restreamFullUrl = info.server_url;
-        updateRestreamUI(info.display_url, info);
-        showToast("Re-stream server started");
+        const live = startPolicyObservation as StreamStatus | null;
+        const relevant = live?.desired && live.selected_protocol === info.protocol
+          && live.server_url === info.server_url ? live : undefined;
+        const policy = presentFirewallPolicy(relevant?.firewall ?? info.firewall);
+        const newer = latestRestreamStatus !== statusBeforeStart ? latestRestreamStatus : undefined;
+        // Preserve the baseline already established by a newer live event.
+        if (!live && (!newer || newer.desired)) policyWarningBaseline = policy.classification !== "applied";
+        if (newer && (!newer.desired || newer.selected_protocol !== info.protocol || live)) {
+          updateRestreamUI(newer.display_url ?? null, newer);
+        } else {
+          state.isRestreamDesired = true;
+          restreamFullUrl = info.server_url;
+          updateRestreamUI(info.display_url, info);
+        }
+        const message = policy.classification === "applied" ? "Re-stream server started."
+          : `Re-stream server started; Windows rule warning: ${policy.shortReason.replace(/\.+$/, "")}.`;
+        showToast(message + (relevant?.firewall_next_retry_secs != null ? " Retry requested." : ""), policy.classification !== "applied");
       } catch (e) {
         showToast("Re-stream server failed: " + formatError(e), true);
+      } finally {
+        startPolicyObservation = undefined;
       }
     }
 
@@ -785,6 +826,21 @@ export async function reloadCanonicalRestreamConfig(): Promise<boolean> {
     log(`Failed to reload canonical re-stream settings: ${formatError(error)}`);
     return false;
   }
+}
+
+/** Refresh accepted settings after an Enable error without repainting drafts. */
+async function reloadCanonicalRestreamEnable(): Promise<boolean> {
+  let reloaded = false;
+  try {
+    state.config = await api.getConfig();
+    reloaded = true;
+  } catch (error) {
+    log(`Failed to reload re-stream Enable: ${formatError(error)}`);
+  }
+  $<HTMLInputElement>("#restream-server-enable").checked =
+    state.config?.rtsp_server.enabled ?? false;
+  syncRestreamOperationControls();
+  return reloaded;
 }
 
 function renderRestreamBindOptions(
@@ -949,14 +1005,29 @@ export function updateRestreamUI(displayUrl: string | null, status?: Partial<Str
   const qrBtn = $<HTMLButtonElement>("#btn-show-qr");
   const errorRow = $("#restream-error-row");
   const errorEl = $("#restream-error");
+  const observation = status ?? latestRestreamStatus;
+  const policy = presentFirewallPolicy(observation?.firewall);
+  const retry = state.isRestreamDesired ? formatFirewallRetry(status?.firewall_next_retry_secs) : "";
+  const scopeEl = $("#restream-bind-scope");
+  scopeEl.textContent = formatBindScope(observation?.bind_scope);
+  scopeEl.title = scopeEl.textContent;
+  $("#restream-scope-row").style.display = state.isRestreamDesired ? "contents" : "none";
+  const ruleEl = $("#restream-firewall-state");
+  ruleEl.textContent = [policy.text, retry].filter(Boolean).join("; ");
+  ruleEl.title = [policy.detail, retry].filter(Boolean).join(" ");
+  ruleEl.className = `status-value restream-policy-detail${policy.classification === "applied" ? "" : " status-warning"}`;
+  $("#restream-firewall-row").style.display = state.isRestreamDesired
+    || (observation?.firewall && observation.firewall.state !== "inactive") ? "contents" : "none";
 
   if (state.isRestreamDesired) {
     const relayState = status?.relay_state ?? "starting";
     switch (relayState) {
       case "listening":
       case "streaming":
-        statusEl.textContent = "Online";
-        statusEl.className = "status-value status-online";
+        statusEl.textContent = policy.classification === "applied" ? "Listening"
+          : observation?.firewall?.state === "applied" && observation.firewall.observed_block_rules.length
+            ? "Listening — check Windows rules" : "Listening — firewall warning";
+        statusEl.className = policy.classification === "applied" ? "status-value status-online" : "status-value status-warning";
         break;
       case "recovering":
         statusEl.textContent = status?.recovery_attempt
@@ -979,6 +1050,7 @@ export function updateRestreamUI(displayUrl: string | null, status?: Partial<Str
     errorEl.textContent = error || "";
     errorRow.style.display = error ? "contents" : "none";
   } else {
+    policyWarningBaseline = undefined;
     statusEl.textContent = "Offline";
     statusEl.className = "status-value status-offline";
     $("#restream-url").textContent = "--";
@@ -1062,22 +1134,26 @@ export function startStatusListener(): void {
 
 function handleStatus(status: StreamStatus | null): void {
   if (!status) return;
+  latestRestreamStatus = status;
+  const stable = status.desired && (status.relay_state === "listening" || status.relay_state === "streaming");
+  if (!status.desired) policyWarningBaseline = undefined;
+  else if (stable) {
+    const policy = presentFirewallPolicy(status.firewall);
+    const warning = policy.classification !== "applied";
+    const busy = restreamToggleBusy || restreamProtocolBusy
+      || restreamBindApplyBusy || restreamSettingsBusy;
+    if (!busy && policyWarningBaseline !== undefined && warning !== policyWarningBaseline) {
+      showToast(warning ? policy.shortReason : "Windows rule applied.", warning);
+    }
+    policyWarningBaseline = warning;
+    if (startPolicyObservation !== undefined) startPolicyObservation = status;
+  }
 
   // Heal webview-reload desync from backend-owned desired and health state.
   // Listener liveness may be false during recovery without making the relay
   // an actionable Start state in the UI.
   state.isRestreamDesired = status.desired;
   acceptRestreamProtocol(status.selected_protocol);
-  if (
-    restreamSwitchStatusIsFinal(
-      restreamProtocolPending,
-      restreamProtocolExpectedDesired,
-      status.selected_protocol,
-      status.desired
-    )
-  ) {
-    finishRestreamProtocolSwitch(status.selected_protocol);
-  }
   if (status.server_url) {
     restreamFullUrl = status.server_url;
   }

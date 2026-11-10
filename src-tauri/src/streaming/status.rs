@@ -17,6 +17,7 @@ use tokio::sync::{watch, Mutex};
 pub struct StreamStatus {
     pub bind_scope: BindScope,
     pub firewall: FirewallOutcome,
+    pub firewall_next_retry_secs: Option<u64>,
     pub playing: bool,
     pub playback_desired: bool,
     pub playback_state: PlaybackState,
@@ -53,6 +54,7 @@ impl StreamStatus {
         Self {
             bind_scope: BindScope::default(),
             firewall: FirewallOutcome::Inactive,
+            firewall_next_retry_secs: None,
             playing: false,
             playback_desired: false,
             playback_state: PlaybackState::Stopped,
@@ -182,6 +184,7 @@ pub(super) async fn compute_status(state: &Arc<Mutex<StreamState>>) -> StreamSta
             BindScope::default()
         },
         firewall: state.relay_data.firewall.clone(),
+        firewall_next_retry_secs: state.relay_data.firewall_next_retry_secs(),
         playing,
         playback_desired: state.playback_data.playback_settings.is_some(),
         playback_state: playback
@@ -301,7 +304,11 @@ mod tests {
             let events = bridge.0.lock().unwrap();
             assert_eq!(events[1].0, "stream-status");
             assert_eq!(events[1].1, expected);
-            assert_eq!(events[1].1.as_object().unwrap().len(), 27);
+            assert_eq!(events[1].1.as_object().unwrap().len(), 28);
+            assert_eq!(
+                events[1].1["firewall_next_retry_secs"],
+                serde_json::Value::Null
+            );
         }
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
@@ -338,6 +345,7 @@ mod tests {
         assert!(json.contains("\"display_url\":"));
         assert!(json.contains("\"relay_state\":\"recovering\""));
         assert!(json.contains("\"recovery_attempt\":2"));
+        assert!(json.contains("\"firewall_next_retry_secs\":null"));
         assert!(json.contains("\"connected_clients\":3"));
         assert!(json.contains("\"client_limit\":10"));
         assert!(json.contains("\"audio_present\":true"));
@@ -349,6 +357,7 @@ mod tests {
         let status = StreamStatus::idle(RestreamProtocol::Rtsp);
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("\"server_url\":null"));
+        assert!(json.contains("\"firewall_next_retry_secs\":null"));
         assert!(json.contains("\"selected_protocol\":\"rtsp\""));
         assert!(json.contains("\"active_protocol\":null"));
         assert!(json.contains("\"display_url\":null"));
