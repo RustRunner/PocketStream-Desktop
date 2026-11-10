@@ -185,14 +185,23 @@ test('settings and bind transactions suppress intermediate policy transitions', 
   }
 });
 
-test('protocol transaction suppression lasts through reply even if final status releases its controls', async () => {
+test('protocol transaction keeps controls busy and suppresses policy toasts through its reply', async () => {
   const f = card(); f.publish(status()); let finish;
   f.api.switchRestreamProtocol = () => new Promise(resolve => { finish = resolve; });
   const work = f.protocolButtons[1].fire('click');
   f.publish(status({ selected_protocol: 'srt', active_protocol: 'srt', firewall: failed() }));
   f.publish(status({ selected_protocol: 'srt', active_protocol: 'srt' }));
   assert.equal(notices(f).length, 0);
+  for (const selector of ['#restream-server-enable', '#btn-toggle-restream', '#restream-bind-interface', '#save-settings']) {
+    assert.equal(f.$(selector).disabled, true, selector);
+  }
+  assert(f.protocolButtons.every(button => button.disabled));
+  assert.equal(f.$('#restream-spinner').style.display, '');
   finish({ desired: true, selected_protocol: 'srt', server_info: info(applied(), 'srt') }); await work;
+  assert.equal(f.$('#restream-server-enable').disabled, false);
+  assert.equal(f.$('#btn-toggle-restream').disabled, false);
+  assert(f.protocolButtons.every(button => !button.disabled));
+  assert.equal(f.$('#restream-spinner').style.display, 'none');
   assert.equal(notices(f).length, 1); assert.match(f.toast().textContent, /switched to SRT/);
   f.publish(status({ selected_protocol: 'srt', active_protocol: 'srt' })); assert.equal(notices(f).length, 1);
 });

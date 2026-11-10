@@ -454,7 +454,7 @@ async function cameraRoleFixture({ alias = "", persisted = false, protocol = "rt
   const f = fixture(), calls = [], key = "40:cd:3a:03:8f:3f";
   let records = [{ mac: key, ip: "192.168.1.204", subnet: "192.168.1.0/24", alias,
     status: "live", open_ports: [554], first_seen: "before", last_seen: "before" }];
-  f.shared.state.config = { network_mode: "static_manual", manual_nodes: [], rtsp_server: {},
+  f.shared.state.config = { network_mode: "static_manual", manual_nodes: [], rtsp_server: { enabled: true },
     stream: { protocol, camera_mac: persisted ? key : null, camera_ip: persisted ? records[0].ip : "", audio_muted: false } };
   f.shared.state.activeInterface = { name: "Ethernet", mac: "00:22:20:3a:e3:b3", is_up: true,
     ips: [{ address: "192.168.1.100", prefix: 24, subnet: records[0].subnet }] };

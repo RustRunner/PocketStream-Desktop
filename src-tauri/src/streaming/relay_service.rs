@@ -5940,6 +5940,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn srt_selected_enable_only_apply_stops_and_preserves_protocol_settings() {
+        init_gstreamer();
+        let mut settings = restream_test_settings(RestreamProtocol::Srt);
+        settings.srt_server.latency_ms = 250;
+        settings.srt_server.stream_id = "enable-only".into();
+        settings.srt_server.passphrase = SrtPassphraseState::Available("strongPass1".into());
+        let config = AppConfig::for_test(settings.clone());
+        let manager = StreamManager::with_selected_protocol(RestreamProtocol::Srt);
+        let adopted = adopted_set(&[]);
+        manager
+            .start_restream_server(&config, &adopted)
+            .await
+            .unwrap();
+        assert!(active_restream_generation(&manager).await.is_some());
+
+        for enabled in [false, true] {
+            let result = manager
+                .relay
+                .apply_restream_settings_with(
+                    &config,
+                    restream_update_from(&config.get(), enabled),
+                    &adopted,
+                    commit_restream_settings_in_memory,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.selected_protocol, RestreamProtocol::Srt);
+            assert!(!result.desired);
+            assert!(result.server_info.is_none());
+            assert!(active_restream_generation(&manager).await.is_none());
+            let mut expected_rtsp = settings.rtsp_server.clone();
+            expected_rtsp.enabled = enabled;
+            assert_eq!(config.get().rtsp_server, expected_rtsp);
+            assert!(config.get().srt_server == settings.srt_server);
+            assert_eq!(config.get().restream_protocol, RestreamProtocol::Srt);
+            let status = compute_status(&manager.state).await;
+            assert!(!status.desired);
+            assert!(!status.server_running);
+            assert_eq!(status.active_protocol, None);
+        }
+        assert!(wait_for_udp_rebind(settings.srt_server.port).await);
+    }
+
+    #[tokio::test]
     async fn persistence_failures_restore_settings_selection_and_runtime() {
         init_gstreamer();
         let settings = restream_test_settings(RestreamProtocol::Rtsp);

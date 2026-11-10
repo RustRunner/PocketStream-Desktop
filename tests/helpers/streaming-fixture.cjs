@@ -62,6 +62,7 @@ function fixture() {
     stopRestreamServer: async () => {},
     switchRestreamProtocol: async () => { throw Error('Switch fixture result required'); },
     applyRestreamSettings: async () => { throw Error('Settings fixture result required'); },
+    getConfig: async () => { throw Error('Config fixture result required'); },
     takeScreenshot: async () => "C:\\Pictures\\PocketStream\\capture.jpg",
     startRecording: async () => {}, stopRecording: async () => "C:\\Videos\\PocketStream\\recording.mp4",
   };

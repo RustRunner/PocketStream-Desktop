@@ -25,7 +25,7 @@ export function selectedRestreamBindInterface(
   return selected.bind_interface_id || (selected.bind_interface ? `legacy:${selected.bind_interface}` : "");
 }
 
-/** Build the one complete backend transaction used by Settings Save. */
+/** Build the complete backend transaction used by re-stream settings writes. */
 export function buildRestreamSettingsUpdate(
   config: AppSettings,
   values: RestreamFormValues
@@ -47,6 +47,22 @@ export function buildRestreamSettingsUpdate(
       bind_interface_id: config.srt_server.bind_interface_id ?? null,
     },
   };
+}
+
+/** One canonical transaction that changes only the shared Enable field. */
+export function buildRestreamEnableUpdate(
+  config: AppSettings,
+  enabled: boolean
+): RestreamSettingsUpdate {
+  return buildRestreamSettingsUpdate(config, {
+    enabled,
+    rtspPort: config.rtsp_server.port,
+    rtspToken: config.rtsp_server.token,
+    srtPort: config.srt_server.port,
+    srtLatencyMs: config.srt_server.latency_ms,
+    srtStreamId: config.srt_server.stream_id,
+    srtPassphrase: { action: "keep" },
+  });
 }
 
 /** A bind selection saves canonical values for both sections and changes
@@ -109,18 +125,6 @@ export function srtPassphraseClearNeedsConfirmation(
     draft.length === 0 &&
     current.state !== "unencrypted"
   );
-}
-
-/** A selector status is final only after both the committed protocol and the
- * desired state captured at click time are visible. During a live switch the
- * backend intentionally emits a selected-but-stopped intermediate snapshot. */
-export function restreamSwitchStatusIsFinal(
-  target: RestreamProtocol | null,
-  expectedDesired: boolean | null,
-  selected: RestreamProtocol,
-  desired: boolean
-): boolean {
-  return target === selected && expectedDesired === desired;
 }
 
 export interface RestreamBindOption {
