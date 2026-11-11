@@ -625,6 +625,41 @@ Candidate checks and installed measurements are recorded below as they complete;
 R2 remains pending until its required repetitions and limits are met. Second,
 paused A4/B, PTU, discovery/Clear and unrelated release gates remain unchanged.
 
+**Access restored / policy barriers.** The operator confirmed Test awake at the
+same address. At 05:05:17 UTC the independent native snapshot again verified no
+product process, both rules disabled and zero managed WFP permits. A fresh bound
+camera OPTIONS probe returned 200 with the expected new MAC Reachable. The
+profile backup is private in `Q/timing-eos-20261111T044800Z/baseline-profile/`.
+The saved SRT passphrase is empty; no credential was exported.
+
+The unchanged fixed RTSP post-enable timeout/settlement/recovery procedure ran
+against the new policy source `7ed10d87d909369e0154ca66083375b2a1f2e5fe` as a
+separate local debug cfg(test), no-feature harness, SHA-256
+`9711391621d8011b51ab58f9b6b805eb67e5761b8b856753125970eff3a92e19` (77 source
+input hashes; asInvoker/Common Controls v6 inspected). Controller SHA-256
+`d5bdc4fa35feb841ffd04f0b41d5ec76043e0c8057f94b9c1456c8cb0fb3f2d3`.
+It passed one exact ignored test, 13 native attempts, four contained/exited
+timeouts, two actual post-enable markers, one settlement-timeout marker and nine
+rule-change events; controller elapsed 156.056 s, exit 0, final disabled state.
+The installed application was still exact v0.6.10 `a1fc999c…`; this is new-policy
+executor/policy evidence, not new-CI application/lease/media qualification.
+Evidence: `I/new-policy-r5.stdout.log`, `I/fault-prepared.json`, indexed native
+export and independent post-R5 snapshot. Original fault executable/evidence are
+preserved separately.
+
+**CI candidate preparation.** Immutable new tag `v0.6.11` points only to `7ed10d8`.
+Source CI is [42963130063](https://github.com/RustRunner/PocketStream-Desktop/actions/runs/42963130063).
+The tag-triggered [release run 42963132597](https://github.com/RustRunner/PocketStream-Desktop/actions/runs/42963132597)
+failed twice before compilation on the pinned runtime MSI GET: curl exit 18,
+54,767,616 and 29,601,792 bytes missing. Both logs are retained in I.
+A workflow-only follow-up adds `--retry-all-errors` to that same file GET's
+existing three-retry/five-second-delay command. File output, version/source guard
+and SHA-256 verification remain required. [curl's documented behavior](https://curl.se/docs/manpage.html#--retry-all-errors)
+resets partial file output before retry; this does not relax any policy timing
+or verification budget. The existing manual rebuild checks out immutable
+application tag `7ed10d8` and separately records its workflow identity. Neither
+application tag is moved; the candidate remains unpublished.
+
 ## Remaining gates and release state
 
 R0 audit repair and source validation passed. Installer built: yes, and the

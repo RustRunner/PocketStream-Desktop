@@ -91,7 +91,7 @@ jobs:
           )
           foreach ($msi in $msis) {
             $path = Join-Path $env:RUNNER_TEMP $msi.Name
-            curl.exe -fsSL --retry 3 --retry-delay 5 -o $path "$base/$($msi.Name)"
+            curl.exe -fsSL --retry 3 --retry-all-errors --retry-delay 5 -o $path "$base/$($msi.Name)"
             if ($LASTEXITCODE -ne 0) { throw "download failed: $($msi.Name)" }
             $hash = (Get-FileHash -Path $path -Algorithm SHA256).Hash
             if ($hash -ne $msi.Sha256) {
