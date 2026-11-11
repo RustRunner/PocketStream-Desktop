@@ -7,9 +7,12 @@ for this artifact. Discovery/Clear/Refresh and privilege integration remain
 separate work.
 
 The [11 November timing/EOS follow-up](#bounded-timingeos-investigation--11-november-2026-utc)
-below identifies the separate unpublished v0.6.11 candidate. The v0.6.10
-identities and qualification samples above that follow-up remain immutable
-historical evidence; they do not transfer to the new image.
+below identifies the separate unpublished v0.6.11 candidate. The latest
+[v0.6.12 CI candidate results](#v0612-exact-ci-candidate-follow-through--11-november-2026-utc)
+record the confirmed pending-reader fix and its affected Test qualification.
+Public release remains blocked by the [remaining gates](#remaining-gates-and-release-state).
+Earlier identities and qualification samples remain immutable historical
+evidence; they do not transfer to a new image.
 
 ## Source and build identity
 
@@ -1253,38 +1256,218 @@ including all three new regressions. No native mutation fixture runs
 on the development PC. CI and installed-candidate results are recorded below
 when available; local results do not qualify an artifact.
 
+## v0.6.12 exact CI candidate follow-through — 11 November 2026 UTC
+
+The confirmed pending-reader fix is source **`e98717193164f2682ad1f9effe8e9a188cd14483`**
+on `fix/v0611-pending-readers`, with new immutable application tag **v0.6.12**.
+Application and workflow commits are identical. Source
+[CI 43076399083](https://github.com/RustRunner/PocketStream-Desktop/actions/runs/43076399083)
+passed all six jobs: Windows **941 / 14 ignored** (36.24 s), Linux **840 / 2
+ignored** (27.20 s), frontend **288**, browser checks at both sizes, notices and
+audit. The
+[release run 43076399335](https://github.com/RustRunner/PocketStream-Desktop/actions/runs/43076399335)
+passed its own 941-test Windows rerun (44.28 s), typecheck, contracts, formatting,
+Clippy, notices/audit, staged closure, generated installer and installed G3.
+No workflow retry or existing-tag change was needed.
+
+| Candidate artifact | Bytes | SHA-256 |
+|---|---:|---|
+| CI installer | 48,512,019 | `79377f5b25f74fb13cf265728959ea04a748b6731b67afbd16f0c1d5bc5fcefa` |
+| Packaged executable | 24,756,224 | `18142f366afb924709505c07e99ff19e51d7fccdb5285f989c10afce3f536c18` |
+| Staged executable | 24,756,224 | `d3d442af810802b9994eee19544a3f9b0991017549f8bcea3cd57bdba21e45c5` |
+
+J's `candidate-identity.json`, `payload-comparison.json`, `updater-verification.json`
+and downloaded CI receipts tie these identities together. Installed G3 receipt:
+`a7072b182cfeee3ee86b154076266d65ad702a7cccf2839e0cf425ccc2de103d`.
+The download matches GitHub's asset digest and CI's installed bytes. Updater
+and trusted-comment signatures verify; altered installer bytes are rejected.
+The packaged administrator/Common Controls manifest, all **76 DLLs**, generated
+NSIS compile contract and only three UNK -> NSS byte changes pass. Required
+`resources/licenses/generated/THIRD-PARTY-RUST.md` is present, SHA-256
+`3a869762d4fc019f9ad047cc5954dad7e61cc6b9ef3496a0ec57ac3ff37f58f1`.
+The candidate remains an unpublished draft; no public feed or main merge occurs.
+
+Test identity, elevated account, signed-in/unlocked TSD-0311 desktop, original
+CI image, saved replacement camera and clean native baseline were rechecked.
+Bound camera OPTIONS returned 200 at 18:50:27 with the same MAC/GUID/source.
+Normal installation exited **0 in 15.242 s** at 18:51:09, producing the exact
+packaged hash above with profile files byte-identical and both owned templates
+disabled. Qualification uses this CI image; local H/H2 results do not transfer.
+
+The first startup policy native/script durations are **6.359 / 5.090 s**, with
+zero admission wait; full address/native reconciliation completed separately
+at 18:52:01.848090. The following cohorts each retain one warmup and **ten
+measured cases**, at the saved explicit Wi-Fi scope on AC/Balanced power:
+
+| Cohort | Ensure native p50 / p95 | Disable native p50 / p95 | Result for recorded conditions |
+|---|---:|---:|---|
+| Unchanged SRT, UDP 18890 | 6.838 / **7.931 s** | 3.574 / **3.817 s** | 10/10 within unchanged 15/8 s limits |
+| Changed RTSP, TCP 19554 / 18554 | 9.227 / **9.326 s** | 3.627 / **3.687 s** | 10/10 within unchanged 15/8 s limits |
+
+Ensure script p50/p95 is 5.818/6.620 s for unchanged SRT and 7.658/7.710 s for
+changed RTSP. Disable script p50/p95 is 2.572/2.837 and 2.607/2.670 s respectively.
+Runner minus script duration is 0.957–1.643 s across these measured calls; this
+includes process startup and other runner costs, not a separately isolated
+process-start measurement. Admission is 0 ms except one SRT disable at 5 ms.
+The source records module loading and individual policy stages separately in
+`J/timing-stage-summary.json`. SRT reports unchanged templates; all ten changed
+RTSP cases report updated templates. The SRT warmup's initial repair is retained
+separately (8.804 s native ensure), not counted as an unchanged measured sample.
+
+Resource snapshots are outside the cohorts: AC, Balanced, 1.706 GHz reported
+current clock, 16% then 5% CPU load and approximately 8.9–9.0 GiB free physical
+memory. No bulk native snapshot/polling observer runs during their timed calls;
+the established UI/socket checks remain part of the procedure. Native/WFP
+snapshots occur after each cohort. These observations do not establish matched
+historical power/resource conditions or quantify every observer's contribution.
+This is a passing affected subset, **not full R2**.
+
+No pending-snapshot refusal or EOS was observed in the two cohorts. All 11 SRT
+refusals are `relay_retired`, **0.986–4.263 ms after** their corresponding backend
+Disable (`J/srt-cohort-refusal-order.json`). This differs from H2's confirmed
+reader refusal 219.185 ms before Disable. Normal synchronous Disable retired
+each listener, and post-cohort snapshots found disabled rules and zero owned
+WFP permits.
+
+The saved RTSP output returned OPTIONS 200 and decoded **150 raw frames** on
+THINKBOOK-G7 in 5.672 s, exit 0; after normal Disable, the peer could not connect.
+Active SRT and RTSP snapshots independently verify six permits each, including
+the exact application, local port, protocol and Wi-Fi LUID `19985273102270464`
+with equality conditions and required layers.
+
+The single SRT decoder ran **360.035 s**, 19:04:19.825526–19:10:19.844233 in the
+peer clock, and decoded **10,774 raw frames**, with zero recorded frame-output
+gaps over two seconds and no reconnect/EOS events. The observer stopped its
+own decoder at the bound (exit -1, not a natural pipeline exit); Test logged
+normal caller removal at 19:10:23.731672. No application EOS or recovery occurred.
+This is sustained remote-media evidence, not recovery acceptance. Peer and Test
+timestamps are not used to claim subsecond cross-host ordering.
+
+The live SRT -> RTSP selection preserved desired streaming. SRT retirement
+completed at 19:11:03.147231 before RTSP Ensure admission at .195395; RTSP
+listened at 19:11:10.479809. A fresh native observation found SRT disabled,
+RTSP enabled and only six RTSP permits. An unnecessary subsequent Start
+controller refused its precondition, `Expected stopped listener before Start`,
+before issuing an application command. Its failed receipt is retained; the
+already running listener is used for the extended RTSP observation. This is a
+qualification-controller sequencing error, not a new production defect.
+
+The extended RTSP serve-guard check decoded **5,400 raw frames in 180.688 s**,
+OPTIONS 200 and exit 0, from 19:13:21.177766 to 19:16:21.866107 in the peer clock.
+Its one 240-second observation bound scales the established 150-frame peer
+procedure to 5,400 frames; it changes no application timing budget. Captures
+through that run contain zero pending-snapshot refusals, EOS events or non-none
+relay faults. Both peer decoders exited. Normal output Disable restored the
+saved stopped RTSP selection before Close.
+
+All three startup observations use the same installed CI image. These are
+policy durations, not total application startup or media readiness:
+
+| Policy completion UTC | Native runner | Policy script | Admission | Full native reconciliation complete UTC |
+|---|---:|---:|---:|---|
+| 18:51:54.058699 | 6.359 s | 5.090 s | 0 ms | 18:52:01.848090 |
+| 19:19:38.237507 | 6.296 s | 4.956 s | 0 ms | 19:19:45.983128 |
+| 19:21:21.624978 | 6.494 s | 5.079 s | 0 ms | 19:21:29.398814 |
+
+Each is within the unchanged 12-second policy target. Full native/address
+reconciliation completes another 7.746–7.789 s later; the conflicting-write
+barrier remains until that completion. Three startup observations do not close
+the full repetition/condition matrix. Each normal Close was followed by a
+PID-and-creation-time check confirming all seven recorded application/WebView
+processes exited. Final exit verification is **19:23:46.501607 UTC**.
+
+For comparison with the preserved failures, these are like-for-like policy
+script durations; the repeated candidate cases report nearest-rank p95, not
+an inferred historical percentile:
+
+| Operation | Original failed script samples | v0.6.12 script observation | v0.6.12 native observation |
+|---|---:|---:|---:|
+| Startup | 13.608 / 14.606 / 14.002 s | 5.090 / 4.956 / 5.079 s | 6.359 / 6.296 / 6.494 s |
+| Unchanged SRT Ensure | 17.203 / 15.512 / 19.192 s | p95 6.620 s, n=10 | p95 7.931 s |
+| Changed RTSP Ensure | 24.164 s | p95 7.710 s, n=10 | p95 9.326 s |
+| RTSP Disable | 8.790 s | p95 2.670 s, n=10 | p95 3.687 s |
+
+These comparisons support the affected improvement, with the historical
+resource/observer uncertainty stated above. Repeated firewall-provider reads
+and module startup explain the established native cost; admission did not
+explain the original failures. The retained v0.6.11 policy optimization removes
+redundant reads without dropping ownership, Block, identity or post-write
+checks. The v0.6.12 change separately fixes the confirmed read/read readiness
+refusal. It does not claim to explain the historical EOS.
+
+Final independent native verification at **19:23:54.653573 UTC** found the exact
+CI image `18142f…536c18` installed and closed, both ActiveStore/PersistentStore
+owned rules disabled, no AppPkgId on either template, zero product/fixture
+processes, zero output listeners/endpoints and zero application-bound WFP
+permits. All owned qualification tasks were retired. At **19:23:58.676006 UTC**,
+address/prefix identity, routes/next hops/metrics, DHCP/interface metrics, DNS
+and operator configuration sections matched baseline. Key, saved secrets,
+camera/PTU roles and output settings were preserved; runtime liveness metadata
+and device-cache observations are not asserted byte-identical. No cleanup
+uncertainty remains. No Second host, PTU movement or development-PC native
+mutation was used.
+
+`J/candidate-final-assembled.json` deduplicates the already redacted captures
+without changing originals; `J/candidate-final-timings.json` pairs all measured
+calls and retains the warmups. The unchanged full Rust rerun and both CI Windows
+runs passed; the earlier local fixture failure remains in
+`J/rust-test-policy-fixture-failure.log`. Its adjacent SRT bind conflict on
+59011 does not identify the competing owner in interleaved test output; no
+production change is attributed to that fixture failure.
+
+The final Test export was downloaded and **all 110 indexed files** verified
+against their recorded byte lengths and SHA-256 values. Receipt:
+`J/evidence-transfer.json`; index SHA-256
+`818ba93b29c60a4287118e5198585c61755ddd401beabaa4f3452afb01a9daf3`;
+archive SHA-256
+`f1051fc6b1bb2b58be6ccfa2387b427a647c7c366f48a62d8515ffcf8d1c98da`.
+Private profiles and raw logs remain on Test; only redacted evidence and private
+file hash/index receipts were exported. Original failed samples and all earlier
+candidate artifacts remain preserved.
+
 ## Remaining gates and release state
 
-The v0.6.10 results above remain historical. The separate v0.6.11 CI candidate
-has passing exact-source checks, normal Test upgrade, the stated repeated AC
-policy cases, three AC startup observations, two custom-port decoded-media runs,
-WFP enforcement/Disable retirement and final normal shutdown. The standalone
-native fault harness verifies only its own policy/executor source and identity;
+The v0.6.10 and v0.6.11 results above remain attached to their original images.
+The new unpublished v0.6.12 CI candidate has passing source/packaging checks,
+normal Test upgrade, two ten-case AC policy cohorts, three startup observations,
+custom-port RTSP/SRT decoded media, live protocol handover, exact WFP conditions
+and normal shutdown/retirement. It fixes the confirmed read-only pending-holder
+refusal with reader/writer exclusion preserved. The standalone native fault
+harness still qualifies only its separately identified policy/executor source;
 it does not close production application/SRT lease, fault-UI or ownership cases.
 
 Ready for public release: **no**. R2 still needs matched resource/power
 conditions, All-addresses reference and remaining port/protocol combinations,
-install-with-repair and all Second repetitions. EOS/transport refusal remains
-open. The separate diagnostic above identifies pending-snapshot contention in
-new SRT/RTSP failures and observes actual decoding after automatic SRT recovery,
-but does not identify the original EOS branch, qualify the CI image, or complete
-before-failure decoding and automatic peer-reconnect acceptance. The remaining R3–R10 subcases,
+install-with-repair and all Second repetitions. Historical EOS origin remains
+unproven: the new reader-holder capture establishes a different recorded refusal
+but cannot retrospectively identify the 04:02:02 EOS branch. No EOS or automatic
+recovery occurred in the v0.6.12 observations. The earlier recovery runs lack
+observed pre-failure decoding, so decoding-before-failure and automatic
+peer-reconnect acceptance remain pending. The remaining R3–R10 subcases,
 separately authorized Second, disposable VM and operator hardware gates retain
-their stated pending status. Paused A4/B, discovery/Clear, privilege integration
-and PTU movement remain outside this task.
+their stated pending status. No Second host is authorized. Paused A4/B,
+discovery/Clear, privilege integration and PTU movement remain outside this task.
 
-Next bounded action: carry the confirmed read/read contention fix through
-regressions, an unpublished CI candidate and exact-artifact Test qualification.
-Preserve pending exclusion and the commit/handover barrier. Complete a bounded decoding-before-failure /
-150-frames-after-recovery run and record whether the existing peer reconnects.
-The remaining matched-condition policy cohorts are still separate R2 work.
-Any further production change
-needs its own unused version/tag and exact CI artifact qualification; retain both
-existing tags and candidates. Native policy-failure UI still needs the prescribed
-separately identified fixture. Test is restored to the original CI image,
-closed and clean at 18:03:54 UTC. Live
-completion checks show v0.6.11 draft ID 441266851 unpublished, public v0.6.9/feed
-unchanged and main still `922b414`; no main merge or publication was performed.
+Next bounded action: on this exact CI image, establish decoded media on one peer
+before observing an unexpected failure, then correlate the existing first-refusal,
+source/output pad, bus and lifecycle diagnostics and require at least 150 decoded
+frames after recovery without manual peer restart. A separately identified
+controlled-fault experiment can qualify recovery behavior but cannot establish
+the historical EOS origin. No further production fix is justified without that
+evidence. Remaining matched-condition policy cohorts are separate R2 work;
+native policy-failure UI still needs the prescribed separately identified fixture.
+Any further production change needs its own unused version/tag and exact CI
+artifact qualification.
+
+Test remains installed on **v0.6.12**, closed and clean at **19:23:54 UTC**.
+Live completion checks identify v0.6.12 draft **442083374**, v0.6.11 draft
+441266851 and v0.6.10 draft 440937913, all unpublished. Main remains
+`922b41434bd16a76eedddace9cdf6bbb101e0901`; all three immutable tags resolve to
+their recorded application sources. Public latest is still v0.6.9, release
+427201837, with updater asset 686372120 SHA-256
+`e2002dce38f57c36cb4f607a9192f4d318c75d4c1d082d54085c34a91c8ab66a`.
+Root edits and existing worktrees are preserved. No main merge, public feed
+update or publication was performed.
 
 Known product limitations are retained in [release notes](../../RELEASE-NOTES.md)
 and [user instructions](../../README.md): current discovery contention/history,
