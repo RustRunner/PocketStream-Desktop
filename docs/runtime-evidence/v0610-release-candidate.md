@@ -660,6 +660,27 @@ or verification budget. The existing manual rebuild checks out immutable
 application tag `7ed10d8` and separately records its workflow identity. Neither
 application tag is moved; the candidate remains unpublished.
 
+The first manual rebuild (`42964587182`, workflow `2847eda`) remained blocked in
+the SDK step and was cancelled before application compilation or artifact
+creation. The two preserved official MSIs were independently rehashed at
+`I/preserved-sdk-inputs.json`: runtime 88,322,048 bytes, `31cbc21f…`; development
+369,569,792 bytes, `af0a0720…`, equal to the existing full pins. They are retained
+as private build-input assets on the unpublished v0.6.11 draft. A manual rebuild
+may use these exact files when present, with the same mandatory SHA-256 checks;
+otherwise it uses the existing official-origin GET. No local application binary
+enters the CI build. Workflow/application identities remain separate.
+
+All 61 new R5 exports matched their Test hashes; index SHA-256
+`eff0582836b96cfae6c7b5baaf3b17bb96a557ab612a2053efd5d83b1d514ad7`.
+The independent post-R5 snapshot again shows no product process/listener or
+managed WFP permit and both owned rules disabled. Matched ordinary attempts in
+the two separately identified fault harnesses (`I/fault-before-after.json`):
+ensure runner 14.981/14.621 -> 10.453/10.441 s; disable runner 7.472/7.031 ->
+5.882/5.793 s; startup retry runner 13.518 -> 10.297 s. Script totals are recorded
+separately. These are not controlled A/B attribution, new production-artifact
+results or a ten-cycle R2 pass. The F speed table is measured under the runner;
+installed repetitions must retain both script and runner time against the limits.
+
 ## Remaining gates and release state
 
 R0 audit repair and source validation passed. Installer built: yes, and the
