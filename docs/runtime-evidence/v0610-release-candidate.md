@@ -1057,6 +1057,87 @@ Live remote refs still resolve main to `922b414`, v0.6.10 to `f2a6f4f` and
 v0.6.11 to `7ed10d8`. Draft 441266851 remains unpublished and public latest is
 v0.6.9. Both immutable CI artifact pairs remain unchanged.
 
+## Pending-lock owner capture — 11 November 2026 UTC
+
+This successor worktree is `.worktrees/v0611-pending-lock-owner`, branch
+`diag/v0611-pending-lock-owner`, from verified release-derived evidence commit
+`81a8c7ee1b78e6f0a2dd75a1d02871c89e5d2a99`. Root edits and prior worktrees are
+preserved. Diagnostic source `9d484ec32b4e21e2a11402078a027bb9f50b4faa` tags all
+11 production pending-mutex sites as read/write and carries observations from
+the actual failed acquisition. A stable nonzero acquisition token identifies
+a holder; changed or zero observations remain unattributed. The mutex,
+readiness decisions, guard lifetimes, commit/handover barrier and retirement
+behavior are unchanged. Only the existing first refusal per transport logs
+fixed codes and numeric tokens; no addresses, URLs or secrets are added.
+
+Evidence **H** is this worktree's
+`src-tauri/target/pending-owner-20261111T170000Z/`, with a matching private Test
+run under `%LOCALAPPDATA%\PocketStreamQualification\v0610\`. This remains an
+unsigned local diagnostic, version 0.6.11, with updater artifacts disabled;
+it is not a new CI candidate or immutable-artifact qualification.
+
+| Artifact | Bytes | SHA-256 |
+|---|---:|---|
+| Diagnostic installer | 48,496,464 | `70873528d8d62e5f909c14f971796880e9fbea3602215987c7c9943f9475b0d7` |
+| Packaged executable | 24,699,392 | `1804a07994734e1681d509fc6cb31561c4fa14622cf3231b5e48437f02eead5d` |
+| Staged executable | 24,699,392 | `4193f12b992dfae63f6f38e2260c93e133fd89b59242464a31dcb90517885522` |
+
+The packaged administrator/Common Controls manifest, 76 DLL hashes, generated
+NSIS contract and the three expected UNK -> NSS byte differences passed.
+Generated Rust notices match the preserved identical dependency lock and are
+verified at the required packaged path. Rejected intermediate packages and
+build-order/prerequisite failures remain in H. No incomplete package was
+installed. Source checks passed: 942 Rust / 14 ignored (37.15 s, default
+parallelism), 288 frontend, typecheck, build/contracts, formatting, all-target
+Clippy and third-party closure. Four additional regressions cover attribution,
+ambiguous handoffs, cancellation and commit/handover exclusion.
+
+Test identity/account/session, original CI image and closed native baseline
+were rechecked. The full private baseline export completed at 17:13:06, before
+application launch; no inventory observer overlapped the reproduction. Bound
+camera OPTIONS returned 200 at 17:14:37 with the same replacement camera MAC,
+Ethernet GUID/source and Wi-Fi output as G. Recorded power was AC. Installation
+exited 0 in 15.336 s with private profile files byte-identical. The first Launch
+controller missed a delayed informational `listening-notice-dialog`; its failed
+receipt and value-free accessibility inspection are retained. The established
+close-only acknowledgement through Inspect succeeded without relaunch or a
+product change.
+
+| Observation | Established result |
+|---|---|
+| Three SRT Start/Disable cycles | Generation 3 / transport 3 refused at 17:23:07.673346, upstream `rtsp_before_send`, `pending_snapshot_busy`. Backend Disable follows at 17:23:07.810109: **136.763 ms later**. No runtime fault is claimed for this interrupted case. The transport context identifies SRT despite the shared upstream stage label. |
+| Separate SRT Start | Generation 4 / transport 4 refused at 17:24:50.187349, `accept`, `pending_snapshot_busy`; a GStreamer error followed at .197189 and automatic recovery rebuilt instance/data 2, transport 5. Listener readiness at 17:25:01.328293 is **11.141 s from refusal**, with the recovery record reporting 11.130 s from its own start. |
+| Owner attribution | Both refusals have `pending_owner_state=unattributed`, `pending_before=0`, `pending_after=0`. Neither establishes a reader/writer holder. Publication/release gaps, a queued/reserved permit and a complete short acquisition between observations remain distinguishable possibilities. |
+| Single SRT peer, 180 s | The decoder logged automatic reconnect attempts and subsequently decoded **5,021 raw frames** without manual reconnect, first frame 17:25:03.112432 in the peer clock. No pre-failure decoded frame was observed; full recovery acceptance remains pending. No >2 s frame-output observation gap was recorded after decoding began. |
+| RTSP peer | OPTIONS 200 and **150 decoded raw frames**, exit 0 in 7.662 s. This isolated diagnostic result does not erase G's preserved 503/zero-frame failure. |
+
+No EOS recurred; the historical 04:02:02 EOS branch remains unproven. A read-only
+clock comparison bounds Test-minus-peer between -1.484 and +0.940 s at the
+sample, so fine cross-host event ordering is not asserted. The three cycles
+are not an R2 cohort, and their first Ensure can rewrite the installer template.
+No production behavior fix is justified by H's unknown holder alone.
+
+Normal Disable and Close completed; Close ran 17:34:06.595–17:34:07.533. At
+17:34:12, all seven recorded app/WebView processes had exited. Diagnostic
+cleanup passed at 17:34:26. The original CI installer reinstalled normally,
+exit 0 in 17.138 s, restoring packaged hash `382b48e1...` and leaving it closed.
+Independent restored cleanup at **17:37:50 UTC** confirms two disabled owned
+rules, zero product/helper/fixture processes, output listeners and application
+WFP permits, with settings/secrets/roles preserved and all owned tasks retired.
+The subsequent baseline comparison also confirms unchanged addresses, routes,
+DHCP/interface metrics, DNS and operator config sections (only runtime
+`adopted_meta` excluded). No cleanup uncertainty remains.
+
+All **81 exported files** verified against Test hashes. Index SHA-256 is
+`0fbdaf07cfc81e3c66fece11d10583295b260559516f329c9707c80c2e1944e0`;
+archive SHA-256 is
+`a64896ea83231e42be90ef82f709b24f7636c39b5ec508649f5cf33346960ab2`.
+H contains 675 deduplicated redacted events merged from the indexed captures;
+the initial derived-array parsing failure is retained. Raw logs and profiles
+remain private on Test. The next diagnostic refinement must cover acquisition
+attempts through actual unlock, including queued access, without guessing a
+holder from a later read or changing the readiness decision.
+
 ## Remaining gates and release state
 
 The v0.6.10 results above remain historical. The separate v0.6.11 CI candidate
