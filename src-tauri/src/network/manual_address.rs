@@ -1898,7 +1898,7 @@ mod tests {
         }];
         m.bindings
             .pending_ips
-            .lock()
+            .write()
             .await
             .push(auto_adopt::PendingIp {
                 iface: "Ethernet".into(),
@@ -1907,7 +1907,7 @@ mod tests {
             });
         m.bindings
             .pending_ips
-            .lock()
+            .write()
             .await
             .push(auto_adopt::PendingIp {
                 iface: "Other".into(),
@@ -1918,13 +1918,13 @@ mod tests {
         assert_eq!(pending.outcome, AddressOutcome::Pending);
         assert!(io.os.writes.lock().unwrap().is_empty());
         assert_eq!(c.get().pending_addresses.len(), 1);
-        assert_eq!(m.bindings.pending_ips.lock().await.len(), 2);
+        assert_eq!(m.bindings.pending_ips.read().await.len(), 2);
         let claimed = m.address_operation(&c, addition()).await;
         assert_eq!(claimed.outcome, AddressOutcome::Success);
         assert!(c.get().pending_addresses.is_empty());
         assert!(!c.get().adopted_meta.contains_key(TARGET));
-        assert_eq!(m.bindings.pending_ips.lock().await.len(), 1);
-        assert_eq!(m.bindings.pending_ips.lock().await[0].iface, "Other");
+        assert_eq!(m.bindings.pending_ips.read().await.len(), 1);
+        assert_eq!(m.bindings.pending_ips.read().await[0].iface, "Other");
     }
 
     #[tokio::test(start_paused = true)]

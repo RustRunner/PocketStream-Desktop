@@ -1,3 +1,9 @@
+# v0.6.12 reliability candidate (unreleased)
+
+Read-only pending-address snapshots can now run concurrently. A captured SRT startup fault was caused by one such reader rejecting another through an exclusive mutex. Pending-address changes and durable commit/handover remain exclusive; readiness still uses fresh native observations and refuses during active or queued writes.
+
+This candidate retains v0.6.11's firewall timing improvements and narrow transport diagnostics. The historical SRT EOS remains unexplained. Exact-artifact qualification and remaining release gates are recorded in the [existing run sheet](docs/runtime-evidence/v0610-release-candidate.md); public release remains blocked.
+
 # v0.6.11 reliability candidate (unreleased)
 
 Firewall policy now uses fresh, identity-checked PersistentStore association reads after locating an owned rule. This removes repeated slow name queries while preserving ownership, overriding Block rules, interface validation, full verification after template changes, synchronous retirement and uncertainty barriers. Startup and explicit-interface timings distinguish reconciliation from inventory and module loading.

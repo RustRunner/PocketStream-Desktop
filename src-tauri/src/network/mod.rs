@@ -216,7 +216,7 @@ async fn commit_pending_address(
     id: u64,
     commit: impl FnOnce() -> Result<(), AppError>,
 ) -> Result<(), AppError> {
-    let mut pending = pending.lock().await;
+    let mut pending = pending.write().await;
     commit()?;
     pending.retain(|entry| !(entry.iface == iface && entry.ip == ip && entry.adoption_id == id));
     Ok(())
@@ -3099,6 +3099,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_readers_preserve_commit_and_handover_exclusion() {
+        let entry = auto_adopt::PendingIp {
+            iface: "Ethernet".into(),
+            ip: ip("192.0.2.100"),
+            adoption_id: 1,
+        };
+        let other = auto_adopt::PendingIp {
+            adoption_id: 2,
+            ..entry.clone()
+        };
+        let pending = Arc::new(tokio::sync::RwLock::new(vec![entry.clone(), other.clone()]));
+        for success in [false, true] {
+            let result = commit_pending_address(&pending, &entry.iface, entry.ip, 1, || {
+                assert!(pending.try_read().is_err(), "commit must exclude snapshots");
+                assert!(
+                    pending.try_write().is_err(),
+                    "commit must exclude mutations"
+                );
+                if success {
+                    Ok(())
+                } else {
+                    Err(AppError::Config("test commit refused".into()))
+                }
+            })
+            .await;
+            assert_eq!(result.is_ok(), success);
+            let retained = pending.read().await;
+            if success {
+                assert_eq!(*retained, vec![other.clone()]);
+            } else {
+                assert_eq!(*retained, vec![entry.clone(), other.clone()]);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn transition_fences_inflight_adoption_before_commit() {
         let manager = NetworkManager::new();
         let old = manager.bindings.address_fence();
@@ -3120,11 +3156,11 @@ mod tests {
             .await
             .is_err()
         );
-        assert_eq!(pending.lock().await.len(), 1);
+        assert_eq!(pending.read().await.len(), 1);
         auto_adopt::reconcile_pending(&ops, &pending, Some(1)).await;
         drop(worker);
         let _transition = manager.bindings.address_work.lock().await;
-        assert!(pending.lock().await.is_empty());
+        assert!(pending.read().await.is_empty());
         assert_eq!(
             *ops.writes.lock().unwrap(),
             vec![(true, ip("172.31.169.254")), (false, ip("172.31.169.254"))]
@@ -3172,7 +3208,7 @@ mod tests {
         .await
         .unwrap();
         manager.bindings.cleanup_pending_with(&ops).await;
-        assert!(manager.bindings.pending_ips.lock().await.is_empty());
+        assert!(manager.bindings.pending_ips.read().await.is_empty());
         assert_eq!(manager.bindings.adopted_ips.lock().await.len(), 2);
         let removed: Vec<_> = ops
             .writes

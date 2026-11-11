@@ -339,7 +339,7 @@ mod tests {
             let fixture = Fixture::new(|_| Ok(())).await;
             let address = fixture.bindings.address_work.lock().await;
             let pending_ips = &fixture.bindings.pending_ips;
-            pending_ips.lock().await.push(auto_adopt::PendingIp {
+            pending_ips.write().await.push(auto_adopt::PendingIp {
                 iface: "Ethernet".into(),
                 ip: "192.0.2.254".parse().unwrap(),
                 adoption_id: 1,
@@ -378,7 +378,7 @@ mod tests {
                 .await;
             }
             assert_eq!(fixture.config.get().pending_addresses.len(), 1);
-            assert_eq!(pending_ips.lock().await.len(), 1);
+            assert_eq!(pending_ips.read().await.len(), 1);
             assert!(fixture.io.inner.writes.lock().unwrap().is_empty());
             assert!(fixture.cleanup.state.lock().unwrap().task.is_some());
             let mut occupant = early
@@ -395,7 +395,7 @@ mod tests {
                     && fixture.executor.available().is_ok()
             })
             .await;
-            assert!(pending_ips.lock().await.is_empty());
+            assert!(pending_ips.read().await.is_empty());
             assert_eq!(
                 *fixture.io.inner.writes.lock().unwrap(),
                 [(false, "192.0.2.254".into())]

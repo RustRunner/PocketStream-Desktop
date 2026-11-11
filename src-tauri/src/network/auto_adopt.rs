@@ -3,7 +3,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{watch, RwLock};
 
 use crate::error::AppError;
 use crate::network::ip_config;
@@ -213,7 +213,9 @@ pub struct PendingIp {
 
 /// Shared registry of `PendingIp`s. Lives on `NetworkManager`; a clone is
 /// handed to the auto-adopt loop and reconciled on stop.
-pub type PendingIps = Arc<Mutex<Vec<PendingIp>>>;
+/// Read-only readiness snapshots must not exclude each other. Mutations and
+/// durable commit/handover retain exclusive access.
+pub type PendingIps = Arc<RwLock<Vec<PendingIp>>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProbeSourceState {
@@ -517,7 +519,7 @@ impl<O: AdoptOps> AdoptOps for PendingAdoptOps<'_, O> {
 }
 
 async fn pending_insert(pending: &PendingIps, iface: &str, ip: Ipv4Addr, adoption_id: u64) {
-    pending.lock().await.push(PendingIp {
+    pending.write().await.push(PendingIp {
         iface: iface.to_string(),
         ip,
         adoption_id,
@@ -526,7 +528,7 @@ async fn pending_insert(pending: &PendingIps, iface: &str, ip: Ipv4Addr, adoptio
 
 async fn pending_remove(pending: &PendingIps, iface: &str, ip: Ipv4Addr, adoption_id: u64) {
     pending
-        .lock()
+        .write()
         .await
         .retain(|e| !(e.iface == iface && e.ip == ip && e.adoption_id == adoption_id));
 }
@@ -592,7 +594,7 @@ pub async fn release_scratch<O: AdoptOps>(
 /// so a later reconcile retries it.
 pub async fn reconcile_pending<O: AdoptOps>(ops: &O, pending: &PendingIps, filter: Option<u64>) {
     let targets: Vec<PendingIp> = {
-        let guard = pending.lock().await;
+        let guard = pending.read().await;
         guard
             .iter()
             .filter(|e| filter.is_none_or(|id| e.adoption_id == id))
@@ -731,7 +733,7 @@ pub(super) async fn adopt_subnet_with_scratch<O: AdoptOps>(
         if scratch.adoption_id != adoption_id
             || scratch.address == device_ip
             || !already_on_subnet(device_ip, &[scratch.address])
-            || !pending.lock().await.iter().any(|p| {
+            || !pending.read().await.iter().any(|p| {
                 p.iface == interface_name && p.ip == scratch.address && p.adoption_id == adoption_id
             })
         {
@@ -1006,14 +1008,14 @@ mod tests {
         os.fail_observe
             .store(true, std::sync::atomic::Ordering::Relaxed);
         release_scratch(&ops, &pending, "USB", ip, 1).await;
-        assert_eq!(pending.lock().await.len(), 1);
+        assert_eq!(pending.read().await.len(), 1);
         assert_eq!(config.get().pending_addresses.len(), 1);
         assert_eq!(os.addresses.lock().unwrap().len(), 1);
         assert_eq!(os.writes.lock().unwrap().as_slice(), ["add"]);
         os.fail_observe
             .store(false, std::sync::atomic::Ordering::Relaxed);
         release_scratch(&ops, &pending, "USB", ip, 1).await;
-        assert!(pending.lock().await.is_empty());
+        assert!(pending.read().await.is_empty());
         assert!(config.get().pending_addresses.is_empty());
         assert!(os.addresses.lock().unwrap().is_empty());
     }
@@ -1080,7 +1082,7 @@ mod tests {
             .is_err());
         assert_eq!(os.addresses.lock().unwrap().len(), 1);
         assert!(config.get().pending_addresses.is_empty());
-        assert!(pending.lock().await.is_empty());
+        assert!(pending.read().await.is_empty());
         assert!(os.writes.lock().unwrap().is_empty());
     }
 
@@ -1098,7 +1100,7 @@ mod tests {
             .await
             .is_err());
         assert_eq!(config.get().pending_addresses.len(), 1);
-        assert_eq!(pending.lock().await.len(), 1);
+        assert_eq!(pending.read().await.len(), 1);
         let restarted = crate::config::AppConfig::temporary_test_config(
             crate::config::test_support::parse_for_test(
                 &crate::config::test_support::serialize_for_test(&config.get()),
@@ -1639,7 +1641,7 @@ mod tests {
         assert_eq!(ops.bound_ips(), [adopted]);
         assert_eq!(ops.probes.lock().unwrap().as_slice(), [adopted]);
         assert_eq!(
-            pending.lock().await.as_slice(),
+            pending.read().await.as_slice(),
             [PendingIp {
                 iface: "eth".into(),
                 ip: adopted,
@@ -1731,7 +1733,7 @@ mod tests {
         .await
         .is_err());
         assert!(ops.bound_ips().is_empty());
-        assert!(pending.lock().await.is_empty());
+        assert!(pending.read().await.is_empty());
         assert!(ops.probes.lock().unwrap().is_empty());
     }
 
@@ -1745,8 +1747,8 @@ mod tests {
         assert_eq!(ops.bound_ips(), vec![SCRATCH]);
         // The breadcrumb survives until an explicit release/handover, so a
         // dropped future still leaves reconcile something to find.
-        assert_eq!(pending.lock().await.len(), 1);
-        assert_eq!(pending.lock().await[0].adoption_id, 7);
+        assert_eq!(pending.read().await.len(), 1);
+        assert_eq!(pending.read().await[0].adoption_id, 7);
     }
 
     #[tokio::test]
@@ -1758,7 +1760,7 @@ mod tests {
             .await
             .is_err());
         assert!(ops.bound_ips().is_empty());
-        assert!(pending.lock().await.is_empty());
+        assert!(pending.read().await.is_empty());
     }
 
     #[tokio::test]
@@ -1770,7 +1772,7 @@ mod tests {
             .unwrap();
         release_scratch(&ops, &pending, "eth0", SCRATCH, 7).await;
         assert!(ops.bound_ips().is_empty());
-        assert!(pending.lock().await.is_empty());
+        assert!(pending.read().await.is_empty());
     }
 
     #[tokio::test]
@@ -1785,11 +1787,11 @@ mod tests {
         // Remove failed: the address is still bound and the breadcrumb is
         // kept so reconcile_pending retries — never silently orphaned.
         assert_eq!(ops.bound_ips(), vec![SCRATCH]);
-        assert_eq!(pending.lock().await.len(), 1);
+        assert_eq!(pending.read().await.len(), 1);
     }
 
     fn new_pending() -> PendingIps {
-        std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()))
+        std::sync::Arc::new(RwLock::new(Vec::new()))
     }
 
     const CANDIDATE: Ipv4Addr = Ipv4Addr::new(10, 99, 99, 100);
@@ -1888,7 +1890,7 @@ mod tests {
         assert_eq!(ops.probes.lock().unwrap().as_slice(), [CANDIDATE]);
         assert_eq!(ops.bound_ips(), [CANDIDATE]);
         assert_eq!(
-            pending.lock().await.len(),
+            pending.read().await.len(),
             1,
             "final remains owned until durable handover"
         );
@@ -1909,7 +1911,7 @@ mod tests {
         assert_eq!(started.elapsed(), PROBE_SOURCE_READY_TIMEOUT);
         assert!(ops.probes.lock().unwrap().is_empty());
         assert!(ops.bound_ips().is_empty());
-        assert!(pending.lock().await.is_empty());
+        assert!(pending.read().await.is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1928,7 +1930,7 @@ mod tests {
         );
         assert!(ops.probes.lock().unwrap().is_empty());
         assert!(ops.bound_ips().is_empty());
-        assert!(pending.lock().await.is_empty());
+        assert!(pending.read().await.is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1948,7 +1950,7 @@ mod tests {
         assert_eq!(result.unwrap(), None);
         assert!(ops.probes.lock().unwrap().is_empty());
         assert!(ops.bound_ips().is_empty());
-        assert!(pending.lock().await.is_empty());
+        assert!(pending.read().await.is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1967,7 +1969,7 @@ mod tests {
         assert!(error.to_string().contains("usable"), "{error}");
         assert_eq!(*ops.probes.lock().unwrap(), vec![CANDIDATE]);
         assert!(ops.bound_ips().is_empty());
-        assert!(pending.lock().await.is_empty());
+        assert!(pending.read().await.is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1987,7 +1989,7 @@ mod tests {
         assert_eq!(result.unwrap(), None);
         assert_eq!(*ops.probes.lock().unwrap(), vec![CANDIDATE]);
         assert!(ops.bound_ips().is_empty());
-        assert!(pending.lock().await.is_empty());
+        assert!(pending.read().await.is_empty());
     }
 
     #[tokio::test]
@@ -2004,14 +2006,14 @@ mod tests {
         assert_eq!(ops.bound_ips(), vec![CANDIDATE]);
         // The final IP is registered as pending until the caller hands over.
         {
-            let p = pending.lock().await;
+            let p = pending.read().await;
             assert_eq!(p.len(), 1);
             assert_eq!(p[0].ip, CANDIDATE);
             assert_eq!(p[0].adoption_id, 1);
         }
         // Handover clears the bookkeeping without touching the adapter.
         pending_handover(&pending, "eth", CANDIDATE, 1).await;
-        assert!(pending.lock().await.is_empty());
+        assert!(pending.read().await.is_empty());
         assert_eq!(ops.bound_ips(), vec![CANDIDATE]);
     }
 
@@ -2031,7 +2033,7 @@ mod tests {
         // Caller never hands over (task dropped). Reconcile by id cleans it.
         reconcile_pending(&ops, &pending, Some(7)).await;
         assert!(ops.bound_ips().is_empty());
-        assert!(pending.lock().await.is_empty());
+        assert!(pending.read().await.is_empty());
     }
 
     #[tokio::test]
@@ -2046,7 +2048,7 @@ mod tests {
         assert_eq!(got, None);
         // Scratch was bound + released; no final bind happened.
         assert!(ops.bound_ips().is_empty());
-        assert!(pending.lock().await.is_empty());
+        assert!(pending.read().await.is_empty());
     }
 
     #[tokio::test]
@@ -2058,7 +2060,7 @@ mod tests {
         let ops = FakeOps::new();
         ops.bound.lock().unwrap().push(CANDIDATE);
         let pending = new_pending();
-        pending.lock().await.push(PendingIp {
+        pending.write().await.push(PendingIp {
             iface: "eth".into(),
             ip: CANDIDATE,
             adoption_id: 1,
@@ -2070,11 +2072,11 @@ mod tests {
             vec![CANDIDATE],
             "an id-2 reconcile must not touch id-1's IP"
         );
-        assert_eq!(pending.lock().await.len(), 1);
+        assert_eq!(pending.read().await.len(), 1);
 
         reconcile_pending(&ops, &pending, Some(1)).await; // owning id
         assert!(ops.bound_ips().is_empty());
-        assert!(pending.lock().await.is_empty());
+        assert!(pending.read().await.is_empty());
     }
 
     #[tokio::test]
@@ -2098,7 +2100,7 @@ mod tests {
         );
         assert!(bound.contains(&CANDIDATE));
         // ...and both carry pending breadcrumbs under id 9.
-        let ips: Vec<Ipv4Addr> = pending.lock().await.iter().map(|e| e.ip).collect();
+        let ips: Vec<Ipv4Addr> = pending.read().await.iter().map(|e| e.ip).collect();
         assert!(ips.contains(&SCRATCH));
         assert!(ips.contains(&CANDIDATE));
     }

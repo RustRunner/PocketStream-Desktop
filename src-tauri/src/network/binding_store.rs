@@ -69,7 +69,7 @@ impl BindingStore {
             temporary_persist: crate::config::save_to_disk,
             adopted_ips: Arc::new(Mutex::new(HashMap::new())),
             adopted_meta: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            pending_ips: Arc::new(Mutex::new(Vec::new())),
+            pending_ips: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             adoption_seq: Arc::new(AtomicU64::new(0)),
             adoption_liveness: Arc::new(std::sync::Mutex::new(HashMap::new())),
             meta_flush: Arc::new(std::sync::Mutex::new(MetaFlush {
@@ -443,7 +443,7 @@ impl BindingStore {
     /// address, for filtering UI-facing interface enumerations.
     pub(crate) async fn pending_ip_strings(&self) -> HashSet<String> {
         self.pending_ips
-            .lock()
+            .read()
             .await
             .iter()
             .map(|e| e.ip.to_string())
@@ -468,7 +468,7 @@ impl BindingStore {
         let before = config.get().adopted_meta;
         self.address_io.claim(config, ip)?;
         self.pending_ips
-            .lock()
+            .write()
             .await
             .retain(|entry| entry.ip.to_string() != ip || entry.iface != alias);
         let adapter = config.get().selected_adapter_mac;
@@ -565,7 +565,7 @@ impl BindingStore {
                 .iter()
                 .any(|a| a.address == row.address && a.prefix == row.prefix)
             {
-                let mut pending = self.pending_ips.lock().await;
+                let mut pending = self.pending_ips.write().await;
                 if !pending.iter().any(|p| p.iface == iface.name && p.ip == ip) {
                     pending.push(auto_adopt::PendingIp {
                         iface: iface.name.clone(),
@@ -595,7 +595,7 @@ impl BindingStore {
         }
         let remaining = config.get().pending_addresses;
         self.pending_ips
-            .lock()
+            .write()
             .await
             .retain(|p| remaining.iter().any(|r| r.address == p.ip.to_string()));
         result

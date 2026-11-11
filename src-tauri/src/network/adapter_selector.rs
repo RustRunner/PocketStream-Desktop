@@ -205,7 +205,8 @@ impl AdapterSelector {
 }
 
 // The ordinary probes discard the reason. Only a refusing transport logs it.
-// Preserve the original read order and try_lock admission, without rereading.
+// Keep native read order and share read-only snapshots. A held or queued writer
+// still refuses admission without waiting or rereading.
 fn probe_scope_with(
     snapshot: presence::Snapshot,
     pending_ips: &auto_adopt::PendingIps,
@@ -227,7 +228,7 @@ fn probe_scope_with(
     }
     adapter.ips = ips;
     let pending = pending_ips
-        .try_lock()
+        .try_read()
         .map_err(|_| Refusal::PendingSnapshotBusy)?;
     adapter
         .ips
@@ -282,7 +283,7 @@ mod tests {
     #[test]
     fn scope_refusal_records_the_exact_branch_without_later_reads() {
         use crate::error::ReadinessRefusal as Refusal;
-        let pending = Arc::new(Mutex::new(Vec::new()));
+        let pending = Arc::new(tokio::sync::RwLock::new(Vec::new()));
         let mut missing = scope_snapshot();
         missing.adapter = None;
         let mut stale = scope_snapshot();
@@ -323,12 +324,12 @@ mod tests {
     #[tokio::test]
     async fn busy_snapshot_still_refuses_and_pending_sources_remain_excluded() {
         use crate::error::ReadinessRefusal as Refusal;
-        let pending = Arc::new(Mutex::new(vec![auto_adopt::PendingIp {
+        let pending = Arc::new(tokio::sync::RwLock::new(vec![auto_adopt::PendingIp {
             iface: "Ethernet".into(),
             ip: "192.0.2.100".parse().unwrap(),
             adoption_id: 1,
         }]));
-        let held = pending.lock().await;
+        let held = pending.write().await;
         let probe = || {
             let snapshot = scope_snapshot();
             let ips = snapshot.adapter.as_ref().unwrap().ips.clone();
@@ -336,13 +337,61 @@ mod tests {
         };
         let refused = probe();
         drop(held);
-        // Releasing the mutex cannot relabel the refusal already captured.
+        // Releasing the writer cannot relabel the refusal already captured.
         assert!(matches!(refused, Err(Refusal::PendingSnapshotBusy)));
         let (adapter, index, fence) = probe().unwrap();
         assert_eq!(index, 7);
         assert!(!fence.is_stale());
         assert_eq!(adapter.ips.len(), 1);
         assert_eq!(adapter.ips[0].address, "192.0.2.101");
+    }
+
+    #[tokio::test]
+    async fn concurrent_pending_reader_keeps_fresh_scope_available() {
+        let pending = Arc::new(tokio::sync::RwLock::new(vec![auto_adopt::PendingIp {
+            iface: "Ethernet".into(),
+            ip: "192.0.2.100".parse().unwrap(),
+            adoption_id: 1,
+        }]));
+        let _reader = pending.read().await;
+        // The cached .101 address is gone; .102 came from the native read.
+        let current = adapter("Ethernet", &["192.0.2.100", "192.0.2.102"]);
+        let (scope, index, fence) = probe_scope_with(
+            scope_snapshot(),
+            &pending,
+            |_| Some(7),
+            |_| Some((true, current.ips)),
+        )
+        .unwrap();
+        assert_eq!(index, 7);
+        assert!(!fence.is_stale());
+        assert_eq!(scope.ips.len(), 1);
+        assert_eq!(scope.ips[0].address, "192.0.2.102");
+    }
+
+    #[tokio::test]
+    async fn queued_pending_writer_blocks_scope_until_cancelled() {
+        use crate::error::ReadinessRefusal as Refusal;
+        let pending = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+        let _reader = pending.read().await;
+        let mut writer = Box::pin(pending.write());
+        // Poll once to register an exclusive waiter behind the held reader.
+        tokio::select! {
+            biased;
+            _ = &mut writer => panic!("writer passed a held reader"),
+            _ = std::future::ready(()) => {}
+        }
+        let probe = || {
+            let snapshot = scope_snapshot();
+            let ips = snapshot.adapter.as_ref().unwrap().ips.clone();
+            probe_scope_with(snapshot, &pending, |_| Some(7), |_| Some((true, ips)))
+        };
+        assert!(matches!(probe(), Err(Refusal::PendingSnapshotBusy)));
+        drop(writer);
+        assert!(
+            probe().is_ok(),
+            "a cancelled writer must release its barrier"
+        );
     }
 
     #[tokio::test]

@@ -129,7 +129,7 @@ mod tests {
         let readiness = manager.readiness();
         let _lifecycle = manager.discovery_op.lock().await;
         let _address = manager.bindings.address_work.lock().await;
-        let _pending = manager.bindings.pending_ips.lock().await;
+        let _pending = manager.bindings.pending_ips.write().await;
         let target = route::CameraTarget {
             key: "manual:192.0.2.204".into(),
             expected_mac: None,

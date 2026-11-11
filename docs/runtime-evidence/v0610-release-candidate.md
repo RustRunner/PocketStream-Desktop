@@ -1219,6 +1219,40 @@ archive SHA-256:
 Private profiles and raw logs remain on Test. Main and both existing tags and
 CI candidates are unchanged; v0.6.12 was verified unused before preparation.
 
+## Pending-reader fix candidate preparation — 11 November 2026 UTC
+
+Branch `fix/v0611-pending-readers` in `.worktrees/v0611-pending-readers` is based
+on verified release-derived `81a8c7e`, with H/H2 documentation carried forward.
+The production change replaces the pending-address mutex with Tokio's reader/
+writer lock. Five read-only sites share readers; six mutation/commit sites
+remain exclusive. The readiness check uses `try_read` after the same fresh
+native selection/index/Up observations and excludes the same pending addresses.
+Active and queued writers still refuse readiness without waiting. Durable
+commit and exact breadcrumb removal remain under one exclusive guard, with no
+await between them. Experimental owner instrumentation is not included.
+
+Three regression tests cover a held reader with fresh native addresses and
+pending exclusion, a queued writer and its cancellation, and exclusive durable
+commit/handover with failed-commit breadcrumb retention. Existing active-writer,
+selection, cancellation, retirement, native accounting and recovery tests remain
+in place. The prior first-refusal and EOS diagnostics are retained.
+
+Version **0.6.12** was verified unused remotely before updating all five source/
+lockfile root versions. `bump-version.ps1` failed to parse under this host's
+Windows PowerShell 5.1 before execution; PowerShell Core is absent. Counted
+exact replacements performed the same version update without changing the
+release script. Evidence **J** is this worktree's
+`src-tauri/target/pending-readers-20261111T181000Z/`. The first frontend build's
+sandbox directory denial is preserved; the unchanged build with dependency
+access passed. Frontend **288/288**, typecheck, build/contracts, formatting and
+all-target Clippy passed. The first full Rust run had **940 passed / one failed /
+14 ignored**, 37.31 s: the existing SRT fake-policy fixture failed to enter
+PLAYING, as also seen before this fix in H2. Its log is preserved. The unchanged
+full rerun passed **941 / 14 ignored in 37.03 s**, at default parallelism,
+including all three new regressions. No native mutation fixture runs
+on the development PC. CI and installed-candidate results are recorded below
+when available; local results do not qualify an artifact.
+
 ## Remaining gates and release state
 
 The v0.6.10 results above remain historical. The separate v0.6.11 CI candidate

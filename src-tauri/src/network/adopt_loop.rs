@@ -474,7 +474,7 @@ async fn attempt_adoption(
             auto_adopt::reconcile_pending(&ops, &ctx.pending_ips, Some(adoption_id)).await;
             let cleanup_complete = !ctx
                 .pending_ips
-                .lock()
+                .read()
                 .await
                 .iter()
                 .any(|p| p.adoption_id == adoption_id);
