@@ -262,7 +262,9 @@ against the current application public key; a modified-file negative control is
 rejected. The current public `latest.json` is v0.6.9, SHA-256
 `e2002dce38f57c36cb4f607a9192f4d318c75d4c1d082d54085c34a91c8ab66a`.
 
-The fixed existing post-enable timeout harness was compiled and listed, not run.
+The fixed existing post-enable timeout harness was initially compiled and listed,
+without execution at that preparation checkpoint. Its bounded Test run is recorded
+below; the original `prepared.json` remains the preparation record.
 Prepared local debug lib-test executable SHA-256:
 `07b0685b7d8042464488a74f40bbfda180608367d382c9be1d303f75a570c5a7`.
 Its manifest is asInvoker/Common Controls v6; elevated isolated execution and
@@ -281,7 +283,8 @@ NetSecurity provider is imported or mutated. All 12 Sandbox tooling tests and
 the full 288-test frontend suite pass. This validation-only follow-up is separate
 from the immutable `v0.6.10` application tag; production sources are unchanged.
 
-Host assignments: Test = authorized `DESKTOP-PI5BMJR` at `192.168.1.73`; VM =
+Host assignments: Test = authorized `DESKTOP-PI5BMJR`, previously at `192.168.1.73`
+and reidentified at `192.168.141.125` for the bounded resume below; VM =
 fresh Sandbox `8B46C1B3-E356-4` for supported cases; Peer = `THINKBOOK-G7`
 at `192.168.1.204`, used only as a read-only media client. The operator confirmed
 there is no separate authorized Windows host for Second. Unsupported Sandbox
@@ -296,14 +299,14 @@ retains Q's distinct requirements.
 | Case | Source requirements | Host | Candidate identity | Result / timing / evidence |
 | --- | --- | --- | --- | --- |
 | R1.1 / R1.2 | F hardware 1-2; Q package repair: actual 0.6.8 and 0.6.9 upgrades, both defective templates, empty Package/no AppPkgId, two repaired_template records, successful NSIS <=65s; first-ensure fallback repair | Test + Second, VM where supported | Final CI artifact | Both real upgrades passed on Test in 21.570 s and 23.714 s; v0.6.9 also passed in Sandbox. First-ensure fallback and Second repeats pending |
-| R2 | F hardware 3; N: ten ensure/disable cycles with unchanged/custom ports; p50/p95/stages; Test ensure <=15s (goal 10), disable <=8s, startup <=12s, install <=35s; Second ensure <=5s/startup <=4s with capability comparison | Test + Second | Final CI artifact | Partial: individual startup, ensure, disable and install samples within Test budgets (above). Ten cycles, percentiles and Second targets pending |
+| R2 | F hardware 3; N: ten ensure/disable cycles with unchanged/custom ports; p50/p95/stages; Test ensure <=15s (goal 10), disable <=8s, startup <=12s, install <=35s; Second ensure <=5s/startup <=4s with capability comparison | Test + Second | Final CI artifact | Partial, with failed timing samples: production startup 13.608/14.606/14.002 s exceeded 12 s; ensure 17.203/15.512/19.192/24.164 s exceeded 15 s; RTSP disable 8.790 s exceeded 8 s. Other measured disables passed. Ten cycles, percentiles, investigation and Second pending |
 | R3 | F 4-6; T/N/R: RTSP and SRT, default/custom ports, wildcard/explicit Wi-Fi, WFP permits/interface filters, OPTIONS 200 + >=150 H.264 buffers, SRT handshake/media; Stop removes filters/disables rules and prevents access | Test + Second + Peer | Final CI artifact | Default wildcard and custom Wi-Fi media passed for both on Test/Peer; SRT default needed recovery. Default Disable, custom RTSP Stop and peer negative probes passed. Second and remaining binding permutations pending |
 | R4 | F 7; R 3: authorized overriding Block survives install/ensure/Stop/uninstall; disabled/other-protocol observations remain cautious; remove fixture Block and Stop/Start restores media | Test + Second + Peer | Final CI artifact | Partial: Sandbox installer preservation passed. Physical overriding Block, cautious UI and removal/recovery pending |
-| R5 | F 8-9; N; R 2/4: fixed post-enable timeout proves actual write and contained/exited writer; successful settle, retained accounting/retry; double failure and failed recovery retain barrier; later qualified Stop retires exactly | Test + Second | Hash-pinned fault fixture and final CI artifact | Pending; fixed harness and guarded controller staged on Test. Execute the firewall revision 3 procedure with its independent baseline and record actual mutations and outcomes |
-| R6 | F 10; N exit; Q startup: fixed one-shot failure settles/retries within original workflow; queued/admitted Stop/exit prevent obsolete Ensure; unresolved lease survives and reconciles next start | Test + Second | Fixed fault candidate / CI artifact | Pending |
+| R5 | F 8-9; N; R 2/4: fixed post-enable timeout proves actual write and contained/exited writer; successful settle, retained accounting/retry; double failure and failed recovery retain barrier; later qualified Stop retires exactly | Test + Second | Hash-pinned fault fixture and final CI artifact | Partial: fixed RTSP executor/policy harness passed on Test, with actual enable events, contained/exited writers, verified settlement, double-failure/failed-recovery barriers, explicit disable recovery and subsequent normal ensure/disable. Application Stop, relay lease/orphan accounting, resumed ordinary native writes, SRT fault coverage and Second remain pending; details below |
+| R6 | F 10; N exit; Q startup: fixed one-shot failure settles/retries within original workflow; queued/admitted Stop/exit prevent obsolete Ensure; unresolved lease survives and reconciles next start | Test + Second | Fixed fault candidate / CI artifact | Partial: the R5 harness's separate startup subcase passed: first 1 s attempt timed out, contained/exited; normal retry returned Inactive and scope write availability passed. Injected application startup, queued/admitted Stop/exit, lease persistence and Second remain pending |
 | R7 | T hardware; R 4: 20 wildcard Start/Stop cycles per host, both protocols, unrelated churn, explicit bind camera churn, settled usable address change without duplicate rebuild; Stop/newer Start wins | Test + Second + Peer | CI f2a6f4f (identity above) | Pending; retain listener/scope/rule/lease generations and churn records |
 | R8 | N hardware; R 1: Start/Stop/retry under current real or qualified scratch contention; separate admission/native timing; User admission <=15s, saturation expires without delayed writes; early/late scratch cleanup and retained uncertainty | Test + Second | Final CI artifact / qualified controlled fixture | Partial: ordinary Start/Disable passed with discovery active; recorded admission wait 0 on RTSP. Actual saturation, scratch cleanup and uncertainty pending |
-| R9 | E hardware: false config -> Enable -> Start without Save, both outputs; Disable while running waits/reports errors; preserve all drafts/secret intents; accepted flag persists after restart | Test + Peer | Final CI artifact | Partial: Enable/Start without Save and Disable/retirement passed for both; saved SRT port and secret were unaffected by drafts and the port draft stayed visible. Enable true on disk after Close. Visual secret-draft, native failure UI and persistence across restart pending |
+| R9 | E hardware: false config -> Enable -> Start without Save, both outputs; Disable while running waits/reports errors; preserve all drafts/secret intents; accepted flag persists after restart | Test + Peer | Final CI artifact | Partial: accepted true/false survived restart without Start. After the operator identified a replacement camera, normal CAM selection resolved the saved-MAC refusal. RTSP port draft and SRT port/latency/replacement/removal intents survived successful Start and running Disable without Save; sockets, six correct permits per running snapshot and retirement verified. Eight follow-up captures confirm visual states. Native policy-failure/reload UI and remaining E save/confirmation paths stay pending; no replacement-camera peer-media campaign is credited |
 | R10.1 | Q fresh/reinstall/upgrade/uninstall in interactive/passive/silent/updater modes; install without /R, correct disabled template shapes, maintenance before deletion, diagnostics on failure | Fresh VM + Test where required | Final CI artifact + hashed legacy installers | Partial: exact final fresh CI /S, Sandbox supported silent/passive/updater/reinstall/uninstall, real Test upgrades passed. Interactive completion and remaining failure/relaunch modes pending |
 | R10.2 | Q legacy 0.6.7 migration/custom/duplicate/disabled/program-scoped rules; indistinguishable manual clone convention; foreign/unrecognized/colliding rules; repeated/partial recovery; exact preservation | Fresh VM | Final CI artifact / separately identified partial-provider fault build | Partial: supported seeded migration, preservation, conflict/retry/collision passed in Sandbox. Actual v0.6.7 installer and partial-provider injection pending |
 | R10.3 | Q strict malformed/unknown/unelevated/unprotected entry refusal, no GUI/profile/native writes; install gate/HostOwner Busy, cancel, file replacement/maintenance failure, every exit path and launch after release | Fresh VM | Final CI artifact | Partial: Sandbox strict entry, welcome Cancel, supported ownership gates and maintenance conflict/retry passed. Full failure/exit/relaunch matrix pending |
@@ -313,20 +316,252 @@ retains Q's distinct requirements.
 | R10.7 | Q existing resource gates: 20 cable cycles, 5 camera reboots, >=60 minutes representative playback/recording/relay, process-tree resources and notices; recovery/address/native postconditions applicable to this unchanged production path | Test + physical hardware/operator | CI f2a6f4f (identity above) | Pending; discovery redesign/S-R2/B gates remain separate |
 | R10.8 | Packaged runtime closure/import/plugin/source/G3 installed gate, generated installer trace, requireAdministrator/Common Controls manifests, staged-vs-packaged image identity, updater signature/public key and feed/version checks | CI + read-only development inspection; isolated installed update fixture | Final CI artifact | Partial: final G3, exact runtime/source closure, generated NSIS, PE manifests, staged/packaged comparison and Tauri signature verified. Authenticode absent; true signed updater transport pending |
 
+## Bounded R5/R9 resume — 10 November 2026
+
+Initial execution was 11 November 02:32–03:09 UTC, followed by the operator's
+replacement-camera clarification and qualification through 04:17 UTC (10 November
+on Test). Release HEAD
+was `dd7258644cbbcfce66226068a4426d9337e0e3a2`, with no production difference
+from immutable tag commit `f2a6f4f5eebc1199487d08480144431bbe3b43f7`.
+The root privilege branch and its unrelated edits/worktrees were preserved.
+The exact installer `88dea7c2…` and packaged image `a1fc999c…` above were rehashed;
+no installation, new production build, tag, feed change, publication or main merge
+was performed. A4/B remained paused; no PTU movement or development-PC native
+mutation occurred. No Second host was available or authorized.
+
+The old Test address timed out. DNS resolved `192.168.141.125`; the previously
+pinned SSH host key, actual hostname `DESKTOP-PI5BMJR`, account
+`DESKTOP-PI5BMJR\TSD-0311`, SID
+`S-1-5-21-3861278283-306712892-3066044081-1001` and both physical adapter
+GUIDs/MACs were reverified. Test remained Windows 11 Pro build 26200 /
+PowerShell `5.1.26100.9711`, elevated SSH session 0 and qualification desktop
+session 1. Required services were running. An existing production PID 7784 was
+closed normally before the independent disabled-rule/no-listener/no-WFP baseline.
+Both stored owned rules had empty Package and no registry AppPkgId.
+
+All local paths in this subsection are relative to
+`src-tauri/target/release-candidate/R5-R9-resume-20261111T023245Z/` (`E`).
+Remote paths below are relative to
+`C:\Users\TSD-0311\AppData\Local\PocketStreamQualification\v0610\` (`Q`).
+The initial profile backup in `Q\R5-R9-preflight-20261111T023529Z\` and the
+interactive run's `baseline-profile\` remain private on Test; their contents,
+including `.key`, were not exported.
+
+**R5 / separate R6 subcase.** The executable remained SHA-256
+`07b0685b7d8042464488a74f40bbfda180608367d382c9be1d303f75a570c5a7`.
+All 77 recorded source-input hashes matched the tag's production sources.
+The asInvoker/Common Controls manifest was inspected; execution used the verified
+elevated account. The executable controller was SHA-256
+`01977d08704c2bf26aa0cd9b243dccf4349f54d9825e1b8ab0d4cb55390fb0b2`.
+It parsed successfully and corresponded exactly to its `.source.ps1` template
+plus the reviewed Snapshot function; the template was not executed.
+
+The one exact ignored test ran as PID 23768 in
+`Q\R5-R6-RTSP-20261111T024105Z\`: 1 passed, 0 failed, 172.77 s;
+controller process observation was 174.462 s, exit 0. The 13 real native attempts
+are retained in `E/R5-native/fixed-fault.stdout.log`; ordered events and parsed
+attempts are in `E/R5-sequence-summary.json`.
+
+| Attempt(s) | Observed result and credited scope |
+| --- | --- |
+| 1–3 | Actual RTSP enable: event 2099 record 26212, Active=1 at 02:41:40.7545261Z, and `qualification_after_enable` before the 30.072 s timeout. Both writer processes were contained/exited. Safety disable returned verified Inactive, mutated=true in 7.073 s; event 26213 Active=0 at 02:41:59.5605153Z. The harness asserted ordinary admission available, followed by idempotent disable. |
+| 4–5 | Same-session normal ensure returned Applied in 14.981 s, then normal disable returned Inactive in 7.472 s; the consumed fault did not recur. |
+| 6–7 | Second actual enable: event 26216 Active=1 at 02:42:43.8170574Z and post-enable marker before a 30.072 s timeout. Safety disable itself timed out at 30.057 s with `qualification_disable_before_readback`. Both process trees were contained/exited. The harness asserted uncertain failure and ReconciliationRequired even though event 26217 already showed Active=0; a disabled observation did not bypass settlement accounting. |
+| 8 | Fixed pre-write recovery failure exited with access-stage Failed, mutated=false, in 2.914 s. Uncertain failure and ReconciliationRequired remained asserted. |
+| 9–11 | A later explicit policy disable freshly verified Inactive in 6.931 s and released the executor barrier. Subsequent ordinary ensure returned Applied in 14.621 s, then disable returned Inactive in 7.031 s. This is policy/executor recovery, not an application Stop or relay lease observation. |
+| 12–13, R6 only | First startup attempt exhausted its fixed 1 s budget in 1.042 s, contained/exited. Its normal retry returned verified Inactive in 13.518 s inside the original reconciliation scope. The harness asserted `first_attempt` retention, scope write availability and final executor availability. No injected application startup/restart/exit campaign is credited. |
+
+Every recorded native attempt had containment and observed tree exit; the four
+timeouts each retained both tree PIDs. Nine rule-change events and complete
+before/after rule/filter/address/route snapshots were preserved. Independent
+checks at `Q\R5-ready-20261111T024021Z\` and
+`Q\R5-qualified-cleanup-20261111T024717Z\` bracket the fault run with no product
+process, both rules disabled and no managed WFP permits. All 60 exported R5
+files matched their remote hashes. Export index SHA-256:
+`b5dbd2b3bd230cce0d7619a88157ffb987263609c9d4e03d6cddfb73258a9b98`;
+result SHA-256:
+`0fd3102ec1ab69a2f1b8837f9a8f66d548f1a3538c75a361d48b8ac90a8fd168`.
+
+The harness does not exercise application listeners, UI policy reporting, relay
+lease ownership, abandoned requester accounting, resumed auto-adopt/address
+writes, SRT fault behavior or production-image timeout behavior. Those R5/R6
+subcases and Second repetitions remain pending. No generic fault framework or
+new application injection surface was added.
+
+**R9.** After qualified R5 cleanup, the exact installed production image was
+relaunched as PID 19044 without Start. Actual UI Automation controls were used,
+with process-scoped WebView2 `--force-renderer-accessibility` for inspection
+([documented diagnostic flag](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/webview-features-flags)).
+No browser/IPC stubs, persistent browser setting or altered application binary
+was used. The launch discovery notice was acknowledged through its close-only
+OK handler. `Inspect-20261111T025253326Z.json` records accepted Enable=On with
+the config true and no RTSP/SRT socket before Start.
+
+| R9 subcase | Result and evidence under `E/R9-native/` |
+| --- | --- |
+| RTSP draft / stopped Disable / Enable | Passed for unsaved port 19554 versus saved 18554; canonical SRT section and RTSP section excluding enabled stayed byte-equivalent by SHA-256. `DraftRtsp-20261111T025515686Z.json`, then `Disable-20261111T025829199Z.json`. |
+| RTSP successful Start / running Disable with draft | Not completed at this first checkpoint. The Start attempt failed with `Network error: Ethernet not ready: expected MAC lacks fresh evidence at this endpoint`; no listener appeared. Its draft remained 19554, and later stopped Disable accepted false. This failed run is retained; the later replacement-camera pass is separate below. |
+| SRT replacement intent | Passed for stopped Enable, rejected Start and stopped Disable: draft port 19890 and latency 777 remained visible versus saved 18890/125. Replacement-pending helper comparison and enabled Copy control persisted. `DraftSrt-20261111T030121588Z.json`; `start_became_desired=false` is explicit. |
+| SRT removal intent | Passed for the same stopped/rejected-Start sequence: empty protected field, removal-pending helper and disabled Copy control persisted, without saving. `ClearSecret-20261111T030229354Z.json`. This is an unsaved removal intent, not a completed passwordless-save confirmation. |
+| Visual secret draft | Six captures after Enable, rejected Start and Disable show masked replacement or empty removal field plus pending-save guidance. The two initial `*-draft.png` captures showed another region and receive no visual credit. See `E/R9-visual-review.json`; all eight originals are retained. |
+| Accepted false across restart | Passed after normal Close of PID 19044 and exact production relaunch as PID 5824, without Start. The early inspector ran before controls loaded and is retained as failed tooling; `Inspect-20261111T030554986Z.json` later records loaded/enabled controls with Enable=Off, saved SRT port 18890 and latency 125. Unsaved drafts were discarded at restart, as permitted by the contract. |
+| Successful SRT Start / running Disable with secret draft | Initially pending fresh expected-MAC evidence. Both SRT Start attempts logged the same readiness refusal as RTSP. These initial attempts establish preservation through refusal; later replacement-camera passes are recorded separately below. |
+| Native policy-failure UI / failed canonical reload | Pending. The prescribed executable exercises executor/policy faults and has no application UI injection path. Readiness refusal does not qualify firewall-retirement failure reporting. |
+
+At every captured draft phase the canonical SRT section SHA-256 remained
+`c56f16966c4527d06ce22a6ef7175a203dfa7ef3035f8da867a9db41e6851679`,
+including the saved secret, port and latency. RTSP excluding enabled remained
+`09a87a33af987654cb20287c4cbca04c519fa51ff9b881c1e27b9007db344d2b`.
+No Save Settings action was used. Redacted production toasts and native startup
+records, including all three readiness failures, are in
+`E/R9-native/production-events-redacted.log`.
+
+Both real production restarts completed native reconciliation, but their startup
+policy totals **13.608 s and 14.606 s exceeded Test's 12 s target** (runner
+14.553 s and 16.025 s). These are failed R2 timing samples, not completed R2
+qualification. Test was on battery; the threshold was not relaxed and no cause
+or production fix is inferred. Only local qualification automation was adjusted
+for transport limits, battery scheduling, actual UI patterns and redaction.
+Failed tooling attempts, the resolved automatic redaction-review rejection and
+two stalled read-only observers are retained under E. The observer processes
+were retired only after their exact encoded source hash was checked and the
+native fixture had exited. Production sources and artifact identities did not change.
+
+**First clean checkpoint.** PID 5824 closed normally; at 03:09:09.6852322Z Test had no
+product/helper/fixture process, no associated listener and no managed WFP permit.
+Both ActiveStore and PersistentStore owned rules were disabled with the expected
+group/program, empty Package and no registry AppPkgId. All temporary qualification
+tasks were retired. The accepted final config is Enable=false, output SRT,
+RTSP 18554, SRT 18890/125, explicit Wi-Fi; `.key` and the saved SRT section are
+unchanged. No unresolved cleanup barrier is reported.
+
+Remote UI/evidence root: `Q\R5-R9-interactive-20261111T023245Z\`.
+Final native snapshot: `Q\R5R9-final-retirement-20261111T030859Z\`, exported as
+`E/final-native-retirement/`. Final state: `E/R9-native/final-state.json`.
+All 34 final exported UI/native files matched their remote hashes; index SHA-256
+`938239cbae14096e0f8c7c6ccca207cf93ccd540f0356511bc64562b107338bb`,
+final-state SHA-256
+`6510d158689ccce7ccd003e7cc665569f266085f6cadffe964c70b6d0c2af856`.
+
+**Replacement-camera follow-up and final stopping point.** The operator clarified
+that a new camera was attached. Test was reverified over the same pinned SSH
+connection. The saved CAM was `10.131.50.56 / 40:cd:3a:03:e0:0d`; the current
+camera was `172.31.169.84 / 40:cd:3a:03:28:e2`. An RTSP OPTIONS probe bound to
+Ethernet source `172.31.169.100`, GUID
+`86193159-40f0-4a29-a389-c4c0b1945e82`, returned `RTSP/1.0 200 OK` and observed
+the expected new MAC Reachable. No address configuration was changed for it.
+
+Fresh local evidence is `E/camera-followup-20261111T032700Z/` (`F`); remote
+evidence is `Q\R9-new-camera-20261111T032700Z\`. The pre-change profile was
+backed up privately in that remote directory. PID 3468 was the exact installed
+production image. Normal Nodes CAM selection persisted the new IP/MAC;
+`F/R9-native/SelectNewCamera-20261111T035540934Z.json` records the accepted
+selection. The old PTU role `fc:68:3e:22:05:2a / 192.168.1.202` was independently
+unchanged in the before/after cache roles. No PTU control was selected or motion
+command sent. The new CAM selection is retained; the old target was not restored.
+
+The native role popup required a guarded pointer interaction: unique camera row,
+exact visible CAM option, actual candidate/browser process ancestry and native
+window ownership were checked. Earlier inaccessible/stale-element, ambiguous
+button, focus/hit-test and popup-action attempts remain failed tooling records.
+One stalled desktop traversal was stopped only as its named qualification task,
+with the saved old camera identity checked afterward. No application process
+was killed and no production/IPC workaround was introduced.
+
+| Follow-up R9 scenario | Result and evidence under `F/R9-native/` |
+| --- | --- |
+| SRT replacement draft, Enable, successful Start, running Disable | Passed as a continuous sequence across `DraftSrt-20261111T035708201Z.json` and `FinishReplacement-20261111T040359605Z.json`. Start returned accepted/desired with UDP `192.168.141.125:18890`, while port draft 19890, latency 777 and replacement intent stayed unsaved. Running observation had the enabled owned rule and six permits; Disable returned disabled-and-stopped, removed the socket, disabled the rule and retired all permits. Initial verifier failures are preserved and assessed separately below. |
+| SRT removal draft, Enable, successful Start, running Disable | Passed in `ClearSecret-20261111T040523943Z.json`: saved UDP 18890 used; empty protected field/removal intent, disabled Copy control and 19890/777 drafts persisted. Six running permits and complete retirement verified. No passwordless-save confirmation was exercised. |
+| RTSP port draft, Enable, successful Start, running Disable | Passed across `DraftRtsp-20261111T041108586Z.json` and `FinishRtsp-20261111T041443141Z.json`. TCP `192.168.141.125:18554` used the saved value while draft 19554 survived. Six running permits and the exact expected TCP layers were observed; Disable removed the socket/permits, disabled the rule, persisted false and preserved 19554. The earlier listen-layer checker error is retained. |
+| Visual secret behavior | Eight reviewed captures cover draft/Enable/successful Start/running Disable for both replacement and removal. Two extra verified-running crops were solid blue and are excluded, with originals preserved. `F/visual-review.json` identifies every credited/excluded image. No secret text is exported. |
+
+All captured output-section hashes remained the same as the initial R9 baseline
+above, including the saved SRT secret. Save Settings was never pressed. Native
+running/disabled snapshots and original WFP XML are in `F/native-snapshots/`.
+No replacement-camera peer media, 150-buffer result or full R3/R6 campaign is
+inferred from these local R9 results.
+
+The verifier initially assumed four permits, then lost a singleton socket's
+Count through a PowerShell 5.1 conditional assignment. A pure local reproduction
+showed the old value was PSCustomObject with Count=null, while an outer array
+retained Count=1; `F/native-observer-array-regression.json` records that check.
+The corrected qualification code checks required layers, permit action, app,
+port and interface conditions, with explicit protocol checks where that layer
+supports them. TCP listen-layer filters do not have an IP_PROTOCOL condition in
+the [documented layer schema](https://learn.microsoft.com/en-us/windows/win32/fwp/filtering-conditions-available-at-each-filtering-layer);
+the TCP listener and rule protocol are independently observed. These are tooling
+corrections, not production fixes or relaxed timing limits.
+
+Each protocol actually had six named permits: one IPv4 and one IPv6 listen
+(RTSP) or resource-assignment (SRT) filter, plus two receive/accept filters per
+family. Direct XML value assessment verified all 18 filters across RTSP running,
+SRT replacement running and SRT removal running: exact installed NT application
+path, local ports 18554/18890, protocols 6/17 where present, and every interface
+LUID equal to `19985273102270464`. A read-only IP Helper query matched that LUID
+to Wi-Fi index 18 / GUID `ec4b8efb-634e-4414-8afe-c5b945fb272b` / MAC
+`10-51-07-F7-A6-B6`. See `F/wfp-value-assessment.json` and
+`F/output-WiFi-luid.stdout.log`.
+
+The SRT replacement run had an actual EOS at 04:02:02 UTC while it remained
+desired. Automatic recovery logged listener readiness after **24.173 s** and
+healthy-for-30-seconds at 04:02:57. That transient is retained in
+`F/R9-native/media-events-redacted.log`; its temporary retirement/re-ensure is
+not an extra operator Start or an injected R6 pass. The replacement draft still
+had its original values/intent after recovery and at the later qualified Disable.
+
+Incidental production timings remain failures against the existing Test budgets:
+startup **14.002 s**; SRT ensure **17.203 s**, recovery ensure **15.512 s**,
+SRT removal-case ensure **19.192 s**, RTSP ensure **24.164 s**; final RTSP
+disable **8.790 s**. Other captured disables were 6.042 s during recovery,
+7.427 s and 7.153 s. Earlier 13.608/14.606 s startup misses are preserved above.
+No percentile or ten-cycle claim is made. These observations and the EOS need
+investigation; no production cause or fix is inferred. Redacted policy/toast
+records are in `F/R9-native/production-events-redacted.log`.
+
+PID 3468 closed normally in `Close-20261111T041628127Z.json`. At
+**04:17:26.1161619Z**, the final independent snapshot established no
+product/helper/fixture process, no associated listener, both ActiveStore and
+PersistentStore owned rules disabled, no managed WFP permits and no remaining
+qualification tasks. Program/group/empty Package/no AppPkgId passed again.
+Final accepted settings are Enable=false, output RTSP, saved RTSP 18554 and SRT
+18890/125, explicit Wi-Fi, and the new CAM IP/MAC. `.key`, the SRT section and
+RTSP fields other than enabled are unchanged; the PTU role is unchanged.
+
+Final state is `F/R9-native/final-state.json`; native retirement is
+`F/final-native-retirement/`, originally
+`Q\R9-new-camera-final-retirement-20261111T041713Z\`.
+All **73** follow-up indexed exports matched their Test hashes, with private
+profile contents excluded. Index SHA-256:
+`9143d0f4ffd96e258a3805b3310b21ef70aa4a3e9de170d4e74c161042993547`;
+final-state SHA-256:
+`3439dd7000ac058515dfcf6c281de476b18a6dc84aa83aaae3cd15036e811378`.
+Together with the first 60 + 34 indexed exports, 167 indexed file transfers were
+verified. R5 remains limited to its exact fault executable; R9 native
+policy-failure/reload UI and remaining E save/confirmation paths are pending.
+Production code/artifact identities remain unchanged, and no new CI candidate
+or production fix is claimed.
+
 ## Remaining gates and release state
 
 R0 audit repair and source validation passed. Installer built: yes, and the
-downloaded hashes match the exact final CI installed candidate. Working on the
-tested configuration: yes, including both real upgrades, live preview, default
-and custom remote RTSP/SRT, and firewall retirement on Stop/Disable. Ready for
-public release: no. The remaining gates above require more isolated Test time,
+downloaded hashes match the exact final CI installed candidate. Earlier Test
+runs passed both real upgrades, live preview, default/custom remote RTSP/SRT,
+and firewall retirement on Stop/Disable. The bounded resume adds only its stated
+passes. The initial saved-MAC refusal was resolved with the operator's new camera;
+R9 running draft/Disable checks then passed. Policy timing misses and the SRT EOS
+are retained. Ready for public release: no. The remaining
+gates above require more isolated Test time,
 a separately authorized Second and full disposable Windows VM, and operator-led
 hardware testing. The release is still a draft. No tag was moved, no public feed
 changed, and no main merge was performed.
 
-Resume with the guarded R5 fault run on Test after rechecking the installed hash,
-closed app and disabled-rule baseline, then a normal relaunch without Start for
-R9. No further native operations were started after the operator's Stop/Close.
+Next bounded action: investigate the recorded Test startup/ensure/disable timing
+misses and SRT EOS using the preserved stages/resources, without relaxing budgets.
+Any production fix needs a separate branch, a new CI-built candidate and affected
+requalification. Native policy-failure UI needs an appropriate separately identified
+prescribed fixture; this executable cannot provide it. Remaining R5/R6
+application/SRT/ownership cases and all Second repetitions stay pending. Test is
+closed and clean at the final stopping point above; public release remains incomplete.
 
 Known product limitations are retained in [release notes](../../RELEASE-NOTES.md)
 and [user instructions](../../README.md): current discovery contention/history,

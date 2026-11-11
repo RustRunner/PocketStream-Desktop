@@ -85,6 +85,8 @@ For each rule snapshot, retain the rule plus `Get-NetFirewallApplicationFilter`,
 
 Revision 3 adds a qualification-only post-enable timeout harness and retains all hardware gates as pending. See [local verification and the timeout procedure](firewall-revision3-local-verification.md). NetSecurity readbacks alone do not qualify WFP enforcement.
 
+Candidate-specific update, 10 November 2026: the [v0.6.10 run sheet](v0610-release-candidate.md#bounded-r5r9-resume--10-november-2026) records the bounded Test RTSP executor/policy fault run, its separate startup-retry subcase, accepted true/false restart persistence, and RTSP/SRT running draft/Disable checks after normal selection of the operator's replacement camera. Final native cleanup passed. Application listener/lease/SRT fault cases, policy-failure/reload UI, remaining E save/confirmation paths and Second repetitions remain pending. Production startup/ensure/disable timing misses and an SRT EOS recovery are preserved. These partial results do not close this matrix or resume paused A4/B work.
+
 The native partial-provider fault mechanism must be identified and recorded on the isolated fixture. A simulated failure before any write, an ordinary conflict, or successful fake cleanup must not be relabeled as a real partial-provider result. Add/Remove/Static/DHCP/DNS/route/renew/restart postconditions and caller-abort uncertainty remain separate pending address-operation gates.
 
 ## Installer ownership and every exit path
