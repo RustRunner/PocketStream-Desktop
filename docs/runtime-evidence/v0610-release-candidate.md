@@ -1622,6 +1622,49 @@ remain valid for their recorded conditions. Battery follow-up is not promoted to
 an additional mandatory release gate, and no new production fix is justified by
 this single startup observation or the interface-metric difference.
 
+## Operator-requested card cleanup (2026-11-11; source validation only)
+
+The operator requested removal of the re-stream card's **Bound** and **Windows
+rule** rows and the duplicate scrollbar in Nodes. This explicitly authorizes
+this presentation change in addition to the earlier bounded reliability work.
+Implementation is isolated on `fix/v0612-card-cleanup`, based on the verified
+release-derived `9752c6fa05fb0531479a2f4e3abbe2626fa40f2c`, with source commit
+`a876b4e863523c82efd4025a2c62de8002184a91`.
+
+Both detail rows and their renderer accesses are removed. Policy warnings,
+retry countdowns and retained retirement failures use the existing Reason row;
+healthy listening has no extra policy detail row. Relay and policy failures can
+appear together, with full repair guidance available in the tooltip. The Bind
+selector and backend policy/lifecycle behavior are preserved.
+
+The Nodes scrollbar cause was reproduced in an isolated browser with 24 nodes:
+both `.card-body` and `.device-list` scrolled vertically. Removing the nested
+list's height/overflow restriction leaves the card body as the single scroll
+area. The same regression passed afterward at 1280x800 and 960x600, with and
+without a capture-scope notice. The last node remained visible and keyboard
+accessible; the header and footer stayed visible. Browser checks also confirmed
+long Reason text wraps, stopped failures persist, and healthy state clears it.
+
+Validation: **289 frontend tests passed**, TypeScript passed, all build contracts
+passed, and the Vite production frontend build passed. The existing Windows
+browser check passed at both sizes. Browser rendering and esbuild required the
+normal environment outside the restricted filesystem sandbox; no installed app
+or native fixture was launched on the development PC. Local evidence is in
+this worktree's `src-tauri/target/ui-layout/`: `result.json` SHA-256
+`fef673217473f8f550ba7f330a5100b8fa4d7748dbb5b2696acf0923dd9c4ddf`;
+preserved pre-fix `nodes-before-1280.json` SHA-256
+`c667cdc920ce878cc4a911e18141dc8f811d95950842853aa330b6e84b519865`.
+The before capture uses the base production source plus the new layout probe;
+the passing capture uses the source commit above.
+
+This is a source-only UI change. No new release version/tag, CI-built installer
+or installed-candidate qualification was prepared for it. Test was not contacted
+or mutated for this change; its last verified state remains the preceding entry.
+The v0.6.12 artifact and its qualification remain tied to their existing hashes.
+Including this cleanup in a release requires a new unused version/tag and an
+exact CI-built artifact with affected installed UI checks. Existing release gates
+remain open; this UI validation does not close timing or recovery gates.
+
 ## Remaining gates and release state
 
 The v0.6.10 and v0.6.11 results above remain attached to their original images.
@@ -1657,7 +1700,7 @@ without an identified coverage gap. Second-host repetitions still need separate 
 RTSP-output recovery needs its acceptance stated before it runs, for example a
 fresh session decoding without operator action. The established RTSP peer
 pipeline (`rtspsrc` under gst-launch) has no reconnect behavior and exits at end
-of stream. No further production fix is justified by current evidence. Native policy-failure UI still needs the
+of stream. No further timing or EOS production fix is justified by current evidence. Native policy-failure UI still needs the
 prescribed separately identified fixture. Any further production change needs its
 own unused version/tag and exact CI artifact qualification.
 
