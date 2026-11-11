@@ -8,7 +8,7 @@ import { $, $$, state, log, showToast, formatUptime } from "./state.ts";
 import type { DeviceTarget } from "./store.ts";
 import * as deviceList from "./device-list.ts";
 import { formatError } from "./errors.ts";
-import { formatBindScope, formatFirewallRetry, formatRestreamBitrate, presentFirewallPolicy } from "./restream-format.ts";
+import { formatFirewallRetry, formatRestreamBitrate, presentFirewallPolicy } from "./restream-format.ts";
 import {
   buildRestreamBindOptions,
   buildRestreamBindUpdate,
@@ -1008,16 +1008,15 @@ export function updateRestreamUI(displayUrl: string | null, status?: Partial<Str
   const observation = status ?? latestRestreamStatus;
   const policy = presentFirewallPolicy(observation?.firewall);
   const retry = state.isRestreamDesired ? formatFirewallRetry(status?.firewall_next_retry_secs) : "";
-  const scopeEl = $("#restream-bind-scope");
-  scopeEl.textContent = formatBindScope(observation?.bind_scope);
-  scopeEl.title = scopeEl.textContent;
-  $("#restream-scope-row").style.display = state.isRestreamDesired ? "contents" : "none";
-  const ruleEl = $("#restream-firewall-state");
-  ruleEl.textContent = [policy.text, retry].filter(Boolean).join("; ");
-  ruleEl.title = [policy.detail, retry].filter(Boolean).join(" ");
-  ruleEl.className = `status-value restream-policy-detail${policy.classification === "applied" ? "" : " status-warning"}`;
-  $("#restream-firewall-row").style.display = state.isRestreamDesired
-    || (observation?.firewall && observation.firewall.state !== "inactive") ? "contents" : "none";
+  // Keep actionable policy evidence in Reason, including incomplete retirement
+  // after Stop, without a permanent policy row on a healthy listener.
+  const showPolicy = state.isRestreamDesired
+    ? policy.classification !== "applied" || !!retry
+    : !!observation?.firewall && observation.firewall.state !== "inactive";
+  const relayError = state.isRestreamDesired ? status?.relay_error : null;
+  errorEl.textContent = [relayError, showPolicy ? policy.text : null, retry].filter(Boolean).join("; ");
+  errorEl.title = [relayError, showPolicy ? policy.detail : null, retry].filter(Boolean).join(" ");
+  errorRow.style.display = errorEl.textContent ? "contents" : "none";
 
   if (state.isRestreamDesired) {
     const relayState = status?.relay_state ?? "starting";
@@ -1046,9 +1045,6 @@ export function updateRestreamUI(displayUrl: string | null, status?: Partial<Str
     }
     $("#restream-url").textContent = displayUrl || "--";
     qrBtn.disabled = !restreamFullUrl;
-    const error = status?.relay_error ?? null;
-    errorEl.textContent = error || "";
-    errorRow.style.display = error ? "contents" : "none";
   } else {
     policyWarningBaseline = undefined;
     statusEl.textContent = "Offline";
@@ -1057,8 +1053,6 @@ export function updateRestreamUI(displayUrl: string | null, status?: Partial<Str
     $("#restream-uptime").textContent = "--";
     $("#restream-clients").textContent = "--";
     $("#restream-bandwidth").textContent = "--";
-    errorEl.textContent = "";
-    errorRow.style.display = "none";
     restreamFullUrl = null;
     qrBtn.disabled = true;
   }

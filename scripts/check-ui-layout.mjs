@@ -141,50 +141,87 @@ try {
     assert.equal(after.screenshot - before.screenshot, 2); assert.equal(after.record - before.record, 2);
     assert(await evaluate(`!!document.querySelector('.toast')`), 'repeat clicks happen while the notice remains visible');
     assert(await evaluate(`!document.querySelector('#btn-remove-primary-ip')`));
-    assert(await evaluate(`['restream-bind-scope', 'restream-firewall-state', 'restream-scope-row', 'restream-firewall-row'].every(id => document.querySelector('#card-restream #' + id))`));
+    const nodesLayout = await evaluate(`(() => {
+      const card = document.querySelector('#card-devices'), body = card.querySelector('.card-body');
+      const list = document.querySelector('#device-list'), scope = document.querySelector('#capture-scope-status');
+      list.innerHTML = '<div class="subnet-group">' + Array.from({ length: 24 }, (_, index) =>
+        '<div class="device-item"><div class="device-name-row"><span class="device-dot dot-green"></span>' +
+        '<select class="node-role-select" title="Assign role"><option>Node ' + (index + 1) + '</option><option>CAM</option><option>PTU</option></select></div>' +
+        '<div class="device-detail-row"><a class="device-ip" href="#">192.0.2.' + (index + 1) + '</a><span class="device-ports">80, 554</span></div></div>'
+      ).join('') + '</div>';
+      const cases = [false, true].map(withNotice => {
+        scope.hidden = !withNotice;
+        scope.textContent = withNotice ? 'Discovery is limited to the selected adapter.' : '';
+        body.scrollTop = 0;
+        const scrollers = [body, ...body.querySelectorAll('*')].filter(element =>
+          /auto|scroll/.test(getComputedStyle(element).overflowY) && element.scrollHeight > element.clientHeight + 1
+        ).map(element => element === body ? 'card-body' : element.id || element.className);
+        body.scrollTop = body.scrollHeight;
+        const last = list.querySelector('.device-item:last-child .node-role-select');
+        last.focus();
+        const rect = last.getBoundingClientRect(), bounds = body.getBoundingClientRect();
+        const header = card.querySelector('.card-header').getBoundingClientRect(), footer = card.querySelector('.card-footer').getBoundingClientRect();
+        return { withNotice, scrollers, lastVisible: rect.top >= bounds.top && rect.bottom <= bounds.bottom,
+          lastFocusable: document.activeElement === last, noHorizontalOverflow: body.scrollWidth <= body.clientWidth + 1,
+          controlsVisible: header.top >= 0 && header.bottom <= bounds.top && footer.top >= bounds.bottom && footer.bottom <= innerHeight };
+      });
+      scope.hidden = true; scope.textContent = ''; body.scrollTop = 0;
+      return cases;
+    })()`);
+    fs.writeFileSync(path.join(output, `nodes-${width}.json`), JSON.stringify(nodesLayout, null, 2) + '\n');
+    for (const item of nodesLayout) {
+      assert.deepEqual(item.scrollers, ['card-body'], `Nodes has one vertical scroll area: ${JSON.stringify(item)}`);
+      assert(item.lastVisible && item.lastFocusable, 'the last node is visible and keyboard accessible');
+      assert(item.controlsVisible && item.noHorizontalOverflow, 'Nodes header/footer stay visible without horizontal scrolling');
+    }
+    assert(await evaluate(`['restream-bind-scope', 'restream-firewall-state', 'restream-scope-row', 'restream-firewall-row'].every(id => !document.querySelector('#card-restream #' + id))`));
     const policyLayout = await evaluate(`(() => {
-      const scope = { kind: 'interface', id: 'uplink', alias: 'Long uplink adapter name '.repeat(5), address: '192.0.2.2', family: 'ipv4', topology_revision: 1 };
       const blocks = ['Disabled other-protocol Block ' + 'native-name'.repeat(40), 'unrelated-interface-rule'];
       const applied = { state: 'applied', rule_name: 'owned', action: 'updated', verified_shape: true, observed_block_rules: blocks };
       const failure = { state: 'failed', stage: 'native_timeout', uncertain: false, reason: 'Long reported reason '.repeat(40) };
       const render = (desired, firewall) => {
         layout.shared.state.isRestreamDesired = desired;
-        layout.streaming.updateRestreamUI('rtsp://192.0.2.2:8554/***', { bind_scope: scope, firewall, relay_state: 'listening', firewall_next_retry_secs: 0 });
+        layout.streaming.updateRestreamUI('rtsp://192.0.2.2:8554/***', { firewall, relay_state: 'listening' });
       };
       const visible = id => getComputedStyle(document.querySelector('#' + id)).display !== 'none';
       render(true, applied);
-      const conflict = { scope: visible('restream-scope-row'), policy: visible('restream-firewall-row'), detail: document.querySelector('#restream-firewall-state').title };
+      const conflict = { reason: visible('restream-error-row'), detail: document.querySelector('#restream-error').title };
       const overflow = () => {
         const card = document.querySelector('#card-restream').getBoundingClientRect();
-        return ['restream-bind-scope', 'restream-firewall-state'].map(id => {
+        return ['restream-error'].map(id => {
           const value = document.querySelector('#' + id), rect = value.getBoundingClientRect();
           return { id, left: rect.left, right: rect.right, cardLeft: card.left, cardRight: card.right, scroll: value.scrollWidth, width: value.clientWidth };
         });
       };
       const conflictGeometry = overflow();
       render(true, failure); const failedGeometry = overflow();
-      render(false, failure); const stopped = { scope: visible('restream-scope-row'), policy: visible('restream-firewall-row') };
-      render(false, { state: 'inactive' }); const inactive = { scope: visible('restream-scope-row'), policy: visible('restream-firewall-row') };
+      render(false, failure); const stopped = { reason: visible('restream-error-row') };
+      render(false, { state: 'inactive' }); const inactive = { reason: visible('restream-error-row') };
       render(true, applied);
-      const readable = ['restream-bind-scope', 'restream-firewall-state'].map(id => {
+      const readable = ['restream-error'].map(id => {
         const value = document.querySelector('#' + id);
         value.scrollIntoView({ block: 'start' });
         const rect = value.getBoundingClientRect(), body = value.closest('.card-body').getBoundingClientRect();
         return { id, inView: rect.top < body.bottom && rect.bottom > body.top, detail: value.title.length >= value.textContent.length };
       });
-      return { conflict, conflictGeometry, failedGeometry, stopped, inactive, readable, pageOverflow: document.documentElement.scrollWidth > innerWidth };
+      const pageOverflow = document.documentElement.scrollWidth > innerWidth;
+      render(true, { ...applied, observed_block_rules: [] });
+      document.querySelector('#card-restream .card-body').scrollTop = 0;
+      const healthy = { reason: visible('restream-error-row'), status: document.querySelector('#restream-status').textContent };
+      return { conflict, conflictGeometry, failedGeometry, stopped, inactive, readable, healthy, pageOverflow };
     })()`);
-    assert(policyLayout.conflict.scope && policyLayout.conflict.policy);
+    assert(policyLayout.conflict.reason);
     assert.match(policyLayout.conflict.detail, /Disabled other-protocol Block.*unrelated-interface-rule/);
     assert.match(policyLayout.conflict.detail, /whether they are enabled and apply/);
     for (const item of [...policyLayout.conflictGeometry, ...policyLayout.failedGeometry]) {
       assert(item.left >= item.cardLeft && item.right <= item.cardRight + 1, `policy value stays in card: ${JSON.stringify(item)}`);
-      assert(item.scroll <= item.width + 1, `long policy/scope text wraps: ${JSON.stringify(item)}`);
+      assert(item.scroll <= item.width + 1, `long Reason text wraps: ${JSON.stringify(item)}`);
     }
-    assert.deepEqual(policyLayout.stopped, { scope: false, policy: true });
-    assert.deepEqual(policyLayout.inactive, { scope: false, policy: false });
-    assert(!policyLayout.pageOverflow, 'policy rows cannot widen the viewport');
-    assert(policyLayout.readable.every(row => row.inView && row.detail), 'each policy row scrolls into view with its full detail available');
+    assert.deepEqual(policyLayout.stopped, { reason: true });
+    assert.deepEqual(policyLayout.inactive, { reason: false });
+    assert.deepEqual(policyLayout.healthy, { reason: false, status: 'Listening' });
+    assert(!policyLayout.pageOverflow, 'Reason cannot widen the viewport');
+    assert(policyLayout.readable.every(row => row.inView && row.detail), 'Reason scrolls into view with its full detail available');
     assert(await evaluate(`!!document.querySelector('#card-restream .card-header #btn-show-qr')`));
     assert(await evaluate(`!document.querySelector('#nodes-title').matches('.clickable-title, [role="button"]')`));
     const shot = await send('Page.captureScreenshot', { format: 'png' });
@@ -193,12 +230,12 @@ try {
     assert.equal((await evaluate(geometry)).expanded, 'false');
     const closedShot = await send('Page.captureScreenshot', { format: 'png' });
     fs.writeFileSync(path.join(output, `collapsed-${width}.png`), Buffer.from(closedShot.data, 'base64'));
-    observations.push({ width, height, closed, moving, open, notice, policyLayout, clicks: after });
+    observations.push({ width, height, closed, moving, open, notice, nodesLayout, policyLayout, clicks: after });
   }
   await send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'reduce' }] });
   assert.equal(await evaluate(`getComputedStyle(document.querySelector('#menu-toggle')).transitionDuration`), '0s');
   fs.writeFileSync(path.join(output, 'result.json'), JSON.stringify({ passed: true, observations }, null, 2) + '\n');
-  console.log('Browser layout passed: panel tracking/rotation, accessible state, toast clearance and real repeated clicks at 1280x800 and 960x600');
+  console.log('Browser layout passed: single Nodes scrollbar, re-stream warnings, panel tracking/rotation, accessible state, toast clearance and real repeated clicks at 1280x800 and 960x600');
 } finally {
   if (socket?.readyState === WebSocket.OPEN) await send('Browser.close').catch(() => {});
   socket?.close();

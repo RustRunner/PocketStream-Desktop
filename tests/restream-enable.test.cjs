@@ -163,8 +163,8 @@ for (const protocol of ['rtsp', 'srt']) {
       assert.equal(f.$('#restream-server-enable').checked, false);
       assert.equal(f.shared.state.isRestreamDesired, false);
       assert.equal(f.$('#restream-status').textContent, 'Offline');
-      assert.equal(f.$('#restream-firewall-row').style.display, 'contents');
-      assert.match(f.$('#restream-firewall-state').textContent, /disable/);
+      assert.equal(f.$('#restream-error-row').style.display, 'contents');
+      assert.match(f.$('#restream-error').textContent, /disable/);
       assert.equal(f.toast().textContent, 'Re-stream server disabled and stopped');
       assert.equal(notices(f).length, 1);
       assert.equal(f.writes.length, 1); assert.equal(f.writes[0].enabled, false);
@@ -370,8 +370,8 @@ test('Disable response resets policy baseline before stopped status and preserve
   assert.equal(notices(f).length, 0);
   write.resolve(result('rtsp')); await work;
   assert.equal(f.$('#restream-status').textContent, 'Offline');
-  assert.equal(f.$('#restream-firewall-row').style.display, 'contents');
-  assert.match(f.$('#restream-firewall-state').textContent, /disable/);
+  assert.equal(f.$('#restream-error-row').style.display, 'contents');
+  assert.match(f.$('#restream-error').textContent, /disable/);
   assert.equal(f.toast().textContent, 'Re-stream server disabled and stopped');
   // No stopped status has arrived. The next stable observation hydrates a new
   // baseline; only the following genuine warning transition should notify.
@@ -380,6 +380,6 @@ test('Disable response resets policy baseline before stopped status and preserve
   f.publish(status('rtsp', true, { firewall: failed('blocks') }));
   assert.equal(notices(f).length, 2);
   f.publish(status('rtsp', false, { firewall: failed('disable') }));
-  assert.equal(f.$('#restream-firewall-row').style.display, 'contents');
+  assert.equal(f.$('#restream-error-row').style.display, 'contents');
   assert.equal(f.$('#restream-status').textContent, 'Offline');
 });

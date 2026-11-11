@@ -462,20 +462,13 @@
 
 #card-restream .restream-error {
   color: var(--status-warning);
-  max-width: 240px;
-  overflow-wrap: anywhere;
-  text-align: right;
-}
-
-#card-restream .restream-policy-detail {
   min-width: 0;
   max-width: 240px;
   overflow-wrap: anywhere;
   text-align: right;
 }
 
-#restream-scope-row > .status-label,
-#restream-firewall-row > .status-label {
+#restream-error-row > .status-label {
   align-self: start;
 }
 
@@ -1071,11 +1064,6 @@
   font-weight: 400;
   color: var(--md-on-surface-variant);
   text-transform: none;
-}
-
-.device-list {
-  max-height: 300px;
-  overflow-y: auto;
 }
 
 .device-item {

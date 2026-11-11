@@ -53,37 +53,51 @@ test('pure policy presentation covers verification, conflicts, absent outcomes a
   assert.equal(retry(null), ''); assert.equal(retry(undefined), '');
 });
 
-test('card renders local listener and policy separately; stopped non-inactive evidence stays visible', () => {
+test('card keeps policy warnings and retry details in Reason, including stopped non-inactive evidence', () => {
   const f = card();
   for (const [firewall, text] of [[applied(), 'Listening'], [applied({ observed_block_rules: ['disabled unrelated UDP'] }), 'Listening — check Windows rules'],
     [applied({ verified_shape: false }), 'Listening — firewall warning'], [failed(), 'Listening — firewall warning'],
     [{ state: 'inactive' }, 'Listening — firewall warning'], [undefined, 'Listening — firewall warning']]) {
     f.publish(status({ firewall, firewall_next_retry_secs: 8 }));
     assert.equal(f.$('#restream-status').textContent, text);
-    assert.equal(f.$('#restream-scope-row').style.display, 'contents');
-    assert.equal(f.$('#restream-firewall-row').style.display, 'contents');
-    assert.match(f.$('#restream-bind-scope').textContent, /Bound on Uplink/);
-    assert.match(f.$('#restream-firewall-state').textContent, /Retrying in 8 s/);
+    assert.equal(f.$('#restream-error-row').style.display, 'contents');
+    assert.match(f.$('#restream-error').textContent, /Retrying in 8 s/);
   }
   f.publish(status({ firewall: failed(), firewall_next_retry_secs: 0 }));
-  assert.match(f.$('#restream-firewall-state').textContent, /Retry requested \/ in progress/);
-  assert(f.$('#restream-firewall-state').title.includes('<img src=x onerror=bad()>'));
-  assert.equal(f.$('#restream-firewall-state').innerHTML, '');
+  assert.match(f.$('#restream-error').textContent, /Retry requested \/ in progress/);
+  assert(f.$('#restream-error').title.includes('<img src=x onerror=bad()>'));
+  assert.equal(f.$('#restream-error').innerHTML, '');
   for (const [relay_state, text] of [['starting', 'Starting'], ['recovering', 'Reconnecting'], ['failed', 'Failed']]) {
     f.publish(status({ relay_state, firewall: failed() })); assert.equal(f.$('#restream-status').textContent, text);
   }
   for (const firewall of [failed('disable', true), { state: 'unavailable', reason: 'Startup reconciliation failed' }, applied()]) {
     f.publish(status({ desired: false, relay_state: 'stopped', server_running: false, firewall }));
     assert.equal(f.$('#restream-status').textContent, 'Offline');
-    assert.equal(f.$('#restream-scope-row').style.display, 'none');
-    assert.equal(f.$('#restream-firewall-row').style.display, 'contents');
+    assert.equal(f.$('#restream-error-row').style.display, 'contents');
     f.streaming.updateRestreamUI(null); // Stop completion must not erase its latest status.
-    assert.equal(f.$('#restream-firewall-row').style.display, 'contents');
+    assert.equal(f.$('#restream-error-row').style.display, 'contents');
   }
   for (const firewall of [{ state: 'inactive' }, undefined]) {
     f.publish(status({ desired: false, firewall }));
-    assert.equal(f.$('#restream-firewall-row').style.display, 'none');
+    assert.equal(f.$('#restream-error-row').style.display, 'none');
+    assert.equal(f.$('#restream-error').textContent, '');
+    assert.equal(f.$('#restream-error').title, '');
   }
+});
+
+test('Reason preserves both relay and policy failures and clears after recovery', () => {
+  const f = card();
+  f.publish(status({ relay_state: 'recovering', relay_error: 'Camera disconnected', firewall: failed('disable', true), firewall_next_retry_secs: 3 }));
+  assert.match(f.$('#restream-error').textContent, /Camera disconnected.*Windows rule failed \(disable\).*Retrying in 3 s/);
+  assert.match(f.$('#restream-error').title, /state is uncertain/);
+  f.publish(status({ relay_error: 'Camera disconnected' }));
+  assert.equal(f.$('#restream-error').textContent, 'Camera disconnected');
+  assert.equal(f.$('#restream-error').title, 'Camera disconnected');
+  f.publish(status());
+  assert.equal(f.$('#restream-status').textContent, 'Listening');
+  assert.equal(f.$('#restream-error-row').style.display, 'none');
+  assert.equal(f.$('#restream-error').textContent, '');
+  assert.equal(f.$('#restream-error').title, '');
 });
 
 test('hydration, repeated snapshots, countdowns and recovery do not manufacture transition toasts', () => {
@@ -117,7 +131,7 @@ test('Start completion owns reply-first, status-first and successful retry befor
     if (ordering === 'retry-before-reply') {
       assert.equal(f.toast().textContent, 'Re-stream server started.');
       assert.equal(f.$('#restream-status').textContent, 'Listening');
-      assert.equal(f.$('#restream-firewall-state').textContent, 'Applied (last verified)');
+      assert.equal(f.$('#restream-error-row').style.display, 'none');
       f.publish(status()); assert.equal(notices(f).length, 1);
     } else {
       assert.match(f.toast().textContent, /^Re-stream server started; Windows rule warning:/);
@@ -145,7 +159,7 @@ test('a stale Start reply cannot restore desired state or a policy baseline afte
   resolve(info(failed())); await work;
   assert.equal(f.shared.state.isRestreamDesired, false);
   assert.equal(f.$('#restream-status').textContent, 'Offline');
-  assert.match(f.$('#restream-firewall-state').textContent, /disable/);
+  assert.match(f.$('#restream-error').textContent, /disable/);
   f.publish(status());
   assert.equal(notices(f).length, 1, 'a stopped baseline stays reset');
 });
@@ -214,10 +228,9 @@ test('Stop remains busy through retirement and retains its reported failure at c
   assert.equal(f.$('#restream-status').textContent, 'Offline');
   assert.equal(f.$('#restream-spinner').style.display, '');
   assert.equal(f.$('#btn-toggle-restream').disabled, true);
-  assert.equal(f.$('#restream-firewall-row').style.display, 'contents');
+  assert.equal(f.$('#restream-error-row').style.display, 'contents');
   finish(); await work;
-  assert.match(f.$('#restream-firewall-state').textContent, /disable/);
-  assert.equal(f.$('#restream-firewall-row').style.display, 'contents');
-  assert.equal(f.$('#restream-scope-row').style.display, 'none');
+  assert.match(f.$('#restream-error').textContent, /disable/);
+  assert.equal(f.$('#restream-error-row').style.display, 'contents');
   assert.equal(notices(f).length, 1); assert.equal(f.toast().textContent, 'Re-stream server stopped');
 });
