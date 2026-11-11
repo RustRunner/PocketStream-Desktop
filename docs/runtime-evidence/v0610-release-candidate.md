@@ -6,6 +6,11 @@ This note is the current candidate run sheet; historical results are not passes
 for this artifact. Discovery/Clear/Refresh and privilege integration remain
 separate work.
 
+The [11 November timing/EOS follow-up](#bounded-timingeos-investigation--11-november-2026-utc)
+below identifies the separate unpublished v0.6.11 candidate. The v0.6.10
+identities and qualification samples above that follow-up remain immutable
+historical evidence; they do not transfer to the new image.
+
 ## Source and build identity
 
 - Branch: `release/v0.6.10`, isolated at
@@ -681,27 +686,246 @@ separately. These are not controlled A/B attribution, new production-artifact
 results or a ten-cycle R2 pass. The F speed table is measured under the runner;
 installed repetitions must retain both script and runner time against the limits.
 
+**EOS evidence recovered from the existing full log.**
+`I/transport-history.stdout.log` and the 50-second
+`I/eos-network-window.stdout.log` contain an earlier line at the same
+04:02:02 UTC timestamp: `bound_tcp` reports its Ethernet-bound transport stopped
+because the selected Ethernet adapter was unavailable, immediately before SRT's
+EOS and bus-thread exit. MAC-verified camera ARP replies were successful at
+04:01:56 and again at 04:02:02, with no recorded Ethernet link-down event in the
+window. No accepted downstream caller is logged there.
+
+Source review shows the transport checks its existing fence/readiness every
+second and aborts its forwarding tasks on refusal; its only fixed timeout is
+the five-second initial connect, not an idle streaming deadline. This strongly
+supports guarded upstream-transport retirement as the proximate EOS trigger.
+It does not establish a camera-origin EOS or physical disconnection. The
+generic readiness refusal combines missing/stale selection, native index/status
+observation failure or mismatch/down state, and a busy pending-address snapshot
+mutex. The historical log does not distinguish these branches. Snapshot
+contention is a hypothesis, not a confirmed cause or justification to weaken
+identity/readiness checks. No readiness or SRT behavior change is claimed.
+
+Original failed samples remain in `I/original-timing-breakdown.json`. Durations
+below are seconds; all recorded runtime admission waits were zero. Runner time
+includes process startup/exit and capture around the policy script; it is the
+timing-budget measurement. Script imports are separately measured, and the old
+ensure `access` stage also includes NetAdapter import.
+
+| Original operation | Samples | Script total | Native runner | Dominant recorded work |
+|---|---:|---:|---:|---|
+| Startup | 3 | 13.608–14.606 | 14.553–16.025 | Inventory 10.721–11.472, including ownership/disable readbacks; NetSecurity imports 2.486–3.047 |
+| SRT unchanged ensure | 3 | 15.512–19.192 | 16.223–20.050 | Prepare 3.592–4.499, shape 2.561–2.799, readback 2.245–2.990; additional ownership, Block and module work |
+| RTSP changed ensure | 1 | 24.164 | 24.971 | Prepare 8.940, including rewrite/full verification; shape 2.959, readback 2.808, trusted import 2.850 |
+| SRT disable | 3 | 6.042–7.427 | 6.784–8.354 | Ownership 1.581–2.132, disable/readback 1.769–2.152, imports 1.952–2.400 |
+| RTSP disable | 1 | 8.790 | 9.747 | Ownership 2.274, disable/readback 2.427, imports 3.058 |
+
+These totals establish expensive repeated provider reads and module/process
+costs, not enumeration-only cost or executor contention. Changed-rule work is
+retained because it verifies the actual written shape. Historical resource and
+observer contributions cannot be subtracted from these failed samples.
+
+All six exact-application-source CI jobs passed in run `42963130063`: Windows
+934 tests / 14 ignored, Linux 833 / 2 ignored, frontend, browser, notices and
+audit. `I/ci-source-7ed10d8.log` preserves the result. The guarded draft build
+uses workflow `03826cfb5d0818547db4101517b550425f9b2496` in
+[run 42965430004](https://github.com/RustRunner/PocketStream-Desktop/actions/runs/42965430004),
+with application tag still `7ed10d8`. Its SDK setup, source checks and runtime
+gates passed before packaging. Draft ID `441266851` remains unpublished.
+
+**Exact installed CI candidate.** `I/candidate-identity.json` records installer
+`PocketStream.Desktop_0.6.11_x64-setup.exe`, 48,501,223 bytes, SHA-256
+`7279f4275c710c41bc89669f884be6b409f7c7aac827f6d8399343971e084963`;
+packaged application 24,710,656 bytes, SHA-256
+`382b48e1675caac91b96b1e91c6d5617c9615a66c7f7de31f81fc6de741fdd87`.
+Installed G3 is complete/draft-ready, receipt SHA-256
+`f8a6b2d9c7f1d9a19e3933f46158360672f84a79dedf29caacbb919d5685b1f8`.
+The extracted package has the required administrator/Common Controls manifest,
+76 verified runtime DLLs, and differs from the staged CI image only in NSIS's
+three-byte `UNK` -> `NSS` marker. Both updater signatures and their trusted
+comments verified cryptographically; modified bytes were rejected. The updater
+metadata matches version, asset and signature. These checks inspect the private
+draft; no public feed was written.
+
+Normal silent upgrade on Test exited 0 in 16.310 s at 05:58:58 UTC, installed
+the exact packaged hash, and preserved all three private profile files byte for
+byte. Both templates remained compliant/disabled. This upgrade did not require
+package-field repair and does not close the separate install-with-repair gate.
+The first installed startup runner was 4.960 s (script 4.560, admission 0), with
+separate ownership/shape/disable/inventory/module stages.
+
+At 06:01 UTC the host reported AC power, Balanced, 1706 MHz, 11% CPU and about
+7 GB free RAM. The 04:45 pre-change checkpoint was on battery; the original
+failed samples do not carry per-sample power records. Matched battery
+repetition was requested; AC and battery samples must remain separate. The new
+installed unchanged-SRT cohort retained its warmup and all ten measured cycles:
+ensure runner p50/p95 5.741/5.868 s, disable 2.610/2.975 s, zero admission wait,
+all contained/exited and no truncation. Every ensure action was `unchanged`.
+This passes the recorded explicit-Wi-Fi/AC case only. Native observers ran
+after the cohort, with no rule/WFP enumeration during its policy calls.
+Evidence: `I/candidate-events-after-srt-ten.stdout.log` and
+`I/candidate-timing-after-srt-ten.json`. A first UI setup attempt failed before
+any sample because the controller required a redundant Enable transition; it
+is retained separately. The launch controller also initially observed the UI
+before its controls loaded; later inspection succeeded without restarting the
+application. Neither tooling failure is relabeled as an application pass.
+
+The changed-port RTSP cohort then passed all ten measured cycles, alternating
+19554/18554 and ending at saved 18554. Every ensure action was `updated`, so
+this includes actual rewrite and full verification. `I/candidate-timing-after-both-sets.json`
+pairs each UI case to exactly one successful, contained/tree-exited native
+ensure and disable; all admission waits were zero. Nearest-rank percentiles:
+
+| Installed CI case, explicit Wi-Fi, AC | n | Ensure runner p50 / p95 | Disable runner p50 / p95 | Ensure / disable script p95 |
+|---|---:|---:|---:|---:|
+| Unchanged SRT 18890 | 10 (+ retained warmup) | 5.741 / 5.868 s | 2.610 / 2.975 s | 5.532 / 2.324 s |
+| Changed RTSP 19554/18554 | 10 | 8.101 / 8.543 s | 2.769 / 2.967 s | 8.180 / 2.633 s |
+
+Every measured runner sample meets ensure <=15 s and disable <=8 s. Cohort-end
+snapshots show both rules disabled, no output socket and no owned permit. A
+separate RTSP 18554 start returned OPTIONS 200 and 150 decoded raw video frames
+on THINKBOOK-G7 (5.529 s). These are matching-image affected checks, not a full
+R2 or R3 pass: battery, All-addresses reference, other port/protocol combinations,
+Second and install-with-repair remain pending. AC observations cannot establish
+how much of the historical speed difference comes from power versus code.
+
+This is a policy timing pass for those conditions, not uninterrupted-media
+qualification of every rapid cycle. Final event review also finds the generic
+bound-transport readiness refusal at 06:06:20 and 06:07:33 UTC, immediately after
+SRT listener-start events for generations 4 and 11. Each is followed by
+`fault=gst_error`, bus join and Recovering -> Stopped as the controller Disables.
+No EOS is logged there. UI timestamps place Disable in the same log second;
+the records do not resolve its sub-second ordering against the guard refusal.
+Both failures are retained in `I/candidate-events-final-capture.stdout.log`;
+neither is excluded from the native timing samples or treated as successful
+continuous decoding. They strengthen the case for the fixed readiness-reason
+capture below, not a speculative camera or retry fix.
+
+The UI observation p50/p95 intervals (Enable/Start through desired-state UI,
+and Disable through controls released) are 6.337/6.878 and 3.950/4.458 s for SRT,
+8.909/9.425 and 2.925/3.448 s for RTSP. They include UI/persistence/polling and
+pipeline work around the native call; they are not isolated teardown times or
+remote-media readiness. The separate 150-frame peer results supply decoding
+evidence for the two explicitly identified media runs.
+
+**Bounded natural EOS observation on the CI image.** Current replacement CAM
+and both physical adapter identities were rechecked. The SRT listener started
+at 06:10:22 UTC and remained desired through the no-caller checkpoint at
+06:16:44 UTC: 382 seconds at one-second log precision, on AC, with no recorded
+EOS or transport refusal in that interval. The new source-pad probe attached.
+One native/WFP snapshot was taken at 06:11:12; other observation used saved
+redacted logs, not a concurrent native sampling loop. It showed UDP 18890 on
+`192.168.141.125`, the SRT rule enabled on Wi-Fi, six permit filters and RTSP
+disabled. Ethernet 13 remained up at 100 Mbps and the expected camera MAC was
+Reachable.
+
+THINKBOOK-G7 then decoded 150 raw video frames over SRT from 06:16:49 to
+06:16:58 UTC (8.237 s). The server logged caller acceptance/removal and no EOS
+through the 06:17:34 checkpoint, 38 seconds after caller removal. Normal Disable
+retired its listener/rule/managed permits; a bounded eight-second peer attempt
+received zero frames afterward. Evidence is `I/candidate-srt-observation.json`,
+the corresponding peer JSON/redacted log and installed native snapshots.
+This is observed decoding after an uninterrupted no-caller interval, not
+decoding after automatic recovery. Natural EOS did not recur in this bounded
+experiment; the original exact readiness-refusal branch remains unresolved.
+
+The next smallest EOS experiment is one failing bound-transport guard capture
+that distinguishes missing/not-ready/stale selection, index lookup/mismatch,
+status lookup/down and pending-snapshot contention with fixed reason codes.
+Correlate it with the existing EOS pad/bus sequence and generation/shutdown
+fields, link/ARP evidence and an actual decoding peer after recovery. Keep all
+readiness/identity fences unchanged. No credential, sensitive URL, native error
+payload or element name is needed. A longer blind soak or a speculative retry/
+readiness relaxation would not identify which historical guard refused.
+
+**Startup repetition and final shutdown.** At the 13:25 UTC resume Test was
+already closed, with a last-boot time of 06:34:41 UTC and no signed-in desktop
+user. Native observation found both rules disabled and no owned permits. The
+requested interactive Close task had never run (`0x41303`); it was recorded and
+retired before another launch. No reboot was initiated by this investigation.
+The operator signed in as TSD-0311; console session 1, exact SID/image, physical
+adapter identities, disabled profile and native baseline were rechecked.
+
+Two more exact-CI application starts completed the three recorded AC startup
+samples. All had admission wait 0, exit 0, contained/tree-exited results and
+complete native reconciliation:
+
+| Startup UTC | Policy script | Native runner | Runner excess | Trusted module stage |
+|---|---:|---:|---:|---:|
+| 06:00:16 | 4.560 s | 4.960 s | 0.400 s | 0.870 s |
+| 13:46:22 | 6.451 s | 8.721 s | 2.270 s | 1.949 s |
+| 13:54:13 | 5.008 s | 6.377 s | 1.369 s | 1.241 s |
+
+Runner p50/max are 6.377/8.721 s, all below 12 s. This is three observed AC
+starts, not a full matched-condition R2 closeout. The second and third full
+native reconciliation markers follow the firewall result by 13 and 8 seconds;
+that additional address/native recovery work is distinct from F's policy-runner
+budget and remains unchanged. A fresh Ethernet-source-bound camera OPTIONS
+returned 200 with `40-CD-3A-03-28-E2` Reachable. Post-start power remained AC;
+the second resource observation reported 37% CPU, unlike the earlier 2–11%
+snapshots. No historical resource contribution is inferred from those points.
+
+The second launch's early cached UI observer again missed controls, while later
+inspection passed in the same application process. A qualification-only change
+reacquires the current process-owned UI window for lookups; the third launch
+then passed. Its first staging attempt had a typed-catch parse error and ran no
+UI action; that failed task/hash is retained. The corrected controller is
+`bfbaf4f1df58258cc62807b5b501d3d485f1857e431468e52997e9bfb2feee76`.
+No application/UI production source was changed by these controller fixes.
+
+Both resumed instances closed by the normal window Close operation. Final
+Close was 13:57:36–13:57:37 UTC; the attached-process exit-code property was
+unavailable, but WaitForExit and independent process absence were verified.
+At **13:59:08 UTC**, `I/candidate-final-clean-retirement.stdout.log` and the
+final exported `final-state.json` establish zero product/helper/fault processes,
+zero output TCP listeners/UDP endpoints, zero named managed permits and zero
+application-bound WFP permits. Both ActiveStore and PersistentStore rules are
+disabled, with empty Package/no registry AppPkgId. All this task's qualification
+tasks are retired. Saved RTSP/SRT sections (including secrets), key, camera/PTU
+roles and selected adapter match the private baseline; Enable is false, output
+RTSP 18554, SRT 18890/125 ms. No unresolved native uncertainty remains. Existing
+host addresses/bindings and paused A4/B work were not manually changed.
+
+The complete timing analysis is `I/candidate-timing-combined.json`, assembled
+from five preserved redacted captures with their SHA-256 identities in
+`I/candidate-events-combined.json`. The application log rotated during the
+resumed run; no original capture was overwritten or failed sample dropped.
+The first 39-file installed export and final 49-file export both verified every
+indexed Test hash, with private profiles excluded. Final index SHA-256:
+`afa6715bbe195fe8ce9bb44b993563fbacbb091cf89faecb73f1fbb6edc37b24`;
+final-state SHA-256:
+`b4ed7a5dc1b3ef6def7b22695f138531ab1adaaa1f575cf6eb6ab550efde4daf`.
+Transfer receipts and both archives remain in I alongside the separate 61-file
+native fault export and all 167 original indexed exports. Both original
+v0.6.10 artifact hashes were reverified again at completion.
+
 ## Remaining gates and release state
 
-R0 audit repair and source validation passed. Installer built: yes, and the
-downloaded hashes match the exact final CI installed candidate. Earlier Test
-runs passed both real upgrades, live preview, default/custom remote RTSP/SRT,
-and firewall retirement on Stop/Disable. The bounded resume adds only its stated
-passes. The initial saved-MAC refusal was resolved with the operator's new camera;
-R9 running draft/Disable checks then passed. Policy timing misses and the SRT EOS
-are retained. Ready for public release: no. The remaining
-gates above require more isolated Test time,
-a separately authorized Second and full disposable Windows VM, and operator-led
-hardware testing. The release is still a draft. No tag was moved, no public feed
-changed, and no main merge was performed.
+The v0.6.10 results above remain historical. The separate v0.6.11 CI candidate
+has passing exact-source checks, normal Test upgrade, the stated repeated AC
+policy cases, three AC startup observations, two custom-port decoded-media runs,
+WFP enforcement/Disable retirement and final normal shutdown. The standalone
+native fault harness verifies only its own policy/executor source and identity;
+it does not close production application/SRT lease, fault-UI or ownership cases.
 
-Next bounded action: investigate the recorded Test startup/ensure/disable timing
-misses and SRT EOS using the preserved stages/resources, without relaxing budgets.
-Any production fix needs a separate branch, a new CI-built candidate and affected
-requalification. Native policy-failure UI needs an appropriate separately identified
-prescribed fixture; this executable cannot provide it. Remaining R5/R6
-application/SRT/ownership cases and all Second repetitions stay pending. Test is
-closed and clean at the final stopping point above; public release remains incomplete.
+Ready for public release: **no**. R2 still needs matched resource/power
+conditions, All-addresses reference and remaining port/protocol combinations,
+install-with-repair and all Second repetitions. EOS/transport refusal remains
+open, including the two new rapid-cycle GStreamer faults. Remote decoding after
+automatic recovery has not been observed. The remaining R3–R10 subcases,
+separately authorized Second, disposable VM and operator hardware gates retain
+their stated pending status. Paused A4/B, discovery/Clear, privilege integration
+and PTU movement remain outside this task.
+
+Next bounded action: capture one exact readiness-refusal reason with fixed,
+redacted diagnostics on Test, correlate pad/bus/generation/shutdown ordering and
+verify actual peer decoding after recovery. Repeat the affected policy cohorts
+under a recorded matched power/resource condition. Any further production change
+needs its own unused version/tag and exact CI artifact qualification; retain both
+existing tags and candidates. Native policy-failure UI still needs the prescribed
+separately identified fixture. Test is closed and clean at 13:59:08 UTC. Live
+completion checks show v0.6.11 draft ID 441266851 unpublished, public v0.6.9/feed
+unchanged and main still `922b414`; no main merge or publication was performed.
 
 Known product limitations are retained in [release notes](../../RELEASE-NOTES.md)
 and [user instructions](../../README.md): current discovery contention/history,
