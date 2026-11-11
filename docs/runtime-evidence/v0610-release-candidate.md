@@ -1425,41 +1425,186 @@ Private profiles and raw logs remain on Test; only redacted evidence and private
 file hash/index receipts were exported. Original failed samples and all earlier
 candidate artifacts remain preserved.
 
+## Controlled SRT recovery qualification — 11 November 2026 UTC
+
+Evidence **K** is this worktree's `src-tauri/target/srt-recovery-20261111T214000Z/`.
+One operator-authorized, precisely targeted upstream TCP abort tested whether an
+already-decoding remote SRT viewer resumes without intervention on the exact
+v0.6.12 CI image `18142f…536c18`. It qualifies recovery behavior only. It does not
+identify the historical v0.6.10 refusal branch or that connection's close semantics.
+
+Test identity, elevated account, unlocked TSD-0311 desktop, the closed exact image,
+the staged controller/observer hashes and the absence of leftover tasks were
+rechecked. The fresh private baseline at 21:50:57.251 recorded RTSP selected with
+the output stopped, SRT 18890 without passphrase or stream ID, the explicit Wi-Fi
+scope, Ethernet source 172.31.169.100 and camera RTSP port 554, with clean owned
+rules/WFP, on AC/Balanced (3% load, 9.3 GiB free). Bound OPTIONS from
+172.31.169.100 to 172.31.169.84:554 returned 200 at 21:51:13 with neighbor MAC
+`40-CD-3A-03-28-E2`.
+
+The qualification-only fixture `K/TcpAbort-Fixture.ps1`, SHA-256
+`4415032639d35fb5652e5cbcd63bbcc905a8a81f389241e1ff989696bc18219e`, follows the
+Microsoft Learn contract: `GetExtendedTcpTable(AF_INET, TCP_TABLE_OWNER_PID_ALL)`
+rows with in_addr addresses and network-order ports in the low 16 bits at
+padding-aware offsets, and one elevated `SetTcpEntry` with
+`MIB_TCP_STATE_DELETE_TCB` (12). It parsed under Windows PowerShell 5.1, and its
+reader matched all 44 non-listening IPv4 connections that `Get-NetTCPConnection`
+reported on THINKBOOK-G7, without entering the abort path. It refuses unless exactly one
+Established row matches the installed image's PID and creation time, the verified
+source, camera address and saved camera port. It re-validates immediately before
+acting, refuses after any refusal, EOS, bus error, runtime fault or recovery since
+Start or without an accepted caller, and writes a one-shot marker before its single
+call. The documentation does not say whether the remote end receives a reset; only
+local effects are recorded.
+
+SSH line-echo clock comparison gives Test − THINKBOOK-G7 = **−1184.525 ms ±10.979
+ms** before (best round trip 21.958 ms, 20 samples) and −1188.656 ±9.837 ms after,
+a −4.1 ms drift. Cross-host values below carry ±42 ms (clock, ≤16 ms Test fixture
+timestamp resolution, ≤15 ms peer line-read latency) and are not otherwise ordered.
+
+The established controller launched PID 16316, created 21:51:31.5693990Z. Startup
+policy native/script was 6.529/5.110 s with 0 ms admission; full reconciliation
+completed at 21:51:50.444. The controller selected SRT and started the saved output
+at 21:53:03.880: Ensure admission 0 ms, native/script 7.234/6.042 s, listener at
+21:53:12.858, generation 1 / instance 1 / data 1 on bound transport 1. The running
+snapshot at 21:53:51–56 verified the enabled SRT rule, the PID-owned UDP
+192.168.141.125:18890 listener and exactly six permits with the exact application,
+port 18890, protocol 17 and Wi-Fi LUID `19985273102270464` equality conditions on
+the required layers.
+
+One decoder, PID 2524, used the established pinned peer launcher and pipeline. Its
+first frame was 21:54:13.720 in the peer clock; Test accepted the caller at
+21:54:12.029. The read-only selection at 21:54:33.955 found exactly one matching
+Established connection, `172.31.169.100:59941 → 172.31.169.84:554`, which was also
+the only camera connection from any process. The application's other rows were the
+loopback proxy listener and its rtspsrc pair. The abort followed 1,365 decoded
+frames and 45.479 s of gap-free decoding, more than 30 s after the last bulk
+observer, with no refusal, EOS, fault or recovery logged since Start.
+
+| Test UTC (21:55:) | After fault | Observation |
+|---|---:|---|
+| 03.5589 | 0 | `SetTcpEntry` returned `NO_ERROR` (8.3 ms call); tuple absent 11 ms later |
+| 03.5653 | 6.3 ms | Proxy forwarding ended with os error 10054; no transport refusal |
+| 03.5655–.5659 | 6.5–6.9 ms | `srt_eos` rtsp_source → output → bus, all `Seqnum(22)`, generation 1 / instance 1 / data 1, `shutdown_requested=false`; message source pipeline |
+| 03.5660 | 7.1 ms | `Streaming -> Recovering fault=eos` |
+| 03.5757 | 16.8 ms | Transport 1 retired (`owner_shutdown`); bus thread joined |
+| 04.6444 | 1.085 s | Disable admitted, 0 ms wait |
+| 08.1340 | 4.575 s | Retirement complete: native 3.488 s, script 2.461 s, `inactive`, 0 blocks, not uncertain; backoff attempt 1, 0 ms |
+| 08.1464 | 4.587 s | Ensure admitted, 0 ms wait |
+| 14.0954 | 10.536 s | Ensure applied and verified: native 5.948 s, script 5.071 s, unchanged template |
+| 14.1182–.1191 | 10.559–10.560 s | Transport 2 context generation 1 / instance 2 / data 2; listener started; `listener_ready` 10.552 s after recovery start |
+| 14.1617 | 10.603 s | Caller re-accepted, 1/10 (the only peer) |
+| 14.2483 | 10.689 s | `Starting -> Streaming` |
+| ≈14.514 | 10.955 s ±42 ms | First resumed decoded frame (peer clock 21:55:15.698) |
+| 45.1851 | 41.626 s | Healthy for 30 s; recovery backoff reset |
+
+Disable stages: trusted modules 967, ownership 891, disable 281, shape 198, input
+99, inventory 17 and access 8 ms. Ensure stages: shape 1,055, trusted modules 924,
+ownership 785, bind modules 598, blocks 585, readback 492, interface 206, prepare
+204, enable 124, input 83, access 7 and inventory 7 ms. Runner minus script is
+1.027 s for Disable and 0.877 s for Ensure. The 1.069 s from bus-thread join to
+Disable admission precedes native accounting. Both calls are within the unchanged
+8/15-second limits.
+
+The same decoder ran its full 300.028 s bound and decoded **8,642 raw frames**:
+1,532 before the interruption, then one 10.947 s gap (last pre-fault frame
+21:55:04.751, first resumed frame 21:55:15.698, peer clock), then **7,110** after
+resuming. There was no other gap over two seconds. At least 150 resumed frames
+were decoded by 21:55:24.565 (peer), within 19.82 s of the fault. The last
+pre-fault frame (≈21:55:03.566 Test) cannot be ordered against the fault within
+±42 ms. Listener readiness to the first resumed frame was 0.395 s ±42 ms. There was
+no manual reconnect, restart or Start. The observer stopped its own decoder at the
+bound (exit −1), and Test logged the caller's removal at 21:59:16.880. The
+post-recovery snapshot at 21:56:32–37, more than 30 s after media resumed, again
+verified the rule, the PID-owned listener and exactly six permits with the exact
+conditions (new filter IDs 88699–88704).
+
+Normal Disable at 21:59:44.295 stopped data 2 with the expected shutdown-order
+`relay_retired` before-send refusal for transport 2, 0.945 ms after `srt_shutdown`.
+Disable admission was 0 ms, native/script 3.882/2.804 s, with retirement
+`inactive`. A fresh peer then decoded 0 frames within 8 s. The saved stopped RTSP
+selection was restored at 22:00:34 without a firewall operation. After normal Close
+at 22:01:26, a PID-and-creation-time check found all seven application/WebView
+processes exited (22:01:46.154).
+
+At 22:02:09.779 the exact image was installed and closed: both owned rules
+disabled in both stores, no AppPkgId, no product or fixture process, no output
+listener or endpoint and zero application-bound WFP permits. All six owned tasks
+were retired. The key, camera/PTU roles, cached roles, selected adapter and output
+sections matched baseline. At 22:02:23.360 addresses, routes, next hops, metrics,
+DHCP/interface metrics, DNS and operator configuration sections matched baseline.
+The fixture marker and exactly one abort record remain. The redacted export of 55
+files was verified by length and SHA-256 (index `d999e786…357b`, archive
+`c0c8362b…3cdc`); private profiles and raw logs remain on Test. No Second host,
+PTU movement, camera reboot, adapter change, unrelated network change or
+development-PC native mutation was used.
+
+**Result: pass**, scoped to automatic EOS-path recovery of one already-decoding
+remote SRT caller under these conditions: saved SRT 18890 on explicit Wi-Fi,
+AC/Balanced, and one THINKBOOK-G7 caller using the established GStreamer `srtsrc`
+pipeline without passphrase or stream ID, after one controlled upstream camera
+abort. The application process stayed the same throughout. Recovery kept generation
+1 and advanced instance and data from 1 to 2. Retirement and Ensure were verified and
+contained within the unchanged limits. The same decoder produced 7,110 frames after
+the interruption, and a later snapshot verified the six exact permits.
+
+This fault entered through the proxy's forwarding error, not a readiness refusal;
+the transport stayed active until owner shutdown. It shares the downstream path
+with the historical event: loopback close, rtspsrc EOS, bus EOS, then `fault=eos`
+recovery. It does not identify that event's refusal branch or close semantics.
+
+The run does not qualify:
+
+- the gst_error path or a refusal-triggered retirement;
+- RTSP output;
+- callers with a passphrase or stream ID, or other client implementations;
+- battery conditions;
+- repetition; this is one sample.
+
+The bounded peer message buffer filled with per-frame property notifications, so
+`srtsrc` messages around the interruption were not retained. Frame counting and gap
+timing use the established line pattern and are unaffected. The historical 24.173 s
+v0.6.10 recovery is not compared beyond recording: images, timings and conditions
+differ.
+
 ## Remaining gates and release state
 
 The v0.6.10 and v0.6.11 results above remain attached to their original images.
 The new unpublished v0.6.12 CI candidate has passing source/packaging checks,
 normal Test upgrade, two ten-case AC policy cohorts, three startup observations,
-custom-port RTSP/SRT decoded media, live protocol handover, exact WFP conditions
-and normal shutdown/retirement. It fixes the confirmed read-only pending-holder
-refusal with reader/writer exclusion preserved. The standalone native fault
+custom-port RTSP/SRT decoded media, live protocol handover, exact WFP conditions,
+one controlled EOS-path SRT viewer recovery and normal shutdown/retirement. It
+fixes the confirmed read-only pending-holder refusal with reader/writer exclusion
+preserved. The standalone native fault
 harness still qualifies only its separately identified policy/executor source;
 it does not close production application/SRT lease, fault-UI or ownership cases.
 
 Ready for public release: **no**. R2 still needs matched resource/power
 conditions, All-addresses reference and remaining port/protocol combinations,
 install-with-repair and all Second repetitions. Historical EOS origin remains
-unproven: the new reader-holder capture establishes a different recorded refusal
-but cannot retrospectively identify the 04:02:02 EOS branch. No EOS or automatic
-recovery occurred in the v0.6.12 observations. The earlier recovery runs lack
-observed pre-failure decoding, so decoding-before-failure and automatic
-peer-reconnect acceptance remain pending. The remaining R3–R10 subcases,
-separately authorized Second, disposable VM and operator hardware gates retain
-their stated pending status. No Second host is authorized. Paused A4/B,
+unproven and cannot be attributed from the preserved evidence. The reader-holder
+capture establishes a different recorded refusal, and the controlled abort
+qualifies recovery behavior only. Automatic recovery of an already-decoding SRT
+caller, with at least 150 decoded frames after recovery and no manual peer action,
+is now qualified for the recorded EOS-path scope above. Still unqualified: the
+gst_error and refusal-triggered paths, RTSP-output viewer recovery, other clients
+and repetition. The remaining R3–R10 subcases, separately authorized Second,
+disposable VM and operator hardware gates retain their stated pending status. No
+Second host is authorized. Paused A4/B,
 discovery/Clear, privilege integration and PTU movement remain outside this task.
 
-Next bounded action: on this exact CI image, establish decoded media on one peer
-before observing an unexpected failure, then correlate the existing first-refusal,
-source/output pad, bus and lifecycle diagnostics and require at least 150 decoded
-frames after recovery without manual peer restart. A separately identified
-controlled-fault experiment can qualify recovery behavior but cannot establish
-the historical EOS origin. No further production fix is justified without that
-evidence. Remaining matched-condition policy cohorts are separate R2 work;
-native policy-failure UI still needs the prescribed separately identified fixture.
-Any further production change needs its own unused version/tag and exact CI
-artifact qualification.
+Next bounded action: run matched-power ten-case unchanged-SRT and changed-RTSP
+cohorts on this exact image with the established procedure. The other single-host
+R2 items are the All-addresses reference, remaining port/protocol combinations and
+install-with-repair. Second-host repetitions still need separate authorization.
+RTSP-output recovery needs its acceptance stated before it runs, for example a
+fresh session decoding without operator action. The established RTSP peer
+pipeline (`rtspsrc` under gst-launch) has no reconnect behavior and exits at end
+of stream. No further production fix is justified by current evidence. Native policy-failure UI still needs the
+prescribed separately identified fixture. Any further production change needs its
+own unused version/tag and exact CI artifact qualification.
 
-Test remains installed on **v0.6.12**, closed and clean at **19:23:54 UTC**.
+Test remains installed on **v0.6.12**, closed and clean at **22:02:09 UTC**.
 Live completion checks identify v0.6.12 draft **442083374**, v0.6.11 draft
 441266851 and v0.6.10 draft 440937913, all unpublished. Main remains
 `922b41434bd16a76eedddace9cdf6bbb101e0901`; all three immutable tags resolve to
