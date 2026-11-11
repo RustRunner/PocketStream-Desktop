@@ -121,7 +121,8 @@ impl SrtCallbackContext {
         // Only fixed stage names and numeric/lifecycle fields. GStreamer object
         // names, paths, debug text and RTSP/SRT properties can contain secrets.
         log::info!(
-            "event=srt_eos stage={stage} instance={} data={} seqnum={seqnum:?} shutdown_requested={}",
+            "event=srt_eos stage={stage} generation={} instance={} data={} seqnum={seqnum:?} shutdown_requested={}",
+            self.health.server_generation(),
             self.server_instance,
             self.data_generation,
             self.is_shutdown_requested(),
@@ -622,6 +623,20 @@ fn spawn_bus_thread(
                     }
                     continue;
                 };
+                // Record the observed message even if shutdown suppresses its
+                // fault, with only fixed values and existing lifecycle IDs.
+                match message.view() {
+                    gst::MessageView::Error(_) => log::info!(
+                        "event=srt_bus stage=error generation={} instance={} data={} seqnum={:?} shutdown_requested={}",
+                        callbacks.health.server_generation(),
+                        callbacks.server_instance,
+                        callbacks.data_generation,
+                        message.seqnum(),
+                        callbacks.is_shutdown_requested(),
+                    ),
+                    gst::MessageView::Eos(_) => callbacks.trace_eos("bus", message.seqnum()),
+                    _ => {}
+                }
                 if callbacks.is_shutdown_requested() {
                     break;
                 }
@@ -645,7 +660,6 @@ fn spawn_bus_thread(
                         );
                     }
                     gst::MessageView::Eos(..) => {
-                        callbacks.trace_eos("bus", message.seqnum());
                         log::info!(
                             "event=srt_eos_message source={}",
                             eos_message_source(&message)
@@ -895,6 +909,12 @@ impl SrtRestreamer {
             shutdown_requested.clone(),
             data_generation,
         );
+        transport.trace_context(
+            "srt",
+            runtime.health.server_generation(),
+            runtime.server_instance,
+            data_generation,
+        );
         let mut signal_handlers = vec![(
             parts.source.clone(),
             super::connect_video_only_select_stream(&parts.source),
@@ -913,7 +933,11 @@ impl SrtRestreamer {
                 if upstream_callbacks.is_shutdown_requested() {
                     return Some(false.to_value());
                 }
-                let ready = upstream_ready().is_ok();
+                let readiness = upstream_ready();
+                if let Err(error) = &readiness {
+                    transport.trace_refusal(error);
+                }
+                let ready = readiness.is_ok();
                 if !ready {
                     upstream_callbacks.emit_fault(
                         RelayFaultKind::GstError,
@@ -1040,6 +1064,12 @@ impl SrtRestreamer {
         if self.stopped {
             return;
         }
+        log::info!(
+            "event=srt_shutdown generation={} instance={} data={}",
+            self.health.server_generation(),
+            self.server_instance,
+            self.data_generation,
+        );
         self.stopped = true;
         stop_candidate(
             &self.pipeline,

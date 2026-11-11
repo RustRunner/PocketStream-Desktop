@@ -110,21 +110,19 @@ impl AdapterSelector {
         &self,
         pending_ips: &auto_adopt::PendingIps,
     ) -> Option<(InterfaceInfo, u32, SweepFence)> {
-        let snapshot = self.presence.snapshot();
-        let mut adapter = snapshot.adapter?;
-        if snapshot.fence.is_stale() || interface::index_for_mac(&adapter.mac)? != snapshot.index {
-            return None;
-        }
-        let (up, ips) = interface::quick_status_by_mac(&adapter.mac)?;
-        if !up {
-            return None;
-        }
-        adapter.ips = ips;
-        let pending = pending_ips.try_lock().ok()?;
-        adapter
-            .ips
-            .retain(|ip| !pending.iter().any(|p| p.ip.to_string() == ip.address));
-        Some((adapter, snapshot.index, snapshot.fence))
+        self.probe_scope_diagnosed(pending_ips).ok()
+    }
+
+    pub(super) fn probe_scope_diagnosed(
+        &self,
+        pending_ips: &auto_adopt::PendingIps,
+    ) -> Result<(InterfaceInfo, u32, SweepFence), crate::error::ReadinessRefusal> {
+        probe_scope_with(
+            self.presence.snapshot(),
+            pending_ips,
+            interface::index_for_mac,
+            interface::quick_status_by_mac,
+        )
     }
     pub(super) fn new() -> Self {
         Self {
@@ -206,6 +204,37 @@ impl AdapterSelector {
     }
 }
 
+// The ordinary probes discard the reason. Only a refusing transport logs it.
+// Preserve the original read order and try_lock admission, without rereading.
+fn probe_scope_with(
+    snapshot: presence::Snapshot,
+    pending_ips: &auto_adopt::PendingIps,
+    index_for_mac: impl FnOnce(&str) -> Option<u32>,
+    status_by_mac: impl FnOnce(&str) -> Option<(bool, Vec<interface::IpInfo>)>,
+) -> Result<(InterfaceInfo, u32, SweepFence), crate::error::ReadinessRefusal> {
+    use crate::error::ReadinessRefusal as Refusal;
+    let mut adapter = snapshot.adapter.ok_or(Refusal::MissingSelection)?;
+    if snapshot.fence.is_stale() {
+        return Err(Refusal::StaleSelection);
+    }
+    let index = index_for_mac(&adapter.mac).ok_or(Refusal::IndexLookupFailed)?;
+    if index != snapshot.index {
+        return Err(Refusal::IndexMismatch);
+    }
+    let (up, ips) = status_by_mac(&adapter.mac).ok_or(Refusal::StatusLookupFailed)?;
+    if !up {
+        return Err(Refusal::AdapterDown);
+    }
+    adapter.ips = ips;
+    let pending = pending_ips
+        .try_lock()
+        .map_err(|_| Refusal::PendingSnapshotBusy)?;
+    adapter
+        .ips
+        .retain(|ip| !pending.iter().any(|p| p.ip.to_string() == ip.address));
+    Ok((adapter, snapshot.index, snapshot.fence))
+}
+
 pub(super) fn adapter_mac(mac: &str) -> Option<String> {
     let bytes = parse_mac_bytes(mac)?;
     (bytes != [0; 6] && bytes[0] & 1 == 0).then(|| mac.replace('-', ":").to_ascii_lowercase())
@@ -235,6 +264,86 @@ pub(crate) fn pick_adapter<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scope_snapshot() -> presence::Snapshot {
+        presence::Snapshot {
+            adapter: Some(adapter("Ethernet", &["192.0.2.100", "192.0.2.101"])),
+            index: 7,
+            mode: Default::default(),
+            revision: 1,
+            fence: SweepFence::new(
+                1,
+                Arc::new(AtomicU64::new(1)),
+                Arc::new(AtomicBool::new(true)),
+            ),
+        }
+    }
+
+    #[test]
+    fn scope_refusal_records_the_exact_branch_without_later_reads() {
+        use crate::error::ReadinessRefusal as Refusal;
+        let pending = Arc::new(Mutex::new(Vec::new()));
+        let mut missing = scope_snapshot();
+        missing.adapter = None;
+        let mut stale = scope_snapshot();
+        stale.fence = SweepFence::new(
+            1,
+            Arc::new(AtomicU64::new(2)),
+            Arc::new(AtomicBool::new(true)),
+        );
+        for (snapshot, expected) in [
+            (missing, Refusal::MissingSelection),
+            (stale, Refusal::StaleSelection),
+        ] {
+            assert!(matches!(
+                probe_scope_with(snapshot, &pending, |_| panic!("late index read"), |_| panic!("late status read")),
+                Err(reason) if reason == expected
+            ));
+        }
+        for (index, expected) in [
+            (None, Refusal::IndexLookupFailed),
+            (Some(8), Refusal::IndexMismatch),
+        ] {
+            assert!(matches!(
+                probe_scope_with(scope_snapshot(), &pending, |_| index, |_| panic!("late status read")),
+                Err(reason) if reason == expected
+            ));
+        }
+        for (status, expected) in [
+            (None, Refusal::StatusLookupFailed),
+            (Some((false, Vec::new())), Refusal::AdapterDown),
+        ] {
+            assert!(matches!(
+                probe_scope_with(scope_snapshot(), &pending, |_| Some(7), |_| status),
+                Err(reason) if reason == expected
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn busy_snapshot_still_refuses_and_pending_sources_remain_excluded() {
+        use crate::error::ReadinessRefusal as Refusal;
+        let pending = Arc::new(Mutex::new(vec![auto_adopt::PendingIp {
+            iface: "Ethernet".into(),
+            ip: "192.0.2.100".parse().unwrap(),
+            adoption_id: 1,
+        }]));
+        let held = pending.lock().await;
+        let probe = || {
+            let snapshot = scope_snapshot();
+            let ips = snapshot.adapter.as_ref().unwrap().ips.clone();
+            probe_scope_with(snapshot, &pending, |_| Some(7), |_| Some((true, ips)))
+        };
+        let refused = probe();
+        drop(held);
+        // Releasing the mutex cannot relabel the refusal already captured.
+        assert!(matches!(refused, Err(Refusal::PendingSnapshotBusy)));
+        let (adapter, index, fence) = probe().unwrap();
+        assert_eq!(index, 7);
+        assert!(!fence.is_stale());
+        assert_eq!(adapter.ips.len(), 1);
+        assert_eq!(adapter.ips[0].address, "192.0.2.101");
+    }
 
     #[tokio::test]
     async fn proposals_do_not_commit_before_old_work_is_retired() {

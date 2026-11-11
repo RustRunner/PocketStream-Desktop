@@ -1482,6 +1482,9 @@ impl RelayService {
                 .or_else(|| state.firewall_generation.map(|(generation, _)| generation));
 
             if stops_desired {
+                log::info!(
+                    "event=restream_stop_intent epoch={stop_epoch} generation={desired_generation:?} desired=true"
+                );
                 if let Some(health) = state.restream_health.as_ref() {
                     health.stop();
                 }
@@ -2081,9 +2084,10 @@ fn guard_relay_upstream(
         if generation.load(std::sync::atomic::Ordering::Acquire) != expected_generation
             || !health.upstream_allowed()
         {
-            return Err(AppError::Stream(
-                "Relay connection superseded or retired".into(),
-            ));
+            return Err(
+                AppError::Stream("Relay connection superseded or retired".into())
+                    .with_readiness_reason(crate::error::ReadinessRefusal::RelayRetired),
+            );
         }
         ready()
     })

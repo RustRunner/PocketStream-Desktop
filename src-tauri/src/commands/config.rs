@@ -38,6 +38,10 @@ pub async fn apply_restream_settings(
     network: State<'_, std::sync::Arc<crate::network::NetworkManager>>,
     update: RestreamSettingsUpdate,
 ) -> Result<RestreamOperationResult, AppError> {
+    log::info!(
+        "event=restream_operator action=apply_settings enabled={}",
+        update.enabled
+    );
     let adopted = network.get_adopted_ips().await.into_values().collect();
     stream
         .apply_restream_settings(&config, update, &adopted)

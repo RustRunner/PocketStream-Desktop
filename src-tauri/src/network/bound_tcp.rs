@@ -1,14 +1,14 @@
 //! Loopback TCP forwarding bound to a freshly verified Ethernet device.
 //! No default-route fallback; the owner and identity fence govern all sockets.
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::{TcpSocket, TcpStream};
 use tokio::task::JoinSet;
 
-use crate::error::AppError;
+use crate::error::{AppError, ReadinessRefusal};
 use crate::network::route::ReadyPath;
 
 pub type PathReady = Arc<dyn Fn() -> Result<ReadyPath, AppError> + Send + Sync>;
@@ -16,27 +16,65 @@ pub type PathReady = Arc<dyn Fn() -> Result<ReadyPath, AppError> + Send + Sync>;
 const CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONNECTIONS: usize = 8;
+static NEXT_TRANSPORT: AtomicU64 = AtomicU64::new(1);
 
 struct Gate {
+    id: u64,
     path: ReadyPath,
     ready: PathReady,
     active: AtomicBool,
+    refusal_logged: AtomicBool,
+    retirement_logged: AtomicBool,
 }
 
 impl Gate {
-    fn check(&self) -> Result<(), AppError> {
-        if !self.active.load(Ordering::Acquire) || self.path.fence.is_stale() {
-            return Err(AppError::Network("Device Ethernet session retired".into()));
+    fn check(&self, stage: &'static str) -> Result<(), AppError> {
+        let result = (|| {
+            if !self.active.load(Ordering::Acquire) {
+                return Err(AppError::Network("Device Ethernet session retired".into())
+                    .with_readiness_reason(ReadinessRefusal::TransportRetired));
+            }
+            if self.path.fence.is_stale() {
+                return Err(AppError::Network("Device Ethernet session retired".into())
+                    .with_readiness_reason(ReadinessRefusal::StaleSelection));
+            }
+            let current = (self.ready)()?;
+            if current.fence.is_stale() {
+                return Err(AppError::Network("Device Ethernet path changed".into())
+                    .with_readiness_reason(ReadinessRefusal::StaleSelection));
+            }
+            if current.index != self.path.index
+                || current.source != self.path.source
+                || current.target != self.path.target
+            {
+                return Err(AppError::Network("Device Ethernet path changed".into())
+                    .with_readiness_reason(ReadinessRefusal::PathChanged));
+            }
+            Ok(())
+        })();
+        if let Err(error) = &result {
+            self.trace_refusal(stage, error);
         }
-        let current = (self.ready)()?;
-        if current.fence.is_stale()
-            || current.index != self.path.index
-            || current.source != self.path.source
-            || current.target != self.path.target
-        {
-            return Err(AppError::Network("Device Ethernet path changed".into()));
+        result
+    }
+
+    fn trace_refusal(&self, stage: &'static str, error: &AppError) {
+        if !self.refusal_logged.swap(true, Ordering::Relaxed) {
+            let reason = match error {
+                AppError::Readiness { reason, .. } => reason.code(),
+                _ => "path_not_ready",
+            };
+            log::warn!(
+                "event=bound_tcp_refusal transport={} stage={stage} reason={reason}",
+                self.id,
+            );
         }
-        Ok(())
+    }
+
+    fn trace_retirement(&self, cause: &'static str) {
+        if !self.retirement_logged.swap(true, Ordering::Relaxed) {
+            log::info!("event=bound_tcp_retire transport={} cause={cause}", self.id);
+        }
     }
 }
 
@@ -67,11 +105,14 @@ impl BoundTcpTransport {
         }
         let destination = SocketAddrV4::new(ip, endpoint.port().unwrap_or(554));
         let gate = Arc::new(Gate {
+            id: NEXT_TRANSPORT.fetch_add(1, Ordering::Relaxed),
             path,
             ready,
             active: AtomicBool::new(true),
+            refusal_logged: AtomicBool::new(false),
+            retirement_logged: AtomicBool::new(false),
         });
-        gate.check()?;
+        gate.check("start")?;
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(transport_error)?;
         listener.set_nonblocking(true).map_err(transport_error)?;
         let address = listener.local_addr().map_err(transport_error)?;
@@ -80,7 +121,10 @@ impl BoundTcpTransport {
         // on a GLib thread without a Tokio reactor entered on that thread.
         let task = tauri::async_runtime::spawn(async move {
             if let Err(error) = serve(listener, destination, current.clone()).await {
+                current.trace_retirement("serve_error");
                 log::warn!("Ethernet-bound TCP transport stopped: {error}");
+            } else {
+                current.trace_retirement("fence_cancelled");
             }
             current.active.store(false, Ordering::Release);
         });
@@ -97,10 +141,28 @@ impl BoundTcpTransport {
 
     pub(crate) fn readiness_check(&self) -> impl Fn() -> bool + Send + Sync + 'static {
         let gate = self.gate.clone();
-        move || gate.check().is_ok()
+        move || gate.check("rtsp_before_send").is_ok()
+    }
+
+    pub(crate) fn trace_context(
+        &self,
+        owner: &'static str,
+        generation: u64,
+        instance: u64,
+        data: u64,
+    ) {
+        log::info!(
+            "event=bound_tcp_context transport={} owner={owner} generation={generation} instance={instance} data={data}",
+            self.gate.id,
+        );
+    }
+
+    pub(crate) fn trace_refusal(&self, error: &AppError) {
+        self.gate.trace_refusal("srt_before_send", error);
     }
 
     pub(crate) fn shutdown(&self) {
+        self.gate.trace_retirement("owner_shutdown");
         self.gate.active.store(false, Ordering::Release);
         self.task.abort();
     }
@@ -129,11 +191,11 @@ async fn serve(
         tokio::select! {
             biased;
             _ = gate.path.fence.cancelled() => return Ok(()),
-            _ = interval.tick() => gate.check()?,
+            _ = interval.tick() => gate.check("serve_interval")?,
             _ = connections.join_next(), if !connections.is_empty() => {},
             accepted = listener.accept() => {
                 let (client, _) = accepted.map_err(transport_error)?;
-                gate.check()?;
+                gate.check("accept")?;
                 if connections.len() < MAX_CONNECTIONS {
                     let current = gate.clone();
                     connections.spawn(async move {
@@ -191,13 +253,13 @@ async fn forward(
     destination: SocketAddrV4,
     gate: Arc<Gate>,
 ) -> Result<(), AppError> {
-    gate.check()?;
+    gate.check("connect")?;
     let socket = bind_socket(gate.path.source, gate.path.index).map_err(transport_error)?;
     let mut camera = tokio::time::timeout(CONNECT_TIMEOUT, socket.connect(destination.into()))
         .await
         .map_err(|_| AppError::Network("Camera TCP connection timed out on Ethernet".into()))?
         .map_err(transport_error)?;
-    gate.check()?;
+    gate.check("connected")?;
     camera.set_nodelay(true).map_err(transport_error)?;
     client.set_nodelay(true).map_err(transport_error)?;
     tokio::io::copy_bidirectional(&mut client, &mut camera)
@@ -230,6 +292,46 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn guard_preserves_the_refusing_result_and_does_not_repeat_readiness() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let observed = calls.clone();
+        let gate = Gate {
+            id: 0,
+            path: test_path("127.0.0.1"),
+            ready: Arc::new(move || {
+                assert_eq!(observed.fetch_add(1, Ordering::Relaxed), 0);
+                Err(
+                    AppError::Network("Selected Ethernet adapter unavailable".into())
+                        .with_readiness_reason(ReadinessRefusal::PendingSnapshotBusy),
+                )
+            }),
+            active: AtomicBool::new(true),
+            refusal_logged: AtomicBool::new(false),
+            retirement_logged: AtomicBool::new(false),
+        };
+        let error = gate.check("serve_interval").unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Readiness {
+                reason: ReadinessRefusal::PendingSnapshotBusy,
+                ..
+            }
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(gate.refusal_logged.load(Ordering::Relaxed));
+        // Explicit retirement still refuses without another readiness read.
+        gate.active.store(false, Ordering::Release);
+        assert!(matches!(
+            gate.check("rtsp_before_send"),
+            Err(AppError::Readiness {
+                reason: ReadinessRefusal::TransportRetired,
+                ..
+            })
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
 
     #[cfg(windows)]
     #[tokio::test]

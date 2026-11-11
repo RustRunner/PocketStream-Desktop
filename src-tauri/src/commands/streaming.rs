@@ -83,6 +83,7 @@ pub async fn start_restream_server(
 pub async fn stop_restream_server(
     stream: State<'_, std::sync::Arc<StreamManager>>,
 ) -> Result<(), AppError> {
+    log::info!("event=restream_operator action=stop");
     stream.stop_restream_server().await
 }
 

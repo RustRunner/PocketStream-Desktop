@@ -289,7 +289,7 @@ fn setup_logging() {
         .format(|out, message, record| {
             out.finish(format_args!(
                 "{} [{}] {} - {}",
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.6f"),
                 record.level(),
                 record.target(),
                 message,
@@ -651,6 +651,7 @@ pub fn run() {
             // its own 5 s wait. block_on is safe here — the event loop is
             // already exiting and there's no UI to keep responsive.
             if let tauri::RunEvent::ExitRequested { .. } = event {
+                log::info!("event=restream_operator action=application_exit");
                 let manager: tauri::State<'_, std::sync::Arc<network::NetworkManager>> = app_handle.state();
                 #[cfg(windows)]
                 manager.close_temporary_cleanup();

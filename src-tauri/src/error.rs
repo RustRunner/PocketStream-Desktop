@@ -1,10 +1,49 @@
 use serde::ser::SerializeStruct;
 use serde::Serialize;
 
+/// Fixed, redacted reasons carried by the check that actually refused a path.
+/// These are internal diagnostics; the existing IPC kind and text stay intact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadinessRefusal {
+    MissingSelection,
+    StaleSelection,
+    IndexLookupFailed,
+    IndexMismatch,
+    StatusLookupFailed,
+    AdapterDown,
+    PendingSnapshotBusy,
+    TransportRetired,
+    PathChanged,
+    RelayRetired,
+}
+
+impl ReadinessRefusal {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::MissingSelection => "missing_selection",
+            Self::StaleSelection => "stale_selection",
+            Self::IndexLookupFailed => "index_lookup_failed",
+            Self::IndexMismatch => "index_mismatch",
+            Self::StatusLookupFailed => "status_lookup_failed",
+            Self::AdapterDown => "adapter_down",
+            Self::PendingSnapshotBusy => "pending_snapshot_busy",
+            Self::TransportRetired => "transport_retired",
+            Self::PathChanged => "path_changed",
+            Self::RelayRetired => "relay_retired",
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error("Network error: {0}")]
     Network(String),
+
+    #[error("{error}")]
+    Readiness {
+        reason: ReadinessRefusal,
+        error: Box<AppError>,
+    },
 
     /// The owned address is still settling; retry only after verified cleanup.
     /// Keep the existing Network wire kind for frontend compatibility.
@@ -43,11 +82,19 @@ pub enum AppError {
 }
 
 impl AppError {
+    pub(crate) fn with_readiness_reason(self, reason: ReadinessRefusal) -> Self {
+        Self::Readiness {
+            reason,
+            error: Box::new(self),
+        }
+    }
+
     /// Stable discriminator for frontend branching. Don't rename casually —
     /// these strings are part of the IPC contract.
     pub fn kind(&self) -> &'static str {
         match self {
             AppError::Network(_) | AppError::AddressNotReady(_) => "Network",
+            AppError::Readiness { error, .. } => error.kind(),
             AppError::DiscoveryUnavailable(_) => "DiscoveryUnavailable",
             AppError::Stream(_) => "Stream",
             AppError::Config(_) => "Config",
@@ -81,6 +128,17 @@ impl Serialize for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_reason_is_internal_and_keeps_existing_network_wire_value() {
+        let previous = AppError::Network("Selected Ethernet adapter unavailable".into());
+        let diagnosed = AppError::Network("Selected Ethernet adapter unavailable".into())
+            .with_readiness_reason(ReadinessRefusal::PendingSnapshotBusy);
+        assert_eq!(
+            serde_json::to_value(previous).unwrap(),
+            serde_json::to_value(diagnosed).unwrap()
+        );
+    }
 
     // ── Display ─────────────────────────────────────────────────────
 

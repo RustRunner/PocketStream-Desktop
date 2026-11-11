@@ -302,6 +302,9 @@ impl PlaybackPipeline {
             .by_name("src")
             .ok_or_else(|| AppError::Stream("RTSP source missing".into()))?;
         self.rtsp_transport = Some(super::rtsp_transport::configure(&source, url, ready)?);
+        if let Some(transport) = &self.rtsp_transport {
+            transport.trace_context("playback", self.generation, 0, 0);
+        }
         Ok(())
     }
 

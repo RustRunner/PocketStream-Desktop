@@ -793,7 +793,8 @@ impl RtspRestreamer {
             let result = if health_for_gate.loop_alive_for(server_instance) {
                 upstream_ready()
             } else {
-                Err(AppError::Stream("Relay instance retired".into()))
+                Err(AppError::Stream("Relay instance retired".into())
+                    .with_readiness_reason(crate::error::ReadinessRefusal::RelayRetired))
             };
             if let Err(error) = &result {
                 health_for_gate.mark_build_failed(server_instance, error.to_string(), false);
@@ -803,6 +804,7 @@ impl RtspRestreamer {
             }
             result
         });
+        let generation_for_transport = health.server_generation();
         factory.connect_media_configure(move |_factory, media| {
             let element = media.element();
             if let Ok(bin) = element.downcast::<gst::Bin>() {
@@ -822,6 +824,7 @@ impl RtspRestreamer {
                                 return; // location remains unset; no upstream connection
                             }
                         };
+                    transport.trace_context("rtsp", generation_for_transport, server_instance, 0);
                     media.connect_unprepared(move |_| transport.shutdown());
                     if !user_for_factory.is_empty() {
                         src.set_property("user-id", &user_for_factory);

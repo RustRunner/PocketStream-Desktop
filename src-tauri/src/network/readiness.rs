@@ -47,8 +47,12 @@ impl CameraReadiness {
             }
         }
         let (adapter, index, fence) = self
-            .probe_scope()
-            .ok_or_else(|| AppError::Network("Selected Ethernet adapter unavailable".into()))?;
+            .selector
+            .probe_scope_diagnosed(&self.bindings.pending_ips)
+            .map_err(|reason| {
+                AppError::Network("Selected Ethernet adapter unavailable".into())
+                    .with_readiness_reason(reason)
+            })?;
         let ip = crate::validation::parse_camera_ip(&target.ip)?;
         let records = self.device_registry.snapshot();
         let source = if bound {
@@ -69,7 +73,8 @@ impl CameraReadiness {
             ));
         }
         if fence.is_stale() {
-            return Err(AppError::Network("Ethernet adapter changed".into()));
+            return Err(AppError::Network("Ethernet adapter changed".into())
+                .with_readiness_reason(crate::error::ReadinessRefusal::StaleSelection));
         }
         Ok(route::ReadyPath {
             target,
