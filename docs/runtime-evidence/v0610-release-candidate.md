@@ -1138,6 +1138,87 @@ remain private on Test. The next diagnostic refinement must cover acquisition
 attempts through actual unlock, including queued access, without guessing a
 holder from a later read or changing the readiness decision.
 
+## Pending-lock holder established — 11 November 2026 UTC
+
+The second owner capture, **H2**, is
+`.worktrees/v0611-pending-lock-owner/src-tauri/target/pending-handoff-20261111T173700Z/`.
+Diagnostic source `80e978ddc18ea1855a538f8a1878e150c2786bdb` retains the same
+exclusive mutex and readiness behavior. It additionally tracks fixed-site
+acquisition attempts through actual unlock, covering queued/reserved permits
+and complete short acquisitions. Ambiguous or mixed candidates remain
+unattributed. Only the existing first-refusal record is extended; no sensitive
+URLs, camera credentials or SRT secrets are logged.
+
+| Artifact | Bytes | SHA-256 |
+|---|---:|---|
+| Diagnostic installer | 48,497,112 | `edfcd2b52ad801487a8607ec9a871110a46b9c75ba95b95b594d093c32e10fdc` |
+| Packaged executable | 24,741,376 | `3477b08619d2e7b9b78122ca26dd9b053fdc145cc6113bca615c66e46f116ed4` |
+| Staged executable | 24,741,376 | `e4562f4df9d0b736543ef5ce93572313814dc9839c78c2b7243d24eeeb622c36` |
+
+This is another unsigned local diagnostic, not a CI candidate. Administrator/
+Common Controls manifests, 76 DLL hashes, generated NSIS contract, required
+Rust notices and the three expected UNK -> NSS differences passed. Final source
+checks: **945 Rust passed / 14 ignored**, default parallelism, 36.59 s; formatting,
+all-target Clippy and build/contracts passed. Frontend code is unchanged from
+H's 288-test/typecheck result. The immediately preceding full Rust run had one
+SRT fake-policy fixture fail its PLAYING transition (944 passed, one failed,
+14 ignored); that failed log is preserved without an assigned cause. The
+unchanged rerun passed. Added diagnostic regressions include an actual queued
+Tokio permit before guard publication, cancellation and ambiguous candidates.
+
+Fresh Test identity/account/session, original CI image, native closed baseline,
+AC power and operator configuration were checked. H's full private firewall
+inventory is referenced explicitly; a new bulk observer was not run during
+reproduction. The bound camera returned OPTIONS 200 at 17:53:32 with the same
+replacement MAC `40-CD-3A-03-28-E2`, Ethernet GUID/source and Wi-Fi output.
+Installation exited 0 in 15.184 s; private profile files were byte-identical.
+The UI controller acknowledged the delayed informational listening notice
+through its normal close-only action. No product UI behavior changed.
+
+**Confirmed production defect:** at **17:57:20.576281 UTC**, SRT generation 2,
+instance/data 1, transport 2 refused `srt_before_send` with
+`reason=pending_snapshot_busy pending_owner_state=stable pending_owner=scope_filter
+pending_phase=read pending_acquisition=1293 pending_before=20689 pending_after=20689
+pending_candidates=1`. The same nonzero acquisition surrounds the actual failed
+try-lock. Another read-only `adapter_selector::probe_scope_with` pending filter
+therefore held the mutex. The exact outer caller/thread is not distinguished;
+the held critical section and read phase are established.
+
+The runtime fault follows at .576461, Starting -> Recovering at .576699, bus
+error at .576868 (`shutdown_requested=false`), shutdown at .576886 and retirement
+at .581302. Backend Disable arrives at **17:57:20.795466**, **219.185 ms later**;
+the UI Disable timestamp is also 171.017 ms later. This is a read/read collision
+that falsely rejects an otherwise valid readiness snapshot, not a refusal
+caused by that Disable. Native selection/index/Up checks passed first. Disable
+interrupts this recovery, so this three-cycle capture claims no recovery or R2
+acceptance. No EOS occurred; H2 does not establish the historical EOS branch or
+retroactively identify the holder in G/H's other failures.
+
+The smallest justified behavior change is shared pending readers with exclusive
+mutations and durable commit/handover. Fresh native observations, pending-IP
+exclusion and held/queued writer barriers must remain intact. Implementation
+is isolated in `fix/v0611-pending-readers` from verified release-derived commit
+`81a8c7e`; experimental owner instrumentation is excluded. Its regressions,
+unused version/tag, CI build and exact-artifact Test qualification remain work
+to complete, with no timing budget relaxation.
+
+The diagnostic was stopped normally after three cycles; saved RTSP/disabled
+output was restored. All seven recorded app/WebView processes exited by
+18:00:26.850517; diagnostic native cleanup passed at 18:00:39.868949. Original
+v0.6.11 CI installer restoration exited 0 in 15.657 s, restoring packaged hash
+`382b48e1...`. At **18:03:54.130888 UTC**, independent checks found two disabled
+owned rules and zero product/helper/fixture processes, output listeners or
+application WFP permits. Settings, secrets, selected roles and native baseline
+were preserved; four owned tasks were retired. No cleanup uncertainty remains.
+
+All **47 exported files** verified against Test hashes at 18:04:42.
+`H2/evidence-transfer.json` identifies the export. Index SHA-256:
+`49eadc5a2df3342e1b80f9904fbbac78d49b38d3fa17233b3aeba2798c8dd2e7`;
+archive SHA-256:
+`8a03ba8b92aaef0376dea9d855972a52e1caa8cbe8e8bbb506e519568c9600a4`.
+Private profiles and raw logs remain on Test. Main and both existing tags and
+CI candidates are unchanged; v0.6.12 was verified unused before preparation.
+
 ## Remaining gates and release state
 
 The v0.6.10 results above remain historical. The separate v0.6.11 CI candidate
@@ -1158,17 +1239,16 @@ separately authorized Second, disposable VM and operator hardware gates retain
 their stated pending status. Paused A4/B, discovery/Clear, privilege integration
 and PTU movement remain outside this task.
 
-Next bounded action: identify the pending-snapshot lock holder and read/write
-phase at one unexpected refusal through the existing owner, then assess a
-minimal fresh-snapshot fix with regression coverage. Preserve pending exclusion
-and the commit/handover barrier. Complete a bounded decoding-before-failure /
+Next bounded action: carry the confirmed read/read contention fix through
+regressions, an unpublished CI candidate and exact-artifact Test qualification.
+Preserve pending exclusion and the commit/handover barrier. Complete a bounded decoding-before-failure /
 150-frames-after-recovery run and record whether the existing peer reconnects.
 The remaining matched-condition policy cohorts are still separate R2 work.
 Any further production change
 needs its own unused version/tag and exact CI artifact qualification; retain both
 existing tags and candidates. Native policy-failure UI still needs the prescribed
 separately identified fixture. Test is restored to the original CI image,
-closed and clean at 15:56:41 UTC. Live
+closed and clean at 18:03:54 UTC. Live
 completion checks show v0.6.11 draft ID 441266851 unpublished, public v0.6.9/feed
 unchanged and main still `922b414`; no main merge or publication was performed.
 
