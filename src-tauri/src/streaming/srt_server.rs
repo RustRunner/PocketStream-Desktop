@@ -117,6 +117,17 @@ impl SrtCallbackContext {
         self.shutdown_requested.load(Ordering::Acquire)
     }
 
+    fn trace_eos(&self, stage: &'static str, seqnum: gst::Seqnum) {
+        // Only fixed stage names and numeric/lifecycle fields. GStreamer object
+        // names, paths, debug text and RTSP/SRT properties can contain secrets.
+        log::info!(
+            "event=srt_eos stage={stage} instance={} data={} seqnum={seqnum:?} shutdown_requested={}",
+            self.server_instance,
+            self.data_generation,
+            self.is_shutdown_requested(),
+        );
+    }
+
     fn emit_fault(&self, kind: RelayFaultKind, reason: String) {
         if self.is_shutdown_requested() {
             return;
@@ -514,8 +525,13 @@ fn install_output_probe(
         .ok_or_else(|| configuration_failure("SRT relay sink has no sink pad"))?;
     let probe_id = sink_pad
         .add_probe(
-            gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+            gst::PadProbeType::BUFFER
+                | gst::PadProbeType::BUFFER_LIST
+                | gst::PadProbeType::EVENT_DOWNSTREAM,
             move |_pad, info| {
+                if let Some(seqnum) = eos_seqnum(info.data.as_ref()) {
+                    callbacks.trace_eos("output", seqnum);
+                }
                 if callbacks.is_shutdown_requested() {
                     return gst::PadProbeReturn::Ok;
                 }
@@ -535,6 +551,47 @@ fn install_output_probe(
         )
         .ok_or_else(|| configuration_failure("Failed to attach the SRT output probe"))?;
     Ok((sink_pad, probe_id))
+}
+
+fn eos_seqnum(data: Option<&gst::PadProbeData>) -> Option<gst::Seqnum> {
+    match data {
+        Some(gst::PadProbeData::Event(event)) if event.type_() == gst::EventType::Eos => {
+            Some(event.seqnum())
+        }
+        _ => None,
+    }
+}
+
+fn install_source_eos_diagnostic(
+    source: &gst::Element,
+    callbacks: SrtCallbackContext,
+) -> glib::SignalHandlerId {
+    source.connect_pad_added(move |_source, pad| {
+        let callbacks = callbacks.clone();
+        let instance = callbacks.server_instance;
+        let data = callbacks.data_generation;
+        // The dynamic source pad owns this event-only probe until disposal.
+        // It observes EOS and always forwards the original event unchanged.
+        let probe = pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
+            if let Some(seqnum) = eos_seqnum(info.data.as_ref()) {
+                callbacks.trace_eos("rtsp_source", seqnum);
+            }
+            gst::PadProbeReturn::Ok
+        });
+        log::debug!(
+            "event=srt_eos_probe stage=rtsp_source instance={instance} data={data} attached={}",
+            probe.is_some()
+        );
+    })
+}
+
+fn eos_message_source(message: &gst::MessageRef) -> &'static str {
+    match message.src().map(|source| source.type_().name()) {
+        Some("GstPipeline") => "pipeline",
+        Some("GstRTSPSrc") => "rtsp_source",
+        Some("GstSRTSink") => "srt_sink",
+        _ => "other",
+    }
 }
 
 fn spawn_bus_thread(
@@ -587,10 +644,17 @@ fn spawn_bus_thread(
                             fault.reason,
                         );
                     }
-                    gst::MessageView::Eos(..) => callbacks.emit_fault(
-                        RelayFaultKind::Eos,
-                        "SRT relay pipeline reached end of stream".into(),
-                    ),
+                    gst::MessageView::Eos(..) => {
+                        callbacks.trace_eos("bus", message.seqnum());
+                        log::info!(
+                            "event=srt_eos_message source={}",
+                            eos_message_source(&message)
+                        );
+                        callbacks.emit_fault(
+                            RelayFaultKind::Eos,
+                            "SRT relay pipeline reached end of stream".into(),
+                        );
+                    }
                     _ => {}
                 }
                 break;
@@ -835,6 +899,10 @@ impl SrtRestreamer {
             parts.source.clone(),
             super::connect_video_only_select_stream(&parts.source),
         )];
+        signal_handlers.push((
+            parts.source.clone(),
+            install_source_eos_diagnostic(&parts.source, callbacks.clone()),
+        ));
         let upstream_callbacks = callbacks.clone();
         signal_handlers.push((
             parts.source.clone(),
@@ -1289,6 +1357,71 @@ mod tests {
             RelayFaultKind::Capability
         );
         assert!(probe.poll_fault().is_none());
+    }
+
+    #[test]
+    fn eos_diagnostics_accept_only_eos_and_never_expose_object_names() {
+        init_gstreamer();
+        let eos = gst::event::Eos::new();
+        let seqnum = eos.seqnum();
+        assert_eq!(
+            eos_seqnum(Some(&gst::PadProbeData::Event(eos))),
+            Some(seqnum)
+        );
+        assert_eq!(
+            eos_seqnum(Some(&gst::PadProbeData::Buffer(gst::Buffer::new()))),
+            None
+        );
+        assert_eq!(
+            eos_seqnum(Some(&gst::PadProbeData::Event(
+                gst::event::FlushStart::new()
+            ))),
+            None
+        );
+        let pipeline =
+            gst::Pipeline::with_name("rtsp://private-user:private-password@camera/private-path");
+        let message = gst::message::Eos::builder().src(&pipeline).build();
+        assert_eq!(eos_message_source(&message), "pipeline");
+        let element = gst::ElementFactory::make("fakesink")
+            .name("secret-stream-id")
+            .build()
+            .unwrap();
+        let message = gst::message::Eos::builder().src(&element).build();
+        assert_eq!(eos_message_source(&message), "other");
+    }
+
+    #[test]
+    fn diagnosed_bus_eos_keeps_fault_identity_and_shutdown_suppression() {
+        init_gstreamer();
+        for shutdown in [false, true] {
+            let (runtime, health) = runtime(RelayIngestKind::Rtsp);
+            let generation = health
+                .begin_data_generation(runtime.server_instance)
+                .unwrap();
+            let probe = SrtRuntimeProbe::new();
+            let callbacks = SrtCallbackContext::new(
+                &runtime,
+                probe.clone(),
+                Arc::new(AtomicBool::new(shutdown)),
+                generation,
+            );
+            let bus = gst::Bus::new();
+            let message = gst::message::Eos::builder().build();
+            bus.post(message).unwrap();
+            let (thread, _done) = build_ok(spawn_bus_thread(bus, callbacks));
+            thread.join().unwrap();
+            let fault = probe.poll_fault();
+            if shutdown {
+                assert!(fault.is_none());
+            } else {
+                let fault = fault.unwrap();
+                assert_eq!(fault.fault.kind, RelayFaultKind::Eos);
+                assert_eq!(
+                    fault.fault.reason,
+                    "SRT relay pipeline reached end of stream"
+                );
+            }
+        }
     }
 
     #[tokio::test]

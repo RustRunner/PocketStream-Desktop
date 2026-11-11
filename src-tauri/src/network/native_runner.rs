@@ -354,7 +354,7 @@ impl FirewallQualification {
                 "    # Even the no-write path needs a fresh read:",
                 "    [Console]::Error.WriteLine('qualification_disable_before_readback'); [Threading.Thread]::Sleep(45000)\n    # Even the no-write path needs a fresh read:")),
             Operation::Disable { .. } if self.recovery_prewrite_failure.swap(false, Ordering::AcqRel) => Some((
-                "    Stage 'inventory'", "    throw 'Qualification recovery failure before writes'\n    Stage 'inventory'")),
+                "    $mode = $data.operation.mode", "    throw 'Qualification recovery failure before writes'\n    $mode = $data.operation.mode")),
             Operation::Startup if self.startup_timeout.swap(false, Ordering::AcqRel) => {
                 budget = Duration::from_secs(1); None
             }
@@ -464,7 +464,7 @@ fn firewall_probe_script() -> String {
         ("# @TRUSTED_IMPORTS_END@", include_str!("../../tests/fixtures/firewall-read-only-v1.ps1")),
         ("function All-Rules { return @(Get-NetFirewallRule -PolicyStore PersistentStore -ErrorAction Stop) }",
          "function All-Rules { $w=[Diagnostics.Stopwatch]::StartNew(); try { return @(Get-NetFirewallRule -PolicyStore PersistentStore -ErrorAction Stop) } finally { [Console]::Error.WriteLine(('read_all_ms='+$w.ElapsedMilliseconds)) } }"),
-        ("function Owner-Shape($rule) {", "function Owner-Shape($rule) { [Console]::Error.WriteLine(('owner_begin='+$rule.Name)); $w=[Diagnostics.Stopwatch]::StartNew()"),
+        ("function Owner-Shape($rule, $application = $null) {", "function Owner-Shape($rule, $application = $null) { [Console]::Error.WriteLine(('owner_begin='+$rule.Name)); $w=[Diagnostics.Stopwatch]::StartNew()"),
         ("    if ($app.Count -ne 1) {", "    [Console]::Error.WriteLine(('owner_ms='+$w.ElapsedMilliseconds))\n    if ($app.Count -ne 1) {"),
     ] {
         assert_eq!(script.matches(original).count(), 1, "firewall probe anchor: {original}");

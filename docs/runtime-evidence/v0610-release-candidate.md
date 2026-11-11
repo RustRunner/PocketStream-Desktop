@@ -541,6 +541,90 @@ policy-failure/reload UI and remaining E save/confirmation paths are pending.
 Production code/artifact identities remain unchanged, and no new CI candidate
 or production fix is claimed.
 
+## Bounded timing/EOS investigation — 11 November 2026 UTC
+
+This S6-R follow-up starts from `release/v0.6.10` at `0ddd4c4`, verified against
+live remote `dd72586` and immutable application tag `f2a6f4f`. Implementation is
+isolated on `fix/v0610-timing-eos` in `.worktrees/v0610-timing-eos`; root privilege
+edits and every existing worktree remain preserved. Live releases/tags confirmed
+`v0.6.11` unused before its version preparation. Original v0.6.10 sources,
+artifacts and failed samples remain historical and are not reclassified.
+
+Evidence `I` is the new `timing-eos-20261111T044800Z/` subdirectory of E above,
+in the original release worktree. The pinned SSH host/account/SID, elevation,
+installed image hash, both physical adapter identities and current replacement
+CAM were rechecked before fixture work. At 04:45 UTC the application was closed,
+both persistent owned rules disabled, no qualification task active, and camera
+`172.31.169.84 / 40:cd:3a:03:28:e2` still selected on Ethernet 13. Output Wi-Fi 18
+was `192.168.141.125`. Read-only resource observations: i5-10310U, 4 cores/8 threads,
+about 8 GB free RAM, reported 1505 MHz, 2% CPU load, battery 59%, Balanced plan.
+These are current observations, not contemporaneous proof of a historical cause.
+
+Recovered redacted historical events in `I/baseline-r2.stdout.log` establish zero
+runtime admission wait, successful containment/tree exit, and actual ensure
+actions: SRT unchanged (17.203/15.512/19.192 s), RTSP updated (24.164 s). Startup's
+inventory includes two ownership checks, two fresh disabled readbacks and legacy
+inventory; it is not enumeration alone. Prepare includes interface validation,
+redundant exact lookup, disabled readback and, when changed, rewrite/full shape
+verification. The recovery's policy totals are 21.554/24.173 s (89.2%); native
+runner durations are 6.784 + 16.223 = 23.007 s (95.2%). The remaining 1.166 s
+includes teardown, scheduling and listener construction; second-resolution logs
+do not isolate those further. No remote-decoding recovery is established.
+
+With app/fixture/observers stopped, `I/reads.stdout.log` measured 639 persistent
+rules, no legacy candidates, exact queries 1.325–1.688 s, seven shape filters
+0.256–0.339 s each, NetSecurity import 1.445 s, explicit NetAdapter import 1.362 s,
+and adapter reads 0.294/0.099 s. Three paired comparisons in `I/refresh.stdout.log`
+measured exact queries 1.523/1.320/1.319 s versus application-filter associations
+0.335/0.248/0.248 s, returning the same exact PersistentStore rule. This confirms
+avoidable repeated name-query cost without concurrent qualification observers.
+Historical observer/power effects remain unquantified. Direct CIM refresh was
+measured but not adopted; the implementation uses the supported, explicitly
+store-selected [NetSecurity association parameter](https://learn.microsoft.com/en-us/powershell/module/netsecurity/get-netfirewallrule).
+
+The minimal policy change reuses the already validated rule/application-filter
+identity for fresh association readbacks and removes Prepare's redundant name
+query. Disappearance, ambiguity, provider error and wrong identity fail closed;
+initial ownership queries, legacy migration/removal checks, Block observation,
+interface identity checks, full changed-shape verification and all executor,
+settlement/retirement accounting remain. Timings now split startup ownership,
+shape and disable from inventory, plus explicit binding module/interface work.
+
+EOS is investigated separately. Existing logs establish a current desired
+generation, EOS before ordered teardown, zero-delay recovery and no logged
+accepted downstream caller during the replacement-camera case. They do not
+identify an upstream RTSP event, pipeline defect, downstream cause or lifecycle
+race. Narrow EOS-only pad/bus diagnostics add fixed stages, sequence numbers and
+instance/data IDs, with shutdown state. They never log object names, URLs,
+credentials, passphrases or stream IDs and do not change media/recovery behavior.
+
+All 167 original indexed exports and both v0.6.10 artifact hashes were reverified
+(`I/preserved-evidence-verification.json`). Local final-source checks passed:
+288 frontend tests including the 27-case pure provider fixture; type checking,
+contracts/production build, both browser sizes, Cargo check, 934 Rust tests
+(14 ignored, default concurrency, 36.03 s), formatting, all-target Clippy with
+warnings denied, current audit using only CI's three existing exceptions,
+76-DLL closure/third-party and source-release policy. Two failed Rust runs are
+retained: only the fixed qualification anchors failed after the source refactor;
+the final anchor check and full rerun pass. The single-line pre-write anchor
+also avoids Windows CRLF assumptions. Sandbox-limited build/browser failures
+and the missing PATH audit launcher are retained; approved source-only reruns
+passed with the existing isolated audit binary. No native ignored test is
+credited as passed.
+
+At about 05:00 UTC Test's pinned SSH transport closed during staging. Subsequent
+exact-address SSH timed out and hostname resolution failed. No candidate
+installation, application launch, firewall/address mutation or fault execution
+had begun. The prepared pre-candidate snapshot/profile-backup script did not run.
+Access restoration was requested while independent CI candidate work continued.
+The last live read at 04:45 UTC had no product/fixture process and disabled owned
+rules; latest complete WFP retirement remains the 04:17 checkpoint above. A new
+final-state observation must wait for connectivity; it is not inferred.
+
+Candidate checks and installed measurements are recorded below as they complete;
+R2 remains pending until its required repetitions and limits are met. Second,
+paused A4/B, PTU, discovery/Clear and unrelated release gates remain unchanged.
+
 ## Remaining gates and release state
 
 R0 audit repair and source validation passed. Installer built: yes, and the

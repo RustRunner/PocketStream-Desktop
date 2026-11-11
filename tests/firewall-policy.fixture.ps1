@@ -17,7 +17,7 @@ function Assert($condition,[string]$reason) { if (!$condition) { throw $reason }
 function Reset {
     $script:rules=[Collections.Generic.List[object]]::new()
     $script:writeCount=0; $script:failSet=0; $script:failQuery=$false; $script:failRemove=$false
-    $script:fullQueries=0; $script:namedQueries=0; $script:filterReads=0
+    $script:fullQueries=0; $script:namedQueries=0; $script:filterReads=0; $script:associationQueries=0; $script:associationFault=''
     $script:filteredQueries=0; $script:rewrites=0; $script:events=[Collections.Generic.List[string]]::new(); $script:imports=[Collections.Generic.List[string]]::new()
     $script:failAfterEnable=$false; $script:failCleanup=$false; $script:enableThenThrow=$false; $script:enabledWrite=$false; $script:emptyBlocks=$false; $script:foreignBlockFailure=$false
     $script:failNamedQuery=$false; $script:foreignNotFound=$false; $script:changeReadback=$false; $script:restorePackage=$false
@@ -32,8 +32,23 @@ function Rule([string]$name,[int]$role=0,[string]$program='Any',[string]$enabled
 }
 function Enforced($row) { return $row.Enabled -eq 'True' -and [string]$row.Package -ceq '' }
 function Get-NetFirewallRule {
-    [CmdletBinding()]param($PolicyStore,[string]$Name,$Action,$Direction,$DisplayName)
+    [CmdletBinding()]param($PolicyStore,[string]$Name,$Action,$Direction,$DisplayName,$AssociatedNetFirewallApplicationFilter)
     if($script:failQuery){throw 'fake query failure'}
+    if($null -ne $AssociatedNetFirewallApplicationFilter) {
+        Assert ($PolicyStore -ceq 'PersistentStore') 'Association lost the explicit policy store'
+        $script:associationQueries++
+        if($script:enabledWrite -and $script:failAfterEnable){$script:failAfterEnable=$false;throw 'fake enabled readback failure'}
+        $matches=@($script:rules | Where-Object {$_.Name -eq $AssociatedNetFirewallApplicationFilter.Name})
+        if($script:changeReadback -and $script:associationQueries -eq 1){$matches[0].Enabled='True'}
+        if($script:enabledWrite -and $script:associationFault) {
+            $fault=$script:associationFault;$script:associationFault=''
+            if($fault -eq 'error'){throw 'association provider failed'}
+            if($fault -eq 'missing'){return @()}
+            if($fault -eq 'ambiguous'){return @($matches[0],$matches[0])}
+            if($fault -eq 'identity'){$other=$matches[0].PSObject.Copy();$other.Name='foreign';return $other}
+        }
+        return $matches
+    }
     if($Name) {
         $script:namedQueries++
         if($script:enabledWrite -and $script:failAfterEnable){$script:failAfterEnable=$false;throw 'fake enabled readback failure'}
@@ -44,7 +59,6 @@ function Get-NetFirewallRule {
             $err=[Management.Automation.ErrorRecord]::new([Management.Automation.ItemNotFoundException]::new('missing name'),'CmdletizationQuery_NotFound_InstanceID',[Management.Automation.ErrorCategory]::ObjectNotFound,$Name)
             $PSCmdlet.ThrowTerminatingError($err)
         }
-        if($script:changeReadback -and $script:namedQueries -eq 2){$matches[0].Enabled='True'}
         return $matches
     }
     if($Action -or $Direction -or $DisplayName) {
@@ -163,13 +177,13 @@ Reset;Assert (Run install).ok 'Load fixture setup'
 foreach($i in 1..602){$other=Rule ('unrelated-'+$i) 0 'C:\Other\app.exe';$other.DisplayName='Other product';$script:rules.Add($other)}
 $block=Rule 'preserved-block' 0 $program;$block.Action='Block';$script:rules.Add($block)
 foreach($sample in @('cold policy pass','warm policy pass')) {
-    $script:writeCount=0;$script:fullQueries=0;$script:namedQueries=0;$script:filterReads=0
+    $script:writeCount=0;$script:fullQueries=0;$script:namedQueries=0;$script:filterReads=0;$script:associationQueries=0
     $r=Run startup
     Assert $r.ok ($sample+' failed')
     Assert ($script:rules.Count -eq 605 -and $block.Enabled -eq 'True') 'Substantial existing policy was changed'
     Assert ($script:fullQueries -eq 1 -and $script:filterReads -eq 2) 'Startup repeated full inventories or light ownership reads'
     Assert ($script:writeCount -eq 0 -and !$r.mutated) 'Startup rewrote already-disabled rules'
-    Assert ($script:namedQueries -eq 4) 'Startup omitted fresh exact-name readback'
+    Assert ($script:namedQueries -eq 2 -and $script:associationQueries -eq 2) 'Startup omitted fresh identity-checked association readback'
 }
 $passed.Add('cold/warm startup with 605 rules uses one legacy inventory, two application filters, fresh readback and no redundant disabled writes')
 Reset;$r=Run startup
@@ -179,7 +193,7 @@ Assert (!$r.ok -and $script:writeCount -eq 0) 'Genuine named-query failure becam
 $script:failNamedQuery=$false;$script:foreignNotFound=$true;$r=Run startup
 Assert (!$r.ok -and $script:writeCount -eq 0) 'Unrelated ObjectNotFound became an empty rule set'
 $passed.Add('exact ObjectNotFound is empty; genuine targeted provider failure fails closed')
-Reset;Assert (Run install).ok 'Readback fixture setup';$script:namedQueries=0;$script:writeCount=0;$script:changeReadback=$true
+Reset;Assert (Run install).ok 'Readback fixture setup';$script:namedQueries=0;$script:associationQueries=0;$script:writeCount=0;$script:changeReadback=$true
 $r=Run startup
 Assert (!$r.ok -and $script:writeCount -eq 0) 'Concurrent enable passed a cached disabled observation'
 $passed.Add('already-disabled startup still requires fresh disabled readback')
@@ -234,6 +248,7 @@ foreach($explicit in @($false,$true)) {
     $r=Run ensure rtsp 8554 $bind
     Assert ($r.ok -and $r.outcome.action -eq 'unchanged' -and $script:fullQueries -eq 0 -and $script:filteredQueries -eq 1) 'Lean ensure enumerated a full store'
     Assert ($script:filterReads -eq (9+[int]$explicit) -and $script:writeCount -eq 1 -and $script:rewrites -eq 0) 'Unchanged ensure repeated shape or rewrite'
+    Assert ($script:namedQueries -eq 5 -and $script:associationQueries -eq 2) 'Ensure repeated an InstanceID enumeration instead of using fresh associations'
     Assert (($script:imports -contains 'NetAdapter') -eq $explicit) 'NetAdapter import did not follow explicit identity'
     Assert ($script:events.IndexOf('blocks') -lt $script:events.IndexOf('enable')) 'Block observation followed enable'
 }
@@ -244,8 +259,8 @@ Assert ($r.ok -and $r.outcome.action -eq 'updated' -and $script:rewrites -eq 1 -
 $passed.Add('changed port rewrites once and reads the full template back once')
 Reset;Assert (Run install).ok 'Light disable setup';$script:rules[0].Enabled='True';$script:filterReads=0;$script:fullQueries=0;$script:namedQueries=0
 $r=Run disable
-Assert ($r.ok -and $script:filterReads -eq 1 -and $script:fullQueries -eq 0 -and $script:namedQueries -eq 2) 'Disable did not use light ownership and fresh disabled readback'
-$passed.Add('disable uses one application filter and fresh exact readback')
+Assert ($r.ok -and $script:filterReads -eq 1 -and $script:fullQueries -eq 0 -and $script:namedQueries -eq 1 -and $script:associationQueries -eq 1) 'Disable did not use light ownership and fresh disabled readback'
+$passed.Add('disable uses one application filter and fresh identity-checked association readback')
 foreach($cleanupFails in @($false,$true)) {
     foreach($enableThrows in @($false,$true)) {
         Reset;Assert (Run install).ok 'Unchanged failure setup';$script:failAfterEnable=!$enableThrows;$script:enableThenThrow=$enableThrows;$script:failCleanup=$cleanupFails
@@ -255,6 +270,16 @@ foreach($cleanupFails in @($false,$true)) {
     }
 }
 $passed.Add('unchanged enable/readback failures always run cleanup with truthful uncertainty')
+foreach($fault in @('error','missing','ambiguous','identity')) {
+    foreach($cleanupFails in @($false,$true)) {
+        Reset;Assert (Run install).ok 'Association failure setup'
+        $script:associationFault=$fault;$script:failCleanup=$cleanupFails
+        $r=Run ensure rtsp 8554
+        Assert (!$r.ok -and $r.mutated -and $r.outcome.uncertain -eq $cleanupFails) 'Invalid association became a successful/certain enable'
+        Assert (($script:rules[0].Enabled -eq 'True') -eq $cleanupFails) 'Invalid association bypassed ordered cleanup'
+    }
+}
+$passed.Add('association error, disappearance, ambiguity and wrong identity fail closed with truthful settlement')
 Reset;Assert (Run install).ok 'Block query setup';$script:emptyBlocks=$true
 Assert (Run ensure rtsp 8554).ok 'Exact provider block not-found did not mean empty'
 $script:emptyBlocks=$false;$script:foreignBlockFailure=$true;$r=Run ensure

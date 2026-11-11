@@ -1,3 +1,9 @@
+# v0.6.11 reliability candidate (unreleased)
+
+Firewall policy now uses fresh, identity-checked PersistentStore association reads after locating an owned rule. This removes repeated slow name queries while preserving ownership, overriding Block rules, interface validation, full verification after template changes, synchronous retirement and uncertainty barriers. Startup and explicit-interface timings distinguish reconciliation from inventory and module loading.
+
+SRT EOS diagnostics record only fixed stages, event sequence numbers and lifecycle IDs at the RTSP source, relay output and bus. The original EOS remains unexplained; these diagnostics do not claim a camera or application fix. The [existing qualification run sheet](docs/runtime-evidence/v0610-release-candidate.md) retains v0.6.10's failures and records this separate candidate's results and remaining gates. No public release or updater-feed change is included.
+
 # v0.6.10 re-stream release candidate (unreleased)
 
 The managed RTSP and SRT firewall templates now require an empty package field. Installer maintenance repairs the ineffective v0.6.8/v0.6.9 templates by disabling, removing and recreating them; the first runtime ensure also repairs them if needed. Startup detects defective templates and disables them. Policy execution uses fewer provider reads, skips unchanged template rewrites, reports stage timings and applies mode-specific budgets.

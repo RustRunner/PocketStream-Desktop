@@ -12,6 +12,7 @@ $script:mutated = $false
 $records = [Collections.Generic.List[object]]::new()
 $outcome = @{state='inactive'}
 $script:touched = $null
+$script:preparedApplication = $null
 $script:recordBytes = 0
 function Stage([string]$next) {
     $now = $clock.ElapsedMilliseconds
@@ -31,7 +32,14 @@ function Exact($role) {
         throw
     }
 }
-function Shape($rule) {
+function Read-Known($rule, $application) {
+    # A fresh association query avoids another expensive InstanceID enumeration.
+    # Keep the store explicit and reject disappearance or a different identity.
+    $read = @(Get-NetFirewallRule -PolicyStore PersistentStore -AssociatedNetFirewallApplicationFilter $application -ErrorAction Stop)
+    if ($read.Count -ne 1 -or $read[0].Name -ne $rule.Name) { throw 'Known rule readback identity mismatch' }
+    return $read
+}
+function Shape($rule, $application = $null) {
     $app = @($rule | Get-NetFirewallApplicationFilter -ErrorAction Stop)
     $port = @($rule | Get-NetFirewallPortFilter -ErrorAction Stop)
     $addr = @($rule | Get-NetFirewallAddressFilter -ErrorAction Stop)
@@ -40,6 +48,7 @@ function Shape($rule) {
     $svc = @($rule | Get-NetFirewallServiceFilter -ErrorAction Stop)
     $sec = @($rule | Get-NetFirewallSecurityFilter -ErrorAction Stop)
     if ($app.Count -ne 1 -or $port.Count -ne 1 -or $addr.Count -ne 1 -or $iface.Count -ne 1 -or $type.Count -ne 1 -or $svc.Count -ne 1 -or $sec.Count -ne 1) { throw 'Ambiguous filters' }
+    if ($null -ne $application) { $application.Value = $app[0] }
     return @{name=[string]$rule.Name;group=[string]$rule.Group;display=[string]$rule.DisplayName;enabled=[string]$rule.Enabled;
         direction=[string]$rule.Direction;action=[string]$rule.Action;profile=[string]$rule.Profile;program=[string]$app[0].Program;
         package=[string]$app[0].Package;protocol=[string]$port[0].Protocol;local_port=@($port[0].LocalPort);remote_port=@($port[0].RemotePort);
@@ -50,9 +59,10 @@ function Shape($rule) {
         platform=@($rule.Platform);loose_source=[string]$rule.LooseSourceMapping;local_only=[string]$rule.LocalOnlyMapping;
         dynamic_target=[string]$port[0].DynamicTarget;dynamic_addresses=@($rule.RemoteDynamicKeywordAddresses)}
 }
-function Owner-Shape($rule) {
+function Owner-Shape($rule, $application = $null) {
     $app = @($rule | Get-NetFirewallApplicationFilter -ErrorAction Stop)
     if ($app.Count -ne 1) { throw 'Ambiguous application filter' }
+    if ($null -ne $application) { $application.Value = $app[0] }
     return @{group=[string]$rule.Group;enabled=[string]$rule.Enabled;direction=[string]$rule.Direction;
         action=[string]$rule.Action;program=[string]$app[0].Program;package=[string]$app[0].Package}
 }
@@ -73,16 +83,17 @@ function Verified($s, $role, [int]$port, [string]$alias, [bool]$enabled) {
         @($s.local_port).Count -eq 1 -and [string]$s.local_port -eq [string]$port -and (Unscoped $s) -and (Template-Package $s) -and
         @($s.interface).Count -eq 1 -and [string]$s.interface -ceq $alias -and ($s.enabled -eq $(if ($enabled) {'True'} else {'False'}))
 }
-function Disable-Verified($rule) {
+function Disable-Verified($rule, $application = $null) {
     if ([string]$rule.Enabled -ne 'False') {
         $script:mutated = $true
         $rule | Set-NetFirewallRule -Enabled False -ErrorAction Stop
     }
     # Even the no-write path needs a fresh read: a cached disabled row is not
     # evidence that another writer has left the rule disabled.
-    $again = @(Exact @{name=$rule.Name})
+    $again = @(if ($null -ne $application) { Read-Known $rule $application } else { Exact @{name=$rule.Name} })
     if ($again.Count -ne 1 -or [string]$again[0].Enabled -ne 'False') { throw 'Disable readback failed' }
     $script:preparedRule = $again[0]
+    $script:preparedApplication = $application
 }
 function Selected-Alias {
     if ($null -eq $data.operation.interface) { return 'Any' }
@@ -96,8 +107,7 @@ function Selected-Alias {
     if ($alias.IndexOfAny([char[]]'*?[]') -ge 0 -or @($all | Where-Object { $_.Name -ceq $alias }).Count -ne 1) { throw 'Ambiguous interface alias' }
     return $alias
 }
-function Prepare($role, [int]$port, [string]$alias, $existingShape) {
-    $rules = @(Exact $role)
+function Prepare($role, [int]$port, [string]$alias, $existingShape, $rules, $application) {
     if ($rules.Count -gt 1) { throw 'Rule name collision' }
     $action = 'created'
     if ($rules.Count -eq 1) {
@@ -106,17 +116,17 @@ function Prepare($role, [int]$port, [string]$alias, $existingShape) {
         $action = 'updated'
         if (!(Template-Package $shape)) {
             $script:touched = $role; $script:mutated = $true
-            Disable-Verified $rules[0]
+            Disable-Verified $rules[0] $application
             $rules[0] | Remove-NetFirewallRule -ErrorAction Stop
             if (@(Exact $role).Count -ne 0) { throw 'Template repair removal readback failed' }
             Add-Record @{repaired_template=[string]$role.name;prior_package=[string]$shape.package}
             $rules = @()
         } elseif (Verified $shape $role $port $alias $false) {
-            Disable-Verified $rules[0]
+            Disable-Verified $rules[0] $application
             return 'unchanged'
         } else {
             $script:touched = $role
-            Disable-Verified $rules[0]
+            Disable-Verified $rules[0] $application
         }
     }
     $script:touched = $role
@@ -133,8 +143,8 @@ function Prepare($role, [int]$port, [string]$alias, $existingShape) {
         $params.NewDisplayName=$role.display_name
         $rules[0] | Set-NetFirewallRule @params
     }
-    $read = @(Exact $role)
-    if ($read.Count -ne 1 -or !(Verified (Shape $read[0]) $role $port $alias $false)) { throw 'Shape readback failed' }
+    $read = @(if ($rules.Count -eq 0) { Exact $role } else { Read-Known $rules[0] $application })
+    if ($read.Count -ne 1 -or !(Verified (Shape $read[0] ([ref]$script:preparedApplication)) $role $port $alias $false)) { throw 'Shape readback failed' }
     $script:preparedRule = $read[0]
     return $action
 }
@@ -179,7 +189,7 @@ try {
         throw 'Native access unavailable'
     }
     # @TRUSTED_IMPORTS_END@
-    if ($null -ne $data.operation.interface) { Import-Trusted 'NetAdapter' }
+    if ($null -ne $data.operation.interface) { Stage 'bind_modules'; Import-Trusted 'NetAdapter' }
     Stage 'inventory'
     $mode = $data.operation.mode
     if ($mode -eq 'startup') {
@@ -187,17 +197,22 @@ try {
         $failed=$false
         foreach ($role in $data.roles) {
             try {
+                Stage 'ownership'
                 $rules=@(Exact $role)
                 if ($rules.Count -gt 1) { throw 'Rule collision' }
                 foreach ($rule in $rules) {
-                    $s = Owner-Shape $rule
+                    Stage 'shape'
+                    $application = $null
+                    $s = Owner-Shape $rule ([ref]$application)
                     if (!(Owned $s)) { throw 'Rule ownership conflict' }
                     if (!(Template-Package $s)) { Add-Record @{defective_template=[string]$role.name;prior_package=[string]$s.package} }
-                    Disable-Verified $rule
+                    Stage 'disable'
+                    Disable-Verified $rule $application
                 }
             } catch { $failed=$true }
         }
         if ($failed) { throw 'Startup ownership reconciliation incomplete' }
+        Stage 'inventory'
     }
     # Retiring one listener must not depend on unrelated migration candidates.
     # Startup and installer migration inspect legacy candidates.
@@ -220,15 +235,16 @@ try {
         $rules = @(Exact $role)
         if ($rules.Count -gt 1) { throw 'Rule collision' }
         $s = $null
+        $application = $null
         foreach ($rule in $rules) {
             Stage 'shape'
-            $s = if ($mode -eq 'disable') { Owner-Shape $rule } else { Shape $rule }
+            $s = if ($mode -eq 'disable') { Owner-Shape $rule ([ref]$application) } else { Shape $rule ([ref]$application) }
             if (!(Owned $s)) { throw 'Rule ownership conflict' }
         }
         if ($mode -in @('startup','disable','uninstall')) {
             foreach ($rule in $rules) {
                 Stage 'disable'
-                Disable-Verified $rule
+                Disable-Verified $rule $application
                 if ($mode -eq 'uninstall') { Stage 'remove'; $rule | Remove-NetFirewallRule -ErrorAction Stop; if (@(Exact $role).Count -ne 0) { throw 'Remove readback failed' } }
             }
         } else {
@@ -238,9 +254,11 @@ try {
             if ($mode -eq 'ensure') {
                 $port = [int]$data.operation.port
                 if ($port -lt 1 -or $port -gt 65535) { throw 'Invalid port' }
+                Stage 'interface'
                 $alias = Selected-Alias
+                Stage 'prepare'
             }
-            $action = Prepare $role $port $alias $s
+            $action = Prepare $role $port $alias $s $rules $application
             if ($mode -eq 'ensure') {
                 Stage 'blocks'
                 try { $blockRules = @(Get-NetFirewallRule -PolicyStore ActiveStore -Action Block -Direction Inbound -ErrorAction Stop) }
@@ -254,12 +272,13 @@ try {
                     if (@($apps | Where-Object { Same-Program $_.Program }).Count -gt 0) { [string]$block.Name }
                 })
                 if ($blocks.Count -gt 32) { throw 'Too many observed block rules' }
-                Stage 'enable'
+                Stage 'interface'
                 if ((Selected-Alias) -cne $alias) { throw 'Bind changed before enable' }
+                Stage 'enable'
                 $script:touched = $role; $script:mutated = $true
                 $script:preparedRule | Set-NetFirewallRule -Enabled True -ErrorAction Stop
                 Stage 'readback'
-                $read = @(Exact $role)
+                $read = @(Read-Known $script:preparedRule $script:preparedApplication)
                 if ($read.Count -ne 1 -or [string]$read[0].Enabled -ne 'True') { throw 'Enabled readback failed' }
                 $app = @($read[0] | Get-NetFirewallApplicationFilter -ErrorAction Stop)
                 $pf = @($read[0] | Get-NetFirewallPortFilter -ErrorAction Stop)
