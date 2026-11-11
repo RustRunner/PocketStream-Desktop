@@ -899,6 +899,164 @@ Transfer receipts and both archives remain in I alongside the separate 61-file
 native fault export and all 167 original indexed exports. Both original
 v0.6.10 artifact hashes were reverified again at completion.
 
+## Guarded readiness-refusal capture — 11 November 2026 UTC
+
+This bounded follow-up uses a new worktree outside build outputs,
+`.worktrees/v0611-readiness-refusal`, branch `diag/v0611-readiness-refusal`,
+from clean documentation baseline `8e4c409e2902e6d7239ae035cbc882f62accb212`.
+Diagnostic application source is `621defd79515f7214e571299042cc6ba45bab86b`.
+No applicable AGENTS.md was found. Root README/DEVELOPMENT/images edits and all
+existing worktrees remain preserved. No production behavior fix, new release
+tag, push, main merge, publication or updater-feed change was made.
+
+Evidence `G` is this successor worktree's
+`src-tauri/target/readiness-20261111T150217Z/`. The matching private Test run is
+`%LOCALAPPDATA%\PocketStreamQualification\v0610\readiness-20261111T150217Z`.
+Before another experiment, the preserved full-log-derived transport history,
+original EOS network window and rapid-cycle capture in I were inspected.
+Both current Test log generations and the profile were then copied privately
+on Test; full diagnostic logs were also preserved there before and after Close.
+Raw logs and profile contents were excluded from the exported evidence.
+
+The pinned SSH host/account/SID, elevated token, interactive TSD-0311 session,
+installed CI image, selected Ethernet GUID/MAC/index 13, Wi-Fi GUID/MAC/index 18
+and saved replacement CAM were rechecked. Test was initially closed/clean.
+Fresh Ethernet-source-bound OPTIONS returned 200 at 15:28:28 UTC, with expected
+camera MAC `40-CD-3A-03-28-E2` Reachable. CAM remains `172.31.169.84`, source
+`172.31.169.100`; output is Wi-Fi `192.168.141.125`. THINKBOOK-G7 is the read-only
+peer, observed source `192.168.141.216`. Recorded power was AC. No Second,
+development-PC installation/native mutation, adapter/route/address fault,
+PTU motion or paused A4/B work was used.
+
+**Diagnostic identity and verification.** This is a local unsigned diagnostic,
+with product version 0.6.11 and updater artifacts disabled, not a CI candidate.
+Its evidence cannot qualify the immutable v0.6.11 production artifact.
+
+| Diagnostic artifact | Bytes | SHA-256 |
+|---|---:|---|
+| Installer | 48,512,861 | `8115917064b0e9f552311ce45f933d1f0496ea581169760a6bff391999022361` |
+| Packaged executable | 24,723,456 | `ee0a08996f1221ddbd4d993f8baabc893fe56b3ff3e1b2ea48526401597c1ae8` |
+| Staged executable | 24,723,456 | `aa0e7299b7199f107aac244f76cbeb956d1b0242338220c794c222e13d638484` |
+
+The packaged image has the administrator/Common Controls manifest and all 76
+pinned runtime DLLs. Only NSIS's three UNK -> NSS marker bytes differ from the
+staged image (`G/payload-comparison.json`). Actual generated NSIS compiled-trace
+and source contracts passed. Existing shared build-output aliases were copied
+and hashed before packaging; both original CI installer/image pairs were
+independently rehashed unchanged. Normal diagnostic installation exited 0 in
+18.237 s, installed the exact packaged hash and preserved all three private
+profile files byte for byte.
+
+Final source checks passed: 288 frontend tests, typecheck, contracts/frontend
+build, 938 Rust tests / 14 ignored at default concurrency (36.84 s), formatting,
+all-target Clippy with warnings denied and the 76-DLL/third-party closure.
+Four added regressions cover exact refusal/read order, busy-snapshot refusal
+and pending exclusion, no repeated readiness read, and unchanged Network wire
+values. Existing path/identity/fence retirement tests passed. Initial build/
+sandbox/tooling failures are retained. The first full Rust run had 12 SRT
+fixture startup/recovery failures; the final rerun with GStreamer warnings
+captured passed without reducing concurrency. Those failures are retained and
+unattributed, not a historical EOS diagnosis or hardware pass.
+
+**What changed.** The actual refusing check carries a fixed reason through the
+existing error channel; IPC kind/message remain unchanged. The finite codes
+distinguish missing/stale selection, index lookup/mismatch, status lookup/down,
+pending snapshot busy, retired transport/relay and changed path. Only the first
+refusal per transport is recorded, including the SRT before-send check. Numeric
+transport records link to existing generation/instance/data IDs. Retirement,
+SRT error-bus/EOS diagnostics, Stop intent and operator Disable/exit have
+sub-second timestamps. Ordinary probe refusals are not logged. No new native
+read, cross-manager lock, setting, command or generic telemetry owner was added.
+Readiness, freshness, pending exclusion, native serialization, synchronous
+retirement and retained-result/uncertainty barriers are unchanged; the confirmed
+firewall optimization is untouched.
+
+**Exact observed refusals.** All times below are UTC, converted from Test's
+Central Standard Time log timestamps. `G/refusal-analysis.json`, the indexed
+`events-20261111T155442838Z.json` capture and earlier checkpoint captures preserve
+the full ordering; no readiness checks were rerun to assign these reasons.
+
+| Scenario | Refusal / lifecycle evidence | Interpretation |
+|---|---|---|
+| Three rapid SRT Start/Disable cycles, saved UDP 18890 | Generation 2, instance/data 1, transport 2: `srt_before_send`, `pending_snapshot_busy` at **15:33:02.325758**; runtime GstError .325819, Recovering .325919, shutdown .326002, bus error .326022, transport retirement .345021. Operator Disable reaches the backend only at **15:33:02.753945**. | Unexpected refusal precedes backend Disable by **428.187 ms**, also preceding the UI's Disable timestamp by 383.698 ms. No EOS was observed. Disable interrupts this recovery, so it is not a recovery-acceptance pass. |
+| Separate SRT Start, then no further Start | Generation 4, instance/data 1, transport 4: `srt_before_send`, `pending_snapshot_busy` at **15:35:04.032875**; Recovering .032987, shutdown .033090, bus error .033157 (`shutdown_requested=true`), retirement .038770. Automatic zero-delay attempt 1 starts at 15:35:08.723473; instance/data 2, transport 5, listener ready at **15:35:14.853123**. | Unexpected refusal while streaming remains desired; **10.820 s** fault-to-listener-ready. The existing peer was not yet decoding. Media was subsequently decoded from this automatically recovered generation without another operator Start, as detailed below. |
+| Single RTSP peer decoding attempt on saved TCP 18554 | Generation 5, transport 6: `serve_interval`, `pending_snapshot_busy` at **15:47:32.622107**; transport retirement .622224 and the original generic unavailable message .622267. The guarded callback marks Failed .621989 before returning that same refusal to Gate; operator Disable is later at **15:50:36.947872**. | Actual bound TCP serve retirement is captured. OPTIONS 200 was followed by **503 and zero decoded frames**. This is a failed affected-media check, not recovered media. |
+
+The other first refusals are normal `relay_retired` during Disable: transports
+1, 3 and 5 occur 2.574, 3.651 and 2.265 ms after the backend operator records.
+They are distinct from the unexpected `pending_snapshot_busy` cases. All eight
+UI controller tasks completed successfully; this does not turn the failed
+media cases into passes. The three cycles are not an R2 cohort: the first
+ensure rewrote the installed default template; only the next two were unchanged.
+
+The exact pending-snapshot code means selection/fence, native index identity
+and native Up-status checks already passed in that invocation, then
+`pending_ips.try_lock()` failed. Camera ARP replies bracket all three refusals:
+15:32:58.833300 / 15:33:04.081387, 15:35:00.091099 / 15:35:05.343849 and
+15:47:29.096318 / 15:47:34.357025. Expected-MAC replies continued and no Ethernet
+link-down was logged. One native snapshot at 15:39:20 shows Ethernet Up at
+100 Mbps, expected camera neighbor Reachable, the exact UDP listener and six
+interface-bound SRT permits. This supports snapshot contention as the direct
+cause of these new refusals, not an observed link loss.
+
+Confidence is high for the new captures' exact branch and lifecycle ordering.
+The original 04:02:02 EOS and the earlier two CI rapid-cycle faults still lack
+branch-level evidence. **EOS did not recur; these captures do not establish
+the original EOS branch.** The pending lock holder is also unknown: read-only snapshots and the
+durable commit/pending-handover path both use the mutex. A reader-sharing fix,
+lock reordering or cached snapshot would remain speculative for the captured
+holder. No readiness/recovery behavior fix was made in this bounded slice.
+
+**Actual decoding after automatic application recovery.** A single SRT decoder
+process on THINKBOOK-G7 ran from 15:36:00.302608 to 15:42:00.370601 UTC, bounded
+to 360 s. First decoded raw frame was 15:36:02.471861; 150 frames were observed
+by 15:36:07.326750; final count was **10,626**. The application had recovered
+generation 4 without another Start before that first peer connection. The peer
+was not connected before the startup fault, so no before-failure decoding or
+automatic peer reconnect was demonstrated. This is a partial recovery result,
+not the requested complete acceptance sequence or CI-image qualification.
+
+The same decoder continued across a **3.579 s decoder-output observation gap**
+at 15:37:11.930358–15:37:15.508946, without manual reconnect. No matching app
+fault, refusal, EOS or generation transition was logged. Reader timing alone
+does not identify that gap's cause or prove a reconnect. There was no later
+refusal/EOS during the six-minute peer window; no longer soak was substituted.
+Evidence is `G/srt-continuous.json` and its milestone/progress records. Subsequent
+normal SRT Disable passed; the bounded stopped peer received zero frames in
+8.116 s. The separate RTSP failed result remains in `G/rtsp-decoded.json`/`.log`.
+
+**Normal closure, restoration and export.** Normal Close was accepted at
+15:51:14.572421 UTC. Independent PID/creation-time observation verified all seven
+app/WebView processes exited. Diagnostic native cleanup passed at 15:52:34.
+The original CI installer `7279f427...` then reinstalled normally, exit 0 in
+17.469 s; its exact packaged image `382b48e1...` is restored and was left closed.
+No GUI relaunch was used or credited as CI-artifact media qualification.
+
+At **15:56:41 UTC**, independent restored cleanup confirms both owned rules
+disabled in ActiveStore and PersistentStore, empty Package/no AppPkgId, zero
+product/helper/fault processes, output listeners/endpoints, named managed
+permits and application-bound WFP permits. All eight qualification tasks were
+retired; no peer decoder fixture remains. Saved RTSP/SRT sections and secrets,
+key, selected adapter, camera/PTU configuration and cached roles match the
+private baseline; Enable is false and the saved output is RTSP 18554, SRT
+18890/125 ms. No unresolved cleanup state or native uncertainty remains.
+
+A final read-only preservation comparison at **16:08:21 UTC** independently
+confirms unchanged operator config sections (only runtime `adopted_meta`
+metadata excluded), address identities/prefixes, route destinations/interfaces/
+next hops/metrics/protocols, DHCP/interface metrics and DNS. It also confirms
+zero product processes and zero remaining qualification tasks. Values remain
+private; booleans are in `G/baseline-preservation.stdout.log`.
+
+All **68 exported files** verified against their Test hashes, with raw logs and
+private profiles excluded (`G/evidence-transfer.json`). Export index SHA-256:
+`728e7ebdc9745e4497e5a1f55abbdae66e4467e2ad34eb00ff1a2cf72f5cec81`;
+archive: `2a97f36ef0f671ace8c5aace03c174e65eca41e4ebcefe9e1982c2423b88660d`;
+restored-state: `3abf508844a64fdc5318c70d23bf4a679d0c207e2aa3c00bdcf1b639bd9f2668`.
+Live remote refs still resolve main to `922b414`, v0.6.10 to `f2a6f4f` and
+v0.6.11 to `7ed10d8`. Draft 441266851 remains unpublished and public latest is
+v0.6.9. Both immutable CI artifact pairs remain unchanged.
+
 ## Remaining gates and release state
 
 The v0.6.10 results above remain historical. The separate v0.6.11 CI candidate
@@ -911,19 +1069,25 @@ it does not close production application/SRT lease, fault-UI or ownership cases.
 Ready for public release: **no**. R2 still needs matched resource/power
 conditions, All-addresses reference and remaining port/protocol combinations,
 install-with-repair and all Second repetitions. EOS/transport refusal remains
-open, including the two new rapid-cycle GStreamer faults. Remote decoding after
-automatic recovery has not been observed. The remaining R3–R10 subcases,
+open. The separate diagnostic above identifies pending-snapshot contention in
+new SRT/RTSP failures and observes actual decoding after automatic SRT recovery,
+but does not identify the original EOS branch, qualify the CI image, or complete
+before-failure decoding and automatic peer-reconnect acceptance. The remaining R3–R10 subcases,
 separately authorized Second, disposable VM and operator hardware gates retain
 their stated pending status. Paused A4/B, discovery/Clear, privilege integration
 and PTU movement remain outside this task.
 
-Next bounded action: capture one exact readiness-refusal reason with fixed,
-redacted diagnostics on Test, correlate pad/bus/generation/shutdown ordering and
-verify actual peer decoding after recovery. Repeat the affected policy cohorts
-under a recorded matched power/resource condition. Any further production change
+Next bounded action: identify the pending-snapshot lock holder and read/write
+phase at one unexpected refusal through the existing owner, then assess a
+minimal fresh-snapshot fix with regression coverage. Preserve pending exclusion
+and the commit/handover barrier. Complete a bounded decoding-before-failure /
+150-frames-after-recovery run and record whether the existing peer reconnects.
+The remaining matched-condition policy cohorts are still separate R2 work.
+Any further production change
 needs its own unused version/tag and exact CI artifact qualification; retain both
 existing tags and candidates. Native policy-failure UI still needs the prescribed
-separately identified fixture. Test is closed and clean at 13:59:08 UTC. Live
+separately identified fixture. Test is restored to the original CI image,
+closed and clean at 15:56:41 UTC. Live
 completion checks show v0.6.11 draft ID 441266851 unpublished, public v0.6.9/feed
 unchanged and main still `922b414`; no main merge or publication was performed.
 

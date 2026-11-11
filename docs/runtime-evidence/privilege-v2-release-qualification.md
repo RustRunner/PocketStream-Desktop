@@ -96,6 +96,15 @@ Two rapid SRT timing cycles recorded guarded-transport refusal and GStreamer
 faults; the original EOS and decoding after automatic recovery remain open.
 The successful 150-frame media runs do not close those failure/recovery gates.
 
+The separate [11 November guarded-readiness diagnostic](v0610-release-candidate.md#guarded-readiness-refusal-capture--11-november-2026-utc)
+captures `pending_snapshot_busy` before operator shutdown in two SRT starts and
+an RTSP serve guard. A single peer decoded 10,626 frames after automatic SRT
+application recovery, but first connected after the fault; the complete
+before-failure/peer-reconnect acceptance remains pending. The diagnostic RTSP
+attempt returned 503 and zero frames. These local-diagnostic results do not
+qualify the unchanged CI image. No readiness behavior fix was made; Test's exact
+original CI image was restored, closed and independently clean at 15:56:41 UTC.
+
 Candidate-specific update, 10 November 2026: the [v0.6.10 run sheet](v0610-release-candidate.md#bounded-r5r9-resume--10-november-2026) records the bounded Test RTSP executor/policy fault run, its separate startup-retry subcase, accepted true/false restart persistence, and RTSP/SRT running draft/Disable checks after normal selection of the operator's replacement camera. Final native cleanup passed. Application listener/lease/SRT fault cases, policy-failure/reload UI, remaining E save/confirmation paths and Second repetitions remain pending. Production startup/ensure/disable timing misses and an SRT EOS recovery are preserved. These partial results do not close this matrix or resume paused A4/B work.
 
 The native partial-provider fault mechanism must be identified and recorded on the isolated fixture. A simulated failure before any write, an ordinary conflict, or successful fake cleanup must not be relabeled as a real partial-provider result. Add/Remove/Static/DHCP/DNS/route/renew/restart postconditions and caller-abort uncertainty remain separate pending address-operation gates.
