@@ -1567,6 +1567,61 @@ timing use the established line pattern and are unaffected. The historical 24.17
 v0.6.10 recovery is not compared beyond recording: images, timings and conditions
 differ.
 
+## Battery preflight observation — 11 November 2026 UTC
+
+Evidence **L** is `src-tauri/target/r2-matched-power-20261111T223749Z/` in this
+worktree. The operator requested the matched-power cohorts, then questioned their
+value and whether further production/test changes were justified. Both cohorts
+were held before execution while that scope decision was pending. No Ensure/
+Disable cycle or stream was started, and no battery-cohort pass is claimed.
+
+Test was initially AC/Balanced at 100% charge, closed on the exact v0.6.12 CI
+image. The operator disconnected only the charger. Fresh baseline at
+22:40:43.200684 verified Offline/Balanced, 100% charge, the same host/account,
+unlocked desktop, camera/adapter identities, stopped saved RTSP output and clean
+owned native state. Reported clock was 1505 MHz, load 3%, free memory about 9 GiB.
+The bound replacement-camera OPTIONS probe returned 200 with the expected MAC.
+
+The one normal launch (PID 17872) produced a startup policy observation:
+**11.545 s native / 9.688 s script**, admission **0 ms**, contained and exited,
+policy completion 22:42:07.409111. Script stages in milliseconds: ownership 3763,
+trusted modules 2331, inventory 1885, shape 936, disable 540, input 213, access 20.
+Full native/address reconciliation completed separately at 22:42:21.098346.
+This single observation is within the unchanged 12-second policy limit; it is
+not a startup percentile or matched historical comparison.
+
+The app was normally closed at 22:44:32–34. All seven recorded application/
+WebView processes had exited by 22:45:02.281666. Native verification at
+22:45:17.237891 found both owned rules disabled in both stores, no AppPkgId,
+no product/fixture processes, output listeners/endpoints or application WFP
+permits. Both owned tasks were retired. No production code or regression tests
+were changed, and no new artifact was built or installed.
+
+**Baseline exception retained:** the final network comparison failed only its
+DHCP/interface-metric group. A numeric CIM comparison narrowed the actual
+difference to Wi-Fi index 18, both IPv4 and IPv6 interface metrics **35 -> 45**;
+DHCP and AutomaticMetric stayed enabled. All other interface settings, addresses,
+routes/next hops/route metrics, DNS and operator configuration sections matched.
+Wi-Fi remained Up (234 Mbps at the follow-up). The cause of this automatic-metric
+value change is not attributed; no metric was forced back and full network-value
+preservation is not claimed. Owned application retirement is verified. An initial
+diagnostic rendered deserialized enum numbers versus live enum names; that
+comparison is preserved, and the numeric comparison supersedes its broad matches.
+
+The first export verified 31 files. The addendum, including both interface
+comparisons, verified **33 files**; `L/evidence-transfer-addendum.json` records
+index SHA-256 `70193dbf8f9fe0f836be156ca65ddd8af9cc89e535468d4b65a887ab09802085`
+and archive SHA-256 `ae07900d3ecab78e50c90ad7895514133b2d3f3d23f7bebf97fac2838552dfa5`.
+Private profiles and raw logs remain on Test. Both exports and the failed baseline
+comparison are preserved.
+
+Battery repetition was a diagnostic follow-up to power uncertainty. F hardware
+item 3 and consolidated R2 require timing repetitions and the stated limits;
+they do not explicitly add a battery matrix. The two already completed AC cohorts
+remain valid for their recorded conditions. Battery follow-up is not promoted to
+an additional mandatory release gate, and no new production fix is justified by
+this single startup observation or the interface-metric difference.
+
 ## Remaining gates and release state
 
 The v0.6.10 and v0.6.11 results above remain attached to their original images.
@@ -1579,9 +1634,11 @@ preserved. The standalone native fault
 harness still qualifies only its separately identified policy/executor source;
 it does not close production application/SRT lease, fault-UI or ownership cases.
 
-Ready for public release: **no**. R2 still needs matched resource/power
-conditions, All-addresses reference and remaining port/protocol combinations,
-install-with-repair and all Second repetitions. Historical EOS origin remains
+Ready for public release: **no**. Reconcile the completed AC timing cases against
+the remaining R2 protocol/template, startup/install-repair and Second requirements. Historical
+resource/power comparability remains a diagnostic limitation, not an extra battery
+gate. All-addresses reference and remaining port/protocol/binding combinations
+also remain in the qualification matrix. Historical EOS origin remains
 unproven and cannot be attributed from the preserved evidence. The reader-holder
 capture establishes a different recorded refusal, and the controlled abort
 qualifies recovery behavior only. Automatic recovery of an already-decoding SRT
@@ -1593,10 +1650,10 @@ disposable VM and operator hardware gates retain their stated pending status. No
 Second host is authorized. Paused A4/B,
 discovery/Clear, privilege integration and PTU movement remain outside this task.
 
-Next bounded action: run matched-power ten-case unchanged-SRT and changed-RTSP
-cohorts on this exact image with the established procedure. The other single-host
-R2 items are the All-addresses reference, remaining port/protocol combinations and
-install-with-repair. Second-host repetitions still need separate authorization.
+Next bounded action: reconcile existing R2 evidence and execute only the missing
+authorized cases on this exact image. The battery cohorts above remain unrun
+pending the operator's scope decision; do not repeat the completed AC cohorts
+without an identified coverage gap. Second-host repetitions still need separate authorization.
 RTSP-output recovery needs its acceptance stated before it runs, for example a
 fresh session decoding without operator action. The established RTSP peer
 pipeline (`rtspsrc` under gst-launch) has no reconnect behavior and exits at end
@@ -1604,8 +1661,10 @@ of stream. No further production fix is justified by current evidence. Native po
 prescribed separately identified fixture. Any further production change needs its
 own unused version/tag and exact CI artifact qualification.
 
-Test remains installed on **v0.6.12**, closed and clean at **22:02:09 UTC**.
-Live completion checks identify v0.6.12 draft **442083374**, v0.6.11 draft
+Test remains installed on **v0.6.12**, normally closed with owned native retirement
+verified at **22:45:17 UTC**. The Wi-Fi automatic-metric baseline exception above
+is retained; full network-value preservation is not claimed for L. The prior
+release completion checks identify v0.6.12 draft **442083374**, v0.6.11 draft
 441266851 and v0.6.10 draft 440937913, all unpublished. Main remains
 `922b41434bd16a76eedddace9cdf6bbb101e0901`; all three immutable tags resolve to
 their recorded application sources. Public latest is still v0.6.9, release
