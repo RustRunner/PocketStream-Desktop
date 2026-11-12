@@ -1,3 +1,15 @@
+# v0.6.14 maintenance candidate (unreleased)
+
+Fixes a reproducible application crash when MPEG-TS input over UDP begins with PES buffers that lack timestamps. The bundled GStreamer demux now uses the first timestamped pending PES for its duration and clock-offset calculations while retaining earlier buffers. Incomplete or media-free input can still report a media error; it is not treated as playable video.
+
+Includes the replacement train's v0.6.8/v0.6.9 firewall-template repair, safer policy recovery and synchronous Stop cleanup, saved Enable behavior, binding improvements and re-stream card cleanup. Existing overriding Windows Block rules remain authoritative. Administrator access remains required.
+
+This candidate includes the previously isolated 1.26.11 demux fix in the application runtime. The other 75 runtime DLLs, including patched SRT 1.5.7, are unchanged. The established external peer is not automatically updated. General SRT-client compatibility and automatic reconnect are not established by the demux fix.
+
+The original v0.6.13 closeout failed application UDP exposure and was stopped. Its results remain failed. Exact-candidate verification and the unrun SRT-comparison and real-upgrade/Block checks are release blockers until separately completed; broader proposed maintenance exceptions require an explicit release-owner decision. This is an unpublished candidate, not publication approval.
+
+Corresponding native sources, patch and build inputs are staged in the [new source prerelease](https://github.com/RustRunner/PocketStream-Desktop/releases/tag/deps-src-gstreamer-1.26.11-srt-1.5.7-tsdemux-1). That source release must be published and verified before the application is published. The [existing run sheet](docs/runtime-evidence/v0610-release-candidate.md) preserves earlier image-specific results and qualification limits.
+
 # v0.6.12 reliability candidate (unreleased)
 
 Read-only pending-address snapshots can now run concurrently. A captured SRT startup fault was caused by one such reader rejecting another through an exclusive mutex. Pending-address changes and durable commit/handover remain exclusive; readiness still uses fresh native observations and refuses during active or queued writes.

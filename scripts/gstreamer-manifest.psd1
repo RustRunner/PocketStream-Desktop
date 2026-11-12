@@ -58,8 +58,20 @@
 
     # Every DLL copied into the installer is locked to the exact byte content
     # of the pinned 1.26.11 runtime MSI, except libsrt.dll which is replaced by
-    # PatchedSrt above. bundle-gstreamer.ps1 rejects missing, extra, renamed,
+    # PatchedSrt above; gstmpegtsdemux.dll uses PatchedTsdemux below.
+    # bundle-gstreamer.ps1 rejects missing, extra, renamed,
     # or hash-drifted files before Tauri can package them.
+    PatchedTsdemux = @{
+        ReleaseTag = 'deps-tsdemux-1.26.11-bootstrap-1'
+        ArchiveFile = 'pocketstream-tsdemux-1.26.11-bootstrap-1.zip'
+        ArchiveSha256 = '8787c796c66adbe24e6e12b408459cd5420ca795230cde3405502ecf67976969'
+        DllSha256 = '824e7d9791aef8692a21eeced55637f304dcd7da4234c680c5753aad565e89f0'
+        StockDllSha256 = 'eb303caaa8a17f949a15f3cccbe59b95c1397987fce2d2a2e86b4805cef2726c'
+        BaseCommit = 'e6ee9e63e033b9c8e343ba0bdfa7590ef81449ee'
+        SourceCommit = 'd616643b9bab799e8e6f2c453722bc95f26cb813'
+        PatchPath = 'scripts/tsdemux-runtime/0001-tsdemux-bootstrap-and-tests.patch'
+        PatchSha256 = '3b71c955f039e56ca1228cb1276ccfce3831e48fd53d9fb3bfd709911b0be875'
+    }
     BundleClosure = @{
         'bin/avcodec-61.dll'                              = 'd871f203550e02de688e5aa17323b2ffb8365f2f6fe4603f330eb450d5cadc19'
         'bin/avfilter-10.dll'                             = 'ae40b79002b86c1e563f3f0374cc0adabfbcc3b0c90c78ea07dce1ef5db7f42d'
@@ -119,7 +131,7 @@
         'lib/gstreamer-1.0/gstdirectsound.dll'            = 'a7228380219a08a4e155ad03015fd8f35a6f3199c261e17612a1409da79362d0'
         'lib/gstreamer-1.0/gstisomp4.dll'                 = 'c6f1cd874b3ef54e4056a50ae9019c4678b51c4f98f78e2a0fdf853641c037d8'
         'lib/gstreamer-1.0/gstlibav.dll'                  = 'f84ab8e0568c7341cb3ef79631edc1da22b8f1396ab63d75a8b37ad4887ba67f'
-        'lib/gstreamer-1.0/gstmpegtsdemux.dll'            = 'eb303caaa8a17f949a15f3cccbe59b95c1397987fce2d2a2e86b4805cef2726c'
+        'lib/gstreamer-1.0/gstmpegtsdemux.dll'            = '824e7d9791aef8692a21eeced55637f304dcd7da4234c680c5753aad565e89f0'
         'lib/gstreamer-1.0/gstmpegtsmux.dll'              = '55ae613b0d278ff834565177fe889744333f6d60603a52363ecc3f7f85ddd6a5'
         'lib/gstreamer-1.0/gstmulaw.dll'                  = '90bfb95772c27775be14b86fe18e15029352d20035e590f1e74066919bfa5f60'
         'lib/gstreamer-1.0/gstopengl.dll'                 = '303a55600031b793831233e6c12f7597b4d14a4360d955daef446973ca2b0da2'
@@ -144,11 +156,14 @@
     # prerelease tag is used instead of mutating the earlier GStreamer-only
     # mirror after the SRT closure was added.
     SourceRelease = @{
-        Tag            = 'deps-src-gstreamer-1.26.11-srt-1.5.7-1'
-        Url            = 'https://github.com/RustRunner/PocketStream-Desktop/releases/tag/deps-src-gstreamer-1.26.11-srt-1.5.7-1'
+        Tag            = 'deps-src-gstreamer-1.26.11-srt-1.5.7-tsdemux-1'
+        Url            = 'https://github.com/RustRunner/PocketStream-Desktop/releases/tag/deps-src-gstreamer-1.26.11-srt-1.5.7-tsdemux-1'
         IndexFile      = 'SHA256SUMS.txt'
-        IndexSha256    = '8d292bdc9befbcd0809141fc7dc7fb2ef6fd580d7208b65309c1216472abc001'
+        IndexSha256    = '0c9795fefe7b40d8d1291709f7ac0884b4671867362adc555ac86d4b3304319d'
         Assets = @{
+            'tsdemux-bootstrap-patch' = @{ Version = '1.26.11'; SourceTag = '1.26.11'; File = '0001-tsdemux-bootstrap-and-tests.patch'; RepositoryPath = 'scripts/tsdemux-runtime/0001-tsdemux-bootstrap-and-tests.patch'; Sha256 = '3b71c955f039e56ca1228cb1276ccfce3831e48fd53d9fb3bfd709911b0be875' }
+            'tsdemux-build-recipe' = @{ Version = '1.26.11'; SourceTag = '1.26.11'; File = 'Build-Peer.ps1'; RepositoryPath = 'scripts/tsdemux-runtime/Build-Peer.ps1'; Sha256 = '03c874f013984c5e263759f2938fefa64127417074b4623060883a226277f4f4' }
+            'tsdemux-build-instructions' = @{ Version = '1.26.11'; SourceTag = '1.26.11'; File = 'tsdemux-build-instructions.md'; RepositoryPath = 'scripts/tsdemux-runtime/README.md'; Sha256 = 'd870c5bd4067cfab36f5df8252b0e489333200991b7db89c950b202f6c4dd5f2' }
             'bzip2' = @{ Version = '1.0.8'; SourceTag = '1.0.8'; File = 'bzip2-1.0.8.tar.gz'; Url = 'https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz'; Sha256 = 'ab5a03176ee106d3f0fa90e381da478ddae405918153cca248e682cd0c4a2269' }
             'cerbero' = @{ Version = '1.26.11'; SourceTag = '1.26.11'; File = 'cerbero-1.26.11.tar.gz'; Url = 'https://github.com/GStreamer/cerbero/archive/refs/tags/1.26.11.tar.gz'; Sha256 = 'c385254bd01a975a48087f28a10e530ae8444ca4351b07831cda60ca8f9c858c' }
             'ffmpeg' = @{ Version = '7.1'; SourceTag = 'n7.1'; File = 'ffmpeg-7.1.tar.xz'; Url = 'https://ffmpeg.org/releases/ffmpeg-7.1.tar.xz'; Sha256 = '40973d44970dbc83ef302b0609f2e74982be2d85916dd2ee7472d30678a7abe6' }
@@ -187,7 +202,7 @@
         'glib'               = @{ Version = '2.80.5'; SourceAssets = @('glib'); BuildOrigin = 'gstreamer-1.26.11-msi'; BuildInputs = @('cerbero') }
         'graphene'           = @{ Version = '1.10.8'; SourceAssets = @('graphene'); BuildOrigin = 'gstreamer-1.26.11-msi'; BuildInputs = @('cerbero') }
         'gst-libav'          = @{ Version = '1.26.11'; SourceAssets = @('gst-libav'); BuildOrigin = 'gstreamer-1.26.11-msi'; BuildInputs = @('cerbero') }
-        'gst-plugins-bad'    = @{ Version = '1.26.11'; SourceAssets = @('gst-plugins-bad'); BuildOrigin = 'gstreamer-1.26.11-msi'; BuildInputs = @('cerbero') }
+        'gst-plugins-bad'    = @{ Version = '1.26.11'; SourceAssets = @('gst-plugins-bad','tsdemux-bootstrap-patch'); BuildOrigin = 'gstreamer-1.26.11-msi + pinned MSVC tsdemux bootstrap replacement'; BuildInputs = @('cerbero','tsdemux-build-recipe','tsdemux-build-instructions') }
         'gst-plugins-base'   = @{ Version = '1.26.11'; SourceAssets = @('gst-plugins-base'); BuildOrigin = 'gstreamer-1.26.11-msi'; BuildInputs = @('cerbero') }
         'gst-plugins-good'   = @{ Version = '1.26.11'; SourceAssets = @('gst-plugins-good'); BuildOrigin = 'gstreamer-1.26.11-msi'; BuildInputs = @('cerbero') }
         'gst-plugins-ugly'   = @{ Version = '1.26.11'; SourceAssets = @('gst-plugins-ugly'); BuildOrigin = 'gstreamer-1.26.11-msi'; BuildInputs = @('cerbero') }

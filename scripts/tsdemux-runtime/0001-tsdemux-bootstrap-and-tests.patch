@@ -1,0 +1,369 @@
+From d616643b9bab799e8e6f2c453722bc95f26cb813 Mon Sep 17 00:00:00 2001
+From: RustRunner <dev.rustrunner@gmail.com>
+Date: Thu, 12 Nov 2026 10:48:33 -0600
+Subject: [PATCH] tsdemux: bootstrap from the first timestamped pending PES
+
+A fresh join may queue PES without PTS/DTS before a later timestamp arrives. Use the first known pending timestamp for the duration threshold and clock offset while retaining untimestamped buffers. Add synthetic transport fixtures and missing/normal timestamp controls.
+---
+ .../gst-plugins-bad/gst/mpegtsdemux/tsdemux.c |  36 +++--
+ .../tests/check/elements/mpegtsdemux.c        | 141 ++++++++++++++++++
+ .../check/elements/tsdemux-timestamp-data.h   | 110 ++++++++++++++
+ 3 files changed, 277 insertions(+), 10 deletions(-)
+ create mode 100644 subprojects/gst-plugins-bad/tests/check/elements/tsdemux-timestamp-data.h
+
+diff --git a/subprojects/gst-plugins-bad/gst/mpegtsdemux/tsdemux.c b/subprojects/gst-plugins-bad/gst/mpegtsdemux/tsdemux.c
+index 569f62d..0f52eec 100644
+--- a/subprojects/gst-plugins-bad/gst/mpegtsdemux/tsdemux.c
++++ b/subprojects/gst-plugins-bad/gst/mpegtsdemux/tsdemux.c
+@@ -2575,6 +2575,26 @@ gst_ts_demux_record_dts (GstTSDemux * demux, TSDemuxStream * stream,
+   }
+ }
+ 
++/* A join can start with untimestamped PES packets. Keep those buffers, but
++ * measure pending duration and clock offset from the first known timestamp.
++ */
++static guint64
++get_first_pending_timestamp (TSDemuxStream * stream)
++{
++  GList *tmp;
++
++  for (tmp = stream->pending; tmp; tmp = tmp->next) {
++    PendingBuffer *pend = tmp->data;
++
++    if (pend->dts != -1)
++      return pend->dts;
++    if (pend->pts != -1)
++      return pend->pts;
++  }
++
++  return -1;
++}
++
+ /* This is called when we haven't got a valid initial PTS/DTS on all streams */
+ static gboolean
+ check_pending_buffers (GstTSDemux * demux)
+@@ -2609,12 +2629,13 @@ check_pending_buffers (GstTSDemux * demux)
+       /* 1.2 Check if we exceeded the maximum threshold of pending data */
+       if (tmpstream->pending && (tmpstream->raw_dts != -1
+               || tmpstream->raw_pts != -1)) {
+-        PendingBuffer *pend = tmpstream->pending->data;
+         guint64 lastval =
+             tmpstream->raw_dts != -1 ? tmpstream->raw_dts : tmpstream->raw_pts;
+-        guint64 firstval = pend->dts != -1 ? pend->dts : pend->pts;
++        guint64 firstval = get_first_pending_timestamp (tmpstream);
+         GstClockTime dur;
+-        g_assert (firstval != -1);
++
++        if (firstval == -1)
++          continue;
+         dur = MPEGTIME_TO_GSTTIME (lastval - firstval);
+         GST_DEBUG_OBJECT (tmpstream->pad,
+             "Pending content duration: %" GST_TIME_FORMAT, GST_TIME_ARGS (dur));
+@@ -2643,7 +2664,6 @@ check_pending_buffers (GstTSDemux * demux)
+   /* 3. Go over all streams that have current/pending data */
+   for (tmp = demux->program->stream_list; tmp; tmp = tmp->next) {
+     TSDemuxStream *tmpstream = (TSDemuxStream *) tmp->data;
+-    PendingBuffer *pend;
+     guint64 firstval, lastval, ts;
+ 
+     /* 3.1 Calculate the offset between current DTS and first DTS */
+@@ -2660,12 +2680,8 @@ check_pending_buffers (GstTSDemux * demux)
+       GST_WARNING ("Don't have a last DTS/PTS to use for offset recalculation");
+       continue;
+     }
+-    pend = tmpstream->pending->data;
+-    if (pend->dts != -1)
+-      firstval = pend->dts;
+-    else if (pend->pts != -1)
+-      firstval = pend->pts;
+-    else {
++    firstval = get_first_pending_timestamp (tmpstream);
++    if (firstval == -1) {
+       GST_WARNING
+           ("Don't have a first DTS/PTS to use for offset recalculation");
+       continue;
+diff --git a/subprojects/gst-plugins-bad/tests/check/elements/mpegtsdemux.c b/subprojects/gst-plugins-bad/tests/check/elements/mpegtsdemux.c
+index 5af0d29..bd680fb 100644
+--- a/subprojects/gst-plugins-bad/tests/check/elements/mpegtsdemux.c
++++ b/subprojects/gst-plugins-bad/tests/check/elements/mpegtsdemux.c
+@@ -21,6 +21,7 @@
+ #include <gst/gst.h>
+ #include <gst/check/gstcheck.h>
+ #include <gst/check/gstharness.h>
++#include "tsdemux-timestamp-data.h"
+ 
+ #define PACKETSIZE 188
+ 
+@@ -377,6 +378,137 @@ GST_START_TEST (test_tsdemux_simple)
+ 
+ GST_END_TEST;
+ 
++static void
++timestamp_bootstrap_pad_added (GstElement * element, GstPad * pad, GstHarness * h)
++{
++  fail_unless_equals_string (GST_PAD_NAME (pad), "video_0_0101");
++  gst_harness_add_element_src_pad (h, pad);
++}
++
++static void
++check_timestamp_bootstrap (guint leading_missing, gboolean no_timestamps,
++    gboolean with_pcr, gboolean with_dts, guint64 step, gboolean timed_input)
++{
++  const guint8 aud[] = { 0, 0, 1, 9, 0xf0 };
++  GstHarness *h = gst_harness_new_with_padnames ("tsdemux", "sink", NULL);
++  GByteArray *data = make_timestamp_bootstrap (leading_missing, no_timestamps,
++      with_pcr, with_dts, step);
++  GstBuffer *input = gst_buffer_new_allocate (NULL, data->len, NULL);
++  GstSegment segment;
++  GstCaps *caps = gst_caps_from_string ("video/mpegts,systemstream=true");
++  GstClockTime previous_pts = GST_CLOCK_TIME_NONE;
++  gboolean ignore_pcr;
++  gboolean eos = FALSE;
++  GstEvent *event;
++  guint i;
++
++  gst_buffer_fill (input, 0, data->data, data->len);
++  g_byte_array_unref (data);
++  g_signal_connect (h->element, "pad-added",
++      G_CALLBACK (timestamp_bootstrap_pad_added), h);
++  gst_harness_push_event (h, gst_event_new_caps (caps));
++  gst_caps_unref (caps);
++  gst_segment_init (&segment, timed_input ? GST_FORMAT_TIME : GST_FORMAT_BYTES);
++  if (timed_input)
++    GST_BUFFER_DTS (input) = 10 * GST_SECOND;
++  gst_harness_push_event (h, gst_event_new_segment (&segment));
++  fail_unless_equals_int (gst_harness_push (h, input), GST_FLOW_OK);
++  fail_unless (gst_harness_push_event (h, gst_event_new_eos ()));
++  g_object_get (h->element, "ignore-pcr", &ignore_pcr, NULL);
++  fail_unless_equals_int (ignore_pcr, !with_pcr);
++  while ((event = gst_harness_try_pull_event (h))) {
++    if (GST_EVENT_TYPE (event) == GST_EVENT_EOS)
++      eos = TRUE;
++    gst_event_unref (event);
++  }
++  fail_unless (eos);
++
++  /* An entirely untimestamped stream cannot establish a timestamp reference.
++   * It must terminate, without inventing timestamps or asserting.
++   */
++  fail_unless_equals_int (gst_harness_buffers_in_queue (h), no_timestamps ? 0 : 8);
++  for (i = 0; i < (no_timestamps ? 0u : 8u); i++) {
++    GstBuffer *buf = gst_harness_pull (h);
++
++    gst_check_buffer_data (buf, aud, sizeof aud);
++    /* Untimed file input without PCR has no clock mapping, even when raw
++     * PES timestamps are present. Keep the existing fallback/data behavior;
++     * a separate timed-input case checks the arrival-time clock mapping.
++     */
++    if (i < leading_missing || (!with_pcr && !timed_input)) {
++      fail_unless_equals_uint64 (GST_BUFFER_PTS (buf), GST_CLOCK_TIME_NONE);
++      fail_unless_equals_uint64 (GST_BUFFER_DTS (buf), GST_CLOCK_TIME_NONE);
++    } else {
++      fail_unless (GST_CLOCK_TIME_IS_VALID (GST_BUFFER_PTS (buf)));
++      if (GST_CLOCK_TIME_IS_VALID (previous_pts))
++        fail_unless_equals_uint64 (GST_BUFFER_PTS (buf) - previous_pts,
++            gst_util_uint64_scale (step, GST_SECOND, 90000));
++      previous_pts = GST_BUFFER_PTS (buf);
++      if (with_dts) {
++        fail_unless (GST_CLOCK_TIME_IS_VALID (GST_BUFFER_DTS (buf)));
++        fail_unless_equals_uint64 (GST_BUFFER_PTS (buf) - GST_BUFFER_DTS (buf),
++            20 * GST_MSECOND);
++      }
++    }
++    gst_buffer_unref (buf);
++  }
++  gst_harness_teardown (h);
++}
++
++GST_START_TEST (test_tsdemux_missing_prefix_late_pcr)
++{
++  check_timestamp_bootstrap (2, FALSE, TRUE, FALSE, 3600, FALSE);
++}
++GST_END_TEST;
++
++GST_START_TEST (test_tsdemux_missing_prefix_no_pcr)
++{
++  check_timestamp_bootstrap (2, FALSE, FALSE, FALSE, 27000, FALSE);
++}
++GST_END_TEST;
++
++GST_START_TEST (test_tsdemux_timestamped_late_pcr)
++{
++  check_timestamp_bootstrap (0, FALSE, TRUE, FALSE, 3600, FALSE);
++}
++GST_END_TEST;
++
++GST_START_TEST (test_tsdemux_timestamped_no_pcr)
++{
++  check_timestamp_bootstrap (0, FALSE, FALSE, FALSE, 27000, FALSE);
++}
++GST_END_TEST;
++
++GST_START_TEST (test_tsdemux_missing_prefix_dts_late_pcr)
++{
++  check_timestamp_bootstrap (2, FALSE, TRUE, TRUE, 3600, FALSE);
++}
++GST_END_TEST;
++
++GST_START_TEST (test_tsdemux_missing_prefix_dts_no_pcr)
++{
++  check_timestamp_bootstrap (2, FALSE, FALSE, TRUE, 27000, FALSE);
++}
++GST_END_TEST;
++
++GST_START_TEST (test_tsdemux_all_missing_late_pcr)
++{
++  check_timestamp_bootstrap (0, TRUE, TRUE, FALSE, 3600, FALSE);
++}
++GST_END_TEST;
++
++GST_START_TEST (test_tsdemux_missing_prefix_timed_no_pcr)
++{
++  check_timestamp_bootstrap (2, FALSE, FALSE, TRUE, 27000, TRUE);
++}
++GST_END_TEST;
++
++GST_START_TEST (test_tsdemux_timestamped_timed_no_pcr)
++{
++  check_timestamp_bootstrap (0, FALSE, FALSE, TRUE, 27000, TRUE);
++}
++GST_END_TEST;
++
+ static Suite *
+ mpegtsdemux_suite (void)
+ {
+@@ -394,6 +526,15 @@ mpegtsdemux_suite (void)
+   tc = tcase_create ("tsdemux");
+   suite_add_tcase (s, tc);
+   tcase_add_test (tc, test_tsdemux_simple);
++  tcase_add_test (tc, test_tsdemux_missing_prefix_late_pcr);
++  tcase_add_test (tc, test_tsdemux_missing_prefix_no_pcr);
++  tcase_add_test (tc, test_tsdemux_timestamped_late_pcr);
++  tcase_add_test (tc, test_tsdemux_timestamped_no_pcr);
++  tcase_add_test (tc, test_tsdemux_missing_prefix_dts_late_pcr);
++  tcase_add_test (tc, test_tsdemux_missing_prefix_dts_no_pcr);
++  tcase_add_test (tc, test_tsdemux_all_missing_late_pcr);
++  tcase_add_test (tc, test_tsdemux_missing_prefix_timed_no_pcr);
++  tcase_add_test (tc, test_tsdemux_timestamped_timed_no_pcr);
+ 
+   return s;
+ }
+diff --git a/subprojects/gst-plugins-bad/tests/check/elements/tsdemux-timestamp-data.h b/subprojects/gst-plugins-bad/tests/check/elements/tsdemux-timestamp-data.h
+new file mode 100644
+index 0000000..68e02e2
+--- /dev/null
++++ b/subprojects/gst-plugins-bad/tests/check/elements/tsdemux-timestamp-data.h
+@@ -0,0 +1,110 @@
++/* Synthetic transport/program/PES data, generated without media captures.
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++#ifndef TSDEMUX_TIMESTAMP_DATA_H
++#define TSDEMUX_TIMESTAMP_DATA_H
++
++static void
++bootstrap_packet (GByteArray * data, guint pid, guint cc,
++    const guint8 * payload, guint size, gboolean pusi, guint64 pcr)
++{
++  guint8 packet[188];
++  guint i;
++
++  g_assert (size <= 176);
++  memset (packet, 0xff, sizeof packet);
++  packet[0] = 0x47;
++  packet[1] = (pid >> 8) | (pusi ? 0x40 : 0);
++  packet[2] = pid;
++  packet[3] = (size ? 0x30 : 0x20) | (cc & 15);
++  packet[4] = 183 - size;
++  packet[5] = pcr == G_MAXUINT64 ? 0 : 0x10;
++  if (pcr != G_MAXUINT64) {
++    for (i = 0; i < 4; i++)
++      packet[6 + i] = (guint8) (pcr >> (25 - 8 * i));
++    packet[10] = ((pcr & 1) << 7) | 0x7e;
++    packet[11] = 0;
++  }
++  if (size)
++    memcpy (packet + 188 - size, payload, size);
++  g_byte_array_append (data, packet, sizeof packet);
++}
++
++static void
++bootstrap_section (GByteArray * data, guint pid,
++    const guint8 * section, guint size)
++{
++  guint8 payload[64] = { 0 };     /* pointer_field = 0 */
++  guint32 crc = 0xffffffff;
++  guint i, j;
++
++  memcpy (payload + 1, section, size);
++  for (i = 0; i < size; i++) {
++    crc ^= (guint32) section[i] << 24;
++    for (j = 0; j < 8; j++)
++      crc = (crc << 1) ^ ((crc & 0x80000000) ? 0x04c11db7 : 0);
++  }
++  GST_WRITE_UINT32_BE (payload + size + 1, crc);
++  bootstrap_packet (data, pid, 0, payload, size + 5, TRUE, G_MAXUINT64);
++}
++
++static void
++bootstrap_timestamp (guint8 * dest, guint64 value, guint prefix)
++{
++  dest[0] = (guint8) ((prefix << 4) | ((value >> 29) & 14) | 1);
++  dest[1] = (guint8) (value >> 22);
++  dest[2] = (guint8) (((value >> 14) & 254) | 1);
++  dest[3] = (guint8) (value >> 7);
++  dest[4] = (guint8) (((value << 1) & 254) | 1);
++}
++
++/* Program 1, PMT 0x20, PCR 0x100, H.264 elementary PID 0x101. The payloads
++ * are AUD NAL units only: this tests demuxing, not picture decoding. PCR is
++ * deliberately absent until after five PES packets, or absent altogether.
++ */
++static GByteArray *
++make_timestamp_bootstrap (guint leading_missing, gboolean no_timestamps,
++    gboolean with_pcr, gboolean with_dts, guint64 step)
++{
++  const guint8 pat[] = { 0, 0xb0, 13, 0, 1, 0xc1, 0, 0, 0, 1, 0xe0, 0x20 };
++  const guint8 pmt[] = { 2, 0xb0, 18, 0, 1, 0xc1, 0, 0, 0xe1, 0, 0xf0, 0,
++    0x1b, 0xe1, 1, 0xf0, 0
++  };
++  const guint8 aud[] = { 0, 0, 1, 9, 0xf0 };
++  const guint8 null_data = 0;
++  GByteArray *data = g_byte_array_new ();
++  guint i, null_cc = 0;
++
++  bootstrap_section (data, 0, pat, sizeof pat);
++  bootstrap_section (data, 0x20, pmt, sizeof pmt);
++  for (i = 0; i < 8; i++) {
++    guint8 pes[24] = { 0, 0, 1, 0xe0, 0, 0, 0x80, 0, 0 };
++    guint ts_size = no_timestamps || i < leading_missing ? 0 : with_dts ? 10 : 5;
++    guint size = 9 + ts_size + sizeof aud;
++
++    if (with_pcr && i == 5) {
++      guint j;
++      bootstrap_packet (data, 0x100, 0, NULL, 0, FALSE, with_dts ? 81000 : 90000);
++      for (j = 0; j < 5; j++)
++        bootstrap_packet (data, 0x1fff, null_cc++, &null_data, 1, FALSE,
++            G_MAXUINT64);
++      bootstrap_packet (data, 0x100, 0, NULL, 0, FALSE, with_dts ? 84600 : 93600);
++    }
++    pes[5] = size - 6;
++    pes[7] = ts_size ? (with_dts ? 0xc0 : 0x80) : 0;
++    pes[8] = ts_size;
++    if (ts_size) {
++      guint64 pts = 90000 + (i - leading_missing) * step;
++      bootstrap_timestamp (pes + 9, pts, with_dts ? 3 : 2);
++      if (with_dts)
++        bootstrap_timestamp (pes + 14, pts - 1800, 1);
++    }
++    memcpy (pes + 9 + ts_size, aud, sizeof aud);
++    bootstrap_packet (data, 0x101, i, pes, size, TRUE, G_MAXUINT64);
++  }
++  for (i = 0; i < 5; i++)
++    bootstrap_packet (data, 0x1fff, null_cc++, &null_data, 1, FALSE, G_MAXUINT64);
++  return data;
++}
++
++#endif
+-- 
+2.53.0.windows.2
+

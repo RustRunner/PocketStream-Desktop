@@ -24,6 +24,8 @@ $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Manifest  = Import-PowerShellDataFile (Join-Path $ScriptDir "gstreamer-manifest.psd1")
+. (Join-Path $ScriptDir 'tsdemux-runtime/install.ps1')
+Assert-TsdemuxManifest -RootManifest $Manifest -ProjectRoot (Split-Path -Parent $ScriptDir)
 
 function Get-Sha256 {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -501,6 +503,10 @@ GStreamer $ExpectedVersion runtime + devel (complete install, ADDLOCAL=ALL) and 
 # checked by Install-PatchedSrt.
 $totalSize += Install-PatchedSrt `
     -ArchivePath $PatchedSrtArchive -Srt $Manifest.PatchedSrt -DestinationBin $OutBin
+$demuxArchive = Get-VerifiedTsdemuxArchive -Demux $Manifest.PatchedTsdemux `
+    -CacheDir $DependencyCacheDir -AllowDraft:$AllowDraftDependencyRelease
+$totalSize += Install-StagedTsdemux -ArchivePath $demuxArchive -Demux $Manifest.PatchedTsdemux `
+    -DestinationPlugin (Join-Path $OutPlugins 'gstmpegtsdemux.dll')
 
 # Freeze the replacement's complete staged closure, including the official
 # MSI's OpenSSL and MinGW runtime DLLs and the two GStreamer plugins. This is
