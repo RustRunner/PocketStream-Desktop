@@ -332,7 +332,7 @@ pub(super) struct NativeProcessRunner;
 
 // Qualification executable only. Faults are consumed in the host, never in the
 // fresh PowerShell process. No production flag, setting or IPC entry exists.
-#[cfg(test)]
+#[cfg(any(test, feature = "qualification-r5"))]
 #[derive(Default)]
 pub(super) struct FirewallQualification {
     pub ensure_timeout: AtomicBool,
@@ -340,7 +340,7 @@ pub(super) struct FirewallQualification {
     pub recovery_prewrite_failure: AtomicBool,
     pub startup_timeout: AtomicBool,
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "qualification-r5"))]
 impl FirewallQualification {
     fn attempt(&self, operation: &super::firewall::Operation) -> (String, Duration) {
         use super::firewall::Operation;
@@ -367,6 +367,7 @@ impl FirewallQualification {
         (script, budget)
     }
 
+    #[cfg(test)]
     pub fn run(
         &self,
         operation: super::firewall::Operation,
@@ -455,6 +456,53 @@ fn firewall_qualification_faults_are_consumed_once_in_the_host() {
     );
     // Fault variants must also fit the real runner's base64 command line.
     assert!(script.len().div_ceil(3) * 4 + 512 < 32767);
+}
+
+#[cfg(test)]
+#[test]
+fn application_r5_fault_sequence_keeps_budgets_and_consumes_each_fault_once() {
+    use super::firewall::{FirewallRule, Operation};
+    for role in [FirewallRule::Rtsp, FirewallRule::Srt] {
+        let faults = FirewallQualification {
+            ensure_timeout: AtomicBool::new(true),
+            disable_timeout: AtomicBool::new(true),
+            recovery_prewrite_failure: AtomicBool::new(true),
+            startup_timeout: AtomicBool::new(false),
+        };
+        let ensure = Operation::Ensure {
+            role,
+            port: 18554,
+            interface: None,
+        };
+        let disable = Operation::Disable { role };
+        assert_eq!(
+            faults.attempt(&Operation::Startup).0,
+            super::firewall::SCRIPT
+        );
+        let (timeout, budget) = faults.attempt(&ensure);
+        assert_eq!(budget, Duration::from_secs(30));
+        assert!(
+            timeout.find("Set-NetFirewallRule -Enabled True").unwrap()
+                < timeout.find("qualification_after_enable").unwrap()
+        );
+        let (settle, budget) = faults.attempt(&disable);
+        assert_eq!(budget, Duration::from_secs(30));
+        assert!(settle.contains("qualification_disable_before_readback"));
+        assert!(!settle.contains("Qualification recovery failure before writes"));
+        let (recovery, budget) = faults.attempt(&disable);
+        assert_eq!(budget, Duration::from_secs(30));
+        assert!(
+            recovery
+                .find("throw 'Qualification recovery failure before writes'")
+                .unwrap()
+                < recovery.find("$mode = $data.operation.mode").unwrap()
+        );
+        for script in [&timeout, &settle, &recovery] {
+            assert!(script.len().div_ceil(3) * 4 + 512 < 32767);
+        }
+        assert_eq!(faults.attempt(&disable).0, super::firewall::SCRIPT);
+        assert_eq!(faults.attempt(&ensure).0, super::firewall::SCRIPT);
+    }
 }
 
 #[cfg(test)]
@@ -572,6 +620,9 @@ impl NativeProcessRunner {
         operation: super::firewall::Operation,
         cancel: Cancellation,
     ) -> Result<ProcessResult, String> {
+        #[cfg(feature = "qualification-r5")]
+        return Self::run_r5_firewall(operation, cancel);
+        #[cfg(not(feature = "qualification-r5"))]
         Self::run_inner(
             super::firewall::SCRIPT,
             operation.payload()?,
@@ -586,6 +637,44 @@ impl NativeProcessRunner {
                 error.raw_os_error()
             )
         })
+    }
+
+    // Fixed application qualification builds only. The normal runner, input,
+    // containment, budgets and settlement path are unchanged. No runtime switch.
+    #[cfg(feature = "qualification-r5")]
+    fn run_r5_firewall(
+        operation: super::firewall::Operation,
+        cancel: Cancellation,
+    ) -> Result<ProcessResult, String> {
+        if std::env::var("COMPUTERNAME").as_deref() != Ok("DESKTOP-PI5BMJR")
+            || std::env::var("USERNAME").as_deref() != Ok("TSD-0311")
+            || std::env::current_exe().ok().as_deref()
+                != Some(std::path::Path::new(
+                    r"C:\Program Files\PocketStream Desktop\pocketstream-desktop.exe",
+                ))
+        {
+            return Err("R5 qualification requires the authorized Test installed image".into());
+        }
+        static FAULTS: std::sync::LazyLock<FirewallQualification> =
+            std::sync::LazyLock::new(|| FirewallQualification {
+                ensure_timeout: AtomicBool::new(true),
+                disable_timeout: AtomicBool::new(cfg!(feature = "qualification-r5-recovery")),
+                recovery_prewrite_failure: AtomicBool::new(cfg!(
+                    feature = "qualification-r5-recovery"
+                )),
+                startup_timeout: AtomicBool::new(false),
+            });
+        let (script, budget) = FAULTS.attempt(&operation);
+        let result = Self::run_inner(&script, operation.payload()?, cancel, budget, None)
+            .map_err(|e| e.to_string())?;
+        let stderr = String::from_utf8_lossy(&result.stderr.bytes);
+        log::info!(
+            "event=qualification_r5_native mode={} role={:?} after_enable={} disable_before_readback={} termination={:?} contained={} tree_exited={} tree_pids={:?}",
+            operation.mode(), operation.runtime_role(), stderr.contains("qualification_after_enable"),
+            stderr.contains("qualification_disable_before_readback"), result.termination,
+            result.containment_verified_before_resume, result.observed_tree_exited, result.observed_tree_pids
+        );
+        Ok(result)
     }
 
     fn run_inner(

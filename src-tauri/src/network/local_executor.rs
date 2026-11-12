@@ -465,6 +465,10 @@ impl LocalExecutor {
             } if running == id => requester,
             _ => panic!("completion must match running operation"),
         };
+        #[cfg(feature = "qualification-r5")]
+        if result.step.starts_with("firewall") {
+            log::info!("event=qualification_r5_completion id={id} recovery={recovery} requester={requester} result={result:?}");
+        }
         state.phase = if recovery && result.outcome == Outcome::Completed {
             Phase::Idle
         } else {
@@ -497,6 +501,11 @@ impl LocalExecutor {
                 result,
                 requester: true,
             } if *current == id && result.outcome != Outcome::Uncertain => {
+                #[cfg(feature = "qualification-r5")]
+                log::info!(
+                    "event=qualification_r5_acknowledge id={id} outcome={:?}",
+                    result.outcome
+                );
                 state.phase = Phase::Idle;
                 self.0.admission.notify_waiters();
                 Ok(())

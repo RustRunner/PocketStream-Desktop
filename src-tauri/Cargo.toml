@@ -55,3 +55,6 @@ tokio = { version = "1", features = ["test-util"] }
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+qualification-r5 = []
+qualification-r5-settle = ["qualification-r5"]
+qualification-r5-recovery = ["qualification-r5"]

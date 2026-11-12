@@ -761,14 +761,33 @@ pub(super) async fn firewall_request(
     recovery: bool,
     abort: impl Future<Output = ()>,
 ) -> super::firewall::PolicyResult {
-    firewall_request_with(
+    #[cfg(feature = "qualification-r5")]
+    let runtime = operation.runtime_role().is_some();
+    let result = firewall_request_with(
         executor(),
         operation,
         recovery,
         abort,
         super::firewall::execute_settling,
     )
-    .await
+    .await;
+    #[cfg(feature = "qualification-r5")]
+    if runtime {
+        // Exercise an existing typed native operation through ordinary writer
+        // admission. Inventory changes no network state. It must be refused
+        // over retained uncertainty and run/acknowledge after exact recovery.
+        let before = executor().retained();
+        let probe = execute(Operation::inventory()).await;
+        let after = executor().retained();
+        log::info!(
+            "event=qualification_r5_accounting admitted={} outcome={} retained_before={:?} retained_after={:?} ordinary_inventory_ok={} ordinary_error={} available={:?}",
+            result.admitted, serde_json::to_string(&result.outcome).unwrap(),
+            before, after, probe.is_ok(),
+            super::log_value(&probe.err().map(|e| e.to_string()).unwrap_or_default()),
+            executor().available()
+        );
+    }
+    result
 }
 
 async fn firewall_request_with<F, Fut>(

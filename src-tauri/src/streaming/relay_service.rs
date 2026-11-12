@@ -380,6 +380,18 @@ pub(super) struct RelayData {
     pub(super) restream_start_time: Option<std::time::Instant>,
 }
 
+#[cfg(feature = "qualification-r5")]
+fn qualification_r5_relay(state: &RelayData, phase: &str) {
+    log::info!(
+        "event=qualification_r5_relay phase={phase} desired={} lease={:?} protocol={:?} server_generation={:?} loop_alive={} retry_generation={:?} retry_due_ms={:?}",
+        state.restream_desired, state.firewall_generation, state.selected_protocol,
+        state.restream_server.as_ref().map(RestreamServer::server_generation),
+        state.restream_server.as_ref().is_some_and(RestreamServer::loop_alive),
+        state.policy_retry.as_ref().map(|r| r.generation),
+        state.policy_retry.as_ref().and_then(|r| r.due).map(|due| due.saturating_duration_since(tokio::time::Instant::now()).as_millis())
+    );
+}
+
 impl RelayData {
     pub(super) fn new(selected_protocol: RestreamProtocol) -> Self {
         Self {
@@ -536,6 +548,8 @@ impl RelayService {
         ))
     }
     async fn refresh_status(&self) {
+        #[cfg(feature = "qualification-r5")]
+        qualification_r5_relay(&*self.state.lock().await, "status");
         self.status.refresh().await;
     }
     #[cfg(test)]
@@ -3140,6 +3154,8 @@ where
         }
     }
     observe_policy_result(&mut state, generation, phase, &result, false);
+    #[cfg(feature = "qualification-r5")]
+    qualification_r5_relay(&state, phase);
     log_relay_firewall(
         phase,
         generation,
@@ -3203,6 +3219,8 @@ where
             retry_for.and_then(|(g, _)| state.policy_retry.as_ref().filter(|r| r.generation == g)),
             state.restream_spec.as_ref(),
         );
+        #[cfg(feature = "qualification-r5")]
+        qualification_r5_relay(&state, "retire");
         if disabled {
             Ok(())
         } else {
