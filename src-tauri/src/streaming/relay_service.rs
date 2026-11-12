@@ -482,6 +482,11 @@ pub(super) struct RelaySupervisorContext {
 }
 
 impl RelayService {
+    #[cfg(feature = "qualification-r6")]
+    pub(super) async fn qualification_r6_observe(&self, phase: &str) {
+        let state = self.state.lock().await;
+        qualification_r5_relay(&state, phase);
+    }
     #[cfg(test)]
     pub(super) fn test_epoch(&self) -> u64 {
         self.restream_epoch

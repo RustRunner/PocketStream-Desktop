@@ -1866,6 +1866,48 @@ host, development-PC install/native policy/address mutation or application fault
 injection, PTU movement, camera reboot, main merge, publication or public updater
 change occurred.
 
+## Test application R6 qualification — 12 November 2026 UTC
+
+This bounded successor starts from pushed `9ead3d8ba93e0511ab0580baef7c4d11e2f77bdc`
+on `qual/v0613-r6-application`, isolated in `.worktrees/v0613-r6-application`.
+Evidence **N** is `src-tauri/target/r6-application-20261112T050123Z/` there.
+The immutable v0.6.13 source/artifacts and successful CI above were reverified;
+the draft remains unpublished. Root edits and all prior worktrees are preserved.
+
+Preserved standalone R6 startup attempts 12–13 prove the fixed first-attempt
+1 s timeout, containment/exit and successful retry within one native scope.
+They do not qualify application startup, listeners, exit or abandoned requesters.
+R5 supplies the fixed post-enable/disable-readback faults and independent native
+observers; its present-requester results are reused only for their stated scope.
+No timing cohort, EOS investigation or adjacent campaign is reopened.
+
+Fresh Test identity/session/hash and closed baseline were verified before
+mutation. At 05:05 UTC the expected camera MAC and bound source returned OPTIONS
+200. Test is on AC, 100% charge. Native/profile snapshots are private on Test;
+exported records exclude secrets and sensitive URLs. Automatic metrics are
+compared to this fresh baseline, without forcing historical values.
+
+The smallest application matrix follows the shared startup reconciliation and
+the two protocol-specific listener/lease paths. Results are initially pending:
+
+| R6 Test case | Required application evidence | Status |
+|---|---|---|
+| Shared startup retry | First attempt only uses fixed 1 s qualification budget; both writers contained/exited; original scope completes once; ordinary inventory remains refused before full reconciliation and succeeds afterward | Pending |
+| Queued Stop, RTSP and SRT | Actual policy waiter behind a separately admitted, read-only inventory; UI Stop supersedes before dispatch; occupant completes/acknowledges independently; no later obsolete Ensure | Pending |
+| Queued normal Close, RTSP and SRT | Same observed admission boundary, normal window Close, no obsolete dispatch and complete native/process retirement | Pending |
+| In-flight admitted Stop, RTSP and SRT | Real automatic policy retry is admitted and actually enables; UI Stop waits for writer/settlement/accounting and ordered exact lease/listener retirement | Pending |
+| Unresolved normal Close, RTSP and SRT | Failed settlement retains the original cause/lease; exit retirement is admitted, bounded exit wait drops its requester, worker containment/settlement/accounting retain the unresolved barrier | Pending |
+| Next startup after unresolved exit | Failed reconciliation preserves admission refusal; subsequent successful startup freshly reconciles both exact owned roles before dependent work; normal media and cleanup follow | Pending |
+
+Compile-only fixture extensions reuse the existing executor, typed inventory,
+firewall scripts and lifecycle owners. The queued fixture holds one admitted
+inventory until observed policy supersession; its 35 s fail-safe is not pass
+evidence. The in-flight Stop image consumes two fixed Ensure delays, one on the
+initial attempt and one on the real automatic retry. The exit image consumes two
+fixed Disable delays, then the existing pre-write failure. Startup refusal uses
+a fixed pre-write throw. No production switch/IPC/persistent fault setting,
+timing-budget relaxation or new lifecycle service is introduced.
+
 ## Remaining gates and release state
 
 The v0.6.10 and v0.6.11 results above remain attached to their original images.

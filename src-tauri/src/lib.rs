@@ -661,6 +661,8 @@ pub fn run() {
                         let _ = tokio::join!(stream.stop_playback(), stream.stop_restream_server());
                     }).await
                 });
+                #[cfg(feature = "qualification-r6")]
+                tauri::async_runtime::block_on(stream.qualification_r6_observe("exit_stream_wait_finished"));
                 let _ = tauri::async_runtime::block_on(async {
                     manager.stop_presence().await;
                     manager.stop_ping_dot().await;
@@ -673,6 +675,8 @@ pub fn run() {
                 #[cfg(windows)]
                 tauri::async_runtime::block_on(async {
                     network::native_operations::shutdown().await;
+                    #[cfg(feature = "qualification-r6")]
+                    stream.qualification_r6_observe("exit_native_joined").await;
                     manager.join_temporary_cleanup().await;
                     // A retained transaction can outlive the bounded cleanup
                     // above. Stop any producer it resumed before cancellation.

@@ -761,6 +761,10 @@ pub(super) async fn firewall_request(
     recovery: bool,
     abort: impl Future<Output = ()>,
 ) -> super::firewall::PolicyResult {
+    #[cfg(feature = "qualification-r6-queued")]
+    if matches!(operation, super::firewall::Operation::Ensure { .. }) {
+        qualification_r6_occupy_retry().await;
+    }
     #[cfg(feature = "qualification-r5")]
     let runtime = operation.runtime_role().is_some();
     let result = firewall_request_with(
@@ -788,6 +792,65 @@ pub(super) async fn firewall_request(
         );
     }
     result
+}
+
+// Fixed Test application fixture. The second Ensure is the real supervisor
+// retry, so UI Stop/Close can supersede it while a separate admitted inventory
+// owns the slot. Only observed policy cancellation releases that occupant.
+#[cfg(feature = "qualification-r6-queued")]
+static R6_OCCUPANT_RELEASE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+#[cfg(feature = "qualification-r6-queued")]
+pub(super) fn qualification_r6_release_occupant() {
+    R6_OCCUPANT_RELEASE.notify_one();
+}
+
+#[cfg(feature = "qualification-r6-queued")]
+async fn qualification_r6_occupy_retry() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static ENSURES: AtomicUsize = AtomicUsize::new(0);
+    if ENSURES.fetch_add(1, Ordering::AcqRel) != 1 {
+        return;
+    }
+    NativeProcessRunner::qualification_installed_test().expect("fixed Test fixture");
+    let (ready, observed) = tokio::sync::oneshot::channel();
+    let mut ticket = executor()
+        .submit(move |cancel| async move {
+            let (completion, result) = observed_result(Operation::inventory(), cancel).await;
+            log::info!(
+                "event=qualification_r6_occupant phase=native_observed result_ok={} outcome={:?}",
+                result.is_ok(),
+                completion.outcome
+            );
+            let _ = ready.send(());
+            let released = tokio::time::timeout(
+                std::time::Duration::from_secs(35),
+                R6_OCCUPANT_RELEASE.notified(),
+            )
+            .await
+            .is_ok();
+            log::info!(
+                "event=qualification_r6_occupant phase=released cancellation_observed={released}"
+            );
+            completion
+        })
+        .expect("ordinary inventory occupant must be admitted");
+    let id = ticket.id;
+    tokio::spawn(async move {
+        let completion = ticket.wait().await.expect("occupant completion");
+        let acknowledged = executor().acknowledge(id);
+        log::info!("event=qualification_r6_occupant phase=accounted id={id} outcome={:?} acknowledged={acknowledged:?}", completion.outcome);
+    });
+    observed
+        .await
+        .expect("inventory observation before policy queue");
+}
+
+#[cfg(feature = "qualification-r6")]
+async fn qualification_r6_probe(phase: &str) {
+    let before = executor().retained();
+    let result = execute(Operation::inventory()).await;
+    log::info!("event=qualification_r6_probe phase={phase} ordinary_ok={} error={} retained_before={before:?} retained_after={:?} available={:?}", result.is_ok(), super::log_value(&result.err().map(|e| e.to_string()).unwrap_or_default()), executor().retained(), executor().available());
 }
 
 async fn firewall_request_with<F, Fut>(
@@ -986,7 +1049,15 @@ pub(crate) async fn startup_reconcile(
             let tracked = state.clone();
             let result = NATIVE_SCOPE
                 .scope((cancel, state), async move {
+                    #[cfg(feature = "qualification-r6")]
+                    tokio::spawn(qualification_r6_probe("startup_before_firewall"))
+                        .await
+                        .unwrap();
                     let firewall = super::firewall::startup().await;
+                    #[cfg(feature = "qualification-r6")]
+                    tokio::spawn(qualification_r6_probe("startup_after_firewall"))
+                        .await
+                        .unwrap();
                     stream.startup_firewall_status(firewall.clone()).await;
                     match firewall {
                         super::firewall::FirewallOutcome::Inactive => {}
@@ -1054,6 +1125,8 @@ pub(crate) async fn startup_reconcile(
         .wait()
         .await
         .map_err(|_| AppError::Network("Startup recovery completion unavailable".into()))?;
+    #[cfg(feature = "qualification-r6")]
+    qualification_r6_probe("startup_terminal").await;
     cleanup_manager.schedule_temporary_cleanup();
     if completion.outcome == Outcome::Completed {
         log::info!("Native startup reconciliation completed; conflicting writes available");

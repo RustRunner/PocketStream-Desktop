@@ -54,6 +54,10 @@ pub struct StreamManager {
 }
 
 impl StreamManager {
+    #[cfg(feature = "qualification-r6")]
+    pub(crate) async fn qualification_r6_observe(&self, phase: &str) {
+        self.relay.qualification_r6_observe(phase).await;
+    }
     #[cfg(test)]
     pub fn new() -> Self {
         Self::with_selected_protocol(RestreamProtocol::Rtsp)

@@ -339,6 +339,8 @@ pub(super) struct FirewallQualification {
     pub disable_timeout: AtomicBool,
     pub recovery_prewrite_failure: AtomicBool,
     pub startup_timeout: AtomicBool,
+    pub ensure_timeout_again: AtomicBool,
+    pub disable_timeout_again: AtomicBool,
 }
 #[cfg(any(test, feature = "qualification-r5"))]
 impl FirewallQualification {
@@ -350,7 +352,13 @@ impl FirewallQualification {
             Operation::Ensure { .. } if self.ensure_timeout.swap(false, Ordering::AcqRel) => Some((
                 "                Stage 'readback'",
                 "                [Console]::Error.WriteLine('qualification_after_enable'); [Threading.Thread]::Sleep(45000)\n                Stage 'readback'")),
+            Operation::Ensure { .. } if self.ensure_timeout_again.swap(false, Ordering::AcqRel) => Some((
+                "                Stage 'readback'",
+                "                [Console]::Error.WriteLine('qualification_after_enable'); [Threading.Thread]::Sleep(45000)\n                Stage 'readback'")),
             Operation::Disable { .. } if self.disable_timeout.swap(false, Ordering::AcqRel) => Some((
+                "    # Even the no-write path needs a fresh read:",
+                "    [Console]::Error.WriteLine('qualification_disable_before_readback'); [Threading.Thread]::Sleep(45000)\n    # Even the no-write path needs a fresh read:")),
+            Operation::Disable { .. } if self.disable_timeout_again.swap(false, Ordering::AcqRel) => Some((
                 "    # Even the no-write path needs a fresh read:",
                 "    [Console]::Error.WriteLine('qualification_disable_before_readback'); [Threading.Thread]::Sleep(45000)\n    # Even the no-write path needs a fresh read:")),
             Operation::Disable { .. } if self.recovery_prewrite_failure.swap(false, Ordering::AcqRel) => Some((
@@ -460,6 +468,57 @@ fn firewall_qualification_faults_are_consumed_once_in_the_host() {
 
 #[cfg(test)]
 #[test]
+fn application_r6_reuses_fixed_faults_without_rearming_child_attempts() {
+    use super::firewall::{FirewallRule, Operation};
+    for role in [FirewallRule::Rtsp, FirewallRule::Srt] {
+        let faults = FirewallQualification {
+            ensure_timeout: AtomicBool::new(true),
+            ensure_timeout_again: AtomicBool::new(true),
+            disable_timeout: AtomicBool::new(true),
+            disable_timeout_again: AtomicBool::new(true),
+            recovery_prewrite_failure: AtomicBool::new(true),
+            startup_timeout: AtomicBool::new(true),
+        };
+        let startup = Operation::Startup;
+        assert_eq!(faults.attempt(&startup).1, Duration::from_secs(1));
+        assert_eq!(
+            faults.attempt(&startup),
+            (super::firewall::SCRIPT.into(), Duration::from_secs(45))
+        );
+        let ensure = Operation::Ensure {
+            role,
+            port: 18554,
+            interface: None,
+        };
+        let disable = Operation::Disable { role };
+        for _ in 0..2 {
+            let (script, budget) = faults.attempt(&ensure);
+            assert_eq!(budget, Duration::from_secs(30));
+            assert!(
+                script.find("Set-NetFirewallRule -Enabled True").unwrap()
+                    < script.find("qualification_after_enable").unwrap()
+            );
+            assert!(script.len().div_ceil(3) * 4 + 512 < 32767);
+            let (script, budget) = faults.attempt(&disable);
+            assert_eq!(budget, Duration::from_secs(30));
+            assert!(script.contains("qualification_disable_before_readback"));
+            assert!(!script.contains("Qualification recovery failure before writes"));
+        }
+        let (script, budget) = faults.attempt(&disable);
+        assert_eq!(budget, Duration::from_secs(30));
+        assert!(
+            script
+                .find("throw 'Qualification recovery failure before writes'")
+                .unwrap()
+                < script.find("$mode = $data.operation.mode").unwrap()
+        );
+        assert_eq!(faults.attempt(&disable).0, super::firewall::SCRIPT);
+        assert_eq!(faults.attempt(&ensure).0, super::firewall::SCRIPT);
+    }
+}
+
+#[cfg(test)]
+#[test]
 fn application_r5_fault_sequence_keeps_budgets_and_consumes_each_fault_once() {
     use super::firewall::{FirewallRule, Operation};
     for role in [FirewallRule::Rtsp, FirewallRule::Srt] {
@@ -468,6 +527,7 @@ fn application_r5_fault_sequence_keeps_budgets_and_consumes_each_fault_once() {
             disable_timeout: AtomicBool::new(true),
             recovery_prewrite_failure: AtomicBool::new(true),
             startup_timeout: AtomicBool::new(false),
+            ..Default::default()
         };
         let ensure = Operation::Ensure {
             role,
@@ -646,25 +706,39 @@ impl NativeProcessRunner {
         operation: super::firewall::Operation,
         cancel: Cancellation,
     ) -> Result<ProcessResult, String> {
-        if std::env::var("COMPUTERNAME").as_deref() != Ok("DESKTOP-PI5BMJR")
-            || std::env::var("USERNAME").as_deref() != Ok("TSD-0311")
-            || std::env::current_exe().ok().as_deref()
-                != Some(std::path::Path::new(
-                    r"C:\Program Files\PocketStream Desktop\pocketstream-desktop.exe",
-                ))
-        {
-            return Err("R5 qualification requires the authorized Test installed image".into());
-        }
+        Self::qualification_installed_test()?;
         static FAULTS: std::sync::LazyLock<FirewallQualification> =
             std::sync::LazyLock::new(|| FirewallQualification {
-                ensure_timeout: AtomicBool::new(true),
-                disable_timeout: AtomicBool::new(cfg!(feature = "qualification-r5-recovery")),
-                recovery_prewrite_failure: AtomicBool::new(cfg!(
-                    feature = "qualification-r5-recovery"
-                )),
-                startup_timeout: AtomicBool::new(false),
+                ensure_timeout: AtomicBool::new(
+                    !cfg!(feature = "qualification-r6")
+                        || cfg!(any(
+                            feature = "qualification-r6-queued",
+                            feature = "qualification-r6-admitted",
+                            feature = "qualification-r6-exit"
+                        )),
+                ),
+                disable_timeout: AtomicBool::new(cfg!(any(
+                    feature = "qualification-r5-recovery",
+                    feature = "qualification-r6-exit"
+                ))),
+                recovery_prewrite_failure: AtomicBool::new(cfg!(any(
+                    feature = "qualification-r5-recovery",
+                    feature = "qualification-r6-exit"
+                ))),
+                startup_timeout: AtomicBool::new(cfg!(feature = "qualification-r6-startup")),
+                ensure_timeout_again: AtomicBool::new(cfg!(feature = "qualification-r6-admitted")),
+                disable_timeout_again: AtomicBool::new(cfg!(feature = "qualification-r6-exit")),
             });
         let (script, budget) = FAULTS.attempt(&operation);
+        #[cfg(feature = "qualification-r6-startup-fail")]
+        let script = if matches!(operation, super::firewall::Operation::Startup) {
+            let anchor = "    $mode = $data.operation.mode";
+            assert_eq!(script.matches(anchor).count(), 1);
+            script.replace(anchor, "    throw 'Qualification startup failure before writes'\n    $mode = $data.operation.mode")
+        } else {
+            script
+        };
+        log::info!("event=qualification_r6_attempt mode={} role={:?} budget_ms={} after_enable={} disable_before_readback={} prewrite_failure={}", operation.mode(), operation.runtime_role(), budget.as_millis(), script.contains("qualification_after_enable"), script.contains("qualification_disable_before_readback"), script.contains("failure before writes"));
         let result = Self::run_inner(&script, operation.payload()?, cancel, budget, None)
             .map_err(|e| e.to_string())?;
         let stderr = String::from_utf8_lossy(&result.stderr.bytes);
@@ -675,6 +749,20 @@ impl NativeProcessRunner {
             result.containment_verified_before_resume, result.observed_tree_exited, result.observed_tree_pids
         );
         Ok(result)
+    }
+
+    #[cfg(feature = "qualification-r5")]
+    pub(super) fn qualification_installed_test() -> Result<(), String> {
+        if std::env::var("COMPUTERNAME").as_deref() != Ok("DESKTOP-PI5BMJR")
+            || std::env::var("USERNAME").as_deref() != Ok("TSD-0311")
+            || std::env::current_exe().ok().as_deref()
+                != Some(std::path::Path::new(
+                    r"C:\Program Files\PocketStream Desktop\pocketstream-desktop.exe",
+                ))
+        {
+            return Err("R5 qualification requires the authorized Test installed image".into());
+        }
+        Ok(())
     }
 
     fn run_inner(

@@ -110,6 +110,27 @@ struct State {
 }
 
 impl State {
+    #[cfg(feature = "qualification-r6")]
+    fn qualification_observe(&self, phase: &str) {
+        let (kind, id, requester, outcome, step) = match &self.phase {
+            Phase::RecoveryRequired => ("recovery_required", 0, false, None, "-"),
+            Phase::Idle => ("idle", 0, false, None, "-"),
+            Phase::Running { id, requester, .. } => ("running", *id, *requester, None, "-"),
+            Phase::Retained {
+                id,
+                requester,
+                result,
+            } => (
+                "retained",
+                *id,
+                *requester,
+                Some(result.outcome),
+                result.step,
+            ),
+        };
+        log::info!("event=qualification_r6_executor phase={phase} state={kind} id={id} requester={requester} outcome={outcome:?} step={step} shutdown={} waiters={:?}", self.shutdown, self.waiters.iter().map(|w| (w.sequence, w.class.name())).collect::<Vec<_>>());
+    }
+
     fn prune(&mut self, now: Instant) {
         self.waiters.retain(|w| w.deadline > now);
     }
@@ -180,6 +201,8 @@ impl Drop for Pending {
             }
             _ => (),
         }
+        #[cfg(feature = "qualification-r6")]
+        state.qualification_observe("requester_drop");
         self.shared.admission.notify_waiters();
     }
 }
@@ -207,6 +230,10 @@ impl WaiterGuard {
             state.waiters.len()
         );
         self.shared.admission.notify_waiters();
+        #[cfg(feature = "qualification-r6-queued")]
+        if matches!(self.class, AdmissionClass::Policy) && outcome == "superseded" {
+            super::native_operations::qualification_r6_release_occupant();
+        }
     }
 }
 
@@ -271,6 +298,8 @@ impl LocalExecutor {
         tokio::pin!(abort);
         let expiry = tokio::time::sleep_until(deadline);
         tokio::pin!(expiry);
+        #[cfg(feature = "qualification-r6")]
+        let mut observed_wait = false;
         loop {
             let notified = self.0.admission.notified();
             tokio::pin!(notified);
@@ -315,6 +344,11 @@ impl LocalExecutor {
                 if matches!(state.phase, Phase::Idle) && state.best(now) == Some(sequence) {
                     guard.finish(&mut state, "admitted");
                     return Ok(self.start_locked(&mut state, false, admission.managed, work));
+                }
+                #[cfg(feature = "qualification-r6")]
+                if !observed_wait {
+                    state.qualification_observe("awaiting_admission");
+                    observed_wait = true;
                 }
                 // An Idle queue must not depend on an expired owner's next
                 // poll. Other waiting futures recheck at the earliest existing
@@ -434,6 +468,8 @@ impl LocalExecutor {
             managed,
             requester: true,
         };
+        #[cfg(feature = "qualification-r6")]
+        state.qualification_observe("admitted");
         let (tx, response) = oneshot::channel();
         let shared = self.0.clone();
         let signal = cancel.clone();
@@ -478,6 +514,8 @@ impl LocalExecutor {
                 requester,
             }
         };
+        #[cfg(feature = "qualification-r6")]
+        state.qualification_observe("completion_accounted");
         shared.terminal.notify_waiters();
         shared.admission.notify_waiters();
     }
@@ -491,6 +529,11 @@ impl LocalExecutor {
 
     pub fn available(&self) -> Result<(), AdmissionError> {
         self.0.state.lock().unwrap().available()
+    }
+
+    #[cfg(feature = "qualification-r6")]
+    pub fn qualification_observe(&self, phase: &str) {
+        self.0.state.lock().unwrap().qualification_observe(phase);
     }
 
     pub fn acknowledge(&self, id: u64) -> Result<(), AdmissionError> {
@@ -544,6 +587,8 @@ impl LocalExecutor {
         {
             let mut state = self.0.state.lock().unwrap();
             state.shutdown = true;
+            #[cfg(feature = "qualification-r6")]
+            state.qualification_observe("shutdown_requested");
             state.waiters.clear();
             self.0.admission.notify_waiters();
             if let Phase::Running { cancel, .. } = &state.phase {
@@ -554,6 +599,8 @@ impl LocalExecutor {
         if let Some(worker) = worker {
             let _ = worker.await;
         }
+        #[cfg(feature = "qualification-r6")]
+        self.qualification_observe("shutdown_joined");
     }
 }
 
