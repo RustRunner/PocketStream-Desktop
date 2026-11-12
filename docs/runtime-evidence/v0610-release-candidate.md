@@ -14,6 +14,9 @@ Public release remains blocked by the [remaining gates](#remaining-gates-and-rel
 The [v0.6.13 Test application R5 completion](#test-application-r5-completion--12-november-2026-utc)
 records the separately identified application fault builds and the exact CI-built
 successor containing the card cleanup.
+The [Test application R6 completion](#test-application-r6-completion--12-november-2026-utc)
+records startup, queued/admitted Stop/Close, actual requester disappearance and
+failed/successful next-startup reconciliation on separately identified fixed images.
 Earlier identities and qualification samples remain immutable historical
 evidence; they do not transfer to a new image.
 
@@ -313,8 +316,8 @@ retains Q's distinct requirements.
 | R2 | F hardware 3; N: ten ensure/disable cycles with unchanged/custom ports; p50/p95/stages; Test ensure <=15s (goal 10), disable <=8s, startup <=12s, install <=35s; Second ensure <=5s/startup <=4s with capability comparison | Test + Second | Final CI artifact | Partial, with failed timing samples: production startup 13.608/14.606/14.002 s exceeded 12 s; ensure 17.203/15.512/19.192/24.164 s exceeded 15 s; RTSP disable 8.790 s exceeded 8 s. Other measured disables passed. Ten cycles, percentiles, investigation and Second pending |
 | R3 | F 4-6; T/N/R: RTSP and SRT, default/custom ports, wildcard/explicit Wi-Fi, WFP permits/interface filters, OPTIONS 200 + >=150 H.264 buffers, SRT handshake/media; Stop removes filters/disables rules and prevents access | Test + Second + Peer | Final CI artifact | Default wildcard and custom Wi-Fi media passed for both on Test/Peer; SRT default needed recovery. Default Disable, custom RTSP Stop and peer negative probes passed. Second and remaining binding permutations pending |
 | R4 | F 7; R 3: authorized overriding Block survives install/ensure/Stop/uninstall; disabled/other-protocol observations remain cautious; remove fixture Block and Stop/Start restores media | Test + Second + Peer | Final CI artifact | Partial: Sandbox installer preservation passed. Physical overriding Block, cautious UI and removal/recovery pending |
-| R5 | F 8-9; N; R 2/4: fixed post-enable timeout proves actual write and contained/exited writer; successful settle, retained accounting/retry; double failure and failed recovery retain barrier; later qualified Stop retires exactly | Test + Second | Hash-pinned fault fixture and final CI artifact | Test application cases passed for RTSP and SRT on separately identified fixed fault builds: actual enable, settlement, same-generation policy retry, retained uncertainty/accounting, failed recovery and later synchronous application Stop recovery, ordinary admission and fresh decoded media. Exact production v0.6.13 UI/normal media and final retirement also passed. The initial SRT peer assertion is retained. Abandoned application requester and Second coverage remain pending in their own slices; see the application R5 completion below. |
-| R6 | F 10; N exit; Q startup: fixed one-shot failure settles/retries within original workflow; queued/admitted Stop/exit prevent obsolete Ensure; unresolved lease survives and reconciles next start | Test + Second | Fixed fault candidate / CI artifact | Partial: the R5 harness's separate startup subcase passed: first 1 s attempt timed out, contained/exited; normal retry returned Inactive and scope write availability passed. Injected application startup, queued/admitted Stop/exit, lease persistence and Second remain pending |
+| R5 | F 8-9; N; R 2/4: fixed post-enable timeout proves actual write and contained/exited writer; successful settle, retained accounting/retry; double failure and failed recovery retain barrier; later qualified Stop retires exactly | Test + Second | Hash-pinned fault fixture and final CI artifact | Test application cases passed for RTSP and SRT on separately identified fixed fault builds: actual enable, settlement, same-generation policy retry, retained uncertainty/accounting, failed recovery and later synchronous application Stop recovery, ordinary admission and fresh decoded media. Exact production v0.6.13 UI/normal media and final retirement also passed. R5 requesters remained present; the defined exit-requester disappearance is now qualified separately in R6. The initial SRT peer assertion is retained; Second remains pending. See the application R5/R6 completion below. |
+| R6 | F 10; N exit; Q startup: same-workflow startup retry; queued/admitted Stop/exit; retained requester/lease accounting and next-start reconciliation | Test + Second | Fixed R6 images / unchanged exact CI v0.6.13 | **Passed Test**, defined 15 application workflows with both protocols and affected exact-production checks; see Test application R6 completion below. Second-host repetitions remain pending and unauthorized |
 | R7 | T hardware; R 4: 20 wildcard Start/Stop cycles per host, both protocols, unrelated churn, explicit bind camera churn, settled usable address change without duplicate rebuild; Stop/newer Start wins | Test + Second + Peer | CI f2a6f4f (identity above) | Pending; retain listener/scope/rule/lease generations and churn records |
 | R8 | N hardware; R 1: Start/Stop/retry under current real or qualified scratch contention; separate admission/native timing; User admission <=15s, saturation expires without delayed writes; early/late scratch cleanup and retained uncertainty | Test + Second | Final CI artifact / qualified controlled fixture | Partial: ordinary Start/Disable passed with discovery active; recorded admission wait 0 on RTSP. Actual saturation, scratch cleanup and uncertainty pending |
 | R9 | E hardware: false config -> Enable -> Start without Save, both outputs; Disable while running waits/reports errors; preserve all drafts/secret intents; accepted flag persists after restart | Test + Peer | Final CI artifact | Partial: accepted true/false survived restart without Start. After the operator identified a replacement camera, normal CAM selection resolved the saved-MAC refusal. RTSP port draft and SRT port/latency/replacement/removal intents survived successful Start and running Disable without Save; sockets, six correct permits per running snapshot and retirement verified. Eight follow-up captures confirm visual states. Native policy-failure/reload UI and remaining E save/confirmation paths stay pending; no replacement-camera peer-media campaign is credited |
@@ -1866,47 +1869,206 @@ host, development-PC install/native policy/address mutation or application fault
 injection, PTU movement, camera reboot, main merge, publication or public updater
 change occurred.
 
-## Test application R6 qualification — 12 November 2026 UTC
+## Test application R6 completion — 12 November 2026 UTC
 
-This bounded successor starts from pushed `9ead3d8ba93e0511ab0580baef7c4d11e2f77bdc`
-on `qual/v0613-r6-application`, isolated in `.worktrees/v0613-r6-application`.
-Evidence **N** is `src-tauri/target/r6-application-20261112T050123Z/` there.
-The immutable v0.6.13 source/artifacts and successful CI above were reverified;
-the draft remains unpublished. Root edits and all prior worktrees are preserved.
+This bounded S6-R successor starts from pushed `9ead3d8ba93e0511ab0580baef7c4d11e2f77bdc`
+on **`qual/v0613-r6-application`**, isolated in `.worktrees/v0613-r6-application`
+outside build outputs. Evidence **N** is
+`src-tauri/target/r6-application-20261112T050123Z/` there. Qualification source is
+**`3eb84924c24f5f1b3dcec5e6b76f197bb884f054`**. Root privilege edits, the dirty topology
+worktree and every prior worktree are preserved. No production defect was
+confirmed; no production behavior fix or release version was introduced.
 
-Preserved standalone R6 startup attempts 12–13 prove the fixed first-attempt
-1 s timeout, containment/exit and successful retry within one native scope.
-They do not qualify application startup, listeners, exit or abandoned requesters.
-R5 supplies the fixed post-enable/disable-readback faults and independent native
-observers; its present-requester results are reused only for their stated scope.
-No timing cohort, EOS investigation or adjacent campaign is reopened.
+### Preserved evidence, baseline and fixed images
 
-Fresh Test identity/session/hash and closed baseline were verified before
-mutation. At 05:05 UTC the expected camera MAC and bound source returned OPTIONS
-200. Test is on AC, 100% charge. Native/profile snapshots are private on Test;
-exported records exclude secrets and sensitive URLs. Automatic metrics are
-compared to this fresh baseline, without forcing historical values.
+All 60 original R5 exports again matched the immutable original index and file
+hashes. The standalone startup attempts 12–13 remain native-only evidence: their
+first 1 s timeout, containment/exit and same-scope retry supplied the established
+fixed mechanism. They did not establish application startup or exit. R5's
+present-requester application cases remain valid for their original images;
+the missing R6 lifecycle/abandonment cases below are new. No completed timing
+cohort or historical EOS attribution investigation was repeated.
 
-The smallest application matrix follows the shared startup reconciliation and
-the two protocol-specific listener/lease paths. Results are initially pending:
+Live instructions, all worktree states, ancestry, main, v0.6.13 tag, CI, draft and
+artifact identities were rechecked. Test's pinned SSH identity, account/SID,
+elevation and unlocked desktop session 1 matched. Fresh closed baseline was
+**05:05:36 UTC**: exact production `5f89a1…757a83`, RTSP/Enable=true, saved ports
+18554/18890, SRT latency 125, empty SRT secret/stream ID, explicit Wi-Fi and the
+expected camera/Ethernet identities. Bound camera OPTIONS returned 200 with the
+expected MAC before mutation and again after the transport interruption. Power
+was AC/Balanced/100%; final read is Online/100%.
+Fresh automatic Wi-Fi metrics were 35/35. Historical L's unattributed 35→45
+exception and the later unattributed return to 35 remain recorded; nothing was
+forced back and the older failed comparison is not relabeled clean.
 
-| R6 Test case | Required application evidence | Status |
+All images below are local release-profile, version 0.6.13, requireAdministrator /
+Common Controls, Authenticode NotSigned, built with POCKETSTREAM_RELEASE=1.
+Features include default/custom-protocol, qualification-r5 and qualification-r6
+plus the listed fixed feature. Source/features/frontend hashes/manifests are in
+`N/fault-*/identity.json`. Only the closed executable was replaced in Test's
+existing protected root; old bytes, pinned runtime and profile hashes were kept.
+Fault results establish only the identified fixed cases.
+
+| Image | Additional feature | Bytes | SHA-256 |
+|---|---|---:|---|
+| startup | `qualification-r6-startup` | 24,835,072 | `b83ae4ec0c1a2218e5f26bcf640cc31a51041d27bd3b6c946c8dd0d4c3f22eb6` |
+| queued | `qualification-r6-queued` | 24,931,840 | `2cafc1620d5d148b51f460c17af95f5518826dc22c245cdd4aac4768b34d2825` |
+| admitted | `qualification-r6-admitted` | 24,835,072 | `d44ebd7747818754dcd917793f7a185a34d9c1c2dd7d333bb7df42b365cc0404` |
+| exit | `qualification-r6-exit` | 24,835,072 | `ba21bb6f3e2b7802ef1af36414e7081d45bd8fb697205bb126e884a481e241e8` |
+| startup-fail | `qualification-r6-startup-fail` | 24,830,464 | `466a5ac444bfc918b57b6b9f72a3666e6b14809e8f29b25eeb0ba8c5f6099245` |
+
+The existing first-startup budget fault is consumed in the application process,
+once, before any fresh native child can rearm it. Its retry uses the original
+cancellation token and unchanged 45 s budget in the original workflow. Other
+delays reuse the fixed successful-enable/pre-readback and disable/pre-readback
+anchors, exhausting unchanged 30 s attempts. The queued image holds one actually
+admitted typed inventory until observed policy supersession; its 35 s fail-safe
+was never the release condition credited by a pass. The admitted image delays
+the initial Ensure and the real supervisor retry, making the ordinary UI Stop
+control available for the second admission. The exit image delays initial
+settlement and exit recovery, then consumes the fixed pre-write recovery failure.
+Failed-startup image uses a fixed pre-write throw; no writes or retry are credited
+to that deterministic policy failure. No production switch, IPC, persistent fault
+setting, broad logger, manager, timing relaxation or barrier bypass was added.
+
+### Application results and accounting
+
+All **15** defined qualification-image workflow instances below **passed**.
+`N/r6-application-assessment.json` checks actual bounded events/UI receipts,
+native state, owned-role identity, before/after retained state, writer facts and
+fresh peer results. The 70 recorded firewall writer results all establish
+containment and observed tree exit, including 17 timeouts and 4 cancellations.
+
+| Test subcase | Result and principal observation | Evidence under N |
 |---|---|---|
-| Shared startup retry | First attempt only uses fixed 1 s qualification budget; both writers contained/exited; original scope completes once; ordinary inventory remains refused before full reconciliation and succeeds afterward | Pending |
-| Queued Stop, RTSP and SRT | Actual policy waiter behind a separately admitted, read-only inventory; UI Stop supersedes before dispatch; occupant completes/acknowledges independently; no later obsolete Ensure | Pending |
-| Queued normal Close, RTSP and SRT | Same observed admission boundary, normal window Close, no obsolete dispatch and complete native/process retirement | Pending |
-| In-flight admitted Stop, RTSP and SRT | Real automatic policy retry is admitted and actually enables; UI Stop waits for writer/settlement/accounting and ordered exact lease/listener retirement | Pending |
-| Unresolved normal Close, RTSP and SRT | Failed settlement retains the original cause/lease; exit retirement is admitted, bounded exit wait drops its requester, worker containment/settlement/accounting retain the unresolved barrier | Pending |
-| Next startup after unresolved exit | Failed reconciliation preserves admission refusal; subsequent successful startup freshly reconciles both exact owned roles before dependent work; normal media and cleanup follow | Pending |
+| Shared original-workflow startup retry | **Passed.** One 1 s attempt, contained/exited; one normal 45 s-budget retry; original scope succeeds. Ordinary probes refuse before and after firewall reconciliation and succeed only after the whole startup scope. | `startup/final-events.stdout.log` |
+| RTSP queued UI Stop | **Passed.** Observed policy waiter at 2026-11-12T05:22:41.2243385Z; superseded at 2026-11-12T05:22:44.9319770Z; independent inventory completion acknowledged at 2026-11-12T05:22:44.9363180Z. No obsolete Ensure dispatch after admission becomes available. Later ordinary Start decoded 150 fresh frames. | `queued-stop-rtsp/final-events.stdout.log` |
+| SRT queued UI Stop | **Passed.** Observed policy waiter at 2026-11-12T12:01:14.3426291Z; superseded at 2026-11-12T12:01:18.1750770Z; independent inventory completion acknowledged at 2026-11-12T12:01:18.1758390Z. No obsolete Ensure dispatch after admission becomes available. Later ordinary Start decoded 150 fresh frames. | `queued-stop-srt-r2/final-events.stdout.log` |
+| RTSP queued normal Close | **Passed.** Observed policy waiter at 2026-11-12T12:05:36.8326235Z; superseded at 2026-11-12T12:05:40.6088750Z; independent inventory completion acknowledged at 2026-11-12T12:05:40.6099090Z. No obsolete Ensure dispatch after admission becomes available. | `queued-close-rtsp/final-events.stdout.log` |
+| SRT queued normal Close | **Passed.** Observed policy waiter at 2026-11-12T12:10:10.4518219Z; superseded at 2026-11-12T12:10:14.1133490Z; independent inventory completion acknowledged at 2026-11-12T12:10:14.1142380Z. No obsolete Ensure dispatch after admission becomes available. | `queued-close-srt/final-events.stdout.log` |
+| RTSP Stop during admitted Ensure | **Passed.** Actually enabled at 2026-11-12T12:12:59.7801631Z; Stop at 2026-11-12T12:13:03.7053750Z, before writer timeout/completion 2026-11-12T12:13:23.4004720Z. Contained writer, exact successful settlement, live acknowledgement and serialized listener/lease retirement; later fresh 150-frame decode. | `admitted-stop-rtsp/final-events.stdout.log` |
+| SRT Stop during admitted Ensure | **Passed.** Actually enabled at 2026-11-12T12:16:35.4079068Z; Stop at 2026-11-12T12:16:39.3180070Z, before writer timeout/completion 2026-11-12T12:16:59.3077070Z. Contained writer, exact successful settlement, live acknowledgement and serialized listener/lease retirement; later fresh 150-frame decode. | `admitted-stop-srt/final-events.stdout.log` |
+| RTSP Close during admitted Ensure | **Passed.** Actually enabled at 2026-11-12T12:21:20.9825883Z; normal Close at 2026-11-12T12:21:24.7703220Z, before native cancellation/completion 2026-11-12T12:21:34.9444250Z. Containment, successful safety disable, accounting and post-exit native retirement verified. | `admitted-close-rtsp/final-events.stdout.log` |
+| SRT Close during admitted Ensure | **Passed.** Actually enabled at 2026-11-12T12:23:56.2028376Z; normal Close at 2026-11-12T12:24:00.0969140Z, before native cancellation/completion 2026-11-12T12:24:10.8213030Z. Containment, successful safety disable, accounting and post-exit native retirement verified. | `admitted-close-srt/final-events.stdout.log` |
+| RTSP unresolved Close / requester disappearance | **Passed.** Normal Close 2026-11-12T12:26:29.8914720Z; requester drops while Running at 2026-11-12T12:26:34.8933110Z. Recovery completion 4 remains Uncertain with requester absent through shutdown join; original Ensure/Rtsp cause and lease (1, Rtsp) survive in process. Exact persistent owned rules are retained. | `unresolved-exit-rtsp/final-events.stdout.log` |
+| SRT unresolved Close / requester disappearance | **Passed.** Normal Close 2026-11-12T12:30:51.0608470Z; requester drops while Running at 2026-11-12T12:30:56.0699020Z. Recovery completion 4 remains Uncertain with requester absent through shutdown join; original Ensure/Srt cause and lease (1, Srt) survive in process. Exact persistent owned rules are retained. | `unresolved-exit-srt/final-events.stdout.log` |
+| Failed next startup after RTSP uncertainty | **Passed.** Fixed pre-write startup refusal returns a policy failure, but startup scope retains Uncertain. Ordinary inventory is refused with the same retained ID before/after; Reason reports startup failure. Disabled-rule snapshots do not open admission. | `failed-next-rtsp/final-events.stdout.log` |
+| Failed next startup after SRT uncertainty | **Passed.** Fixed pre-write startup refusal returns a policy failure, but startup scope retains Uncertain. Ordinary inventory is refused with the same retained ID before/after; Reason reports startup failure. Disabled-rule snapshots do not open admission. | `failed-next-srt/final-events.stdout.log` |
+| Successful next startup after RTSP uncertainty | **Passed.** One-shot startup retry freshly reconciles both exact owned roles; dependent ordinary inventory succeeds only after full reconciliation. Matching output subsequently decodes 150 fresh frames, then normal Stop/Close retires it. | `reconciled-next-rtsp/final-events.stdout.log` |
+| Successful next startup after SRT uncertainty | **Passed.** One-shot startup retry freshly reconciles both exact owned roles; dependent ordinary inventory succeeds only after full reconciliation. Matching output subsequently decodes 150 fresh frames, then normal Stop/Close retires it. | `reconciled-next-srt/final-events.stdout.log` |
 
-Compile-only fixture extensions reuse the existing executor, typed inventory,
-firewall scripts and lifecycle owners. The queued fixture holds one admitted
-inventory until observed policy supersession; its 35 s fail-safe is not pass
-evidence. The in-flight Stop image consumes two fixed Ensure delays, one on the
-initial attempt and one on the real automatic retry. The exit image consumes two
-fixed Disable delays, then the existing pre-write failure. Startup refusal uses
-a fixed pre-write throw. No production switch/IPC/persistent fault setting,
-timing-budget relaxation or new lifecycle service is introduced.
+Queued cancellation removes only the obsolete waiter: the admitted inventory
+continues to its own completion and explicit acknowledgement before waiting
+retirement proceeds. Stop clears desired/retry state before waiting for existing
+serialization. Admitted Ensure retains its worker/result through settlement;
+Stop does not discard it because intent changed. RTSP TCP and SRT UDP/internal
+loopback listeners were independently observed retired. All credited Stops used
+the visible Stop Server control. All credited Closes used the actual native
+window Close and observed process exit; no application kill is credited.
+
+During in-flight Close the original supervisor requester remains present and
+acknowledges the settled failure; the relay lease stays conservative during the
+bounded shutdown. The separate unresolved-exit cases prove actual disappearance:
+Pending drops while recovery is Running, native cancellation is contained, and a
+failed safety settlement preserves original Ensure/role/cause. Completion 4 is
+still Uncertain, requester=false at shutdown join, with lease (1, matching role).
+An exited writer, caller absence, disabled rule or zero-permit snapshot does not
+erase accounting or release uncertainty.
+
+Completion/lease IDs are process-local; no serialized-ticket claim is made.
+`unresolved-exit-*/durable-ownership.stdout.log` independently verifies both exact
+owned rules and filters in PersistentStore after exit, plus private-profile
+fingerprints and diagnostic persistence. Fresh startup always reconciles both
+owned roles before dependent native work. Failed startup preserves its new
+Uncertain scope and same retained ID over an ordinary probe; UI Reason reports
+the inventory-stage refusal. Only successful full reconciliation opens admission.
+Inventory traverses the ordinary writer admission/acknowledgement seam while
+changing no address. This does not qualify an address mutation or auto-adoption.
+All media checks here use **fresh connections**, not existing-viewer recovery.
+
+### Failed attempts and remaining uncertainty
+
+The first post-cancel fresh SRT peer aborted at 12:01:46–12:01:50 UTC with
+`tsdemux.c:2617 / check_pending_buffers / firstval != -1`, zero frames and exit
+0xc0000409. Its JSON/log and application events remain in
+`queued-stop-srt-r2/post-cancel-fresh-peer.*` and `peer-failure-events.stdout.log`.
+With no app restart or setting/network/decoder change, the one unchanged retry
+decoded 150 frames in the same application session. This repeats R5's adjacent
+unattributed media finding. Its source/client cause is unresolved; no production
+admission/lifecycle defect or historical EOS explanation is inferred. The
+v0.6.12 reader fix still does not prove the original v0.6.10 EOS cause.
+
+A long transport gap reset the SSH controller after an idle application launch
+in `queued-stop-srt`. That session receives no queue/soak credit: actual receipts,
+native state and power were rechecked, it was normally closed, every native and
+operator-setting baseline comparison passed, and fresh `queued-stop-srt-r2`
+supplies the qualified case. The midpoint verifier's final-only task assertion
+also refused intentionally preserved completed tasks; its original result and
+precise assessment are retained. Local tooling corrections for a missing copied
+peer decoder, child-process PATH/working-directory isolation and a nonexistent
+Start log assumption preserve the original failures. Startup's first peer
+tooling failure was followed by a successful 150-frame invocation in the same
+application session. No failed attempt was overwritten or counted as a pass.
+
+### Validation, production restoration and final state
+
+[Qualification CI 43160022967](https://github.com/RustRunner/PocketStream-Desktop/actions/runs/43160022967)
+on the exact source above passed all six jobs: Windows **943 / 14 ignored**,
+Linux **840 / 2 ignored**, frontend **289**, typecheck/build/contracts, browser
+checks, audit and notices. Local combined-feature full Rust passed **943 / 14
+ignored**, all-target Clippy with warnings denied passed, formatting passed and
+all five individual release feature builds passed. Added pure regression checks
+both roles' fixed fault order, one-shot consumption, launch size and unchanged
+normal budgets. The first sandbox full-suite attempt failed six adapter/media
+fixtures; its unchanged authorized source-only rerun outside the sandbox passed
+at default concurrency. Original failed compile/tool/test logs are retained.
+Ignored native tests receive no pass credit. No production-defect regression was
+needed because no production defect was confirmed.
+
+Production **v0.6.13 remains immutable**, source
+`ab7e037672daf6ffff8e6fd9bb35e90d3d937796`, tag object
+`784af33c45a539c39f3eb6decb0ea52aadd6fbc6`. Source CI **43131441324**,
+release CI **43131443505**, unpublished draft **442386392** and original artifacts
+are unchanged. Reverified installer SHA-256
+`c350edaf14bb354ebf5725f241cc3370c8f3afd38a8bab6f58643f6eda8232d5`;
+updater-signature SHA-256
+`fd9fb473491744451f845ce3d11bf52611e30d537d1bf9e8ac441b6efd59b014`.
+The exact downloaded packaged executable was restored at **12:33 UTC**, SHA-256
+`5f89a114fc9afc6a0117fdcbf0476ee35e2f586ed0c6a54f036c08b325757a83`.
+Only the executable had been fault-swapped; pinned installed runtime/registration
+were retained. No new installer or release candidate was needed. On those exact
+production bytes, normal startup completed, SRT and RTSP each decoded **150 fresh
+frames** (exit 0), six application-scoped running permits were observed for each,
+both Stops retired all output/internal listeners and permits, and normal Close
+completed. Production events contain no qualification-hook records.
+
+Independent final native verification at **2026-11-12T12:40:52.9905578Z** left exact production
+installed and closed, both ActiveStore/PersistentStore templates disabled with
+canonical ownership/filters, empty Package/no AppPkgId, zero managed or other
+application-bound WFP permits, zero product/helper/fixture/WebView processes and
+zero output listeners/endpoints. **85** completed owned qualification
+tasks were retired; none remain. At **2026-11-12T12:40:55.6886299Z**, addresses/prefixes, routes,
+next hops/metrics/protocols, DHCP/automatic/interface metrics, DNS and all operator
+configuration sections match the fresh baseline. Keys, CAM/PTU/cache roles,
+adapter and saved output settings are preserved; entry **RTSP / Enable=true** is
+restored. Only runtime adoption/liveness metadata is excluded from section
+equality. No cleanup uncertainty remains.
+
+All **372** exported files matched their remote lengths and SHA-256 values.
+`N/evidence-transfer.json` records index `03c033dbcba47533dfcec0f531f4b94810ed7a7d7f86a89dbb9e4bf33eba220a`
+and archive `457ee742af10ee247b1c8a23c02413dc807f090da1c2e2ef7b745e7aebcc3560`. Private profiles and raw logs stay on Test;
+the export checks credentials/media URLs and includes only redacted diagnostics.
+Main/public updater and every existing tag/artifact remain unchanged; no release
+was published. No Second host, development-PC native mutation/application fault
+execution, PTU movement, camera reboot, paused A4/B or adjacent campaign occurred.
+
+This closes the defined **Test application R6** slice for its fixed images plus
+affected exact-production checks. **Second-host repetitions remain pending and
+unauthorized.** Address-transaction/caller-abort hardware, contention, topology,
+other R2–R10 cases and privilege integration retain their own slices. Ready for
+public release remains **no**. The next bounded release slice should separately
+scope the recurring fresh-SRT demux assertion with the exact production image
+and unchanged peer; it must preserve the historical EOS attribution boundary.
 
 ## Remaining gates and release state
 
@@ -1918,6 +2080,9 @@ one controlled EOS-path SRT viewer recovery and normal shutdown/retirement. It
 fixes the confirmed read-only pending-holder refusal with reader/writer exclusion
 preserved. Its evidence remains tied to that image. The separately identified
 application fault builds now pass the specified Test RTSP/SRT R5 cases above.
+The separately identified R6 images also pass the defined Test startup retry,
+queued/admitted Stop/Close, exit-requester disappearance and failed/successful
+next-startup cases. Second-host R6 repetitions remain pending and unauthorized.
 The current unpublished v0.6.13 successor contains the card cleanup and has its
 own passing source/release CI, installed UI/ordinary RTSP/SRT media checks and
 complete native retirement. Fault-image results and older timing/media results
@@ -1941,7 +2106,7 @@ disposable VM and operator hardware gates retain their stated pending status. No
 Second host is authorized. Paused A4/B,
 discovery/Clear, privilege integration and PTU movement remain outside this task.
 
-The requested Test application R5 slice is complete for its fixed cases. Other
+The requested Test application R5 and R6 slices are complete for their fixed cases. Other
 gaps retain their own bounded slices. The battery cohorts remain unrun and are
 not an additional mandatory gate; do not repeat completed AC cohorts without an
 identified coverage gap. Second-host repetitions still need separate authorization.
