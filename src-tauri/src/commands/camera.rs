@@ -5,7 +5,7 @@ use tauri::State;
 
 use crate::config::AppConfig;
 use crate::error::AppError;
-use crate::network::{route::CameraTarget, NetworkManager};
+use crate::network::{bound_http, route::CameraTarget, NetworkManager};
 use crate::validation::parse_camera_ip;
 
 /// Open a discovered device's web UI in the system browser.
@@ -80,17 +80,12 @@ pub async fn ptu_send(
 pub async fn control_cgi_zoom_direct(
     target: CameraTarget,
     manager: State<'_, std::sync::Arc<NetworkManager>>,
-    config: State<'_, std::sync::Arc<AppConfig>>,
+    _config: State<'_, std::sync::Arc<AppConfig>>,
     position: i32,
 ) -> Result<(), AppError> {
     let addr = parse_camera_ip(&target.ip)?;
     let url = format!("http://{}/cgi-bin/control.cgi", addr);
-    let command = format!("zoom_direct {}", position);
-    let form = [
-        ("action", "CameraControl"),
-        ("command", command.as_str()),
-        ("cam_index", "1"),
-    ];
+    let form = format!("action=CameraControl&command=zoom_direct+{position}&cam_index=1");
 
     log::info!("control.cgi zoom_direct: position={} → {}", position, url);
 
@@ -100,25 +95,26 @@ pub async fn control_cgi_zoom_direct(
     // time to become available again. HTTP error responses (4xx/5xx)
     // aren't retried — those indicate the camera actually answered and
     // rejected us, so retrying would just hammer it.
-    let mut last_err: Option<reqwest::Error> = None;
+    let mut last_err = None;
+    let readiness = manager.readiness();
     let mut target = target;
     for attempt in 0..2 {
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
-        let path = manager.camera_ready(&target, &config).await?;
+        let path = readiness.bound_now(&target)?;
         target = path.target.clone(); // freeze a legacy manual binding for every retry
-        let client = crate::camera::flir_ptu::client(&path)?;
-        match client
-            .post(&url)
-            .header("X-Requested-With", "XMLHttpRequest")
-            .form(&form)
-            .timeout(std::time::Duration::from_secs(3))
-            .send()
-            .await
+        match bound_http::post_form(
+            &path,
+            || readiness.bound_now(&path.target),
+            "/cgi-bin/control.cgi",
+            form.clone(),
+            &[("X-Requested-With", "XMLHttpRequest")],
+        )
+        .await
         {
             Ok(resp) => {
-                let status = resp.status();
+                let status = resp.status;
                 if !status.is_success() && status.as_u16() != 204 {
                     return Err(AppError::Camera(format!(
                         "control.cgi returned HTTP {}",
@@ -128,6 +124,9 @@ pub async fn control_cgi_zoom_direct(
                 return Ok(());
             }
             Err(e) => {
+                if !e.retryable {
+                    return Err(e.error);
+                }
                 log::warn!("control.cgi attempt {} failed: {}", attempt + 1, e);
                 last_err = Some(e);
             }

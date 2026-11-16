@@ -11,6 +11,7 @@ pub mod adapter_refresh;
 pub mod arp;
 pub mod auto_adopt;
 pub mod bindings;
+pub(crate) mod bound_http;
 pub(crate) mod bound_tcp;
 mod cache_probe;
 pub mod device_registry;
@@ -1588,14 +1589,6 @@ impl NetworkManager {
                 Ok(false)
             }
         }
-    }
-
-    pub(crate) async fn camera_ready(
-        &self,
-        target: &route::CameraTarget,
-        config: &crate::config::AppConfig,
-    ) -> Result<route::ReadyPath, AppError> {
-        self.readiness.camera_path_now(target, config, false)
     }
 
     /// Native/in-memory checks only; callable on the relay's GLib threads.
