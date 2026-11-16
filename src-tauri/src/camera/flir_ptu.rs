@@ -3,7 +3,6 @@
 //! The FLIR PTU exposes a simple HTTP API at `POST /API/PTCmd`.
 //! Commands are sent as form-encoded data and responses are JSON.
 
-use crate::config::AppConfig;
 use crate::network::{
     bound_http,
     route::{CameraTarget, ReadyPath},
@@ -34,7 +33,6 @@ impl PtuController {
     pub async fn send(
         &self,
         manager: &NetworkManager,
-        _config: &AppConfig,
         target: &CameraTarget,
         cmd: &str,
     ) -> Result<HashMap<String, String>, AppError> {

@@ -60,14 +60,13 @@ pub async fn ptu_send(
     ptu: State<'_, crate::camera::flir_ptu::PtuController>,
     target: CameraTarget,
     manager: State<'_, std::sync::Arc<NetworkManager>>,
-    config: State<'_, std::sync::Arc<AppConfig>>,
     cmd: String,
 ) -> Result<std::collections::HashMap<String, String>, AppError> {
     parse_camera_ip(&target.ip)?;
     // Route through the backend controller: serializes all PTU sends at
     // the trust boundary (no frontend path can interleave) and enforces
     // velocity mode on speed commands.
-    ptu.send(&manager, &config, &target, &cmd).await
+    ptu.send(&manager, &target, &cmd).await
 }
 
 // ── Nexus control.cgi ───────────────────────────────────────────────
@@ -80,7 +79,6 @@ pub async fn ptu_send(
 pub async fn control_cgi_zoom_direct(
     target: CameraTarget,
     manager: State<'_, std::sync::Arc<NetworkManager>>,
-    _config: State<'_, std::sync::Arc<AppConfig>>,
     position: i32,
 ) -> Result<(), AppError> {
     let addr = parse_camera_ip(&target.ip)?;

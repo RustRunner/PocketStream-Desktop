@@ -70,6 +70,31 @@ pub(crate) async fn post_form(
     post_form_on_port(path, ready, 80, resource, body, headers).await
 }
 
+fn form_request(
+    ip: Ipv4Addr,
+    port: u16,
+    resource: &str,
+    body: String,
+    headers: &[(&str, &str)],
+) -> Result<Request<Full<Bytes>>, AppError> {
+    let host = if port == 80 {
+        ip.to_string()
+    } else {
+        format!("{ip}:{port}")
+    };
+    let mut request = Request::post(resource)
+        .header("Host", host)
+        .header("Accept", "*/*")
+        .header("Connection", "close")
+        .header("Content-Type", "application/x-www-form-urlencoded");
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    request
+        .body(Full::new(Bytes::from(body)))
+        .map_err(|e| AppError::Camera(format!("Invalid device HTTP request: {e}")))
+}
+
 async fn post_form_on_port(
     path: &ReadyPath,
     ready: impl Fn() -> Result<ReadyPath, AppError>,
@@ -89,16 +114,7 @@ async fn post_form_on_port(
             .ip
             .parse::<Ipv4Addr>()
             .map_err(|_| AppError::Camera("Device HTTP requires an IPv4 address".into()))?;
-        let mut request = Request::post(resource)
-            .header("Host", format!("{ip}:{port}"))
-            .header("Connection", "close")
-            .header("Content-Type", "application/x-www-form-urlencoded");
-        for (name, value) in headers {
-            request = request.header(*name, *value);
-        }
-        let request = request
-            .body(Full::new(Bytes::from(body)))
-            .map_err(|e| AppError::Camera(format!("Invalid device HTTP request: {e}")))?;
+        let request = form_request(ip, port, resource, body, headers)?;
         check_path(path, &ready)?;
         let socket = bind_socket(path.source, path.index)
             .map_err(|e| AppError::Camera(format!("Ethernet HTTP binding failed: {e}")))?;
@@ -161,7 +177,7 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio::time::timeout;
 
-    async fn read_request(socket: &mut TcpStream) -> String {
+    async fn read_request(socket: &mut (impl tokio::io::AsyncRead + Unpin)) -> String {
         let mut bytes = Vec::new();
         loop {
             let byte = socket.read_u8().await.unwrap();
@@ -202,6 +218,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_port_ptu_request_has_bare_host_and_accept_header() {
+        let (client, mut peer) = tokio::io::duplex(1024);
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+        let request = form_request(
+            "192.168.1.202".parse().unwrap(),
+            80,
+            "/API/PTCmd",
+            "PP&TP".into(),
+            &[],
+        )
+        .unwrap();
+        let send = async move {
+            assert_eq!(sender.send_request(request).await.unwrap().status(), 204);
+        };
+        let receive = async {
+            let request = read_request(&mut peer).await;
+            let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+            let mut lines = headers.lines();
+            assert_eq!(lines.next(), Some("POST /API/PTCmd HTTP/1.1"));
+            let mut headers: Vec<_> = lines.map(str::to_ascii_lowercase).collect();
+            headers.sort();
+            assert_eq!(
+                headers,
+                [
+                    "accept: */*",
+                    "connection: close",
+                    "content-length: 5",
+                    "content-type: application/x-www-form-urlencoded",
+                    "host: 192.168.1.202",
+                ]
+            );
+            assert_eq!(body, "PP&TP");
+            println!("Captured port-80 PTU request:\n{request}");
+            peer.write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+                .await
+                .unwrap();
+        };
+        let (result, (), ()) = tokio::join!(connection, send, receive);
+        result.unwrap();
+    }
+
+    #[tokio::test]
     async fn binds_each_request_source_and_never_follows_redirects() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -217,6 +277,10 @@ mod tests {
                 assert!(request
                     .to_ascii_lowercase()
                     .contains("content-type: application/x-www-form-urlencoded\r\n"));
+                assert!(request
+                    .to_ascii_lowercase()
+                    .contains(&format!("host: 127.0.0.1:{port}\r\n")));
+                assert!(request.to_ascii_lowercase().contains("accept: */*\r\n"));
                 assert!(request.ends_with("C=V&PS=0&TS=0"));
                 socket.write_all(format!("HTTP/1.1 302 Found\r\nLocation: http://{location}/\r\nContent-Length: 0\r\n\r\n").as_bytes()).await.unwrap();
                 assert_closed(&mut socket).await;
