@@ -366,8 +366,8 @@ mod tests {
              videotestsrc is-live=true pattern=snow \
              ! video/x-raw,format=I420,width=320,height=240,framerate=30/1 \
              ! x265enc name=input_encoder tune=zerolatency speed-preset=ultrafast bitrate=1000 key-int-max=30 \
-             ! h265parse name=input_parse ! queue ! input_mux. \
-             audiotestsrc is-live=true ! audioconvert ! avenc_aac bitrate=320000 ! aacparse ! queue ! input_mux. \
+             ! h265parse name=input_parse ! queue name=video_input ! input_mux. \
+             audiotestsrc is-live=true ! audioconvert ! avenc_aac bitrate=320000 ! aacparse ! queue name=audio_input ! input_mux. \
              h264parse name=parse ! avdec_h264 ! appsink name=out sync=false",
         )
         .unwrap()
@@ -394,6 +394,31 @@ mod tests {
                 gst::PadProbeReturn::Ok
             });
         let input_encoder = pipeline.by_name("input_encoder").unwrap();
+        // Exercise slower video encoder startup than audio.
+        input_encoder
+            .static_pad("sink")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, |_, _| {
+                std::thread::sleep(Duration::from_millis(300));
+                gst::PadProbeReturn::Remove
+            });
+        // Both encoded caps must reach the mux before it announces its initial program.
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(2);
+        let mut input_probes = Vec::new();
+        for name in ["video_input", "audio_input"] {
+            let pad = pipeline.by_name(name).unwrap().static_pad("src").unwrap();
+            let ready_tx = ready_tx.clone();
+            let probe = pad
+                .add_probe(
+                    gst::PadProbeType::BLOCK | gst::PadProbeType::BUFFER,
+                    move |_, _| {
+                        let _ = ready_tx.try_send(());
+                        gst::PadProbeReturn::Ok
+                    },
+                )
+                .unwrap();
+            input_probes.push((pad, probe));
+        }
         let output_bytes = Arc::new(AtomicU64::new(0));
         let counted_output = output_bytes.clone();
         pipeline
@@ -415,6 +440,14 @@ mod tests {
         let bus = pipeline.bus().unwrap();
         pipeline.set_state(gst::State::Playing).unwrap();
         let mut previous_target = 0;
+        let inputs_ready = (0..2).all(|_| ready_rx.recv_timeout(Duration::from_secs(5)).is_ok());
+        for (pad, probe) in input_probes {
+            pad.remove_probe(probe);
+        }
+        assert!(
+            inputs_ready,
+            "both encoded tracks must be ready before muxing"
+        );
         for input_kbps in [1000_u32, 3000, 500] {
             input_encoder.set_property("bitrate", input_kbps);
             let phase_started = Instant::now();
