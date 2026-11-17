@@ -772,8 +772,10 @@ impl RtspRestreamer {
         // The RTSP source URL is set via a media-configure callback below,
         // not interpolated into the launch string, to prevent GStreamer
         // pipeline injection via crafted RTSP paths or credentials.
-        let launch = "( rtspsrc name=src latency=200 protocols=tcp \
-             h264parse name=parse \
+        // The queue keeps clocked sending from blocking input and dropping encoded packets.
+        // Match preview's input allowance for camera bursts.
+        let launch = "( rtspsrc name=src latency=500 protocols=tcp \
+             h264parse name=parse ! queue \
              ! rtph264pay name=pay0 pt=96 )";
 
         factory.set_launch(launch);
@@ -923,7 +925,7 @@ impl RtspRestreamer {
 
         let launch = format!(
             "( udpsrc name=src port={port} \
-             h264parse name=parse \
+             h264parse name=parse ! queue \
              ! rtph264pay name=pay0 pt=96 )",
             port = udp_port,
         );

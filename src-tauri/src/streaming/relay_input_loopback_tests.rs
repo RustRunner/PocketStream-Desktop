@@ -15,10 +15,15 @@ struct Camera {
     source: glib::Source,
     main_loop: glib::MainLoop,
     thread: Option<std::thread::JoinHandle<()>>,
+    frames: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Camera {
     fn new(codec: &str) -> Self {
+        Self::with_bursts(codec, false)
+    }
+
+    fn with_bursts(codec: &str, bursts: bool) -> Self {
         gst::init().unwrap();
         let server = rtsp::RTSPServer::new();
         server.set_address("127.0.0.1");
@@ -26,6 +31,35 @@ impl Camera {
         let factory = rtsp::RTSPMediaFactory::new();
         factory.set_launch(&format!("( {VIDEO} ! {codec} name=pay0 pt=96 )"));
         factory.set_shared(true);
+        let frames = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        if bursts {
+            let counted = frames.clone();
+            factory.connect_media_configure(move |_, media| {
+                let bin = media.element().downcast::<gst::Bin>().unwrap();
+                let counted = counted.clone();
+                bin.by_name("input_parse")
+                    .unwrap()
+                    .static_pad("src")
+                    .unwrap()
+                    .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                        counted.fetch_add(1, Ordering::Relaxed);
+                        gst::PadProbeReturn::Ok
+                    });
+                let pay = bin.by_name("pay0").unwrap();
+                let next = std::sync::Mutex::new(Instant::now() + Duration::from_millis(500));
+                pay.static_pad("sink").unwrap().add_probe(
+                    gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+                    move |_, _| {
+                        let mut next = next.lock().unwrap();
+                        if Instant::now() >= *next {
+                            *next = Instant::now() + Duration::from_millis(500);
+                            std::thread::sleep(Duration::from_millis(400));
+                        }
+                        gst::PadProbeReturn::Ok
+                    },
+                );
+            });
+        }
         server.mount_points().unwrap().add_factory("/test", factory);
         let source = server.create_source(gio::Cancellable::NONE).unwrap();
         let context = glib::MainContext::new();
@@ -52,12 +86,61 @@ impl Camera {
             source,
             main_loop,
             thread: Some(thread),
+            frames,
         }
     }
 
     fn url(&self) -> String {
         format!("rtsp://127.0.0.1:{}/test", self.server.bound_port())
     }
+}
+
+fn receive_bursty_video(input: &str, camera: &Camera) {
+    let pipeline = gst::parse::launch(&format!(
+        "{input} ! h264parse ! avdec_h264 ! appsink name=out sync=false"
+    ))
+    .unwrap()
+    .downcast::<gst::Pipeline>()
+    .unwrap();
+    let _stop = StopPipeline(pipeline.clone());
+    let sink = pipeline
+        .by_name("out")
+        .unwrap()
+        .downcast::<gstreamer_app::AppSink>()
+        .unwrap();
+    pipeline.set_state(gst::State::Playing).unwrap();
+    let bus = pipeline.bus().unwrap();
+    assert!(sink
+        .try_pull_sample(gst::ClockTime::from_seconds(10))
+        .is_some());
+    let started = Instant::now();
+    let mut frames = 0;
+    let mut produced_baseline = None;
+    while started.elapsed() < Duration::from_secs(8) {
+        if started.elapsed() >= Duration::from_secs(2) && produced_baseline.is_none() {
+            produced_baseline = Some(camera.frames.load(Ordering::Relaxed));
+        }
+        if sink
+            .try_pull_sample(gst::ClockTime::from_mseconds(100))
+            .is_some()
+            && started.elapsed() >= Duration::from_secs(2)
+        {
+            frames += 1;
+        }
+        if let Some(message) = bus.pop_filtered(&[gst::MessageType::Error]) {
+            panic!("Bursty re-stream failed: {:?}", message.view());
+        }
+    }
+    let produced = camera.frames.load(Ordering::Relaxed) - produced_baseline.unwrap();
+    pipeline.set_state(gst::State::Null).unwrap();
+    assert!(
+        produced >= 75,
+        "bursty source produced only {produced} frames"
+    );
+    assert!(
+        frames + 10 >= produced,
+        "source produced {produced} frames but re-stream delivered {frames}"
+    );
 }
 
 impl Drop for Camera {
@@ -225,6 +308,57 @@ async fn udp_transport_stream_reaches_both_outputs() {
             receive_video(&format!(
                 "rtspsrc location=rtsp://127.0.0.1:{output_port}/test protocols=tcp latency=0 ! rtph264depay"
             ));
+            relay.shutdown().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn bursty_transport_stream_preserves_video_cadence() {
+    for srt in [false, true] {
+        let camera = Camera::with_bursts(
+            &format!(
+                "{H264} name=input_parse ! mpegtsmux alignment=7 \
+                 ! queue max-size-buffers=0 max-size-bytes=0 max-size-time=2000000000 ! rtpmp2tpay"
+            ),
+            true,
+        );
+        if srt {
+            let port = unused_udp_port();
+            let mut relay = SrtRestreamer::start_from_rtsp(
+                &camera.url(),
+                port,
+                Some("127.0.0.1"),
+                "",
+                "",
+                None,
+                20,
+                "test",
+                runtime(RelayIngestKind::Rtsp),
+            )
+            .unwrap_or_else(|e| panic!("{}", e.error));
+            receive_bursty_video(
+                &format!(
+                    "srtsrc uri=\"srt://127.0.0.1:{port}?streamid=test\" latency=20 ! tsdemux"
+                ),
+                &camera,
+            );
+            relay.shutdown().await;
+        } else {
+            let mut relay = RtspRestreamer::start_from_rtsp(
+                &camera.url(),
+                unused_tcp_port(),
+                "/test",
+                Some("127.0.0.1"),
+                "",
+                "",
+                runtime(RelayIngestKind::Rtsp),
+            )
+            .unwrap_or_else(|e| panic!("{}", e.error));
+            receive_bursty_video(
+                &format!("rtspsrc location=rtsp://127.0.0.1:{}/test protocols=tcp latency=500 ! rtph264depay", relay.port()),
+                &camera,
+            );
             relay.shutdown().await;
         }
     }

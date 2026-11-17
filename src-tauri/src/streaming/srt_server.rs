@@ -24,14 +24,16 @@ use super::relay::{
 };
 use crate::error::AppError;
 
-const RTSP_PIPELINE_SKELETON: &str = "rtspsrc name=src latency=200 protocols=tcp \
-    h264parse name=parse config-interval=-1 \
+// Keep clocked sending from blocking input and dropping encoded packets.
+// Match preview's input allowance for camera bursts.
+const RTSP_PIPELINE_SKELETON: &str = "rtspsrc name=src latency=500 protocols=tcp \
+    h264parse name=parse config-interval=-1 ! queue \
     ! mpegtsmux name=mux alignment=7 \
     ! srtsink name=sink mode=listener wait-for-connection=false authentication=true";
 
 // Input normalization connects these separate source and output chains.
 const UDP_PIPELINE_SKELETON: &str = "udpsrc name=src \
-    h264parse name=parse config-interval=-1 \
+    h264parse name=parse config-interval=-1 ! queue \
     ! mpegtsmux name=mux alignment=7 \
     ! srtsink name=sink mode=listener wait-for-connection=false authentication=true";
 
