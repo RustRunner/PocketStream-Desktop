@@ -103,8 +103,8 @@ function Selected-Alias {
         ([string]$_.MacAddress).Replace('-',':').ToLowerInvariant() -eq $id.mac -and $_.ifIndex -eq $id.index })
     if ($matches.Count -ne 1 -or [string]$matches[0].Status -ne 'Up') { throw 'Bind identity unavailable' }
     $alias = [string]$matches[0].Name
-    # InterfaceAlias accepts wildcard syntax; unsupported aliases fail closed.
-    if ($alias.IndexOfAny([char[]]'*?[]') -ge 0 -or @($all | Where-Object { $_.Name -ceq $alias }).Count -ne 1) { throw 'Ambiguous interface alias' }
+    # Brackets are literal adapter names; escape them at the provider boundary.
+    if ($alias -eq 'Any' -or $alias.IndexOfAny([char[]]'*?`') -ge 0 -or @($all | Where-Object { $_.Name -ceq $alias }).Count -ne 1) { throw 'Ambiguous interface alias' }
     return $alias
 }
 function Prepare($role, [int]$port, [string]$alias, $existingShape, $rules, $application) {
@@ -133,7 +133,7 @@ function Prepare($role, [int]$port, [string]$alias, $existingShape, $rules, $app
     $script:mutated = $true
     $params = @{DisplayName=$role.display_name;Group=$data.group;Direction='Inbound';Action='Allow';Enabled='False';Profile='Any';
         Program=$data.program;Protocol=$role.protocol;LocalPort=$port;RemotePort='Any';LocalAddress='Any';RemoteAddress='Any';
-        InterfaceAlias=$alias;InterfaceType='Any';Service='Any';EdgeTraversalPolicy='Block';
+        InterfaceAlias=([WildcardPattern]::Escape($alias));InterfaceType='Any';Service='Any';EdgeTraversalPolicy='Block';
         Authentication='NotRequired';Encryption='NotRequired';LocalUser='Any';RemoteUser='Any';RemoteMachine='Any';
         OverrideBlockRules=$false;LooseSourceMapping=$false;LocalOnlyMapping=$false;DynamicTarget='Any';ErrorAction='Stop'}
     if ($rules.Count -eq 0) { New-NetFirewallRule -PolicyStore PersistentStore -Name $role.name @params | Out-Null }

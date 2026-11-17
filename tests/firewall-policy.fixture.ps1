@@ -22,6 +22,7 @@ function Reset {
     $script:failAfterEnable=$false; $script:failCleanup=$false; $script:enableThenThrow=$false; $script:enabledWrite=$false; $script:emptyBlocks=$false; $script:foreignBlockFailure=$false
     $script:failNamedQuery=$false; $script:foreignNotFound=$false; $script:changeReadback=$false; $script:restorePackage=$false
     $script:adapter=[pscustomobject]@{InterfaceGuid='{01234567-89ab-cdef-0123-456789abcdef}';MacAddress='00-11-22-33-44-55';ifIndex=15;Status='Up';Name='Renamed Ethernet'}
+    $script:otherAdapters=@()
 }
 function Rule([string]$name,[int]$role=0,[string]$program='Any',[string]$enabled='True') {
     return [pscustomobject]@{Name=$name;DisplayName=$roles[$role].display_name;Group='';Program=$program;Enabled=$enabled;
@@ -70,7 +71,13 @@ function Get-NetFirewallRule {
     $script:fullQueries++;$script:events.Add('full')
     return $script:rules.ToArray()
 }
-function Get-NetAdapter { [CmdletBinding()]param([switch]$IncludeHidden) return $script:adapter }
+function Get-NetAdapter { [CmdletBinding()]param([switch]$IncludeHidden) return @($script:adapter)+$script:otherAdapters }
+function Resolve-InterfaceAlias($value) {
+    if ([string]$value -ceq 'Any') { return 'Any' }
+    $matches=@((Get-NetAdapter) | Where-Object { $_.Name -like [string]$value })
+    Assert ($matches.Count -eq 1) 'Interface pattern did not select exactly one adapter'
+    return [string]$matches[0].Name
+}
 foreach($name in @('Application','Port','Address','Interface','InterfaceType','Service','Security')) {
     Set-Item -LiteralPath ('Function:Get-NetFirewall'+$name+'Filter') -Value {
         [CmdletBinding()]param([Parameter(ValueFromPipeline=$true)]$InputObject) process {$script:filterReads++;return $InputObject}
@@ -84,7 +91,7 @@ function Set-NetFirewallRule {
         $script:writeCount++
         if($Enabled -eq 'False' -and $script:enabledWrite -and $script:failCleanup){throw 'fake cleanup failure'}
         if($script:failSet -eq $script:writeCount){throw 'fake partial filter failure'}
-        foreach($key in $PSBoundParameters.Keys){if($key -eq 'NewDisplayName'){$InputObject.DisplayName=$NewDisplayName} elseif($key -notin @('InputObject','ErrorAction')){$InputObject.$key=$PSBoundParameters[$key]}}
+        foreach($key in $PSBoundParameters.Keys){if($key -eq 'NewDisplayName'){$InputObject.DisplayName=$NewDisplayName} elseif($key -eq 'InterfaceAlias'){$InputObject.InterfaceAlias=Resolve-InterfaceAlias $InterfaceAlias} elseif($key -notin @('InputObject','ErrorAction')){$InputObject.$key=$PSBoundParameters[$key]}}
         if($script:restorePackage){$InputObject.Package='Any'}
         if($Enabled -eq 'True'){$script:enabledWrite=$true;$script:events.Add('enable');if($script:enableThenThrow){throw 'fake enable mutated before failure'}}
     }
@@ -98,7 +105,7 @@ function New-NetFirewallRule {
         Assert (@($script:rules | Where-Object {$_.Program -eq 'Any' -and $_.Action -eq 'Allow' -and $_.Enabled -eq 'True' -and $_.DisplayName -in $roles.display_name}).Count -eq 0) 'Enabled broad allow survived template creation'
     }
     $row=Rule $Name
-    foreach($key in $PSBoundParameters.Keys){if($key -notin @('PolicyStore','ErrorAction')){$row.$key=$PSBoundParameters[$key]}}
+    foreach($key in $PSBoundParameters.Keys){if($key -eq 'InterfaceAlias'){$row.InterfaceAlias=Resolve-InterfaceAlias $InterfaceAlias} elseif($key -notin @('PolicyStore','ErrorAction')){$row.$key=$PSBoundParameters[$key]}}
     $script:rules.Add($row);$script:writeCount++
     return $row
 }
@@ -153,9 +160,37 @@ Reset;Assert (Run install).ok 'Fixture setup';$script:writeCount=0;$script:failS
 Assert (!$r.ok -and @($script:rules | Where-Object {$_.Enabled -eq 'True'}).Count -eq 0) 'Partial filter failure left enabled rule'
 $script:failSet=0;Assert (Run install).ok 'Partial migration retry not idempotent'
 $passed.Add('partial filter failure stays disabled and retry is idempotent')
-Reset;$script:adapter.Name='Wildcard*';$r=Run ensure rtsp 13554 $identity
-Assert (!$r.ok -and $script:writeCount -eq 0) 'Wildcard alias widened to Any'
+foreach($alias in @('Wildcard*','Wildcard?','Escape`Name','Any')) {
+    Reset;$script:adapter.Name=$alias;$r=Run ensure rtsp 13554 $identity
+    Assert (!$r.ok -and $r.outcome.stage -eq 'interface' -and $script:writeCount -eq 0) 'Unsupported alias widened explicit binding'
+}
 $passed.Add('unsupported alias grammar never widens explicit binding')
+foreach($role in @('rtsp','srt')) {
+    foreach($alias in @('ZeroTier One [41d49af6c26fa68c]','Adapter [abc]','Adapter [','Adapter ]')) {
+        Reset;$script:adapter.Name=$alias
+        $decoy=$script:adapter.PSObject.Copy();$decoy.InterfaceGuid='{11234567-89ab-cdef-0123-456789abcdef}';$decoy.ifIndex=16;$decoy.MacAddress='00-11-22-33-44-66';$decoy.Name='Adapter a';$script:otherAdapters=@($decoy)
+        $r=Run ensure $role 13554 $identity
+        Assert ($r.ok -and $r.outcome.action -eq 'created' -and $script:rules[0].InterfaceAlias -ceq $alias -and (Enforced $script:rules[0])) 'Bracketed alias creation lost literal interface scope'
+        $r=Run ensure $role 13555 $identity
+        Assert ($r.ok -and $r.outcome.action -eq 'updated' -and $script:rules[0].InterfaceAlias -ceq $alias) 'Bracketed alias update lost literal interface scope'
+        Assert (Run disable $role).ok 'Bracketed alias stop before restart failed'
+        $r=Run ensure $role 13555 $identity
+        Assert ($r.ok -and $r.outcome.action -eq 'unchanged' -and $r.outcome.verified_shape) 'Bracketed alias readback required a redundant rewrite'
+        Assert (Run disable $role).ok 'Bracketed alias disable failed'
+        Assert ($script:rules[0].Enabled -eq 'False') 'Bracketed alias remained enabled'
+    }
+}
+$passed.Add('literal brackets preserve exact interface scope through create, update, readback and disable for both roles')
+foreach($field in @('InterfaceGuid','MacAddress','ifIndex','Status')) {
+    Reset;$script:adapter.Name='ZeroTier One [41d49af6c26fa68c]'
+    $script:adapter.$field=if($field -eq 'ifIndex'){16}else{'unavailable'}
+    $r=Run ensure rtsp 13554 $identity
+    Assert (!$r.ok -and $r.outcome.stage -eq 'interface' -and $script:writeCount -eq 0) 'Bracketed alias bypassed native identity validation'
+}
+Reset;$script:adapter.Name='ZeroTier One [41d49af6c26fa68c]';$duplicate=$script:adapter.PSObject.Copy();$duplicate.ifIndex=16;$script:otherAdapters=@($duplicate)
+$r=Run ensure rtsp 13554 $identity
+Assert (!$r.ok -and $script:writeCount -eq 0) 'Duplicate bracketed alias was accepted'
+$passed.Add('bracketed aliases still require a unique alias and current GUID, MAC, index and link')
 Reset;Assert (Run install).ok 'Fixture setup';Assert (Run ensure).ok 'Fixture start'
 $owned=@($script:rules | Where-Object {$_.Name -eq $roles[0].name})[0]
 $bad=Rule 'unrelated-legacy-conflict' 1;$bad.Profile='Private';$script:rules.Add($bad)
