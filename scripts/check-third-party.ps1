@@ -6,7 +6,7 @@ Validates the complete third-party runtime, metadata, source, and notices contra
 .DESCRIPTION
 This offline compliance gate cross-checks the committed manifest and resources:
 
-1. CoreDlls and Plugins are exactly represented by the 76-file SHA-256 lock.
+1. CoreDlls and Plugins are exactly represented by the SHA-256 lock.
 2. Every DLL maps to one versioned component with build and source metadata.
 3. Every source/build input is pinned, referenced, and included in the
    deterministic corresponding-source index.

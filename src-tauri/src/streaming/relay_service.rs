@@ -2915,6 +2915,7 @@ fn preflight_restream(spec: &ResolvedStartSpec) -> Result<(), AppError> {
         "x264enc",
         "fakesink",
         "tsdemux",
+        "jpegparse",
     ];
     for name in input.iter().chain(output).chain(&normalize) {
         if gst::ElementFactory::find(name).is_none() {

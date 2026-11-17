@@ -130,6 +130,7 @@
         'lib/gstreamer-1.0/gstd3d11.dll'                  = '4c3804eedd08ee1e72f18083f38ec454c0a0cb644e116db20929e3a877676776'
         'lib/gstreamer-1.0/gstdirectsound.dll'            = 'a7228380219a08a4e155ad03015fd8f35a6f3199c261e17612a1409da79362d0'
         'lib/gstreamer-1.0/gstisomp4.dll'                 = 'c6f1cd874b3ef54e4056a50ae9019c4678b51c4f98f78e2a0fdf853641c037d8'
+        'lib/gstreamer-1.0/gstjpegformat.dll'             = 'd9e85e7a4040e000240b7a78377657e92efb869e4e41ed6e02e4f54a4ba6bafb'
         'lib/gstreamer-1.0/gstlibav.dll'                  = 'f84ab8e0568c7341cb3ef79631edc1da22b8f1396ab63d75a8b37ad4887ba67f'
         'lib/gstreamer-1.0/gstmpegtsdemux.dll'            = '824e7d9791aef8692a21eeced55637f304dcd7da4234c680c5753aad565e89f0'
         'lib/gstreamer-1.0/gstmpegtsmux.dll'              = '55ae613b0d278ff834565177fe889744333f6d60603a52363ecc3f7f85ddd6a5'
@@ -351,6 +352,9 @@
         # H.264 parser: h264parse
         'gstvideoparsersbad.dll'
 
+        # JPEG frame parser for the libav MJPEG decoder
+        'gstjpegformat.dll'
+
         # FFmpeg/libav decoders: avdec_h264
         'gstlibav.dll'
 
@@ -442,6 +446,7 @@
         'gstdxva-1.0-0.dll'        = 'gst-plugins-bad'
         'gstmpegtsdemux.dll'       = 'gst-plugins-bad'
         'gstvideoparsersbad.dll'   = 'gst-plugins-bad'
+        'gstjpegformat.dll'        = 'gst-plugins-bad'
         'gstd3d11.dll'             = 'gst-plugins-bad'
         'gstrawparse.dll'          = 'gst-plugins-bad'
         'gstcodecalpha.dll'        = 'gst-plugins-bad'
