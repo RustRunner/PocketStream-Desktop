@@ -675,11 +675,15 @@ function Get-SourceReleaseEvidence {
     Assert-SourceReleaseMetadata -SourceManifest $Manifest.SourceRelease `
         -Release $release -AllowDraft:$AllowDraftSourceRelease
 
-    $latestApiUrl = 'https://api.github.com/repos/RustRunner/PocketStream-Desktop/releases/latest'
-    $latestText = @(& $curl.Source -fsSL `
-        -H 'Accept: application/vnd.github+json' `
-        -H 'X-GitHub-Api-Version: 2022-11-28' $latestApiUrl 2>&1 |
-        ForEach-Object { $_.ToString() }) -join "`n"
+    if ($AllowDraftSourceRelease) {
+        $latestText = @(& $gh.Source api 'repos/RustRunner/PocketStream-Desktop/releases/latest') -join "`n"
+    } else {
+        $latestApiUrl = 'https://api.github.com/repos/RustRunner/PocketStream-Desktop/releases/latest'
+        $latestText = @(& $curl.Source -fsSL `
+            -H 'Accept: application/vnd.github+json' `
+            -H 'X-GitHub-Api-Version: 2022-11-28' $latestApiUrl 2>&1 |
+            ForEach-Object { $_.ToString() }) -join "`n"
+    }
     if ($LASTEXITCODE -ne 0) {
         throw "Latest application release lookup failed with exit $LASTEXITCODE."
     }
