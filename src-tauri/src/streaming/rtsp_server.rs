@@ -773,7 +773,7 @@ impl RtspRestreamer {
         // not interpolated into the launch string, to prevent GStreamer
         // pipeline injection via crafted RTSP paths or credentials.
         let launch = "( rtspsrc name=src latency=200 protocols=tcp \
-             ! rtph264depay ! h264parse \
+             h264parse name=parse \
              ! rtph264pay name=pay0 pt=96 )";
 
         factory.set_launch(launch);
@@ -790,12 +790,11 @@ impl RtspRestreamer {
         let health_for_gate = health.clone();
         let tx_for_gate = event_tx.clone();
         let guarded: UpstreamReady = Arc::new(move || {
-            let result = if health_for_gate.loop_alive_for(server_instance) {
-                upstream_ready()
-            } else {
-                Err(AppError::Stream("Relay instance retired".into())
-                    .with_readiness_reason(crate::error::ReadinessRefusal::RelayRetired))
-            };
+            if !health_for_gate.loop_alive_for(server_instance) {
+                return Err(AppError::Stream("Relay instance retired".into())
+                    .with_readiness_reason(crate::error::ReadinessRefusal::RelayRetired));
+            }
+            let result = upstream_ready();
             if let Err(error) = &result {
                 health_for_gate.mark_build_failed(server_instance, error.to_string(), false);
                 let _ = tx_for_gate.send(RelaySupervisorEvent::RetryRequested {
@@ -809,6 +808,10 @@ impl RtspRestreamer {
             let element = media.element();
             if let Ok(bin) = element.downcast::<gst::Bin>() {
                 if let Some(src) = bin.by_name("src") {
+                    if let Err(error) = super::relay_input::install(&bin, &src, true) {
+                        gst::element_error!(bin, gst::StreamError::Format, ("{}", error));
+                        return;
+                    }
                     if let Err(error) = super::configure_tcp_rtspsrc(&src) {
                         // The identical element type passed preflight above;
                         // retain a diagnostic if the runtime changed under us,
@@ -830,15 +833,8 @@ impl RtspRestreamer {
                         src.set_property("user-id", &user_for_factory);
                         src.set_property("user-pw", &pw_for_factory);
                     }
-                    // Accept only the first video stream at SETUP. The
-                    // launch chain can only consume H.264 video; an
-                    // audio pad would have no consumer and its
-                    // GST_FLOW_NOT_LINKED would kill the re-stream
-                    // pipeline the same way it killed playback. Fresh
-                    // state per media — the factory is shared, and each
-                    // media construction negotiates its own streams.
-                    // media-configure fires before SDP/SETUP, so the
-                    // handler lands in time.
+                    // Select one video input before SETUP. Tracks inside a
+                    // transport stream are selected by the input decoder.
                     super::connect_video_only_select_stream(&src);
                 }
             }
@@ -926,8 +922,8 @@ impl RtspRestreamer {
         let factory = gst_rtsp_server::RTSPMediaFactory::new();
 
         let launch = format!(
-            "( udpsrc port={port} \
-             ! tsdemux ! h264parse \
+            "( udpsrc name=src port={port} \
+             h264parse name=parse \
              ! rtph264pay name=pay0 pt=96 )",
             port = udp_port,
         );
@@ -935,6 +931,16 @@ impl RtspRestreamer {
         factory.set_launch(&launch);
         factory.set_shared(true);
         factory.set_protocols(gst_rtsp::RTSPLowerTrans::TCP);
+
+        factory.connect_media_configure(move |_factory, media| {
+            if let Ok(bin) = media.element().downcast::<gst::Bin>() {
+                if let Some(src) = bin.by_name("src") {
+                    if let Err(error) = super::relay_input::install(&bin, &src, false) {
+                        gst::element_error!(bin, gst::StreamError::Format, ("{}", error));
+                    }
+                }
+            }
+        });
 
         let bytes_sent = Arc::new(AtomicU64::new(0));
         let fault_probe = RtspRuntimeProbe::new(health.clone());

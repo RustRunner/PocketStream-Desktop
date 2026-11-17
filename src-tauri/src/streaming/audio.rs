@@ -188,8 +188,7 @@ impl SelectionState {
 
     /// SETUP-time policy for the RTSP re-stream server: accept only
     /// the first video stream; decline audio and every other media
-    /// type. The re-stream launch chain can only consume H.264 video —
-    /// audio pass-through is a separate future feature.
+    /// type. Re-stream output carries video only.
     pub fn select_video_only(&self, kind: MediaKind) -> bool {
         match kind {
             MediaKind::Video => self

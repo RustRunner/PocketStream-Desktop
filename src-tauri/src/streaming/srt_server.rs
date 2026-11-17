@@ -25,13 +25,12 @@ use super::relay::{
 use crate::error::AppError;
 
 const RTSP_PIPELINE_SKELETON: &str = "rtspsrc name=src latency=200 protocols=tcp \
-    ! rtph264depay ! h264parse name=parse config-interval=-1 \
+    h264parse name=parse config-interval=-1 \
     ! mpegtsmux name=mux alignment=7 \
     ! srtsink name=sink mode=listener wait-for-connection=false authentication=true";
 
-// `demux` and `parse` deliberately begin separate parse-launch chains. The
-// first H.264 pad is linked explicitly by `install_udp_demux_handlers`.
-const UDP_PIPELINE_SKELETON: &str = "udpsrc name=src ! tsdemux name=demux \
+// Input normalization connects these separate source and output chains.
+const UDP_PIPELINE_SKELETON: &str = "udpsrc name=src \
     h264parse name=parse config-interval=-1 \
     ! mpegtsmux name=mux alignment=7 \
     ! srtsink name=sink mode=listener wait-for-connection=false authentication=true";
@@ -453,69 +452,6 @@ fn install_admission_handlers(
     ]
 }
 
-fn pad_is_h264(pad: &gst::Pad) -> bool {
-    let caps = pad.current_caps().unwrap_or_else(|| pad.query_caps(None));
-    caps.iter()
-        .any(|structure| structure.name().as_str() == "video/x-h264")
-}
-
-fn install_udp_demux_handlers(
-    pipeline: &gst::Pipeline,
-    callbacks: SrtCallbackContext,
-) -> Result<Vec<(gst::Element, glib::SignalHandlerId)>, RestreamBuildFailure> {
-    let demux = pipeline
-        .by_name("demux")
-        .ok_or_else(|| configuration_failure("SRT UDP relay pipeline has no demux element"))?;
-    let parser = pipeline
-        .by_name("parse")
-        .ok_or_else(|| configuration_failure("SRT UDP relay pipeline has no parser element"))?;
-    let parser_sink = parser
-        .static_pad("sink")
-        .ok_or_else(|| configuration_failure("SRT UDP parser has no sink pad"))?;
-    let parser_sink_weak = parser_sink.downgrade();
-    let video_linked = Arc::new(AtomicBool::new(false));
-
-    let linked_for_pad = video_linked.clone();
-    let linked_for_done = video_linked;
-    let callbacks_for_pad = callbacks.clone();
-    let pad_added = demux.connect_pad_added(move |_demux, pad| {
-        if callbacks_for_pad.is_shutdown_requested() || !pad_is_h264(pad) {
-            return;
-        }
-        if linked_for_pad
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-        let Some(parser_sink) = parser_sink_weak.upgrade() else {
-            callbacks_for_pad.emit_fault(
-                RelayFaultKind::Capability,
-                "SRT UDP relay parser disappeared during pad linking".into(),
-            );
-            return;
-        };
-        if parser_sink.is_linked() || pad.link(&parser_sink).is_err() {
-            callbacks_for_pad.emit_fault(
-                RelayFaultKind::Capability,
-                "SRT UDP relay could not link its H.264 stream".into(),
-            );
-        }
-    });
-
-    let callbacks_for_done = callbacks;
-    let no_more_pads = demux.connect_no_more_pads(move |_demux| {
-        if !linked_for_done.load(Ordering::Acquire) {
-            callbacks_for_done.emit_fault(
-                RelayFaultKind::Capability,
-                "SRT UDP relay found no H.264 video stream".into(),
-            );
-        }
-    });
-
-    Ok(vec![(demux.clone(), pad_added), (demux, no_more_pads)])
-}
-
 fn install_output_probe(
     sink: &gst::Element,
     bytes_sent: Arc<AtomicU64>,
@@ -919,6 +855,16 @@ impl SrtRestreamer {
             parts.source.clone(),
             super::connect_video_only_select_stream(&parts.source),
         )];
+        match super::relay_input::install(parts.pipeline.upcast_ref(), &parts.source, true) {
+            Ok(handlers) => signal_handlers.extend(handlers),
+            Err(error) => {
+                disconnect_handlers(&mut signal_handlers);
+                runtime
+                    .health
+                    .end_data_generation(runtime.server_instance, data_generation);
+                return Err(RestreamBuildFailure::configuration(error));
+            }
+        }
         signal_handlers.push((
             parts.source.clone(),
             install_source_eos_diagnostic(&parts.source, callbacks.clone()),
@@ -1018,13 +964,13 @@ impl SrtRestreamer {
             data_generation,
         );
         let mut signal_handlers =
-            match install_udp_demux_handlers(&parts.pipeline, callbacks.clone()) {
+            match super::relay_input::install(parts.pipeline.upcast_ref(), &parts.source, false) {
                 Ok(handlers) => handlers,
-                Err(failure) => {
+                Err(error) => {
                     runtime
                         .health
                         .end_data_generation(runtime.server_instance, data_generation);
-                    return Err(failure);
+                    return Err(RestreamBuildFailure::configuration(error));
                 }
             };
         signal_handlers.extend(install_admission_handlers(

@@ -2902,14 +2902,21 @@ fn scope_revision(scope: &BindScope) -> Option<u64> {
 fn preflight_restream(spec: &ResolvedStartSpec) -> Result<(), AppError> {
     crate::ensure_gstreamer()?;
     let input: &[&str] = match spec.source {
-        ResolvedSource::Rtsp { .. } => &["rtspsrc", "rtph264depay"],
+        ResolvedSource::Rtsp { .. } => &["rtspsrc", "rtph264depay", "rtpmp2tdepay"],
         ResolvedSource::Udp { .. } => &["udpsrc", "tsdemux"],
     };
     let output: &[&str] = match spec.protocol() {
         RestreamProtocol::Rtsp => &["h264parse", "rtph264pay"],
         RestreamProtocol::Srt => &["h264parse", "mpegtsmux", "srtsink"],
     };
-    for name in input.iter().chain(output) {
+    let normalize = [
+        "decodebin",
+        "videoconvert",
+        "x264enc",
+        "fakesink",
+        "tsdemux",
+    ];
+    for name in input.iter().chain(output).chain(&normalize) {
         if gst::ElementFactory::find(name).is_none() {
             return Err(AppError::Stream(format!(
                 "Bundled GStreamer lacks required element '{name}'"

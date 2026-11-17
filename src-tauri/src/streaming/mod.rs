@@ -5,6 +5,7 @@ mod classify;
 mod playback;
 pub mod recorder;
 mod relay;
+mod relay_input;
 mod relay_service;
 pub mod rtsp_client;
 pub mod rtsp_server;
