@@ -9,6 +9,22 @@ fn failure(message: &str) -> AppError {
     AppError::Stream(message.into())
 }
 
+fn video_decoders() -> glib::List<gst::ElementFactory> {
+    gst::ElementFactory::factories_with_type(
+        gst::ElementFactoryType::DECODER | gst::ElementFactoryType::MEDIA_VIDEO,
+        gst::Rank::MARGINAL,
+    )
+}
+
+fn is_video(caps: &gst::CapsRef) -> bool {
+    caps.structure(0).is_some_and(|s| {
+        matches!(s.name().as_str(), "video/x-h264" | "video/x-raw")
+            || video_decoders()
+                .iter()
+                .any(|factory| factory.can_sink_all_caps(caps))
+    })
+}
+
 fn discard_pad(bin: &gst::Bin, pad: &gst::Pad) -> Result<(), AppError> {
     let sink = gst::ElementFactory::make("fakesink")
         .property("sync", false)
@@ -35,11 +51,28 @@ fn discard_pad(bin: &gst::Bin, pad: &gst::Pad) -> Result<(), AppError> {
 
 fn transcode_pad(bin: &gst::Bin, pad: &gst::Pad, parser: &gst::Element) -> Result<(), AppError> {
     let branch = gst::parse::bin_from_description(
-        "videoconvert ! video/x-raw,format=I420 \
-         ! x264enc tune=zerolatency speed-preset=ultrafast bitrate=4000 key-int-max=30",
-        true,
+        "decodebin name=relay_decoder force-sw-decoders=true ! videoconvert ! video/x-raw,format=I420 \
+         ! x264enc name=relay_encoder tune=zerolatency speed-preset=ultrafast key-int-max=30",
+        false,
     )
     .map_err(|_| failure("Re-stream video conversion is unavailable"))?;
+    let encoder = branch
+        .by_name("relay_encoder")
+        .ok_or_else(|| failure("Re-stream encoder is unavailable"))?;
+    let decoder = branch
+        .by_name("relay_decoder")
+        .ok_or_else(|| failure("Re-stream video decoder is unavailable"))?;
+    for (element, name) in [(&decoder, "sink"), (&encoder, "src")] {
+        let pad = element
+            .static_pad(name)
+            .ok_or_else(|| failure("Re-stream conversion pad is unavailable"))?;
+        let ghost = gst::GhostPad::with_target(&pad)
+            .map_err(|_| failure("Cannot expose re-stream conversion pad"))?;
+        branch
+            .add_pad(&ghost)
+            .map_err(|_| failure("Cannot add re-stream conversion pad"))?;
+    }
+    encoder.set_property("bitrate", super::relay_bitrate::STARTUP_KBPS);
     branch.set_property("name", "relay_transcode");
     bin.add(&branch)
         .map_err(|_| failure("Cannot add re-stream video conversion"))?;
@@ -51,7 +84,8 @@ fn transcode_pad(bin: &gst::Bin, pad: &gst::Pad, parser: &gst::Element) -> Resul
             .static_pad("sink")
             .ok_or_else(|| failure("Re-stream conversion has no input pad"))?;
         pad.link(&target)
-            .map_err(|_| failure("Cannot link decoded re-stream video"))?;
+            .map_err(|_| failure("Cannot link encoded re-stream video"))?;
+        super::relay_bitrate::follow_input(pad, &encoder);
         branch
             .sync_state_with_parent()
             .map_err(|_| failure("Cannot start re-stream video conversion"))
@@ -92,18 +126,21 @@ pub(super) fn install(
         .map_err(|_| failure("Cannot add re-stream input decoder"))?;
     let mut handlers = Vec::new();
 
-    // Expose non-video tracks for disposal without requiring their decoders.
+    // Expose elementary video before decoding so its bitrate excludes other tracks.
     let autoplug = decoder.connect("autoplug-continue", false, |values| {
         let keep_decoding = values
             .get(2)
             .and_then(|value| value.get::<gst::Caps>().ok())
-            .and_then(|caps| caps.structure(0).map(|s| s.name().to_string()))
-            .is_none_or(|name| {
-                !(name.starts_with("audio/")
-                    || name.starts_with("text/")
-                    || name.starts_with("subpicture/")
-                    || name.starts_with("meta/")
-                    || name == "application/x-id3")
+            .is_none_or(|caps| {
+                !is_video(&caps)
+                    && caps.structure(0).is_none_or(|s| {
+                        let name = s.name().as_str();
+                        !(name.starts_with("audio/")
+                            || name.starts_with("text/")
+                            || name.starts_with("subpicture/")
+                            || name.starts_with("meta/")
+                            || name == "application/x-id3")
+                    })
             });
         Some(keep_decoding.to_value())
     });
@@ -119,7 +156,8 @@ pub(super) fn install(
         };
         let caps = pad.current_caps().unwrap_or_else(|| pad.query_caps(None));
         let name = caps.structure(0).map(|s| s.name().as_str());
-        let video = matches!(name, Some("video/x-h264" | "video/x-raw"));
+        let video =
+            name.is_some_and(|name| name.starts_with("video/") || name.starts_with("image/"));
         let result = if !video || linked_for_pad.swap(true, Ordering::AcqRel) {
             discard_pad(&bin, pad)
         } else if name == Some("video/x-h264") {
@@ -316,5 +354,122 @@ mod tests {
             unreachable!();
         };
         assert!(error.error().matches(gst::StreamError::Format));
+    }
+
+    #[test]
+    fn conversion_tracks_changing_video_rate_without_transport_stream_audio() {
+        use std::sync::atomic::AtomicU64;
+
+        gst::init().unwrap();
+        let pipeline = gst::parse::launch(
+            "mpegtsmux name=input_mux alignment=7 ! rtpmp2tpay pt=33 ! identity name=src \
+             videotestsrc is-live=true pattern=snow \
+             ! video/x-raw,format=I420,width=320,height=240,framerate=30/1 \
+             ! x265enc name=input_encoder tune=zerolatency speed-preset=ultrafast bitrate=1000 key-int-max=30 \
+             ! h265parse name=input_parse ! queue ! input_mux. \
+             audiotestsrc is-live=true ! audioconvert ! avenc_aac bitrate=320000 ! aacparse ! queue ! input_mux. \
+             h264parse name=parse ! avdec_h264 ! appsink name=out sync=false",
+        )
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let _stop = StopPipeline(pipeline.clone());
+        let _handlers = install(
+            pipeline.upcast_ref(),
+            &pipeline.by_name("src").unwrap(),
+            false,
+        )
+        .unwrap();
+        let bytes = Arc::new(AtomicU64::new(0));
+        let counted = bytes.clone();
+        pipeline
+            .by_name("input_parse")
+            .unwrap()
+            .static_pad("src")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                if let Some(gst::PadProbeData::Buffer(buffer)) = info.data.as_ref() {
+                    counted.fetch_add(buffer.size() as u64, Ordering::Relaxed);
+                }
+                gst::PadProbeReturn::Ok
+            });
+        let input_encoder = pipeline.by_name("input_encoder").unwrap();
+        let output_bytes = Arc::new(AtomicU64::new(0));
+        let counted_output = output_bytes.clone();
+        pipeline
+            .by_name("parse")
+            .unwrap()
+            .static_pad("src")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                if let Some(gst::PadProbeData::Buffer(buffer)) = info.data.as_ref() {
+                    counted_output.fetch_add(buffer.size() as u64, Ordering::Relaxed);
+                }
+                gst::PadProbeReturn::Ok
+            });
+        let output = pipeline
+            .by_name("out")
+            .unwrap()
+            .downcast::<gstreamer_app::AppSink>()
+            .unwrap();
+        let bus = pipeline.bus().unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let mut previous_target = 0;
+        for input_kbps in [1000_u32, 3000, 500] {
+            input_encoder.set_property("bitrate", input_kbps);
+            let phase_started = Instant::now();
+            let mut measured = None;
+            let mut frames = 0;
+            while phase_started.elapsed() < Duration::from_secs(6) {
+                if output
+                    .try_pull_sample(gst::ClockTime::from_mseconds(100))
+                    .is_some()
+                {
+                    frames += 1;
+                }
+                if measured.is_none() && phase_started.elapsed() >= Duration::from_secs(4) {
+                    measured = Some((
+                        Instant::now(),
+                        bytes.load(Ordering::Relaxed),
+                        output_bytes.load(Ordering::Relaxed),
+                    ));
+                }
+                if let Some(message) = bus.pop_filtered(&[gst::MessageType::Error]) {
+                    panic!("Conversion failed: {:?}", message.view());
+                }
+            }
+            assert!(
+                frames > 60,
+                "conversion must keep producing video during bitrate changes"
+            );
+            let (started, baseline, output_baseline) = measured.unwrap();
+            let measured_kbps = (bytes.load(Ordering::Relaxed) - baseline) as f64 * 8.0
+                / started.elapsed().as_secs_f64()
+                / 1000.0;
+            let output_kbps = (output_bytes.load(Ordering::Relaxed) - output_baseline) as f64 * 8.0
+                / started.elapsed().as_secs_f64()
+                / 1000.0;
+            let encoder = pipeline.by_name("relay_encoder").unwrap();
+            let target = encoder.property::<u32>("bitrate");
+            assert!(
+                (f64::from(target) - measured_kbps).abs() < measured_kbps * 0.2 + 30.0,
+                "input={measured_kbps:.0} kbps but target={target} kbps"
+            );
+            assert!(
+                output_kbps < measured_kbps * 1.35 + 50.0 && output_kbps > measured_kbps * 0.5,
+                "input={measured_kbps:.0} kbps but converted output={output_kbps:.0} kbps"
+            );
+            if input_kbps == 1000 {
+                assert!(
+                    target < 1500,
+                    "a low-rate input must not inherit a fixed floor"
+                );
+            } else if input_kbps == 3000 {
+                assert!(target > previous_target * 2);
+            } else {
+                assert!(target < previous_target / 2);
+            }
+            previous_target = target;
+        }
     }
 }
